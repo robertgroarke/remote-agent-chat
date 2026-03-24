@@ -1,0 +1,79 @@
+{
+  "name": "remote-agent-proxy",
+  "displayName": "Remote Agent Proxy",
+  "description": "Bridges IDE agent webviews (Claude Code, Codex, Gemini) to the Remote Agent Chat relay server via CDP",
+  "version": "1.0.0",
+  "publisher": "remote-agent-chat",
+  "engines": {
+    "vscode": "^1.80.0"
+  },
+  "categories": [
+    "Other"
+  ],
+  "activationEvents": [
+    "onStartupFinished"
+  ],
+  "main": "./dist/extension.js",
+  "scripts": {
+    "build": "esbuild extension.js --bundle --outfile=dist/extension.js --platform=node --target=node18 --external:vscode --format=cjs --sourcemap",
+    "package": "npm run build && vsce package"
+  },
+  "contributes": {
+    "commands": [
+      {
+        "command": "remoteAgentProxy.start",
+        "title": "Remote Agent Proxy: Start"
+      },
+      {
+        "command": "remoteAgentProxy.stop",
+        "title": "Remote Agent Proxy: Stop"
+      },
+      {
+        "command": "remoteAgentProxy.restart",
+        "title": "Remote Agent Proxy: Restart"
+      },
+      {
+        "command": "remoteAgentProxy.showLogs",
+        "title": "Remote Agent Proxy: Show Logs"
+      }
+    ],
+    "configuration": {
+      "title": "Remote Agent Proxy",
+      "properties": {
+        "remoteAgentProxy.relayUrl": {
+          "type": "string",
+          "default": "",
+          "description": "WebSocket URL of the relay server (e.g. ws://your-server-ip:3500/proxy-ws or wss://agents.yourdomain.com/proxy-ws)"
+        },
+        "remoteAgentProxy.proxySecret": {
+          "type": "string",
+          "default": "",
+          "description": "Shared secret for relay authentication"
+        },
+        "remoteAgentProxy.cdpPorts": {
+          "type": "string",
+          "default": "9223,9225",
+          "description": "Comma-separated CDP port numbers to scan (e.g. 9223,9225 for Antigravity + Codex Desktop)"
+        },
+        "remoteAgentProxy.machineLabel": {
+          "type": "string",
+          "default": "",
+          "description": "Machine label for session metadata (defaults to hostname)"
+        },
+        "remoteAgentProxy.autoStart": {
+          "type": "boolean",
+          "default": true,
+          "description": "Automatically start the proxy when the extension activates"
+        }
+      }
+    }
+  },
+  "dependencies": {
+    "chrome-remote-interface": "^0.34.0",
+    "ws": "^8.19.0"
+  },
+  "devDependencies": {
+    "esbuild": "^0.25.0",
+    "@vscode/vsce": "^3.7.0"
+  }
+}

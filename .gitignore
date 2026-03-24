@@ -1,0 +1,73 @@
+# Logs
+proxy.log
+proxy-err.log
+
+# Env files (contain secrets)
+.env
+agent-proxy/.env
+relay-server/.env
+
+# Personal server reference (contains credentials)
+UNRAID_INFO.md
+SECURITY_KANBAN.md
+
+# Personal planning docs (not for public repo)
+google-cloud-billing-investigation.md
+implementation-task-board.md
+remote-agent-chat-plan.md
+remote-agent-chat-session-context.md
+architecture-review-and-roadmap.md
+
+# Claude Code IDE settings
+.claude/
+
+# Local proxy environment overrides (node path, etc.)
+proxy-env.bat
+
+# Windows Scheduled Task (contains local machine username)
+agent-proxy-task.xml
+
+# Node modules
+node_modules/
+agent-proxy/node_modules/
+relay-server/node_modules/
+
+# Uploaded files
+uploads/
+
+# SQLite DB
+*.db
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Local Claude settings
+.claude/settings.local.json
+agent-proxy/proxy.log
+
+# Frontend build artifacts
+frontend/dist/
+frontend/node_modules/
+
+# Android build artifacts
+frontend/agent-chat.apk
+frontend/agent-chat.apk.idsig
+relay-server/public/agent-chat.apk
+android-app/node_modules/
+android-app/android/
+android-app/.expo/
+android-app/.node22/
+
+# Python cache
+__pycache__/
+
+# Runtime files
+agent-proxy/proxy-new.log
+agent-proxy/session-store.json
+
+# VSIX build artifacts
+agent-proxy/vscode-ext/*.vsix
+agent-proxy/vscode-ext/dist/
+agent-proxy/vscode-ext/node_modules/
+*.log

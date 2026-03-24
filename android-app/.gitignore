@@ -1,0 +1,9 @@
+# Android build artifacts
+android/
+node_modules/
+.expo/
+*.keystore
+*.keystore.bak
+.env
+keystore.properties
+package-lock.json

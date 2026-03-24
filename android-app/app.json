@@ -1,0 +1,35 @@
+{
+  "expo": {
+    "name": "Agent Chat",
+    "slug": "agent-chat",
+    "version": "1.0.0",
+    "orientation": "portrait",
+    "scheme": "agentchat",
+    "userInterfaceStyle": "dark",
+    "backgroundColor": "#0b0f14",
+    "icon": "./assets/icon.png",
+    "android": {
+      "adaptiveIcon": {
+        "foregroundImage": "./assets/icon.png",
+        "backgroundColor": "#0b0f14"
+      },
+      "package": "com.agentchat.app"
+    },
+    "splash": {
+      "image": "./assets/splash.png",
+      "resizeMode": "contain",
+      "backgroundColor": "#0b0f14"
+    },
+    "plugins": [
+      "expo-secure-store",
+      [
+        "expo-notifications",
+        {
+          "icon": "./assets/notification-icon.png",
+          "color": "#58a6ff",
+          "defaultChannel": "agent-idle"
+        }
+      ]
+    ]
+  }
+}
