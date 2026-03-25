@@ -217,6 +217,20 @@ export function useRelay() {
       return requestId;
     }
 
+    // Resumes an old session by launching a new agent and replaying history.
+    function resumeSession(sourceSession, agentType, workspacePath) {
+      const requestId = `resume-${Date.now()}-${Math.random().toString(36).slice(2, 7)}`;
+      setLaunchStates(prev => ({ ...prev, [requestId]: { status: 'launching', agentType } }));
+      send({
+        type: 'resume_session',
+        source_session: sourceSession,
+        agent_type: agentType || 'claude',
+        workspace_path: workspacePath || undefined,
+        request_id: requestId,
+      });
+      return requestId;
+    }
+
     // Closes an existing session. For disconnected/orphaned sessions, sends
     // dismiss_session so the relay removes it from the sidebar immediately.
     function closeSession(sessionId, isDisconnected) {
@@ -245,7 +259,17 @@ export function useRelay() {
       // ── Session list (legacy) ───────────────────────────────────────────────
       if (t === 'session_list') {
         setSessions(msg.sessions || []);
-        (msg.sessions || []).forEach(requestHistory);
+        (msg.sessions || []).forEach(s => {
+          if (s && typeof s === 'object' && s.is_list_view) {
+            const id = s.session_id;
+            if (id) setMessages(prev => {
+              if (prev[id] && prev[id].length > 0) return { ...prev, [id]: [] };
+              return prev;
+            });
+          } else {
+            requestHistory(s);
+          }
+        });
         if (Array.isArray(msg.workspaces)) setWorkspaces(msg.workspaces);
         return;
       }
@@ -254,7 +278,18 @@ export function useRelay() {
       if (t === 'session_snapshot' || t === 'proxy_session_snapshot') {
         setSessions(msg.sessions || []);
         mergeSessionMetadataActivity(msg.sessions || []);
-        (msg.sessions || []).forEach(requestHistory);
+        (msg.sessions || []).forEach(s => {
+          if (s && typeof s === 'object' && s.is_list_view) {
+            // Panel is in list/new-chat mode — clear stale messages instead of fetching
+            const id = s.session_id;
+            if (id) setMessages(prev => {
+              if (prev[id] && prev[id].length > 0) return { ...prev, [id]: [] };
+              return prev;
+            });
+          } else {
+            requestHistory(s);
+          }
+        });
         return;
       }
 
@@ -263,7 +298,17 @@ export function useRelay() {
         if (msg.sessions && msg.sessions.length > 0) {
           setSessions(msg.sessions);
           mergeSessionMetadataActivity(msg.sessions);
-          msg.sessions.forEach(requestHistory);
+          msg.sessions.forEach(s => {
+            if (s && typeof s === 'object' && s.is_list_view) {
+              const id = s.session_id;
+              if (id) setMessages(prev => {
+                if (prev[id] && prev[id].length > 0) return { ...prev, [id]: [] };
+                return prev;
+              });
+            } else {
+              requestHistory(s);
+            }
+          });
         }
         if (Array.isArray(msg.workspaces)) setWorkspaces(msg.workspaces);
         if (msg.session_health) {
@@ -299,7 +344,11 @@ export function useRelay() {
       // ── History snapshot (legacy + v1) ──────────────────────────────────────
       if (t === 'history' || t === 'history_snapshot') {
         const id = msg.session || msg.session_id;
-        if (id) setMessages(prev => ({ ...prev, [id]: msg.messages || [] }));
+        if (!id) return;
+        // Don't overwrite cleared messages for sessions in list-view mode
+        const sessionObj = sessions.find(s => (typeof s === 'object' ? s.session_id : s) === id);
+        if (sessionObj && typeof sessionObj === 'object' && sessionObj.is_list_view && msg.messages?.length > 0) return;
+        setMessages(prev => ({ ...prev, [id]: msg.messages || [] }));
         return;
       }
 
@@ -501,7 +550,7 @@ export function useRelay() {
       }
     }
 
-    return { sessions, messages, connected, unread, setUnread, thinking, activities, health, deliveryStates, launchStates, justLaunched, setJustLaunched, permissionPrompts, respondToPrompt, interruptSession, agentConfigs, requestAgentConfig, setAgentModel, setAgentPermissionMode, setAntigravityMode, setCodexConfig, newThread, openPanel, requestChatList, switchChat, newChat, chatLists, requestThreadList, switchThread, threadLists, switchWorkspace, requestTerminalOutput, terminalOutputs, requestFileChanges, fileChanges, sendAttachment, send, sendToSession, launchSession, closeSession, activeSessionRef, workspaces, branchLists, requestBranchList, switchBranch, createBranch, skillLists, requestSkillList };
+    return { sessions, messages, connected, unread, setUnread, thinking, activities, health, deliveryStates, launchStates, justLaunched, setJustLaunched, permissionPrompts, respondToPrompt, interruptSession, agentConfigs, requestAgentConfig, setAgentModel, setAgentPermissionMode, setAntigravityMode, setCodexConfig, newThread, openPanel, requestChatList, switchChat, newChat, chatLists, requestThreadList, switchThread, threadLists, switchWorkspace, requestTerminalOutput, terminalOutputs, requestFileChanges, fileChanges, sendAttachment, send, sendToSession, launchSession, resumeSession, closeSession, activeSessionRef, workspaces, branchLists, requestBranchList, switchBranch, createBranch, skillLists, requestSkillList };
   }
 
 // (removed window.useRelay — now an ES module export)

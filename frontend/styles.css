@@ -647,6 +647,81 @@ body {
 }
 .empty-state .icon { font-size: 36px; }
 
+/* ── Thread picker (empty-state chat selector for desktop apps) ── */
+.thread-picker-empty {
+  flex: 1;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  padding: 24px 16px;
+  overflow-y: auto;
+  max-width: 480px;
+  width: 100%;
+  margin: 0 auto;
+}
+.thread-picker-header {
+  font-size: 16px;
+  font-weight: 600;
+  color: var(--text1);
+  margin-bottom: 16px;
+}
+.thread-picker-list {
+  width: 100%;
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+.thread-picker-item {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  width: 100%;
+  padding: 12px 14px;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  background: var(--bg2);
+  color: var(--text1);
+  cursor: pointer;
+  text-align: left;
+  font-size: 14px;
+  transition: background 0.15s, border-color 0.15s;
+}
+.thread-picker-item:hover {
+  background: var(--surface-hover, #1a2030);
+  border-color: var(--accent);
+}
+.thread-picker-item.active {
+  border-color: var(--accent);
+  background: var(--accent-bg, rgba(88, 166, 255, 0.08));
+}
+.thread-picker-title {
+  flex: 1;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.thread-picker-age {
+  font-size: 12px;
+  color: var(--text2);
+  white-space: nowrap;
+}
+.thread-picker-new {
+  margin-top: 12px;
+  padding: 10px 20px;
+  border: 1px dashed var(--border);
+  border-radius: 8px;
+  background: transparent;
+  color: var(--accent);
+  cursor: pointer;
+  font-size: 14px;
+  transition: background 0.15s, border-color 0.15s;
+}
+.thread-picker-new:hover {
+  background: var(--bg2);
+  border-color: var(--accent);
+}
+
 .message {
   display: grid;
   grid-template-columns: 32px minmax(0, 1fr);

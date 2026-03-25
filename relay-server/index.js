@@ -1306,6 +1306,7 @@ function handleProxyConnection(ws, req) {
           session_id:       msg.session_id,
           agent_type:       msg.agent_type || pending.agent_type,
           server_ts:        new Date().toISOString(),
+          ...(msg.fire_and_forget ? { fire_and_forget: true, message: msg.message } : {}),
         };
         if (pending.browser_ws?.readyState === WebSocket.OPEN) {
           pending.browser_ws.send(JSON.stringify(ackMsg));

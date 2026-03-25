@@ -1741,6 +1741,14 @@ function App() {
     : null;
   const assistantMonospace = activeSessionMeta?.agent_type === 'codex';
 
+  // Auto-fetch thread list for desktop sessions with no messages (e.g. Codex Desktop showing chat picker)
+  const hasThreadCap = activeConfig?.capabilities?.thread_list;
+  const noMessages = currentMessages.length === 0;
+  React.useEffect(() => {
+    if (activeSession && hasThreadCap && noMessages) {
+      requestThreadList(activeSession);
+    }
+  }, [activeSession, hasThreadCap, noMessages]);
 
   function updateInput(value) {
     if (!activeSession) return;
@@ -1929,6 +1937,19 @@ function App() {
                       chats
                     </button>
                   )}
+                  {activeConfig?.capabilities?.thread_list && (
+                    <button
+                      className={`context-pill chat-list-toggle${showThreadList ? ' active' : ''}`}
+                      title="View threads"
+                      onClick={() => {
+                        const next = !showThreadList;
+                        setShowThreadList(next);
+                        if (next) requestThreadList(activeSession);
+                      }}
+                    >
+                      threads
+                    </button>
+                  )}
                   {activeConfig?.capabilities?.terminal_output && (
                     <button
                       className={`context-pill terminal-toggle${showTerminal ? ' active' : ''}`}
@@ -2027,6 +2048,47 @@ function App() {
           )}
           {!activeSession ? (
             <div className="empty-state"><div className="icon">🤖</div><div>Select an agent session</div></div>
+          ) : currentMessages.length === 0 && hasThreadCap && (threadLists[activeSession]?.length > 0) ? (
+            <div className="thread-picker-empty">
+              <div className="thread-picker-header">Select a chat</div>
+              <div className="thread-picker-list">
+                {threadLists[activeSession].map((thread, i) => (
+                  <button
+                    key={thread.id || i}
+                    className={`thread-picker-item${thread.active ? ' active' : ''}`}
+                    onClick={() => switchThread(activeSession, thread.id)}
+                    title={thread.title}
+                  >
+                    <span className="thread-picker-title">{thread.title || 'Untitled'}</span>
+                    {thread.age && <span className="thread-picker-age">{thread.age}</span>}
+                  </button>
+                ))}
+              </div>
+              <button
+                className="thread-picker-new"
+                onClick={() => newThread(activeSession)}
+              >+ New Thread</button>
+            </div>
+          ) : (activeSessionMeta?.is_list_view && chatLists[activeSession]?.length > 0) ? (
+            <div className="thread-picker-empty">
+              <div className="thread-picker-header">Select a conversation or type a new message</div>
+              <div className="thread-picker-list">
+                {chatLists[activeSession].map((chat, i) => (
+                  <button
+                    key={chat.id || i}
+                    className={`thread-picker-item${chat.active ? ' active' : ''}`}
+                    onClick={() => switchChat(activeSession, chat.id)}
+                    title={chat.title}
+                  >
+                    <span className="thread-picker-title">{chat.title || 'Untitled'}</span>
+                  </button>
+                ))}
+              </div>
+              <button
+                className="thread-picker-new"
+                onClick={() => newChat(activeSession)}
+              >+ New Chat</button>
+            </div>
           ) : currentMessages.length === 0 ? (
             <div className="empty-state"><div className="icon">💬</div><div>No messages yet</div></div>
           ) : (

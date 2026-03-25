@@ -3979,7 +3979,6 @@ async function openAntigravityPanel(Runtime) {
 async function readAntigravityPanelChatList(Runtime) {
   try {
     const raw = await evalInPage(Runtime, `
-      (function() {
         var panel = d.querySelector('.antigravity-agent-side-panel');
         if (!panel) return JSON.stringify([]);
 
@@ -4012,35 +4011,37 @@ async function readAntigravityPanelChatList(Runtime) {
           });
         }
 
-        // Strategy 2: If no structured list, look for clickable buttons/links
-        // that represent different conversations
+        // Strategy 2: Look for conversation history buttons.
+        // These are full-width buttons with "grow" and "cursor-pointer" classes
+        // that contain the conversation title and an age indicator.
         if (chats.length === 0) {
-          var btns = Array.from(panel.querySelectorAll('button, a, [role="button"]'));
+          var btns = Array.from(panel.querySelectorAll('button'));
           var chatBtns = btns.filter(function(b) {
-            var t = (b.textContent || '').trim();
-            // Filter out action buttons
-            if (/^(New|Send|Stop|Cancel|Copy|\\+|×|✕)$/i.test(t)) return false;
-            if (t.length < 2 || t.length > 100) return false;
-            return t.split('\\n')[0].trim().length > 1;
+            var cls = b.className || '';
+            // Match the Antigravity chat history button pattern:
+            // full-width, grow, cursor-pointer, flex-row layout
+            if (cls.includes('grow') && cls.includes('cursor-pointer') && cls.includes('flex') && cls.includes('w-full')) {
+              var t = (b.textContent || '').trim();
+              return t.length >= 2 && t.length <= 200;
+            }
+            return false;
           });
 
-          // Only treat as chat list if multiple candidates found
-          if (chatBtns.length > 1) {
-            for (var j = 0; j < chatBtns.length; j++) {
-              var btn = chatBtns[j];
-              var btnTitle = (btn.textContent || '').trim().split('\\n')[0].trim();
-              chats.push({
-                id: 'ag-chat-' + j,
-                title: btnTitle.substring(0, 100),
-                active: btn.classList.contains('active') || btn.getAttribute('aria-selected') === 'true',
-                index: j
-              });
-            }
+          for (var j = 0; j < chatBtns.length; j++) {
+            var btn = chatBtns[j];
+            var btnText = (btn.textContent || '').trim();
+            // Strip trailing age indicator (e.g. "5d", "2h", "10m")
+            var btnTitle = btnText.replace(/\\d+[smhd]$/, '').trim();
+            chats.push({
+              id: 'ag-chat-' + j,
+              title: btnTitle.substring(0, 100),
+              active: btn.classList.contains('active') || btn.getAttribute('aria-selected') === 'true',
+              index: j
+            });
           }
         }
 
         return JSON.stringify(chats);
-      })()
     `);
     return raw ? JSON.parse(raw) : [];
   } catch {
@@ -4117,9 +4118,16 @@ async function newAntigravityPanelChat(Runtime) {
         var panel = d.querySelector('.antigravity-agent-side-panel');
         if (!panel) return 'no-panel';
 
-        var allBtns = Array.from(panel.querySelectorAll('button, [role="button"], [role="menuitem"]'));
+        // Strategy 1: Direct hit — the "new conversation" tooltip anchor
+        var newConv = panel.querySelector('[data-tooltip-id="new-conversation-tooltip"]');
+        if (newConv) {
+          newConv.click();
+          return 'clicked-new-conversation-tooltip';
+        }
 
-        // Strategy 1: Button with "New" text
+        var allBtns = Array.from(panel.querySelectorAll('button, [role="button"], [role="menuitem"], a[data-tooltip-id]'));
+
+        // Strategy 2: Button/anchor with "New" text
         var newBtn = allBtns.find(function(b) {
           var t = (b.textContent || b.getAttribute('aria-label') || b.title || '').trim().toLowerCase();
           return t === 'new chat' || t === 'new conversation' || t === 'new' ||
@@ -4130,7 +4138,7 @@ async function newAntigravityPanelChat(Runtime) {
           return 'clicked-new-btn';
         }
 
-        // Strategy 2: "+" button in the panel header
+        // Strategy 3: "+" button in the panel header
         var plusBtn = allBtns.find(function(b) {
           var t = (b.textContent || b.getAttribute('aria-label') || '').trim();
           return t === '+' || t === 'Add' || /^plus$/i.test(t) ||
@@ -4141,7 +4149,7 @@ async function newAntigravityPanelChat(Runtime) {
           return 'clicked-plus';
         }
 
-        // Strategy 3: Icon button with a plus/add SVG
+        // Strategy 4: Icon button/anchor with a plus SVG path
         var iconBtns = allBtns.filter(function(b) {
           return b.querySelector('svg') && (b.textContent || '').trim().length < 5;
         });
@@ -4150,7 +4158,8 @@ async function newAntigravityPanelChat(Runtime) {
           var paths = svg ? Array.from(svg.querySelectorAll('path, line')) : [];
           var isPlus = paths.some(function(p) {
             var pathD = p.getAttribute('d') || '';
-            return pathD.includes('M12 5v14') || pathD.includes('M5 12h14') ||
+            return pathD.includes('M12 4.5v15') || pathD.includes('M4.5 12h15') ||
+                   pathD.includes('M12 5v14') || pathD.includes('M5 12h14') ||
                    pathD.includes('M12 4v16') || pathD.includes('M4 12h16');
           });
           if (isPlus) {

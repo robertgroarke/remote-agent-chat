@@ -468,4 +468,4 @@ async function closeSession({ targetId, port }) {
   }
 }
 
-module.exports = { launchSession, closeSession };
+module.exports = { launchSession, closeSession, spawnAntigravity };

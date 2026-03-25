@@ -268,7 +268,7 @@ class ProxyEngine extends EventEmitter {
       open_panel:             agentType === 'codex' || agentType === 'antigravity_panel',
       chat_list:              agentType === 'codex' || agentType === 'antigravity_panel' || agentType === 'claude-desktop',
       switch_chat:            agentType === 'codex' || agentType === 'antigravity_panel' || agentType === 'claude-desktop',
-      new_chat:               agentType === 'codex' || agentType === 'antigravity_panel' || agentType === 'claude-desktop',
+      new_chat:               agentType === 'codex' || agentType === 'antigravity_panel' || agentType === 'claude-desktop' || agentType === 'claude',
       terminal_output:        isCodex || agentType === 'claude-desktop',
       terminal_input:         agentType === 'codex-desktop',
       file_changes:           isCodex || agentType === 'claude-desktop',
@@ -1150,14 +1150,29 @@ class ProxyEngine extends EventEmitter {
       const agentT = sessionData?.agentType;
       const requestId = msg.request_id;
 
-      if (agentT !== 'codex' && agentT !== 'codex-desktop' && agentT !== 'antigravity_panel' && agentT !== 'claude-desktop') {
+      if (agentT !== 'codex' && agentT !== 'codex-desktop' && agentT !== 'antigravity_panel' && agentT !== 'claude-desktop' && agentT !== 'claude') {
         this._sendToRelay(proto.agentControlResult(sid, requestId, 'new_chat', 'failed', {
           code: 'not_supported', message: `new_chat not supported for ${agentT || 'unknown'}`,
         }));
         return;
       }
 
+      // Claude Code extension: send /clear to start a new conversation
+      if (agentT === 'claude') {
+        selectors.sendMessage(sessionData.client.Runtime, 'claude', '/clear', sid)
+          .then(result => {
+            this._sendToRelay(proto.agentControlResult(sid, requestId, 'new_chat', result.ok ? 'ok' : 'failed',
+              result.ok ? undefined : { code: result.code || 'new_chat_failed', message: result.detail }));
+          })
+          .catch(() => {
+            this._sendToRelay(proto.agentControlResult(sid, requestId, 'new_chat', 'failed', { code: 'cdp_error' }));
+          });
+        return;
+      }
+
       if (agentT === 'antigravity_panel') {
+        // Suppress hasContent removal check while the panel resets
+        sessionData._newChatPending = Date.now();
         selectors.newAntigravityPanelChat(sessionData.client.Runtime)
           .then(result => {
             this._sendToRelay(proto.agentControlResult(sid, requestId, 'new_chat', result.ok ? 'ok' : 'failed',
@@ -1443,6 +1458,171 @@ class ProxyEngine extends EventEmitter {
       const workspacePath = msg.workspace_path || null;
       this._log('info', `[ctrl] launch_session agent=${agentType} request=${requestId}`);
 
+      // Antigravity window: File > New Window via DOM menu on existing workbench
+      if (agentType === 'antigravity') {
+        (async () => {
+          try {
+            const targets = await CDP.List({ port: this.CDP_PORTS[0] });
+            const workbenchPages = targets.filter(t =>
+              t.type === 'page' && t.url && t.url.includes('workbench.html') && !t.url.includes('jetski')
+            );
+            if (workbenchPages.length === 0) {
+              launchers.spawnAntigravity(this.CDP_PORTS[0]);
+              this._log('info', `[launch] No Antigravity workbench — spawned fresh`);
+            } else {
+              const page = workbenchPages[0];
+              let pageClient;
+              try {
+                pageClient = await CDP({ port: this.CDP_PORTS[0], target: page.id });
+                await pageClient.Runtime.enable();
+                await pageClient.Runtime.evaluate({ expression: 'window.focus()' });
+                await sleep(200);
+                // Alt+F to open File menu (DOM-based in Antigravity)
+                await pageClient.Input.dispatchKeyEvent({ type: 'rawKeyDown', key: 'F', code: 'KeyF', windowsVirtualKeyCode: 70, modifiers: 1 });
+                await pageClient.Input.dispatchKeyEvent({ type: 'keyUp', key: 'F', code: 'KeyF', windowsVirtualKeyCode: 70 });
+                await sleep(600);
+                // Click "New Window" by aria-label
+                const result = await pageClient.Runtime.evaluate({
+                  expression: `(function() {
+                    var item = document.querySelector('[aria-label="New Window"]');
+                    if (item) { item.click(); return 'ok'; }
+                    return 'not-found';
+                  })()`,
+                  returnByValue: true,
+                });
+                await pageClient.close();
+                const val = result.result?.value;
+                if (val === 'ok') {
+                  this._log('info', `[launch] Clicked File > New Window on "${page.title}"`);
+                } else {
+                  this._log('warn', `[launch] New Window menu item not found`);
+                  launchers.spawnAntigravity(this.CDP_PORTS[0]);
+                }
+              } catch (e) {
+                if (pageClient) try { await pageClient.close(); } catch {}
+                this._log('warn', `[launch] File > New Window failed: ${e.message}`);
+                launchers.spawnAntigravity(this.CDP_PORTS[0]);
+              }
+            }
+            this._sendToRelay({
+              type: 'session_launch_ack',
+              protocol_version: proto.PROTOCOL_VERSION,
+              request_id: requestId,
+              session_id: null,
+              fire_and_forget: true,
+              message: 'Antigravity window opened — select a workspace to start chatting',
+            });
+          } catch (e) {
+            this._log('error', `[launch] Antigravity launch error: ${e.message}`);
+            this._sendToRelay({
+              type: 'session_launch_failed',
+              protocol_version: proto.PROTOCOL_VERSION,
+              request_id: requestId,
+              agent_type: agentType,
+              reason: e.message,
+              error_code: 'spawn_failed',
+            });
+          }
+        })();
+        return;
+      }
+
+      // Antigravity Chat: open the side panel on an existing workbench page
+      if (agentType === 'antigravity_panel') {
+        this._log('info', `[launch] Opening Antigravity side-panel`);
+        (async () => {
+          try {
+            const targets = await CDP.List({ port: this.CDP_PORTS[0] });
+            const workbenchPages = targets.filter(t =>
+              t.type === 'page' && t.url && t.url.includes('workbench.html') && !t.url.includes('jetski')
+            );
+            if (workbenchPages.length === 0) {
+              this._sendToRelay({
+                type: 'session_launch_failed', protocol_version: proto.PROTOCOL_VERSION,
+                request_id: requestId, agent_type: agentType,
+                reason: 'No Antigravity window open — launch Antigravity first',
+                error_code: 'agent_not_open',
+              });
+              return;
+            }
+            // If workspace specified, prefer matching window
+            if (workspacePath && workbenchPages.length > 1) {
+              const normalise = p => (p || '').replace(/\\/g, '/').toLowerCase().replace(/\/+$/, '');
+              const wanted = normalise(workspacePath);
+              const wantedBase = wanted.split('/').filter(Boolean).pop() || '';
+              workbenchPages.sort((a, b) => {
+                const aT = (a.title || '').replace(/ - Antigravity.*/, '').trim().toLowerCase();
+                const bT = (b.title || '').replace(/ - Antigravity.*/, '').trim().toLowerCase();
+                return (bT === wantedBase || wanted.endsWith(bT) ? 1 : 0)
+                     - (aT === wantedBase || wanted.endsWith(aT) ? 1 : 0);
+              });
+            }
+            let panelOpened = false;
+            for (const page of workbenchPages) {
+              let pageClient;
+              try {
+                pageClient = await CDP({ port: this.CDP_PORTS[0], target: page.id });
+                await pageClient.Runtime.enable();
+                const result = await selectors.openAntigravityPanel(pageClient.Runtime);
+                await pageClient.close();
+                if (result.ok) {
+                  this._log('info', `[launch] Opened Antigravity side-panel: method=${result.method} on "${page.title}"`);
+                  panelOpened = true;
+                  break;
+                }
+              } catch (e) {
+                if (pageClient) try { await pageClient.close(); } catch {}
+                this._log('warn', `[launch] openAntigravityPanel failed on ${page.id.substring(0, 8)}: ${e.message}`);
+              }
+            }
+            if (!panelOpened) {
+              this._sendToRelay({
+                type: 'session_launch_failed', protocol_version: proto.PROTOCOL_VERSION,
+                request_id: requestId, agent_type: agentType,
+                reason: 'Could not open Antigravity side panel',
+                error_code: 'panel_open_failed',
+              });
+              return;
+            }
+            // Wait for discovery to pick up the new panel session
+            this._log('info', `[launch] Waiting for side-panel session to appear...`);
+            await sleep(3000);
+            await this._discoverTargets();
+            // Find the newly appeared antigravity_panel session
+            const panelSession = Array.from(this.sessions.values()).find(s =>
+              s.agentType === 'antigravity_panel' && (!workspacePath ||
+                (s.windowTitle || '').toLowerCase().includes(
+                  (workspacePath || '').split(/[\\/]/).filter(Boolean).pop().toLowerCase()
+                ))
+            );
+            if (panelSession) {
+              this._log('info', `[launch] session_launch_ack: ${panelSession.session_id}`);
+              this._sendToRelay({
+                type: 'session_launch_ack', protocol_version: proto.PROTOCOL_VERSION,
+                request_id: requestId, session_id: panelSession.session_id,
+              });
+            } else {
+              // Panel opened but no session yet — fire-and-forget, discovery will catch it
+              this._log('info', `[launch] Panel opened but session not yet discovered — acking without session`);
+              this._sendToRelay({
+                type: 'session_launch_ack', protocol_version: proto.PROTOCOL_VERSION,
+                request_id: requestId, session_id: null,
+                fire_and_forget: true,
+                message: 'Antigravity side panel opened — session will appear shortly',
+              });
+            }
+          } catch (e) {
+            this._log('error', `[launch] Antigravity panel launch error: ${e.message}`);
+            this._sendToRelay({
+              type: 'session_launch_failed', protocol_version: proto.PROTOCOL_VERSION,
+              request_id: requestId, agent_type: agentType,
+              reason: e.message, error_code: 'panel_open_failed',
+            });
+          }
+        })();
+        return;
+      }
+
       launchers.launchSession({
         agentType,
         port:          this.CDP_PORTS[0],
@@ -1648,6 +1828,7 @@ class ProxyEngine extends EventEmitter {
       last_seen_at:     s.last_seen_at,
       rate_limited_until: s.rate_limited_until || null,
       rate_limit_active:  s.rateLimitActive    || false,
+      is_list_view:       s._panelEmpty        || false,
     }));
   }
 
@@ -1740,14 +1921,28 @@ class ProxyEngine extends EventEmitter {
           session._lastTitleCheckAt = now;
           try {
             const hasContent = await selectors.detectAntigravityPanelHasContent(session.client.Runtime);
+            this._log('info', `[${sessionId}] panel poll: hasContent=${hasContent} _panelEmpty=${!!session._panelEmpty} lastMsgCount=${session.lastMessageCount}`);
             if (!hasContent) {
-              this._log('info', `[${sessionId}] Antigravity side-panel conversation cleared — removing session`);
-              sessionStore.markDisconnected(sessionId);
-              try { await session.client.close(); } catch {}
-              this.sessions.delete(sessionId);
-              this._broadcastSessionSnapshot();
-              return;
+              // Panel is in "new chat" / list view — no active conversation.
+              // Clear any stale messages from the web UI so it doesn't show
+              // old content that doesn't match what the user sees.
+              if (session.lastMessageCount > 0) {
+                this._log('info', `[${sessionId}] Panel empty — clearing ${session.lastMessageCount} stale messages from web UI`);
+                this._sendToRelay(proto.historySnapshot(sessionId, []));
+                session.lastMessageCount = 0;
+                session.lastObservedCount = 0;
+                session.lastTranscriptSig = '';
+              }
+              if (session._newChatPending) {
+                delete session._newChatPending;
+              }
+              // Mark panel as empty so we skip stale message processing below
+              session._panelEmpty = true;
+            } else if (session._newChatPending) {
+              // Panel has content again after new_chat — clear the flag and update title
+              delete session._newChatPending;
             }
+            if (hasContent) session._panelEmpty = false;
             const panelTitle = await selectors.readAntigravityPanelTitle(session.client.Runtime);
             const workspacePart = session.windowTitle.split(' / ')[0];
             const newTitle = panelTitle ? `${workspacePart} / ${panelTitle}` : workspacePart;
@@ -1758,9 +1953,26 @@ class ProxyEngine extends EventEmitter {
               sessionStore.updateSession(sessionId, { window_title: newTitle, workspace_name: newTitle });
               this._broadcastSessionSnapshot();
             }
+
+            // Proactively send chat list so the web UI can show conversation history
+            try {
+              const chatList = await selectors.readAntigravityPanelChatList(session.client.Runtime);
+              this._log('info', `[${sessionId}] chatList: ${chatList.length} items`);
+              const chatListSig = JSON.stringify(chatList.map(c => c.title + ':' + c.active));
+              if (chatListSig !== session._lastChatListSig) {
+                session._lastChatListSig = chatListSig;
+                this._sendToRelay(proto.chatList(sessionId, chatList));
+                this._log('info', `[${sessionId}] Sent chat_list with ${chatList.length} conversations`);
+              }
+            } catch (e) {
+              this._log('warn', `[${sessionId}] readAntigravityPanelChatList error: ${e.message}`);
+            }
           } catch {}
         }
       }
+
+      // Skip stale message processing when the Antigravity panel is in empty/list-view mode
+      if (session._panelEmpty) return;
 
       const messages = JSON.parse(raw);
       const transcriptSig = this._transcriptSignature(messages);
@@ -2473,10 +2685,8 @@ class ProxyEngine extends EventEmitter {
 
         const hasContent = await selectors.detectAntigravityPanelHasContent(client.Runtime);
         this._log('info', `[discover] Side-panel ${target.id.substring(0,8)} "${target.title.substring(0,40)}" hasContent=${hasContent}`);
-        if (!hasContent) {
-          await client.close();
-          continue;
-        }
+        // Register the panel even when empty so it shows in the web UI immediately.
+        // The user can start typing and the session will persist.
 
         const workspaceName = (target.title || '').replace(/ - Antigravity.*/, '').trim() || target.title;
         const panelTitle    = await selectors.readAntigravityPanelTitle(client.Runtime);
@@ -2485,12 +2695,16 @@ class ProxyEngine extends EventEmitter {
         this._log('info', `[discover] Probing Antigravity side-panel in "${workspaceName}" (${target.id.substring(0, 8)})`);
 
         const sigSource  = `${target.url}::panel::${workspaceName}`;
+        // Resolve workspace path from open workspaces list
+        const panelWsMatch = this.openWorkspaces.find(w =>
+          w.path && w.title && w.title.toLowerCase() === workspaceName.toLowerCase()
+        );
         const sessionMeta = sessionStore.resolveSession({
           target: { ...target, id: target.id },
           windowTitle: displayName,
           agentType: 'antigravity_panel',
           workspaceName: displayName,
-          workspacePath: null,
+          workspacePath: panelWsMatch?.path || null,
           sigOverride: sigSource,
         });
         const sessionId = sessionMeta.session_id;
