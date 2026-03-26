@@ -2826,9 +2826,70 @@ async function setGeminiModel(Runtime, modelId, sessionId) {
   }
 }
 
+// Set model for Antigravity Chat side panel using JS clicks (no CDP mouse events needed).
+// The panel's model selector is a [role="button"] div inside .antigravity-agent-side-panel.
+// Clicking it opens a dropdown of div options with cursor-pointer class.
+async function setAntigravityPanelModel(Runtime, modelId, sessionId) {
+  try {
+    const raw = await evalInPage(Runtime, `
+      var panel = d.querySelector('.antigravity-agent-side-panel');
+      if (!panel) return JSON.stringify({ error: 'no-panel' });
+
+      // Find and click the model selector button
+      var modelEl = Array.from(panel.querySelectorAll('[role="button"]')).find(function(el) {
+        return /gemini|claude|gpt/i.test(el.innerText) && el.innerText.trim().length < 40;
+      });
+      if (!modelEl) return JSON.stringify({ error: 'no-model-button' });
+      modelEl.click();
+      return JSON.stringify({ ok: true, current: modelEl.innerText.trim() });
+    `);
+    if (!raw) return { ok: false, code: 'eval_null', detail: 'No result' };
+    const step1 = JSON.parse(raw);
+    if (step1.error) return { ok: false, code: step1.error, detail: 'Model button not found' };
+
+    // Wait for dropdown to appear
+    await new Promise(r => setTimeout(r, 500));
+
+    // Find and click the desired model option
+    const selectRaw = await evalInPage(Runtime, `
+      var wanted = ${JSON.stringify(modelId)}.toLowerCase();
+      // Look for dropdown options (cursor-pointer divs with model names)
+      var opts = Array.from(d.querySelectorAll('div')).filter(function(el) {
+        var cls = el.className || '';
+        if (!cls.includes('cursor-pointer') || !cls.includes('px-2') || !cls.includes('py-1')) return false;
+        var t = (el.innerText || '').trim();
+        return /gemini|claude|gpt/i.test(t) && t.length < 50;
+      });
+      if (opts.length === 0) return JSON.stringify({ error: 'no-options', detail: 'Dropdown not found' });
+
+      var match = opts.find(function(o) {
+        var t = o.innerText.trim().split('\\n')[0].trim().toLowerCase();
+        return t === wanted || t.includes(wanted) || wanted.includes(t);
+      });
+      if (!match) {
+        var avail = opts.map(function(o) { return o.innerText.trim().split('\\n')[0].trim(); });
+        return JSON.stringify({ error: 'option_not_found', available: avail });
+      }
+      match.click();
+      return JSON.stringify({ ok: true, selected: match.innerText.trim().split('\\n')[0].trim() });
+    `);
+    if (!selectRaw) return { ok: false, code: 'select_eval_null', detail: 'No result selecting option' };
+    const step2 = JSON.parse(selectRaw);
+    if (step2.error) return { ok: false, code: step2.error, detail: step2.detail || `No option matching "${modelId}"`, available: step2.available };
+
+    console.log(`[${sessionId}] [model] Panel model selected: ${step2.selected}`);
+    return { ok: true, selected: step2.selected };
+  } catch (e) {
+    return { ok: false, code: 'exception', detail: e.message };
+  }
+}
+
 // Returns { ok: true, selected: label } or { ok: false, code, detail }.
 // InputDomain (optional) is client.Input — required for antigravity (CDP mouse events).
 async function setAgentModel(Runtime, agentType, modelId, sessionId, InputDomain) {
+  if (agentType === 'antigravity_panel') {
+    return setAntigravityPanelModel(Runtime, modelId, sessionId);
+  }
   if (agentType === 'antigravity') {
     if (!InputDomain) return { ok: false, code: 'no_input_domain', detail: 'InputDomain required for antigravity model selection' };
     return setAntigravityModel(Runtime, InputDomain, modelId, sessionId);
@@ -4061,13 +4122,27 @@ async function switchAntigravityPanelChat(Runtime, chatId) {
 
   try {
     const result = await evalInPage(Runtime, `
-      (function() {
         var panel = d.querySelector('.antigravity-agent-side-panel');
         if (!panel) return 'no-panel';
 
         var targetIndex = ${index};
 
-        // Strategy 1: Click list items
+        // Strategy 1: Click chat history buttons (full-width grow cursor-pointer)
+        var chatBtns = Array.from(panel.querySelectorAll('button')).filter(function(b) {
+          var cls = b.className || '';
+          if (cls.includes('grow') && cls.includes('cursor-pointer') && cls.includes('w-full')) {
+            var t = (b.textContent || '').trim();
+            return t.length >= 2 && t.length <= 200;
+          }
+          return false;
+        });
+
+        if (chatBtns[targetIndex]) {
+          chatBtns[targetIndex].click();
+          return 'clicked-chat-btn';
+        }
+
+        // Strategy 2: Click list items (fallback for different DOM structures)
         var listItems = Array.from(panel.querySelectorAll(
           '[role="listitem"], [role="option"], [role="treeitem"], ' +
           'li, [class*="conversation"], [class*="chat-item"], [class*="history-item"]'
@@ -4081,22 +4156,7 @@ async function switchAntigravityPanelChat(Runtime, chatId) {
           return 'clicked-list-item';
         }
 
-        // Strategy 2: Click button/link items
-        var btns = Array.from(panel.querySelectorAll('button, a, [role="button"]'));
-        var chatBtns = btns.filter(function(b) {
-          var t = (b.textContent || '').trim();
-          if (/^(New|Send|Stop|Cancel|Copy|\\+|×|✕)$/i.test(t)) return false;
-          if (t.length < 2 || t.length > 100) return false;
-          return t.split('\\n')[0].trim().length > 1;
-        });
-
-        if (chatBtns[targetIndex]) {
-          chatBtns[targetIndex].click();
-          return 'clicked-chat-btn';
-        }
-
         return 'chat-not-found';
-      })()
     `);
     if (result && result !== 'no-panel' && result !== 'chat-not-found') {
       return { ok: true, detail: result };
@@ -4114,7 +4174,6 @@ async function switchAntigravityPanelChat(Runtime, chatId) {
 async function newAntigravityPanelChat(Runtime) {
   try {
     const result = await evalInPage(Runtime, `
-      (function() {
         var panel = d.querySelector('.antigravity-agent-side-panel');
         if (!panel) return 'no-panel';
 
@@ -4169,7 +4228,6 @@ async function newAntigravityPanelChat(Runtime) {
         }
 
         return 'no-new-button';
-      })()
     `);
     if (result && result !== 'no-panel' && result !== 'no-new-button') {
       return { ok: true, detail: result };

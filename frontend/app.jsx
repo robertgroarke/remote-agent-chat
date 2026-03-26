@@ -2084,10 +2084,6 @@ function App() {
                   </button>
                 ))}
               </div>
-              <button
-                className="thread-picker-new"
-                onClick={() => newChat(activeSession)}
-              >+ New Chat</button>
             </div>
           ) : currentMessages.length === 0 ? (
             <div className="empty-state"><div className="icon">💬</div><div>No messages yet</div></div>

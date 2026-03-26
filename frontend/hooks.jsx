@@ -95,9 +95,19 @@ export function useRelay() {
       send({ type: 'agent_config_request', session_id: sessionId, request_id: requestId });
     }
 
+    // Track sessions with in-flight model changes to suppress stale config updates
+    const modelChangeGrace = {};
+
     function setAgentModel(sessionId, modelId) {
       const requestId = `model-${Date.now()}-${Math.random().toString(36).slice(2, 7)}`;
       send({ type: 'agent_set_model', session_id: sessionId, model_id: modelId, request_id: requestId });
+      // Suppress config overwrites for 10s while the model change propagates
+      modelChangeGrace[sessionId] = Date.now() + 10000;
+      // Optimistically update the config
+      setAgentConfigs(prev => {
+        const existing = prev[sessionId] || {};
+        return { ...prev, [sessionId]: { ...existing, model_id: modelId } };
+      });
       return requestId;
     }
 
@@ -447,7 +457,18 @@ export function useRelay() {
       // ── Agent config ─────────────────────────────────────────────────────────
       if (t === 'agent_config') {
         const sid = msg.session_id || msg.session;
-        if (sid) setAgentConfigs(prev => ({ ...prev, [sid]: msg }));
+        if (!sid) return;
+        // Don't overwrite optimistic model change during grace period
+        if (modelChangeGrace[sid] && Date.now() < modelChangeGrace[sid]) {
+          // Merge but keep the optimistic model_id
+          setAgentConfigs(prev => {
+            const existing = prev[sid] || {};
+            return { ...prev, [sid]: { ...msg, model_id: existing.model_id || msg.model_id } };
+          });
+          return;
+        }
+        delete modelChangeGrace[sid];
+        setAgentConfigs(prev => ({ ...prev, [sid]: msg }));
         return;
       }
 

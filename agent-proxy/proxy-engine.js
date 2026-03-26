@@ -256,7 +256,7 @@ class ProxyEngine extends EventEmitter {
     const isDesktop = agentType === 'codex-desktop' || agentType === 'claude-desktop';
     return {
       interrupt:              ['claude', 'codex', 'gemini', 'antigravity', 'antigravity_panel', 'claude-desktop', 'codex-desktop'].includes(agentType),
-      set_model:              agentType === 'claude' || agentType === 'antigravity' || agentType === 'gemini',
+      set_model:              agentType === 'claude' || agentType === 'antigravity' || agentType === 'antigravity_panel' || agentType === 'gemini',
       set_mode:               agentType === 'antigravity',
       permission_mode_change: agentType === 'claude',
       permission_dialogs:     isClaude || isCodex || agentType === 'antigravity' || agentType === 'antigravity_panel',
@@ -265,7 +265,7 @@ class ProxyEngine extends EventEmitter {
       thread_list:            isDesktop,
       switch_thread:          isDesktop,
       switch_workspace:       isDesktop,
-      open_panel:             agentType === 'codex' || agentType === 'antigravity_panel',
+      open_panel:             agentType === 'codex',
       chat_list:              agentType === 'codex' || agentType === 'antigravity_panel' || agentType === 'claude-desktop',
       switch_chat:            agentType === 'codex' || agentType === 'antigravity_panel' || agentType === 'claude-desktop',
       new_chat:               agentType === 'codex' || agentType === 'antigravity_panel' || agentType === 'claude-desktop' || agentType === 'claude',
@@ -1532,6 +1532,23 @@ class ProxyEngine extends EventEmitter {
         this._log('info', `[launch] Opening Antigravity side-panel`);
         (async () => {
           try {
+            // Check if a panel session already exists for the target workspace
+            const normalise = p => (p || '').replace(/\\/g, '/').toLowerCase().replace(/\/+$/, '');
+            const wantedBase = workspacePath ? normalise(workspacePath).split('/').filter(Boolean).pop() : '';
+            const existingPanel = Array.from(this.sessions.values()).find(s =>
+              s.agentType === 'antigravity_panel' && wantedBase &&
+              (normalise(s.workspace_path) === normalise(workspacePath) ||
+               (s.windowTitle || '').toLowerCase().includes(wantedBase))
+            );
+            if (existingPanel) {
+              this._log('info', `[launch] Panel already exists for workspace: ${existingPanel.session_id}`);
+              this._sendToRelay({
+                type: 'session_launch_ack', protocol_version: proto.PROTOCOL_VERSION,
+                request_id: requestId, session_id: existingPanel.session_id,
+              });
+              return;
+            }
+
             const targets = await CDP.List({ port: this.CDP_PORTS[0] });
             const workbenchPages = targets.filter(t =>
               t.type === 'page' && t.url && t.url.includes('workbench.html') && !t.url.includes('jetski')
@@ -1895,6 +1912,22 @@ class ProxyEngine extends EventEmitter {
         this._sendToRelay(proto.proxyStatus(sessionId, 'healthy', session.activity));
       }
       session.nullPollCount = 0;
+
+      // Periodic agent config refresh (branch, model changes) — every 15s
+      const configNow = Date.now();
+      if (!session._lastConfigPollAt || configNow - session._lastConfigPollAt > 15000) {
+        session._lastConfigPollAt = configNow;
+        try {
+          const cfg = await selectors.readAgentConfig(session.client.Runtime, session.agentType, session.workspace_path);
+          const merged = this._mergeAgentConfig(session.agentType, cfg, session.workspace_path);
+          const cfgSig = `${merged.branch}|${merged.model_id}|${merged.permission_mode}`;
+          if (cfgSig !== session._lastConfigSig) {
+            session._lastConfigSig = cfgSig;
+            const capabilities = this._buildCapabilities(session.agentType);
+            this._sendToRelay(proto.agentConfig(sessionId, { ...merged, capabilities }));
+          }
+        } catch {}
+      }
 
       // Antigravity Manager title polling
       if (session.agentType === 'antigravity') {
