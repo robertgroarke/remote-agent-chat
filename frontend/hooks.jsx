@@ -13,6 +13,7 @@ export function useRelay() {
     const [connected,       setConnected]       = useState(false);
     const [unread,          setUnread]          = useState({});   // sessionId -> count
     const [thinking,        setThinking]        = useState({});   // sessionId -> label string | false
+    const [thinkingContent, setThinkingContent] = useState({});   // sessionId -> string (Claude Code thinking text) | ''
     const [activities,      setActivities]      = useState({});   // sessionId -> { kind, label, updatedAt } | false
     const [health,          setHealth]          = useState({});   // sessionId -> 'healthy'|'degraded'|'disconnected'
     const [deliveryStates,  setDeliveryStates]  = useState({});   // clientMsgId -> 'queued'|'accepted'|'failed'
@@ -389,11 +390,16 @@ export function useRelay() {
           clearTimeout(thinkingTimers.current[id]);
           setThinking(prev => ({ ...prev, [id]: label }));
           setActivities(prev => ({ ...prev, [id]: activity }));
+          // Store Claude Code thinking content text
+          if (msg.thinking_content != null) {
+            setThinkingContent(prev => ({ ...prev, [id]: msg.thinking_content }));
+          }
         } else {
           clearTimeout(thinkingTimers.current[id]);
           thinkingTimers.current[id] = setTimeout(() => {
             setThinking(prev => ({ ...prev, [id]: false }));
             setActivities(prev => ({ ...prev, [id]: false }));
+            setThinkingContent(prev => ({ ...prev, [id]: '' }));
           }, 4000);
         }
         return;
@@ -571,7 +577,7 @@ export function useRelay() {
       }
     }
 
-    return { sessions, messages, connected, unread, setUnread, thinking, activities, health, deliveryStates, launchStates, justLaunched, setJustLaunched, permissionPrompts, respondToPrompt, interruptSession, agentConfigs, requestAgentConfig, setAgentModel, setAgentPermissionMode, setAntigravityMode, setCodexConfig, newThread, openPanel, requestChatList, switchChat, newChat, chatLists, requestThreadList, switchThread, threadLists, switchWorkspace, requestTerminalOutput, terminalOutputs, requestFileChanges, fileChanges, sendAttachment, send, sendToSession, launchSession, resumeSession, closeSession, activeSessionRef, workspaces, branchLists, requestBranchList, switchBranch, createBranch, skillLists, requestSkillList };
+    return { sessions, messages, connected, unread, setUnread, thinking, thinkingContent, activities, health, deliveryStates, launchStates, justLaunched, setJustLaunched, permissionPrompts, respondToPrompt, interruptSession, agentConfigs, requestAgentConfig, setAgentModel, setAgentPermissionMode, setAntigravityMode, setCodexConfig, newThread, openPanel, requestChatList, switchChat, newChat, chatLists, requestThreadList, switchThread, threadLists, switchWorkspace, requestTerminalOutput, terminalOutputs, requestFileChanges, fileChanges, sendAttachment, send, sendToSession, launchSession, resumeSession, closeSession, activeSessionRef, workspaces, branchLists, requestBranchList, switchBranch, createBranch, skillLists, requestSkillList };
   }
 
 // (removed window.useRelay — now an ES module export)

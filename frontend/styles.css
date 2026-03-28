@@ -860,9 +860,10 @@ body {
   box-shadow: none;
 }
 
-/* A5-13: Code blocks and tool sections flush against the left gutter border */
+/* A5-13: Code blocks flush against the left gutter border */
 .message-body .code-block  { margin-left: -12px; }
-.message-body .tool-section { margin-left: -12px; }
+/* Tool sections need padding for the timeline dot, keep small negative margin */
+.message-body .tool-section { margin-left: -4px; }
 
 .message.assistant.monospace .message-body,
 .message-body.monospace-body {
@@ -1120,6 +1121,7 @@ body {
   align-items: center;
   gap: 10px;
   padding: 6px 0 6px 44px;  /* indent to align with message content (32px gutter + 12px gap) */
+  min-height: 28px;
   background: none;
   border: none;
   box-shadow: none;
@@ -1187,6 +1189,60 @@ body {
 
 @keyframes spin {
   to { transform: rotate(360deg); }
+}
+
+/* ── Claude Code thinking spinner ─────────────────────────── */
+.claude-spinner-icon {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 16px;
+  height: 16px;
+  font-family: monospace;
+  font-size: 14px;
+  line-height: 1;
+  color: var(--red);
+  flex-shrink: 0;
+  overflow: hidden;
+}
+
+.activity-row.claude-thinking {
+  border-left-color: var(--accent);
+  background: rgba(104,179,255,0.04);
+}
+
+.thinking-content {
+  max-height: 2.8em;
+  overflow: hidden;
+  cursor: pointer;
+  transition: max-height 0.3s ease;
+  margin-top: 4px;
+  position: relative;
+}
+
+.thinking-content.expanded {
+  max-height: 400px;
+  overflow-y: auto;
+}
+
+.thinking-content:not(.expanded)::after {
+  content: '';
+  position: absolute;
+  bottom: 0;
+  left: 0;
+  right: 0;
+  height: 1.2em;
+  background: linear-gradient(transparent, var(--bg));
+  pointer-events: none;
+}
+
+.thinking-content-text {
+  font-size: 11px;
+  line-height: 1.4;
+  color: var(--text3);
+  font-family: 'Cascadia Code', 'SF Mono', Consolas, monospace;
+  white-space: pre-wrap;
+  word-break: break-word;
 }
 
 /* ── Code blocks ───────────────────────────────────────────── */
@@ -1461,8 +1517,13 @@ mark.code-search-mark.current {
 /* When there is no filepath, stats should still push copy to the right */
 .code-header:not(:has(.diff-filepath)) .diff-stats { margin-right: auto; }
 
-.diff-code { display: block; }
-.diff-code span { display: block; min-width: 100%; white-space: pre; }
+.diff-code, .code-block pre code.diff-code { display: block; white-space: normal; line-height: 0; font-size: 0; }
+.diff-code > .diff-add,
+.diff-code > .diff-del,
+.diff-code > .diff-ctx,
+.diff-code > .diff-hunk,
+.diff-code > .diff-meta { display: block; white-space: pre; line-height: 1.4; margin: 0; padding: 0; font-size: 13px; }
+.diff-block pre { padding: 4px 12px; }
 
 /* Gutter column: fixed 1-char wide, non-selectable, rendered in monospace */
 /* Two-column line-number gutter (A11-01) */
@@ -1491,8 +1552,8 @@ mark.code-search-mark.current {
 .diff-add .diff-gutter-num.diff-gutter-new { color: rgba(63, 185, 80, 0.65); }
 .diff-del .diff-gutter-num.diff-gutter-old { color: rgba(248, 81, 73, 0.65); }
 
-.diff-add  { background: rgba(63, 185, 80, 0.12); color: #aff5b4; }
-.diff-del  { background: rgba(248, 81, 73, 0.12);  color: #ffc1bb; }
+.diff-add  { background: rgba(35, 134, 54, 0.25); color: #e6edf3; }
+.diff-del  { background: rgba(218, 54, 51, 0.25);  color: #e6edf3; }
 .diff-hunk { background: rgba(88, 166, 255, 0.08); color: #79c0ff; font-weight: 600; }
 .diff-hunk-btn { cursor: pointer; user-select: none; }
 .diff-hunk-btn:hover { background: rgba(88, 166, 255, 0.16); }
@@ -1594,10 +1655,16 @@ mark.code-search-mark.current {
 
 /* Split view layout */
 .diff-split {
-  display: grid;
+  display: none;
   grid-template-columns: 1fr 1fr;
   border-top: 1px solid #30363d;
   overflow: hidden;
+}
+.diff-block[data-diff-mode="split"] .diff-split {
+  display: grid;
+}
+.diff-block[data-diff-mode="split"] > pre {
+  display: none;
 }
 .diff-split-col {
   overflow-x: auto;
@@ -1618,25 +1685,30 @@ mark.code-search-mark.current {
 }
 
 .diff-add mark.diff-word-add {
-  background: rgba(63, 185, 80, 0.35);
+  background: rgba(35, 134, 54, 0.55);
   color: inherit;
   border-radius: 2px;
 }
 .diff-del mark.diff-word-del {
-  background: rgba(248, 81, 73, 0.35);
+  background: rgba(218, 54, 51, 0.55);
   color: inherit;
   border-radius: 2px;
 }
 
 .tool-section {
-  margin: 4px 0 0;
-  border-left: 2px solid transparent;
-  transition: border-color 0.15s;
+  margin: 0;
+  border-left: 2px solid var(--border);
+  padding-left: 8px;
+  position: relative;
 }
 
+.tool-section:last-child {
+  border-left-color: transparent;
+}
+
+/* Consecutive tool sections form a timeline; non-collapsed keep the line */
 .tool-section:not(.collapsed) {
-  border-left-color: var(--border);
-  padding-left: 2px;
+  padding-left: 8px;
 }
 
 .tool-toggle {
@@ -1657,16 +1729,13 @@ mark.code-search-mark.current {
   border-radius: 4px;
 }
 
-/* Collapsed sections look like a bordered chip so users know they're clickable */
+/* Collapsed sections — clean inline look, no bordered chip */
 .tool-section.collapsed .tool-toggle {
-  background: var(--bg3);
-  border: 1px solid var(--border);
-  border-radius: 6px;
-  padding: 4px 8px;
+  padding: 2px 4px;
 }
 .tool-section.collapsed .tool-toggle:hover {
-  background: var(--bg4);
-  border-color: var(--border2);
+  background: rgba(255, 255, 255, 0.04);
+  border-radius: 4px;
 }
 
 .tool-toggle-main {
@@ -1687,12 +1756,15 @@ mark.code-search-mark.current {
 .tool-icon { display: none; }
 .tool-icon-svg { display: none; }
 
-/* Coloured ● dot — replaces SVG icon */
+/* Coloured ● dot — positioned on the timeline border */
 .tool-dot {
   font-size: 9px;
   line-height: 1;
   flex-shrink: 0;
   user-select: none;
+  position: relative;
+  left: -16px;
+  margin-right: -10px;
 }
 .dot-bash    { color: #e8c56d; }
 .dot-read    { color: #79c0ff; }
@@ -1703,7 +1775,7 @@ mark.code-search-mark.current {
 
 .tool-name {
   font-size: 12px;
-  font-weight: 500;
+  font-weight: 700;
   color: var(--text);
 }
 
@@ -1713,8 +1785,9 @@ mark.code-search-mark.current {
   text-overflow: ellipsis;
   white-space: nowrap;
   color: var(--text3);
-  font-size: 11px;
+  font-size: 10.5px;
   font-family: 'Cascadia Code', 'SF Mono', Consolas, monospace;
+  font-weight: 400;
 }
 
 .tool-preview {
@@ -1738,11 +1811,7 @@ mark.code-search-mark.current {
 .tool-stat-del { color: #f85149; }
 
 .tool-chevron {
-  font-size: 9px;
-  color: var(--text3);
-  flex-shrink: 0;
-  width: 10px;
-  text-align: center;
+  display: none;
 }
 
 /* ── Compact IN/OUT block (Bash tool call results) ─────────────────────────── */
@@ -1948,6 +2017,13 @@ mark.code-search-mark.current {
 }
 .input-col textarea:focus { border-color: var(--accent); }
 .input-col textarea::placeholder { color: var(--text2); }
+
+.file-chips {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px;
+  max-width: 100%;
+}
 
 .file-chip {
   display: flex;
@@ -2542,8 +2618,8 @@ select.new-session-workspace option { background: var(--bg2); color: var(--text)
   .message-body { padding-left: 10px; }
   .user-text    { padding-left: 10px; }
   .message-body .code-block,
-  .message-body .tool-section,
   .message-body .tool-io-block { margin-left: -10px; }
+  .message-body .tool-section { margin-left: -2px; }
   .input-area { padding: 10px 12px; padding-bottom: max(10px, env(safe-area-inset-bottom)); }
 
   /* Touch targets ≥ 44px (A10-02) */

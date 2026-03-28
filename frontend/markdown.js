@@ -404,9 +404,9 @@ function renderSplitHtml(rows) {
       right.push(`<span class="diff-add${row.hlCls}">${splitGutter(row.newLine)}${row.content}</span>`);
     }
   }
-  return `<div class="diff-split" hidden>` +
-    `<div class="diff-split-col diff-split-old"><code class="hljs diff-code">${left.join('\n')}</code></div>` +
-    `<div class="diff-split-col diff-split-new"><code class="hljs diff-code">${right.join('\n')}</code></div>` +
+  return `<div class="diff-split">` +
+    `<div class="diff-split-col diff-split-old"><code class="hljs diff-code">${left.join('')}</code></div>` +
+    `<div class="diff-split-col diff-split-new"><code class="hljs diff-code">${right.join('')}</code></div>` +
     `</div>`;
 }
 
@@ -566,7 +566,7 @@ function renderDiff(text, lang) {
     : '';
   const splitRows = buildSplitRows(entries, hlLines, wordDiffContent);
   const splitHtml = renderSplitHtml(splitRows);
-  return { body: outputLines.join('\n'), stats, splitHtml, hasHunks };
+  return { body: outputLines.join(''), stats, splitHtml, hasHunks };
 }
 
 const SPLIT_SVG  = `<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M8 3H5a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h3"/><path d="M16 3h3a2 2 0 0 1 2 2v14a2 2 0 0 1-2 2h-3"/><line x1="12" y1="3" x2="12" y2="21"/></svg>`;
@@ -685,8 +685,9 @@ function renderToolSection(name, text, index) {
   const isOutputBlock = /^\d+\s+lines?(?:\s+of\s+output)?$/i.test(name.trim());
   // If the output block has no content (proxy failed to capture the lazy DOM body),
   // we still show it collapsed so the user can see something happened, but add a note.
-  const isEmpty = isOutputBlock && lineCount === 0;
-  const collapsed = lineCount > 50 || isOutputBlock;
+  const hasContent = lines.some(l => l.trim());
+  const isEmpty = (isOutputBlock && lineCount === 0) || !hasContent;
+  const collapsed = lineCount > 50 || isOutputBlock || !hasContent;
   // Output blocks show everything when expanded; other long sections still get the
   // "Show all N lines" affordance so they don't blow out the viewport.
   const showAll = !isOutputBlock && lineCount > 60;
@@ -696,18 +697,53 @@ function renderToolSection(name, text, index) {
   const renderAsDiff = isDiffContent(text) || (hasEditLikeToolName(name) && (stats.adds || stats.dels));
   const filepath = renderAsDiff ? (extractDiffFilename(text) || path) : path;
   const diffLang = renderAsDiff && filepath ? (_getLang(filepath)) : null;
-  const diff = renderAsDiff ? renderDiff(visibleText, diffLang) : null;
+  // Strip fenced code block wrappers and summary text (e.g. "Modified\n\n```diff\n...\n```")
+  // so renderDiff only sees the actual diff lines
+  const diffText = (() => {
+    if (!renderAsDiff) return visibleText;
+    let t = visibleText;
+    // Strip leading summary lines before the first +/- or @@
+    const fenceMatch = t.match(/```(?:diff|patch)?\s*\n([\s\S]*?)```\s*$/m);
+    if (fenceMatch) t = fenceMatch[1];
+    // Strip any remaining leading non-diff lines (e.g. "Modified", "Added 3 lines")
+    const dlines = t.split('\n');
+    let start = 0;
+    while (start < dlines.length) {
+      const l = dlines[start];
+      if (l.startsWith('+') || l.startsWith('-') || l.startsWith('@@') || l.startsWith(' ')) break;
+      start++;
+    }
+    return dlines.slice(start).join('\n');
+  })();
+  const diff = renderAsDiff ? renderDiff(diffText, diffLang) : null;
   const statHtml = (stats.adds || stats.dels)
     ? `<span class="tool-stat-add">+${stats.adds}</span><span class="tool-stat-del">-${stats.dels}</span>`
     : '';
+  // Extract edit summary (e.g. "Modified", "Added 8 lines") from lines before the diff
+  const editSummary = renderAsDiff ? (() => {
+    for (const l of lines) {
+      const t = l.trim();
+      if (t && !t.startsWith('```') && !t.startsWith('+') && !t.startsWith('-') && !t.startsWith('@@') && !t.startsWith(' ')) return t;
+    }
+    return '';
+  })() : '';
   // Preview: shown only when collapsed and no filepath already displayed
-  const preview = collapsed && !filepath ? extractToolPreview(name, lines) : '';
+  const preview = collapsed && !filepath ? (editSummary || extractToolPreview(name, lines)) : (editSummary || '');
   return `<section class="tool-section${collapsed ? ' collapsed' : ''}" data-tool-index="${index}">
     <button class="tool-toggle" type="button" aria-expanded="${collapsed ? 'false' : 'true'}">
       <span class="tool-chevron">${isEmpty ? '' : collapsed ? '▸' : '▾'}</span>
       <span class="tool-dot ${toolDotClass(name)}">●</span>
       <span class="tool-toggle-main">
-        <span class="tool-name">${escapeHtml(name)}</span>
+        ${(() => {
+          // Split tool name into verb (bold) and description (smaller)
+          const spaceIdx = name.indexOf(' ');
+          if (spaceIdx > 0) {
+            const verb = name.substring(0, spaceIdx);
+            const desc = name.substring(spaceIdx + 1).trim();
+            return `<span class="tool-name">${escapeHtml(verb)}</span><span class="tool-path">${escapeHtml(desc)}</span>`;
+          }
+          return `<span class="tool-name">${escapeHtml(name)}</span>`;
+        })()}
         ${filepath ? `<span class="tool-path">${escapeHtml(filepath)}</span>` : ''}
         ${preview ? `<span class="tool-preview">${escapeHtml(preview)}</span>` : ''}
       </span>
@@ -716,7 +752,7 @@ function renderToolSection(name, text, index) {
         ${isOutputBlock && lineCount > 0 ? `<span class="tool-line-count">${lineCount} lines</span>` : ''}
       </span>
     </button>
-    <div class="tool-body"${collapsed ? ' hidden' : ''}>
+    ${isEmpty ? '' : `<div class="tool-body"${collapsed ? ' hidden' : ''}>
       ${renderAsDiff
         ? `<div class="code-block diff-block tool-diff-block" data-diff-mode="unified">
             <div class="code-header">
@@ -729,9 +765,7 @@ function renderToolSection(name, text, index) {
             <pre><code class="hljs diff-code">${diff?.body || ''}</code></pre>
             ${diff?.splitHtml || ''}
           </div>`
-        : isEmpty
-          ? `<p class="tool-empty-note">Output not captured — content was not rendered in the agent's DOM at read time.</p>`
-          : (() => {
+        : (() => {
               const _io = parseIOBlock(visibleText);
               if (_io) return renderIOBlock(_io, index + '_b');
               const trimmed = visibleText.trim();
@@ -739,7 +773,7 @@ function renderToolSection(name, text, index) {
               return `<pre class="tool-body-pre"><code>${escapeHtml(visibleText)}</code></pre>`;
             })()}
       ${showAll && collapsed ? `<button class="tool-show-all" type="button" data-lines="${lineCount}">Show all ${lineCount} lines</button>` : ''}
-    </div>
+    </div>`}
   </section>`;
 }
 
@@ -798,7 +832,8 @@ function renderIOBlock(io, index) {
     </div>`;
   };
 
-  return `<div class="tool-io-block" data-tool-index="${index}">${renderRow('IN', inLines)}${renderRow('OUT', outLines)}</div>`;
+  const outEmpty = outLines.length === 0 || (outLines.length === 1 && !outLines[0].trim());
+  return `<div class="tool-io-block" data-tool-index="${index}">${renderRow('IN', inLines)}${outEmpty ? '' : renderRow('OUT', outLines)}</div>`;
 }
 
 function renderStructuredContent(content) {
@@ -808,6 +843,8 @@ function renderStructuredContent(content) {
       // Detect compact IN/OUT block before falling through to full markdown rendering
       const io = parseIOBlock(chunk.content);
       if (io) return renderIOBlock(io, index);
+      // Skip empty/whitespace-only markdown chunks
+      if (!(chunk.content || '').trim()) return '';
       return marked.parse(chunk.content || '');
     } catch (e) {
       return '<pre style="color:var(--red,#f26d78);font-size:11px">[render error: ' + escapeHtml(String(e)) + ']</pre>' +
@@ -1197,20 +1234,7 @@ function MarkdownContent({ content, monospace = false }) {
       };
     });
 
-    // Apply persisted diff view preference to all blocks on render (A11-08)
-    const savedDiffPref = (() => { try { return localStorage.getItem('diff_view_pref'); } catch { return null; } })();
-    if (savedDiffPref === 'split') {
-      ref.current.querySelectorAll('.diff-block').forEach(block => {
-        const pre = block.querySelector(':scope > pre');
-        const split = block.querySelector('.diff-split');
-        const toggleBtn = block.querySelector('.diff-split-toggle');
-        if (!split) return;
-        block.dataset.diffMode = 'split';
-        if (pre) pre.hidden = true;
-        split.hidden = false;
-        if (toggleBtn) { toggleBtn.classList.add('active'); toggleBtn.title = 'Toggle unified view'; }
-      });
-    }
+    // Always default to unified diff view — split is available via toggle button
 
     ref.current.querySelectorAll('.diff-split-toggle').forEach(btn => {
       btn.onclick = () => {
@@ -1221,12 +1245,9 @@ function MarkdownContent({ content, monospace = false }) {
         const isSplit = block.dataset.diffMode === 'split';
         const nowSplit = !isSplit;
         block.dataset.diffMode = nowSplit ? 'split' : 'unified';
-        if (pre) pre.hidden = nowSplit;
-        if (split) split.hidden = !nowSplit;
         btn.classList.toggle('active', nowSplit);
         btn.title = nowSplit ? 'Toggle unified view' : 'Toggle side-by-side view';
-        // Persist the chosen view mode (A11-08)
-        try { localStorage.setItem('diff_view_pref', nowSplit ? 'split' : 'unified'); } catch {}
+        // Toggle is per-block only, no persistence
       };
     });
     ref.current.querySelectorAll('.diff-filepath[data-copy-path]').forEach(btn => {

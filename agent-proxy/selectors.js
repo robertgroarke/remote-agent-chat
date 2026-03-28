@@ -19,6 +19,8 @@ const CLAUDE_PRIMARY = {
   assistantTestId: 'assistant-message',
   thinkingDetails: 'details.thinking_aHyQPQ[open]',
   thinkingSummary: '.thinkingSummary_aHyQPQ',
+  spinnerRow:  '.spinnerRow_07S1Yg',
+  spinnerVerb: '.text_hc5dvw',
   input:     '.messageInput_cKsPxg',
   sendBtn:   'button.sendButton_gGYT1w[type="submit"]',
 };
@@ -337,19 +339,69 @@ async function detectThinking(Runtime, agentType) {
   if (agentType !== 'claude' && agentType !== 'claude-desktop') return { thinking: false, label: '' };
   try {
     const raw = await evalInFrame(Runtime, `
-      const msgs = d.querySelectorAll('[data-testid="${CLAUDE_PRIMARY.assistantTestId}"]');
-      if (msgs.length > 0) {
-        const last = msgs[msgs.length - 1];
-        const openDetails = last.querySelector('${CLAUDE_PRIMARY.thinkingDetails}') ||
-                            last.querySelector('details[open]');
-        if (openDetails) {
-          const summary = openDetails.querySelector('${CLAUDE_PRIMARY.thinkingSummary}') ||
-                          openDetails.querySelector('summary');
-          const label = summary ? summary.textContent.trim() : 'Thinking';
-          return JSON.stringify({ thinking: true, label: label });
+      var result = { thinking: false, label: '', thinkingContent: '', spinnerVerb: '' };
+
+      // Check for the spinner verb text (e.g. "Cerebrating...", "Spelunking...")
+      var spinnerRow = d.querySelector('${CLAUDE_PRIMARY.spinnerRow}');
+      if (spinnerRow) {
+        var verbEl = spinnerRow.querySelector('${CLAUDE_PRIMARY.spinnerVerb}') ||
+                     spinnerRow.querySelector('[class*="text_"]');
+        if (verbEl) {
+          result.spinnerVerb = (verbEl.textContent || '').trim();
         }
       }
-      return JSON.stringify({ thinking: false, label: '' });
+
+      var msgs = d.querySelectorAll('[data-testid="${CLAUDE_PRIMARY.assistantTestId}"]');
+      if (msgs.length > 0) {
+        var last = msgs[msgs.length - 1];
+        // Check for OPEN thinking details (actively thinking)
+        var openDetails = last.querySelector('${CLAUDE_PRIMARY.thinkingDetails}') ||
+                          last.querySelector('details[open]');
+        if (openDetails) {
+          var summary = openDetails.querySelector('${CLAUDE_PRIMARY.thinkingSummary}') ||
+                        openDetails.querySelector('summary');
+          // Use spinner verb if available, otherwise summary text
+          result.thinking = true;
+          result.label = result.spinnerVerb || (summary ? summary.textContent.trim() : 'Thinking');
+          // Extract thinking content text (skip the summary element itself)
+          try {
+            var children = openDetails.childNodes;
+            for (var ci = 0; ci < children.length; ci++) {
+              var child = children[ci];
+              if (child.nodeName.toUpperCase() === 'SUMMARY') continue;
+              var txt = (child.innerText || child.textContent || '').trim();
+              if (txt) result.thinkingContent += (result.thinkingContent ? '\\n' : '') + txt;
+            }
+            if (result.thinkingContent.length > 2000) result.thinkingContent = result.thinkingContent.substring(0, 2000) + '…';
+          } catch(e) {}
+          return JSON.stringify(result);
+        }
+        // Spinner visible but no open thinking details = generating after thinking
+        if (result.spinnerVerb) {
+          result.thinking = true;
+          result.label = result.spinnerVerb;
+          return JSON.stringify(result);
+        }
+        // Check for CLOSED thinking details — thinking finished, now generating
+        var closedDetails = last.querySelector('details.thinking_aHyQPQ:not([open])') ||
+                            last.querySelector('details:not([open])');
+        if (closedDetails) {
+          var clsSummary = closedDetails.querySelector('${CLAUDE_PRIMARY.thinkingSummary}') ||
+                           closedDetails.querySelector('summary');
+          var closedLabel = clsSummary ? clsSummary.textContent.trim() : '';
+          if (closedLabel) {
+            result.label = closedLabel;
+            return JSON.stringify(result);
+          }
+        }
+      } else if (result.spinnerVerb) {
+        // Spinner visible but no assistant messages yet (first response)
+        result.thinking = true;
+        result.label = result.spinnerVerb;
+        return JSON.stringify(result);
+      }
+
+      return JSON.stringify(result);
     `);
     try { return JSON.parse(raw); } catch { return { thinking: false, label: '' }; }
   } catch {
@@ -399,6 +451,49 @@ function buildClaudeReadExpr(userClass, userText, userTextAlt) {
         var toolName = nameEl ? nameEl.textContent.trim() : 'Tool';
         var toolDesc = descEl ? descEl.textContent.trim() : '';
         var header = toolName + (toolDesc ? ' ' + toolDesc : '');
+        // Check for Monaco diff editor (Edit tool blocks)
+        var diffWrapper = node.querySelector('[class*="diffEditorWrapper_"]');
+        if (diffWrapper) {
+          var secondaryEl = node.querySelector('[class*="secondaryLine_"]');
+          var summary = secondaryEl ? secondaryEl.textContent.trim() : '';
+          var diffEditor = diffWrapper.querySelector('.monaco-diff-editor');
+          var body = summary + '\\n';
+          if (diffEditor) {
+            var origEditor = diffEditor.querySelector('.editor.original');
+            var modEditor = diffEditor.querySelector('.editor.modified');
+            function getViewLineTexts(editor) {
+              if (!editor) return [];
+              return Array.from(editor.querySelectorAll('.view-line')).map(function(l) { return l.textContent; });
+            }
+            var origLines = getViewLineTexts(origEditor);
+            var modLines = getViewLineTexts(modEditor);
+            // Build a simple unified diff
+            if (origLines.length > 0 || modLines.length > 0) {
+              body += fence + 'diff\\n';
+              // Find common prefix/suffix to show only changed region
+              var maxOrig = origLines.length, maxMod = modLines.length;
+              var prefixLen = 0;
+              while (prefixLen < maxOrig && prefixLen < maxMod && origLines[prefixLen] === modLines[prefixLen]) prefixLen++;
+              var suffixLen = 0;
+              while (suffixLen < (maxOrig - prefixLen) && suffixLen < (maxMod - prefixLen) && origLines[maxOrig - 1 - suffixLen] === modLines[maxMod - 1 - suffixLen]) suffixLen++;
+              // Show context lines around changes
+              var ctxStart = Math.max(0, prefixLen - 2);
+              var ctxEndOrig = Math.min(maxOrig, maxOrig - suffixLen + 2);
+              var ctxEndMod = Math.min(maxMod, maxMod - suffixLen + 2);
+              for (var li = ctxStart; li < ctxEndOrig || li < ctxEndMod; li++) {
+                if (li < prefixLen || li >= maxOrig - suffixLen) {
+                  // Context line (same in both)
+                  if (li < maxMod) body += ' ' + modLines[li] + '\\n';
+                } else {
+                  if (li < maxOrig - suffixLen && li < maxOrig) body += '-' + origLines[li] + '\\n';
+                  if (li < maxMod - suffixLen && li < maxMod) body += '+' + modLines[li] + '\\n';
+                }
+              }
+              body += fence + '\\n';
+            }
+          }
+          return '\\n[' + header + ']\\n' + body + '[end]\\n';
+        }
         // Extract IN/OUT rows
         var rows = node.querySelectorAll('[class*="toolBodyRow_"]');
         var body = '';
@@ -412,9 +507,11 @@ function buildClaudeReadExpr(userClass, userText, userTextAlt) {
           }
         });
         if (!body) {
-          // Fallback: plain text body
+          // Fallback: plain text body (skip Monaco editors that produce garbled text)
           var bodyEl = node.querySelector('[class*="toolBody_"]');
-          body = bodyEl ? bodyEl.textContent.trim() : '';
+          if (bodyEl && !bodyEl.querySelector('.monaco-editor')) {
+            body = bodyEl.textContent.trim();
+          }
         }
         return '\\n[' + header + ']\\n' + body + '[end]\\n';
       }

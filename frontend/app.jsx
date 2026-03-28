@@ -175,21 +175,49 @@ function SessionCard({ session, health, unread, isThinking, isActive, agentConfi
   );
 }
 
-function ActivityRow({ activity }) {
+// ─── ClaudeSpinner — replicates the Claude Code extension's thinking spinner ──
+// Cycles through Unicode symbols at 120ms per frame, matching the extension exactly.
+const SPINNER_SYMBOLS_FWD = ['·', '✢', '*', '✶', '✻', '✽'];
+const SPINNER_SYMBOLS = [...SPINNER_SYMBOLS_FWD, ...[...SPINNER_SYMBOLS_FWD].reverse()];
+
+function ClaudeSpinner() {
+  const [frame, setFrame] = React.useState(0);
+  React.useEffect(() => {
+    const id = setInterval(() => setFrame(f => (f + 1) % SPINNER_SYMBOLS.length), 120);
+    return () => clearInterval(id);
+  }, []);
+  return <span className="claude-spinner-icon">{SPINNER_SYMBOLS[frame]}</span>;
+}
+
+function ActivityRow({ activity, thinkingText, isClaude }) {
   const kind = activity?.kind || 'working';
   const meta = ACTIVITY_META[kind] || ACTIVITY_META.working;
   const isActive = meta.tone === 'thinking' || meta.tone === 'info';
   const label = activity?.label || kind.replaceAll('_', ' ');
+  const isThinkingKind = kind === 'thinking' || kind === 'generating';
+  const showBlob = isClaude && isThinkingKind;
+  const [expanded, setExpanded] = React.useState(false);
 
   return (
-    <div className={`activity-row ${meta.tone}${isActive ? ' active' : ''}`}>
+    <div className={`activity-row ${meta.tone}${isActive ? ' active' : ''}${showBlob ? ' claude-thinking' : ''}`}>
       <div className="activity-icon">
-        {isActive
-          ? <div className="activity-spinner" />
-          : meta.icon}
+        {showBlob
+          ? <ClaudeSpinner />
+          : isActive
+            ? <div className="activity-spinner" />
+            : meta.icon}
       </div>
       <div className="activity-copy">
         <div className="activity-label">{label}</div>
+        {showBlob && thinkingText && (
+          <div
+            className={`thinking-content${expanded ? ' expanded' : ''}`}
+            onClick={() => setExpanded(prev => !prev)}
+            title={expanded ? 'Click to collapse' : 'Click to expand thinking text'}
+          >
+            <div className="thinking-content-text">{thinkingText}</div>
+          </div>
+        )}
       </div>
     </div>
   );
@@ -1394,7 +1422,7 @@ function SkillsView({ skills, onRefresh, onBack }) {
 }
 
 function App() {
-  const { sessions, messages, connected, unread, setUnread, thinking, activities, health, deliveryStates, launchStates, justLaunched, setJustLaunched, permissionPrompts, respondToPrompt, interruptSession, agentConfigs, requestAgentConfig, setAgentModel, setAgentPermissionMode, setAntigravityMode, setCodexConfig, newThread, openPanel, requestChatList, switchChat, newChat, chatLists, requestThreadList, switchThread, threadLists, switchWorkspace, requestTerminalOutput, terminalOutputs, requestFileChanges, fileChanges, sendAttachment, send, sendToSession, launchSession, resumeSession, closeSession, activeSessionRef, workspaces, branchLists, requestBranchList, switchBranch, createBranch, skillLists, requestSkillList } = useRelay();
+  const { sessions, messages, connected, unread, setUnread, thinking, thinkingContent, activities, health, deliveryStates, launchStates, justLaunched, setJustLaunched, permissionPrompts, respondToPrompt, interruptSession, agentConfigs, requestAgentConfig, setAgentModel, setAgentPermissionMode, setAntigravityMode, setCodexConfig, newThread, openPanel, requestChatList, switchChat, newChat, chatLists, requestThreadList, switchThread, threadLists, switchWorkspace, requestTerminalOutput, terminalOutputs, requestFileChanges, fileChanges, sendAttachment, send, sendToSession, launchSession, resumeSession, closeSession, activeSessionRef, workspaces, branchLists, requestBranchList, switchBranch, createBranch, skillLists, requestSkillList } = useRelay();
   const [activeSession, setActiveSession] = useState(null);
   const [drafts, setDrafts]             = useState({});
   const [draftFiles, setDraftFiles]     = useState({});
@@ -1527,8 +1555,23 @@ function App() {
     if (!sessionId) return;
     setDraftFiles(prev => {
       const next = { ...prev };
-      if (file) next[sessionId] = file;
-      else delete next[sessionId];
+      if (file === null) { delete next[sessionId]; return next; }
+      // Support appending to existing array
+      const existing = next[sessionId] || [];
+      if (Array.isArray(file)) { next[sessionId] = file; }
+      else { next[sessionId] = [...existing, file]; }
+      return next;
+    });
+  }
+
+  function removeDraftFile(sessionId, index) {
+    if (!sessionId) return;
+    setDraftFiles(prev => {
+      const next = { ...prev };
+      const arr = [...(next[sessionId] || [])];
+      arr.splice(index, 1);
+      if (arr.length === 0) delete next[sessionId];
+      else next[sessionId] = arr;
       return next;
     });
   }
@@ -1546,45 +1589,52 @@ function App() {
   // ── File attachment ───────────────────────────────────────────────────────
 
   async function handleFileSelect(e) {
-    const file = e.target.files[0];
-    if (!file) return;
+    const files = Array.from(e.target.files || []);
+    if (files.length === 0) return;
     e.target.value = '';
 
-    if (file.size > 2 * 1024 * 1024) { showToast('File too large (max 2 MB)'); return; }
+    for (const file of files) {
+      if (file.size > 2 * 1024 * 1024) { showToast(`${file.name}: too large (max 2 MB)`); continue; }
 
-    if (isTextFile(file.name) && file.size < 500 * 1024) {
-      const reader = new FileReader();
-      reader.onload  = ev => setDraftFileForSession(activeSession, { name: file.name, content: ev.target.result, isText: true });
-      reader.onerror = () => showToast('Failed to read file');
-      reader.readAsText(file);
-    } else {
-      setUploading(true);
-      try {
-        const reader = new FileReader();
-        reader.onload = async ev => {
-          const base64 = ev.target.result.split(',')[1];
-          // For codex-desktop with send_attachment: inject image files directly
-          const caps = activeConfig?.capabilities || {};
-          if (caps.send_attachment && file.type.startsWith('image/')) {
-            sendAttachment(activeSession, base64, file.type, file.name);
-            showToast(`Image sent to Codex: ${file.name}`);
-          } else {
-            const resp   = await fetch('/upload', {
-              method:  'POST',
-              headers: { 'Content-Type': 'application/json' },
-              body:    JSON.stringify({ filename: file.name, content: base64, mimeType: file.type }),
-            });
-            if (!resp.ok) throw new Error('Upload failed');
-            const { url } = await resp.json();
-            setDraftFileForSession(activeSession, { name: file.name, url, isText: false });
-            showToast(`Uploaded: ${file.name}`);
-          }
-        };
-        reader.readAsDataURL(file);
-      } catch {
-        showToast('Upload failed');
-      } finally {
-        setUploading(false);
+      if (isTextFile(file.name) && file.size < 500 * 1024) {
+        await new Promise((resolve, reject) => {
+          const reader = new FileReader();
+          reader.onload  = ev => { setDraftFileForSession(activeSession, { name: file.name, content: ev.target.result, isText: true }); resolve(); };
+          reader.onerror = () => { showToast(`Failed to read ${file.name}`); resolve(); };
+          reader.readAsText(file);
+        });
+      } else {
+        setUploading(true);
+        try {
+          await new Promise((resolve, reject) => {
+            const reader = new FileReader();
+            reader.onload = async ev => {
+              const base64 = ev.target.result.split(',')[1];
+              const caps = activeConfig?.capabilities || {};
+              if (caps.send_attachment && file.type.startsWith('image/')) {
+                sendAttachment(activeSession, base64, file.type, file.name);
+                showToast(`Image sent to Codex: ${file.name}`);
+              } else {
+                const resp = await fetch('/upload', {
+                  method:  'POST',
+                  headers: { 'Content-Type': 'application/json' },
+                  body:    JSON.stringify({ filename: file.name, content: base64, mimeType: file.type }),
+                });
+                if (!resp.ok) throw new Error('Upload failed');
+                const { url } = await resp.json();
+                setDraftFileForSession(activeSession, { name: file.name, url, isText: false });
+                showToast(`Uploaded: ${file.name}`);
+              }
+              resolve();
+            };
+            reader.onerror = () => { showToast(`Failed to read ${file.name}`); resolve(); };
+            reader.readAsDataURL(file);
+          });
+        } catch {
+          showToast(`Upload failed: ${file.name}`);
+        } finally {
+          setUploading(false);
+        }
       }
     }
   }
@@ -1643,21 +1693,22 @@ function App() {
 
   function sendMessage() {
     const currentInput = activeSession ? (drafts[activeSession] || '') : '';
-    const attachedFile = activeSession ? draftFiles[activeSession] : null;
+    const attachedFiles = activeSession ? (draftFiles[activeSession] || []) : [];
     const text = currentInput.trim();
-    if (!text && !attachedFile) return;
+    if (!text && attachedFiles.length === 0) return;
     if (!activeSession) return;
 
     let content = '';
-    if (attachedFile) {
-      if (attachedFile.isText) {
-        const lang = getLang(attachedFile.name);
-        content = `\`${attachedFile.name}\`\n\`\`\`${lang}\n${attachedFile.content}\n\`\`\``;
-        if (text) content += `\n\n${text}`;
-      } else {
-        content = `[File: ${attachedFile.name}](${attachedFile.url})`;
-        if (text) content += `\n\n${text}`;
-      }
+    if (attachedFiles.length > 0) {
+      const fileParts = attachedFiles.map(f => {
+        if (f.isText) {
+          const lang = getLang(f.name);
+          return `\`${f.name}\`\n\`\`\`${lang}\n${f.content}\n\`\`\``;
+        }
+        return `[File: ${f.name}](${f.url})`;
+      });
+      content = fileParts.join('\n\n');
+      if (text) content += `\n\n${text}`;
     } else {
       content = text;
     }
@@ -1692,10 +1743,10 @@ function App() {
   const isActiveThinking = activeSession ? !!thinking[activeSession] : false;
   const isStopPending    = activeSession ? !!stopPending[activeSession] : false;
   const currentInput    = activeSession ? (drafts[activeSession] || '') : '';
-  const attachedFile    = activeSession ? draftFiles[activeSession] || null : null;
+  const attachedFiles   = activeSession ? (draftFiles[activeSession] || []) : [];
   const currentMessages = messages[activeSession] || [];
   const activePrompt    = activeSession ? permissionPrompts[activeSession] || null : null;
-  const canSend         = !!(currentInput.trim() || attachedFile) && !!activeSession && connected && !uploading && !activePrompt;
+  const canSend         = !!(currentInput.trim() || attachedFiles.length > 0) && !!activeSession && connected && !uploading && !activePrompt;
   const unreadTotal     = Object.values(unread).reduce((a, b) => a + b, 0);
   const slashQuery      = currentInput.startsWith('/') ? currentInput.slice(1).trim().toLowerCase() : '';
   const filteredSlashCommands = currentInput.startsWith('/')
@@ -2088,7 +2139,7 @@ function App() {
           ) : currentMessages.length === 0 ? (
             <div className="empty-state"><div className="icon">💬</div><div>No messages yet</div></div>
           ) : (
-            currentMessages.map((msg, i) => (
+            currentMessages.filter(msg => msg.content && msg.content.trim()).map((msg, i) => (
               msg.role === 'user' ? (
                 <div key={msg._cid || i} className={`message user${msg._optimistic && deliveryStates[msg._cid] === 'failed' ? ' failed' : ''}`}>
                   <div className="user-gutter">
@@ -2120,7 +2171,11 @@ function App() {
               )
             ))
           )}
-          {activeActivity && <ActivityRow activity={activeActivity} />}
+          {activeActivity && <ActivityRow
+            activity={activeActivity}
+            thinkingText={activeSession ? (thinkingContent[activeSession] || '') : ''}
+            isClaude={activeSessionMeta?.agent_type === 'claude'}
+          />}
           <div ref={messagesEndRef} />
         </div>
         </div>
@@ -2195,6 +2250,7 @@ function App() {
             <input
               type="file"
               hidden
+              multiple
               ref={fileInputRef}
               onChange={handleFileSelect}
               disabled={!activeSession || !connected || !!activePrompt}
@@ -2202,10 +2258,14 @@ function App() {
           </label>
 
           <div className="input-col">
-            {attachedFile && (
-              <div className="file-chip">
-                <span>📄 {attachedFile.name}{attachedFile.isText ? '' : ' (uploaded)'}</span>
-                <button onClick={() => setDraftFileForSession(activeSession, null)}>×</button>
+            {attachedFiles.length > 0 && (
+              <div className="file-chips">
+                {attachedFiles.map((f, i) => (
+                  <div key={i} className="file-chip">
+                    <span>📄 {f.name}{f.isText ? '' : ' (uploaded)'}</span>
+                    <button onClick={() => removeDraftFile(activeSession, i)}>×</button>
+                  </div>
+                ))}
               </div>
             )}
             {showSlashMenu && filteredSlashCommands.length > 0 && (
@@ -2233,8 +2293,8 @@ function App() {
                 placeholder={activePrompt
                   ? 'Resolve the permission prompt above to continue'
                   : activeSession
-                    ? 'Message… (/ for commands)'
-                    : 'Select a session to start chatting'}
+                    ? (window.innerWidth < 600 ? 'Enter message…' : 'Message… (/ for commands)')
+                    : 'Select a session'}
                 disabled={!activeSession || !connected || !!activePrompt}
                 rows={1}
               />

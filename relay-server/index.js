@@ -1242,7 +1242,9 @@ function handleProxyConnection(ws, req) {
         }
       }
       // Normalise to old shape so existing frontend still works
-      broadcastToBrowsers({ type: 'status', session: id || msg.session, thinking: msg.thinking, label: msg.label, activity: msg.activity });
+      const statusMsg = { type: 'status', session: id || msg.session, thinking: msg.thinking, label: msg.label, activity: msg.activity };
+      if (msg.thinking_content) statusMsg.thinking_content = msg.thinking_content;
+      broadcastToBrowsers(statusMsg);
 
     // ── Incoming agent message ─────────────────────────────────────────────
     } else if (t === 'message' || t === 'proxy_message') {

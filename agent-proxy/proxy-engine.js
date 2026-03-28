@@ -2112,11 +2112,18 @@ class ProxyEngine extends EventEmitter {
       const kind   = ts.thinking ? 'thinking' : active ? 'generating' : 'idle';
       const label  = ts.label || (active ? 'Generating' : '');
       const newActivity = { kind, label, updated_at: new Date().toISOString() };
+      // Attach thinking content for Claude Code sessions only
+      if (ts.thinkingContent && (session.agentType === 'claude' || session.agentType === 'claude-desktop')) {
+        newActivity.thinkingContent = ts.thinkingContent;
+      }
 
       const prevKind = session.activity?.kind || 'idle';
-      if (ts.thinking !== session.thinking || label !== session.thinkingLabel || kind !== prevKind) {
+      const prevThinkingContent = session.thinkingContent || '';
+      const currThinkingContent = ts.thinkingContent || '';
+      if (ts.thinking !== session.thinking || label !== session.thinkingLabel || kind !== prevKind || currThinkingContent !== prevThinkingContent) {
         session.thinking     = ts.thinking;
         session.thinkingLabel = label;
+        session.thinkingContent = currThinkingContent;
         session.activity     = newActivity;
         sessionStore.updateSession(sessionId, { activity: newActivity });
         this._sendToRelay(proto.proxyStatus(sessionId, session.status || 'healthy', newActivity));

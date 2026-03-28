@@ -95,6 +95,10 @@ function proxyStatus(sessionId, status, activity, selectorFailures) {
     thinking,
     label,
   };
+  // Claude Code thinking content — passed through activity.thinkingContent
+  if (activity?.thinkingContent) {
+    msg.thinking_content = activity.thinkingContent;
+  }
   if (selectorFailures && (selectorFailures.readFails > 0 || selectorFailures.sendFails > 0)) {
     msg.selector_failures = {
       read:  selectorFailures.readFails  || 0,
