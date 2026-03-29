@@ -1484,12 +1484,30 @@ function handleProxyConnection(ws, req) {
     } else if (t === 'rate_limit_active') {
       const id = msg.session_id || msg.session;
       if (id) touchSession(id);
+      if (id && sessionMeta.has(id)) {
+        sessionMeta.set(id, {
+          ...sessionMeta.get(id),
+          rate_limited_until: msg.retry_after_hint || 'unknown',
+          rate_limit_active: true,
+          percent_used: msg.percent_used ?? null,
+          last_seen_at: new Date().toISOString(),
+        });
+      }
       broadcastToBrowsers(msg);
       log('info', 'rate-limit', 'Rate limit active', { session: id, retry_after_hint: msg.retry_after_hint });
 
     } else if (t === 'rate_limit_cleared') {
       const id = msg.session_id || msg.session;
       if (id) touchSession(id);
+      if (id && sessionMeta.has(id)) {
+        sessionMeta.set(id, {
+          ...sessionMeta.get(id),
+          rate_limited_until: null,
+          rate_limit_active: false,
+          percent_used: null,
+          last_seen_at: new Date().toISOString(),
+        });
+      }
       broadcastToBrowsers(msg);
       if (NOTIFY_EVEN_IF_CONNECTED || browserClients.size === 0) {
         sendPushNotification(

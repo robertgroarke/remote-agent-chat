@@ -2522,9 +2522,67 @@ async function injectCodexImage(Runtime, base64Data, mimeType, filename, usePage
         var blob = new Blob([bytes], { type: mime });
         var file = new File([blob], fname, { type: mime });
 
-        // Strategy 1: Dispatch paste event with DataTransfer on ProseMirror editor
-        var editor = d.querySelector('.ProseMirror[contenteditable="true"]');
+        function visible(el) {
+          if (!el) return false;
+          var cs = getComputedStyle(el);
+          if (!cs || cs.display === 'none' || cs.visibility === 'hidden') return false;
+          var r = el.getBoundingClientRect();
+          return r.width > 0 && r.height > 0;
+        }
+
+        function attachmentAccepted() {
+          var bodyText = (d.body && (d.body.innerText || d.body.textContent) || '');
+          if (bodyText.indexOf(fname) >= 0) return true;
+
+          var fileInput = d.querySelector('input[type="file"]');
+          if (fileInput && fileInput.files && fileInput.files.length > 0) {
+            for (var fi = 0; fi < fileInput.files.length; fi++) {
+              if ((fileInput.files[fi] && fileInput.files[fi].name) === fname) return true;
+            }
+          }
+
+          var chips = Array.from(d.querySelectorAll('button, div, span, li')).filter(function(el) {
+            if (!visible(el)) return false;
+            var text = (el.textContent || '').trim();
+            if (!text || text.length > 240) return false;
+            if (text.indexOf(fname) >= 0) return true;
+            // Some Codex builds display generic image chips without the full filename.
+            return /image|attachment|uploaded|paste/i.test(text) && !!el.closest('form,[role="textbox"],.ProseMirror');
+          });
+          if (chips.length > 0) return true;
+
+          var blobs = d.querySelectorAll('img[src^="blob:"], [style*="blob:"]');
+          return blobs.length > 0;
+        }
+
+        function setFilesOnInput(input, files) {
+          try {
+            var desc = Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, 'files');
+            if (desc && desc.set) desc.set.call(input, files);
+            else input.files = files;
+          } catch (e) {
+            try { input.files = files; } catch (_) {}
+          }
+        }
+
+        // Strategy 1: Set files on the hidden file input and dispatch both input/change.
+        // This tends to be more reliable than synthetic paste for the Codex webview.
+        var fileInput = d.querySelector('input[type="file"]');
+        if (fileInput) {
+          var dt2 = new DataTransfer();
+          dt2.items.add(file);
+          setFilesOnInput(fileInput, dt2.files);
+          fileInput.dispatchEvent(new Event('input', { bubbles: true }));
+          fileInput.dispatchEvent(new Event('change', { bubbles: true }));
+          if (attachmentAccepted()) {
+            return JSON.stringify({ ok: true, method: 'file-input' });
+          }
+        }
+
+        // Strategy 2: Dispatch paste event with DataTransfer on ProseMirror editor
+        var editor = d.querySelector('.ProseMirror[contenteditable="true"], [contenteditable="true"][role="textbox"]');
         if (editor) {
+          try { editor.focus(); } catch (e) {}
           var dt = new DataTransfer();
           dt.items.add(file);
           var pasteEvent = new ClipboardEvent('paste', {
@@ -2533,17 +2591,16 @@ async function injectCodexImage(Runtime, base64Data, mimeType, filename, usePage
             clipboardData: dt
           });
           editor.dispatchEvent(pasteEvent);
-          return JSON.stringify({ ok: true, method: 'paste-event' });
-        }
-
-        // Strategy 2: Set files on the hidden file input and dispatch change
-        var fileInput = d.querySelector('input[type="file"]');
-        if (fileInput) {
-          var dt2 = new DataTransfer();
-          dt2.items.add(file);
-          fileInput.files = dt2.files;
-          fileInput.dispatchEvent(new Event('change', { bubbles: true }));
-          return JSON.stringify({ ok: true, method: 'file-input' });
+          editor.dispatchEvent(new InputEvent('input', {
+            bubbles: true,
+            cancelable: true,
+            inputType: 'insertFromPaste',
+            dataTransfer: dt
+          }));
+          if (attachmentAccepted()) {
+            return JSON.stringify({ ok: true, method: 'paste-event' });
+          }
+          return JSON.stringify({ ok: false, detail: 'paste-not-accepted' });
         }
 
         return JSON.stringify({ ok: false, detail: 'no-editor-or-input' });

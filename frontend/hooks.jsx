@@ -29,6 +29,7 @@ export function useRelay() {
     const [fileChanges,       setFileChanges]       = useState({});   // sessionId -> [{ file?, content, type }] — Codex file changes/diff
     const [branchLists,       setBranchLists]       = useState({});   // sessionId -> { branches: string[], current: string }
     const [skillLists,        setSkillLists]        = useState({});   // sessionId -> { installed: [...], recommended: [...] }
+    const [controlResults,    setControlResults]    = useState({});   // requestId -> latest agent_control_result
 
     const thinkingTimers   = useRef({});
     const wsRef            = useRef(null);
@@ -511,6 +512,9 @@ export function useRelay() {
 
       if (t === 'agent_control_result') {
         const sid = msg.session_id || msg.session;
+        if (msg.request_id) {
+          setControlResults(prev => ({ ...prev, [msg.request_id]: { ...msg, received_at: Date.now() } }));
+        }
         if (msg.command === 'permission_response' && sid) {
           if (msg.result === 'ok') {
             setPermissionPrompts(prev => { const { [sid]: _, ...rest } = prev; return rest; });
@@ -674,7 +678,7 @@ export function useRelay() {
       }
     }
 
-    return { sessions, messages, connected, unread, setUnread, thinking, thinkingContent, activities, health, deliveryStates, launchStates, justLaunched, setJustLaunched, permissionPrompts, respondToPrompt, interruptSession, agentConfigs, requestAgentConfig, setAgentModel, setAgentPermissionMode, setAntigravityMode, setCodexConfig, newThread, openPanel, requestChatList, switchChat, newChat, chatLists, requestThreadList, switchThread, threadLists, switchWorkspace, requestTerminalOutput, terminalOutputs, requestFileChanges, fileChanges, sendAttachment, send, sendToSession, steerMessage, discardQueuedMessage, editQueuedMessage, queuedMessages, launchSession, resumeSession, closeSession, activeSessionRef, workspaces, branchLists, requestBranchList, switchBranch, createBranch, skillLists, requestSkillList };
+    return { sessions, messages, connected, unread, setUnread, thinking, thinkingContent, activities, health, deliveryStates, launchStates, justLaunched, setJustLaunched, permissionPrompts, respondToPrompt, interruptSession, agentConfigs, requestAgentConfig, setAgentModel, setAgentPermissionMode, setAntigravityMode, setCodexConfig, newThread, openPanel, requestChatList, switchChat, newChat, chatLists, requestThreadList, switchThread, threadLists, switchWorkspace, requestTerminalOutput, terminalOutputs, requestFileChanges, fileChanges, sendAttachment, send, sendToSession, steerMessage, discardQueuedMessage, editQueuedMessage, queuedMessages, launchSession, resumeSession, closeSession, activeSessionRef, workspaces, branchLists, requestBranchList, switchBranch, createBranch, skillLists, requestSkillList, controlResults };
   }
 
 // (removed window.useRelay — now an ES module export)

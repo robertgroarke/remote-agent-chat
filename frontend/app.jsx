@@ -1480,7 +1480,7 @@ function SkillsView({ skills, onRefresh, onBack }) {
 }
 
 function App() {
-  const { sessions, messages, connected, unread, setUnread, thinking, thinkingContent, activities, health, deliveryStates, launchStates, justLaunched, setJustLaunched, permissionPrompts, respondToPrompt, interruptSession, agentConfigs, requestAgentConfig, setAgentModel, setAgentPermissionMode, setAntigravityMode, setCodexConfig, newThread, openPanel, requestChatList, switchChat, newChat, chatLists, requestThreadList, switchThread, threadLists, switchWorkspace, requestTerminalOutput, terminalOutputs, requestFileChanges, fileChanges, sendAttachment, send, sendToSession, steerMessage, discardQueuedMessage, editQueuedMessage, queuedMessages, launchSession, resumeSession, closeSession, activeSessionRef, workspaces, branchLists, requestBranchList, switchBranch, createBranch, skillLists, requestSkillList } = useRelay();
+  const { sessions, messages, connected, unread, setUnread, thinking, thinkingContent, activities, health, deliveryStates, launchStates, justLaunched, setJustLaunched, permissionPrompts, respondToPrompt, interruptSession, agentConfigs, requestAgentConfig, setAgentModel, setAgentPermissionMode, setAntigravityMode, setCodexConfig, newThread, openPanel, requestChatList, switchChat, newChat, chatLists, requestThreadList, switchThread, threadLists, switchWorkspace, requestTerminalOutput, terminalOutputs, requestFileChanges, fileChanges, sendAttachment, send, sendToSession, steerMessage, discardQueuedMessage, editQueuedMessage, queuedMessages, launchSession, resumeSession, closeSession, activeSessionRef, workspaces, branchLists, requestBranchList, switchBranch, createBranch, skillLists, requestSkillList, controlResults } = useRelay();
   const [activeSession, setActiveSession] = useState(null);
   const [drafts, setDrafts]             = useState({});
   const [draftFiles, setDraftFiles]     = useState({});
@@ -1506,6 +1506,8 @@ function App() {
   const textareaRef     = useRef(null);
   const fileInputRef    = useRef(null);
   const prevConnected   = useRef(connected);
+  const pendingAttachmentReqs = useRef({});
+  const seenAttachmentResults = useRef({});
 
   useEffect(() => {
     try {
@@ -1634,6 +1636,57 @@ function App() {
     });
   }
 
+  async function uploadBinaryDraft(sessionId, base64, mimeType, filename) {
+    const resp = await fetch('/upload', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ filename, content: base64, mimeType }),
+    });
+    if (!resp.ok) throw new Error('Upload failed');
+    const { url } = await resp.json();
+    setDraftFileForSession(sessionId, { name: filename, url, isText: false });
+    return url;
+  }
+
+  function requestDirectImageAttach(sessionId, base64, mimeType, filename) {
+    const requestId = sendAttachment(sessionId, base64, mimeType, filename);
+    pendingAttachmentReqs.current[requestId] = {
+      sessionId,
+      filename,
+      mimeType,
+      base64,
+      createdAt: Date.now(),
+    };
+    showToast(`Sending image to Codex: ${filename}`);
+    return requestId;
+  }
+
+  useEffect(() => {
+    const entries = Object.entries(controlResults || {});
+    for (const [requestId, result] of entries) {
+      if (!requestId.startsWith('attach-') || seenAttachmentResults.current[requestId]) continue;
+      seenAttachmentResults.current[requestId] = true;
+      const pending = pendingAttachmentReqs.current[requestId];
+      delete pendingAttachmentReqs.current[requestId];
+      if (!pending) continue;
+
+      if (result?.result === 'ok') {
+        showToast(`Image attached to Codex: ${pending.filename}`);
+        continue;
+      }
+
+      (async () => {
+        try {
+          await uploadBinaryDraft(pending.sessionId, pending.base64, pending.mimeType, pending.filename);
+          showToast(`Direct image attach failed — added ${pending.filename} as a file link draft`);
+        } catch {
+          const detail = result?.error?.message || result?.error?.code || 'unknown error';
+          showToast(`Image attach failed: ${detail}`);
+        }
+      })();
+    }
+  }, [controlResults]);
+
   function selectSession(id, sessionMeta) {
     setActiveSession(id);
     activeSessionRef.current = id;
@@ -1670,17 +1723,9 @@ function App() {
               const base64 = ev.target.result.split(',')[1];
               const caps = activeConfig?.capabilities || {};
               if (caps.send_attachment && file.type.startsWith('image/')) {
-                sendAttachment(activeSession, base64, file.type, file.name);
-                showToast(`Image sent to Codex: ${file.name}`);
+                requestDirectImageAttach(activeSession, base64, file.type, file.name);
               } else {
-                const resp = await fetch('/upload', {
-                  method:  'POST',
-                  headers: { 'Content-Type': 'application/json' },
-                  body:    JSON.stringify({ filename: file.name, content: base64, mimeType: file.type }),
-                });
-                if (!resp.ok) throw new Error('Upload failed');
-                const { url } = await resp.json();
-                setDraftFileForSession(activeSession, { name: file.name, url, isText: false });
+                await uploadBinaryDraft(activeSession, base64, file.type, file.name);
                 showToast(`Uploaded: ${file.name}`);
               }
               resolve();
@@ -1715,31 +1760,27 @@ function App() {
     const ext      = file.type === 'image/jpeg' ? 'jpg' : 'png';
     const filename = `screenshot-${Date.now()}.${ext}`;
 
-    setUploading(true);
-    try {
-      const reader = new FileReader();
-      reader.onload = async ev => {
-        const base64 = ev.target.result.split(',')[1];
+  setUploading(true);
+  try {
+      await new Promise((resolve) => {
+        const reader = new FileReader();
+        reader.onload = async ev => {
+          const base64 = ev.target.result.split(',')[1];
 
-        // For codex-desktop sessions with send_attachment capability, inject directly
-        const caps = activeConfig?.capabilities || {};
-        if (caps.send_attachment) {
-          sendAttachment(activeSession, base64, file.type, filename);
-          showToast('Image sent to Codex Desktop');
-        } else {
-          const resp   = await fetch('/upload', {
-            method:  'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body:    JSON.stringify({ filename, content: base64, mimeType: file.type }),
-          });
-          if (!resp.ok) throw new Error('Upload failed');
-          const { url } = await resp.json();
-          setDraftFileForSession(activeSession, { name: filename, url, isText: false });
-          showToast('Screenshot attached');
-        }
-      };
-      reader.onerror = () => showToast('Failed to read clipboard image');
-      reader.readAsDataURL(file);
+          // For Codex sessions with direct attachment capability, inject directly and
+          // wait for the proxy result before showing success.
+          const caps = activeConfig?.capabilities || {};
+          if (caps.send_attachment) {
+            requestDirectImageAttach(activeSession, base64, file.type, filename);
+          } else {
+            await uploadBinaryDraft(activeSession, base64, file.type, filename);
+            showToast('Screenshot attached');
+          }
+          resolve();
+        };
+        reader.onerror = () => { showToast('Failed to read clipboard image'); resolve(); };
+        reader.readAsDataURL(file);
+      });
     } catch {
       showToast('Paste upload failed');
     } finally {
