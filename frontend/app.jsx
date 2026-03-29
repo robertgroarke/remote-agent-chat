@@ -115,6 +115,57 @@ function DeliveryStatus({ msg, deliveryStates, onSteer }) {
   return <span className="delivery delivered" title="Sent">✓</span>;
 }
 
+// ─── QueuedItem — queued message with Steer, trash, and ... menu ─────────────
+function QueuedItem({ qm, onSteer, onDiscard, onEdit }) {
+  const [menuOpen, setMenuOpen] = React.useState(false);
+  const [editing, setEditing] = React.useState(false);
+  const [editText, setEditText] = React.useState(qm.content);
+  const menuRef = React.useRef(null);
+
+  React.useEffect(() => {
+    if (!menuOpen) return;
+    const close = (e) => { if (menuRef.current && !menuRef.current.contains(e.target)) setMenuOpen(false); };
+    document.addEventListener('mousedown', close);
+    return () => document.removeEventListener('mousedown', close);
+  }, [menuOpen]);
+
+  if (editing) {
+    return (
+      <div className="queued-item editing">
+        <textarea
+          className="queued-edit-input"
+          value={editText}
+          onChange={e => setEditText(e.target.value)}
+          onKeyDown={e => { if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); onEdit(editText); setEditing(false); } if (e.key === 'Escape') setEditing(false); }}
+          rows={2}
+          autoFocus
+        />
+        <button className="steer-btn" onClick={() => { onEdit(editText); setEditing(false); }}>Save</button>
+        <button className="queued-trash-btn" onClick={() => setEditing(false)} title="Cancel">✕</button>
+      </div>
+    );
+  }
+
+  return (
+    <div className="queued-item">
+      <span className="queued-item-text">{qm.content.length > 80 ? qm.content.substring(0, 77) + '...' : qm.content}</span>
+      <div className="queued-actions">
+        <button className="steer-btn" onClick={onSteer} title="Send to agent now">Steer ▸</button>
+        <button className="queued-trash-btn" onClick={onDiscard} title="Discard message">🗑</button>
+        <div className="queued-menu-wrap" ref={menuRef}>
+          <button className="queued-more-btn" onClick={() => setMenuOpen(!menuOpen)} title="More options">···</button>
+          {menuOpen && (
+            <div className="queued-dropdown">
+              <button onClick={() => { setMenuOpen(false); setEditText(qm.content); setEditing(true); }}>✏ Edit message</button>
+              <button onClick={() => { setMenuOpen(false); onDiscard(); }}>🗑 Discard</button>
+            </div>
+          )}
+        </div>
+      </div>
+    </div>
+  );
+}
+
 // ─── SessionCard — IDE workbench style ────────────────────────────────────────
 // Each card shows: colored agent badge, agent name, window label, health dot,
 // and either a thinking spinner or an unread count badge.
@@ -1429,7 +1480,7 @@ function SkillsView({ skills, onRefresh, onBack }) {
 }
 
 function App() {
-  const { sessions, messages, connected, unread, setUnread, thinking, thinkingContent, activities, health, deliveryStates, launchStates, justLaunched, setJustLaunched, permissionPrompts, respondToPrompt, interruptSession, agentConfigs, requestAgentConfig, setAgentModel, setAgentPermissionMode, setAntigravityMode, setCodexConfig, newThread, openPanel, requestChatList, switchChat, newChat, chatLists, requestThreadList, switchThread, threadLists, switchWorkspace, requestTerminalOutput, terminalOutputs, requestFileChanges, fileChanges, sendAttachment, send, sendToSession, steerMessage, launchSession, resumeSession, closeSession, activeSessionRef, workspaces, branchLists, requestBranchList, switchBranch, createBranch, skillLists, requestSkillList } = useRelay();
+  const { sessions, messages, connected, unread, setUnread, thinking, thinkingContent, activities, health, deliveryStates, launchStates, justLaunched, setJustLaunched, permissionPrompts, respondToPrompt, interruptSession, agentConfigs, requestAgentConfig, setAgentModel, setAgentPermissionMode, setAntigravityMode, setCodexConfig, newThread, openPanel, requestChatList, switchChat, newChat, chatLists, requestThreadList, switchThread, threadLists, switchWorkspace, requestTerminalOutput, terminalOutputs, requestFileChanges, fileChanges, sendAttachment, send, sendToSession, steerMessage, discardQueuedMessage, editQueuedMessage, queuedMessages, launchSession, resumeSession, closeSession, activeSessionRef, workspaces, branchLists, requestBranchList, switchBranch, createBranch, skillLists, requestSkillList } = useRelay();
   const [activeSession, setActiveSession] = useState(null);
   const [drafts, setDrafts]             = useState({});
   const [draftFiles, setDraftFiles]     = useState({});
@@ -2093,14 +2144,14 @@ function App() {
               onRespond={respondToPrompt}
             />
           )}
-          {activeSessionMeta?.rate_limited_until && (
-            <div className="rate-limit-banner">
-              <span className="rate-limit-icon">⏳</span>
+          {(activeSessionMeta?.rate_limited_until || activeSessionMeta?.percent_used != null) && (
+            <div className={`rate-limit-overlay${activeSessionMeta?.percent_used >= 90 ? ' critical' : activeSessionMeta?.percent_used >= 75 ? ' warning' : ''}`}>
+              <span className="rate-limit-icon">{activeSessionMeta?.percent_used != null ? '📊' : '⏳'}</span>
               <span className="rate-limit-text">
-                Rate limited
-                {activeSessionMeta.rate_limited_until !== 'unknown'
-                  ? <> — available after <strong>{activeSessionMeta.rate_limited_until}</strong></>
-                  : null}
+                {activeSessionMeta?.percent_used != null
+                  ? <>Used <strong>{activeSessionMeta.percent_used}%</strong> of session limit{activeSessionMeta.rate_limited_until && activeSessionMeta.rate_limited_until !== 'unknown' ? <> · resets in <strong>{activeSessionMeta.rate_limited_until}</strong></> : null}</>
+                  : <>Rate limited{activeSessionMeta.rate_limited_until !== 'unknown' ? <> — available after <strong>{activeSessionMeta.rate_limited_until}</strong></> : null}</>
+                }
               </span>
             </div>
           )}
@@ -2287,6 +2338,20 @@ function App() {
                     <span className="slash-command">{item.command}</span>
                     <span className="slash-detail">{item.detail}</span>
                   </button>
+                ))}
+              </div>
+            )}
+            {/* Queued messages bar — shown above input when agent is busy */}
+            {activeSession && (queuedMessages[activeSession] || []).length > 0 && (
+              <div className="queued-bar">
+                {(queuedMessages[activeSession] || []).map(qm => (
+                  <QueuedItem
+                    key={qm.cid}
+                    qm={qm}
+                    onSteer={() => steerMessage(activeSession, qm.cid, qm.content)}
+                    onDiscard={() => discardQueuedMessage(activeSession, qm.cid)}
+                    onEdit={(newContent) => editQueuedMessage(activeSession, qm.cid, newContent)}
+                  />
                 ))}
               </div>
             )}

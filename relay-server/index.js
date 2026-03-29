@@ -913,6 +913,7 @@ const KNOWN_PROXY_TYPES = new Set([
   'rate_limit_active', 'rate_limit_cleared',
   'chat_list', 'thread_list', 'terminal_output', 'file_changes',
   'branch_list', 'skill_list',
+  'message_queued', 'queue_delivered', 'steer_result', 'proxy_send_result',
 ]);
 
 const KNOWN_CLIENT_TYPES = new Set([
@@ -927,7 +928,7 @@ const KNOWN_CLIENT_TYPES = new Set([
   'thread_list', 'switch_thread', 'switch_workspace', 'terminal_output',
   'file_changes', 'send_attachment', 'terminal_input',
   'branch_list', 'switch_branch', 'create_branch',
-  'skill_list',
+  'skill_list', 'steer', 'discard_queued', 'edit_queued',
   'automations_list', 'automations_create', 'automations_update', 'automations_delete', 'automations_run',
 ]);
 
@@ -1739,6 +1740,12 @@ function handleClientConnection(ws, req) {
       }
       proxyWs.send(JSON.stringify(msg));
       log('info', 'send', 'Steer request forwarded', { session: id, cid: msg.client_message_id });
+
+    // ── Queue management (discard/edit queued messages) ───────────────────
+    } else if (t === 'discard_queued' || t === 'edit_queued') {
+      const id = msg.session_id || msg.session;
+      const proxyWs = proxySockets.get(id);
+      if (proxyWs && proxyWs.readyState === WebSocket.OPEN) proxyWs.send(JSON.stringify(msg));
 
     // ── Launch session (A2-08) ─────────────────────────────────────────────
     } else if (t === 'launch_session') {

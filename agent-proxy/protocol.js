@@ -167,7 +167,7 @@ function agentControlResult(sessionId, requestId, command, result, error) {
 
 // Emitted when rate limiting is first detected for a session.
 // retry_after_hint is a human-readable string (e.g. "3:00 PM", "March 15 at 3pm") or null.
-function rateLimitActive(sessionId, retryAfterHint) {
+function rateLimitActive(sessionId, retryAfterHint, percentUsed) {
   const msg = {
     type:             'rate_limit_active',
     protocol_version: PROTOCOL_VERSION,
@@ -175,6 +175,7 @@ function rateLimitActive(sessionId, retryAfterHint) {
     detected_at:      new Date().toISOString(),
   };
   if (retryAfterHint) msg.retry_after_hint = retryAfterHint;
+  if (percentUsed != null) msg.percent_used = percentUsed;
   return msg;
 }
 

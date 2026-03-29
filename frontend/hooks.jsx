@@ -17,6 +17,7 @@ export function useRelay() {
     const [activities,      setActivities]      = useState({});   // sessionId -> { kind, label, updatedAt } | false
     const [health,          setHealth]          = useState({});   // sessionId -> 'healthy'|'degraded'|'disconnected'
     const [deliveryStates,  setDeliveryStates]  = useState({});   // clientMsgId -> 'queued'|'accepted'|'failed'|'busy_queued'|'steered'
+    const [queuedMessages,  setQueuedMessages]  = useState({});   // sessionId -> [{ cid, content, queuedAt }]
     const [launchStates,      setLaunchStates]      = useState({});   // requestId -> { status:'launching'|'failed', agentType, error? }
     const [justLaunched,      setJustLaunched]      = useState(null); // session_id of most recently launched session (for auto-select)
     const [permissionPrompts, setPermissionPrompts] = useState({});   // session_id -> prompt object (one active prompt per session)
@@ -268,6 +269,32 @@ export function useRelay() {
       send({ type: 'steer', session_id: sessionId, client_message_id: clientMessageId, content });
     }
 
+    function discardQueuedMessage(sessionId, clientMessageId) {
+      send({ type: 'discard_queued', session_id: sessionId, client_message_id: clientMessageId });
+      setQueuedMessages(prev => ({ ...prev, [sessionId]: (prev[sessionId] || []).filter(m => m.cid !== clientMessageId) }));
+      setDeliveryStates(prev => { const next = { ...prev }; delete next[clientMessageId]; return next; });
+      // Remove the optimistic message from chat
+      setMessages(prev => {
+        const msgs = prev[sessionId] || [];
+        return { ...prev, [sessionId]: msgs.filter(m => m._cid !== clientMessageId) };
+      });
+    }
+
+    function editQueuedMessage(sessionId, clientMessageId, newContent) {
+      // Update locally
+      setQueuedMessages(prev => ({
+        ...prev,
+        [sessionId]: (prev[sessionId] || []).map(m => m.cid === clientMessageId ? { ...m, content: newContent } : m),
+      }));
+      // Update the optimistic message in chat
+      setMessages(prev => {
+        const msgs = prev[sessionId] || [];
+        return { ...prev, [sessionId]: msgs.map(m => m._cid === clientMessageId ? { ...m, content: newContent } : m) };
+      });
+      // Tell proxy to update the queued content
+      send({ type: 'edit_queued', session_id: sessionId, client_message_id: clientMessageId, content: newContent });
+    }
+
     function handleRelayMessage(msg) {
       const t = msg.type;
 
@@ -499,7 +526,12 @@ export function useRelay() {
       // ── Delivery ack / failure ───────────────────────────────────────────────
       if (t === 'message_accepted') {
         const cid = msg.client_message_id;
-        if (cid) setDeliveryStates(prev => ({ ...prev, [cid]: 'accepted' }));
+        // Don't overwrite busy_queued or steered — those are higher-priority states
+        if (cid) setDeliveryStates(prev => {
+          const cur = prev[cid];
+          if (cur === 'busy_queued' || cur === 'steered') return prev;
+          return { ...prev, [cid]: 'accepted' };
+        });
         return;
       }
 
@@ -512,18 +544,57 @@ export function useRelay() {
       // ── Steer / queue messages ──────────────────────────────────────────────
       if (t === 'message_queued') {
         const cid = msg.client_message_id;
-        if (cid) setDeliveryStates(prev => ({ ...prev, [cid]: 'busy_queued' }));
+        const sid = msg.session_id || msg.session;
+        if (cid) {
+          setDeliveryStates(prev => ({ ...prev, [cid]: 'busy_queued' }));
+          if (sid) {
+            setQueuedMessages(prev => ({
+              ...prev,
+              [sid]: [...(prev[sid] || []), { cid, content: msg.content, queuedAt: msg.queued_at }],
+            }));
+          }
+        }
         return;
       }
       if (t === 'queue_delivered') {
         const cid = msg.client_message_id;
-        if (cid) setDeliveryStates(prev => ({ ...prev, [cid]: 'accepted' }));
+        const sid = msg.session_id || msg.session;
+        if (cid) {
+          setDeliveryStates(prev => ({ ...prev, [cid]: 'accepted' }));
+          if (sid) setQueuedMessages(prev => ({ ...prev, [sid]: (prev[sid] || []).filter(m => m.cid !== cid) }));
+        }
         return;
       }
       if (t === 'steer_result') {
         const cid = msg.client_message_id;
+        const sid = msg.session_id || msg.session;
         if (cid) {
           setDeliveryStates(prev => ({ ...prev, [cid]: msg.result === 'ok' ? 'steered' : 'failed' }));
+          if (sid) setQueuedMessages(prev => ({ ...prev, [sid]: (prev[sid] || []).filter(m => m.cid !== cid) }));
+        }
+        return;
+      }
+
+      // ── Rate limit / usage warning ──────────────────────────────────────────
+      if (t === 'rate_limit_active') {
+        const sid = msg.session_id || msg.session;
+        if (sid) {
+          setSessions(prev => prev.map(s =>
+            sessionIdOf(s) === sid
+              ? { ...(typeof s === 'object' ? s : {}), session_id: sid, rate_limited_until: msg.retry_after_hint || 'unknown', rate_limit_active: true, percent_used: msg.percent_used ?? null }
+              : s
+          ));
+        }
+        return;
+      }
+      if (t === 'rate_limit_cleared') {
+        const sid = msg.session_id || msg.session;
+        if (sid) {
+          setSessions(prev => prev.map(s =>
+            sessionIdOf(s) === sid
+              ? { ...(typeof s === 'object' ? s : {}), session_id: sid, rate_limited_until: null, rate_limit_active: false, percent_used: null }
+              : s
+          ));
         }
         return;
       }
@@ -578,11 +649,14 @@ export function useRelay() {
         setMessages(prev => {
           const existing = prev[id] || [];
           if (role === 'user') {
-            // Replace a matching optimistic message with the confirmed real one
+            // Replace a matching optimistic message with the confirmed real one.
+            // Preserve _cid and _optimistic so delivery state tracking (queued/steer)
+            // continues to work after the relay echoes the message back.
             const idx = existing.findIndex(m => m._optimistic && m.content === content);
             if (idx >= 0) {
               const updated = [...existing];
-              updated[idx] = { role, content, _delivered: true };
+              const prev_msg = existing[idx];
+              updated[idx] = { role, content, _delivered: true, _cid: prev_msg._cid, _optimistic: prev_msg._optimistic };
               return { ...prev, [id]: updated };
             }
           }
@@ -600,7 +674,7 @@ export function useRelay() {
       }
     }
 
-    return { sessions, messages, connected, unread, setUnread, thinking, thinkingContent, activities, health, deliveryStates, launchStates, justLaunched, setJustLaunched, permissionPrompts, respondToPrompt, interruptSession, agentConfigs, requestAgentConfig, setAgentModel, setAgentPermissionMode, setAntigravityMode, setCodexConfig, newThread, openPanel, requestChatList, switchChat, newChat, chatLists, requestThreadList, switchThread, threadLists, switchWorkspace, requestTerminalOutput, terminalOutputs, requestFileChanges, fileChanges, sendAttachment, send, sendToSession, steerMessage, launchSession, resumeSession, closeSession, activeSessionRef, workspaces, branchLists, requestBranchList, switchBranch, createBranch, skillLists, requestSkillList };
+    return { sessions, messages, connected, unread, setUnread, thinking, thinkingContent, activities, health, deliveryStates, launchStates, justLaunched, setJustLaunched, permissionPrompts, respondToPrompt, interruptSession, agentConfigs, requestAgentConfig, setAgentModel, setAgentPermissionMode, setAntigravityMode, setCodexConfig, newThread, openPanel, requestChatList, switchChat, newChat, chatLists, requestThreadList, switchThread, threadLists, switchWorkspace, requestTerminalOutput, terminalOutputs, requestFileChanges, fileChanges, sendAttachment, send, sendToSession, steerMessage, discardQueuedMessage, editQueuedMessage, queuedMessages, launchSession, resumeSession, closeSession, activeSessionRef, workspaces, branchLists, requestBranchList, switchBranch, createBranch, skillLists, requestSkillList };
   }
 
 // (removed window.useRelay — now an ES module export)

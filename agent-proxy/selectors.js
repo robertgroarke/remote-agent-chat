@@ -963,60 +963,16 @@ const CODEX_READ_EXPR = `
   return JSON.stringify(msgs);
 `;
 
-// Expand collapsed "Worked for" / "Running command" sections in Codex so command content is in the DOM.
-// Only expands sections that were collapsed — tracks which ones we opened so we can re-collapse.
-async function _expandCodexWorkedSections(Runtime, usePageEval) {
-  const evalFn = usePageEval ? evalInPage : evalInFrame;
-  try {
-    const count = await evalFn(Runtime, `
-      var btns = Array.from(d.querySelectorAll('button[aria-expanded="false"]')).filter(function(b) {
-        return /Worked for|Running command/i.test(b.textContent);
-      });
-      window.__rac_codex_exp = btns;
-      btns.forEach(function(b) { b.click(); });
-      return btns.length;
-    `);
-    const n = Number(count) || 0;
-    if (n === 0) return 0;
-    // Wait for React to render the expanded content
-    for (let i = 0; i < 10; i++) {
-      await new Promise(r => setTimeout(r, 150));
-      const ready = await evalFn(Runtime, `
-        var btns = window.__rac_codex_exp || [];
-        return btns.every(function(b) { return b.getAttribute('aria-expanded') === 'true'; });
-      `).catch(() => true);
-      if (ready) break;
-    }
-    return n;
-  } catch { return 0; }
-}
-
-async function _collapseCodexWorkedSections(Runtime, usePageEval) {
-  const evalFn = usePageEval ? evalInPage : evalInFrame;
-  try {
-    await evalFn(Runtime, `
-      if (window.__rac_codex_exp) {
-        window.__rac_codex_exp.forEach(function(b) {
-          if (b.getAttribute('aria-expanded') === 'true') b.click();
-        });
-        window.__rac_codex_exp = null;
-      }
-    `);
-  } catch {}
-}
-
 async function readCodexMessages(Runtime, sessionId, usePageEval) {
-  // Pre-flight: expand "Worked for" / "Running command" sections
-  const expanded = await _expandCodexWorkedSections(Runtime, usePageEval);
-
+  // Keep background polling read-only.
+  // Expanding/collapsing Codex disclosure rows during every poll causes visible
+  // UI thrash in the desktop app, so we only read what is already rendered.
   try {
     const raw = usePageEval
       ? await evalInPage(Runtime, CODEX_READ_EXPR)
       : await evalInFrame(Runtime, CODEX_READ_EXPR);
-    if (expanded > 0) await _collapseCodexWorkedSections(Runtime, usePageEval);
     if (raw !== null) { resetReadFailures(sessionId); return raw; }
   } catch (e) {
-    if (expanded > 0) await _collapseCodexWorkedSections(Runtime, usePageEval);
     console.warn(`[${sessionId}] [sel] Codex read error: ${e.message}`);
   }
 
@@ -2606,25 +2562,58 @@ async function injectCodexImage(Runtime, base64Data, mimeType, filename, usePage
 // or "Resets on March 15 at 3:00 PM").  Returns null when not rate-limited.
 
 const READ_CODEX_RATE_LIMIT_EXPR = `
-  var allText = (d.body ? d.body.innerText : '');
-  var rateLimitPat = /rate.?limit|usage.?limit|too many requests|try again after|reset(s)? (on|at|after)|blocked until|available after|limit reset|quota exceeded/i;
-  if (!rateLimitPat.test(allText)) return null;
+  function isVisible(el) {
+    if (!el || el.offsetParent === null) return false;
+    var cs = getComputedStyle(el);
+    return cs && cs.visibility !== 'hidden' && cs.display !== 'none';
+  }
 
-  // Pattern 1: ISO datetime (2024-03-15T14:30:00)
-  var isoMatch = allText.match(/\\d{4}-\\d{2}-\\d{2}T\\d{2}:\\d{2}:\\d{2}/);
-  if (isoMatch) return JSON.stringify({ rate_limited: true, until_text: isoMatch[0] });
+  function normalizeText(text) {
+    return (text || '').replace(/\\s+/g, ' ').trim();
+  }
 
-  // Pattern 2: "after/until/at HH:MM AM/PM [timezone]"
-  var afterMatch = allText.match(/(?:after|until|at)\\s+([\\d]{1,2}:[\\d]{2}(?::[\\d]{2})?(?:\\s*(?:AM|PM|UTC|GMT|[A-Z]{2,4}))?)/i);
-  if (afterMatch) return JSON.stringify({ rate_limited: true, until_text: afterMatch[1].trim() });
+  function extractUntil(text) {
+    if (!text) return null;
+    var isoMatch = text.match(/\\d{4}-\\d{2}-\\d{2}T\\d{2}:\\d{2}:\\d{2}/);
+    if (isoMatch) return isoMatch[0];
 
-  // Pattern 3: Month Day[,] [Year][,] [at] HH:MM [AM/PM]
-  // Handles "Mar 20, 2026, 3:42 AM" and "Mar 20, 2026 at 3:42 AM" and "Mar 20 3:42 AM"
-  var dateMatch = allText.match(/(Jan(?:uary)?|Feb(?:ruary)?|Mar(?:ch)?|Apr(?:il)?|May|Jun(?:e)?|Jul(?:y)?|Aug(?:ust)?|Sep(?:tember)?|Oct(?:ober)?|Nov(?:ember)?|Dec(?:ember)?)\\s+\\d{1,2}(?:,?\\s+\\d{4})?(?:[,\\s]+(?:at\\s+)?)?\\d{1,2}:\\d{2}(?::[\\d]{2})?\\s*(?:AM|PM|UTC|GMT)?/i);
-  if (dateMatch) return JSON.stringify({ rate_limited: true, until_text: dateMatch[0].trim() });
+    var afterMatch = text.match(/(?:after|until|at)\\s+([\\d]{1,2}:[\\d]{2}(?::[\\d]{2})?(?:\\s*(?:AM|PM|UTC|GMT|[A-Z]{2,4}))?)/i);
+    if (afterMatch) return afterMatch[1].trim();
 
-  // Rate limited but couldn't extract specific time
-  return JSON.stringify({ rate_limited: true, until_text: null });
+    var dateMatch = text.match(/(Jan(?:uary)?|Feb(?:ruary)?|Mar(?:ch)?|Apr(?:il)?|May|Jun(?:e)?|Jul(?:y)?|Aug(?:ust)?|Sep(?:tember)?|Oct(?:ober)?|Nov(?:ember)?|Dec(?:ember)?)\\s+\\d{1,2}(?:,?\\s+\\d{4})?(?:[,\\s]+(?:at\\s+)?)?\\d{1,2}:\\d{2}(?::[\\d]{2})?\\s*(?:AM|PM|UTC|GMT)?/i);
+    if (dateMatch) return dateMatch[0].trim();
+
+    return null;
+  }
+
+  var rateWordPat = /rate.?limit|usage.?limit|too many requests|blocked until|available after|quota exceeded/i;
+  var resetWordPat = /try again after|available after|reset(s)? (on|at|after)|blocked until|quota exceeded/i;
+  var conv = d.querySelector('[data-thread-find-target="conversation"]');
+
+  // Scan only short, visible, status-like UI text outside the transcript.
+  var candidates = Array.from(d.querySelectorAll(
+    '[role="alert"], [role="status"], [aria-live], [class*="warning"], [class*="error"], [class*="alert"], [class*="notice"], [class*="banner"], button, div, span, p'
+  )).filter(function(el) {
+    if (!isVisible(el)) return false;
+    if (conv && conv.contains(el)) return false;
+    if (el.closest && el.closest('[data-thread-find-target="conversation"], pre, code')) return false;
+    var text = normalizeText(el.innerText || el.textContent || '');
+    if (!text || text.length < 8 || text.length > 240) return false;
+    if (!rateWordPat.test(text)) return false;
+    return resetWordPat.test(text);
+  });
+
+  if (candidates.length === 0) return null;
+
+  // Prefer the shortest matching banner/status text to avoid container over-capture.
+  candidates.sort(function(a, b) {
+    var at = normalizeText(a.innerText || a.textContent || '');
+    var bt = normalizeText(b.innerText || b.textContent || '');
+    return at.length - bt.length;
+  });
+
+  var bestText = normalizeText(candidates[0].innerText || candidates[0].textContent || '');
+  return JSON.stringify({ rate_limited: true, until_text: extractUntil(bestText) });
 `;
 
 async function readCodexRateLimit(Runtime, usePageEval) {
@@ -2757,33 +2746,43 @@ const READ_ANTIGRAVITY_RATE_LIMIT_EXPR = `
 // incidental text matches (e.g. "overloaded" in a code comment, timestamps
 // in transcript messages) don't produce false positives.
 //
-// TODO: inspect a rate-limited Claude Code webview via CDP and replace these
-// placeholder selectors with confirmed class names / test IDs.
+// Claude Code usage warning banner: class like "banner_XXXX" with text
+// "You've used NN% of your session limit · resets in Xh"
 const READ_CLAUDE_RATE_LIMIT_EXPR = `
-  // STUB selectors — replace after observing a live rate-limited session
-  var bannerEl = d.querySelector(
-    '[data-testid="rate-limit-banner"], ' +
-    '[data-testid="usage-limit-banner"], ' +
-    '.rate-limit-notice, ' +
-    '[class*="rateLimitBanner"], ' +
-    '[class*="usageLimitBanner"], ' +
-    '[class*="RateLimitBanner"]'
-  );
+  function isActuallyVisible(el) {
+    if (!el || el.offsetParent === null) return false;
+    var cs = getComputedStyle(el);
+    if (!cs || cs.display === 'none' || cs.visibility === 'hidden' || cs.opacity === '0') return false;
+    var r = el.getBoundingClientRect();
+    if (!r || r.width < 4 || r.height < 4) return false;
+    var vh = window.innerHeight || document.documentElement.clientHeight || 0;
+    var vw = window.innerWidth || document.documentElement.clientWidth || 0;
+    return r.bottom > 0 && r.right > 0 && r.top < vh && r.left < vw;
+  }
+
+  // Match by class prefix (hash suffix changes between builds)
+  var bannerEl = null;
+  var candidates = d.querySelectorAll('[class*="banner_"]');
+  for (var i = 0; i < candidates.length; i++) {
+    var t = (candidates[i].textContent || '').trim();
+    if ((t.indexOf('session limit') >= 0 || t.indexOf('usage') >= 0) && isActuallyVisible(candidates[i])) {
+      bannerEl = candidates[i];
+      break;
+    }
+  }
   if (!bannerEl) return null;
 
-  // If a confirmed banner is present, try to extract a reset time from its text
-  var bannerText = bannerEl.innerText || bannerEl.textContent || '';
+  var bannerText = bannerEl.textContent || '';
 
-  var isoMatch = bannerText.match(/\\d{4}-\\d{2}-\\d{2}T\\d{2}:\\d{2}:\\d{2}/);
-  if (isoMatch) return JSON.stringify({ rate_limited: true, until_text: isoMatch[0] });
+  // Extract percentage: "You've used 93% of your session limit"
+  var pctMatch = bannerText.match(/(\\d+)%/);
+  var pct = pctMatch ? parseInt(pctMatch[1], 10) : null;
 
-  var afterMatch = bannerText.match(/(?:after|until|at)\\s+([\\d]{1,2}:[\\d]{2}(?::[\\d]{2})?(?:\\s*(?:AM|PM|UTC|GMT|[A-Z]{2,4}))?)/i);
-  if (afterMatch) return JSON.stringify({ rate_limited: true, until_text: afterMatch[1].trim() });
+  // Extract reset time: "resets in 1h", "resets in 30m", "resets in 2h 15m"
+  var resetMatch = bannerText.match(/resets\\s+in\\s+([\\dhmins ]+)/i);
+  var resetText = resetMatch ? resetMatch[1].trim() : null;
 
-  var dateMatch = bannerText.match(/(Jan(?:uary)?|Feb(?:ruary)?|Mar(?:ch)?|Apr(?:il)?|May|Jun(?:e)?|Jul(?:y)?|Aug(?:ust)?|Sep(?:tember)?|Oct(?:ober)?|Nov(?:ember)?|Dec(?:ember)?)\\s+\\d{1,2}(?:,?\\s+\\d{4})?(?:\\s+at)?\\s+\\d{1,2}:\\d{2}(?::[\\d]{2})?\\s*(?:AM|PM|UTC|GMT)?/i);
-  if (dateMatch) return JSON.stringify({ rate_limited: true, until_text: dateMatch[0].trim() });
-
-  return JSON.stringify({ rate_limited: true, until_text: null });
+  return JSON.stringify({ rate_limited: true, percent_used: pct, until_text: resetText });
 `;
 
 async function readClaudeRateLimit(Runtime) {
@@ -4965,6 +4964,7 @@ module.exports = {
   readAntigravityPanelTitle,
   detectAntigravityPanelHasContent,
   readCodexRateLimit,
+  readClaudeRateLimit,
   readRateLimit,
   setCodexDesktopConfig,
   newCodexThread,

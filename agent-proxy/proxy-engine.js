@@ -561,6 +561,15 @@ class ProxyEngine extends EventEmitter {
           })
           .catch(e => this._log('warn', `[relay] History resync failed for ${sessionId}: ${e.message}`));
       }
+      // Re-broadcast queued messages so the frontend queue bar survives refresh
+      for (const [sessionId, session] of this.sessions.entries()) {
+        if (session.messageQueue?.length) {
+          for (const item of session.messageQueue) {
+            this._sendToRelay(proto.messageQueued(sessionId, item.client_message_id, item.content));
+          }
+          this._log('info', `[relay] Re-broadcast ${session.messageQueue.length} queued messages for ${sessionId}`);
+        }
+      }
       return;
     }
 
@@ -597,6 +606,32 @@ class ProxyEngine extends EventEmitter {
 
     if (type === 'steer') {
       this._handleSteerRequest(msg);
+      return;
+    }
+
+    if (type === 'discard_queued') {
+      const sid = msg.session_id || msg.session;
+      const session = this.sessions.get(sid);
+      if (session?.messageQueue) {
+        const wasFirst = session.messageQueue[0]?.client_message_id === msg.client_message_id;
+        session.messageQueue = session.messageQueue.filter(m => m.client_message_id !== msg.client_message_id);
+        this._log('info', `[${sid}] Discarded queued message ${msg.client_message_id} (remaining: ${session.messageQueue.length})`);
+        // If the discarded message was the one in ProseMirror, type the next one
+        if (wasFirst) this._typeNextQueuedIntoProseMirror(sid);
+      }
+      return;
+    }
+
+    if (type === 'edit_queued') {
+      const sid = msg.session_id || msg.session;
+      const session = this.sessions.get(sid);
+      if (session?.messageQueue) {
+        const item = session.messageQueue.find(m => m.client_message_id === msg.client_message_id);
+        if (item) {
+          item.content = msg.content;
+          this._log('info', `[${sid}] Edited queued message ${msg.client_message_id}`);
+        }
+      }
       return;
     }
 
@@ -1851,6 +1886,7 @@ class ProxyEngine extends EventEmitter {
       last_seen_at:     s.last_seen_at,
       rate_limited_until: s.rate_limited_until || null,
       rate_limit_active:  s.rateLimitActive    || false,
+      percent_used:       s.percentUsed        ?? null,
       is_list_view:       s._panelEmpty        || false,
     }));
   }
@@ -2156,21 +2192,28 @@ class ProxyEngine extends EventEmitter {
         }
       }
 
-      // Rate limit check — Codex only
-      if (session.agentType === 'codex') {
+      // Rate limit / usage warning check — Codex and Claude
+      if (session.agentType === 'codex' || session.agentType === 'claude') {
         session._rateLimitPollCount = (session._rateLimitPollCount || 0) + 1;
         if (session._rateLimitPollCount >= 10) {
           session._rateLimitPollCount = 0;
-          selectors.readCodexRateLimit(session.client.Runtime).then(rl => {
+          const readFn = session.agentType === 'codex'
+            ? selectors.readCodexRateLimit(session.client.Runtime)
+            : selectors.readClaudeRateLimit(session.client.Runtime);
+          readFn.then(rl => {
             const wasActive = session.rateLimitActive || false;
             const nowActive = rl?.rate_limited === true;
             const untilText = rl?.until_text || null;
-            if (wasActive !== nowActive) {
+            const pctUsed   = rl?.percent_used ?? null;
+            const sig = `${nowActive}|${pctUsed}|${untilText}`;
+            if (sig !== session._rateLimitSig) {
+              session._rateLimitSig = sig;
               session.rateLimitActive    = nowActive;
               session.rate_limited_until = nowActive ? (untilText || 'unknown') : null;
+              session.percentUsed        = pctUsed;
               if (nowActive) {
-                this._log('info', `[${sessionId}] [rate-limit] Active: ${untilText || 'no reset time'}`);
-                this._sendToRelay(proto.rateLimitActive(sessionId, untilText));
+                this._log('info', `[${sessionId}] [rate-limit] Active: ${pctUsed != null ? pctUsed + '%' : ''} resets ${untilText || 'unknown'}`);
+                this._sendToRelay(proto.rateLimitActive(sessionId, untilText, pctUsed));
               } else {
                 this._log('info', `[${sessionId}] [rate-limit] Cleared`);
                 this._sendToRelay(proto.rateLimitCleared(sessionId));
@@ -2273,6 +2316,27 @@ class ProxyEngine extends EventEmitter {
 
     this._log('info', `[${sessionId}] Injecting: ${messageContent.substring(0, 80)}...`);
 
+    // Pre-send busy check for Codex: if the agent is busy, queue the message
+    // and type it into ProseMirror so Codex shows its native Steer button.
+    // The web UI shows queued messages with Steer buttons that click the native button.
+    const isCodexType = sessionData.agentType === 'codex' || sessionData.agentType === 'codex-desktop';
+    const activityKind = sessionData.activity?.kind;
+    if (isCodexType && (activityKind === 'thinking' || activityKind === 'generating') && client_message_id) {
+      if (!sessionData.messageQueue) sessionData.messageQueue = [];
+      const isFirstInQueue = sessionData.messageQueue.length === 0;
+      sessionData.messageQueue.push({ content: messageContent, client_message_id, queued_at: Date.now() });
+      // Only type the FIRST queued message into ProseMirror (so Codex shows its
+      // native Steer button). Subsequent messages stay in proxy queue — typing
+      // each one would overwrite the previous in the single ProseMirror input.
+      if (isFirstInQueue) {
+        const usePageEval = sessionData.agentType === 'codex-desktop';
+        await selectors.steerCodexInput(sessionData.client.Runtime, messageContent, usePageEval);
+      }
+      this._log('info', `[${sessionId}] Agent is ${activityKind} — queued ${client_message_id} (depth: ${sessionData.messageQueue.length})${isFirstInQueue ? ' + typed into input' : ''}`);
+      this._sendToRelay(proto.messageQueued(sessionId, client_message_id, messageContent));
+      return;
+    }
+
     let result;
     for (let attempt = 0; attempt <= SEND_MAX_RETRIES; attempt++) {
       if (attempt > 0) {
@@ -2344,6 +2408,8 @@ class ProxyEngine extends EventEmitter {
       this._sendToRelay(proto.proxyStatus(sessionId, session.status || 'healthy', genActivity));
       this._sendToRelay(proto.queueDelivered(sessionId, item.client_message_id));
       this._sendToRelay(proto.proxySendResult(sessionId, item.client_message_id, 'delivered'));
+      // Type next queued message into ProseMirror
+      await this._typeNextQueuedIntoProseMirror(sessionId);
     } else if (result.code === 'agent_busy') {
       // Agent went busy again — re-queue
       session.messageQueue.unshift(item);
@@ -2351,10 +2417,14 @@ class ProxyEngine extends EventEmitter {
       this._sendToRelay(proto.proxySendResult(sessionId, item.client_message_id, 'failed', {
         error: { code: result.code, message: result.detail || 'Queued send failed' },
       }));
+      // Type next queued message into ProseMirror even on failure
+      await this._typeNextQueuedIntoProseMirror(sessionId);
     }
   }
 
-  // Handle steer request — inject text into Codex input without sending
+  // Handle steer request — force-send a queued message to Codex even while busy.
+  // Uses steerCodexInput (type text) + Enter key dispatch (submit) to bypass
+  // the SVG-based busy check that would normally block sendCodexPrimary.
   async _handleSteerRequest(msg) {
     const { session_id: sessionId, client_message_id, content } = msg;
     const session = this.sessions.get(sessionId);
@@ -2364,26 +2434,84 @@ class ProxyEngine extends EventEmitter {
       return;
     }
 
-    // Remove from queue if present
+    // Remove from queue
     if (session.messageQueue) {
       session.messageQueue = session.messageQueue.filter(m => m.client_message_id !== client_message_id);
     }
 
-    // Only Codex sessions support steer
     if (session.agentType !== 'codex' && session.agentType !== 'codex-desktop') {
-      this._sendToRelay(proto.steerResult(sessionId, client_message_id, 'failed', 'Steer not supported for this agent type'));
+      this._sendToRelay(proto.steerResult(sessionId, client_message_id, 'failed', 'Steer not supported'));
       return;
     }
 
-    this._log('info', `[${sessionId}] Steer: injecting text into Codex input`);
-    const usePageEval = session.agentType === 'codex-desktop';
-    const result = await selectors.steerCodexInput(session.client.Runtime, content, usePageEval);
+    this._log('info', `[${sessionId}] Steer: clicking Codex native Steer button`);
 
-    this._sendToRelay(proto.steerResult(
-      sessionId, client_message_id,
-      result.ok ? 'ok' : 'failed',
-      result.ok ? null : (result.detail || result.code)
-    ));
+    const usePageEval = session.agentType === 'codex-desktop';
+    const evalFn = usePageEval ? selectors.evalInPage : selectors.evalInFrame;
+
+    // Find and click Codex's native "Steer" button in the DOM.
+    // The message is already queued in Codex (typed into input during pre-send).
+    // Codex shows a "Steer" button next to queued messages while generating.
+    const clickResult = await evalFn(session.client.Runtime, `
+      // Strategy 1: Find a button whose text content is exactly "Steer"
+      var btns = Array.from(d.querySelectorAll('button'));
+      var steerBtn = btns.find(function(b) {
+        var t = (b.textContent || '').trim();
+        return t === 'Steer' || t === '↩ Steer';
+      });
+      if (steerBtn) { steerBtn.click(); return 'clicked-steer'; }
+
+      // Strategy 2: Find any clickable element with "Steer" text
+      var all = d.querySelectorAll('[role="button"], a, span');
+      for (var i = 0; i < all.length; i++) {
+        var t = (all[i].textContent || '').trim();
+        if (t === 'Steer' || t === '↩ Steer') { all[i].click(); return 'clicked-steer-alt'; }
+      }
+
+      // Strategy 3: Look for aria-label containing steer
+      var ariaBtn = d.querySelector('[aria-label*="steer" i], [aria-label*="Steer"]');
+      if (ariaBtn) { ariaBtn.click(); return 'clicked-aria'; }
+
+      return 'no-steer-button';
+    `);
+
+    if (clickResult && clickResult.startsWith('clicked')) {
+      this._log('info', `[${sessionId}] Steer: ${clickResult}`);
+      this._sendToRelay(proto.steerResult(sessionId, client_message_id, 'ok'));
+    } else {
+      // Fallback: type + Enter if native steer button not found
+      this._log('warn', `[${sessionId}] Steer: native button not found (${clickResult}), falling back to type+Enter`);
+      const typeResult = await selectors.steerCodexInput(session.client.Runtime, content, usePageEval);
+      if (typeResult.ok) {
+        await new Promise(r => setTimeout(r, 400));
+        await evalFn(session.client.Runtime, `
+          var input = d.querySelector('.ProseMirror');
+          if (input) { input.focus(); input.dispatchEvent(new KeyboardEvent('keydown', { key: 'Enter', code: 'Enter', keyCode: 13, which: 13, bubbles: true })); }
+        `);
+      }
+      this._sendToRelay(proto.steerResult(sessionId, client_message_id, typeResult.ok ? 'ok' : 'failed', typeResult.ok ? null : 'fallback'));
+    }
+    if (ok) {
+      this._sendToRelay(proto.proxySendResult(sessionId, client_message_id, 'delivered'));
+    }
+
+    // Type the next queued message into ProseMirror (if any remain)
+    await this._typeNextQueuedIntoProseMirror(sessionId);
+  }
+
+  // After a queued message is consumed (steered/delivered/discarded),
+  // type the next one into ProseMirror so Codex shows its native Steer button.
+  async _typeNextQueuedIntoProseMirror(sessionId) {
+    const session = this.sessions.get(sessionId);
+    if (!session?.messageQueue?.length) return;
+    const next = session.messageQueue[0];
+    const usePageEval = session.agentType === 'codex-desktop';
+    try {
+      await selectors.steerCodexInput(session.client.Runtime, next.content, usePageEval);
+      this._log('info', `[${sessionId}] Typed next queued message into ProseMirror: ${next.client_message_id}`);
+    } catch (e) {
+      this._log('warn', `[${sessionId}] Failed to type next queued: ${e.message}`);
+    }
   }
 
   // ─── Target discovery ────────────────────────────────────────────────
