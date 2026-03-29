@@ -572,6 +572,12 @@ body {
   position: relative;
 }
 
+.session-tasklist-strip {
+  padding: 10px 18px 0;
+  border-bottom: 1px solid rgba(255, 255, 255, 0.03);
+  flex-shrink: 0;
+}
+
 .last-user-banner {
   display: flex;
   align-items: center;
@@ -1192,6 +1198,13 @@ body {
   margin-left: -2px;
 }
 
+.activity-row.pinned {
+  margin: 0 0 10px;
+  padding: 6px 14px 6px 18px;
+  border-left-width: 3px;
+  border-radius: 10px;
+}
+
 .activity-row.active {
   border-left-color: var(--accent);
   background: rgba(104,179,255,0.03);
@@ -1234,6 +1247,89 @@ body {
   color: var(--text2);
   line-height: 1.35;
   font-family: 'Cascadia Code', 'SF Mono', Consolas, monospace;
+}
+
+.activity-tasklist {
+  margin-top: 8px;
+  padding: 10px 12px;
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  background: rgba(255, 255, 255, 0.025);
+  min-width: min(640px, calc(100vw - 140px));
+  max-width: 100%;
+}
+
+.activity-row.pinned .activity-tasklist {
+  min-width: 0;
+  width: min(760px, 100%);
+}
+
+.activity-tasklist-head {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 12px;
+}
+
+.activity-tasklist-summary,
+.activity-tasklist-count {
+  font-size: 11px;
+  font-family: 'Cascadia Code', 'SF Mono', Consolas, monospace;
+  color: var(--text2);
+}
+
+.activity-tasklist-count {
+  color: var(--text3);
+  flex-shrink: 0;
+}
+
+.activity-tasklist-bar {
+  margin-top: 8px;
+  height: 6px;
+  border-radius: 999px;
+  background: rgba(255, 255, 255, 0.08);
+  overflow: hidden;
+}
+
+.activity-tasklist-bar-fill {
+  height: 100%;
+  border-radius: inherit;
+  background: linear-gradient(90deg, var(--accent), #7be3c3);
+  transition: width 0.2s ease;
+}
+
+.activity-tasklist-items {
+  margin-top: 10px;
+  display: flex;
+  flex-direction: column;
+  gap: 7px;
+}
+
+.activity-task-item {
+  display: flex;
+  align-items: flex-start;
+  gap: 8px;
+  font-size: 12px;
+  line-height: 1.4;
+  color: var(--text);
+}
+
+.activity-task-item.pending { color: var(--text2); }
+.activity-task-item.in_progress { color: var(--accent); }
+.activity-task-item.completed { color: var(--green); }
+
+.activity-task-item-icon {
+  width: 14px;
+  text-align: center;
+  flex-shrink: 0;
+  font-size: 12px;
+  margin-top: 1px;
+}
+
+.activity-task-item-text {
+  min-width: 0;
+  white-space: pre-wrap;
+  word-break: break-word;
 }
 
 .activity-kind {

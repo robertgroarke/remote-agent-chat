@@ -247,7 +247,7 @@ function ClaudeSpinner() {
   return <span className="claude-spinner-icon">{SPINNER_SYMBOLS[frame]}</span>;
 }
 
-function ActivityRow({ activity, thinkingText, isClaude }) {
+function ActivityRow({ activity, thinkingText, isClaude, pinned = false }) {
   const kind = activity?.kind || 'working';
   const meta = ACTIVITY_META[kind] || ACTIVITY_META.working;
   const isActive = meta.tone === 'thinking' || meta.tone === 'info';
@@ -257,7 +257,7 @@ function ActivityRow({ activity, thinkingText, isClaude }) {
   const [expanded, setExpanded] = React.useState(false);
 
   return (
-    <div className={`activity-row ${meta.tone}${isActive ? ' active' : ''}${showBlob ? ' claude-thinking' : ''}`}>
+    <div className={`activity-row ${meta.tone}${isActive ? ' active' : ''}${showBlob ? ' claude-thinking' : ''}${pinned ? ' pinned' : ''}`}>
       <div className="activity-icon">
         {showBlob
           ? <ClaudeSpinner />
@@ -2110,6 +2110,17 @@ function App() {
           </div>
         </div>
 
+        {activeActivity?.task_list && (
+          <div className="session-tasklist-strip">
+            <ActivityRow
+              activity={activeActivity}
+              thinkingText={activeSession ? (thinkingContent[activeSession] || '') : ''}
+              isClaude={activeSessionMeta?.agent_type === 'claude'}
+              pinned={true}
+            />
+          </div>
+        )}
+
         {showBranchSelector && activeSession && activeConfig?.capabilities?.branch_list && (
           <BranchSelectorPanel
             branchData={branchLists[activeSession] || null}
@@ -2229,7 +2240,7 @@ function App() {
               )
             ))
           )}
-          {activeActivity && <ActivityRow
+          {activeActivity && !activeActivity?.task_list && <ActivityRow
             activity={activeActivity}
             thinkingText={activeSession ? (thinkingContent[activeSession] || '') : ''}
             isClaude={activeSessionMeta?.agent_type === 'claude'}
