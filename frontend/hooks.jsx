@@ -16,7 +16,7 @@ export function useRelay() {
     const [thinkingContent, setThinkingContent] = useState({});   // sessionId -> string (Claude Code thinking text) | ''
     const [activities,      setActivities]      = useState({});   // sessionId -> { kind, label, updatedAt } | false
     const [health,          setHealth]          = useState({});   // sessionId -> 'healthy'|'degraded'|'disconnected'
-    const [deliveryStates,  setDeliveryStates]  = useState({});   // clientMsgId -> 'queued'|'accepted'|'failed'
+    const [deliveryStates,  setDeliveryStates]  = useState({});   // clientMsgId -> 'queued'|'accepted'|'failed'|'busy_queued'|'steered'
     const [launchStates,      setLaunchStates]      = useState({});   // requestId -> { status:'launching'|'failed', agentType, error? }
     const [justLaunched,      setJustLaunched]      = useState(null); // session_id of most recently launched session (for auto-select)
     const [permissionPrompts, setPermissionPrompts] = useState({});   // session_id -> prompt object (one active prompt per session)
@@ -264,6 +264,10 @@ export function useRelay() {
       return cid;
     }
 
+    function steerMessage(sessionId, clientMessageId, content) {
+      send({ type: 'steer', session_id: sessionId, client_message_id: clientMessageId, content });
+    }
+
     function handleRelayMessage(msg) {
       const t = msg.type;
 
@@ -505,6 +509,25 @@ export function useRelay() {
         return;
       }
 
+      // ── Steer / queue messages ──────────────────────────────────────────────
+      if (t === 'message_queued') {
+        const cid = msg.client_message_id;
+        if (cid) setDeliveryStates(prev => ({ ...prev, [cid]: 'busy_queued' }));
+        return;
+      }
+      if (t === 'queue_delivered') {
+        const cid = msg.client_message_id;
+        if (cid) setDeliveryStates(prev => ({ ...prev, [cid]: 'accepted' }));
+        return;
+      }
+      if (t === 'steer_result') {
+        const cid = msg.client_message_id;
+        if (cid) {
+          setDeliveryStates(prev => ({ ...prev, [cid]: msg.result === 'ok' ? 'steered' : 'failed' }));
+        }
+        return;
+      }
+
       // ── Session launch lifecycle ─────────────────────────────────────────────
       if (t === 'session_launching') {
         // Relay acknowledged the launch request; proxy is now trying to open the agent.
@@ -577,7 +600,7 @@ export function useRelay() {
       }
     }
 
-    return { sessions, messages, connected, unread, setUnread, thinking, thinkingContent, activities, health, deliveryStates, launchStates, justLaunched, setJustLaunched, permissionPrompts, respondToPrompt, interruptSession, agentConfigs, requestAgentConfig, setAgentModel, setAgentPermissionMode, setAntigravityMode, setCodexConfig, newThread, openPanel, requestChatList, switchChat, newChat, chatLists, requestThreadList, switchThread, threadLists, switchWorkspace, requestTerminalOutput, terminalOutputs, requestFileChanges, fileChanges, sendAttachment, send, sendToSession, launchSession, resumeSession, closeSession, activeSessionRef, workspaces, branchLists, requestBranchList, switchBranch, createBranch, skillLists, requestSkillList };
+    return { sessions, messages, connected, unread, setUnread, thinking, thinkingContent, activities, health, deliveryStates, launchStates, justLaunched, setJustLaunched, permissionPrompts, respondToPrompt, interruptSession, agentConfigs, requestAgentConfig, setAgentModel, setAgentPermissionMode, setAntigravityMode, setCodexConfig, newThread, openPanel, requestChatList, switchChat, newChat, chatLists, requestThreadList, switchThread, threadLists, switchWorkspace, requestTerminalOutput, terminalOutputs, requestFileChanges, fileChanges, sendAttachment, send, sendToSession, steerMessage, launchSession, resumeSession, closeSession, activeSessionRef, workspaces, branchLists, requestBranchList, switchBranch, createBranch, skillLists, requestSkillList };
   }
 
 // (removed window.useRelay — now an ES module export)

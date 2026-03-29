@@ -284,6 +284,45 @@ function skillsList(sessionId, skills) {
   };
 }
 
+// ─── Message queue events ────────────────────────────────────────────────────
+
+// Sent when a message has been queued for delivery to the agent session.
+function messageQueued(sessionId, clientMessageId, content) {
+  return {
+    type:              'message_queued',
+    protocol_version:  PROTOCOL_VERSION,
+    session_id:        sessionId,
+    client_message_id: clientMessageId,
+    content,
+    queued_at:         new Date().toISOString(),
+  };
+}
+
+// Sent when a queued message has been successfully delivered to the agent.
+function queueDelivered(sessionId, clientMessageId) {
+  return {
+    type:              'queue_delivered',
+    protocol_version:  PROTOCOL_VERSION,
+    session_id:        sessionId,
+    client_message_id: clientMessageId,
+    delivered_at:      new Date().toISOString(),
+  };
+}
+
+// Sent with the result of a steer (mid-conversation injection) attempt.
+function steerResult(sessionId, clientMessageId, result, error) {
+  const msg = {
+    type:              'steer_result',
+    protocol_version:  PROTOCOL_VERSION,
+    session_id:        sessionId,
+    client_message_id: clientMessageId,
+    result,
+    server_ts:         new Date().toISOString(),
+  };
+  if (result === 'failed' && error) msg.error = error;
+  return msg;
+}
+
 module.exports = {
   PROTOCOL_VERSION,
   hello,
@@ -303,4 +342,7 @@ module.exports = {
   terminalOutput,
   fileChanges,
   skillsList,
+  messageQueued,
+  queueDelivered,
+  steerResult,
 };

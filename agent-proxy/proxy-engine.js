@@ -59,9 +59,10 @@ const RETRIABLE_SEND_CODES = new Set([
   'input_not_found',
   'send_button_failed',
   'fallback_no_input',
+  // agent_busy is NOT retriable — messages are queued instead (steer feature)
 ]);
-const SEND_MAX_RETRIES    = 3;
-const SEND_RETRY_DELAY_MS = 1500;
+const SEND_MAX_RETRIES    = 8;
+const SEND_RETRY_DELAY_MS = 3000;
 
 // ─── ProxyEngine class ─────────────────────────────────────────────────────
 
@@ -265,7 +266,7 @@ class ProxyEngine extends EventEmitter {
       thread_list:            isDesktop,
       switch_thread:          isDesktop,
       switch_workspace:       isDesktop,
-      open_panel:             agentType === 'codex',
+      open_panel:             false, // Codex side pane is already open if session exists
       chat_list:              agentType === 'codex' || agentType === 'antigravity_panel' || agentType === 'claude-desktop',
       switch_chat:            agentType === 'codex' || agentType === 'antigravity_panel' || agentType === 'claude-desktop',
       new_chat:               agentType === 'codex' || agentType === 'antigravity_panel' || agentType === 'claude-desktop' || agentType === 'claude',
@@ -591,6 +592,11 @@ class ProxyEngine extends EventEmitter {
 
     if (type === 'send') {
       this._handleSendRequest(msg);
+      return;
+    }
+
+    if (type === 'steer') {
+      this._handleSteerRequest(msg);
       return;
     }
 
@@ -2127,6 +2133,11 @@ class ProxyEngine extends EventEmitter {
         session.activity     = newActivity;
         sessionStore.updateSession(sessionId, { activity: newActivity });
         this._sendToRelay(proto.proxyStatus(sessionId, session.status || 'healthy', newActivity));
+
+        // Auto-send queued messages when agent transitions to idle
+        if ((prevKind === 'generating' || prevKind === 'thinking') && kind === 'idle') {
+          this._processMessageQueue(sessionId);
+        }
       }
 
       // Thread list polling — Codex Desktop only (Epic 2)
@@ -2282,6 +2293,15 @@ class ProxyEngine extends EventEmitter {
       if (!RETRIABLE_SEND_CODES.has(result.code)) break;
     }
 
+    // Queue message if agent is busy (steer feature)
+    if (!result.ok && result.code === 'agent_busy' && client_message_id) {
+      if (!sessionData.messageQueue) sessionData.messageQueue = [];
+      sessionData.messageQueue.push({ content: messageContent, client_message_id, queued_at: Date.now() });
+      this._log('info', `[${sessionId}] Agent busy — queued message ${client_message_id} (queue depth: ${sessionData.messageQueue.length})`);
+      this._sendToRelay(proto.messageQueued(sessionId, client_message_id, messageContent));
+      return;
+    }
+
     if (result.ok) {
       sessionData.waitingForAssistant = true;
       const genActivity = { kind: 'generating', label: 'Generating', updated_at: new Date().toISOString() };
@@ -2302,6 +2322,68 @@ class ProxyEngine extends EventEmitter {
         }));
       }
     }
+  }
+
+  // Process queued messages when agent goes idle
+  async _processMessageQueue(sessionId) {
+    const session = this.sessions.get(sessionId);
+    if (!session || !session.messageQueue || session.messageQueue.length === 0) return;
+
+    const item = session.messageQueue.shift();
+    this._log('info', `[${sessionId}] Auto-sending queued message ${item.client_message_id}`);
+
+    const result = await selectors.sendMessage(
+      session.client.Runtime, session.agentType, item.content, sessionId
+    );
+
+    if (result.ok) {
+      session.waitingForAssistant = true;
+      const genActivity = { kind: 'generating', label: 'Generating', updated_at: new Date().toISOString() };
+      session.activity = genActivity;
+      sessionStore.updateSession(sessionId, { activity: genActivity });
+      this._sendToRelay(proto.proxyStatus(sessionId, session.status || 'healthy', genActivity));
+      this._sendToRelay(proto.queueDelivered(sessionId, item.client_message_id));
+      this._sendToRelay(proto.proxySendResult(sessionId, item.client_message_id, 'delivered'));
+    } else if (result.code === 'agent_busy') {
+      // Agent went busy again — re-queue
+      session.messageQueue.unshift(item);
+    } else {
+      this._sendToRelay(proto.proxySendResult(sessionId, item.client_message_id, 'failed', {
+        error: { code: result.code, message: result.detail || 'Queued send failed' },
+      }));
+    }
+  }
+
+  // Handle steer request — inject text into Codex input without sending
+  async _handleSteerRequest(msg) {
+    const { session_id: sessionId, client_message_id, content } = msg;
+    const session = this.sessions.get(sessionId);
+
+    if (!session) {
+      this._sendToRelay(proto.steerResult(sessionId, client_message_id, 'failed', 'Session not found'));
+      return;
+    }
+
+    // Remove from queue if present
+    if (session.messageQueue) {
+      session.messageQueue = session.messageQueue.filter(m => m.client_message_id !== client_message_id);
+    }
+
+    // Only Codex sessions support steer
+    if (session.agentType !== 'codex' && session.agentType !== 'codex-desktop') {
+      this._sendToRelay(proto.steerResult(sessionId, client_message_id, 'failed', 'Steer not supported for this agent type'));
+      return;
+    }
+
+    this._log('info', `[${sessionId}] Steer: injecting text into Codex input`);
+    const usePageEval = session.agentType === 'codex-desktop';
+    const result = await selectors.steerCodexInput(session.client.Runtime, content, usePageEval);
+
+    this._sendToRelay(proto.steerResult(
+      sessionId, client_message_id,
+      result.ok ? 'ok' : 'failed',
+      result.ok ? null : (result.detail || result.code)
+    ));
   }
 
   // ─── Target discovery ────────────────────────────────────────────────

@@ -1498,6 +1498,11 @@ function handleProxyConnection(ws, req) {
         ).catch(() => {});
       }
       log('info', 'rate-limit', 'Rate limit cleared', { session: id });
+
+    // ── Steer / queue messages (proxy → browser) ─────────────────────────
+    } else if (t === 'message_queued' || t === 'queue_delivered' || t === 'steer_result') {
+      broadcastToBrowsers(msg);
+      log('info', 'send', `${t}`, { session: msg.session_id, cid: msg.client_message_id });
     }
   });
 
@@ -1723,6 +1728,17 @@ function handleClientConnection(ws, req) {
         sequence:          finalSeq,
         server_message_id: serverId,
       });
+
+    // ── Steer (inject text into Codex input without sending) ───────────────
+    } else if (t === 'steer') {
+      const id = msg.session_id || msg.session;
+      const proxyWs = proxySockets.get(id);
+      if (!proxyWs || proxyWs.readyState !== WebSocket.OPEN) {
+        ws.send(JSON.stringify({ type: 'steer_result', session_id: id, client_message_id: msg.client_message_id, result: 'failed', error: 'Session not connected' }));
+        return;
+      }
+      proxyWs.send(JSON.stringify(msg));
+      log('info', 'send', 'Steer request forwarded', { session: id, cid: msg.client_message_id });
 
     // ── Launch session (A2-08) ─────────────────────────────────────────────
     } else if (t === 'launch_session') {

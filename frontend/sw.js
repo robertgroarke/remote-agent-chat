@@ -1,6 +1,6 @@
 'use strict';
 
-const CACHE_NAME = 'agent-chat-v25';
+const CACHE_NAME = 'agent-chat-v28';
 
 const SHELL_ASSETS = [
   '/',

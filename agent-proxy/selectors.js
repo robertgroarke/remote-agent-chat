@@ -286,10 +286,16 @@ async function detectThinking(Runtime, agentType) {
 
         if (!isThinking) return JSON.stringify({ thinking: false, label: '' });
 
-        // Enhanced activity detection (Epic 8): extract granular activity label
-        // from the last assistant message's tool output sections.
+        // Enhanced activity detection: extract granular activity label.
+        // Check for "Thinking" spinner text first — Codex shows this as a
+        // visible span while the model is reasoning before generating.
         var label = 'Generating';
         try {
+          var thinkLeafs = Array.from(d.querySelectorAll('span')).filter(function(s) {
+            return s.children.length === 0 && s.offsetParent !== null &&
+                   /^Thinking$/i.test((s.textContent || '').trim());
+          });
+          if (thinkLeafs.length > 0) label = 'Thinking';
           // Find the last turn's content units — tool outputs have role info
           var units = Array.from(d.querySelectorAll('[data-content-search-unit-key]'));
           if (units.length > 0) {
@@ -315,16 +321,27 @@ async function detectThinking(Runtime, agentType) {
             }
           }
 
-          // Also check for visible status/progress text near the conversation
-          var statusEls = d.querySelectorAll('[class*="status"], [class*="progress"], [role="status"]');
-          for (var si = statusEls.length - 1; si >= 0; si--) {
-            var statusText = (statusEls[si].innerText || '').trim();
-            if (statusText && statusText.length < 80 && statusText.length > 2) {
-              // Use status text if it's more specific than our current label
-              if (!/generating/i.test(statusText)) {
-                label = statusText;
-              }
+          // Check for "Running command for Ns" expanded button
+          var runBtns = d.querySelectorAll('button[aria-expanded="true"]');
+          for (var ri = runBtns.length - 1; ri >= 0; ri--) {
+            var rtxt = (runBtns[ri].textContent || '').trim();
+            if (/Running command/i.test(rtxt)) {
+              label = rtxt;
               break;
+            }
+          }
+
+          // Also check for visible status/progress text near the conversation
+          if (label === 'Generating') {
+            var statusEls = d.querySelectorAll('[class*="status"], [class*="progress"], [role="status"]');
+            for (var si = statusEls.length - 1; si >= 0; si--) {
+              var statusText = (statusEls[si].innerText || '').trim();
+              if (statusText && statusText.length < 80 && statusText.length > 2) {
+                if (!/generating/i.test(statusText)) {
+                  label = statusText;
+                }
+                break;
+              }
             }
           }
         } catch(e) {}
@@ -654,37 +671,242 @@ const CODEX_READ_EXPR = `
   var bt = String.fromCharCode(96);
   var fence = bt + bt + bt;
 
-  // Strategy 1: data-content-search-unit-key attributes (Codex 2025+ DOM)
-  var unitEls = Array.from(d.querySelectorAll('[data-content-search-unit-key]'));
-  if (unitEls.length > 0) {
-    var msgs = [];
-    for (var u = 0; u < unitEls.length; u++) {
-      var unitEl = unitEls[u];
-      var key = unitEl.getAttribute('data-content-search-unit-key') || '';
-      if (key.endsWith(':user')) {
-        var wpw = unitEl.querySelector('.whitespace-pre-wrap');
-        var text = wpw ? wpw.textContent.trim() : unitEl.textContent.trim();
-        if (text) msgs.push({ role: 'user', content: text });
-      } else if (key.endsWith(':assistant')) {
-        var parts = [];
-        var children = Array.from(unitEl.querySelectorAll('p, li, pre, h1, h2, h3, h4'));
-        for (var c = 0; c < children.length; c++) {
-          var child = children[c];
-          if (child.tagName !== 'PRE' && child.closest('pre')) continue;
-          if (child.tagName === 'PRE') {
-            var codeEl = child.querySelector('code');
-            var langMatch = codeEl ? (codeEl.className.match(/language-(\\w+)/) || []) : [];
-            var lang = langMatch[1] || '';
-            parts.push('\\n' + fence + lang + '\\n' + child.textContent.trim() + '\\n' + fence + '\\n');
-          } else {
-            var t = child.textContent.trim();
-            if (t) parts.push(t);
-          }
+  // Strategy 1: Sequential flat-child reader for Codex conversation container.
+  // The Codex side pane renders all items (user bubbles, "Ran ..." commands, assistant text,
+  // "Context automatically compacted" banners, file change cards, "Worked for" summaries)
+  // as flat siblings inside a flex-col wrapper — NOT nested inside turn elements.
+  var conv = d.querySelector('[data-thread-find-target="conversation"]');
+  // Codex renders turns inside a .flex.flex-col.gap-3 container.
+  // Each child of gap-3 is a complete turn (user msg + assistant response).
+  // Inside each turn, assistant content lives in .flex.flex-col.space-y-0 containers
+  // or as direct children (for simple responses like "Received.").
+  var gap3 = conv ? conv.querySelector('.flex.flex-col.gap-3') : null;
+  if (gap3 && gap3.children.length > 0) {
+    var allItems = [];
+    for (var gi = 0; gi < gap3.children.length; gi++) {
+      var turn = gap3.children[gi];
+      // Collect items from space-y-0 containers inside this turn
+      var sy0s = turn.querySelectorAll(':scope .flex.flex-col.space-y-0');
+      if (sy0s.length > 0) {
+        for (var si = 0; si < sy0s.length; si++) {
+          var ch = sy0s[si].children;
+          for (var ci = 0; ci < ch.length; ci++) allItems.push(ch[ci]);
         }
-        var content = parts.join('\\n').trim();
-        if (content) msgs.push({ role: 'assistant', content: content });
+      }
+      // Also collect direct flex-col gap-0 children (simple turns, final messages)
+      // Skip gap-0 containers that are inside a space-y-0 (already covered) or that
+      // CONTAIN a space-y-0 (their children overlap with sy0 items and the coarse
+      // gap-0 children cause command handlers to swallow narrative text).
+      var gap0s = turn.querySelectorAll(':scope > .flex.flex-col > .flex.flex-col.gap-0');
+      if (gap0s.length === 0) gap0s = turn.querySelectorAll(':scope .flex.flex-col.gap-0');
+      for (var g0i = 0; g0i < gap0s.length; g0i++) {
+        var skipGap0 = false;
+        // Skip if inside a space-y-0
+        var p = gap0s[g0i].parentElement;
+        while (p && p !== turn) {
+          if (p.classList && p.classList.contains('space-y-0')) { skipGap0 = true; break; }
+          p = p.parentElement;
+        }
+        // Skip if this gap-0 contains a space-y-0 (content already collected above)
+        if (!skipGap0 && gap0s[g0i].querySelector('.flex.flex-col.space-y-0')) {
+          skipGap0 = true;
+        }
+        if (!skipGap0) {
+          var ch2 = gap0s[g0i].children;
+          for (var ci2 = 0; ci2 < ch2.length; ci2++) allItems.push(ch2[ci2]);
+        }
       }
     }
+
+    var msgs = [];
+    var pendingAssistant = [];
+
+    function flushAssistant() {
+      if (pendingAssistant.length === 0) return;
+      var content = pendingAssistant.join('\\n\\n').trim();
+      if (content) msgs.push({ role: 'assistant', content: content });
+      pendingAssistant = [];
+    }
+
+    // Extract diff content from a diffs-container shadow DOM.
+    // The shadow DOM uses: <code data-code><div data-gutter>...<div data-content>
+    // The data-content div has children with data-line-type="change-addition"|"change-deletion"|"context"
+    function _extractDiffFromShadow(parentEl) {
+      var dc = parentEl.querySelector('diffs-container');
+      if (!dc || !dc.shadowRoot) return '';
+      var sr = dc.shadowRoot;
+      var contentCol = sr.querySelector('div[data-content]');
+      if (!contentCol) return '';
+      var diffLines = [];
+      var children = contentCol.children;
+      for (var li = 0; li < children.length && diffLines.length < 200; li++) {
+        var line = children[li];
+        var lineType = line.getAttribute('data-line-type') || '';
+        var lineText = (line.innerText || line.textContent || '');
+        // Trim trailing whitespace but preserve leading
+        lineText = lineText.replace(/\\s+$/, '');
+        if (lineType === 'change-addition') {
+          diffLines.push('+' + lineText);
+        } else if (lineType === 'change-deletion') {
+          diffLines.push('-' + lineText);
+        } else if (lineType === 'context' && lineText) {
+          diffLines.push(' ' + lineText);
+        }
+      }
+      return diffLines.length > 0 ? diffLines.join('\\n') : '';
+    }
+
+    var items = allItems;
+    for (var i = 0; i < items.length; i++) {
+      var el = items[i];
+      var text = (el.innerText || '').trim();
+      if (!text) continue; // skip spacers
+
+      // Detect user messages: has items-end class or whitespace-pre-wrap inside items-end
+      var userEl = el.querySelector('[class*="items-end"]');
+      if (userEl) {
+        flushAssistant();
+        var wpw = userEl.querySelector('.whitespace-pre-wrap');
+        var utext = wpw ? wpw.textContent.trim() : userEl.textContent.trim();
+        if (utext) msgs.push({ role: 'user', content: utext });
+        continue;
+      }
+      // Detect user unit key
+      var userUnit = el.querySelector('[data-content-search-unit-key$=":user"]');
+      if (userUnit) {
+        flushAssistant();
+        var wpw2 = userUnit.querySelector('.whitespace-pre-wrap');
+        var ut2 = wpw2 ? wpw2.textContent.trim() : userUnit.textContent.trim();
+        if (ut2) msgs.push({ role: 'user', content: ut2 });
+        continue;
+      }
+
+      // "Context automatically compacted" banner — flush before it
+      if (/context.*compact/i.test(text) && text.length < 60) {
+        flushAssistant();
+        pendingAssistant.push('--- ' + text + ' ---');
+        flushAssistant();
+        continue;
+      }
+
+      // "Worked for Xs" — marks end of a turn, flush accumulated content first
+      var statusBtn = el.querySelector('button[aria-expanded]');
+      if (statusBtn && /Worked for/i.test(statusBtn.textContent)) {
+        pendingAssistant.push((statusBtn.textContent || '').trim());
+        flushAssistant();
+        continue;
+      }
+      // "Running command for Ns" — active, add to current accumulation
+      if (statusBtn && /Running command/i.test(statusBtn.textContent)) {
+        pendingAssistant.push((statusBtn.textContent || '').trim());
+      }
+
+      // Command blocks ("Ran ..." with group/command inside, or "$ ..." shell lines)
+      // The group/command element only contains the command header (e.g. "$ command").
+      // The actual command output lives in .overflow-hidden descendant of the item,
+      // or in a group/output sibling of the command element.
+      var cmdEls = el.querySelectorAll('[class*="group/command"]');
+      if (cmdEls.length > 0) {
+        for (var ci = 0; ci < cmdEls.length; ci++) {
+          var cmdText = (cmdEls[ci].innerText || '').trim();
+          if (!cmdText) continue;
+          var cmdLine = cmdText.split('\\n')[0].replace(/^\\$\\s*/, '').trim();
+          if (!cmdLine) cmdLine = cmdText.split('\\n')[0];
+          // Find the output: try group/output sibling first, then .overflow-hidden in item
+          var outputEl = null;
+          var cp = cmdEls[ci].parentElement;
+          if (cp) {
+            var sib = cp.querySelector('[class*="group/output"]');
+            if (sib) outputEl = sib;
+          }
+          if (!outputEl) outputEl = el.querySelector('.overflow-hidden');
+          var cmdOutput = outputEl ? (outputEl.innerText || '').trim() : '';
+          var block = '[Bash ' + cmdLine + ']\\n' + (cmdOutput || '') + '\\n[end]';
+          pendingAssistant.push(block);
+        }
+        continue;
+      }
+
+      // "Ran ..." summary text (when commands are collapsed — no group/command children)
+      if (/^Ran /i.test(text)) {
+        var ranLine = text.split('\\n')[0].trim().substring(4);
+        // Include any visible output below the "Ran" header
+        var ranOutput = text.split('\\n').slice(1).join('\\n').trim();
+        pendingAssistant.push('[Bash ' + ranLine + ']\\n' + (ranOutput || '') + '\\n[end]');
+        continue;
+      }
+
+      // File change cards
+      var fileDiff = el.querySelector('[class*="group/file-diff"], [class*="thread-diff"]');
+      if (fileDiff) {
+        var fnameBtns = fileDiff.querySelectorAll('button[data-state]');
+        var seenFiles = {};
+        fnameBtns.forEach(function(fb) {
+          var visSpan = fb.querySelector('span:not(.hidden):not([class*="hidden"])');
+          var fname = visSpan ? visSpan.textContent.trim() : (fb.textContent || '').trim();
+          // De-duplicate filename (responsive span renders name twice)
+          if (fname && fname.length > 4) {
+            var fhalf = Math.floor(fname.length / 2);
+            if (fname.substring(0, fhalf) === fname.substring(fhalf)) fname = fname.substring(0, fhalf);
+          }
+          if (fname && fname.length < 200 && !seenFiles[fname]) {
+            seenFiles[fname] = true;
+            var diffContent = _extractDiffFromShadow(el);
+            var block = '[Edit ' + fname + ']\\n';
+            if (diffContent) block += diffContent + '\\n';
+            block += '[end]';
+            pendingAssistant.push(block);
+          }
+        });
+        continue;
+      }
+      // "N file(s) changed" summary
+      if (/^\\d+\\s+files?\\s+changed/i.test(text)) {
+        pendingAssistant.push(text.split('\\n')[0].trim());
+        continue;
+      }
+
+      // "Edited file" block — may have inline diff in shadow DOM
+      if (/^Edited file/i.test(text)) {
+        // Extract filename: look for a line containing a dot (file extension)
+        var editName = '';
+        var _efParts = text.split(String.fromCharCode(10));
+        for (var _efi = 0; _efi < _efParts.length; _efi++) {
+          var _efLine = _efParts[_efi].replace(/^\\s+|\\s+$/g, '');
+          if (_efLine && _efLine.indexOf('.') >= 0 && _efLine.length > 2) {
+            editName = _efLine;
+            break;
+          }
+        }
+        // Remove duplicate filename (responsive span renders name twice)
+        if (editName.length > 4) {
+          var half = Math.floor(editName.length / 2);
+          if (editName.substring(0, half) === editName.substring(half)) {
+            editName = editName.substring(0, half);
+          }
+        }
+        var diffContent = _extractDiffFromShadow(el);
+        if (editName) {
+          var block = '[Edit ' + editName + ']\\n';
+          if (diffContent) block += diffContent + '\\n';
+          block += '[end]';
+          pendingAssistant.push(block);
+        }
+        continue;
+      }
+
+      // "Final message" divider — skip it
+      if (/^Final message$/i.test(text)) continue;
+      // Skip bare button text (Undo, Review)
+      if (/^(Undo|Review)$/i.test(text)) continue;
+
+      // Regular assistant text (narrative paragraphs)
+      if (text.length > 5) {
+        // Use innerText directly — Codex uses divs not p tags
+        pendingAssistant.push(text);
+      }
+    }
+    flushAssistant();
     if (msgs.length > 0) return JSON.stringify(msgs);
   }
 
@@ -741,13 +963,60 @@ const CODEX_READ_EXPR = `
   return JSON.stringify(msgs);
 `;
 
+// Expand collapsed "Worked for" / "Running command" sections in Codex so command content is in the DOM.
+// Only expands sections that were collapsed — tracks which ones we opened so we can re-collapse.
+async function _expandCodexWorkedSections(Runtime, usePageEval) {
+  const evalFn = usePageEval ? evalInPage : evalInFrame;
+  try {
+    const count = await evalFn(Runtime, `
+      var btns = Array.from(d.querySelectorAll('button[aria-expanded="false"]')).filter(function(b) {
+        return /Worked for|Running command/i.test(b.textContent);
+      });
+      window.__rac_codex_exp = btns;
+      btns.forEach(function(b) { b.click(); });
+      return btns.length;
+    `);
+    const n = Number(count) || 0;
+    if (n === 0) return 0;
+    // Wait for React to render the expanded content
+    for (let i = 0; i < 10; i++) {
+      await new Promise(r => setTimeout(r, 150));
+      const ready = await evalFn(Runtime, `
+        var btns = window.__rac_codex_exp || [];
+        return btns.every(function(b) { return b.getAttribute('aria-expanded') === 'true'; });
+      `).catch(() => true);
+      if (ready) break;
+    }
+    return n;
+  } catch { return 0; }
+}
+
+async function _collapseCodexWorkedSections(Runtime, usePageEval) {
+  const evalFn = usePageEval ? evalInPage : evalInFrame;
+  try {
+    await evalFn(Runtime, `
+      if (window.__rac_codex_exp) {
+        window.__rac_codex_exp.forEach(function(b) {
+          if (b.getAttribute('aria-expanded') === 'true') b.click();
+        });
+        window.__rac_codex_exp = null;
+      }
+    `);
+  } catch {}
+}
+
 async function readCodexMessages(Runtime, sessionId, usePageEval) {
+  // Pre-flight: expand "Worked for" / "Running command" sections
+  const expanded = await _expandCodexWorkedSections(Runtime, usePageEval);
+
   try {
     const raw = usePageEval
       ? await evalInPage(Runtime, CODEX_READ_EXPR)
       : await evalInFrame(Runtime, CODEX_READ_EXPR);
+    if (expanded > 0) await _collapseCodexWorkedSections(Runtime, usePageEval);
     if (raw !== null) { resetReadFailures(sessionId); return raw; }
   } catch (e) {
+    if (expanded > 0) await _collapseCodexWorkedSections(Runtime, usePageEval);
     console.warn(`[${sessionId}] [sel] Codex read error: ${e.message}`);
   }
 
@@ -1637,11 +1906,35 @@ async function sendCodexPrimary(Runtime, text, usePageEval) {
     const btn = btns[btns.length - 1];
     if (!btn) return 'no-btn';
     if (btn.disabled) return 'disabled';
+    // Check if this is the send button (arrow icon M9.334) vs stop button
+    var svg = btn.querySelector('svg path');
+    var svgD = svg ? svg.getAttribute('d') || '' : '';
+    if (svgD && !svgD.startsWith('M9.334')) return 'agent_busy';
     btn.click();
     return 'sent';
   `);
   if (click === 'sent') return { ok: true };
+  if (click === 'agent_busy') return { ok: false, code: 'agent_busy', detail: 'Agent is generating — send button is stop icon' };
   return { ok: false, code: 'send_button_failed', detail: click };
+}
+
+// Steer: inject text into Codex's ProseMirror input WITHOUT clicking send.
+// This triggers Codex's native steer UI when the agent is generating —
+// Codex detects user typing mid-generation and shows a "steer" prompt.
+async function steerCodexInput(Runtime, text, usePageEval) {
+  const evalFn = usePageEval ? evalInPage : evalInFrame;
+  const set = await evalFn(Runtime, `
+    const input = d.querySelector('${CODEX_PRIMARY.input}');
+    if (!input) return 'no-input';
+    input.focus();
+    d.execCommand('selectAll', false, null);
+    d.execCommand('delete', false, null);
+    const ok = d.execCommand('insertText', false, ${JSON.stringify(text)});
+    if (!ok) { input.textContent = ${JSON.stringify(text)}; input.dispatchEvent(new Event('input', { bubbles: true })); }
+    return 'ok';
+  `);
+  if (set !== 'ok') return { ok: false, code: 'input_not_found', detail: set };
+  return { ok: true };
 }
 
 // Codex fallback: dispatch Enter keydown (no Shift = submit, not newline)
@@ -4664,6 +4957,7 @@ module.exports = {
   detectPermissionDialog,
   respondToPermissionDialog,
   sendMessage,
+  steerCodexInput,
   getSelectorFailures,
   evalInFrame,
   evalInPage,

@@ -687,7 +687,11 @@ function renderToolSection(name, text, index) {
   // we still show it collapsed so the user can see something happened, but add a note.
   const hasContent = lines.some(l => l.trim());
   const isEmpty = (isOutputBlock && lineCount === 0) || !hasContent;
-  const collapsed = lineCount > 50 || isOutputBlock || !hasContent;
+  // Collapse command blocks by default — Codex conversations have many Bash blocks
+  // with verbose output that push narrative text off screen. Keep them collapsed
+  // like the IDE side pane does. Edit/diff blocks stay expanded if short.
+  const isBashBlock = /^Bash\b/i.test(name.trim());
+  const collapsed = lineCount > 50 || isOutputBlock || !hasContent || (isBashBlock && lineCount > 4);
   // Output blocks show everything when expanded; other long sections still get the
   // "Show all N lines" affordance so they don't blow out the viewport.
   const showAll = !isOutputBlock && lineCount > 60;
@@ -772,7 +776,7 @@ function renderToolSection(name, text, index) {
               if (trimmed.startsWith('```')) return `<div class="tool-body-md">${marked.parse(trimmed)}</div>`;
               return `<pre class="tool-body-pre"><code>${escapeHtml(visibleText)}</code></pre>`;
             })()}
-      ${showAll && collapsed ? `<button class="tool-show-all" type="button" data-lines="${lineCount}">Show all ${lineCount} lines</button>` : ''}
+      ${showAll && collapsed ? `<button class="tool-show-all tool-io-more-btn" type="button" data-lines="${lineCount}">▸ ${lineCount} lines</button>` : ''}
     </div>`}
   </section>`;
 }

@@ -821,6 +821,16 @@ body {
 .delivery.accepted  { color: var(--text2); }
 .delivery.delivered { color: var(--green); }
 .delivery.failed    { color: var(--red); font-weight: 600; }
+.delivery.busy-queued { color: var(--yellow, #e2b714); display: inline-flex; align-items: center; gap: 6px; }
+.delivery.steered   { color: var(--blue, #58a6ff); }
+.queued-label { font-size: 11px; opacity: 0.8; }
+.steer-btn {
+  font-size: 11px; padding: 1px 8px; border-radius: 10px;
+  background: rgba(226, 183, 20, 0.15); color: var(--yellow, #e2b714);
+  border: 1px solid rgba(226, 183, 20, 0.3); cursor: pointer;
+  font-weight: 600; line-height: 1.4; transition: background 0.15s;
+}
+.steer-btn:hover { background: rgba(226, 183, 20, 0.3); }
 
 /* Failed message — red left border on the text */
 .message.user.failed .user-text {
@@ -1777,6 +1787,8 @@ mark.code-search-mark.current {
   font-size: 12px;
   font-weight: 700;
   color: var(--text);
+  white-space: nowrap;
+  flex-shrink: 0;
 }
 
 .tool-path {
@@ -2156,6 +2168,28 @@ mark.code-search-mark.current {
   max-width: 200px;
 }
 .composer-setting-select:hover  { border-color: var(--border2); }
+
+/* Mobile action buttons — only shown inside composer-settings on mobile */
+.composer-mobile-actions { display: none; }
+@media (max-width: 768px) {
+  .composer-mobile-actions {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 6px;
+    width: 100%;
+    margin-top: 4px;
+  }
+  .composer-mobile-action {
+    background: var(--bg3);
+    border: 1px solid var(--border);
+    border-radius: 5px;
+    color: var(--text2);
+    font-size: 11px;
+    padding: 6px 10px;
+    cursor: pointer;
+  }
+  .composer-mobile-action:hover { border-color: var(--border2); color: var(--text); }
+}
 .composer-setting-select:focus  { outline: none; border-color: var(--accent2); }
 .composer-workspace {
   font-size: 11px;
@@ -2684,6 +2718,7 @@ select.new-session-workspace option { background: var(--bg2); color: var(--text)
 
   /* Gear / action buttons — touch-friendly sizing on mobile */
   .composer-gear-btn { width: 44px; height: 44px; font-size: 18px; }
+  .composer-gear-btn.mobile-hide { display: none; }
   .send-btn  { height: 44px; min-width: 44px; }
   .stop-btn  { height: 44px; min-width: 44px; }
 

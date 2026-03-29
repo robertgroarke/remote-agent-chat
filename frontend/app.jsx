@@ -97,10 +97,17 @@ const ACTIVITY_META = {
 //   _delivered             → ✓✓ (proxy echoed it back — confirmed in agent)
 //   (historical)           → ✓
 
-function DeliveryStatus({ msg, deliveryStates }) {
+function DeliveryStatus({ msg, deliveryStates, onSteer }) {
   if (msg._optimistic) {
     const status = deliveryStates[msg._cid] || 'queued';
     if (status === 'queued')   return <span className="delivery queued"   title="Sending…">···</span>;
+    if (status === 'busy_queued') return (
+      <span className="delivery busy-queued" title="Agent is busy — message queued">
+        <span className="queued-label">queued</span>
+        {onSteer && <button className="steer-btn" onClick={(e) => { e.stopPropagation(); onSteer(msg._cid, msg.content); }} title="Inject into agent's context now">Steer ▸</button>}
+      </span>
+    );
+    if (status === 'steered')  return <span className="delivery steered"  title="Injected into agent context">⤳</span>;
     if (status === 'accepted') return <span className="delivery accepted" title="Received by relay">✓</span>;
     if (status === 'failed')   return <span className="delivery failed"   title="Failed — agent may be offline">✕</span>;
   }
@@ -1422,7 +1429,7 @@ function SkillsView({ skills, onRefresh, onBack }) {
 }
 
 function App() {
-  const { sessions, messages, connected, unread, setUnread, thinking, thinkingContent, activities, health, deliveryStates, launchStates, justLaunched, setJustLaunched, permissionPrompts, respondToPrompt, interruptSession, agentConfigs, requestAgentConfig, setAgentModel, setAgentPermissionMode, setAntigravityMode, setCodexConfig, newThread, openPanel, requestChatList, switchChat, newChat, chatLists, requestThreadList, switchThread, threadLists, switchWorkspace, requestTerminalOutput, terminalOutputs, requestFileChanges, fileChanges, sendAttachment, send, sendToSession, launchSession, resumeSession, closeSession, activeSessionRef, workspaces, branchLists, requestBranchList, switchBranch, createBranch, skillLists, requestSkillList } = useRelay();
+  const { sessions, messages, connected, unread, setUnread, thinking, thinkingContent, activities, health, deliveryStates, launchStates, justLaunched, setJustLaunched, permissionPrompts, respondToPrompt, interruptSession, agentConfigs, requestAgentConfig, setAgentModel, setAgentPermissionMode, setAntigravityMode, setCodexConfig, newThread, openPanel, requestChatList, switchChat, newChat, chatLists, requestThreadList, switchThread, threadLists, switchWorkspace, requestTerminalOutput, terminalOutputs, requestFileChanges, fileChanges, sendAttachment, send, sendToSession, steerMessage, launchSession, resumeSession, closeSession, activeSessionRef, workspaces, branchLists, requestBranchList, switchBranch, createBranch, skillLists, requestSkillList } = useRelay();
   const [activeSession, setActiveSession] = useState(null);
   const [drafts, setDrafts]             = useState({});
   const [draftFiles, setDraftFiles]     = useState({});
@@ -2148,7 +2155,7 @@ function App() {
                   <div className="user-content">
                     <div className="message-role">
                       <span>You</span>
-                      <DeliveryStatus msg={msg} deliveryStates={deliveryStates} />
+                      <DeliveryStatus msg={msg} deliveryStates={deliveryStates} onSteer={(cid, content) => steerMessage(activeSession, cid, content)} />
                     </div>
                     <div className="user-text">{msg.content}</div>
                   </div>
@@ -2308,14 +2315,14 @@ function App() {
                 )}
                 {activeConfig?.capabilities?.new_thread && (
                   <button
-                    className="composer-gear-btn"
+                    className="composer-gear-btn mobile-hide"
                     onClick={() => newThread(activeSession)}
                     title="New thread"
                   >✎</button>
                 )}
                 {activeConfig?.capabilities?.chat_list && (
                   <button
-                    className={`composer-gear-btn${showChatList ? ' active' : ''}`}
+                    className={`composer-gear-btn mobile-hide${showChatList ? ' active' : ''}`}
                     onClick={() => {
                       const willShow = !showChatList;
                       setShowChatList(willShow);
@@ -2326,7 +2333,7 @@ function App() {
                 )}
                 {activeConfig?.capabilities?.thread_list && (
                   <button
-                    className={`composer-gear-btn${showThreadList ? ' active' : ''}`}
+                    className={`composer-gear-btn mobile-hide${showThreadList ? ' active' : ''}`}
                     onClick={() => {
                       const willShow = !showThreadList;
                       setShowThreadList(willShow);
@@ -2337,14 +2344,14 @@ function App() {
                 )}
                 {activeConfig?.capabilities?.open_panel && (
                   <button
-                    className="composer-gear-btn"
+                    className="composer-gear-btn mobile-hide"
                     onClick={() => openPanel(activeSession)}
                     title="Open panel"
                   >⊞</button>
                 )}
                 {activeConfig?.capabilities?.new_chat && (
                   <button
-                    className="composer-gear-btn"
+                    className="composer-gear-btn mobile-hide"
                     onClick={() => newChat(activeSession)}
                     title="New chat"
                   >+</button>
@@ -2483,6 +2490,23 @@ function App() {
                     ⌂ {activeWorkspaceBasename || activeWorkspacePath}
                   </span>
                 )}
+                <div className="composer-mobile-actions">
+                  {activeConfig?.capabilities?.new_thread && (
+                    <button className="composer-mobile-action" onClick={() => newThread(activeSession)}>✎ New thread</button>
+                  )}
+                  {activeConfig?.capabilities?.chat_list && (
+                    <button className="composer-mobile-action" onClick={() => { requestChatList(activeSession); setShowChatList(true); setShowComposerSettings(false); }}>☰ Chat history</button>
+                  )}
+                  {activeConfig?.capabilities?.thread_list && (
+                    <button className="composer-mobile-action" onClick={() => { requestThreadList(activeSession); setShowThreadList(true); setShowComposerSettings(false); }}>⊟ Threads</button>
+                  )}
+                  {activeConfig?.capabilities?.open_panel && (
+                    <button className="composer-mobile-action" onClick={() => openPanel(activeSession)}>⊞ Open panel</button>
+                  )}
+                  {activeConfig?.capabilities?.new_chat && (
+                    <button className="composer-mobile-action" onClick={() => newChat(activeSession)}>+ New chat</button>
+                  )}
+                </div>
               </div>
             )}
           </div>
