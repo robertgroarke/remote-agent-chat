@@ -324,6 +324,18 @@ function steerResult(sessionId, clientMessageId, result, error) {
   return msg;
 }
 
+// Sent when the native queue state changes (Codex side-panel queue items with Steer buttons).
+// These are messages queued by Codex itself (not our proxy) while the agent was busy.
+function nativeQueue(sessionId, items) {
+  return {
+    type:             'native_queue',
+    protocol_version: PROTOCOL_VERSION,
+    session_id:       sessionId,
+    items,            // [{ text, index }]
+    detected_at:      new Date().toISOString(),
+  };
+}
+
 module.exports = {
   PROTOCOL_VERSION,
   hello,
@@ -346,4 +358,5 @@ module.exports = {
   messageQueued,
   queueDelivered,
   steerResult,
+  nativeQueue,
 };

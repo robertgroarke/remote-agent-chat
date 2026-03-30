@@ -48,6 +48,60 @@ body {
   inset: 0;
 }
 
+.app-crash {
+  position: fixed;
+  inset: 0;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 24px;
+  background:
+    radial-gradient(circle at top left, rgba(104, 179, 255, 0.08), transparent 28%),
+    linear-gradient(180deg, #0a0f15 0%, #0b1016 100%);
+}
+
+.app-crash-card {
+  width: min(560px, 100%);
+  border: 1px solid var(--border2);
+  border-radius: 14px;
+  background: linear-gradient(180deg, rgba(255,255,255,0.03), rgba(255,255,255,0.01)), var(--panel);
+  box-shadow: var(--shadow);
+  padding: 20px;
+}
+
+.app-crash-title {
+  font-size: 18px;
+  font-weight: 700;
+  color: var(--text);
+}
+
+.app-crash-body {
+  margin-top: 10px;
+  color: var(--text2);
+  line-height: 1.5;
+  white-space: pre-wrap;
+  word-break: break-word;
+}
+
+.app-crash-actions {
+  margin-top: 16px;
+  display: flex;
+  justify-content: flex-end;
+}
+
+.app-crash-btn {
+  border: 1px solid var(--border2);
+  background: var(--bg4);
+  color: var(--text);
+  border-radius: 8px;
+  padding: 8px 12px;
+  cursor: pointer;
+}
+
+.app-crash-btn:hover {
+  background: #243044;
+}
+
 /* ── Sidebar ───────────────────────────────────────────────── */
 .sidebar {
   width: var(--sidebar-w);

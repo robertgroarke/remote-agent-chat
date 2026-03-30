@@ -2852,6 +2852,43 @@ async function readClaudeRateLimit(Runtime) {
   }
 }
 
+// ─── Codex native queue detection ─────────────────────────────────────────────
+//
+// Reads the native queue (messages waiting with Steer buttons) from the Codex
+// side-panel DOM. These are messages typed/sent while the agent was busy.
+// The queue container has class "vertical-scroll-fade-mask" with child items
+// having class "overflow-visible" containing text + Steer button.
+//
+// Returns array of { text: string, index: number } or empty array.
+
+const READ_CODEX_NATIVE_QUEUE_EXPR = `
+  var steerBtns = [];
+  var btns = d.querySelectorAll('button');
+  for (var i = 0; i < btns.length; i++) {
+    if (btns[i].textContent.trim() === 'Steer') steerBtns.push(btns[i]);
+  }
+  if (steerBtns.length === 0) return null;
+  var items = [];
+  for (var i = 0; i < steerBtns.length; i++) {
+    var container = steerBtns[i].closest('.overflow-visible') || steerBtns[i].parentElement;
+    var textEl = container.querySelector('[class*="text-size-chat"]');
+    var text = textEl ? textEl.textContent.trim() : container.textContent.replace('Steer', '').trim();
+    if (text) items.push({ text: text, index: i });
+  }
+  return JSON.stringify(items);
+`;
+
+async function readCodexNativeQueue(Runtime, usePageEval) {
+  try {
+    const evalFn = usePageEval ? evalInPage : evalInFrame;
+    const raw = await evalFn(Runtime, READ_CODEX_NATIVE_QUEUE_EXPR);
+    if (!raw) return [];
+    return JSON.parse(raw);
+  } catch {
+    return [];
+  }
+}
+
 // ─── Generic rate limit detection (Claude, Gemini, Antigravity) ───────────────
 //
 // - claude:      text-scan of webview body (stub — selectors need live validation)
@@ -5023,6 +5060,7 @@ module.exports = {
   readCodexRateLimit,
   readClaudeRateLimit,
   readRateLimit,
+  readCodexNativeQueue,
   setCodexDesktopConfig,
   newCodexThread,
   // Epic 2 — Thread history

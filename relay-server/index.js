@@ -914,6 +914,7 @@ const KNOWN_PROXY_TYPES = new Set([
   'chat_list', 'thread_list', 'terminal_output', 'file_changes',
   'branch_list', 'skill_list',
   'message_queued', 'queue_delivered', 'steer_result', 'proxy_send_result',
+  'native_queue',
 ]);
 
 const KNOWN_CLIENT_TYPES = new Set([
@@ -1522,6 +1523,10 @@ function handleProxyConnection(ws, req) {
     } else if (t === 'message_queued' || t === 'queue_delivered' || t === 'steer_result') {
       broadcastToBrowsers(msg);
       log('info', 'send', `${t}`, { session: msg.session_id, cid: msg.client_message_id });
+
+    // ── Native queue (Codex side-panel queue items) ─────────────────────────
+    } else if (t === 'native_queue') {
+      broadcastToBrowsers(msg);
     }
   });
 

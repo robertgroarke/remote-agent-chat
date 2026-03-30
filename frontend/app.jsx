@@ -28,6 +28,46 @@ const AGENT_CONFIG = {
 };
 const DEFAULT_AGENT = { name: 'Agent', color: '#8b949e', abbr: 'AG' };
 
+function safeString(value, fallback = '') {
+  if (typeof value === 'string') return value;
+  if (value == null) return fallback;
+  return String(value);
+}
+
+function normalizeMessageContent(content) {
+  if (typeof content === 'string') return content;
+  if (Array.isArray(content)) {
+    return content
+      .map(part => {
+        if (typeof part === 'string') return part;
+        if (!part || typeof part !== 'object') return '';
+        if (typeof part.text === 'string') return part.text;
+        if (typeof part.content === 'string') return part.content;
+        if (typeof part.url === 'string') return part.url;
+        if (typeof part.image_url === 'string') return part.image_url;
+        return '';
+      })
+      .filter(Boolean)
+      .join(' ');
+  }
+  if (content && typeof content === 'object') {
+    if (typeof content.text === 'string') return content.text;
+    if (typeof content.content === 'string') return content.content;
+    if (typeof content.url === 'string') return content.url;
+    if (typeof content.image_url === 'string') return content.image_url;
+    try {
+      return JSON.stringify(content);
+    } catch {
+      return '';
+    }
+  }
+  return '';
+}
+
+function hasVisibleMessageContent(content) {
+  return normalizeMessageContent(content).trim().length > 0;
+}
+
 function isUuidLike(value) {
   return typeof value === 'string'
     && /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(value);
@@ -142,6 +182,18 @@ function QueuedItem({ qm, onSteer, onDiscard, onEdit }) {
         />
         <button className="steer-btn" onClick={() => { onEdit(editText); setEditing(false); }}>Save</button>
         <button className="queued-trash-btn" onClick={() => setEditing(false)} title="Cancel">✕</button>
+      </div>
+    );
+  }
+
+  // Native queue items (from Codex DOM) — only show Steer, no trash/edit
+  if (qm.native) {
+    return (
+      <div className="queued-item native">
+        <span className="queued-item-text">{qm.content.length > 80 ? qm.content.substring(0, 77) + '...' : qm.content}</span>
+        <div className="queued-actions">
+          <button className="steer-btn" onClick={onSteer} title="Click Steer in Codex">Steer ▸</button>
+        </div>
       </div>
     );
   }
@@ -1479,6 +1531,48 @@ function SkillsView({ skills, onRefresh, onBack }) {
   );
 }
 
+class AppErrorBoundary extends React.Component {
+  constructor(props) {
+    super(props);
+    this.state = { error: null };
+  }
+
+  static getDerivedStateFromError(error) {
+    return { error };
+  }
+
+  componentDidCatch(error, info) {
+    try {
+      console.error('Agent Chat render crash', error, info);
+      sessionStorage.setItem('agent-chat:last-render-error', JSON.stringify({
+        message: error?.message || String(error),
+        stack: error?.stack || '',
+        componentStack: info?.componentStack || '',
+        at: new Date().toISOString(),
+      }));
+    } catch {
+      // Ignore storage/logging issues so the fallback still renders.
+    }
+  }
+
+  render() {
+    if (!this.state.error) return this.props.children;
+    return (
+      <div className="app-crash">
+        <div className="app-crash-card">
+          <div className="app-crash-title">Agent Chat hit a render error</div>
+          <div className="app-crash-body">
+            {this.state.error?.message || 'Unknown UI error'}
+          </div>
+          <div className="app-crash-actions">
+            <button className="app-crash-btn" onClick={() => location.reload()}>Refresh</button>
+          </div>
+        </div>
+      </div>
+    );
+  }
+}
+
 function App() {
   const { sessions, messages, connected, unread, setUnread, thinking, thinkingContent, activities, health, deliveryStates, launchStates, justLaunched, setJustLaunched, permissionPrompts, respondToPrompt, interruptSession, agentConfigs, requestAgentConfig, setAgentModel, setAgentPermissionMode, setAntigravityMode, setCodexConfig, newThread, openPanel, requestChatList, switchChat, newChat, chatLists, requestThreadList, switchThread, threadLists, switchWorkspace, requestTerminalOutput, terminalOutputs, requestFileChanges, fileChanges, sendAttachment, send, sendToSession, steerMessage, discardQueuedMessage, editQueuedMessage, queuedMessages, launchSession, resumeSession, closeSession, activeSessionRef, workspaces, branchLists, requestBranchList, switchBranch, createBranch, skillLists, requestSkillList, controlResults } = useRelay();
   const [activeSession, setActiveSession] = useState(null);
@@ -1508,6 +1602,38 @@ function App() {
   const prevConnected   = useRef(connected);
   const pendingAttachmentReqs = useRef({});
   const seenAttachmentResults = useRef({});
+
+  useEffect(() => {
+    const onError = (event) => {
+      try {
+        sessionStorage.setItem('agent-chat:last-window-error', JSON.stringify({
+          message: event?.error?.message || event?.message || 'Unknown window error',
+          stack: event?.error?.stack || '',
+          at: new Date().toISOString(),
+        }));
+      } catch {
+        // Ignore error logging failures.
+      }
+    };
+    const onRejection = (event) => {
+      try {
+        const reason = event?.reason;
+        sessionStorage.setItem('agent-chat:last-promise-error', JSON.stringify({
+          message: reason?.message || safeString(reason, 'Unhandled promise rejection'),
+          stack: reason?.stack || '',
+          at: new Date().toISOString(),
+        }));
+      } catch {
+        // Ignore error logging failures.
+      }
+    };
+    window.addEventListener('error', onError);
+    window.addEventListener('unhandledrejection', onRejection);
+    return () => {
+      window.removeEventListener('error', onError);
+      window.removeEventListener('unhandledrejection', onRejection);
+    };
+  }, []);
 
   useEffect(() => {
     try {
@@ -1872,11 +1998,7 @@ function App() {
   // Last user message — shown as sticky context banner at top of chat
   const lastUserMsg = [...currentMessages].reverse().find(m => m.role === 'user');
   const lastUserText = lastUserMsg
-    ? (typeof lastUserMsg.content === 'string'
-        ? lastUserMsg.content
-        : (Array.isArray(lastUserMsg.content)
-            ? lastUserMsg.content.map(c => c.text || c.content || '').join(' ')
-            : ''))
+    ? normalizeMessageContent(lastUserMsg.content)
       .replace(/\s+/g, ' ').trim()
     : '';
   const activeHealth = activeSession ? (health[activeSession] || activeSessionMeta?.status || 'unknown') : '';
@@ -2249,7 +2371,7 @@ function App() {
           ) : currentMessages.length === 0 ? (
             <div className="empty-state"><div className="icon">💬</div><div>No messages yet</div></div>
           ) : (
-            currentMessages.filter(msg => msg.content && msg.content.trim()).map((msg, i) => (
+            currentMessages.filter(msg => hasVisibleMessageContent(msg.content)).map((msg, i) => (
               msg.role === 'user' ? (
                 <div key={msg._cid || i} className={`message user${msg._optimistic && deliveryStates[msg._cid] === 'failed' ? ' failed' : ''}`}>
                   <div className="user-gutter">
@@ -2260,7 +2382,7 @@ function App() {
                       <span>You</span>
                       <DeliveryStatus msg={msg} deliveryStates={deliveryStates} onSteer={(cid, content) => steerMessage(activeSession, cid, content)} />
                     </div>
-                    <div className="user-text">{msg.content}</div>
+                    <div className="user-text">{normalizeMessageContent(msg.content)}</div>
                   </div>
                 </div>
               ) : (
@@ -2275,7 +2397,7 @@ function App() {
                   </div>
                   <div className="assistant-content">
                     <div className="message-role"><span>{activeAgent.name}</span></div>
-                    <MarkdownContent content={msg.content} monospace={assistantMonospace} />
+                    <MarkdownContent content={normalizeMessageContent(msg.content)} monospace={assistantMonospace} />
                   </div>
                 </div>
               )
@@ -2400,7 +2522,7 @@ function App() {
                   <QueuedItem
                     key={qm.cid}
                     qm={qm}
-                    onSteer={() => steerMessage(activeSession, qm.cid, qm.content)}
+                    onSteer={() => steerMessage(activeSession, qm.cid, qm.content, qm.nativeIndex)}
                     onDiscard={() => discardQueuedMessage(activeSession, qm.cid)}
                     onEdit={(newContent) => editQueuedMessage(activeSession, qm.cid, newContent)}
                   />
@@ -2639,4 +2761,8 @@ function App() {
 
 export { App };
 
-ReactDOM.createRoot(document.getElementById('root')).render(<App />);
+ReactDOM.createRoot(document.getElementById('root')).render(
+  <AppErrorBoundary>
+    <App />
+  </AppErrorBoundary>
+);

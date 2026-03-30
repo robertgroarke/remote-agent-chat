@@ -569,6 +569,12 @@ class ProxyEngine extends EventEmitter {
           }
           this._log('info', `[relay] Re-broadcast ${session.messageQueue.length} queued messages for ${sessionId}`);
         }
+        // Re-broadcast native queue state and reset signature so next poll re-sends
+        if (session.nativeQueue?.length) {
+          this._sendToRelay(proto.nativeQueue(sessionId, session.nativeQueue));
+          this._log('info', `[relay] Re-broadcast ${session.nativeQueue.length} native queue items for ${sessionId}`);
+        }
+        session._nativeQueueSig = null; // Force re-detection on next poll
       }
       return;
     }
@@ -2224,6 +2230,31 @@ class ProxyEngine extends EventEmitter {
         }
       }
 
+      // Native queue detection — Codex side-panel queue items (messages with Steer buttons)
+      if (session.agentType === 'codex' || session.agentType === 'codex-desktop') {
+        session._nativeQueuePollCount = (session._nativeQueuePollCount || 0) + 1;
+        if (session._nativeQueuePollCount >= 3) {
+          session._nativeQueuePollCount = 0;
+          const usePageEval = session.agentType === 'codex-desktop';
+          selectors.readCodexNativeQueue(session.client.Runtime, usePageEval).then(items => {
+            const sig = items.map(i => i.text).join('|');
+            const changed = sig !== (session._nativeQueueSig || '');
+            // Always re-send every ~10 polls (~30s) so new browsers pick it up
+            session._nativeQueueResendCount = (session._nativeQueueResendCount || 0) + 1;
+            const forceResend = items.length > 0 && session._nativeQueueResendCount >= 10;
+            if (changed || forceResend) {
+              if (forceResend) session._nativeQueueResendCount = 0;
+              session._nativeQueueSig = sig;
+              session.nativeQueue = items;
+              if (changed && items.length > 0) {
+                this._log('info', `[${sessionId}] [native-queue] ${items.length} items detected`);
+              }
+              this._sendToRelay(proto.nativeQueue(sessionId, items));
+            }
+          }).catch((e) => { this._log('warn', `[${sessionId}] [native-queue] Error: ${e.message}`); });
+        }
+      }
+
     } catch (e) {
       this._log('error', `[${sessionId}] Poll error: ${e.message}`);
     }
@@ -2426,7 +2457,7 @@ class ProxyEngine extends EventEmitter {
   // Uses steerCodexInput (type text) + Enter key dispatch (submit) to bypass
   // the SVG-based busy check that would normally block sendCodexPrimary.
   async _handleSteerRequest(msg) {
-    const { session_id: sessionId, client_message_id, content } = msg;
+    const { session_id: sessionId, client_message_id, content, native_index } = msg;
     const session = this.sessions.get(sessionId);
 
     if (!session) {
@@ -2434,7 +2465,7 @@ class ProxyEngine extends EventEmitter {
       return;
     }
 
-    // Remove from queue
+    // Remove from proxy queue (only relevant for proxy-queued items, not native)
     if (session.messageQueue) {
       session.messageQueue = session.messageQueue.filter(m => m.client_message_id !== client_message_id);
     }
@@ -2444,34 +2475,20 @@ class ProxyEngine extends EventEmitter {
       return;
     }
 
-    this._log('info', `[${sessionId}] Steer: clicking Codex native Steer button`);
+    const idx = native_index != null ? native_index : 0;
+    this._log('info', `[${sessionId}] Steer: clicking Codex native Steer button (index: ${idx})`);
 
     const usePageEval = session.agentType === 'codex-desktop';
     const evalFn = usePageEval ? selectors.evalInPage : selectors.evalInFrame;
 
-    // Find and click Codex's native "Steer" button in the DOM.
-    // The message is already queued in Codex (typed into input during pre-send).
-    // Codex shows a "Steer" button next to queued messages while generating.
+    // Find and click Codex's native "Steer" button in the DOM at the specified index.
     const clickResult = await evalFn(session.client.Runtime, `
-      // Strategy 1: Find a button whose text content is exactly "Steer"
-      var btns = Array.from(d.querySelectorAll('button'));
-      var steerBtn = btns.find(function(b) {
-        var t = (b.textContent || '').trim();
-        return t === 'Steer' || t === '↩ Steer';
+      var btns = Array.from(d.querySelectorAll('button')).filter(function(b) {
+        return b.textContent.trim() === 'Steer';
       });
-      if (steerBtn) { steerBtn.click(); return 'clicked-steer'; }
-
-      // Strategy 2: Find any clickable element with "Steer" text
-      var all = d.querySelectorAll('[role="button"], a, span');
-      for (var i = 0; i < all.length; i++) {
-        var t = (all[i].textContent || '').trim();
-        if (t === 'Steer' || t === '↩ Steer') { all[i].click(); return 'clicked-steer-alt'; }
-      }
-
-      // Strategy 3: Look for aria-label containing steer
-      var ariaBtn = d.querySelector('[aria-label*="steer" i], [aria-label*="Steer"]');
-      if (ariaBtn) { ariaBtn.click(); return 'clicked-aria'; }
-
+      var targetIdx = ${idx};
+      if (btns.length > targetIdx) { btns[targetIdx].click(); return 'clicked-steer-' + targetIdx + '-of-' + btns.length; }
+      if (btns.length > 0) { btns[0].click(); return 'clicked-steer-0-fallback-of-' + btns.length; }
       return 'no-steer-button';
     `);
 

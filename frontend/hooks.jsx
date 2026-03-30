@@ -266,8 +266,14 @@ export function useRelay() {
       return cid;
     }
 
-    function steerMessage(sessionId, clientMessageId, content) {
-      send({ type: 'steer', session_id: sessionId, client_message_id: clientMessageId, content });
+    function steerMessage(sessionId, clientMessageId, content, nativeIndex) {
+      const msg = { type: 'steer', session_id: sessionId, client_message_id: clientMessageId, content };
+      if (nativeIndex != null) msg.native_index = nativeIndex;
+      send(msg);
+      // Remove native item from queue bar immediately
+      if (clientMessageId && clientMessageId.startsWith('native-')) {
+        setQueuedMessages(prev => ({ ...prev, [sessionId]: (prev[sessionId] || []).filter(m => m.cid !== clientMessageId) }));
+      }
     }
 
     function discardQueuedMessage(sessionId, clientMessageId) {
@@ -575,6 +581,27 @@ export function useRelay() {
         if (cid) {
           setDeliveryStates(prev => ({ ...prev, [cid]: msg.result === 'ok' ? 'steered' : 'failed' }));
           if (sid) setQueuedMessages(prev => ({ ...prev, [sid]: (prev[sid] || []).filter(m => m.cid !== cid) }));
+        }
+        return;
+      }
+
+      // ── Native queue (Codex side-panel queue items detected via DOM) ────────
+      if (t === 'native_queue') {
+        const sid = msg.session_id || msg.session;
+        const items = msg.items || [];
+        if (sid) {
+          // Merge native queue items into queuedMessages, using 'native-N' as cid
+          setQueuedMessages(prev => {
+            // Remove old native items, keep proxy-queued items (those with cmsg- prefix)
+            const existing = (prev[sid] || []).filter(m => m.cid && m.cid.startsWith('cmsg-'));
+            const native = items.map((item, i) => ({
+              cid: `native-${i}`,
+              content: item.text,
+              native: true,
+              nativeIndex: item.index,
+            }));
+            return { ...prev, [sid]: [...existing, ...native] };
+          });
         }
         return;
       }
