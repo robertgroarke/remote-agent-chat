@@ -278,6 +278,7 @@ class ProxyEngine extends EventEmitter {
       switch_branch:          true,
       create_branch:          true,
       skill_list:             agentType === 'codex-desktop',
+      file_browser:           true, // all session types support workspace file browsing
     };
   }
 
@@ -1092,6 +1093,7 @@ class ProxyEngine extends EventEmitter {
       const sessionData = this.sessions.get(sid);
       const agentT = sessionData?.agentType;
       const requestId = msg.request_id;
+      this._log('info', `[ctrl] chat_list request for ${sid} (${agentT || 'no session'})`);
 
       if (agentT !== 'codex' && agentT !== 'codex-desktop' && agentT !== 'antigravity_panel' && agentT !== 'claude-desktop') {
         this._sendToRelay(proto.agentControlResult(sid, requestId, 'chat_list', 'failed', {
@@ -1120,6 +1122,7 @@ class ProxyEngine extends EventEmitter {
         : selectors.readCodexChatList(sessionData.client.Runtime, usePageEval);
       readerFn
         .then(chats => {
+          this._log('info', `[ctrl] chat_list result for ${sid}: ${chats.length} chats`);
           this._sendToRelay(proto.chatList(sid, chats));
           this._sendToRelay(proto.agentControlResult(sid, requestId, 'chat_list', 'ok'));
         })
@@ -1331,6 +1334,153 @@ class ProxyEngine extends EventEmitter {
           this._log('warn', `[ctrl] file_changes failed for ${sid}: ${err.message}`);
           this._sendToRelay(proto.agentControlResult(sid, requestId, 'file_changes', 'failed', { code: 'cdp_error' }));
         });
+      return;
+    }
+
+    // ── File browser: list directory ──────────────────────────────────────
+    if (type === 'list_directory') {
+      const sid = msg.session_id || msg.session;
+      const sessionData = this.sessions.get(sid);
+      const requestId = msg.request_id;
+      const workspacePath = sessionData?.workspace_path;
+
+      if (!workspacePath) {
+        this._sendToRelay(proto.agentControlResult(sid, requestId, 'list_directory', 'failed', {
+          code: 'no_workspace', message: 'Session has no workspace path',
+        }));
+        return;
+      }
+
+      const requestPath = msg.path || '.';
+      const absPath = path.resolve(workspacePath, requestPath);
+
+      // Security: ensure resolved path is within workspace
+      if (!absPath.toLowerCase().startsWith(workspacePath.toLowerCase().replace(/\\/g, path.sep).replace(/\//g, path.sep)) &&
+          !absPath.toLowerCase().startsWith(workspacePath.toLowerCase())) {
+        this._sendToRelay(proto.agentControlResult(sid, requestId, 'list_directory', 'failed', {
+          code: 'path_traversal', message: 'Path is outside workspace',
+        }));
+        return;
+      }
+
+      fs.readdir(absPath, { withFileTypes: true }, (err, dirents) => {
+        if (err) {
+          this._sendToRelay(proto.agentControlResult(sid, requestId, 'list_directory', 'failed', {
+            code: 'fs_error', message: err.message,
+          }));
+          return;
+        }
+
+        const entries = [];
+        let pending = dirents.length;
+        if (pending === 0) {
+          this._sendToRelay(proto.directoryListing(sid, requestPath, [], requestId));
+          this._sendToRelay(proto.agentControlResult(sid, requestId, 'list_directory', 'ok'));
+          return;
+        }
+
+        for (const d of dirents) {
+          // Skip hidden files/dirs (starting with .) and node_modules
+          if (d.name.startsWith('.') || d.name === 'node_modules') {
+            if (--pending === 0) {
+              entries.sort((a, b) => {
+                if (a.type !== b.type) return a.type === 'directory' ? -1 : 1;
+                return a.name.localeCompare(b.name);
+              });
+              this._sendToRelay(proto.directoryListing(sid, requestPath, entries, requestId));
+              this._sendToRelay(proto.agentControlResult(sid, requestId, 'list_directory', 'ok'));
+            }
+            continue;
+          }
+          const fullPath = path.join(absPath, d.name);
+          fs.stat(fullPath, (statErr, stats) => {
+            if (!statErr) {
+              entries.push({
+                name: d.name,
+                type: d.isDirectory() ? 'directory' : 'file',
+                size: stats.size,
+                modified: stats.mtime.toISOString(),
+              });
+            }
+            if (--pending === 0) {
+              entries.sort((a, b) => {
+                if (a.type !== b.type) return a.type === 'directory' ? -1 : 1;
+                return a.name.localeCompare(b.name);
+              });
+              this._sendToRelay(proto.directoryListing(sid, requestPath, entries, requestId));
+              this._sendToRelay(proto.agentControlResult(sid, requestId, 'list_directory', 'ok'));
+            }
+          });
+        }
+      });
+      return;
+    }
+
+    // ── File browser: read file ─────────────────────────────────────────
+    if (type === 'read_file') {
+      const sid = msg.session_id || msg.session;
+      const sessionData = this.sessions.get(sid);
+      const requestId = msg.request_id;
+      const workspacePath = sessionData?.workspace_path;
+      const MAX_FILE_SIZE = msg.max_size || 512 * 1024; // 512KB default
+
+      if (!workspacePath) {
+        this._sendToRelay(proto.agentControlResult(sid, requestId, 'read_file', 'failed', {
+          code: 'no_workspace', message: 'Session has no workspace path',
+        }));
+        return;
+      }
+
+      const requestPath = msg.path;
+      if (!requestPath) {
+        this._sendToRelay(proto.agentControlResult(sid, requestId, 'read_file', 'failed', {
+          code: 'invalid_message', message: 'read_file requires path',
+        }));
+        return;
+      }
+
+      const absPath = path.resolve(workspacePath, requestPath);
+
+      // Security: ensure resolved path is within workspace
+      if (!absPath.toLowerCase().startsWith(workspacePath.toLowerCase().replace(/\\/g, path.sep).replace(/\//g, path.sep)) &&
+          !absPath.toLowerCase().startsWith(workspacePath.toLowerCase())) {
+        this._sendToRelay(proto.agentControlResult(sid, requestId, 'read_file', 'failed', {
+          code: 'path_traversal', message: 'Path is outside workspace',
+        }));
+        return;
+      }
+
+      fs.stat(absPath, (statErr, stats) => {
+        if (statErr) {
+          this._sendToRelay(proto.agentControlResult(sid, requestId, 'read_file', 'failed', {
+            code: 'fs_error', message: statErr.message,
+          }));
+          return;
+        }
+
+        const truncated = stats.size > MAX_FILE_SIZE;
+        const readSize = truncated ? MAX_FILE_SIZE : stats.size;
+
+        if (readSize === 0) {
+          this._sendToRelay(proto.fileContent(sid, requestPath, '', false, requestId));
+          this._sendToRelay(proto.agentControlResult(sid, requestId, 'read_file', 'ok'));
+          return;
+        }
+
+        // Read up to MAX_FILE_SIZE bytes
+        const stream = fs.createReadStream(absPath, { start: 0, end: readSize - 1, encoding: 'utf8' });
+        let content = '';
+        stream.on('data', chunk => { content += chunk; });
+        stream.on('end', () => {
+          this._sendToRelay(proto.fileContent(sid, requestPath, content, truncated, requestId));
+          this._sendToRelay(proto.agentControlResult(sid, requestId, 'read_file', 'ok'));
+        });
+        stream.on('error', readErr => {
+          this._sendToRelay(proto.agentControlResult(sid, requestId, 'read_file', 'failed', {
+            code: 'fs_error', message: readErr.message,
+          }));
+        });
+      });
       return;
     }
 

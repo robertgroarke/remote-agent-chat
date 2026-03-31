@@ -260,6 +260,18 @@ async function detectThinking(Runtime, agentType) {
         if (stopBtn && stopBtn.offsetParent !== null) {
           isThinking = true;
         }
+        // Check for visible "Thinking" or "Generating" text — Codex shows this
+        // as a spinner label even when no stop button is present.
+        if (!isThinking) {
+          var spans = d.querySelectorAll('span');
+          for (var si = 0; si < spans.length; si++) {
+            var st = (spans[si].textContent || '').trim();
+            if ((st === 'Thinking' || st === 'Generating') && spans[si].offsetParent !== null && spans[si].children.length === 0) {
+              isThinking = true;
+              break;
+            }
+          }
+        }
         // Fallback: check send button opacity — when generating, it may have full opacity
         // with a different SVG. The idle send button has opacity-50.
         if (!isThinking) {
@@ -275,10 +287,17 @@ async function detectThinking(Runtime, agentType) {
               var lastBtn = btns[btns.length - 1];
               if (lastBtn) {
                 var svg = lastBtn.querySelector('svg path');
-                // Idle send arrow starts with "M9.334" — a different path means stop icon
-                if (svg && !svg.getAttribute('d').startsWith('M9.334')) {
-                  isThinking = true;
+                // Idle send arrow: "M9.334" (old) or "M4.5 5.75" (new).
+                // Stop icon uses a rect or a very different path (e.g. square).
+                // Only trigger thinking if we see a STOP icon, not just an unknown send arrow.
+                if (svg) {
+                  var pathD = svg.getAttribute('d') || '';
+                  var isKnownSendArrow = pathD.startsWith('M9.334') || pathD.startsWith('M4.5 5.75') || pathD.startsWith('M4.5 ');
+                  if (!isKnownSendArrow) isThinking = true;
                 }
+                // Also check for rect-based stop icon (square)
+                var stopRect = lastBtn.querySelector('svg rect');
+                if (stopRect) isThinking = true;
               }
             }
           }
@@ -1838,10 +1857,26 @@ async function sendCodexPrimary(Runtime, text, usePageEval) {
     const input = d.querySelector('${CODEX_PRIMARY.input}');
     if (!input) return 'no-input';
     input.focus();
+    // Clear existing content
     d.execCommand('selectAll', false, null);
     d.execCommand('delete', false, null);
-    const ok = d.execCommand('insertText', false, ${JSON.stringify(text)});
-    if (!ok) { input.textContent = ${JSON.stringify(text)}; input.dispatchEvent(new Event('input', { bubbles: true })); }
+    // Try modern InputEvent first, fall back to execCommand
+    var ok = false;
+    try {
+      var ev = new InputEvent('beforeinput', { inputType: 'insertText', data: ${JSON.stringify(text)}, bubbles: true, cancelable: true, composed: true });
+      input.dispatchEvent(ev);
+      // Check if ProseMirror accepted it
+      if (input.textContent.trim().length > 0) { ok = true; }
+    } catch(e) {}
+    if (!ok) {
+      ok = d.execCommand('insertText', false, ${JSON.stringify(text)});
+    }
+    if (!ok) {
+      // Last resort: set innerHTML and dispatch input event
+      input.innerHTML = '<p>' + ${JSON.stringify(text)}.replace(/</g, '&lt;') + '</p>';
+      input.dispatchEvent(new Event('input', { bubbles: true }));
+      ok = true;
+    }
     return 'ok';
   `);
   if (set !== 'ok') return { ok: false, code: 'input_not_found', detail: set };
@@ -1862,10 +1897,15 @@ async function sendCodexPrimary(Runtime, text, usePageEval) {
     const btn = btns[btns.length - 1];
     if (!btn) return 'no-btn';
     if (btn.disabled) return 'disabled';
-    // Check if this is the send button (arrow icon M9.334) vs stop button
+    // Check if this is the send button vs stop button.
+    // Send arrow: "M9.334" (old) or "M4.5 5.75" / "M4.5 " (new).
+    // Stop icon: rect element or unknown SVG path.
     var svg = btn.querySelector('svg path');
     var svgD = svg ? svg.getAttribute('d') || '' : '';
-    if (svgD && !svgD.startsWith('M9.334')) return 'agent_busy';
+    var isKnownSend = !svgD || svgD.startsWith('M9.334') || svgD.startsWith('M4.5 ');
+    if (!isKnownSend) return 'agent_busy';
+    var hasStopRect = btn.querySelector('svg rect');
+    if (hasStopRect) return 'agent_busy';
     btn.click();
     return 'sent';
   `);
@@ -1885,8 +1925,17 @@ async function steerCodexInput(Runtime, text, usePageEval) {
     input.focus();
     d.execCommand('selectAll', false, null);
     d.execCommand('delete', false, null);
-    const ok = d.execCommand('insertText', false, ${JSON.stringify(text)});
-    if (!ok) { input.textContent = ${JSON.stringify(text)}; input.dispatchEvent(new Event('input', { bubbles: true })); }
+    var ok = false;
+    try {
+      var ev = new InputEvent('beforeinput', { inputType: 'insertText', data: ${JSON.stringify(text)}, bubbles: true, cancelable: true, composed: true });
+      input.dispatchEvent(ev);
+      if (input.textContent.trim().length > 0) ok = true;
+    } catch(e) {}
+    if (!ok) ok = d.execCommand('insertText', false, ${JSON.stringify(text)});
+    if (!ok) {
+      input.innerHTML = '<p>' + ${JSON.stringify(text)}.replace(/</g, '&lt;') + '</p>';
+      input.dispatchEvent(new Event('input', { bubbles: true }));
+    }
     return 'ok';
   `);
   if (set !== 'ok') return { ok: false, code: 'input_not_found', detail: set };
@@ -3918,15 +3967,16 @@ async function newCodexThread(Runtime, usePageEval) {
 
   // Try to find and click a "New thread" button
   const res = await evalFn(Runtime, `
-    (function() {
-      var allEls = Array.from(d.querySelectorAll('button, [role="button"], [role="menuitem"]'));
-      var btn = allEls.find(function(el) {
-        var t = (el.textContent || el.getAttribute('aria-label') || '').trim().toLowerCase();
-        return t === 'new thread' || t === 'new chat' || t === 'new conversation';
-      });
-      if (btn) { btn.click(); return 'clicked'; }
-      return 'not-found';
-    })()
+    var allEls = Array.from(d.querySelectorAll('button, [role="button"], [role="menuitem"]'));
+    var btn = allEls.find(function(el) {
+      var t = (el.textContent || el.getAttribute('aria-label') || '').trim().toLowerCase();
+      return t === 'new thread' || t === 'new chat' || t === 'new conversation';
+    });
+    if (btn) { btn.click(); return 'clicked'; }
+    // Also try aria-label="New chat"
+    var ariaBtn = d.querySelector('button[aria-label="New chat"], button[aria-label="New thread"]');
+    if (ariaBtn) { ariaBtn.click(); return 'clicked-aria'; }
+    return 'not-found';
   `);
 
   if (res === 'clicked') return true;
@@ -4285,8 +4335,18 @@ async function openCodexPanel(Runtime) {
  */
 async function readCodexChatList(Runtime, usePageEval) {
   const evalFn = usePageEval ? evalInPage : evalInFrame;
+
+  // If we're in a chat (Back button visible), click Back to show the list
+  const needsBack = await evalFn(Runtime, `
+    var back = d.querySelector('button[aria-label="Back"]');
+    if (back && back.offsetParent !== null) { back.click(); return 'clicked'; }
+    return 'already-list';
+  `);
+  if (needsBack === 'clicked') {
+    await new Promise(r => setTimeout(r, 800));
+  }
+
   const raw = await evalFn(Runtime, `
-    (function() {
       var chats = [];
 
       // Strategy 1: Look for conversation/thread list items (sidebar or panel)
@@ -4304,8 +4364,8 @@ async function readCodexChatList(Runtime, usePageEval) {
           var id = el.getAttribute('data-thread-id') || el.getAttribute('data-conversation-id') || ('idx-' + i);
           var title = (el.textContent || '').trim().substring(0, 100);
           if (!title) continue;
-          var active = el.classList.contains('active') || el.classList.contains('selected') ||
-                       el.getAttribute('aria-selected') === 'true' || el.getAttribute('aria-current') === 'true';
+          var active = false;
+          try { active = el.classList.contains('active') || el.classList.contains('selected') || el.getAttribute('aria-selected') === 'true' || el.getAttribute('aria-current') === 'true'; } catch(e) {}
           chats.push({ id: id, title: title, active: active });
         }
         if (chats.length > 0) return JSON.stringify(chats);
@@ -4333,14 +4393,13 @@ async function readCodexChatList(Runtime, usePageEval) {
         btns.forEach(function(btn, idx) {
           var title = (btn.textContent || '').trim().substring(0, 100);
           if (!title) return;
-          var active = btn.classList.contains('active') || btn.classList.contains('selected') ||
-                       btn.getAttribute('aria-selected') === 'true';
+          var active = false;
+          try { active = btn.classList.contains('active') || btn.classList.contains('selected') || btn.getAttribute('aria-selected') === 'true'; } catch(e) {}
           chats.push({ id: 'btn-' + idx, title: title, active: active, el_tag: btn.tagName });
         });
       });
 
       return JSON.stringify(chats);
-    })()
   `);
   try { return JSON.parse(raw) || []; } catch { return []; }
 }
@@ -4352,7 +4411,6 @@ async function readCodexChatList(Runtime, usePageEval) {
 async function switchCodexChat(Runtime, chatId, usePageEval) {
   const evalFn = usePageEval ? evalInPage : evalInFrame;
   const raw = await evalFn(Runtime, `
-    (function() {
       var targetId = ${JSON.stringify(chatId)};
 
       // Strategy 1: Find by data attribute
@@ -4394,7 +4452,6 @@ async function switchCodexChat(Runtime, chatId, usePageEval) {
       }
 
       return JSON.stringify({ ok: false, detail: 'chat-not-found: ' + targetId });
-    })()
   `);
   try { return JSON.parse(raw); } catch { return { ok: false, detail: 'eval-failed' }; }
 }

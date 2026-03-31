@@ -30,6 +30,8 @@ export function useRelay() {
     const [branchLists,       setBranchLists]       = useState({});   // sessionId -> { branches: string[], current: string }
     const [skillLists,        setSkillLists]        = useState({});   // sessionId -> { installed: [...], recommended: [...] }
     const [controlResults,    setControlResults]    = useState({});   // requestId -> latest agent_control_result
+    const [directoryListings, setDirectoryListings] = useState({});  // sessionId -> { path, entries }
+    const [fileContents,      setFileContents]      = useState({});  // sessionId:path -> { path, content, truncated }
 
     const thinkingTimers   = useRef({});
     const wsRef            = useRef(null);
@@ -183,6 +185,18 @@ export function useRelay() {
     function requestFileChanges(sessionId) {
       const requestId = `diff-${Date.now()}-${Math.random().toString(36).slice(2, 7)}`;
       send({ type: 'file_changes', session_id: sessionId, request_id: requestId });
+      return requestId;
+    }
+
+    function requestDirectoryListing(sessionId, dirPath) {
+      const requestId = `dir-${Date.now()}-${Math.random().toString(36).slice(2, 7)}`;
+      send({ type: 'list_directory', session_id: sessionId, request_id: requestId, path: dirPath || '.' });
+      return requestId;
+    }
+
+    function requestFileContent(sessionId, filePath) {
+      const requestId = `file-${Date.now()}-${Math.random().toString(36).slice(2, 7)}`;
+      send({ type: 'read_file', session_id: sessionId, request_id: requestId, path: filePath });
       return requestId;
     }
 
@@ -498,6 +512,20 @@ export function useRelay() {
         return;
       }
 
+      // ── Directory listing (file browser) ────────────────────────────────────
+      if (t === 'directory_listing') {
+        const sid = msg.session_id || msg.session;
+        if (sid) setDirectoryListings(prev => ({ ...prev, [sid]: { path: msg.path, entries: msg.entries || [] } }));
+        return;
+      }
+
+      // ── File content (file browser) ──────────────────────────────────────
+      if (t === 'file_content') {
+        const sid = msg.session_id || msg.session;
+        if (sid) setFileContents(prev => ({ ...prev, [`${sid}:${msg.path}`]: { path: msg.path, content: msg.content, truncated: msg.truncated } }));
+        return;
+      }
+
       // ── Agent config ─────────────────────────────────────────────────────────
       if (t === 'agent_config') {
         const sid = msg.session_id || msg.session;
@@ -611,7 +639,7 @@ export function useRelay() {
         const sid = msg.session_id || msg.session;
         if (sid) {
           setSessions(prev => prev.map(s =>
-            sessionIdOf(s) === sid
+            (typeof s === 'string' ? s : s?.session_id) === sid
               ? { ...(typeof s === 'object' ? s : {}), session_id: sid, rate_limited_until: msg.retry_after_hint || 'unknown', rate_limit_active: true, percent_used: msg.percent_used ?? null }
               : s
           ));
@@ -622,7 +650,7 @@ export function useRelay() {
         const sid = msg.session_id || msg.session;
         if (sid) {
           setSessions(prev => prev.map(s =>
-            sessionIdOf(s) === sid
+            (typeof s === 'string' ? s : s?.session_id) === sid
               ? { ...(typeof s === 'object' ? s : {}), session_id: sid, rate_limited_until: null, rate_limit_active: false, percent_used: null }
               : s
           ));
@@ -705,7 +733,7 @@ export function useRelay() {
       }
     }
 
-    return { sessions, messages, connected, unread, setUnread, thinking, thinkingContent, activities, health, deliveryStates, launchStates, justLaunched, setJustLaunched, permissionPrompts, respondToPrompt, interruptSession, agentConfigs, requestAgentConfig, setAgentModel, setAgentPermissionMode, setAntigravityMode, setCodexConfig, newThread, openPanel, requestChatList, switchChat, newChat, chatLists, requestThreadList, switchThread, threadLists, switchWorkspace, requestTerminalOutput, terminalOutputs, requestFileChanges, fileChanges, sendAttachment, send, sendToSession, steerMessage, discardQueuedMessage, editQueuedMessage, queuedMessages, launchSession, resumeSession, closeSession, activeSessionRef, workspaces, branchLists, requestBranchList, switchBranch, createBranch, skillLists, requestSkillList, controlResults };
+    return { sessions, messages, connected, unread, setUnread, thinking, thinkingContent, activities, health, deliveryStates, launchStates, justLaunched, setJustLaunched, permissionPrompts, respondToPrompt, interruptSession, agentConfigs, requestAgentConfig, setAgentModel, setAgentPermissionMode, setAntigravityMode, setCodexConfig, newThread, openPanel, requestChatList, switchChat, newChat, chatLists, requestThreadList, switchThread, threadLists, switchWorkspace, requestTerminalOutput, terminalOutputs, requestFileChanges, fileChanges, sendAttachment, send, sendToSession, steerMessage, discardQueuedMessage, editQueuedMessage, queuedMessages, launchSession, resumeSession, closeSession, activeSessionRef, workspaces, branchLists, requestBranchList, switchBranch, createBranch, skillLists, requestSkillList, controlResults, directoryListings, requestDirectoryListing, fileContents, requestFileContent };
   }
 
 // (removed window.useRelay — now an ES module export)

@@ -285,6 +285,37 @@ function skillsList(sessionId, skills) {
   };
 }
 
+// ─── File browser events ─────────────────────────────────────────────────────
+
+// Sent by proxy in response to a list_directory request from the browser.
+function directoryListing(sessionId, requestPath, entries, requestId) {
+  const msg = {
+    type:             'directory_listing',
+    protocol_version: PROTOCOL_VERSION,
+    session_id:       sessionId,
+    path:             requestPath,     // relative to workspace root
+    entries,                           // [{ name, type: 'file'|'directory', size, modified }]
+    read_at:          new Date().toISOString(),
+  };
+  if (requestId) msg.request_id = requestId;
+  return msg;
+}
+
+// Sent by proxy in response to a read_file request from the browser.
+function fileContent(sessionId, requestPath, content, truncated, requestId) {
+  const msg = {
+    type:             'file_content',
+    protocol_version: PROTOCOL_VERSION,
+    session_id:       sessionId,
+    path:             requestPath,     // relative to workspace root
+    content,                           // file content as string
+    truncated:        !!truncated,     // true if content was capped at max_size
+    read_at:          new Date().toISOString(),
+  };
+  if (requestId) msg.request_id = requestId;
+  return msg;
+}
+
 // ─── Message queue events ────────────────────────────────────────────────────
 
 // Sent when a message has been queued for delivery to the agent session.
@@ -355,6 +386,8 @@ module.exports = {
   terminalOutput,
   fileChanges,
   skillsList,
+  directoryListing,
+  fileContent,
   messageQueued,
   queueDelivered,
   steerResult,

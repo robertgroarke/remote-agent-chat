@@ -1122,6 +1122,194 @@ function DiffViewer({ entries, onClose, onRefresh }) {
   );
 }
 
+// ─── File Browser + Markdown Viewer ─────────────────────────────────────────
+
+const FILE_ICONS = {
+  directory: '📁',
+  md: '📄', txt: '📄', json: '📋', js: '📜', jsx: '📜', ts: '📜', tsx: '📜',
+  py: '🐍', html: '🌐', css: '🎨', yml: '⚙', yaml: '⚙', toml: '⚙',
+  sh: '⚡', bat: '⚡', ps1: '⚡', env: '🔒', lock: '🔒',
+  png: '🖼', jpg: '🖼', gif: '🖼', svg: '🖼',
+  default: '📄',
+};
+
+function getFileIcon(entry) {
+  if (entry.type === 'directory') return FILE_ICONS.directory;
+  const ext = entry.name.split('.').pop().toLowerCase();
+  return FILE_ICONS[ext] || FILE_ICONS.default;
+}
+
+function formatFileSize(bytes) {
+  if (bytes == null) return '';
+  if (bytes < 1024) return `${bytes} B`;
+  if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(1)} KB`;
+  return `${(bytes / (1024 * 1024)).toFixed(1)} MB`;
+}
+
+// Text file extensions that can be viewed
+const VIEWABLE_EXTENSIONS = new Set([
+  'md', 'txt', 'json', 'js', 'jsx', 'ts', 'tsx', 'py', 'html', 'css',
+  'yml', 'yaml', 'toml', 'sh', 'bat', 'ps1', 'cfg', 'conf', 'ini',
+  'xml', 'csv', 'log', 'env', 'gitignore', 'dockerignore', 'sql',
+  'rs', 'go', 'java', 'c', 'cpp', 'h', 'hpp', 'rb', 'php', 'swift',
+  'kt', 'scala', 'r', 'lua', 'vim', 'zsh', 'bash', 'fish',
+]);
+
+function isViewableFile(name) {
+  const ext = name.split('.').pop().toLowerCase();
+  // Also handle dotfiles like .gitignore, .env
+  return VIEWABLE_EXTENSIONS.has(ext) || name.startsWith('.');
+}
+
+function isMarkdownFile(name) {
+  return name.toLowerCase().endsWith('.md');
+}
+
+function MarkdownViewer({ path: filePath, content, truncated, onBack }) {
+  const rendered = React.useMemo(() => {
+    if (!content) return '';
+    try {
+      const html = marked.parse(content);
+      return DOMPurify.sanitize(html);
+    } catch (e) {
+      return `<pre>${DOMPurify.sanitize(content)}</pre>`;
+    }
+  }, [content]);
+
+  // Highlight code blocks after render
+  const bodyRef = React.useRef(null);
+  React.useEffect(() => {
+    if (bodyRef.current) {
+      bodyRef.current.querySelectorAll('pre code').forEach(block => {
+        hljs.highlightElement(block);
+      });
+    }
+  }, [rendered]);
+
+  const fileName = filePath ? filePath.split('/').pop().split('\\').pop() : 'File';
+
+  return (
+    <div className="file-viewer">
+      <div className="file-viewer-header">
+        <button className="file-viewer-back" onClick={onBack} title="Back to files">←</button>
+        <span className="file-viewer-title" title={filePath}>{fileName}</span>
+        {truncated && <span className="file-viewer-truncated">truncated</span>}
+      </div>
+      <div className="file-viewer-body markdown-body" ref={bodyRef} dangerouslySetInnerHTML={{ __html: rendered }} />
+    </div>
+  );
+}
+
+function PlainFileViewer({ path: filePath, content, truncated, onBack }) {
+  const fileName = filePath ? filePath.split('/').pop().split('\\').pop() : 'File';
+  const ext = fileName.split('.').pop().toLowerCase();
+
+  const highlighted = React.useMemo(() => {
+    if (!content) return '';
+    try {
+      if (ext && hljs.getLanguage(ext)) {
+        return hljs.highlight(content, { language: ext }).value;
+      }
+      return hljs.highlightAuto(content).value;
+    } catch (e) {
+      return DOMPurify.sanitize(content);
+    }
+  }, [content, ext]);
+
+  return (
+    <div className="file-viewer">
+      <div className="file-viewer-header">
+        <button className="file-viewer-back" onClick={onBack} title="Back to files">←</button>
+        <span className="file-viewer-title" title={filePath}>{fileName}</span>
+        {truncated && <span className="file-viewer-truncated">truncated</span>}
+      </div>
+      <div className="file-viewer-body">
+        <pre className="file-viewer-code"><code dangerouslySetInnerHTML={{ __html: highlighted }} /></pre>
+      </div>
+    </div>
+  );
+}
+
+function FileBrowser({ sessionId, listing, fileContents, onNavigate, onOpenFile, onClose, onRefresh, viewingFile, onBackToListing }) {
+  // If viewing a file, show the appropriate viewer
+  if (viewingFile) {
+    const key = `${sessionId}:${viewingFile}`;
+    const fileData = fileContents[key];
+    const content = fileData?.content || '';
+    const truncated = fileData?.truncated || false;
+
+    if (isMarkdownFile(viewingFile)) {
+      return <MarkdownViewer path={viewingFile} content={content} truncated={truncated} onBack={onBackToListing} />;
+    }
+    return <PlainFileViewer path={viewingFile} content={content} truncated={truncated} onBack={onBackToListing} />;
+  }
+
+  // Directory listing view
+  const entries = listing?.entries || [];
+  const currentPath = listing?.path || '.';
+  const pathParts = currentPath === '.' ? [] : currentPath.replace(/\\/g, '/').split('/').filter(Boolean);
+
+  return (
+    <div className="file-browser">
+      <div className="file-browser-header">
+        <span className="file-browser-title">Files</span>
+        <button className="file-browser-refresh" onClick={onRefresh} title="Refresh">↻</button>
+        <button className="file-browser-close" onClick={onClose} title="Close">✕</button>
+      </div>
+      <div className="file-browser-breadcrumbs">
+        <button className="breadcrumb-item" onClick={() => onNavigate('.')}>root</button>
+        {pathParts.map((part, i) => {
+          const subPath = pathParts.slice(0, i + 1).join('/');
+          return (
+            <React.Fragment key={subPath}>
+              <span className="breadcrumb-sep">/</span>
+              <button className="breadcrumb-item" onClick={() => onNavigate(subPath)}>{part}</button>
+            </React.Fragment>
+          );
+        })}
+      </div>
+      <div className="file-browser-body">
+        {entries.length === 0 ? (
+          <div className="file-browser-empty">Empty directory</div>
+        ) : (
+          <div className="file-browser-list">
+            {currentPath !== '.' && (
+              <div className="file-browser-entry" onClick={() => {
+                const parent = pathParts.slice(0, -1).join('/') || '.';
+                onNavigate(parent);
+              }}>
+                <span className="file-entry-icon">📁</span>
+                <span className="file-entry-name">..</span>
+              </div>
+            )}
+            {entries.map(entry => (
+              <div
+                key={entry.name}
+                className={`file-browser-entry${entry.type === 'directory' ? ' is-dir' : ''}${isViewableFile(entry.name) ? ' is-viewable' : ''}`}
+                onClick={() => {
+                  if (entry.type === 'directory') {
+                    const newPath = currentPath === '.' ? entry.name : `${currentPath}/${entry.name}`;
+                    onNavigate(newPath);
+                  } else if (isViewableFile(entry.name)) {
+                    const filePath = currentPath === '.' ? entry.name : `${currentPath}/${entry.name}`;
+                    onOpenFile(filePath);
+                  }
+                }}
+              >
+                <span className="file-entry-icon">{getFileIcon(entry)}</span>
+                <span className="file-entry-name">{entry.name}</span>
+                <span className="file-entry-meta">
+                  {entry.type === 'file' && formatFileSize(entry.size)}
+                </span>
+              </div>
+            ))}
+          </div>
+        )}
+      </div>
+    </div>
+  );
+}
+
 // ─── Automations View ───────────────────────────────────────────────────────
 // Mirrors the Codex Desktop Automations UI: category-grouped cards with
 // create/edit modal and manual trigger.
@@ -1574,7 +1762,7 @@ class AppErrorBoundary extends React.Component {
 }
 
 function App() {
-  const { sessions, messages, connected, unread, setUnread, thinking, thinkingContent, activities, health, deliveryStates, launchStates, justLaunched, setJustLaunched, permissionPrompts, respondToPrompt, interruptSession, agentConfigs, requestAgentConfig, setAgentModel, setAgentPermissionMode, setAntigravityMode, setCodexConfig, newThread, openPanel, requestChatList, switchChat, newChat, chatLists, requestThreadList, switchThread, threadLists, switchWorkspace, requestTerminalOutput, terminalOutputs, requestFileChanges, fileChanges, sendAttachment, send, sendToSession, steerMessage, discardQueuedMessage, editQueuedMessage, queuedMessages, launchSession, resumeSession, closeSession, activeSessionRef, workspaces, branchLists, requestBranchList, switchBranch, createBranch, skillLists, requestSkillList, controlResults } = useRelay();
+  const { sessions, messages, connected, unread, setUnread, thinking, thinkingContent, activities, health, deliveryStates, launchStates, justLaunched, setJustLaunched, permissionPrompts, respondToPrompt, interruptSession, agentConfigs, requestAgentConfig, setAgentModel, setAgentPermissionMode, setAntigravityMode, setCodexConfig, newThread, openPanel, requestChatList, switchChat, newChat, chatLists, requestThreadList, switchThread, threadLists, switchWorkspace, requestTerminalOutput, terminalOutputs, requestFileChanges, fileChanges, sendAttachment, send, sendToSession, steerMessage, discardQueuedMessage, editQueuedMessage, queuedMessages, launchSession, resumeSession, closeSession, activeSessionRef, workspaces, branchLists, requestBranchList, switchBranch, createBranch, skillLists, requestSkillList, controlResults, directoryListings, requestDirectoryListing, fileContents, requestFileContent } = useRelay();
   const [activeSession, setActiveSession] = useState(null);
   const [drafts, setDrafts]             = useState({});
   const [draftFiles, setDraftFiles]     = useState({});
@@ -1594,6 +1782,9 @@ function App() {
   const [showBranchSelector, setShowBranchSelector] = useState(false);
   const [showAutomations, setShowAutomations]       = useState(false);
   const [showSkills, setShowSkills]                 = useState(false);
+  const [showFileBrowser, setShowFileBrowser]       = useState(false);
+  const [fileBrowserPath, setFileBrowserPath]       = useState('.');
+  const [viewingFile, setViewingFile]               = useState(null); // { path, content } when viewing a file
   const messagesEndRef  = useRef(null);
   const messagesListRef = useRef(null);
   const isAtBottom      = useRef(true);   // updated by scroll listener before DOM changes
@@ -2248,6 +2439,23 @@ function App() {
                       changes
                     </button>
                   )}
+                  {activeConfig?.capabilities?.file_browser && (
+                    <button
+                      className={`context-pill files-toggle${showFileBrowser ? ' active' : ''}`}
+                      title="Browse workspace files"
+                      onClick={() => {
+                        const next = !showFileBrowser;
+                        setShowFileBrowser(next);
+                        if (next) {
+                          setViewingFile(null);
+                          setFileBrowserPath('.');
+                          requestDirectoryListing(activeSession, '.');
+                        }
+                      }}
+                    >
+                      files
+                    </button>
+                  )}
                   {activeConfig?.capabilities?.open_panel && (
                     <button
                       className="context-pill open-panel-btn"
@@ -2295,7 +2503,36 @@ function App() {
           />
         )}
 
-        <div className="messages-wrap">
+        {showFileBrowser && activeSession && activeConfig?.capabilities?.file_browser && (
+          <FileBrowser
+            sessionId={activeSession}
+            listing={directoryListings[activeSession]}
+            fileContents={fileContents}
+            viewingFile={viewingFile}
+            onNavigate={(dirPath) => {
+              setFileBrowserPath(dirPath);
+              setViewingFile(null);
+              requestDirectoryListing(activeSession, dirPath);
+            }}
+            onOpenFile={(filePath) => {
+              setViewingFile(filePath);
+              requestFileContent(activeSession, filePath);
+            }}
+            onBackToListing={() => setViewingFile(null)}
+            onRefresh={() => {
+              if (viewingFile) {
+                requestFileContent(activeSession, viewingFile);
+              } else {
+                requestDirectoryListing(activeSession, fileBrowserPath);
+              }
+            }}
+            onClose={() => {
+              setShowFileBrowser(false);
+              setViewingFile(null);
+            }}
+          />
+        )}
+        <div className="messages-wrap" style={showFileBrowser ? { display: 'none' } : undefined}>
         {activeSession && lastUserText && (
           <div className="last-user-banner" title={lastUserText}>
             <span className="last-user-banner-icon">↵</span>
@@ -2458,7 +2695,7 @@ function App() {
           />
         )}
 
-        {showTerminal && activeSession && activeConfig?.capabilities?.terminal_output && (
+        {!showFileBrowser && showTerminal && activeSession && activeConfig?.capabilities?.terminal_output && (
           <TerminalViewer
             entries={terminalOutputs[activeSession] || []}
             onRefresh={() => requestTerminalOutput(activeSession)}
@@ -2466,7 +2703,7 @@ function App() {
           />
         )}
 
-        {showDiffViewer && activeSession && activeConfig?.capabilities?.file_changes && (
+        {!showFileBrowser && showDiffViewer && activeSession && activeConfig?.capabilities?.file_changes && (
           <DiffViewer
             entries={fileChanges[activeSession] || []}
             onRefresh={() => requestFileChanges(activeSession)}
@@ -2474,7 +2711,7 @@ function App() {
           />
         )}
 
-        <div className="input-area">
+        <div className="input-area" style={showFileBrowser ? { display: 'none' } : undefined}>
           <label className={`attach-btn ${!activeSession || !connected || !!activePrompt ? 'disabled' : ''}`} title="Attach file">
             <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
               <path d="M21.44 11.05l-9.19 9.19a6 6 0 0 1-8.49-8.49l9.19-9.19a4 4 0 0 1 5.66 5.66l-9.2 9.19a2 2 0 0 1-2.83-2.83l8.49-8.48" />

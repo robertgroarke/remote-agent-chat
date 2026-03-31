@@ -913,6 +913,7 @@ const KNOWN_PROXY_TYPES = new Set([
   'rate_limit_active', 'rate_limit_cleared',
   'chat_list', 'thread_list', 'terminal_output', 'file_changes',
   'branch_list', 'skill_list',
+  'directory_listing', 'file_content',
   'message_queued', 'queue_delivered', 'steer_result', 'proxy_send_result',
   'native_queue',
 ]);
@@ -929,7 +930,8 @@ const KNOWN_CLIENT_TYPES = new Set([
   'thread_list', 'switch_thread', 'switch_workspace', 'terminal_output',
   'file_changes', 'send_attachment', 'terminal_input',
   'branch_list', 'switch_branch', 'create_branch',
-  'skill_list', 'steer', 'discard_queued', 'edit_queued',
+  'skill_list', 'list_directory', 'read_file',
+  'steer', 'discard_queued', 'edit_queued',
   'automations_list', 'automations_create', 'automations_update', 'automations_delete', 'automations_run',
 ]);
 
@@ -1446,6 +1448,30 @@ function handleProxyConnection(ws, req) {
       if (sessionId) touchSession(sessionId);
       broadcastToBrowsers(msg);
       log('info', 'ctrl', 'Skill list received', { session: sessionId, installed: (msg.installed || []).length, recommended: (msg.recommended || []).length });
+
+    // ── File browser: directory listing (proxy → browsers) ─────────────
+    } else if (t === 'directory_listing') {
+      const requestId = msg.request_id;
+      const targetWs  = requestId ? pendingCtrlReqs.get(requestId) : null;
+      if (requestId) pendingCtrlReqs.delete(requestId);
+      if (targetWs && targetWs.readyState === WebSocket.OPEN) {
+        targetWs.send(JSON.stringify(msg));
+      } else {
+        broadcastToBrowsers(msg);
+      }
+      log('info', 'ctrl', 'Directory listing received', { session: msg.session_id, path: msg.path, count: (msg.entries || []).length });
+
+    // ── File browser: file content (proxy → browsers) ─────────────────
+    } else if (t === 'file_content') {
+      const requestId = msg.request_id;
+      const targetWs  = requestId ? pendingCtrlReqs.get(requestId) : null;
+      if (requestId) pendingCtrlReqs.delete(requestId);
+      if (targetWs && targetWs.readyState === WebSocket.OPEN) {
+        targetWs.send(JSON.stringify(msg));
+      } else {
+        broadcastToBrowsers(msg);
+      }
+      log('info', 'ctrl', 'File content received', { session: msg.session_id, path: msg.path, truncated: msg.truncated });
 
     // ── Agent control result (A2-07) ──────────────────────────────────────
     } else if (t === 'agent_control_result') {
@@ -2117,7 +2143,7 @@ function handleClientConnection(ws, req) {
       log('info', 'ctrl', 'Set codex config forwarded', { session: sessionId, request_id: requestId });
 
     // ── Panel/agent control commands (Epics 2, 3, 4, 9) ──────────────────
-    } else if (t === 'new_thread' || t === 'open_panel' || t === 'chat_list' || t === 'switch_chat' || t === 'new_chat' || t === 'thread_list' || t === 'switch_thread' || t === 'switch_workspace' || t === 'terminal_output' || t === 'file_changes' || t === 'send_attachment' || t === 'terminal_input' || t === 'branch_list' || t === 'switch_branch' || t === 'create_branch' || t === 'skill_list') {
+    } else if (t === 'new_thread' || t === 'open_panel' || t === 'chat_list' || t === 'switch_chat' || t === 'new_chat' || t === 'thread_list' || t === 'switch_thread' || t === 'switch_workspace' || t === 'terminal_output' || t === 'file_changes' || t === 'send_attachment' || t === 'terminal_input' || t === 'branch_list' || t === 'switch_branch' || t === 'create_branch' || t === 'skill_list' || t === 'list_directory' || t === 'read_file') {
       const sessionId = msg.session_id || msg.session;
       const requestId = msg.request_id;
       const proxyWs   = proxySockets.get(sessionId);
@@ -2145,6 +2171,8 @@ function handleClientConnection(ws, req) {
         ...(msg.folder_path ? { folder_path: msg.folder_path } : {}),
         ...(msg.branch_name ? { branch_name: msg.branch_name } : {}),
         ...(msg.text != null ? { text: msg.text } : {}),
+        ...(msg.path != null ? { path: msg.path } : {}),
+        ...(msg.max_size != null ? { max_size: msg.max_size } : {}),
       }));
       log('info', 'ctrl', `${t} forwarded`, { session: sessionId, request_id: requestId });
 
