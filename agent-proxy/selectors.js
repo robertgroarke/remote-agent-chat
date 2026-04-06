@@ -305,67 +305,77 @@ async function detectThinking(Runtime, agentType) {
 
         if (!isThinking) return JSON.stringify({ thinking: false, label: '' });
 
-        // Enhanced activity detection: extract granular activity label.
-        // Check for "Thinking" spinner text first — Codex shows this as a
-        // visible span while the model is reasoning before generating.
+        // Enhanced activity detection: extract granular activity label + command content.
         var label = 'Generating';
+        var thinkingContent = '';
         try {
-          var thinkLeafs = Array.from(d.querySelectorAll('span')).filter(function(s) {
-            return s.children.length === 0 && s.offsetParent !== null &&
-                   /^Thinking$/i.test((s.textContent || '').trim());
-          });
-          if (thinkLeafs.length > 0) label = 'Thinking';
-          // Find the last turn's content units — tool outputs have role info
-          var units = Array.from(d.querySelectorAll('[data-content-search-unit-key]'));
-          if (units.length > 0) {
-            var lastUnit = units[units.length - 1];
-            var unitKey = lastUnit.getAttribute('data-content-search-unit-key') || '';
-            // unitKey format: "{turnId}:{index}:{role}" e.g. "turn-1:3:tool"
-            var parts = unitKey.split(':');
-            var role = parts.length >= 3 ? parts[parts.length - 1] : '';
-
-            if (role === 'tool') {
-              // Extract the tool name/action from the unit content
-              // Tool output often starts with a label like "Running: ...", "Reading: ..."
-              var unitText = (lastUnit.innerText || '').trim();
-              var firstLine = unitText.split('\\n')[0].trim();
-              // Look for common patterns: "$ command", file paths, function names
-              if (firstLine.startsWith('$')) {
-                label = 'Running: ' + firstLine.substring(1).trim().substring(0, 60);
-              } else if (/^(Reading|Writing|Editing|Creating|Deleting)\\b/i.test(firstLine)) {
-                label = firstLine.substring(0, 80);
-              } else if (firstLine.length > 0 && firstLine.length < 80) {
-                label = 'Tool: ' + firstLine;
+          // Priority 1: "Running command for Ns" / "Reading file" / "Searching" etc.
+          // These are DIVs with class containing "loading-shimmer" or matching text pattern.
+          var activityDivs = d.querySelectorAll('div, span');
+          for (var ai = activityDivs.length - 1; ai >= 0; ai--) {
+            var el = activityDivs[ai];
+            if (!el.offsetParent) continue;
+            var t = (el.textContent || '').trim();
+            var m = t.match(/^(Running command|Reading|Writing|Editing|Searching|Creating|Applying)(?:\\s+\\w+)*(?:\\s+for\\s+[\\dsmh ]+)?$/i);
+            if (m && t.length < 80) {
+              label = t;
+              // Try to find the command/content being executed nearby
+              // Look for the last CODE element before this activity indicator
+              var codes = d.querySelectorAll('code');
+              for (var ci = codes.length - 1; ci >= 0; ci--) {
+                var codeText = codes[ci].textContent.trim();
+                if (codeText.startsWith('$') && codeText.length > 3) {
+                  thinkingContent = codeText.substring(1).trim().substring(0, 200);
+                  break;
+                }
               }
-            }
-          }
-
-          // Check for "Running command for Ns" expanded button
-          var runBtns = d.querySelectorAll('button[aria-expanded="true"]');
-          for (var ri = runBtns.length - 1; ri >= 0; ri--) {
-            var rtxt = (runBtns[ri].textContent || '').trim();
-            if (/Running command/i.test(rtxt)) {
-              label = rtxt;
               break;
             }
           }
 
-          // Also check for visible status/progress text near the conversation
+          // Priority 2: "Running command" in expanded button
           if (label === 'Generating') {
-            var statusEls = d.querySelectorAll('[class*="status"], [class*="progress"], [role="status"]');
-            for (var si = statusEls.length - 1; si >= 0; si--) {
-              var statusText = (statusEls[si].innerText || '').trim();
-              if (statusText && statusText.length < 80 && statusText.length > 2) {
-                if (!/generating/i.test(statusText)) {
-                  label = statusText;
+            var runBtns = d.querySelectorAll('button[aria-expanded="true"]');
+            for (var ri = runBtns.length - 1; ri >= 0; ri--) {
+              var rtxt = (runBtns[ri].textContent || '').trim();
+              if (/Running command/i.test(rtxt)) { label = rtxt; break; }
+            }
+          }
+
+          // Priority 3: "Thinking" / "Generating" visible text
+          if (label === 'Generating') {
+            var thinkLeafs = Array.from(d.querySelectorAll('span')).filter(function(s) {
+              return s.children.length === 0 && s.offsetParent !== null &&
+                     /^(Thinking|Generating)$/i.test((s.textContent || '').trim());
+            });
+            if (thinkLeafs.length > 0) label = thinkLeafs[thinkLeafs.length - 1].textContent.trim();
+          }
+
+          // Priority 4: data-content-search-unit-key tool output
+          if (label === 'Generating') {
+            var units = Array.from(d.querySelectorAll('[data-content-search-unit-key]'));
+            if (units.length > 0) {
+              var lastUnit = units[units.length - 1];
+              var unitKey = lastUnit.getAttribute('data-content-search-unit-key') || '';
+              var parts = unitKey.split(':');
+              var role = parts.length >= 3 ? parts[parts.length - 1] : '';
+              if (role === 'tool') {
+                var unitText = (lastUnit.innerText || '').trim();
+                var firstLine = unitText.split('\\n')[0].trim();
+                if (firstLine.startsWith('$')) {
+                  label = 'Running command';
+                  thinkingContent = firstLine.substring(1).trim().substring(0, 200);
+                } else if (/^(Reading|Writing|Editing|Creating|Deleting)\\b/i.test(firstLine)) {
+                  label = firstLine.substring(0, 80);
+                } else if (firstLine.length > 0 && firstLine.length < 80) {
+                  label = 'Tool: ' + firstLine;
                 }
-                break;
               }
             }
           }
         } catch(e) {}
 
-        return JSON.stringify({ thinking: true, label: label });
+        return JSON.stringify({ thinking: true, label: label, thinkingContent: thinkingContent });
       `);
       try { return JSON.parse(raw); } catch { return { thinking: false, label: '' }; }
     } catch {
@@ -543,10 +553,15 @@ function buildClaudeReadExpr(userClass, userText, userTextAlt) {
           }
         });
         if (!body) {
-          // Fallback: plain text body (skip Monaco editors that produce garbled text)
           var bodyEl = node.querySelector('[class*="toolBody_"]');
-          if (bodyEl && !bodyEl.querySelector('.monaco-editor')) {
-            body = bodyEl.textContent.trim();
+          if (bodyEl) {
+            var monacoEditor = bodyEl.querySelector('.monaco-editor:not(.original-in-monaco-diff-editor):not(.modified-in-monaco-diff-editor)');
+            if (monacoEditor) {
+              var lines = Array.from(monacoEditor.querySelectorAll('.view-line')).map(function(l) { return l.textContent; });
+              body = lines.join('\\n');
+            } else if (!bodyEl.querySelector('.monaco-diff-editor')) {
+              body = bodyEl.textContent.trim();
+            }
           }
         }
         return '\\n[' + header + ']\\n' + body + '[end]\\n';
@@ -598,9 +613,10 @@ async function _expandOutputDetails(Runtime) {
       });
       window.__rac_exp.forEach(function(el) {
         el.open = true;
-        // Also fire a click on the summary in case React controls state via event handler
-        var s = el.querySelector('summary');
-        if (s) s.dispatchEvent(new MouseEvent('click', { bubbles: true, cancelable: true }));
+        // NOTE: do NOT dispatch synthetic click events here — they can propagate
+        // focus to the host BrowserWindow, causing focus-stealing between
+        // multiple Antigravity windows.  Setting el.open = true is sufficient
+        // to expose the DOM content for reading.
       });
       return window.__rac_exp.length;
     `);
@@ -630,11 +646,7 @@ async function _expandOutputDetails(Runtime) {
 function _collapseOutputDetails(Runtime) {
   evalInFrame(Runtime, `
     if (window.__rac_exp) {
-      window.__rac_exp.forEach(function(el) {
-        el.open = false;
-        var s = el.querySelector('summary');
-        if (s && el.open) s.dispatchEvent(new MouseEvent('click', { bubbles: true, cancelable: true }));
-      });
+      window.__rac_exp.forEach(function(el) { el.open = false; });
       window.__rac_exp = null;
     }
   `).catch(() => {});
@@ -781,13 +793,32 @@ const CODEX_READ_EXPR = `
       var text = (el.innerText || '').trim();
       if (!text) continue; // skip spacers
 
+      // Helper: extract inline images (screenshots/attachments) from a user message element
+      function _extractImages(container) {
+        var imgParts = [];
+        var images = container.querySelectorAll('img');
+        for (var ii = 0; ii < images.length; ii++) {
+          var imgSrc = images[ii].src || '';
+          if (imgSrc.startsWith('data:image/') && imgSrc.length < 700000) {
+            imgParts.push('![screenshot](' + imgSrc + ')');
+          } else if (imgSrc.startsWith('data:image/')) {
+            imgParts.push('[Screenshot: ' + images[ii].naturalWidth + 'x' + images[ii].naturalHeight + ' (too large)]');
+          } else if (imgSrc.startsWith('blob:')) {
+            imgParts.push('[Screenshot: ' + images[ii].naturalWidth + 'x' + images[ii].naturalHeight + ']');
+          }
+        }
+        return imgParts;
+      }
+
       // Detect user messages: has items-end class or whitespace-pre-wrap inside items-end
       var userEl = el.querySelector('[class*="items-end"]');
       if (userEl) {
         flushAssistant();
         var wpw = userEl.querySelector('.whitespace-pre-wrap');
         var utext = wpw ? wpw.textContent.trim() : userEl.textContent.trim();
-        if (utext) msgs.push({ role: 'user', content: utext });
+        var uimgs = _extractImages(userEl);
+        var ucontent = (uimgs.length > 0 ? uimgs.join('\\n') + '\\n' : '') + (utext || '');
+        if (ucontent.trim()) msgs.push({ role: 'user', content: ucontent.trim() });
         continue;
       }
       // Detect user unit key
@@ -796,7 +827,9 @@ const CODEX_READ_EXPR = `
         flushAssistant();
         var wpw2 = userUnit.querySelector('.whitespace-pre-wrap');
         var ut2 = wpw2 ? wpw2.textContent.trim() : userUnit.textContent.trim();
-        if (ut2) msgs.push({ role: 'user', content: ut2 });
+        var uimgs2 = _extractImages(userUnit);
+        var ucontent2 = (uimgs2.length > 0 ? uimgs2.join('\\n') + '\\n' : '') + (ut2 || '');
+        if (ucontent2.trim()) msgs.push({ role: 'user', content: ucontent2.trim() });
         continue;
       }
 
@@ -918,6 +951,12 @@ const CODEX_READ_EXPR = `
       if (/^Final message$/i.test(text)) continue;
       // Skip bare button text (Undo, Review)
       if (/^(Undo|Review)$/i.test(text)) continue;
+
+      // Check for inline images (screenshots taken by the agent)
+      var aImgs = _extractImages(el);
+      if (aImgs.length > 0) {
+        pendingAssistant.push(aImgs.join('\\n'));
+      }
 
       // Regular assistant text (narrative paragraphs)
       if (text.length > 5) {
@@ -1116,20 +1155,10 @@ const ANTIGRAVITY_READ_EXPR = `
 
   // Extract text from a tool-call / action block (isolate bordered container).
   function extractToolBlock(el) {
-    var parts = [];
-    var titleEl = el.querySelector('[class*="font-semibold"]');
-    if (titleEl) parts.push('[' + titleEl.textContent.trim() + ']');
-    var descEls = el.querySelectorAll('[class*="leading-relaxed"] p, [class*="leading-relaxed"] li');
-    for (var di = 0; di < descEls.length; di++) {
-      var dt = nodeToText(descEls[di]).trim();
-      if (dt) parts.push(dt);
-    }
-    if (parts.length <= 1) {
-      var fallback = (el.innerText || '').trim();
-      fallback = fallback.replace(/^(Expand all|Collapse)$/gm, '').trim();
-      if (fallback && parts.length === 0) parts.push(fallback.substring(0, 500));
-    }
-    return parts.join('\\n').trim();
+    var rawText = (el.innerText || '').trim();
+    var cleanText = rawText.replace(/^(Expand all|Collapse all|Collapse|Relocate|Cancel|Always run|Never run)$/gmi, '').trim();
+    cleanText = cleanText.replace(/\\n\\s*\\n\\s*\\n/g, '\\n\\n');
+    return cleanText.length > 10000 ? cleanText.substring(0, 10000) + '\\n...[truncated]' : cleanText;
   }
 
   // Find the conversation turn container
@@ -1370,24 +1399,10 @@ const ANTIGRAVITY_PANEL_READ_EXPR = `
   // Extract text from a tool-call / action block (isolate bordered container).
   // Structure: .isolate > .flex (header with title + description) + div (progress/files)
   function extractToolBlock(el) {
-    var parts = [];
-    // Title from font-semibold span
-    var titleEl = el.querySelector('[class*="font-semibold"]');
-    if (titleEl) parts.push('[' + titleEl.textContent.trim() + ']');
-    // Description from leading-relaxed text container
-    var descEls = el.querySelectorAll('[class*="leading-relaxed"] p, [class*="leading-relaxed"] li');
-    for (var di = 0; di < descEls.length; di++) {
-      var dt = nodeToText(descEls[di]).trim();
-      if (dt) parts.push(dt);
-    }
-    // If no structured content found, fall back to innerText
-    if (parts.length <= 1) {
-      var fallback = (el.innerText || '').trim();
-      // Strip button labels (Expand all, Collapse, etc.) and progress noise
-      fallback = fallback.replace(/^(Expand all|Collapse)$/gm, '').trim();
-      if (fallback && parts.length === 0) parts.push(fallback.substring(0, 500));
-    }
-    return parts.join('\\n').trim();
+    var rawText = (el.innerText || '').trim();
+    var cleanText = rawText.replace(/^(Expand all|Collapse all|Collapse|Relocate|Cancel|Always run|Never run)$/gmi, '').trim();
+    cleanText = cleanText.replace(/\\n\\s*\\n\\s*\\n/g, '\\n\\n');
+    return cleanText.length > 10000 ? cleanText.substring(0, 10000) + '\\n...[truncated]' : cleanText;
   }
 
   // Scope search to the side panel
@@ -1674,9 +1689,23 @@ async function detectAntigravityPanelThinking(Runtime) {
       var panel = d.querySelector('.antigravity-agent-side-panel');
       if (!panel) return JSON.stringify({ thinking: false, label: '' });
       var btns = Array.from(panel.querySelectorAll('button'));
+      // Only match actual stop/abort buttons, NOT "Cancel" from permission prompts
+      // (permission prompts have "Always run" + "Cancel" side by side)
       var stopBtn = btns.find(function(b) {
-        var t = (b.textContent || b.getAttribute('aria-label') || '').toLowerCase();
-        return t === 'stop' || t === 'cancel' || t.includes('stop generating');
+        var t = (b.textContent || b.getAttribute('aria-label') || '').trim().toLowerCase();
+        if (t === 'stop' || t === 'stop generating' || t.includes('stop generating')) return true;
+        // "Cancel" is only a stop button if there's no "Always run" nearby
+        // (permission prompts have "Always run" + "Cancel" in nearby ancestors)
+        if (t === 'cancel') {
+          var ancestor = b.parentElement;
+          for (var ci = 0; ci < 4 && ancestor; ci++) {
+            var nearby = Array.from(ancestor.querySelectorAll('button'));
+            if (nearby.some(function(s) { return (s.textContent || '').toLowerCase().includes('always run'); })) return false;
+            ancestor = ancestor.parentElement;
+          }
+          return true;
+        }
+        return false;
       });
       var isThinking = !!stopBtn && stopBtn.offsetParent !== null;
       return JSON.stringify({ thinking: isThinking, label: isThinking ? 'Working' : '' });
@@ -2888,7 +2917,9 @@ const READ_CLAUDE_RATE_LIMIT_EXPR = `
   var resetMatch = bannerText.match(/resets\\s+in\\s+([\\dhmins ]+)/i);
   var resetText = resetMatch ? resetMatch[1].trim() : null;
 
-  return JSON.stringify({ rate_limited: true, percent_used: pct, until_text: resetText });
+  // Only flag as rate_limited if at 100% or banner contains explicit limit text
+  var isHardLimited = pct >= 100 || bannerText.indexOf('limit reached') >= 0 || bannerText.indexOf('rate limited') >= 0;
+  return JSON.stringify({ rate_limited: isHardLimited, percent_used: pct, until_text: resetText });
 `;
 
 async function readClaudeRateLimit(Runtime) {
@@ -2936,6 +2967,51 @@ async function readCodexNativeQueue(Runtime, usePageEval) {
   } catch {
     return [];
   }
+}
+
+// ─── Codex task list detection ────────────────────────────────────────────────
+//
+// Reads the plan/task list from Codex Desktop or Codex extension.
+// Header: SPAN matching /\d+ out of \d+ tasks completed/
+// Items: div[id^="plan-item-"] with number + icon + description span.
+// States: animate-spin = in_progress, SVG path M10 2.9032 = pending, else = completed.
+//
+// Returns { completed, total, tasks: [{ index, text, state }] } or null.
+
+async function readCodexTaskList(Runtime, usePageEval) {
+  const evalFn = usePageEval ? evalInPage : evalInFrame;
+  const raw = await evalFn(Runtime, `
+    var header = null;
+    var spans = d.querySelectorAll('span');
+    for (var i = 0; i < spans.length; i++) {
+      if (/\\d+ out of \\d+ tasks/.test(spans[i].textContent.trim())) { header = spans[i]; break; }
+    }
+    if (!header) return null;
+    var headerText = header.textContent.trim();
+    var match = headerText.match(/(\\d+) out of (\\d+)/);
+    var planItems = d.querySelectorAll('div[id^="plan-item-"]');
+    if (planItems.length === 0) return null;
+    var tasks = [];
+    for (var j = 0; j < planItems.length; j++) {
+      var item = planItems[j];
+      var rect = item.getBoundingClientRect();
+      if (rect.height <= 0) continue;
+      // Second child is the task description span (first child is the number+icon)
+      var descSpan = item.children.length > 1 ? item.children[1] : null;
+      var text = descSpan ? descSpan.textContent.trim() : item.textContent.trim().replace(/^\\d+\\.\\s*/, '');
+      var hasSpinner = !!item.querySelector('[class*="animate-spin"]');
+      var hasLineThrough = descSpan ? (descSpan.className || '').toString().indexOf('line-through') >= 0 : false;
+      var state = hasSpinner ? 'in_progress' : hasLineThrough ? 'completed' : 'pending';
+      tasks.push({ index: j, text: text, state: state });
+    }
+    // Mark completed tasks based on header count (Codex marks first N as completed)
+    var completedCount = match ? parseInt(match[1]) : 0;
+    for (var k = 0; k < tasks.length; k++) {
+      if (tasks[k].state === 'pending' && k < completedCount) tasks[k].state = 'completed';
+    }
+    return JSON.stringify({ completed: completedCount, total: match ? parseInt(match[2]) : tasks.length, tasks: tasks });
+  `);
+  try { return raw ? JSON.parse(raw) : null; } catch { return null; }
 }
 
 // ─── Generic rate limit detection (Claude, Gemini, Antigravity) ───────────────
@@ -5118,6 +5194,7 @@ module.exports = {
   readClaudeRateLimit,
   readRateLimit,
   readCodexNativeQueue,
+  readCodexTaskList,
   setCodexDesktopConfig,
   newCodexThread,
   // Epic 2 — Thread history

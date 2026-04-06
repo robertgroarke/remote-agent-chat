@@ -114,6 +114,11 @@ class ProxyEngine extends EventEmitter {
     // Main poll interval handle
     this._pollTimer = null;
 
+    // Window-staggered polling: rotate which parentId (window) gets polled each tick
+    // to avoid rapid CDP interactions across multiple Antigravity windows that cause
+    // OS-level focus stealing.
+    this._pollWindowIndex = 0;
+
     // Running flag
     this._running = false;
   }
@@ -556,9 +561,10 @@ class ProxyEngine extends EventEmitter {
       for (const [sessionId, session] of this.sessions.entries()) {
         selectors.readMessages(session.client.Runtime, session.agentType, sessionId)
           .then(raw => {
-            if (!raw) return;
-            const msgs = JSON.parse(raw);
-            if (msgs.length > 0) this._sendToRelay(proto.historySnapshot(sessionId, msgs));
+            if (!raw && !session._accumulatedMessages) return;
+            const msgs = raw ? JSON.parse(raw) : [];
+            const effMsgs = session._accumulatedMessages || msgs;
+            if (effMsgs.length > 0) this._sendToRelay(proto.historySnapshot(sessionId, effMsgs));
           })
           .catch(e => this._log('warn', `[relay] History resync failed for ${sessionId}: ${e.message}`));
       }
@@ -619,10 +625,31 @@ class ProxyEngine extends EventEmitter {
     if (type === 'discard_queued') {
       const sid = msg.session_id || msg.session;
       const session = this.sessions.get(sid);
+      const cid = msg.client_message_id;
+
+      // Native queue item — click Codex's "Delete queued message" button
+      if (cid && cid.startsWith('native-') && session) {
+        const idx = parseInt(cid.replace('native-', ''), 10) || 0;
+        const usePageEval = session.agentType === 'codex-desktop';
+        const evalFn = usePageEval ? selectors.evalInPage : selectors.evalInFrame;
+        evalFn(session.client.Runtime, `
+          var delBtns = Array.from(d.querySelectorAll('button[aria-label="Delete queued message"]'));
+          if (delBtns.length > ${idx}) { delBtns[${idx}].click(); return 'deleted-' + ${idx}; }
+          if (delBtns.length > 0) { delBtns[0].click(); return 'deleted-0-fallback'; }
+          return 'no-delete-btn';
+        `).then(r => {
+          this._log('info', `[${sid}] Native queue delete: ${r}`);
+          // Reset native queue sig to force re-detection
+          session._nativeQueueSig = null;
+        }).catch(() => {});
+        return;
+      }
+
+      // Proxy-queued item
       if (session?.messageQueue) {
-        const wasFirst = session.messageQueue[0]?.client_message_id === msg.client_message_id;
-        session.messageQueue = session.messageQueue.filter(m => m.client_message_id !== msg.client_message_id);
-        this._log('info', `[${sid}] Discarded queued message ${msg.client_message_id} (remaining: ${session.messageQueue.length})`);
+        const wasFirst = session.messageQueue[0]?.client_message_id === cid;
+        session.messageQueue = session.messageQueue.filter(m => m.client_message_id !== cid);
+        this._log('info', `[${sid}] Discarded queued message ${cid} (remaining: ${session.messageQueue.length})`);
         // If the discarded message was the one in ProseMirror, type the next one
         if (wasFirst) this._typeNextQueuedIntoProseMirror(sid);
       }
@@ -1223,6 +1250,9 @@ class ProxyEngine extends EventEmitter {
       if (agentT === 'antigravity_panel') {
         // Suppress hasContent removal check while the panel resets
         sessionData._newChatPending = Date.now();
+        // Clear accumulated message buffer so we start fresh
+        sessionData._accumulatedMessages = null;
+        sessionStore.updateSession(sid, { accumulated_messages: null });
         selectors.newAntigravityPanelChat(sessionData.client.Runtime)
           .then(result => {
             this._sendToRelay(proto.agentControlResult(sid, requestId, 'new_chat', result.ok ? 'ok' : 'failed',
@@ -2163,6 +2193,8 @@ class ProxyEngine extends EventEmitter {
                 session.lastMessageCount = 0;
                 session.lastObservedCount = 0;
                 session.lastTranscriptSig = '';
+                session._accumulatedMessages = null;
+                sessionStore.updateSession(sessionId, { accumulated_messages: null });
               }
               if (session._newChatPending) {
                 delete session._newChatPending;
@@ -2206,65 +2238,137 @@ class ProxyEngine extends EventEmitter {
       if (session._panelEmpty) return;
 
       const messages = JSON.parse(raw);
-      const transcriptSig = this._transcriptSignature(messages);
+
+      // ── Antigravity accumulation layer ──────────────────────────────
+      // The Antigravity side panel virtualizes older turns — they disappear
+      // from the DOM as the conversation grows.  Instead of treating the DOM
+      // snapshot as authoritative (which would wipe history), we accumulate
+      // messages in session._accumulatedMessages and merge new DOM content
+      // into that buffer.
+      const isAccumulating = session.agentType === 'antigravity_panel' || session.agentType === 'antigravity';
+
+      if (isAccumulating) {
+        if (!session._accumulatedMessages) {
+          // First poll — seed with whatever the DOM has
+          session._accumulatedMessages = messages.slice();
+        } else {
+          // Merge: find where current DOM messages overlap with the accumulated tail
+          // The DOM always shows the newest N messages, so we match backwards.
+          const acc  = session._accumulatedMessages;
+          const dom  = messages;
+
+          if (dom.length > 0) {
+            // Find the longest suffix of `acc` that is a prefix of `dom`
+            // (i.e. how many of the last accumulated messages are still visible)
+            let overlapLen = 0;
+            for (let tryLen = Math.min(acc.length, dom.length); tryLen >= 1; tryLen--) {
+              let match = true;
+              for (let k = 0; k < tryLen; k++) {
+                const accMsg = acc[acc.length - tryLen + k];
+                const domMsg = dom[k];
+                if (accMsg.role !== domMsg.role) { match = false; break; }
+                // Content may have grown (streaming) — check if DOM content starts with accumulated or vice versa
+                if (accMsg.content !== domMsg.content &&
+                    !domMsg.content.startsWith(accMsg.content.substring(0, 80)) &&
+                    !accMsg.content.startsWith(domMsg.content.substring(0, 80))) {
+                  match = false; break;
+                }
+              }
+              if (match) { overlapLen = tryLen; break; }
+            }
+
+            if (overlapLen > 0) {
+              // Update overlapping tail (content may have grown from streaming)
+              for (let k = 0; k < overlapLen; k++) {
+                const accIdx = acc.length - overlapLen + k;
+                const domIdx = k;
+                // Keep the longer version
+                if (dom[domIdx].content.length > acc[accIdx].content.length) {
+                  acc[accIdx] = dom[domIdx];
+                }
+              }
+              // Append truly new messages
+              for (let k = overlapLen; k < dom.length; k++) {
+                acc.push(dom[k]);
+              }
+            } else {
+              // No overlap — the DOM jumped to completely new content.
+              // This can happen after a /clear or new_chat. Check if all DOM
+              // messages are already in the tail of acc (subset check).
+              const lastAccContent = acc.length > 0 ? acc[acc.length - 1].content : '';
+              const firstDomContent = dom[0]?.content || '';
+              // If the DOM first message matches nothing in recent history, append all
+              if (!lastAccContent || !firstDomContent.startsWith(lastAccContent.substring(0, 80))) {
+                for (const m of dom) acc.push(m);
+              }
+            }
+          }
+        }
+        sessionStore.updateSession(sessionId, { accumulated_messages: session._accumulatedMessages });
+      }
+
+      // Use accumulated messages for antigravity sessions, DOM snapshot for others
+      const effectiveMessages = isAccumulating ? (session._accumulatedMessages || messages) : messages;
+      const transcriptSig = this._transcriptSignature(effectiveMessages);
       const prevObservedCount = session.lastObservedCount ?? session.lastMessageCount;
 
-      if (messages.length < prevObservedCount) {
-        this._log('warn', `[${sessionId}] Transcript regressed ${prevObservedCount} -> ${messages.length}, forcing history snapshot`);
-        this._sendToRelay(proto.historySnapshot(sessionId, messages));
-        session.lastMessageCount = messages.length;
-        session.lastObservedCount = messages.length;
+      if (effectiveMessages.length < prevObservedCount) {
+        // For accumulating sessions this should rarely happen (new chat / clear)
+        this._log('warn', `[${sessionId}] Transcript regressed ${prevObservedCount} -> ${effectiveMessages.length}${isAccumulating ? ' (accumulated)' : ''}, forcing history snapshot`);
+        this._sendToRelay(proto.historySnapshot(sessionId, effectiveMessages));
+        session.lastMessageCount = effectiveMessages.length;
+        session.lastObservedCount = effectiveMessages.length;
         session.lastTranscriptSig = transcriptSig;
         session.pendingLast = null;
         session.resyncCandidateSig = null;
-        session.waitingForAssistant = messages.length > 0 && messages[messages.length - 1].role === 'user';
+        session.waitingForAssistant = effectiveMessages.length > 0 && effectiveMessages[effectiveMessages.length - 1].role === 'user';
         return;
       }
 
       if (
         session.lastTranscriptSig &&
         transcriptSig !== session.lastTranscriptSig &&
-        messages.length === prevObservedCount
+        effectiveMessages.length === prevObservedCount
       ) {
         if (session.resyncCandidateSig === transcriptSig) {
           this._log('warn', `[${sessionId}] Transcript mutated in place, forcing history snapshot`);
-          this._sendToRelay(proto.historySnapshot(sessionId, messages));
-          session.lastMessageCount = messages.length;
-          session.lastObservedCount = messages.length;
+          this._sendToRelay(proto.historySnapshot(sessionId, effectiveMessages));
+          session.lastMessageCount = effectiveMessages.length;
+          session.lastObservedCount = effectiveMessages.length;
           session.lastTranscriptSig = transcriptSig;
           session.pendingLast = null;
           session.resyncCandidateSig = null;
-          session.waitingForAssistant = messages.length > 0 && messages[messages.length - 1].role === 'user';
+          session.waitingForAssistant = effectiveMessages.length > 0 && effectiveMessages[effectiveMessages.length - 1].role === 'user';
           return;
         }
         session.resyncCandidateSig = transcriptSig;
-        session.lastObservedCount = messages.length;
+        session.lastObservedCount = effectiveMessages.length;
         session.lastTranscriptSig = transcriptSig;
         return;
       }
 
       if (session.resyncCandidateSig && session.resyncCandidateSig === transcriptSig) {
         this._log('warn', `[${sessionId}] Mutated transcript stabilized — resyncing`);
-        this._sendToRelay(proto.historySnapshot(sessionId, messages));
-        session.lastMessageCount = messages.length;
-        session.lastObservedCount = messages.length;
+        this._sendToRelay(proto.historySnapshot(sessionId, effectiveMessages));
+        session.lastMessageCount = effectiveMessages.length;
+        session.lastObservedCount = effectiveMessages.length;
         session.lastTranscriptSig = transcriptSig;
         session.pendingLast = null;
         session.resyncCandidateSig = null;
-        session.waitingForAssistant = messages.length > 0 && messages[messages.length - 1].role === 'user';
+        session.waitingForAssistant = effectiveMessages.length > 0 && effectiveMessages[effectiveMessages.length - 1].role === 'user';
         return;
       }
 
-      if (messages.length < session.lastMessageCount) {
-        this._log('warn', `[${sessionId}] Msg count regressed ${session.lastMessageCount} → ${messages.length}, resetting`);
-        session.lastMessageCount = messages.length;
+      if (effectiveMessages.length < session.lastMessageCount) {
+        this._log('warn', `[${sessionId}] Msg count regressed ${session.lastMessageCount} → ${effectiveMessages.length}, resetting`);
+        session.lastMessageCount = effectiveMessages.length;
         session.pendingLast = null;
       }
 
       // Pending stabilisation
       if (session.pendingLast !== null) {
         const p       = session.pendingLast;
-        const current = messages[session.lastMessageCount];
+        const current = effectiveMessages[session.lastMessageCount];
         if (current && current.role === p.role && current.content === p.content) {
           this._log('info', `[${sessionId}] Stable ${p.role} msg (${p.content.length} chars)`);
           this._sendToRelay(proto.proxyMessage(sessionId, p.role, p.content));
@@ -2274,10 +2378,11 @@ class ProxyEngine extends EventEmitter {
           if (p.role === 'assistant') session.waitingForAssistant = false;
         } else if (current) {
           session.pendingLast = { role: current.role, content: current.content };
-          session.lastObservedCount = messages.length;
+          session.lastObservedCount = effectiveMessages.length;
           session.lastTranscriptSig = transcriptSig;
           if (session.activity?.kind !== 'generating' && session.activity?.kind !== 'thinking') {
             const genActivity = { kind: 'generating', label: 'Generating', updated_at: new Date().toISOString() };
+            if (session.taskList) genActivity.task_list = session.taskList;
             session.activity = genActivity;
             sessionStore.updateSession(sessionId, { activity: genActivity });
             this._sendToRelay(proto.proxyStatus(sessionId, session.status || 'healthy', genActivity));
@@ -2288,19 +2393,19 @@ class ProxyEngine extends EventEmitter {
 
       // Send newly complete messages
       const prev = session.lastMessageCount;
-      if (messages.length > prev) {
-        for (let i = prev; i < messages.length - 1; i++) {
-          this._log('info', `[${sessionId}] New ${messages[i].role} msg (${messages[i].content.length} chars)`);
-          this._sendToRelay(proto.proxyMessage(sessionId, messages[i].role, messages[i].content));
-          if (messages[i].role === 'user')      session.waitingForAssistant = true;
-          if (messages[i].role === 'assistant') session.waitingForAssistant = false;
+      if (effectiveMessages.length > prev) {
+        for (let i = prev; i < effectiveMessages.length - 1; i++) {
+          this._log('info', `[${sessionId}] New ${effectiveMessages[i].role} msg (${effectiveMessages[i].content.length} chars)`);
+          this._sendToRelay(proto.proxyMessage(sessionId, effectiveMessages[i].role, effectiveMessages[i].content));
+          if (effectiveMessages[i].role === 'user')      session.waitingForAssistant = true;
+          if (effectiveMessages[i].role === 'assistant') session.waitingForAssistant = false;
         }
-        session.lastMessageCount = messages.length - 1;
-        const last = messages[messages.length - 1];
+        session.lastMessageCount = effectiveMessages.length - 1;
+        const last = effectiveMessages[effectiveMessages.length - 1];
         session.pendingLast = { role: last.role, content: last.content };
       }
 
-      session.lastObservedCount = messages.length;
+      session.lastObservedCount = effectiveMessages.length;
       session.lastTranscriptSig = transcriptSig;
       session.resyncCandidateSig = null;
 
@@ -2310,8 +2415,10 @@ class ProxyEngine extends EventEmitter {
       const kind   = ts.thinking ? 'thinking' : active ? 'generating' : 'idle';
       const label  = ts.label || (active ? 'Generating' : '');
       const newActivity = { kind, label, updated_at: new Date().toISOString() };
-      // Attach thinking content for Claude Code sessions only
-      if (ts.thinkingContent && (session.agentType === 'claude' || session.agentType === 'claude-desktop')) {
+      // Carry forward task list from previous activity
+      if (session.taskList) newActivity.task_list = session.taskList;
+      // Attach thinking content (command being run, tool output, etc.)
+      if (ts.thinkingContent) {
         newActivity.thinkingContent = ts.thinkingContent;
       }
 
@@ -2361,16 +2468,21 @@ class ProxyEngine extends EventEmitter {
             const nowActive = rl?.rate_limited === true;
             const untilText = rl?.until_text || null;
             const pctUsed   = rl?.percent_used ?? null;
+            const hasBanner = pctUsed != null;
             const sig = `${nowActive}|${pctUsed}|${untilText}`;
             if (sig !== session._rateLimitSig) {
               session._rateLimitSig = sig;
               session.rateLimitActive    = nowActive;
               session.rate_limited_until = nowActive ? (untilText || 'unknown') : null;
-              session.percentUsed        = pctUsed;
+              session.percentUsed        = hasBanner ? pctUsed : null;
               if (nowActive) {
                 this._log('info', `[${sessionId}] [rate-limit] Active: ${pctUsed != null ? pctUsed + '%' : ''} resets ${untilText || 'unknown'}`);
                 this._sendToRelay(proto.rateLimitActive(sessionId, untilText, pctUsed));
-              } else {
+              } else if (hasBanner) {
+                // Usage warning (banner visible but not hard-limited) — send percent for display
+                this._log('info', `[${sessionId}] [rate-limit] Usage: ${pctUsed}% resets ${untilText || 'unknown'}`);
+                this._sendToRelay(proto.rateLimitActive(sessionId, untilText, pctUsed));
+              } else if (wasActive || session.percentUsed != null) {
                 this._log('info', `[${sessionId}] [rate-limit] Cleared`);
                 this._sendToRelay(proto.rateLimitCleared(sessionId));
               }
@@ -2402,6 +2514,28 @@ class ProxyEngine extends EventEmitter {
               this._sendToRelay(proto.nativeQueue(sessionId, items));
             }
           }).catch((e) => { this._log('warn', `[${sessionId}] [native-queue] Error: ${e.message}`); });
+        }
+      }
+
+      // Task list detection — Codex plan/task items
+      if (session.agentType === 'codex' || session.agentType === 'codex-desktop') {
+        session._taskListPollCount = (session._taskListPollCount || 0) + 1;
+        if (session._taskListPollCount >= 5) {
+          session._taskListPollCount = 0;
+          const usePageEval = session.agentType === 'codex-desktop';
+          selectors.readCodexTaskList(session.client.Runtime, usePageEval).then(taskList => {
+            const sig = taskList ? JSON.stringify(taskList) : '';
+            if (sig !== (session._taskListSig || '')) {
+              session._taskListSig = sig;
+              session.taskList = taskList;
+              // Attach task list to the activity update (create a minimal activity if none exists yet)
+              if (!session.activity) {
+                session.activity = { kind: 'idle', label: '', updated_at: new Date().toISOString() };
+              }
+              session.activity.task_list = taskList;
+              this._sendToRelay(proto.proxyStatus(sessionId, session.status || 'healthy', session.activity));
+            }
+          }).catch(() => {});
         }
       }
 
@@ -2584,6 +2718,7 @@ class ProxyEngine extends EventEmitter {
     if (result.ok) {
       session.waitingForAssistant = true;
       const genActivity = { kind: 'generating', label: 'Generating', updated_at: new Date().toISOString() };
+      if (session.taskList) genActivity.task_list = session.taskList;
       session.activity = genActivity;
       sessionStore.updateSession(sessionId, { activity: genActivity });
       this._sendToRelay(proto.proxyStatus(sessionId, session.status || 'healthy', genActivity));
@@ -2701,12 +2836,21 @@ class ProxyEngine extends EventEmitter {
 
     const storagePaths = this._readAntigravityWindowPaths();
 
-    // Build vscodeWindowId → page target map
+    // Build vscodeWindowId → page target map.
+    // Cache by page.id to avoid opening new CDP connections to workbench pages
+    // on every discovery cycle — those connections can steal window focus.
+    if (!this._windowIdCache) this._windowIdCache = new Map(); // pageId → winId
     const windowIdToPage = new Map();
     const winIdPages = antigravityPg.filter(t =>
       t.url && t.url.includes('workbench.html') && !t.url.includes('jetski')
     );
     for (const page of winIdPages) {
+      // Use cached windowId if we already resolved this page target
+      const cached = this._windowIdCache.get(page.id);
+      if (cached) {
+        windowIdToPage.set(cached, page);
+        continue;
+      }
       let pageClient;
       try {
         pageClient = await CDP({ port: 9223, target: page.id });
@@ -2716,11 +2860,19 @@ class ProxyEngine extends EventEmitter {
           returnByValue: true,
         });
         const winId = res.result?.value;
-        if (winId) windowIdToPage.set(winId, page);
+        if (winId) {
+          windowIdToPage.set(winId, page);
+          this._windowIdCache.set(page.id, winId);
+        }
         await pageClient.close();
       } catch (e) {
         if (pageClient) try { await pageClient.close(); } catch {}
       }
+    }
+    // Prune cached windowIds for page targets that no longer exist
+    const currentPageIds = new Set(winIdPages.map(p => p.id));
+    for (const cachedPageId of this._windowIdCache.keys()) {
+      if (!currentPageIds.has(cachedPageId)) this._windowIdCache.delete(cachedPageId);
     }
     if (windowIdToPage.size > 0) {
       const entries = Array.from(windowIdToPage.entries()).map(([id, p]) => `${id}→"${p.title.substring(0,40)}"`);
@@ -2878,7 +3030,9 @@ class ProxyEngine extends EventEmitter {
         }
 
         const raw          = await selectors.readMessages(client.Runtime, agentType, sessionId);
-        const initialMsgs  = raw ? JSON.parse(raw) : [];
+        const domMsgs      = raw ? JSON.parse(raw) : [];
+        const isAccumAccum = (agentType === 'antigravity_panel' || agentType === 'antigravity');
+        const initialMsgs  = (isAccumAccum && sessionMeta.accumulated_messages) ? sessionMeta.accumulated_messages : domMsgs;
         const initialCount = initialMsgs.length;
 
         const firstUserMsg = initialMsgs.find(m => m.role === 'user');
@@ -2901,6 +3055,7 @@ class ProxyEngine extends EventEmitter {
           lastMessageCount: initialCount,
           lastObservedCount: initialCount,
           lastTranscriptSig: this._transcriptSignature(initialMsgs),
+          _accumulatedMessages: (isAccumAccum && sessionMeta.accumulated_messages) ? sessionMeta.accumulated_messages : (isAccumAccum ? domMsgs : null),
           nullPollCount:    0,
           pendingLast:      null,
           resyncCandidateSig: null,
@@ -3328,9 +3483,28 @@ class ProxyEngine extends EventEmitter {
         this._broadcastSessionSnapshot();
       }
 
-      for (const [sessionId] of this.sessions.entries()) {
-        await this._pollSession(sessionId);
-        await this._pollPermissions(sessionId);
+      // Group sessions by parentId (Antigravity window) so we only interact with
+      // one window's CDP targets per tick.  This prevents rapid focus-stealing
+      // between multiple Antigravity windows when the user is typing.
+      const windowGroups = new Map(); // parentId → [sessionId, ...]
+      for (const [sessionId, session] of this.sessions.entries()) {
+        const key = session.parentId || sessionId; // desktop apps have no parentId
+        if (!windowGroups.has(key)) windowGroups.set(key, []);
+        windowGroups.get(key).push(sessionId);
+      }
+
+      const windowKeys = Array.from(windowGroups.keys());
+      if (windowKeys.length > 0) {
+        // Pick which window to poll this tick (round-robin)
+        this._pollWindowIndex = this._pollWindowIndex % windowKeys.length;
+        const activeKey = windowKeys[this._pollWindowIndex];
+        this._pollWindowIndex++;
+
+        // Poll all sessions in the selected window
+        for (const sessionId of windowGroups.get(activeKey)) {
+          await this._pollSession(sessionId);
+          await this._pollPermissions(sessionId);
+        }
       }
     }, this.POLL_INTERVAL_MS);
   }

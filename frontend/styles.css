@@ -632,6 +632,16 @@ body {
   flex-shrink: 0;
 }
 
+.codex-task-list { padding: 8px 0; }
+.codex-task-header { font-size: 11px; color: var(--text2); margin-bottom: 6px; font-weight: 600; }
+.codex-task-item { display: flex; align-items: flex-start; gap: 6px; padding: 2px 0; font-size: 12px; color: var(--text2); }
+.codex-task-item.done { color: var(--text3); text-decoration: line-through; opacity: 0.6; }
+.codex-task-item.active { color: var(--text1); }
+.codex-task-icon { flex-shrink: 0; width: 14px; text-align: center; font-size: 11px; }
+.codex-task-item.done .codex-task-icon { color: #4caf50; }
+.codex-task-item.active .codex-task-icon { color: var(--amber); }
+.codex-task-text { line-height: 1.4; }
+
 .last-user-banner {
   display: flex;
   align-items: center;
@@ -863,6 +873,18 @@ body {
   min-width: 0;
   display: flex;
   flex-direction: column;
+}
+
+/* ── Inline screenshots / images ──────────────────────────── */
+.assistant-content img, .user-bubble img {
+  max-width: min(400px, 80vw);
+  max-height: 300px;
+  border-radius: 6px;
+  border: 1px solid var(--border);
+  margin: 6px 0;
+  cursor: pointer;
+  object-fit: contain;
+  background: rgba(0, 0, 0, 0.2);
 }
 
 /* ── Delivery status indicators ────────────────────────────── */
@@ -1301,6 +1323,28 @@ body {
   color: var(--text2);
   line-height: 1.35;
   font-family: 'Cascadia Code', 'SF Mono', Consolas, monospace;
+}
+
+.activity-command {
+  margin-top: 4px;
+  font-size: 11px;
+  line-height: 1.3;
+  max-width: 100%;
+  overflow: hidden;
+}
+.activity-command code {
+  display: block;
+  padding: 4px 8px;
+  background: rgba(255, 255, 255, 0.04);
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  font-family: 'Cascadia Code', 'SF Mono', Consolas, monospace;
+  font-size: 10.5px;
+  color: var(--text2);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  max-width: min(500px, 60vw);
 }
 
 .activity-tasklist {

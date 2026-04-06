@@ -68,6 +68,7 @@ export function useRelay() {
           kind:      session.activity.kind || 'working',
           label:     session.activity.label || 'Working',
           updatedAt: session.activity.updated_at || null,
+          task_list: session.activity.task_list || null,
         };
       });
       if (Object.keys(next).length > 0) {
@@ -339,17 +340,20 @@ export function useRelay() {
 
       // ── Session snapshot (v1) ───────────────────────────────────────────────
       if (t === 'session_snapshot' || t === 'proxy_session_snapshot') {
+        const prevSessions = sessions;
+        const prevIds = new Set(prevSessions.map(s => typeof s === 'string' ? s : s?.session_id).filter(Boolean));
         setSessions(msg.sessions || []);
         mergeSessionMetadataActivity(msg.sessions || []);
         (msg.sessions || []).forEach(s => {
+          const id = s && typeof s === 'object' ? s.session_id : s;
           if (s && typeof s === 'object' && s.is_list_view) {
             // Panel is in list/new-chat mode — clear stale messages instead of fetching
-            const id = s.session_id;
             if (id) setMessages(prev => {
               if (prev[id] && prev[id].length > 0) return { ...prev, [id]: [] };
               return prev;
             });
-          } else {
+          } else if (!prevIds.has(id)) {
+            // Only request history for NEW sessions (not already known)
             requestHistory(s);
           }
         });
@@ -436,6 +440,7 @@ export function useRelay() {
               kind:      msg.activity?.kind || (isThinking ? 'thinking' : 'working'),
               label,
               updatedAt: msg.activity?.updated_at || null,
+              task_list: msg.activity?.task_list || null,
             }
           : false;
         if (isThinking) {
@@ -637,10 +642,13 @@ export function useRelay() {
       // ── Rate limit / usage warning ──────────────────────────────────────────
       if (t === 'rate_limit_active') {
         const sid = msg.session_id || msg.session;
+        const pct = msg.percent_used ?? null;
+        // Hard limit = 100% or no percent (legacy). Below 100% = usage warning only.
+        const isHardLimit = pct == null || pct >= 100;
         if (sid) {
           setSessions(prev => prev.map(s =>
             (typeof s === 'string' ? s : s?.session_id) === sid
-              ? { ...(typeof s === 'object' ? s : {}), session_id: sid, rate_limited_until: msg.retry_after_hint || 'unknown', rate_limit_active: true, percent_used: msg.percent_used ?? null }
+              ? { ...(typeof s === 'object' ? s : {}), session_id: sid, rate_limited_until: msg.retry_after_hint || (isHardLimit ? 'unknown' : null), rate_limit_active: isHardLimit, percent_used: pct }
               : s
           ));
         }

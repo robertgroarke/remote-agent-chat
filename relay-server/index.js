@@ -908,7 +908,7 @@ const KNOWN_PROXY_TYPES = new Set([
   'status', 'proxy_status',
   'message', 'proxy_message',
   'session_launch_ack', 'session_launch_failed', 'session_closed', 'session_meta_backfill',
-  'permission_prompt', 'agent_config', 'agent_control_result',
+  'permission_prompt', 'permission_prompt_expired', 'agent_config', 'agent_control_result',
   'history', 'history_snapshot',
   'rate_limit_active', 'rate_limit_cleared',
   'chat_list', 'thread_list', 'terminal_output', 'file_changes',
@@ -1399,6 +1399,26 @@ function handleProxyConnection(ws, req) {
       pendingPrompts.set(key, { prompt: msg, timer });
       broadcastToBrowsers(msg);
       log('info', 'prompt', 'Permission prompt received', { session: sessionId, prompt_id: promptId });
+
+    // ── Permission prompt expired (proxy-originated dismiss) ──────────────
+    } else if (t === 'permission_prompt_expired') {
+      const sessionId = msg.session_id || msg.session;
+      const promptId  = msg.prompt_id;
+      if (!sessionId || !promptId) return;
+      const key = `${sessionId}:${promptId}`;
+      const entry = pendingPrompts.get(key);
+      if (entry) {
+        clearTimeout(entry.timer);
+        pendingPrompts.delete(key);
+      }
+      broadcastToBrowsers({
+        type:             'permission_prompt_expired',
+        protocol_version: PROTOCOL_VERSION,
+        session_id:       sessionId,
+        prompt_id:        promptId,
+        server_ts:        new Date().toISOString(),
+      });
+      log('info', 'prompt', 'Permission prompt dismissed at source', { session: sessionId, prompt_id: promptId });
 
     // ── Agent config (A2-07) ──────────────────────────────────────────────
     } else if (t === 'agent_config') {

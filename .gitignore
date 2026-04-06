@@ -59,6 +59,15 @@ android-app/android/
 android-app/.expo/
 android-app/.node22/
 
+# CDP probe/debug scripts and output
+agent-proxy/probe-*.js
+agent-proxy/dom_dump*.txt
+agent-proxy/probe-output.txt
+agent-proxy/test.html
+
+# Android Expo build output
+android-app/dist/
+
 # Python cache
 __pycache__/
 

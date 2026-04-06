@@ -861,7 +861,7 @@ function renderStructuredContent(content) {
   // Sanitize before touching the DOM to prevent XSS from agent-controlled content.
   const tmp = document.createElement('div');
   if (typeof DOMPurify !== 'undefined') {
-    tmp.innerHTML = DOMPurify.sanitize(html);
+    tmp.innerHTML = DOMPurify.sanitize(html, { ADD_DATA_URI_TAGS: ['img'], ALLOW_DATA_ATTR: true });
   } else {
     tmp.textContent = html; // safe fallback — no HTML rendering if DOMPurify unavailable
   }
@@ -1137,7 +1137,9 @@ function MarkdownContent({ content, monospace = false }) {
     lastContent.current = content;
     // SEC-08: Re-sanitize at final DOM insertion point as defense-in-depth
     const rendered = renderStructuredContent(content || '');
-    ref.current.innerHTML = typeof DOMPurify !== 'undefined' ? DOMPurify.sanitize(rendered) : rendered;
+    ref.current.innerHTML = typeof DOMPurify !== 'undefined'
+      ? DOMPurify.sanitize(rendered, { ADD_DATA_URI_TAGS: ['img'], ALLOW_DATA_ATTR: true })
+      : rendered;
 
     // Restore tool-section collapsed states
     ref.current.querySelectorAll('.tool-section[data-tool-index]').forEach(s => {

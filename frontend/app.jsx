@@ -186,13 +186,14 @@ function QueuedItem({ qm, onSteer, onDiscard, onEdit }) {
     );
   }
 
-  // Native queue items (from Codex DOM) — only show Steer, no trash/edit
+  // Native queue items (from Codex DOM) — Steer + trash (clicks Codex's native delete)
   if (qm.native) {
     return (
       <div className="queued-item native">
         <span className="queued-item-text">{qm.content.length > 80 ? qm.content.substring(0, 77) + '...' : qm.content}</span>
         <div className="queued-actions">
           <button className="steer-btn" onClick={onSteer} title="Click Steer in Codex">Steer ▸</button>
+          <button className="queued-trash-btn" onClick={onDiscard} title="Delete queued message">🗑</button>
         </div>
       </div>
     );
@@ -228,12 +229,14 @@ function SessionCard({ session, health, unread, isThinking, isActive, agentConfi
   const winLabel = sessionSubLabel(session, sessionId, agentConfig);
   const dotColor = HEALTH_COLOR[health] || '#444c56';
   const rateLimitedUntil = session?.rate_limited_until || null;
+  const isHardLimited = session?.rate_limit_active === true;
+  const pctUsed = session?.percent_used;
   // Show granular activity label when thinking (Epic 8)
   const activityLabel = isThinking && activity?.label ? activity.label : null;
 
   return (
     <div
-      className={`session-card${isActive ? ' active' : ''}${rateLimitedUntil ? ' rate-limited' : ''}`}
+      className={`session-card${isActive ? ' active' : ''}${isHardLimited ? ' rate-limited' : ''}`}
       onClick={onSelect}
       title={sessionId}
     >
@@ -249,7 +252,8 @@ function SessionCard({ session, health, unread, isThinking, isActive, agentConfi
         <div className="session-card-name">{agent.name}</div>
         <div className={`session-card-sub${hasPermissionPrompt ? ' perm-active' : ''}`}>
           {hasPermissionPrompt ? 'Permission required'
-            : rateLimitedUntil ? `⏳ Rate limited`
+            : isHardLimited ? `⏳ Rate limited${rateLimitedUntil && rateLimitedUntil !== 'unknown' ? ` · ${rateLimitedUntil}` : ''}`
+            : pctUsed >= 80 ? `📊 ${pctUsed}% used`
             : activityLabel ? activityLabel
             : (winLabel || sessionId)}
         </div>
@@ -328,7 +332,29 @@ function ActivityRow({ activity, thinkingText, isClaude, pinned = false }) {
             <div className="thinking-content-text">{thinkingText}</div>
           </div>
         )}
+        {!showBlob && isActive && thinkingText && (
+          <div className="activity-command">
+            <code>{thinkingText}</code>
+          </div>
+        )}
       </div>
+    </div>
+  );
+}
+
+function TaskList({ taskList }) {
+  if (!taskList || !taskList.tasks || taskList.tasks.length === 0) return null;
+  const stateIcon = { completed: '\u2713', in_progress: '\u25CC', pending: '\u25CB' };
+  const stateCls = { completed: 'done', in_progress: 'active', pending: '' };
+  return (
+    <div className="codex-task-list">
+      <div className="codex-task-header">{taskList.completed}/{taskList.total} tasks</div>
+      {taskList.tasks.map((t, i) => (
+        <div key={i} className={`codex-task-item ${stateCls[t.state] || ''}`}>
+          <span className="codex-task-icon">{stateIcon[t.state] || '\u25CB'}</span>
+          <span className="codex-task-text">{t.text}</span>
+        </div>
+      ))}
     </div>
   );
 }
@@ -2483,12 +2509,7 @@ function App() {
 
         {activeActivity?.task_list && (
           <div className="session-tasklist-strip">
-            <ActivityRow
-              activity={activeActivity}
-              thinkingText={activeSession ? (thinkingContent[activeSession] || '') : ''}
-              isClaude={activeSessionMeta?.agent_type === 'claude'}
-              pinned={true}
-            />
+            <TaskList taskList={activeActivity.task_list} />
           </div>
         )}
 
@@ -2555,13 +2576,13 @@ function App() {
               onRespond={respondToPrompt}
             />
           )}
-          {(activeSessionMeta?.rate_limited_until || activeSessionMeta?.percent_used != null) && (
-            <div className={`rate-limit-overlay${activeSessionMeta?.percent_used >= 90 ? ' critical' : activeSessionMeta?.percent_used >= 75 ? ' warning' : ''}`}>
-              <span className="rate-limit-icon">{activeSessionMeta?.percent_used != null ? '📊' : '⏳'}</span>
+          {(activeSessionMeta?.rate_limit_active || (activeSessionMeta?.percent_used != null && activeSessionMeta.percent_used >= 80)) && (
+            <div className={`rate-limit-overlay${activeSessionMeta?.rate_limit_active ? ' critical' : activeSessionMeta?.percent_used >= 90 ? ' critical' : activeSessionMeta?.percent_used >= 75 ? ' warning' : ''}`}>
+              <span className="rate-limit-icon">{activeSessionMeta?.rate_limit_active ? '⏳' : '📊'}</span>
               <span className="rate-limit-text">
-                {activeSessionMeta?.percent_used != null
-                  ? <>Used <strong>{activeSessionMeta.percent_used}%</strong> of session limit{activeSessionMeta.rate_limited_until && activeSessionMeta.rate_limited_until !== 'unknown' ? <> · resets in <strong>{activeSessionMeta.rate_limited_until}</strong></> : null}</>
-                  : <>Rate limited{activeSessionMeta.rate_limited_until !== 'unknown' ? <> — available after <strong>{activeSessionMeta.rate_limited_until}</strong></> : null}</>
+                {activeSessionMeta?.rate_limit_active
+                  ? <>Rate limited{activeSessionMeta.rate_limited_until && activeSessionMeta.rate_limited_until !== 'unknown' ? <> — resets in <strong>{activeSessionMeta.rate_limited_until}</strong></> : null}</>
+                  : <>Used <strong>{activeSessionMeta.percent_used}%</strong> of session limit{activeSessionMeta.rate_limited_until && activeSessionMeta.rate_limited_until !== 'unknown' ? <> · resets in <strong>{activeSessionMeta.rate_limited_until}</strong></> : null}</>
                 }
               </span>
             </div>
@@ -2619,7 +2640,11 @@ function App() {
                       <span>You</span>
                       <DeliveryStatus msg={msg} deliveryStates={deliveryStates} onSteer={(cid, content) => steerMessage(activeSession, cid, content)} />
                     </div>
-                    <div className="user-text">{normalizeMessageContent(msg.content)}</div>
+                    {msg.content && msg.content.includes('![screenshot](data:') ? (
+                      <div className="user-text"><MarkdownContent content={normalizeMessageContent(msg.content)} /></div>
+                    ) : (
+                      <div className="user-text">{normalizeMessageContent(msg.content)}</div>
+                    )}
                   </div>
                 </div>
               ) : (
