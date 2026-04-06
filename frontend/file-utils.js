@@ -20,7 +20,7 @@ function isTextFile(filename) {
 }
 
 // Session display label — handles both legacy string IDs and protocol v1 metadata objects
-const AGENT_DISPLAY = { claude: 'Claude Code', codex: 'Codex', gemini: 'Gemini' };
+const AGENT_DISPLAY = { claude: 'Claude Code', codex: 'Codex', gemini: 'Gemini', continue: 'Continue' };
 const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
 
 function sessionLabel(sessionOrId, fallbackId) {

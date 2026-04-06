@@ -23,6 +23,7 @@ const AGENT_CONFIG = {
   codex:             { name: 'Codex',            color: '#10a37f', abbr: 'CX', logo: '/logo-codex-in-ag.svg' },
   'codex-desktop':   { name: 'Codex Desktop',   color: '#10a37f', abbr: 'CX', logo: '/logo-codex.svg' },
   gemini:            { name: 'Gemini',           color: '#4285f4', abbr: 'GC', logo: '/logo-gemini-in-ag.svg' },
+  continue:          { name: 'Continue',         color: '#d29922', abbr: 'CN', logo: null },
   antigravity:       { name: 'Antigravity',      color: '#a855f7', abbr: 'AG', logo: '/logo-antigravity.svg' },
   antigravity_panel: { name: 'Antigravity Chat', color: '#a855f7', abbr: 'AC', logo: '/logo-antigravity.svg' },
 };
@@ -921,6 +922,14 @@ function AgentSettingsPanel({ session, config, onRequestRefresh, onSetModel, onS
           <div className="settings-row">
             <span className="settings-label">Access</span>
             <span className={`settings-value${permMode === 'unknown' ? ' dim' : ''}`}>{permMode}</span>
+          </div>
+        )}
+
+        {/* Continue-specific: mode (read-only, configured in Continue UI) */}
+        {agentType === 'continue' && config?.mode && config.mode !== 'unknown' && (
+          <div className="settings-row">
+            <span className="settings-label">Mode</span>
+            <span className="settings-value">{config.mode}</span>
           </div>
         )}
 
@@ -2877,6 +2886,12 @@ function App() {
               </div>
             </div>
             <div className="composer-meta">
+              {activeSessionMeta?.agent_type === 'continue' && activeConfig?.mode && activeConfig.mode !== 'unknown' && (
+                <span className="composer-hint" style={{ color: '#d29922' }}>{activeConfig.mode}</span>
+              )}
+              {activeSessionMeta?.agent_type === 'continue' && activeConfig?.model_id && activeConfig.model_id !== 'unknown' && (
+                <span className="composer-hint" style={{ color: '#d29922' }}>{activeConfig.model_id}</span>
+              )}
               <span className="composer-hint">Enter send</span>
               <span className="composer-hint">Shift+Enter newline</span>
               <span className="composer-hint">Ctrl/Cmd+K focus</span>

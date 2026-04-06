@@ -261,7 +261,7 @@ class ProxyEngine extends EventEmitter {
     const isClaude  = agentType === 'claude' || agentType === 'claude-desktop';
     const isDesktop = agentType === 'codex-desktop' || agentType === 'claude-desktop';
     return {
-      interrupt:              ['claude', 'codex', 'gemini', 'antigravity', 'antigravity_panel', 'claude-desktop', 'codex-desktop'].includes(agentType),
+      interrupt:              ['claude', 'codex', 'gemini', 'continue', 'antigravity', 'antigravity_panel', 'claude-desktop', 'codex-desktop'].includes(agentType),
       set_model:              agentType === 'claude' || agentType === 'antigravity' || agentType === 'antigravity_panel' || agentType === 'gemini',
       set_mode:               agentType === 'antigravity',
       permission_mode_change: agentType === 'claude',
@@ -326,6 +326,15 @@ class ProxyEngine extends EventEmitter {
         available_access:   CODEX_ACCESS_MODES,
         branch:             branch || 'unknown',
         sandbox_status:     domCfg?.sandbox_status  || null,
+      };
+    }
+    if (agentType === 'continue') {
+      return {
+        model_id:           domCfg?.model_id        || 'unknown',
+        mode:               domCfg?.mode            || 'unknown',
+        permission_mode:    'unknown',
+        file_access_scope:  workspacePath || 'unknown',
+        branch:             branch || 'unknown',
       };
     }
     return {
@@ -2969,7 +2978,8 @@ class ProxyEngine extends EventEmitter {
                       ext.toLowerCase().includes('openai')    ||
                       ext.toLowerCase().includes('chatgpt')   ||
                       ext.toLowerCase().includes('googlecloud') ||
-                      ext.toLowerCase().includes('gemini');
+                      ext.toLowerCase().includes('gemini')    ||
+                      ext.toLowerCase().includes('continue.continue');
       if (!isAgent) continue;
 
       this._log('info', `[discover] Probing ${target.id.substring(0, 8)} ext=${ext}`);

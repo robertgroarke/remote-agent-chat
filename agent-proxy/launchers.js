@@ -288,6 +288,19 @@ async function launchSession({ agentType, port, sessions, requestId, workspacePa
     }
   }
 
+  // Continue: sidebar extension, can't be spawned — must already be open
+  if (agentType === 'continue') {
+    const hasContinue = Array.from(sessions.values()).some(s => s.agentType === 'continue');
+    if (!hasContinue) {
+      onFailure(
+        'Agent not open — open the Continue panel in Antigravity first',
+        'agent_not_open',
+        requestId
+      );
+      return;
+    }
+  }
+
   // Snapshot existing target IDs so we can detect the new one
   let existingIds;
   try {

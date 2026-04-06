@@ -34,7 +34,7 @@ This repo has two branches with distinct purposes:
 
 ## Project Overview
 
-A system to remotely access and chat with Antigravity IDE agent windows (Claude Code, Gemini Code Assist, OpenAI Codex) from a phone or browser. Uses Chrome DevTools Protocol (CDP) to bridge IDE agent webviews to a mobile-friendly web app hosted on Unraid.
+A system to remotely access and chat with Antigravity IDE agent windows (Claude Code, Gemini Code Assist, OpenAI Codex, Continue) from a phone or browser. Uses Chrome DevTools Protocol (CDP) to bridge IDE agent webviews to a mobile-friendly web app hosted on Unraid.
 
 **Target URL:** configurable via `PUBLIC_URL` env var (e.g. `agents.yourdomain.com`)
 
@@ -260,6 +260,7 @@ Verify targets at `http://localhost:9223/json/list`.
 | Claude Code | `Anthropic.claude-code` |
 | Gemini | `googlecloudtools.cloudcode` (TBD) |
 | Codex | `openai.chatgpt` |
+| Continue | `Continue.continue` |
 
 ### Claude Desktop App (MSIX — port 9224) — CDP BLOCKED
 

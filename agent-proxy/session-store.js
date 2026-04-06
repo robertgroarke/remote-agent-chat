@@ -107,7 +107,7 @@ function resolveSession({ target, windowTitle, agentType, workspaceName, workspa
   // Create a new durable session
   const session_id = crypto.randomUUID();
   const now = new Date().toISOString();
-  const displayNames = { claude: 'Claude Code', codex: 'Codex', gemini: 'Gemini', antigravity: 'Antigravity' };
+  const displayNames = { claude: 'Claude Code', codex: 'Codex', gemini: 'Gemini', antigravity: 'Antigravity', continue: 'Continue' };
 
   const session = {
     session_id,

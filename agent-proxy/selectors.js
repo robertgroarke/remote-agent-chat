@@ -96,6 +96,29 @@ const GEMINI_FALLBACK = {
   ].join(', '),
 };
 
+// ─── Continue selector sets ──────────────────────────────────────────────────
+// Continue.dev VS Code extension (Continue.continue).
+// Uses TipTap/ProseMirror for input, data-testid attributes for key elements.
+// Conversation turns are children of the scroll container:
+//   - User messages: contain [data-testid^="continue-input-box-"] (non-main)
+//   - Assistant messages: contain .thread-message with .sc-eDPEul markdown body
+
+const CONTINUE_PRIMARY = {
+  detect:    '[data-testid="editor-input-main"]',
+  input:     '[data-testid="editor-input-main"]',             // TipTap .tiptap.ProseMirror contenteditable
+  sendBtn:   '[data-testid="submit-input-button"]:last-of-type', // last submit button = main input's
+  modelBtn:  '[data-testid="model-select-button"]',
+  modeBtn:   '[data-testid="mode-select-button"]',
+  scrollContainer: '.overflow-y-scroll.no-scrollbar.flex-1',  // conversation scroll area
+  threadMsg: '.thread-message',                               // assistant message wrapper
+  markdownBody: '.sc-eDPEul',                                 // rendered markdown inside thread-message
+};
+
+const CONTINUE_FALLBACK = {
+  input:   '.tiptap.ProseMirror[contenteditable="true"]',
+  sendBtn: 'button[data-testid="submit-input-button"]',
+};
+
 // ─── Failure tracking ─────────────────────────────────────────────────────────
 
 const selectorFailures = new Map(); // sessionId -> { readFails, sendFails, lastDiagAt }
@@ -215,6 +238,7 @@ async function detectAgentType(Runtime, extensionIdHint) {
       if (!f || !f.contentDocument) return null;
       const d = f.contentDocument;
       if (d.querySelector('${CLAUDE_PRIMARY.detect}')) return 'claude';
+      if (d.querySelector('${CONTINUE_PRIMARY.detect}')) return 'continue';
       if (d.querySelector('${CODEX_PRIMARY.detect}')) return 'codex';
       if (d.querySelector('${GEMINI_PRIMARY.detect}')) return 'gemini';
       if (d.querySelector('${CLAUDE_FALLBACK.detect}')) return 'claude';
@@ -229,12 +253,14 @@ async function detectAgentType(Runtime, extensionIdHint) {
   // Last resort: use extension ID hint (covers empty/loading panels)
   const hint = String(extensionIdHint || '').toLowerCase();
   if (hint.includes('gemini') || hint.includes('googlecloud') || hint.includes('geminicodeassist')) return 'gemini';
+  if (hint.includes('continue.continue')) return 'continue';
   return null;
 }
 
 // ─── Thinking detection ───────────────────────────────────────────────────────
 
 async function detectThinking(Runtime, agentType) {
+  if (agentType === 'continue') return detectContinueThinking(Runtime);
   if (agentType === 'antigravity_panel') return detectAntigravityPanelThinking(Runtime);
   if (agentType === 'antigravity') return detectAntigravityThinking(Runtime);
   if (agentType === 'gemini') {
@@ -1111,6 +1137,227 @@ async function readGeminiMessages(Runtime, sessionId) {
   return JSON.stringify([]);
 }
 
+// ─── Continue (Continue.continue extension) ──────────────────────────────────
+//
+// DOM structure (confirmed via live CDP probe):
+//   Scroll container: .overflow-y-scroll.no-scrollbar.flex-1
+//   Children are alternating user/assistant turns:
+//     User turn:      contains [data-testid^="continue-input-box-"] (NOT main)
+//       └─ .tiptap editor with user text
+//     Assistant turn:  contains .thread-message
+//       └─ .sc-eDPEul markdown body with rendered response
+//   Main input: [data-testid="editor-input-main"] (TipTap/ProseMirror)
+//   Submit button: last [data-testid="submit-input-button"]
+//   Model button: [data-testid="model-select-button"]
+//   Mode button: [data-testid="mode-select-button"]
+
+const CONTINUE_READ_EXPR = `
+  var bt = String.fromCharCode(96);
+  var fence = bt + bt + bt;
+
+  function nodeToText(node) {
+    if (!node) return '';
+    if (node.nodeType === 3) return node.textContent;
+    if (node.nodeType !== 1) return '';
+    var tag = node.nodeName.toUpperCase();
+    if (tag === 'BR') return '\\n';
+    if (tag === 'PRE') {
+      var codeEl = node.querySelector('code');
+      var cls = codeEl ? (codeEl.className || '') : '';
+      var lang = (cls.match(/language-(\\w+)/) || [])[1] || '';
+      return '\\n' + fence + lang + '\\n' + (codeEl || node).textContent.trim() + '\\n' + fence + '\\n';
+    }
+    if (tag === 'CODE') return bt + node.textContent + bt;
+    if (tag === 'BUTTON' || tag === 'SVG' || tag === 'STYLE') return '';
+    var inner = Array.from(node.childNodes).map(nodeToText).join('');
+    var BLOCK = { DIV:1, P:1, LI:1, TR:1, H1:1, H2:1, H3:1, H4:1, H5:1, H6:1, BLOCKQUOTE:1, SECTION:1 };
+    if (BLOCK[tag] && inner.trim()) {
+      return inner.endsWith('\\n') ? inner : inner + '\\n';
+    }
+    return inner;
+  }
+
+  var scrollContainer = d.querySelector('${CONTINUE_PRIMARY.scrollContainer}');
+  if (!scrollContainer) return JSON.stringify([]);
+
+  var msgs = [];
+  var children = Array.from(scrollContainer.children);
+
+  for (var i = 0; i < children.length; i++) {
+    var child = children[i];
+
+    // User turn: contains a non-main input box
+    var inputBox = child.querySelector('[data-testid^="continue-input-box-"]');
+    if (inputBox && !inputBox.getAttribute('data-testid').includes('main')) {
+      var editor = inputBox.querySelector('.tiptap');
+      var text = editor ? (editor.innerText || '').trim() : '';
+      if (text) {
+        msgs.push({ role: 'user', content: text });
+      }
+      continue;
+    }
+
+    // Assistant turn: contains .thread-message
+    var threadMsg = child.querySelector('${CONTINUE_PRIMARY.threadMsg}');
+    if (threadMsg) {
+      var markdown = threadMsg.querySelector('${CONTINUE_PRIMARY.markdownBody}');
+      var el = markdown || threadMsg;
+      var text = nodeToText(el).trim();
+      if (text) {
+        msgs.push({ role: 'assistant', content: text });
+      }
+      continue;
+    }
+  }
+
+  return JSON.stringify(msgs);
+`;
+
+async function readContinueMessages(Runtime, sessionId) {
+  try {
+    const raw = await evalInFrame(Runtime, CONTINUE_READ_EXPR);
+    if (raw !== null) { resetReadFailures(sessionId); return raw; }
+  } catch (e) {
+    console.warn(`[${sessionId}] [sel] Continue read error: ${e.message}`);
+  }
+
+  const f = recordReadFailure(sessionId);
+  if (f.readFails === 1 || f.readFails % 5 === 0) {
+    console.warn(`[${sessionId}] [sel] Continue read null x${f.readFails}`);
+    await captureDiagnostic(Runtime, sessionId);
+  }
+  return JSON.stringify([]);
+}
+
+async function detectContinueThinking(Runtime) {
+  try {
+    const raw = await evalInFrame(Runtime, `
+      // Continue shows a stop button while the model is generating.
+      // The submit button text changes or a loading indicator appears.
+      var submitBtns = d.querySelectorAll('[data-testid="submit-input-button"]');
+      var lastSubmit = submitBtns[submitBtns.length - 1];
+      if (!lastSubmit) return JSON.stringify({ thinking: false, label: '' });
+
+      // Check if the button shows a stop icon (pause/stop SVG) or is disabled
+      var isDisabled = lastSubmit.disabled;
+      var svgPaths = lastSubmit.querySelectorAll('svg path');
+      var hasStopIcon = false;
+      for (var i = 0; i < svgPaths.length; i++) {
+        var pathD = svgPaths[i].getAttribute('d') || '';
+        // Stop icons typically use rect/square paths, not arrow paths
+        if (pathD.includes('M6') && pathD.includes('18') && !pathD.includes('M12')) {
+          hasStopIcon = true;
+          break;
+        }
+      }
+
+      // Also check for any visible loading/spinner elements near the conversation
+      var spinners = d.querySelectorAll('[class*=animate-spin], [class*=loading], [class*=spinner]');
+      var hasSpinner = false;
+      for (var i = 0; i < spinners.length; i++) {
+        if (spinners[i].offsetParent !== null) { hasSpinner = true; break; }
+      }
+
+      // Check if the last thread-message is still being streamed (growing)
+      var threadMsgs = d.querySelectorAll('.thread-message');
+      var lastMsg = threadMsgs[threadMsgs.length - 1];
+      var isStreaming = false;
+      if (lastMsg) {
+        // Look for streaming indicators: cursor blink, partial content
+        var cursor = lastMsg.querySelector('[class*=cursor], [class*=blink]');
+        if (cursor && cursor.offsetParent !== null) isStreaming = true;
+      }
+
+      var thinking = hasStopIcon || hasSpinner || isStreaming;
+      return JSON.stringify({ thinking: thinking, label: thinking ? 'Generating' : '' });
+    `);
+    try { return JSON.parse(raw); } catch { return { thinking: false, label: '' }; }
+  } catch {
+    return { thinking: false, label: '' };
+  }
+}
+
+async function sendContinuePrimary(Runtime, text) {
+  // Set text in the main TipTap editor via execCommand
+  const set = await evalInFrame(Runtime, `
+    var input = d.querySelector('${CONTINUE_PRIMARY.input}');
+    if (!input) return 'no-input';
+    input.focus();
+    // TipTap/ProseMirror: use execCommand to insert text so the editor state updates
+    d.execCommand('selectAll', false, null);
+    d.execCommand('delete', false, null);
+    var ok = d.execCommand('insertText', false, ${JSON.stringify(text)});
+    if (!ok) {
+      // Fallback: set innerHTML and dispatch input event
+      input.innerHTML = '<p>' + ${JSON.stringify(text)}.replace(/\\n/g, '</p><p>') + '</p>';
+      input.dispatchEvent(new Event('input', { bubbles: true }));
+    }
+    return 'ok';
+  `);
+  if (set !== 'ok') return { ok: false, code: 'input_not_found', detail: set };
+
+  // Wait for TipTap to process the input
+  await new Promise(r => setTimeout(r, 200));
+
+  // Click the last submit button (the main one)
+  const click = await evalInFrame(Runtime, `
+    var btns = d.querySelectorAll('${CONTINUE_PRIMARY.sendBtn}');
+    if (!btns.length) {
+      // Fallback: get all submit-input-buttons and pick the last
+      btns = d.querySelectorAll('[data-testid="submit-input-button"]');
+    }
+    var btn = btns[btns.length - 1];
+    if (!btn) return 'no-btn';
+    if (btn.disabled) return 'disabled';
+    btn.click();
+    return 'sent';
+  `);
+  if (click === 'sent') return { ok: true };
+  return { ok: false, code: 'send_button_failed', detail: click };
+}
+
+async function sendContinueFallback(Runtime, text) {
+  // Fallback: try broader selectors and Enter key dispatch
+  const result = await evalInFrame(Runtime, `
+    var input = d.querySelector('${CONTINUE_FALLBACK.input}');
+    if (!input) return 'no-input';
+    input.focus();
+    d.execCommand('selectAll', false, null);
+    d.execCommand('delete', false, null);
+    var ok = d.execCommand('insertText', false, ${JSON.stringify(text)});
+    if (!ok) {
+      input.textContent = ${JSON.stringify(text)};
+      input.dispatchEvent(new Event('input', { bubbles: true }));
+    }
+    // Try click first
+    var btn = d.querySelector('${CONTINUE_FALLBACK.sendBtn}');
+    if (btn && !btn.disabled) {
+      btn.click();
+      return 'sent-btn';
+    }
+    // Fallback: Enter key
+    input.dispatchEvent(new KeyboardEvent('keydown', { key: 'Enter', code: 'Enter', bubbles: true, cancelable: true }));
+    input.dispatchEvent(new KeyboardEvent('keyup',   { key: 'Enter', code: 'Enter', bubbles: true }));
+    return 'dispatched';
+  `);
+  if (result === 'sent-btn' || result === 'dispatched') return { ok: true };
+  return { ok: false, code: 'fallback_enter_failed', detail: result };
+}
+
+async function readContinueConfig(Runtime) {
+  try {
+    const raw = await evalInFrame(Runtime, `
+      var modelBtn = d.querySelector('${CONTINUE_PRIMARY.modelBtn}');
+      var modeBtn = d.querySelector('${CONTINUE_PRIMARY.modeBtn}');
+      return JSON.stringify({
+        model: modelBtn ? (modelBtn.textContent || '').trim() : null,
+        mode: modeBtn ? (modeBtn.textContent || '').trim() : null,
+      });
+    `);
+    return raw ? JSON.parse(raw) : null;
+  } catch { return null; }
+}
+
 // ─── Antigravity native agent (workbench-jetski-agent.html) ─────────────────
 //
 // Selectors confirmed via live CDP DOM inspection of the Manager page.
@@ -1820,6 +2067,7 @@ async function readMessages(Runtime, agentType, sessionId) {
   if (agentType === 'codex-desktop')      return readCodexMessages(Runtime, sessionId, true);
   if (agentType === 'codex')              return readCodexMessages(Runtime, sessionId, false);
   if (agentType === 'gemini')             return readGeminiMessages(Runtime, sessionId);
+  if (agentType === 'continue')           return readContinueMessages(Runtime, sessionId);
   if (agentType === 'antigravity')        return readAntigravityMessages(Runtime, sessionId);
   if (agentType === 'antigravity_panel')  return readAntigravityPanelMessages(Runtime, sessionId);
   // 'claude' and 'claude-desktop' both use Claude message selectors
@@ -2114,6 +2362,18 @@ const STOP_SELECTORS = {
     ].join(', '),
     escapeOnFail: false,
   },
+  continue: {
+    primary: [
+      'button[aria-label*="Stop" i]',
+      'button[aria-label*="Cancel" i]',
+      'button[data-testid*="stop" i]',
+    ].join(', '),
+    fallback: [
+      'button[class*="stop"]',
+      'button[class*="cancel"]',
+    ].join(', '),
+    escapeOnFail: false,
+  },
 };
 
 // Try clicking the stop button using the given selector string.
@@ -2158,7 +2418,7 @@ async function interruptAgent(Runtime, agentType, sessionId) {
   const normalised = (agentType === 'antigravity' || agentType === 'antigravity_panel') ? 'claude'
     : agentType === 'claude-desktop' ? 'claude'
     : agentType === 'codex-desktop'  ? 'codex'
-    : agentType;
+    : agentType; // 'continue', 'gemini', 'claude', 'codex' pass through
   const sels = STOP_SELECTORS[normalised] || STOP_SELECTORS.claude;
   const evalFn = (agentType === 'codex-desktop') ? evalInPage : evalInFrame;
 
@@ -3026,6 +3286,7 @@ async function readCodexTaskList(Runtime, usePageEval) {
 async function readRateLimit(Runtime, agentType) {
   if (agentType === 'codex' || agentType === 'codex-desktop') return readCodexRateLimit(Runtime, agentType === 'codex-desktop');
   if (agentType === 'claude' || agentType === 'claude-desktop') return readClaudeRateLimit(Runtime);
+  if (agentType === 'continue') return null; // Continue uses local models — no rate limiting
   if (agentType === 'antigravity' || agentType === 'antigravity_panel') {
     try {
       const raw = await evalInPage(Runtime, READ_ANTIGRAVITY_RATE_LIMIT_EXPR);
@@ -3082,6 +3343,19 @@ const READ_AGENT_CONFIG_EXPR = `
 // Fields are 'unknown' when not detected.
 async function readAgentConfig(Runtime, agentType, workspacePath) {
   if (agentType === 'antigravity' || agentType === 'antigravity_panel') return readAntigravityConfig(Runtime, workspacePath);
+  if (agentType === 'continue') {
+    try {
+      const cfg = await readContinueConfig(Runtime);
+      return {
+        model_id:          cfg?.model || 'unknown',
+        mode:              cfg?.mode  || 'unknown',
+        permission_mode:   'unknown',
+        file_access_scope: workspacePath || 'unknown',
+      };
+    } catch {
+      return { model_id: 'unknown', permission_mode: 'unknown', file_access_scope: workspacePath || 'unknown' };
+    }
+  }
   if (agentType === 'gemini') {
     try {
       const raw = await evalInFrame(Runtime, `
@@ -3863,7 +4137,7 @@ function _buildPanelPermissionClickExpr(choiceId) {
 
 // Returns { message, choices: [{choice_id, label}] } or null if no dialog.
 async function detectPermissionDialog(Runtime, agentType) {
-  if (agentType === 'gemini') return null;
+  if (agentType === 'gemini' || agentType === 'continue') return null;
 
   // Antigravity panel: use panel-specific inline prompt detection
   if (agentType === 'antigravity_panel') {
@@ -3933,6 +4207,12 @@ async function sendMessage(Runtime, agentType, text, sessionId) {
     if (!result.ok) {
       console.warn(`[${sessionId}] [sel] Gemini primary send failed (${result.code}:${result.detail}), trying fallback`);
       result = await sendGeminiFallback(Runtime, text);
+    }
+  } else if (agentType === 'continue') {
+    result = await sendContinuePrimary(Runtime, text);
+    if (!result.ok) {
+      console.warn(`[${sessionId}] [sel] Continue primary send failed (${result.code}:${result.detail}), trying fallback`);
+      result = await sendContinueFallback(Runtime, text);
     }
   } else {
     result = await sendClaudePrimary(Runtime, text);
@@ -5228,4 +5508,6 @@ module.exports = {
   navigateCodexSkills,
   // Session close — click the tab/panel close button
   closeSessionTab,
+  // Continue extension
+  readContinueConfig,
 };
