@@ -1820,6 +1820,9 @@ function App() {
   const [showFileBrowser, setShowFileBrowser]       = useState(false);
   const [fileBrowserPath, setFileBrowserPath]       = useState('.');
   const [viewingFile, setViewingFile]               = useState(null); // { path, content } when viewing a file
+  const [theme, setTheme]                           = useState(() => {
+    try { return localStorage.getItem('remote-agent-chat-theme') || 'dark'; } catch { return 'dark'; }
+  });
   const messagesEndRef  = useRef(null);
   const messagesListRef = useRef(null);
   const isAtBottom      = useRef(true);   // updated by scroll listener before DOM changes
@@ -1877,6 +1880,11 @@ function App() {
       // Ignore storage failures to avoid breaking compose flow.
     }
   }, [drafts]);
+
+  useEffect(() => {
+    try { localStorage.setItem('remote-agent-chat-theme', theme); } catch {}
+    document.documentElement.setAttribute('data-theme', theme);
+  }, [theme]);
 
   // Auto-select first session when list arrives
   useEffect(() => {
@@ -2395,6 +2403,9 @@ function App() {
                   </div>
                 </div>
                 <div className="topbar-meta">
+                  <button className="theme-toggle-btn" onClick={() => setTheme(t => t === 'light' ? 'dark' : 'light')} title="Toggle Light/Dark Mode">
+                    {theme === 'light' ? '🌙' : '☀️'}
+                  </button>
                   <span
                     className={`context-pill ${connected ? 'ok' : 'warn'}`}
                     title={connected ? 'Relay connected' : 'Relay disconnected — reconnecting'}

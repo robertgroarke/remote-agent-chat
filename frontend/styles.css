@@ -2,35 +2,65 @@
 *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
 
 :root {
-  --bg:        #0b0f14;
-  --bg2:       #11161d;
-  --bg3:       #181f29;
-  --bg4:       #202938;
-  --panel:     #0f141b;
-  --panel2:    #131a23;
-  --border:    #283243;
-  --border2:   #334055;
-  --text:      #d7dee7;
-  --text2:     #91a0b5;
-  --text3:     #6f7c8f;
-  --accent:    #68b3ff;
-  --accent2:   #2a7bd8;
-  --user-bg:   #17202b;
-  --asst-bg:   #121922;
-  --green:     #46c37b;
-  --red:       #f26d78;
-  --amber:     #d9a441;
-  --shadow:    0 10px 30px rgba(0, 0, 0, 0.24);
-  --radius:    8px;
+  --bg:        #202124;
+  --bg2:       #28292c;
+  --bg3:       #303134;
+  --bg4:       #3c4043;
+  --panel:     #202124;
+  --panel2:    #28292c;
+  --border:    #5f6368;
+  --border2:   #80868b;
+  --text:      #e8eaed;
+  --text2:     #9aa0a6;
+  --text3:     #80868b;
+  --accent:    #8ab4f8;
+  --accent2:   #669df6;
+  --user-bg:   #3c4043;
+  --asst-bg:   #202124;
+  --green:     #81c995;
+  --red:       #f28b82;
+  --amber:     #fde293;
+  --shadow:    0 1px 2px 0 rgba(0,0,0,0.3), 0 2px 6px 2px rgba(0,0,0,0.15);
+  --radius:    4px;
   --sidebar-w: 260px;
+  --bg-gradient: var(--bg);
+  --topbar-bg: #202124;
+  --input-area-bg: #202124;
+  --code-block-bg: #28292c;
+  --code-header-bg: #303134;
+}
+
+:root[data-theme="light"] {
+  --bg:        #ffffff;
+  --bg2:       #f8f9fa;
+  --bg3:       #f1f3f4;
+  --bg4:       #e8eaed;
+  --panel:     #ffffff;
+  --panel2:    #f8f9fa;
+  --border:    #dadce0;
+  --border2:   #bdc1c6;
+  --text:      #202124;
+  --text2:     #5f6368;
+  --text3:     #80868b;
+  --accent:    #1a73e8;
+  --accent2:   #1558d6;
+  --user-bg:   #e8f0fe;
+  --asst-bg:   #ffffff;
+  --green:     #1e8e3e;
+  --red:       #d93025;
+  --amber:     #f29900;
+  --shadow:    0 1px 2px 0 rgba(60,64,67,0.3), 0 1px 3px 1px rgba(60,64,67,0.15);
+  --bg-gradient: var(--bg);
+  --topbar-bg: #ffffff;
+  --input-area-bg: #ffffff;
+  --code-block-bg: #f8f9fa;
+  --code-header-bg: #f1f3f4;
 }
 
 html, body, #root { height: 100%; }
 body {
-  font-family: 'Segoe UI', 'SF Pro Text', 'Helvetica Neue', sans-serif;
-  background:
-    radial-gradient(circle at top left, rgba(104, 179, 255, 0.08), transparent 28%),
-    linear-gradient(180deg, #0a0f15 0%, #0b1016 100%);
+  font-family: 'Roboto', Arial, sans-serif;
+  background: var(--bg-gradient);
   color: var(--text);
   font-size: 13px;
   overflow: hidden;
@@ -55,9 +85,7 @@ body {
   align-items: center;
   justify-content: center;
   padding: 24px;
-  background:
-    radial-gradient(circle at top left, rgba(104, 179, 255, 0.08), transparent 28%),
-    linear-gradient(180deg, #0a0f15 0%, #0b1016 100%);
+  background: var(--bg-gradient);
 }
 
 .app-crash-card {
@@ -253,7 +281,7 @@ body {
   padding: 11px 16px;
   padding-top: max(11px, env(safe-area-inset-top));
   border-bottom: 1px solid var(--border);
-  background: rgba(17, 22, 29, 0.86);
+  background: var(--topbar-bg);
   backdrop-filter: blur(10px);
   min-height: 62px;
 }
@@ -1029,7 +1057,7 @@ body {
   font-family: 'Cascadia Code', 'SF Mono', Consolas, monospace;
 }
 .message-body pre {
-  background: #0b1017;
+  background: var(--code-block-bg);
   border: 1px solid var(--border2);
   border-radius: 8px;
   padding: 12px;
@@ -1072,7 +1100,7 @@ body {
   padding: 12px 16px;
   padding-bottom: max(12px, env(safe-area-inset-bottom));
   border-top: 1px solid var(--border);
-  background: rgba(17, 22, 29, 0.94);
+  background: var(--input-area-bg);
   backdrop-filter: blur(10px);
 }
 
@@ -1508,7 +1536,7 @@ body {
   border-radius: 8px;
   overflow: hidden;
   border: 1px solid var(--border2);
-  background: #0b1017;
+  background: var(--code-block-bg);
 }
 
 .code-header {
@@ -1516,7 +1544,7 @@ body {
   align-items: center;
   gap: 0;
   padding: 5px 12px;
-  background: #0f1520;
+  background: var(--code-header-bg);
   border-bottom: 1px solid var(--border);
 }
 .code-header .code-copy { margin-left: auto; }
@@ -1569,7 +1597,7 @@ body {
   align-items: center;
   gap: 4px;
   padding: 5px 10px;
-  background: #0b1017;
+  background: var(--code-block-bg);
   border-top: 1px solid var(--border);
 }
 .code-search-input {
@@ -1622,7 +1650,7 @@ mark.code-search-mark.current {
 .code-block pre {
   margin: 0;
   padding: 14px 16px;
-  background: #0b1017;
+  background: var(--code-block-bg);
   overflow-x: auto;
   border: none;
   border-radius: 0;
@@ -2081,7 +2109,7 @@ mark.code-search-mark.current {
   overflow: hidden;
   font-family: 'SF Mono', 'Fira Code', 'Cascadia Code', 'Consolas', monospace;
   font-size: 12px;
-  background: #0b1017;
+  background: var(--code-block-bg);
 }
 .message-body .tool-io-block { margin-left: -12px; }
 
@@ -2160,7 +2188,7 @@ mark.code-search-mark.current {
 
 .tool-body {
   border-top: 1px solid var(--border);
-  background: #0b1017;
+  background: var(--code-block-bg);
   border-radius: 4px;
   margin-top: 2px;
 }
