@@ -1201,11 +1201,28 @@ const CONTINUE_READ_EXPR = `
     var threadMsg = child.querySelector('${CONTINUE_PRIMARY.threadMsg}');
     if (threadMsg) {
       var markdown = threadMsg.querySelector('${CONTINUE_PRIMARY.markdownBody}');
-      var el = markdown || threadMsg;
-      var text = nodeToText(el).trim();
-      if (text) {
-        msgs.push({ role: 'assistant', content: text });
+      // Use the markdown body for stable text (innerText of thread-message
+      // fluctuates when Continue collapses/expands tool-call blocks).
+      var text = markdown ? (markdown.innerText || '').trim() : '';
+
+      // Tool call blocks are siblings of .thread-message (div.py-1).
+      // Extract the tool description text (e.g. "Continue read file.py",
+      // "Terminal Run pwd") from the sibling's innerText.
+      var toolSummary = '';
+      var py1 = child.querySelector('.py-1');
+      if (py1) {
+        toolSummary = (py1.innerText || '').trim().split('\\n')[0].substring(0, 120);
       }
+
+      // Combine text response + tool summary
+      if (text && toolSummary) {
+        text = toolSummary + '\\n' + text;
+      } else if (!text && toolSummary) {
+        text = toolSummary;
+      } else if (!text) {
+        text = '[tool call]';
+      }
+      msgs.push({ role: 'assistant', content: text });
       continue;
     }
   }
@@ -1258,17 +1275,7 @@ async function detectContinueThinking(Runtime) {
         if (spinners[i].offsetParent !== null) { hasSpinner = true; break; }
       }
 
-      // Check if the last thread-message is still being streamed (growing)
-      var threadMsgs = d.querySelectorAll('.thread-message');
-      var lastMsg = threadMsgs[threadMsgs.length - 1];
-      var isStreaming = false;
-      if (lastMsg) {
-        // Look for streaming indicators: cursor blink, partial content
-        var cursor = lastMsg.querySelector('[class*=cursor], [class*=blink]');
-        if (cursor && cursor.offsetParent !== null) isStreaming = true;
-      }
-
-      var thinking = hasStopIcon || hasSpinner || isStreaming;
+      var thinking = hasStopIcon || hasSpinner;
       return JSON.stringify({ thinking: thinking, label: thinking ? 'Generating' : '' });
     `);
     try { return JSON.parse(raw); } catch { return { thinking: false, label: '' }; }
@@ -3970,11 +3977,11 @@ const ANTIGRAVITY_PANEL_PERMISSION_EXPR = `
   if (!rejectBtn) {
     // Check for a prompt-like text anywhere in the panel
     var panelText = (panel.innerText || '');
-    var hasPromptText = /Run command\\??|Edit file\\??|Steps? Require Input|Run tool\\??/i.test(panelText);
+    var hasPromptText = /Run command\\??|Edit file\\??|Steps? Requires? Input|Run tool\\??|Allow .* access|Allow directory/i.test(panelText);
     if (!hasPromptText) return null;
 
     // Find buttons that look like action buttons (Run, Allow, Reject, Accept, etc.)
-    var actionPat = /^(run|reject|allow|accept|deny|cancel|always run|approve)/i;
+    var actionPat = /^(run|reject|allow|accept|deny|cancel|always run|approve|allow once|allow this)/i;
     var actionBtns = allBtns.filter(function(b) {
       var t = (b.textContent || '').trim();
       // Strip keyboard shortcut suffixes
@@ -4079,9 +4086,9 @@ function _buildPanelPermissionClickExpr(choiceId) {
     // Fallback: find action-like buttons near prompt text
     if (!rejectBtn) {
       var panelText = (panel.innerText || '');
-      var hasPrompt = /Run command\\??|Edit file\\??|Steps? Require Input|Run tool\\??/i.test(panelText);
+      var hasPrompt = /Run command\\??|Edit file\\??|Steps? Requires? Input|Run tool\\??|Allow .* access|Allow directory/i.test(panelText);
       if (!hasPrompt) return 'no-dialog';
-      var actionPat = /^(run|reject|allow|accept|deny|cancel|always run|approve)/i;
+      var actionPat = /^(run|reject|allow|accept|deny|cancel|always run|approve|allow once|allow this)/i;
       var actionBtns = allBtns.filter(function(b) {
         var t = (b.textContent || '').trim().replace(/\\s*(Alt|Ctrl|Shift|Cmd|Meta)\\+\\S+$/i, '').trim();
         return actionPat.test(t) && t.length < 30;
@@ -4130,14 +4137,55 @@ function _buildPanelPermissionClickExpr(choiceId) {
 
     if (!found) return 'no-match';
     if (found.disabled || found.getAttribute('aria-disabled') === 'true') return 'disabled';
-    found.click();
+    // Dispatch full pointer+mouse event sequence for React compatibility
+    var rect = found.getBoundingClientRect();
+    var cx = rect.x + rect.width / 2;
+    var cy = rect.y + rect.height / 2;
+    var opts = { bubbles: true, cancelable: true, view: window, clientX: cx, clientY: cy, button: 0 };
+    found.dispatchEvent(new PointerEvent('pointerdown', opts));
+    found.dispatchEvent(new MouseEvent('mousedown', opts));
+    found.dispatchEvent(new PointerEvent('pointerup', opts));
+    found.dispatchEvent(new MouseEvent('mouseup', opts));
+    found.dispatchEvent(new MouseEvent('click', opts));
     return 'clicked';
   `;
 }
 
 // Returns { message, choices: [{choice_id, label}] } or null if no dialog.
 async function detectPermissionDialog(Runtime, agentType) {
-  if (agentType === 'gemini' || agentType === 'continue') return null;
+  if (agentType === 'gemini') return null;
+
+  // Continue: check for accept/reject tool call buttons.
+  // Multiple tool-call blocks may exist in the DOM from previous turns;
+  // pick the LAST visible accept button (the active permission prompt).
+  if (agentType === 'continue') {
+    try {
+      const raw = await evalInFrame(Runtime, `
+        var allAccept = d.querySelectorAll('[data-testid^="accept-tool-call-button-"]');
+        var acceptBtn = null;
+        for (var i = allAccept.length - 1; i >= 0; i--) {
+          if (allAccept[i].offsetParent !== null) { acceptBtn = allAccept[i]; break; }
+        }
+        if (!acceptBtn) return null;
+        // Find the matching reject button (same call ID suffix)
+        var callId = acceptBtn.getAttribute('data-testid').replace('accept-tool-call-button-', '');
+        var rejectBtn = d.querySelector('[data-testid="reject-tool-call-button-' + callId + '"]');
+        // Find the last tool-call-title (closest to the active accept button)
+        var allTitles = d.querySelectorAll('[data-testid="tool-call-title"]');
+        var titleEl = allTitles.length > 0 ? allTitles[allTitles.length - 1] : null;
+        var message = titleEl ? (titleEl.textContent || '').trim() : 'Tool call pending';
+        return JSON.stringify({
+          message: message,
+          choices: [
+            { choice_id: acceptBtn.getAttribute('data-testid'), label: 'Accept' },
+            { choice_id: rejectBtn ? rejectBtn.getAttribute('data-testid') : 'reject-tool-call-button-' + callId, label: 'Reject' },
+          ],
+        });
+      `);
+      if (!raw) return null;
+      return JSON.parse(raw);
+    } catch { return null; }
+  }
 
   // Antigravity panel: use panel-specific inline prompt detection
   if (agentType === 'antigravity_panel') {
@@ -4164,7 +4212,40 @@ async function detectPermissionDialog(Runtime, agentType) {
 async function respondToPermissionDialog(Runtime, agentType, choiceId, sessionId) {
   try {
     let r;
-    if (agentType === 'antigravity_panel') {
+    if (agentType === 'continue') {
+      // Continue uses data-testid for accept/reject buttons.
+      // Simple .click() doesn't trigger React's synthetic event system inside
+      // the iframe — dispatch the full pointer+mouse event sequence instead.
+      r = await evalInFrame(Runtime, `
+        var btn = d.querySelector('[data-testid="${choiceId}"]');
+        if (!btn) {
+          // Try finding by partial match (call ID may have changed)
+          var prefix = '${choiceId}'.split('-').slice(0, -1).join('-');
+          var all = d.querySelectorAll('[data-testid^="' + prefix + '"]');
+          btn = all.length > 0 ? all[all.length - 1] : null;
+        }
+        if (!btn) return 'no-btn';
+        if (btn.disabled) return 'disabled';
+        var rect = btn.getBoundingClientRect();
+        var cx = rect.x + rect.width / 2;
+        var cy = rect.y + rect.height / 2;
+        var w = d.defaultView || f.contentWindow || window;
+        var opts = { bubbles: true, cancelable: true, view: w, clientX: cx, clientY: cy, button: 0 };
+        btn.dispatchEvent(new w.PointerEvent('pointerdown', opts));
+        btn.dispatchEvent(new w.MouseEvent('mousedown', opts));
+        btn.dispatchEvent(new w.PointerEvent('pointerup', opts));
+        btn.dispatchEvent(new w.MouseEvent('mouseup', opts));
+        btn.dispatchEvent(new w.MouseEvent('click', opts));
+        // Fallback: also try the keyboard shortcut (Ctrl+Enter = Accept)
+        var isAccept = '${choiceId}'.indexOf('accept') !== -1;
+        if (isAccept) {
+          var kbOpts = { key: 'Enter', code: 'Enter', keyCode: 13, ctrlKey: true, bubbles: true, cancelable: true };
+          d.body.dispatchEvent(new w.KeyboardEvent('keydown', kbOpts));
+          d.body.dispatchEvent(new w.KeyboardEvent('keyup', kbOpts));
+        }
+        return 'clicked';
+      `);
+    } else if (agentType === 'antigravity_panel') {
       r = await evalInPage(Runtime, _buildPanelPermissionClickExpr(choiceId));
     } else {
       const usePageEval = agentType === 'codex-desktop' || agentType === 'antigravity';

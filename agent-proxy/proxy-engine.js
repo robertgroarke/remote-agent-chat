@@ -265,7 +265,7 @@ class ProxyEngine extends EventEmitter {
       set_model:              agentType === 'claude' || agentType === 'antigravity' || agentType === 'antigravity_panel' || agentType === 'gemini',
       set_mode:               agentType === 'antigravity',
       permission_mode_change: agentType === 'claude',
-      permission_dialogs:     isClaude || isCodex || agentType === 'antigravity' || agentType === 'antigravity_panel',
+      permission_dialogs:     isClaude || isCodex || agentType === 'antigravity' || agentType === 'antigravity_panel' || agentType === 'continue',
       set_codex_config:       isCodex,
       new_thread:             isDesktop,
       thread_list:            isDesktop,
