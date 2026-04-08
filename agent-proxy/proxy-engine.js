@@ -2383,9 +2383,20 @@ class ProxyEngine extends EventEmitter {
           this._sendToRelay(proto.proxyMessage(sessionId, p.role, p.content));
           session.lastMessageCount++;
           session.pendingLast = null;
+          session._pendingFirstSeenAt = null;
           if (p.role === 'user')      session.waitingForAssistant = true;
           if (p.role === 'assistant') session.waitingForAssistant = false;
         } else if (current) {
+          // Track how long the pending message has been changing
+          if (!session._pendingFirstSeenAt) session._pendingFirstSeenAt = Date.now();
+          const pendingAge = Date.now() - session._pendingFirstSeenAt;
+          // Flush a full resync every 5s while content is changing
+          // This keeps the web UI roughly in sync during long tool-call sequences
+          if (pendingAge > 5000 && current.content !== session._lastStreamedContent) {
+            session._lastStreamedContent = current.content;
+            this._sendToRelay(proto.historySnapshot(sessionId, effectiveMessages));
+            this._log('info', `[${sessionId}] Streaming flush (${effectiveMessages.length} msgs, pending ${Math.round(pendingAge / 1000)}s)`);
+          }
           session.pendingLast = { role: current.role, content: current.content };
           session.lastObservedCount = effectiveMessages.length;
           session.lastTranscriptSig = transcriptSig;
