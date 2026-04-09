@@ -686,10 +686,14 @@ function AgentSettingsPanel({ session, config, onRequestRefresh, onSetModel, onS
   const effortLevel    = config?.effort || null;
   const fileScope    = config?.file_access_scope || 'unknown';
   const permModes    = PERMISSION_MODES[agentType] || [];
-  const modelOptions = agentType === 'claude' ? KNOWN_CLAUDE_MODELS
+  let modelOptions = agentType === 'claude' ? KNOWN_CLAUDE_MODELS
     : (agentType === 'antigravity' || agentType === 'antigravity_panel') ? KNOWN_ANTIGRAVITY_MODELS
     : agentType === 'gemini' ? KNOWN_GEMINI_MODELS
     : [];
+
+  if (config?.available_models && Array.isArray(config.available_models) && config.available_models.length > 0) {
+    modelOptions = config.available_models.map(m => typeof m === 'string' ? { id: m, label: m } : m);
+  }
 
   React.useEffect(() => {
     if (sessionId) onRequestRefresh(sessionId);

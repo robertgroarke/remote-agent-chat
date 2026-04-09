@@ -212,6 +212,30 @@ async function evalInPage(Runtime, code) {
 // ─── Core frame eval helper ───────────────────────────────────────────────────
 
 async function evalInFrame(Runtime, code) {
+  // If the session has a cached inner-frame contextId, evaluate directly
+  // in that context to avoid accessing active-frame.contentDocument which
+  // can trigger focus/scroll changes in Electron webviews.
+  if (Runtime._innerContextId) {
+    try {
+      const result = await Runtime.evaluate({
+        expression: `(function() {
+          const d = document;
+          ${code}
+        })()`,
+        contextId: Runtime._innerContextId,
+        returnByValue: true,
+        awaitPromise: false,
+        silent: true,
+        userGesture: false,
+      });
+      if (!result.exceptionDetails) return result.result?.value ?? null;
+      // Context may be stale — fall through to the standard path
+      Runtime._innerContextId = null;
+    } catch {
+      Runtime._innerContextId = null;
+    }
+  }
+
   const result = await Runtime.evaluate({
     expression: `(function() {
       const f = document.getElementById('active-frame');
@@ -227,6 +251,28 @@ async function evalInFrame(Runtime, code) {
     throw new Error(`JS exception: ${desc}`);
   }
   return result.result?.value ?? null;
+}
+
+// Cache the inner-frame execution context ID for a session's Runtime.
+// Call once after connecting to an iframe target to find the active-frame context.
+async function cacheInnerContextId(Runtime) {
+  return new Promise((resolve) => {
+    const contexts = [];
+    const handler = (params) => { contexts.push(params.context); };
+    Runtime.on('executionContextCreated', handler);
+    // Re-trigger context events by disabling then re-enabling Runtime
+    Runtime.disable().then(() => Runtime.enable()).then(() => {
+      setTimeout(() => {
+        try { Runtime.off('executionContextCreated', handler); } catch { }
+        // The inner active-frame context has a higher id than the outer webview
+        if (contexts.length > 1) {
+          contexts.sort((a, b) => b.id - a.id);
+          Runtime._innerContextId = contexts[0].id;
+        }
+        resolve(Runtime._innerContextId || null);
+      }, 300);
+    }).catch(() => resolve(null));
+  });
 }
 
 // ─── Agent type detection ─────────────────────────────────────────────────────
@@ -1190,7 +1236,7 @@ const CONTINUE_READ_EXPR = `
     var inputBox = child.querySelector('[data-testid^="continue-input-box-"]');
     if (inputBox && !inputBox.getAttribute('data-testid').includes('main')) {
       var editor = inputBox.querySelector('.tiptap');
-      var text = editor ? (editor.innerText || '').trim() : '';
+      var text = editor ? (editor.textContent || '').trim() : '';
       if (text) {
         msgs.push({ role: 'user', content: text });
       }
@@ -1201,17 +1247,15 @@ const CONTINUE_READ_EXPR = `
     var threadMsg = child.querySelector('${CONTINUE_PRIMARY.threadMsg}');
     if (threadMsg) {
       var markdown = threadMsg.querySelector('${CONTINUE_PRIMARY.markdownBody}');
-      // Use the markdown body for stable text (innerText of thread-message
-      // fluctuates when Continue collapses/expands tool-call blocks).
-      var text = markdown ? (markdown.innerText || '').trim() : '';
+      // Use textContent (not innerText) to avoid triggering layout reflow
+      // which causes Continue's scroll position to reset to top.
+      var text = markdown ? (markdown.textContent || '').trim() : '';
 
       // Tool call blocks are siblings of .thread-message (div.py-1).
-      // Extract the tool description text (e.g. "Continue read file.py",
-      // "Terminal Run pwd") from the sibling's innerText.
       var toolSummary = '';
       var py1 = child.querySelector('.py-1');
       if (py1) {
-        toolSummary = (py1.innerText || '').trim().split('\\n')[0].substring(0, 120);
+        toolSummary = (py1.textContent || '').trim().split('\\n')[0].substring(0, 120);
       }
 
       // Combine text response + tool summary
@@ -3352,15 +3396,55 @@ async function readAgentConfig(Runtime, agentType, workspacePath) {
   if (agentType === 'antigravity' || agentType === 'antigravity_panel') return readAntigravityConfig(Runtime, workspacePath);
   if (agentType === 'continue') {
     try {
-      const cfg = await readContinueConfig(Runtime);
+      const raw = await evalInFrame(Runtime, `
+        var btn = d.querySelector('[data-testid="model-select-button"]');
+        if (!btn) return JSON.stringify({ model: 'unknown', available_models: [] });
+        var model_id = btn.textContent.trim();
+        // Open dropdown to scrape available models
+        btn.click();
+        return JSON.stringify({ open: true, model: model_id });
+      `);
+      let parsed = { model: 'unknown', available_models: [] };
+      if (raw) {
+        var r = JSON.parse(raw);
+        parsed.model = r.model;
+        if (r.open) {
+          await new Promise(res => setTimeout(res, 300));
+          const modelsRaw = await evalInFrame(Runtime, `
+            var opts = Array.from(d.querySelectorAll('.truncate, div[class*="option"], [role="option"], [role="menuitem"]'));
+            var models = [];
+            for (var i = 0; i < opts.length; i++) {
+              var textEl = opts[i].querySelector('.truncate') || opts[i];
+              var t = textEl.textContent.trim().replace(/\\n/g, '').replace(/\\r/g, '');
+              if (t && opts[i].offsetParent !== null && !models.includes(t)) {
+                if (t.length < 50 && !t.includes("Select model") && !t.includes("Add Chat model")) {
+                  models.push(t);
+                }
+              }
+            }
+            if (models.length === 0) {
+              models = Array.from(d.querySelectorAll('h3')).map(function(el) { return el.textContent.trim(); }).filter(Boolean).slice(0, 50);
+            }
+            // Close dropdown
+            var menuBtn = d.querySelector('[data-testid="model-select-button"]');
+            if (menuBtn) menuBtn.click();
+            return JSON.stringify({ available_models: models });
+          `);
+          if (modelsRaw) {
+            var m = JSON.parse(modelsRaw);
+            parsed.available_models = m.available_models || [];
+          }
+        }
+      }
       return {
-        model_id:          cfg?.model || 'unknown',
-        mode:              cfg?.mode  || 'unknown',
+        model_id:          parsed.model || 'unknown',
+        mode:              'unknown',
         permission_mode:   'unknown',
+        available_models:  parsed.available_models || [],
         file_access_scope: workspacePath || 'unknown',
       };
     } catch {
-      return { model_id: 'unknown', permission_mode: 'unknown', file_access_scope: workspacePath || 'unknown' };
+      return { model_id: 'unknown', permission_mode: 'unknown', available_models: [], file_access_scope: workspacePath || 'unknown' };
     }
   }
   if (agentType === 'gemini') {
@@ -3659,6 +3743,52 @@ async function setAntigravityMode(Runtime, InputDomain, mode, sessionId) {
 
   console.log(`[${sessionId}] [mode] Antigravity conversation mode set to: ${itemCoords.selected}`);
   return { ok: true, selected: itemCoords.selected };
+}
+
+// ─── Continue model selection ──────────────────────────────────────────────────
+async function setContinueModel(Runtime, modelId, sessionId) {
+  try {
+    const raw = await evalInFrame(Runtime, `
+      var btn = d.querySelector('[data-testid="model-select-button"]');
+      if (!btn) return JSON.stringify({ error: 'no-model-btn' });
+      btn.click();
+      return JSON.stringify({ ok: true });
+    `);
+    if (!raw) return { ok: false, code: 'eval_null', detail: 'No result opening model selector' };
+    const step1 = JSON.parse(raw);
+    if (step1.error) return { ok: false, code: step1.error, detail: 'Model button not found' };
+
+    await new Promise(r => setTimeout(r, 300));
+
+    const selectRaw = await evalInFrame(Runtime, `
+      var target = ${JSON.stringify((modelId || '').toLowerCase())};
+      var opts = Array.from(d.querySelectorAll('div[class*="option"], [role="option"], [role="menuitem"], .truncate'));
+      var match = null;
+      for (var i = 0; i < opts.length; i++) {
+        var textEl = opts[i].querySelector('.truncate') || opts[i];
+        var t = textEl.textContent.trim().toLowerCase();
+        if (t && (t === target || t.includes(target) || target.includes(t)) && opts[i].offsetParent !== null) {
+           match = opts[i]; break; 
+        }
+      }
+      if (!match) {
+        var available = Array.from(d.querySelectorAll('.truncate, span')).map(function(el) { return el.textContent.trim(); }).filter(Boolean).slice(0, 50);
+        var menuBtn = d.querySelector('[data-testid="model-select-button"]');
+        if (menuBtn) menuBtn.click(); // close dropdown
+        return JSON.stringify({ error: 'option_not_found', available: available });
+      }
+      match.click();
+      return JSON.stringify({ ok: true, selected: match.textContent.trim() });
+    `);
+    if (!selectRaw) return { ok: false, code: 'select_eval_null', detail: 'No result selecting option' };
+    const step2 = JSON.parse(selectRaw);
+    if (step2.error) return { ok: false, code: step2.error, detail: `No option matching "${modelId}"`, available: step2.available };
+
+    console.log(`[${sessionId}] [model] Continue model selected: ${step2.selected}`);
+    return { ok: true, selected: step2.selected };
+  } catch (e) {
+    return { ok: false, code: 'exception', detail: e.message };
+  }
 }
 
 // ─── Gemini model selection ───────────────────────────────────────────────────
@@ -5547,6 +5677,7 @@ module.exports = {
   steerCodexInput,
   getSelectorFailures,
   evalInFrame,
+  cacheInnerContextId,
   evalInPage,
   readAntigravitySessionTitle,
   readAntigravityPanelTitle,

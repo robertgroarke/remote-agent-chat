@@ -262,7 +262,7 @@ class ProxyEngine extends EventEmitter {
     const isDesktop = agentType === 'codex-desktop' || agentType === 'claude-desktop';
     return {
       interrupt:              ['claude', 'codex', 'gemini', 'continue', 'antigravity', 'antigravity_panel', 'claude-desktop', 'codex-desktop'].includes(agentType),
-      set_model:              agentType === 'claude' || agentType === 'antigravity' || agentType === 'antigravity_panel' || agentType === 'gemini',
+      set_model:              ['claude', 'antigravity', 'antigravity_panel', 'gemini', 'continue'].includes(agentType),
       set_mode:               agentType === 'antigravity',
       permission_mode_change: agentType === 'claude',
       permission_dialogs:     isClaude || isCodex || agentType === 'antigravity' || agentType === 'antigravity_panel' || agentType === 'continue',
@@ -334,6 +334,7 @@ class ProxyEngine extends EventEmitter {
         mode:               domCfg?.mode            || 'unknown',
         permission_mode:    'unknown',
         file_access_scope:  workspacePath || 'unknown',
+        available_models:   domCfg?.available_models || [],
         branch:             branch || 'unknown',
       };
     }
@@ -2112,11 +2113,262 @@ class ProxyEngine extends EventEmitter {
     }, 250);
   }
 
+  // ─── Ephemeral CDP polling (Continue) ─────────────────────────────────
+  //
+  // Continue iframe targets in Electron/Antigravity steal focus and reset
+  // scroll position when Runtime.evaluate is called on a persistent CDP
+  // connection (the execution context stays "active").
+  //
+  // Fix: for Continue sessions, open a fresh CDP connection per poll,
+  // perform all reads, then immediately disconnect.  This prevents the
+  // webview from staying activated between polls.
+
+  async _ephemeralCdpPoll(session, sessionId) {
+    let client;
+    try {
+      client = await CDP({ port: session._cdpPort || this.CDP_PORTS[0], target: session.targetId });
+      await client.Runtime.enable();
+      await selectors.cacheInnerContextId(client.Runtime);
+
+      const raw      = await selectors.readMessages(client.Runtime, session.agentType, sessionId);
+      const thinking = await selectors.detectThinking(client.Runtime, session.agentType);
+      const perm     = await selectors.detectPermissionDialog(client.Runtime, session.agentType);
+
+      let config = null;
+      const now = Date.now();
+      if (!session._lastConfigPollAt || now - session._lastConfigPollAt > 15000) {
+        session._lastConfigPollAt = now;
+        try {
+          config = await selectors.readAgentConfig(client.Runtime, session.agentType, session.workspace_path);
+        } catch {}
+      }
+
+      return { raw, thinking, perm, config };
+    } finally {
+      if (client) try { await client.close(); } catch {}
+    }
+  }
+
+  // ─── Continue-specific poll (ephemeral CDP) ─────────────────────────
+
+  async _pollSessionContinue(sessionId, session) {
+    let pollResult;
+    try {
+      pollResult = await this._ephemeralCdpPoll(session, sessionId);
+    } catch (e) {
+      this._log('error', `[${sessionId}] Continue ephemeral poll error: ${e.message}`);
+      session.nullPollCount = (session.nullPollCount || 0) + 1;
+      if (session.nullPollCount >= 15) {
+        this._log('warn', `[${sessionId}] 15 consecutive Continue poll failures — removing session for re-discovery`);
+        sessionStore.markDisconnected(sessionId);
+        try { await session.client.close(); } catch {}
+        this.sessions.delete(sessionId);
+        this.activePermissionPrompts.delete(sessionId);
+        this._broadcastSessionSnapshot();
+      }
+      return;
+    }
+
+    const { raw, thinking: ts, perm, config } = pollResult;
+
+    // ── Null-read handling ──
+    if (!raw) {
+      session.nullPollCount = (session.nullPollCount || 0) + 1;
+      if (session.nullPollCount === 5 && session.status === 'healthy') {
+        const failures = selectors.getSelectorFailures(sessionId);
+        this._log('warn', `[${sessionId}] 5 null reads — marking degraded`);
+        session.status = 'degraded';
+        sessionStore.updateSession(sessionId, { status: 'degraded' });
+        this._sendToRelay(proto.proxyStatus(sessionId, 'degraded', session.activity, failures));
+      }
+      if (session.nullPollCount >= 15) {
+        this._log('warn', `[${sessionId}] 15 null — removing session for re-discovery`);
+        sessionStore.markDisconnected(sessionId);
+        try { await session.client.close(); } catch {}
+        this.sessions.delete(sessionId);
+        this.activePermissionPrompts.delete(sessionId);
+        this._broadcastSessionSnapshot();
+      }
+      return;
+    }
+
+    if (session.nullPollCount > 0 && session.status === 'degraded') {
+      this._log('info', `[${sessionId}] Reads recovered — marking healthy`);
+      session.status = 'healthy';
+      sessionStore.updateSession(sessionId, { status: 'healthy' });
+      this._sendToRelay(proto.proxyStatus(sessionId, 'healthy', session.activity));
+    }
+    session.nullPollCount = 0;
+
+    // ── Config refresh ──
+    if (config) {
+      try {
+        const merged = this._mergeAgentConfig(session.agentType, config, session.workspace_path);
+        const cfgSig = `${merged.branch}|${merged.model_id}|${merged.permission_mode}`;
+        if (cfgSig !== session._lastConfigSig) {
+          session._lastConfigSig = cfgSig;
+          const capabilities = this._buildCapabilities(session.agentType);
+          this._sendToRelay(proto.agentConfig(sessionId, { ...merged, capabilities }));
+        }
+      } catch {}
+    }
+
+    // ── Message processing ── (same logic as generic _pollSession)
+    const messages = JSON.parse(raw);
+    const effectiveMessages = messages;
+    const transcriptSig = this._transcriptSignature(effectiveMessages);
+    const prevObservedCount = session.lastObservedCount ?? session.lastMessageCount;
+
+    if (effectiveMessages.length < prevObservedCount) {
+      this._log('warn', `[${sessionId}] Transcript regressed ${prevObservedCount} -> ${effectiveMessages.length}, forcing history snapshot`);
+      this._sendToRelay(proto.historySnapshot(sessionId, effectiveMessages));
+      session.lastMessageCount = effectiveMessages.length;
+      session.lastObservedCount = effectiveMessages.length;
+      session.lastTranscriptSig = transcriptSig;
+      session.pendingLast = null;
+      session.resyncCandidateSig = null;
+      session.waitingForAssistant = effectiveMessages.length > 0 && effectiveMessages[effectiveMessages.length - 1].role === 'user';
+      // Still process thinking + permissions below
+    } else if (
+      session.lastTranscriptSig &&
+      transcriptSig !== session.lastTranscriptSig &&
+      effectiveMessages.length === prevObservedCount
+    ) {
+      if (session.resyncCandidateSig === transcriptSig) {
+        this._log('warn', `[${sessionId}] Transcript mutated in place, forcing history snapshot`);
+        this._sendToRelay(proto.historySnapshot(sessionId, effectiveMessages));
+        session.lastMessageCount = effectiveMessages.length;
+        session.lastObservedCount = effectiveMessages.length;
+        session.lastTranscriptSig = transcriptSig;
+        session.pendingLast = null;
+        session.resyncCandidateSig = null;
+        session.waitingForAssistant = effectiveMessages.length > 0 && effectiveMessages[effectiveMessages.length - 1].role === 'user';
+      } else {
+        session.resyncCandidateSig = transcriptSig;
+        session.lastObservedCount = effectiveMessages.length;
+        session.lastTranscriptSig = transcriptSig;
+      }
+    } else {
+      if (session.resyncCandidateSig && session.resyncCandidateSig === transcriptSig) {
+        this._log('warn', `[${sessionId}] Mutated transcript stabilized — resyncing`);
+        this._sendToRelay(proto.historySnapshot(sessionId, effectiveMessages));
+        session.lastMessageCount = effectiveMessages.length;
+        session.lastObservedCount = effectiveMessages.length;
+        session.lastTranscriptSig = transcriptSig;
+        session.pendingLast = null;
+        session.resyncCandidateSig = null;
+        session.waitingForAssistant = effectiveMessages.length > 0 && effectiveMessages[effectiveMessages.length - 1].role === 'user';
+      } else {
+        if (effectiveMessages.length < session.lastMessageCount) {
+          this._log('warn', `[${sessionId}] Msg count regressed ${session.lastMessageCount} → ${effectiveMessages.length}, resetting`);
+          session.lastMessageCount = effectiveMessages.length;
+          session.pendingLast = null;
+        }
+
+        // Pending stabilisation
+        if (session.pendingLast !== null) {
+          const p = session.pendingLast;
+          const current = effectiveMessages[session.lastMessageCount];
+          if (current && current.role === p.role && current.content === p.content) {
+            this._log('info', `[${sessionId}] Stable ${p.role} msg (${p.content.length} chars)`);
+            this._sendToRelay(proto.proxyMessage(sessionId, p.role, p.content));
+            session.lastMessageCount++;
+            session.pendingLast = null;
+            session._pendingFirstSeenAt = null;
+            if (p.role === 'user') session.waitingForAssistant = true;
+            if (p.role === 'assistant') session.waitingForAssistant = false;
+          } else if (current) {
+            if (!session._pendingFirstSeenAt) session._pendingFirstSeenAt = Date.now();
+            const pendingAge = Date.now() - session._pendingFirstSeenAt;
+            if (pendingAge > 5000 && current.content !== session._lastStreamedContent) {
+              session._lastStreamedContent = current.content;
+              this._sendToRelay(proto.historySnapshot(sessionId, effectiveMessages));
+              this._log('info', `[${sessionId}] Streaming flush (${effectiveMessages.length} msgs, pending ${Math.round(pendingAge / 1000)}s)`);
+            }
+            session.pendingLast = { role: current.role, content: current.content };
+            session.lastObservedCount = effectiveMessages.length;
+            session.lastTranscriptSig = transcriptSig;
+          }
+        }
+
+        // Send newly complete messages
+        const prev = session.lastMessageCount;
+        if (effectiveMessages.length > prev && session.pendingLast === null) {
+          for (let i = prev; i < effectiveMessages.length - 1; i++) {
+            this._log('info', `[${sessionId}] New ${effectiveMessages[i].role} msg (${effectiveMessages[i].content.length} chars)`);
+            this._sendToRelay(proto.proxyMessage(sessionId, effectiveMessages[i].role, effectiveMessages[i].content));
+            if (effectiveMessages[i].role === 'user') session.waitingForAssistant = true;
+            if (effectiveMessages[i].role === 'assistant') session.waitingForAssistant = false;
+          }
+          session.lastMessageCount = effectiveMessages.length - 1;
+          const last = effectiveMessages[effectiveMessages.length - 1];
+          session.pendingLast = { role: last.role, content: last.content };
+        }
+
+        session.lastObservedCount = effectiveMessages.length;
+        session.lastTranscriptSig = transcriptSig;
+        session.resyncCandidateSig = null;
+      }
+    }
+
+    // ── Thinking / activity state ──
+    const active = session.pendingLast !== null || session.waitingForAssistant;
+    const kind = ts.thinking ? 'thinking' : active ? 'generating' : 'idle';
+    const label = ts.label || (active ? 'Generating' : '');
+    const newActivity = { kind, label, updated_at: new Date().toISOString() };
+    if (session.taskList) newActivity.task_list = session.taskList;
+    if (ts.thinkingContent) newActivity.thinkingContent = ts.thinkingContent;
+
+    const prevKind = session.activity?.kind || 'idle';
+    const prevThinkingContent = session.thinkingContent || '';
+    const currThinkingContent = ts.thinkingContent || '';
+    if (ts.thinking !== session.thinking || label !== session.thinkingLabel || kind !== prevKind || currThinkingContent !== prevThinkingContent) {
+      session.thinking = ts.thinking;
+      session.thinkingLabel = label;
+      session.thinkingContent = currThinkingContent;
+      session.activity = newActivity;
+      sessionStore.updateSession(sessionId, { activity: newActivity });
+      this._sendToRelay(proto.proxyStatus(sessionId, session.status || 'healthy', newActivity));
+      if ((prevKind === 'generating' || prevKind === 'thinking') && kind === 'idle') {
+        this._processMessageQueue(sessionId);
+      }
+    }
+
+    // ── Permission dialog ──
+    if (perm) {
+      const promptId = this._makePromptId(sessionId, perm.message, perm.choices);
+      const last = this.activePermissionPrompts.get(sessionId);
+      if (!last || last.prompt_id !== promptId) {
+        this._log('info', `[${sessionId}] [perm] Permission dialog detected: "${perm.message.substring(0, 60)}..."`);
+        const prompt = {
+          type: 'permission_prompt',
+          protocol_version: proto.PROTOCOL_VERSION,
+          session_id: sessionId,
+          prompt_id: promptId,
+          message: perm.message,
+          choices: perm.choices,
+          timeout_ms: 300000,
+          detected_at: new Date().toISOString(),
+        };
+        this.activePermissionPrompts.set(sessionId, { prompt_id: promptId, prompt });
+        this._sendToRelay(prompt);
+      }
+    } else if (this.activePermissionPrompts.has(sessionId)) {
+      this._log('info', `[${sessionId}] [perm] Permission dialog dismissed`);
+      this.activePermissionPrompts.delete(sessionId);
+    }
+  }
+
   // ─── Session polling ─────────────────────────────────────────────────
 
   async _pollSession(sessionId) {
     const session = this.sessions.get(sessionId);
     if (!session) return;
+
+    // Continue: use ephemeral CDP connection to avoid focus/scroll steal
+    if (session.agentType === 'continue') {
+      return this._pollSessionContinue(sessionId, session);
+    }
 
     try {
       const raw = await selectors.readMessages(session.client.Runtime, session.agentType, sessionId);
@@ -2574,6 +2826,8 @@ class ProxyEngine extends EventEmitter {
   async _pollPermissions(sessionId) {
     const session = this.sessions.get(sessionId);
     if (!session) return;
+    // Continue permissions are read inside _ephemeralCdpPoll — skip here
+    if (session.agentType === 'continue') return;
 
     try {
       const dialog = await selectors.detectPermissionDialog(session.client.Runtime, session.agentType);
@@ -2999,6 +3253,10 @@ class ProxyEngine extends EventEmitter {
       try {
         client = await CDP({ port: target._cdpPort || this.CDP_PORTS[0], target: target.id });
         await client.Runtime.enable();
+
+        // Cache inner-frame context ID to avoid active-frame traversal
+        // which causes focus/scroll steal in Continue webviews
+        await selectors.cacheInnerContextId(client.Runtime);
 
         const agentType = await selectors.detectAgentType(client.Runtime, ext);
         if (!agentType) {
@@ -3523,6 +3781,14 @@ class ProxyEngine extends EventEmitter {
 
         // Poll all sessions in the selected window
         for (const sessionId of windowGroups.get(activeKey)) {
+          const session = this.sessions.get(sessionId);
+          // Throttle Continue sessions — CDP eval on their iframe steals
+          // VS Code panel focus.  Poll every 5s instead of every tick.
+          if (session?.agentType === 'continue') {
+            session._continuePollCount = (session._continuePollCount || 0) + 1;
+            if (session._continuePollCount < 5) continue;
+            session._continuePollCount = 0;
+          }
           await this._pollSession(sessionId);
           await this._pollPermissions(sessionId);
         }
