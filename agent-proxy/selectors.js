@@ -209,6 +209,44 @@ async function evalInPage(Runtime, code) {
   return result.result?.value ?? null;
 }
 
+async function evalInWorkbenchWebview(Runtime, webviewId, code) {
+  const result = await Runtime.evaluate({
+    expression: `(function() {
+      const root = document;
+      const webviewId = ${JSON.stringify(webviewId || '')};
+      function resolveDoc() {
+        if (!webviewId) return null;
+        let iframe = root.querySelector('iframe[name="' + webviewId + '"]');
+        if (iframe && iframe.contentDocument) return iframe.contentDocument;
+
+        const editorEl = root.querySelector('[aria-flowto="' + webviewId + '"]');
+        if (editorEl) {
+          iframe = editorEl.querySelector('iframe');
+          if (iframe && iframe.contentDocument) return iframe.contentDocument;
+        }
+
+        const iframes = Array.from(root.querySelectorAll('iframe'));
+        iframe = iframes.find(f => f.name === webviewId || f.id === webviewId) || null;
+        if (iframe && iframe.contentDocument) return iframe.contentDocument;
+        return null;
+      }
+
+      const d = resolveDoc();
+      if (!d) return null;
+      ${code}
+    })()`,
+    returnByValue: true,
+    awaitPromise: false,
+    silent: true,
+    userGesture: false,
+  });
+  if (result.exceptionDetails) {
+    const desc = result.exceptionDetails.exception?.description || result.exceptionDetails.text;
+    throw new Error(`JS exception: ${desc}`);
+  }
+  return result.result?.value ?? null;
+}
+
 // ─── Core frame eval helper ───────────────────────────────────────────────────
 
 async function evalInFrame(Runtime, code) {
@@ -263,7 +301,13 @@ async function cacheInnerContextId(Runtime) {
     // Re-trigger context events by disabling then re-enabling Runtime
     Runtime.disable().then(() => Runtime.enable()).then(() => {
       setTimeout(() => {
-        try { Runtime.off('executionContextCreated', handler); } catch { }
+        try {
+          if (typeof Runtime.off === 'function') {
+            Runtime.off('executionContextCreated', handler);
+          } else if (typeof Runtime.removeListener === 'function') {
+            Runtime.removeListener('executionContextCreated', handler);
+          }
+        } catch {}
         // The inner active-frame context has a higher id than the outer webview
         if (contexts.length > 1) {
           contexts.sort((a, b) => b.id - a.id);
@@ -1290,6 +1334,21 @@ async function readContinueMessages(Runtime, sessionId) {
   return JSON.stringify([]);
 }
 
+async function readContinueMessagesFromWorkbench(Runtime, webviewId, sessionId) {
+  try {
+    const raw = await evalInWorkbenchWebview(Runtime, webviewId, CONTINUE_READ_EXPR);
+    if (raw !== null) { resetReadFailures(sessionId); return raw; }
+  } catch (e) {
+    console.warn(`[${sessionId}] [sel] Continue workbench read error: ${e.message}`);
+  }
+
+  const f = recordReadFailure(sessionId);
+  if (f.readFails === 1 || f.readFails % 5 === 0) {
+    console.warn(`[${sessionId}] [sel] Continue workbench read null x${f.readFails}`);
+  }
+  return JSON.stringify([]);
+}
+
 async function detectContinueThinking(Runtime) {
   try {
     const raw = await evalInFrame(Runtime, `
@@ -1328,8 +1387,71 @@ async function detectContinueThinking(Runtime) {
   }
 }
 
+async function detectContinueThinkingFromWorkbench(Runtime, webviewId) {
+  try {
+    const raw = await evalInWorkbenchWebview(Runtime, webviewId, `
+      var submitBtns = d.querySelectorAll('[data-testid="submit-input-button"]');
+      var lastSubmit = submitBtns[submitBtns.length - 1];
+      if (!lastSubmit) return JSON.stringify({ thinking: false, label: '' });
+
+      var isDisabled = lastSubmit.disabled;
+      var svgPaths = lastSubmit.querySelectorAll('svg path');
+      var hasStopIcon = false;
+      for (var i = 0; i < svgPaths.length; i++) {
+        var pathD = svgPaths[i].getAttribute('d') || '';
+        if (pathD.includes('M6') && pathD.includes('18') && !pathD.includes('M12')) {
+          hasStopIcon = true;
+          break;
+        }
+      }
+
+      var spinners = d.querySelectorAll('[class*=animate-spin], [class*=loading], [class*=spinner]');
+      var hasSpinner = false;
+      for (var i = 0; i < spinners.length; i++) {
+        if (spinners[i].offsetParent !== null) { hasSpinner = true; break; }
+      }
+
+      var thinking = hasStopIcon || hasSpinner || isDisabled;
+      return JSON.stringify({ thinking: thinking, label: thinking ? 'Generating' : '' });
+    `);
+    try { return JSON.parse(raw); } catch { return { thinking: false, label: '' }; }
+  } catch {
+    return { thinking: false, label: '' };
+  }
+}
+
+async function detectContinuePermissionDialogFromWorkbench(Runtime, webviewId) {
+  try {
+    const raw = await evalInWorkbenchWebview(Runtime, webviewId, `
+      var allAccept = d.querySelectorAll('[data-testid^="accept-tool-call-button-"]');
+      var acceptBtn = null;
+      for (var i = allAccept.length - 1; i >= 0; i--) {
+        if (allAccept[i].offsetParent !== null) { acceptBtn = allAccept[i]; break; }
+      }
+      if (!acceptBtn) return null;
+      var callId = acceptBtn.getAttribute('data-testid').replace('accept-tool-call-button-', '');
+      var rejectBtn = d.querySelector('[data-testid="reject-tool-call-button-' + callId + '"]');
+      var allTitles = d.querySelectorAll('[data-testid="tool-call-title"]');
+      var titleEl = allTitles.length > 0 ? allTitles[allTitles.length - 1] : null;
+      var message = titleEl ? (titleEl.textContent || '').trim() : 'Tool call pending';
+      return JSON.stringify({
+        message: message,
+        choices: [
+          { choice_id: acceptBtn.getAttribute('data-testid'), label: 'Accept' },
+          { choice_id: rejectBtn ? rejectBtn.getAttribute('data-testid') : 'reject-tool-call-button-' + callId, label: 'Reject' },
+        ],
+      });
+    `);
+    if (!raw) return null;
+    return JSON.parse(raw);
+  } catch {
+    return null;
+  }
+}
+
 async function sendContinuePrimary(Runtime, text) {
   // Set text in the main TipTap editor via execCommand
+  console.log(`[continue-focus] send primary:start chars=${(text || '').length}`);
   const set = await evalInFrame(Runtime, `
     var input = d.querySelector('${CONTINUE_PRIMARY.input}');
     if (!input) return 'no-input';
@@ -1351,6 +1473,7 @@ async function sendContinuePrimary(Runtime, text) {
   await new Promise(r => setTimeout(r, 200));
 
   // Click the last submit button (the main one)
+  console.log('[continue-focus] send primary:click-submit');
   const click = await evalInFrame(Runtime, `
     var btns = d.querySelectorAll('${CONTINUE_PRIMARY.sendBtn}');
     if (!btns.length) {
@@ -1369,6 +1492,7 @@ async function sendContinuePrimary(Runtime, text) {
 
 async function sendContinueFallback(Runtime, text) {
   // Fallback: try broader selectors and Enter key dispatch
+  console.log(`[continue-focus] send fallback:start chars=${(text || '').length}`);
   const result = await evalInFrame(Runtime, `
     var input = d.querySelector('${CONTINUE_FALLBACK.input}');
     if (!input) return 'no-input';
@@ -3032,20 +3156,21 @@ const READ_CODEX_RATE_LIMIT_EXPR = `
     return null;
   }
 
-  var rateWordPat = /rate.?limit|usage.?limit|too many requests|blocked until|available after|quota exceeded/i;
-  var resetWordPat = /try again after|available after|reset(s)? (on|at|after)|blocked until|quota exceeded/i;
+  var rateWordPat = /rate.?limit|usage.?limit|too many requests|blocked until|available after|quota exceeded|hit your.*limit/i;
+  var resetWordPat = /try again after|available after|reset(s)? (on|at|after)|blocked until|quota exceeded|upgrade to|purchase more/i;
   var conv = d.querySelector('[data-thread-find-target="conversation"]');
 
-  // Scan only short, visible, status-like UI text outside the transcript.
+  // Scan visible text — include conversation area for Codex "usage limit" messages
   var candidates = Array.from(d.querySelectorAll(
     '[role="alert"], [role="status"], [aria-live], [class*="warning"], [class*="error"], [class*="alert"], [class*="notice"], [class*="banner"], button, div, span, p'
   )).filter(function(el) {
     if (!isVisible(el)) return false;
-    if (conv && conv.contains(el)) return false;
-    if (el.closest && el.closest('[data-thread-find-target="conversation"], pre, code')) return false;
+    if (el.closest && el.closest('pre, code')) return false;
     var text = normalizeText(el.innerText || el.textContent || '');
     if (!text || text.length < 8 || text.length > 240) return false;
     if (!rateWordPat.test(text)) return false;
+    // For "hit your usage limit" messages, don't require reset time pattern
+    if (/hit your.*limit|usage limit.*upgrade/i.test(text)) return true;
     return resetWordPat.test(text);
   });
 
@@ -3396,11 +3521,54 @@ async function readAgentConfig(Runtime, agentType, workspacePath) {
   if (agentType === 'antigravity' || agentType === 'antigravity_panel') return readAntigravityConfig(Runtime, workspacePath);
   if (agentType === 'continue') {
     try {
+      console.log('[continue-focus] config read:start');
       const raw = await evalInFrame(Runtime, `
+        function norm(t) {
+          return String(t || '').replace(/\\s+/g, ' ').trim();
+        }
+        function hasVisibleBox(el) {
+          if (!el || !el.getBoundingClientRect) return false;
+          var rect = el.getBoundingClientRect();
+          return rect.width > 0 && rect.height > 0;
+        }
+        function isVisible(el) {
+          if (!el || !hasVisibleBox(el)) return false;
+          var style = window.getComputedStyle ? window.getComputedStyle(el) : null;
+          if (style && (style.display === 'none' || style.visibility === 'hidden' || style.opacity === '0')) return false;
+          return true;
+        }
+        function keepModelText(t) {
+          return t &&
+            t.length < 120 &&
+            !/^Models?$/i.test(t) &&
+            !/^Add Chat model$/i.test(t) &&
+            !/^Ctrl/i.test(t) &&
+            !/^Select model$/i.test(t) &&
+            !/to toggle model$/i.test(t);
+        }
+        function collectVisibleModels() {
+          var opts = Array.from(d.querySelectorAll('div[class*="option"], [role="option"], [role="menuitem"], [role="menuitemradio"], [cmdk-item], .truncate'));
+          var models = [];
+          for (var i = 0; i < opts.length; i++) {
+            var opt = opts[i];
+            var textEl = opt.querySelector ? (opt.querySelector('.truncate, span, div') || opt) : opt;
+            var t = norm(textEl && textEl.textContent ? textEl.textContent : opt.textContent);
+            if (!keepModelText(t)) continue;
+            var visible = isVisible(opt);
+            if (!visible && opt.parentElement) visible = isVisible(opt.parentElement);
+            if (visible && !models.includes(t)) models.push(t);
+          }
+          return models;
+        }
         var btn = d.querySelector('[data-testid="model-select-button"]');
         if (!btn) return JSON.stringify({ model: 'unknown', available_models: [] });
         var model_id = btn.textContent.trim();
+        var existingModels = collectVisibleModels();
+        if (existingModels.length > 0) {
+          return JSON.stringify({ open: false, model: model_id, available_models: existingModels });
+        }
         // Open dropdown to scrape available models
+        console.log('[continue-focus] config read:open-model-dropdown');
         btn.click();
         return JSON.stringify({ open: true, model: model_id });
       `);
@@ -3408,24 +3576,75 @@ async function readAgentConfig(Runtime, agentType, workspacePath) {
       if (raw) {
         var r = JSON.parse(raw);
         parsed.model = r.model;
+        parsed.available_models = r.available_models || [];
         if (r.open) {
           await new Promise(res => setTimeout(res, 300));
           const modelsRaw = await evalInFrame(Runtime, `
-            var opts = Array.from(d.querySelectorAll('.truncate, div[class*="option"], [role="option"], [role="menuitem"]'));
+            function hasVisibleBox(el) {
+              if (!el || !el.getBoundingClientRect) return false;
+              var rect = el.getBoundingClientRect();
+              return rect.width > 0 && rect.height > 0;
+            }
+            function isVisible(el) {
+              if (!el || !hasVisibleBox(el)) return false;
+              var style = window.getComputedStyle ? window.getComputedStyle(el) : null;
+              if (style && (style.display === 'none' || style.visibility === 'hidden' || style.opacity === '0')) return false;
+              return true;
+            }
+            function norm(t) {
+              return String(t || '').replace(/\\s+/g, ' ').trim();
+            }
+            function keepModelText(t) {
+              return t &&
+                t.length < 120 &&
+                !/^Models?$/i.test(t) &&
+                !/^Add Chat model$/i.test(t) &&
+                !/^Ctrl/i.test(t) &&
+                !/^Select model$/i.test(t) &&
+                !/to toggle model$/i.test(t);
+            }
+            function pushText(models, t) {
+              if (!keepModelText(t)) return;
+              if (!models.includes(t)) models.push(t);
+            }
+            var popupRoots = Array.from(d.querySelectorAll('[role="listbox"], [role="menu"], [data-radix-popper-content-wrapper], [data-radix-portal], [cmdk-list], [data-state="open"]'))
+              .filter(isVisible);
+            var opts = [];
+            for (var ri = 0; ri < popupRoots.length; ri++) {
+              opts = opts.concat(Array.from(popupRoots[ri].querySelectorAll('[role="option"], [role="menuitem"], [role="menuitemradio"], [cmdk-item], div[class*="option"]')));
+            }
+            if (opts.length === 0) {
+              opts = Array.from(d.querySelectorAll('[role="option"], [role="menuitem"], [role="menuitemradio"], [cmdk-item], div[class*="option"]')).filter(isVisible);
+            }
             var models = [];
             for (var i = 0; i < opts.length; i++) {
-              var textEl = opts[i].querySelector('.truncate') || opts[i];
-              var t = textEl.textContent.trim().replace(/\\n/g, '').replace(/\\r/g, '');
-              if (t && opts[i].offsetParent !== null && !models.includes(t)) {
-                if (t.length < 50 && !t.includes("Select model") && !t.includes("Add Chat model")) {
-                  models.push(t);
-                }
+              var textEl = opts[i].querySelector('.truncate, span, div') || opts[i];
+              var t = norm(textEl.textContent);
+              if (t && isVisible(opts[i]) && !models.includes(t)) {
+                pushText(models, t);
               }
             }
             if (models.length === 0) {
-              models = Array.from(d.querySelectorAll('h3')).map(function(el) { return el.textContent.trim(); }).filter(Boolean).slice(0, 50);
+              var looseOpts = Array.from(d.querySelectorAll('div[class*="option"], [role="option"], [role="menuitem"], [role="menuitemradio"], [cmdk-item], .truncate'));
+              for (var li = 0; li < looseOpts.length; li++) {
+                var looseEl = looseOpts[li];
+                var looseText = norm((looseEl.querySelector && looseEl.querySelector('.truncate')) ? looseEl.querySelector('.truncate').textContent : looseEl.textContent);
+                if (!looseText) continue;
+                var visible = isVisible(looseEl);
+                if (!visible && looseEl.parentElement) visible = isVisible(looseEl.parentElement);
+                if (!visible && looseEl.closest) {
+                  var visibleAncestor = looseEl.closest('[role="option"], [role="menuitem"], [role="menuitemradio"], [cmdk-item], div[class*="option"]');
+                  if (visibleAncestor) visible = isVisible(visibleAncestor);
+                }
+                if (visible) pushText(models, looseText);
+              }
+            }
+            if (models.length === 0 && popupRoots.length > 0) {
+              var allTexts = Array.from(popupRoots[0].querySelectorAll('*')).map(function(el) { return norm(el.textContent); });
+              for (var ti = 0; ti < allTexts.length; ti++) pushText(models, allTexts[ti]);
             }
             // Close dropdown
+            console.log('[continue-focus] config read:close-model-dropdown');
             var menuBtn = d.querySelector('[data-testid="model-select-button"]');
             if (menuBtn) menuBtn.click();
             return JSON.stringify({ available_models: models });
@@ -3503,6 +3722,86 @@ async function readAgentConfig(Runtime, agentType, workspacePath) {
     };
   } catch {
     return null;
+  }
+}
+
+async function readContinueConfigFromWorkbench(Runtime, webviewId, workspacePath) {
+  try {
+    console.log(`[continue-focus] workbench config read:start webview=${webviewId || 'unknown'}`);
+    const raw = await evalInWorkbenchWebview(Runtime, webviewId, `
+      var btn = d.querySelector('[data-testid="model-select-button"]');
+      if (!btn) return JSON.stringify({ model: 'unknown', available_models: [] });
+      var model_id = (btn.textContent || '').trim();
+      console.log('[continue-focus] workbench config read:open-model-dropdown');
+      btn.click();
+      return JSON.stringify({ open: true, model: model_id });
+    `);
+    let parsed = { model: 'unknown', available_models: [] };
+    if (raw) {
+      var r = JSON.parse(raw);
+      parsed.model = r.model;
+      if (r.open) {
+        await new Promise(res => setTimeout(res, 300));
+        const modelsRaw = await evalInWorkbenchWebview(Runtime, webviewId, `
+          function hasVisibleBox(el) {
+            if (!el || !el.getBoundingClientRect) return false;
+            var rect = el.getBoundingClientRect();
+            return rect.width > 0 && rect.height > 0;
+          }
+          function isVisible(el) {
+            if (!el || !hasVisibleBox(el)) return false;
+            var style = window.getComputedStyle ? window.getComputedStyle(el) : null;
+            if (style && (style.display === 'none' || style.visibility === 'hidden' || style.opacity === '0')) return false;
+            return true;
+          }
+          function norm(t) {
+            return String(t || '').replace(/\\s+/g, ' ').trim();
+          }
+          var popupRoots = Array.from(d.querySelectorAll('[role="listbox"], [role="menu"], [data-radix-popper-content-wrapper], [data-radix-portal], [cmdk-list], [data-state="open"]'))
+            .filter(isVisible);
+          var opts = [];
+          for (var ri = 0; ri < popupRoots.length; ri++) {
+            opts = opts.concat(Array.from(popupRoots[ri].querySelectorAll('[role="option"], [role="menuitem"], [role="menuitemradio"], [cmdk-item], div[class*="option"]')));
+          }
+          if (opts.length === 0) {
+            opts = Array.from(d.querySelectorAll('[role="option"], [role="menuitem"], [role="menuitemradio"], [cmdk-item], div[class*="option"]')).filter(isVisible);
+          }
+          var models = [];
+          for (var i = 0; i < opts.length; i++) {
+            var textEl = opts[i].querySelector('.truncate, span, div') || opts[i];
+            var t = norm(textEl.textContent);
+            if (t && isVisible(opts[i]) && !models.includes(t)) {
+              if (
+                t.length < 80 &&
+                !/^Models?$/i.test(t) &&
+                !/^Add Chat model$/i.test(t) &&
+                !/^Ctrl/i.test(t) &&
+                !/^Select model$/i.test(t)
+              ) {
+                models.push(t);
+              }
+            }
+          }
+          var menuBtn = d.querySelector('[data-testid="model-select-button"]');
+          console.log('[continue-focus] workbench config read:close-model-dropdown');
+          if (menuBtn) menuBtn.click();
+          return JSON.stringify({ available_models: models });
+        `);
+        if (modelsRaw) {
+          var m = JSON.parse(modelsRaw);
+          parsed.available_models = m.available_models || [];
+        }
+      }
+    }
+    return {
+      model_id:          parsed.model || 'unknown',
+      mode:              'unknown',
+      permission_mode:   'unknown',
+      available_models:  parsed.available_models || [],
+      file_access_scope: workspacePath || 'unknown',
+    };
+  } catch {
+    return { model_id: 'unknown', permission_mode: 'unknown', available_models: [], file_access_scope: workspacePath || 'unknown' };
   }
 }
 
@@ -3748,9 +4047,11 @@ async function setAntigravityMode(Runtime, InputDomain, mode, sessionId) {
 // ─── Continue model selection ──────────────────────────────────────────────────
 async function setContinueModel(Runtime, modelId, sessionId) {
   try {
+    console.log(`[${sessionId}] [continue-focus] set-model:start model=${modelId}`);
     const raw = await evalInFrame(Runtime, `
       var btn = d.querySelector('[data-testid="model-select-button"]');
       if (!btn) return JSON.stringify({ error: 'no-model-btn' });
+      console.log('[continue-focus] set-model:open-dropdown');
       btn.click();
       return JSON.stringify({ ok: true });
     `);
@@ -3774,9 +4075,11 @@ async function setContinueModel(Runtime, modelId, sessionId) {
       if (!match) {
         var available = Array.from(d.querySelectorAll('.truncate, span')).map(function(el) { return el.textContent.trim(); }).filter(Boolean).slice(0, 50);
         var menuBtn = d.querySelector('[data-testid="model-select-button"]');
+        console.log('[continue-focus] set-model:close-dropdown-no-match');
         if (menuBtn) menuBtn.click(); // close dropdown
         return JSON.stringify({ error: 'option_not_found', available: available });
       }
+      console.log('[continue-focus] set-model:select-option');
       match.click();
       return JSON.stringify({ ok: true, selected: match.textContent.trim() });
     `);
@@ -4356,6 +4659,7 @@ async function respondToPermissionDialog(Runtime, agentType, choiceId, sessionId
         }
         if (!btn) return 'no-btn';
         if (btn.disabled) return 'disabled';
+        console.log('[continue-focus] permission:dispatch-pointer-sequence');
         var rect = btn.getBoundingClientRect();
         var cx = rect.x + rect.width / 2;
         var cy = rect.y + rect.height / 2;
@@ -4369,6 +4673,7 @@ async function respondToPermissionDialog(Runtime, agentType, choiceId, sessionId
         // Fallback: also try the keyboard shortcut (Ctrl+Enter = Accept)
         var isAccept = '${choiceId}'.indexOf('accept') !== -1;
         if (isAccept) {
+          console.log('[continue-focus] permission:dispatch-ctrl-enter');
           var kbOpts = { key: 'Enter', code: 'Enter', keyCode: 13, ctrlKey: true, bubbles: true, cancelable: true };
           d.body.dispatchEvent(new w.KeyboardEvent('keydown', kbOpts));
           d.body.dispatchEvent(new w.KeyboardEvent('keyup', kbOpts));
@@ -5722,4 +6027,9 @@ module.exports = {
   closeSessionTab,
   // Continue extension
   readContinueConfig,
+  readContinueConfigFromWorkbench,
+  readContinueMessagesFromWorkbench,
+  detectContinueThinkingFromWorkbench,
+  detectContinuePermissionDialogFromWorkbench,
+  evalInWorkbenchWebview,
 };

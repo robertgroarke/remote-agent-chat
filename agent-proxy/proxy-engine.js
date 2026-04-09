@@ -555,7 +555,7 @@ class ProxyEngine extends EventEmitter {
       for (const [sessionId, session] of this.sessions.entries()) {
         const agentCaps = this._buildCapabilities(session.agentType);
         const resolvedPath = session.workspace_path;
-        selectors.readAgentConfig(session.client.Runtime, session.agentType, resolvedPath)
+        this._readSessionConfig(session, resolvedPath)
           .then(cfg => {
             const merged = this._mergeAgentConfig(session.agentType, cfg, resolvedPath);
             this._log('info', `[startup-cfg] ${sessionId} (${session.agentType}): ${JSON.stringify({ ...merged, capabilities: agentCaps })}`);
@@ -569,7 +569,7 @@ class ProxyEngine extends EventEmitter {
       }
       // Re-sync transcript history
       for (const [sessionId, session] of this.sessions.entries()) {
-        selectors.readMessages(session.client.Runtime, session.agentType, sessionId)
+        this._readSessionMessages(session, sessionId)
           .then(raw => {
             if (!raw && !session._accumulatedMessages) return;
             const msgs = raw ? JSON.parse(raw) : [];
@@ -691,7 +691,12 @@ class ProxyEngine extends EventEmitter {
       }
 
       this._log('info', `[ctrl] agent_interrupt for ${sid} (${sessionData.agentType})`);
-      selectors.interruptAgent(sessionData.client.Runtime, sessionData.agentType, sid)
+      const interruptPromise = sessionData.agentType === 'continue'
+        ? this._withContinueClient(sessionData, client =>
+            selectors.interruptAgent(client.Runtime, sessionData.agentType, sid)
+          , 'interrupt')
+        : selectors.interruptAgent(sessionData.client.Runtime, sessionData.agentType, sid);
+      interruptPromise
         .then((result) => {
           if (result.ok) {
             this._sendToRelay(proto.agentControlResult(sid, msg.request_id, 'agent_interrupt', 'ok'));
@@ -730,7 +735,12 @@ class ProxyEngine extends EventEmitter {
         return;
       }
 
-      selectors.respondToPermissionDialog(sessionData.client.Runtime, sessionData.agentType, choiceId, sid)
+      const permissionPromise = sessionData.agentType === 'continue'
+        ? this._withContinueClient(sessionData, client =>
+            selectors.respondToPermissionDialog(client.Runtime, sessionData.agentType, choiceId, sid)
+          , 'permission_response')
+        : selectors.respondToPermissionDialog(sessionData.client.Runtime, sessionData.agentType, choiceId, sid);
+      permissionPromise
         .then(result => {
           if (result.ok) {
             this.activePermissionPrompts.delete(sid);
@@ -764,11 +774,16 @@ class ProxyEngine extends EventEmitter {
       }
       const modelId = msg.model_id;
       this._log('info', `[ctrl] agent_set_model for ${sid} model=${modelId}`);
-      selectors.setAgentModel(sessionData.client.Runtime, sessionData.agentType, modelId, sid, sessionData.client.Input)
+      const setModelPromise = sessionData.agentType === 'continue'
+        ? this._withContinueClient(sessionData, client =>
+            selectors.setAgentModel(client.Runtime, sessionData.agentType, modelId, sid, client.Input)
+          , 'set_model')
+        : selectors.setAgentModel(sessionData.client.Runtime, sessionData.agentType, modelId, sid, sessionData.client.Input);
+      setModelPromise
         .then(result => {
           if (result.ok) {
             this._sendToRelay(proto.agentControlResult(sid, msg.request_id, 'agent_set_model', 'ok'));
-            return selectors.readAgentConfig(sessionData.client.Runtime, sessionData.agentType, sessionData.workspace_path)
+            return this._readSessionConfig(sessionData, sessionData.workspace_path, { forceRefresh: true })
               .then(cfg => {
                 const merged = this._mergeAgentConfig(sessionData.agentType, cfg, sessionData.workspace_path);
                 this._sendToRelay(proto.agentConfig(sid, { ...merged, capabilities: this._buildCapabilities(sessionData.agentType) }));
@@ -847,7 +862,7 @@ class ProxyEngine extends EventEmitter {
       }
 
       this._log('info', `[ctrl] agent_config_request for ${sid} (${agentT})`);
-      selectors.readAgentConfig(sessionData.client.Runtime, agentT, sessionData.workspace_path)
+      this._readSessionConfig(sessionData, sessionData.workspace_path)
         .then(cfg => {
           const merged = this._mergeAgentConfig(agentT, cfg, sessionData.workspace_path);
           this._log('info', `[ctrl] agent_config sending for ${sid}: ${JSON.stringify({ ...merged, capabilities })}`);
@@ -1916,7 +1931,7 @@ class ProxyEngine extends EventEmitter {
               const s = this.sessions.get(sessionId);
               if (s) {
                 this._log('info', `[launch] Injecting /cd ${wsPath} into ${sessionId}`);
-                await selectors.sendMessage(s.client.Runtime, s.agentType, `/cd ${wsPath}`, sessionId)
+                await this._sendSessionMessage(s, `/cd ${wsPath}`, sessionId)
                   .catch(e => this._log('warn', `[launch] /cd inject failed: ${e.message}`));
               }
             }, 2000);
@@ -2126,27 +2141,131 @@ class ProxyEngine extends EventEmitter {
   async _ephemeralCdpPoll(session, sessionId) {
     let client;
     try {
+      this._log('info', `[${sessionId}] [continue-focus] poll attach:start target=${session.targetId}`);
       client = await CDP({ port: session._cdpPort || this.CDP_PORTS[0], target: session.targetId });
-      await client.Runtime.enable();
-      await selectors.cacheInnerContextId(client.Runtime);
+      await this._primeContinueRuntime(session, client.Runtime);
 
-      const raw      = await selectors.readMessages(client.Runtime, session.agentType, sessionId);
-      const thinking = await selectors.detectThinking(client.Runtime, session.agentType);
-      const perm     = await selectors.detectPermissionDialog(client.Runtime, session.agentType);
+      let raw      = await selectors.readMessages(client.Runtime, session.agentType, sessionId);
+      let thinking = await selectors.detectThinking(client.Runtime, session.agentType);
+      const perm   = await selectors.detectPermissionDialog(client.Runtime, session.agentType);
 
-      let config = null;
-      const now = Date.now();
-      if (!session._lastConfigPollAt || now - session._lastConfigPollAt > 15000) {
-        session._lastConfigPollAt = now;
-        try {
-          config = await selectors.readAgentConfig(client.Runtime, session.agentType, session.workspace_path);
-        } catch {}
+      if (raw === JSON.stringify([]) && (session.lastObservedCount || 0) > 0) {
+        await this._primeContinueRuntime(session, client.Runtime, true);
+        raw = await selectors.readMessages(client.Runtime, session.agentType, sessionId);
+        thinking = await selectors.detectThinking(client.Runtime, session.agentType);
       }
 
-      return { raw, thinking, perm, config };
+      return { raw, thinking, perm, config: null };
+    } finally {
+      this._log('info', `[${sessionId}] [continue-focus] poll attach:end`);
+      if (client) try { await client.close(); } catch {}
+    }
+  }
+
+  async _withContinueClient(session, work, reason = 'unknown') {
+    let client;
+    try {
+      this._log('info', `[${session.session_id}] [continue-focus] client attach:start reason=${reason} target=${session.targetId}`);
+      client = await CDP({ port: session._cdpPort || this.CDP_PORTS[0], target: session.targetId });
+      await this._primeContinueRuntime(session, client.Runtime);
+      return await work(client);
+    } finally {
+      this._log('info', `[${session.session_id}] [continue-focus] client attach:end reason=${reason}`);
+      if (client) try { await client.close(); } catch {}
+    }
+  }
+
+  async _primeContinueRuntime(session, Runtime, forceRefresh = false) {
+    if (!forceRefresh && session._continueInnerContextId) {
+      Runtime._innerContextId = session._continueInnerContextId;
+      return session._continueInnerContextId;
+    }
+    this._log('info', `[${session.session_id}] [continue-focus] context cache:start force=${forceRefresh}`);
+    const contextId = await selectors.cacheInnerContextId(Runtime);
+    if (contextId) {
+      session._continueInnerContextId = contextId;
+      Runtime._innerContextId = contextId;
+    } else if (session._continueInnerContextId) {
+      Runtime._innerContextId = session._continueInnerContextId;
+    }
+    this._log('info', `[${session.session_id}] [continue-focus] context cache:end resolved=${Runtime._innerContextId || 'null'}`);
+    return Runtime._innerContextId || null;
+  }
+
+  async _withWorkbenchClient(session, work) {
+    const cdpPort = session._cdpPort || this.CDP_PORTS[0];
+    const targets = await CDP.List({ port: cdpPort });
+    const workbenchPages = targets.filter(t =>
+      t.type === 'page' && t.url && t.url.includes('workbench.html') && !t.url.includes('jetski')
+    );
+    if (workbenchPages.length === 0) {
+      throw new Error('No workbench page found');
+    }
+
+    let workbenchTarget = workbenchPages[0];
+    if (session.parentId) {
+      for (const page of workbenchPages) {
+        let pageClient;
+        try {
+          pageClient = await CDP({ port: cdpPort, target: page.id });
+          await pageClient.Runtime.enable();
+          const res = await pageClient.Runtime.evaluate({
+            expression: '(typeof window.vscodeWindowId !== "undefined") ? String(window.vscodeWindowId) : null',
+            returnByValue: true,
+          });
+          await pageClient.close();
+          if (res.result?.value === session.parentId) {
+            workbenchTarget = page;
+            break;
+          }
+        } catch {
+          if (pageClient) try { await pageClient.close(); } catch {}
+        }
+      }
+    }
+
+    let client;
+    try {
+      client = await CDP({ port: cdpPort, target: workbenchTarget.id });
+      await client.Runtime.enable();
+      return await work(client);
     } finally {
       if (client) try { await client.close(); } catch {}
     }
+  }
+
+  async _readSessionMessages(session, sessionId) {
+    if (session.agentType === 'continue') {
+      return this._withContinueClient(session, client =>
+        selectors.readMessages(client.Runtime, session.agentType, sessionId)
+      , 'read_messages');
+    }
+    return selectors.readMessages(session.client.Runtime, session.agentType, sessionId);
+  }
+
+  async _readSessionConfig(session, workspacePath, options = {}) {
+    const forceRefresh = options.forceRefresh === true;
+    if (session.agentType === 'continue') {
+      if (!forceRefresh && session._continueConfigCache) {
+        return session._continueConfigCache;
+      }
+      return this._withContinueClient(session, client =>
+        selectors.readAgentConfig(client.Runtime, session.agentType, workspacePath)
+      , forceRefresh ? 'read_config_force' : 'read_config').then(cfg => {
+        if (cfg) session._continueConfigCache = cfg;
+        return cfg;
+      });
+    }
+    return selectors.readAgentConfig(session.client.Runtime, session.agentType, workspacePath);
+  }
+
+  async _sendSessionMessage(session, content, sessionId) {
+    if (session.agentType === 'continue') {
+      return this._withContinueClient(session, client =>
+        selectors.sendMessage(client.Runtime, session.agentType, content, sessionId)
+      , 'send_message');
+    }
+    return selectors.sendMessage(session.client.Runtime, session.agentType, content, sessionId);
   }
 
   // ─── Continue-specific poll (ephemeral CDP) ─────────────────────────
@@ -2161,7 +2280,7 @@ class ProxyEngine extends EventEmitter {
       if (session.nullPollCount >= 15) {
         this._log('warn', `[${sessionId}] 15 consecutive Continue poll failures — removing session for re-discovery`);
         sessionStore.markDisconnected(sessionId);
-        try { await session.client.close(); } catch {}
+        if (session.client) try { await session.client.close(); } catch {}
         this.sessions.delete(sessionId);
         this.activePermissionPrompts.delete(sessionId);
         this._broadcastSessionSnapshot();
@@ -2170,6 +2289,9 @@ class ProxyEngine extends EventEmitter {
     }
 
     const { raw, thinking: ts, perm, config } = pollResult;
+    const thinkingState = ts && typeof ts === 'object'
+      ? ts
+      : { thinking: false, label: '', thinkingContent: '' };
 
     // ── Null-read handling ──
     if (!raw) {
@@ -2184,7 +2306,7 @@ class ProxyEngine extends EventEmitter {
       if (session.nullPollCount >= 15) {
         this._log('warn', `[${sessionId}] 15 null — removing session for re-discovery`);
         sessionStore.markDisconnected(sessionId);
-        try { await session.client.close(); } catch {}
+        if (session.client) try { await session.client.close(); } catch {}
         this.sessions.delete(sessionId);
         this.activePermissionPrompts.delete(sessionId);
         this._broadcastSessionSnapshot();
@@ -2313,17 +2435,17 @@ class ProxyEngine extends EventEmitter {
 
     // ── Thinking / activity state ──
     const active = session.pendingLast !== null || session.waitingForAssistant;
-    const kind = ts.thinking ? 'thinking' : active ? 'generating' : 'idle';
-    const label = ts.label || (active ? 'Generating' : '');
+    const kind = thinkingState.thinking ? 'thinking' : active ? 'generating' : 'idle';
+    const label = thinkingState.label || (active ? 'Generating' : '');
     const newActivity = { kind, label, updated_at: new Date().toISOString() };
     if (session.taskList) newActivity.task_list = session.taskList;
-    if (ts.thinkingContent) newActivity.thinkingContent = ts.thinkingContent;
+    if (thinkingState.thinkingContent) newActivity.thinkingContent = thinkingState.thinkingContent;
 
     const prevKind = session.activity?.kind || 'idle';
     const prevThinkingContent = session.thinkingContent || '';
-    const currThinkingContent = ts.thinkingContent || '';
-    if (ts.thinking !== session.thinking || label !== session.thinkingLabel || kind !== prevKind || currThinkingContent !== prevThinkingContent) {
-      session.thinking = ts.thinking;
+    const currThinkingContent = thinkingState.thinkingContent || '';
+    if (thinkingState.thinking !== session.thinking || label !== session.thinkingLabel || kind !== prevKind || currThinkingContent !== prevThinkingContent) {
+      session.thinking = thinkingState.thinking;
       session.thinkingLabel = label;
       session.thinkingContent = currThinkingContent;
       session.activity = newActivity;
@@ -2936,12 +3058,7 @@ class ProxyEngine extends EventEmitter {
           break;
         }
       }
-      result = await selectors.sendMessage(
-        sessionData.client.Runtime,
-        sessionData.agentType,
-        messageContent,
-        sessionId
-      );
+      result = await this._sendSessionMessage(sessionData, messageContent, sessionId);
       if (result.ok) break;
       if (!RETRIABLE_SEND_CODES.has(result.code)) break;
     }
@@ -2985,9 +3102,7 @@ class ProxyEngine extends EventEmitter {
     const item = session.messageQueue.shift();
     this._log('info', `[${sessionId}] Auto-sending queued message ${item.client_message_id}`);
 
-    const result = await selectors.sendMessage(
-      session.client.Runtime, session.agentType, item.content, sessionId
-    );
+    const result = await this._sendSessionMessage(session, item.content, sessionId);
 
     if (result.ok) {
       session.waitingForAssistant = true;
@@ -3067,10 +3182,6 @@ class ProxyEngine extends EventEmitter {
       }
       this._sendToRelay(proto.steerResult(sessionId, client_message_id, typeResult.ok ? 'ok' : 'failed', typeResult.ok ? null : 'fallback'));
     }
-    if (ok) {
-      this._sendToRelay(proto.proxySendResult(sessionId, client_message_id, 'delivered'));
-    }
-
     // Type the next queued message into ProseMirror (if any remain)
     await this._typeNextQueuedIntoProseMirror(sessionId);
   }
@@ -3256,7 +3367,13 @@ class ProxyEngine extends EventEmitter {
 
         // Cache inner-frame context ID to avoid active-frame traversal
         // which causes focus/scroll steal in Continue webviews
+        if (ext.toLowerCase().includes('continue.continue')) {
+          this._log('info', `[discover] [continue-focus] initial context cache:start target=${target.id}`);
+        }
         await selectors.cacheInnerContextId(client.Runtime);
+        if (ext.toLowerCase().includes('continue.continue')) {
+          this._log('info', `[discover] [continue-focus] initial context cache:end target=${target.id} resolved=${client.Runtime?._innerContextId || 'null'}`);
+        }
 
         const agentType = await selectors.detectAgentType(client.Runtime, ext);
         if (!agentType) {
@@ -3351,7 +3468,15 @@ class ProxyEngine extends EventEmitter {
           targetId:         target.id,
           _cdpPort:         target._cdpPort,
           _webviewId:       (target.url.match(/[?&]id=([0-9a-f-]+)/i) || [])[1] || null,
+          _continueInnerContextId: agentType === 'continue' ? (client.Runtime?._innerContextId || null) : null,
         });
+
+        if (agentType === 'continue') {
+          try { await client.close(); } catch {}
+          client = null;
+          const continueSession = this.sessions.get(sessionId);
+          if (continueSession) continueSession.client = null;
+        }
 
         this._log('info', `[cdp] ${agentType} → ${sessionId} in "${windowTitle}" (${initialCount} existing msgs)`);
 
@@ -3378,7 +3503,7 @@ class ProxyEngine extends EventEmitter {
           }).catch(() => {});
         }
 
-        selectors.readAgentConfig(client.Runtime, agentType, resolvedPath).then(cfg => {
+        this._readSessionConfig(this.sessions.get(sessionId), resolvedPath).then(cfg => {
           const merged = this._mergeAgentConfig(agentType, cfg, resolvedPath);
           this._log('info', `[init-cfg] ${sessionId} (${agentType}): ${JSON.stringify({ ...merged, capabilities: agentCaps })}`);
           this._sendToRelay(proto.agentConfig(sessionId, { ...merged, capabilities: agentCaps }));
@@ -3400,13 +3525,15 @@ class ProxyEngine extends EventEmitter {
           this._sendToRelay(proto.agentConfig(sessionId, { ...merged, capabilities: agentCaps }));
         });
 
-        client.on('disconnect', () => {
-          this._log('info', `[${sessionId}] CDP disconnected`);
-          sessionStore.markDisconnected(sessionId);
-          this.sessions.delete(sessionId);
-          this.activePermissionPrompts.delete(sessionId);
-          this._broadcastSessionSnapshot();
-        });
+        if (client) {
+          client.on('disconnect', () => {
+            this._log('info', `[${sessionId}] CDP disconnected`);
+            sessionStore.markDisconnected(sessionId);
+            this.sessions.delete(sessionId);
+            this.activePermissionPrompts.delete(sessionId);
+            this._broadcastSessionSnapshot();
+          });
+        }
 
         this._broadcastSessionSnapshot();
 
@@ -3809,7 +3936,9 @@ class ProxyEngine extends EventEmitter {
 
     // Close all CDP clients
     for (const [sid, session] of this.sessions.entries()) {
-      try { session.client.close(); } catch {}
+      if (session.client) {
+        try { session.client.close(); } catch {}
+      }
     }
     this.sessions.clear();
     this.activePermissionPrompts.clear();
