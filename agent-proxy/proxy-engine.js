@@ -2851,6 +2851,41 @@ class ProxyEngine extends EventEmitter {
 
       // Rate limit / usage warning check — Codex and Claude
       if (session.agentType === 'codex' || session.agentType === 'claude') {
+        // Time-based auto-clear: if we have a reset time and it's passed, clear immediately
+        if (session.rateLimitActive && session.rate_limited_until && session.rate_limited_until !== 'unknown') {
+          const untilStr = session.rate_limited_until;
+          // Parse time like "2:50 PM", "14:50", "3h", "30m"
+          let resetMs = null;
+          const hmMatch = untilStr.match(/^(\d{1,2}):(\d{2})\s*(AM|PM)?$/i);
+          if (hmMatch) {
+            let h = parseInt(hmMatch[1], 10);
+            const m = parseInt(hmMatch[2], 10);
+            const ampm = (hmMatch[3] || '').toUpperCase();
+            if (ampm === 'PM' && h < 12) h += 12;
+            if (ampm === 'AM' && h === 12) h = 0;
+            const now = new Date();
+            const resetDate = new Date(now);
+            resetDate.setHours(h, m, 0, 0);
+            // If the reset time is earlier today, it may have been yesterday's — assume it's passed
+            resetMs = resetDate.getTime();
+          }
+          const durationMatch = untilStr.match(/^(\d+)\s*h(?:\s*(\d+)\s*m)?$|^(\d+)\s*m$/i);
+          if (durationMatch && session._rateLimitDetectedAt) {
+            const hours = parseInt(durationMatch[1] || '0', 10);
+            const mins = parseInt(durationMatch[2] || durationMatch[3] || '0', 10);
+            resetMs = session._rateLimitDetectedAt + (hours * 3600000) + (mins * 60000);
+          }
+          if (resetMs && Date.now() > resetMs) {
+            this._log('info', `[${sessionId}] [rate-limit] Time-based auto-clear: ${untilStr} has passed`);
+            session.rateLimitActive = false;
+            session.rate_limited_until = null;
+            session.percentUsed = null;
+            session._rateLimitSig = null;
+            this._sendToRelay(proto.rateLimitCleared(sessionId));
+            this._broadcastSessionSnapshot();
+          }
+        }
+
         session._rateLimitPollCount = (session._rateLimitPollCount || 0) + 1;
         if (session._rateLimitPollCount >= 10) {
           session._rateLimitPollCount = 0;
@@ -2870,6 +2905,7 @@ class ProxyEngine extends EventEmitter {
               session.rate_limited_until = nowActive ? (untilText || 'unknown') : null;
               session.percentUsed        = hasBanner ? pctUsed : null;
               if (nowActive) {
+                if (!wasActive) session._rateLimitDetectedAt = Date.now();
                 this._log('info', `[${sessionId}] [rate-limit] Active: ${pctUsed != null ? pctUsed + '%' : ''} resets ${untilText || 'unknown'}`);
                 this._sendToRelay(proto.rateLimitActive(sessionId, untilText, pctUsed));
               } else if (hasBanner) {

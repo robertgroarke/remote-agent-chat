@@ -3160,19 +3160,37 @@ const READ_CODEX_RATE_LIMIT_EXPR = `
   var resetWordPat = /try again after|available after|reset(s)? (on|at|after)|blocked until|quota exceeded|upgrade to|purchase more/i;
   var conv = d.querySelector('[data-thread-find-target="conversation"]');
 
-  // Scan visible text — include conversation area for Codex "usage limit" messages
+  // Strategy 1: Scan for live banner/status UI OUTSIDE the conversation.
+  // These elements disappear when the rate limit clears.
   var candidates = Array.from(d.querySelectorAll(
     '[role="alert"], [role="status"], [aria-live], [class*="warning"], [class*="error"], [class*="alert"], [class*="notice"], [class*="banner"], button, div, span, p'
   )).filter(function(el) {
     if (!isVisible(el)) return false;
-    if (el.closest && el.closest('pre, code')) return false;
+    if (conv && conv.contains(el)) return false;
+    if (el.closest && el.closest('[data-thread-find-target="conversation"], pre, code')) return false;
     var text = normalizeText(el.innerText || el.textContent || '');
     if (!text || text.length < 8 || text.length > 240) return false;
     if (!rateWordPat.test(text)) return false;
-    // For "hit your usage limit" messages, don't require reset time pattern
-    if (/hit your.*limit|usage limit.*upgrade/i.test(text)) return true;
     return resetWordPat.test(text);
   });
+
+  // Strategy 2: Check if the LAST visible message in the conversation is a
+  // "usage limit" message. Only triggers if it's the final message (not
+  // followed by newer messages, which would mean the limit cleared).
+  if (candidates.length === 0 && conv) {
+    var lastChild = conv.lastElementChild;
+    while (lastChild && lastChild.lastElementChild) lastChild = lastChild.lastElementChild;
+    // Walk back up to find a text-bearing element
+    var el = lastChild;
+    for (var ci = 0; ci < 5 && el && el !== conv; ci++) {
+      var ct = normalizeText(el.textContent || '');
+      if (ct.length > 20 && /hit your.*limit|usage.?limit.*upgrade/i.test(ct) && ct.length < 240) {
+        candidates.push(el);
+        break;
+      }
+      el = el.parentElement;
+    }
+  }
 
   if (candidates.length === 0) return null;
 
