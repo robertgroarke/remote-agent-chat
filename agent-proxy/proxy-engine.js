@@ -691,8 +691,8 @@ class ProxyEngine extends EventEmitter {
       }
 
       this._log('info', `[ctrl] agent_interrupt for ${sid} (${sessionData.agentType})`);
-      const interruptPromise = sessionData.agentType === 'continue'
-        ? this._withContinueClient(sessionData, client =>
+      const interruptPromise = this._isIframeSession(sessionData)
+        ? this._withEphemeralClient(sessionData, client =>
             selectors.interruptAgent(client.Runtime, sessionData.agentType, sid)
           , 'interrupt')
         : selectors.interruptAgent(sessionData.client.Runtime, sessionData.agentType, sid);
@@ -735,8 +735,8 @@ class ProxyEngine extends EventEmitter {
         return;
       }
 
-      const permissionPromise = sessionData.agentType === 'continue'
-        ? this._withContinueClient(sessionData, client =>
+      const permissionPromise = this._isIframeSession(sessionData)
+        ? this._withEphemeralClient(sessionData, client =>
             selectors.respondToPermissionDialog(client.Runtime, sessionData.agentType, choiceId, sid)
           , 'permission_response')
         : selectors.respondToPermissionDialog(sessionData.client.Runtime, sessionData.agentType, choiceId, sid);
@@ -774,8 +774,8 @@ class ProxyEngine extends EventEmitter {
       }
       const modelId = msg.model_id;
       this._log('info', `[ctrl] agent_set_model for ${sid} model=${modelId}`);
-      const setModelPromise = sessionData.agentType === 'continue'
-        ? this._withContinueClient(sessionData, client =>
+      const setModelPromise = this._isIframeSession(sessionData)
+        ? this._withEphemeralClient(sessionData, client =>
             selectors.setAgentModel(client.Runtime, sessionData.agentType, modelId, sid, client.Input)
           , 'set_model')
         : selectors.setAgentModel(sessionData.client.Runtime, sessionData.agentType, modelId, sid, sessionData.client.Input);
@@ -2128,67 +2128,129 @@ class ProxyEngine extends EventEmitter {
     }, 250);
   }
 
-  // ─── Ephemeral CDP polling (Continue) ─────────────────────────────────
+  // ─── Ephemeral CDP polling ──────────────────────────────────────────
   //
-  // Continue iframe targets in Electron/Antigravity steal focus and reset
-  // scroll position when Runtime.evaluate is called on a persistent CDP
+  // Iframe targets in Electron/Antigravity steal focus and reset scroll
+  // position when Runtime.evaluate is called on a persistent CDP
   // connection (the execution context stays "active").
   //
-  // Fix: for Continue sessions, open a fresh CDP connection per poll,
-  // perform all reads, then immediately disconnect.  This prevents the
-  // webview from staying activated between polls.
+  // Fix: open a fresh CDP connection per poll, perform all reads, then
+  // immediately disconnect.  This prevents the webview from staying
+  // activated between polls and eliminates focus-stealing between
+  // multiple Antigravity windows.
+  //
+  // Used by: continue, claude, codex, gemini (all iframe-based sessions).
+  // NOT used by: antigravity, antigravity_panel, codex-desktop (page targets).
+
+  _isIframeSession(session) {
+    return ['claude', 'codex', 'gemini', 'continue'].includes(session.agentType);
+  }
 
   async _ephemeralCdpPoll(session, sessionId) {
     let client;
     try {
-      this._log('info', `[${sessionId}] [continue-focus] poll attach:start target=${session.targetId}`);
       client = await CDP({ port: session._cdpPort || this.CDP_PORTS[0], target: session.targetId });
-      await this._primeContinueRuntime(session, client.Runtime);
+      // All iframe sessions need the inner context ID cached so evalInFrame
+      // uses the direct contextId path instead of accessing
+      // active-frame.contentDocument which steals focus in Electron.
+      await this._primeIframeRuntime(session, client.Runtime);
 
       let raw      = await selectors.readMessages(client.Runtime, session.agentType, sessionId);
       let thinking = await selectors.detectThinking(client.Runtime, session.agentType);
       const perm   = await selectors.detectPermissionDialog(client.Runtime, session.agentType);
 
+      // Context retry: if we got empty results but should have content,
+      // force-refresh the inner context ID and retry (context may be stale)
       if (raw === JSON.stringify([]) && (session.lastObservedCount || 0) > 0) {
-        await this._primeContinueRuntime(session, client.Runtime, true);
+        await this._primeIframeRuntime(session, client.Runtime, true);
         raw = await selectors.readMessages(client.Runtime, session.agentType, sessionId);
         thinking = await selectors.detectThinking(client.Runtime, session.agentType);
       }
 
-      return { raw, thinking, perm, config: null };
+      // Read config periodically (every 15s)
+      let config = null;
+      const configNow = Date.now();
+      if (!session._lastConfigPollAt || configNow - session._lastConfigPollAt > 15000) {
+        session._lastConfigPollAt = configNow;
+        try {
+          config = await selectors.readAgentConfig(client.Runtime, session.agentType, session.workspace_path);
+        } catch {}
+      }
+
+      // Rate limit polling (every 10 polls) for claude/codex iframe sessions
+      let rateLimit = null;
+      if (session.agentType === 'claude' || session.agentType === 'codex') {
+        session._rateLimitPollCount = (session._rateLimitPollCount || 0) + 1;
+        if (session._rateLimitPollCount >= 10) {
+          session._rateLimitPollCount = 0;
+          try {
+            rateLimit = session.agentType === 'codex'
+              ? await selectors.readCodexRateLimit(client.Runtime)
+              : await selectors.readClaudeRateLimit(client.Runtime);
+          } catch {}
+        }
+      }
+
+      // Codex native queue + task list polling
+      let nativeQueue = null, taskList = null;
+      if (session.agentType === 'codex') {
+        session._nativeQueuePollCount = (session._nativeQueuePollCount || 0) + 1;
+        if (session._nativeQueuePollCount >= 3) {
+          session._nativeQueuePollCount = 0;
+          try { nativeQueue = await selectors.readCodexNativeQueue(client.Runtime, false); } catch {}
+        }
+        session._taskListPollCount = (session._taskListPollCount || 0) + 1;
+        if (session._taskListPollCount >= 5) {
+          session._taskListPollCount = 0;
+          try { taskList = await selectors.readCodexTaskList(client.Runtime, false); } catch {}
+        }
+      }
+
+      return { raw, thinking, perm, config, rateLimit, nativeQueue, taskList };
     } finally {
-      this._log('info', `[${sessionId}] [continue-focus] poll attach:end`);
       if (client) try { await client.close(); } catch {}
     }
   }
 
-  async _withContinueClient(session, work, reason = 'unknown') {
+  /**
+   * Open an ephemeral CDP connection, run `work(client)`, then close.
+   * Used for one-off operations (send, permission response) on iframe sessions.
+   */
+  async _withEphemeralClient(session, work, reason = 'unknown') {
     let client;
     try {
-      this._log('info', `[${session.session_id}] [continue-focus] client attach:start reason=${reason} target=${session.targetId}`);
       client = await CDP({ port: session._cdpPort || this.CDP_PORTS[0], target: session.targetId });
-      await this._primeContinueRuntime(session, client.Runtime);
+      await this._primeIframeRuntime(session, client.Runtime);
       return await work(client);
     } finally {
-      this._log('info', `[${session.session_id}] [continue-focus] client attach:end reason=${reason}`);
       if (client) try { await client.close(); } catch {}
     }
   }
 
-  async _primeContinueRuntime(session, Runtime, forceRefresh = false) {
-    if (!forceRefresh && session._continueInnerContextId) {
-      Runtime._innerContextId = session._continueInnerContextId;
-      return session._continueInnerContextId;
+  /**
+   * Prime a fresh Runtime for an iframe session by restoring the cached
+   * inner-frame contextId.  This ensures evalInFrame uses the direct
+   * contextId path instead of accessing active-frame.contentDocument
+   * which steals focus in Electron webviews.
+   *
+   * On the first call (no cache), runs cacheInnerContextId which does
+   * Runtime.disable → Runtime.enable to discover contexts (~300ms).
+   * Subsequent calls just restore the cached ID (~0ms).
+   */
+  async _primeIframeRuntime(session, Runtime, forceRefresh = false) {
+    // Use cached contextId if available
+    if (!forceRefresh && session._innerContextId) {
+      Runtime._innerContextId = session._innerContextId;
+      return session._innerContextId;
     }
-    this._log('info', `[${session.session_id}] [continue-focus] context cache:start force=${forceRefresh}`);
     const contextId = await selectors.cacheInnerContextId(Runtime);
     if (contextId) {
-      session._continueInnerContextId = contextId;
+      session._innerContextId = contextId;
       Runtime._innerContextId = contextId;
-    } else if (session._continueInnerContextId) {
-      Runtime._innerContextId = session._continueInnerContextId;
+    } else if (session._innerContextId) {
+      // cacheInnerContextId failed but we have a previous ID — use it
+      Runtime._innerContextId = session._innerContextId;
     }
-    this._log('info', `[${session.session_id}] [continue-focus] context cache:end resolved=${Runtime._innerContextId || 'null'}`);
     return Runtime._innerContextId || null;
   }
 
@@ -2235,8 +2297,8 @@ class ProxyEngine extends EventEmitter {
   }
 
   async _readSessionMessages(session, sessionId) {
-    if (session.agentType === 'continue') {
-      return this._withContinueClient(session, client =>
+    if (this._isIframeSession(session)) {
+      return this._withEphemeralClient(session, client =>
         selectors.readMessages(client.Runtime, session.agentType, sessionId)
       , 'read_messages');
     }
@@ -2245,14 +2307,14 @@ class ProxyEngine extends EventEmitter {
 
   async _readSessionConfig(session, workspacePath, options = {}) {
     const forceRefresh = options.forceRefresh === true;
-    if (session.agentType === 'continue') {
-      if (!forceRefresh && session._continueConfigCache) {
-        return session._continueConfigCache;
+    if (this._isIframeSession(session)) {
+      if (!forceRefresh && session._configCache) {
+        return session._configCache;
       }
-      return this._withContinueClient(session, client =>
+      return this._withEphemeralClient(session, client =>
         selectors.readAgentConfig(client.Runtime, session.agentType, workspacePath)
       , forceRefresh ? 'read_config_force' : 'read_config').then(cfg => {
-        if (cfg) session._continueConfigCache = cfg;
+        if (cfg) session._configCache = cfg;
         return cfg;
       });
     }
@@ -2260,27 +2322,30 @@ class ProxyEngine extends EventEmitter {
   }
 
   async _sendSessionMessage(session, content, sessionId) {
-    if (session.agentType === 'continue') {
-      return this._withContinueClient(session, client =>
+    if (this._isIframeSession(session)) {
+      return this._withEphemeralClient(session, client =>
         selectors.sendMessage(client.Runtime, session.agentType, content, sessionId)
       , 'send_message');
     }
     return selectors.sendMessage(session.client.Runtime, session.agentType, content, sessionId);
   }
 
-  // ─── Continue-specific poll (ephemeral CDP) ─────────────────────────
+  // ─── Ephemeral session poll (iframe targets) ────────────────────────
+  //
+  // Processes the result of _ephemeralCdpPoll for all iframe-based sessions
+  // (claude, codex, gemini, continue).  All CDP reads happen inside the
+  // ephemeral connection; this method only processes the results.
 
-  async _pollSessionContinue(sessionId, session) {
+  async _pollSessionEphemeral(sessionId, session) {
     let pollResult;
     try {
       pollResult = await this._ephemeralCdpPoll(session, sessionId);
     } catch (e) {
-      this._log('error', `[${sessionId}] Continue ephemeral poll error: ${e.message}`);
+      this._log('error', `[${sessionId}] Ephemeral poll error: ${e.message}`);
       session.nullPollCount = (session.nullPollCount || 0) + 1;
       if (session.nullPollCount >= 15) {
-        this._log('warn', `[${sessionId}] 15 consecutive Continue poll failures — removing session for re-discovery`);
+        this._log('warn', `[${sessionId}] 15 consecutive poll failures — removing session for re-discovery`);
         sessionStore.markDisconnected(sessionId);
-        if (session.client) try { await session.client.close(); } catch {}
         this.sessions.delete(sessionId);
         this.activePermissionPrompts.delete(sessionId);
         this._broadcastSessionSnapshot();
@@ -2288,7 +2353,7 @@ class ProxyEngine extends EventEmitter {
       return;
     }
 
-    const { raw, thinking: ts, perm, config } = pollResult;
+    const { raw, thinking: ts, perm, config, rateLimit, nativeQueue, taskList } = pollResult;
     const thinkingState = ts && typeof ts === 'object'
       ? ts
       : { thinking: false, label: '', thinkingContent: '' };
@@ -2306,7 +2371,6 @@ class ProxyEngine extends EventEmitter {
       if (session.nullPollCount >= 15) {
         this._log('warn', `[${sessionId}] 15 null — removing session for re-discovery`);
         sessionStore.markDisconnected(sessionId);
-        if (session.client) try { await session.client.close(); } catch {}
         this.sessions.delete(sessionId);
         this.activePermissionPrompts.delete(sessionId);
         this._broadcastSessionSnapshot();
@@ -2335,7 +2399,7 @@ class ProxyEngine extends EventEmitter {
       } catch {}
     }
 
-    // ── Message processing ── (same logic as generic _pollSession)
+    // ── Message processing ──
     const messages = JSON.parse(raw);
     const effectiveMessages = messages;
     const transcriptSig = this._transcriptSignature(effectiveMessages);
@@ -2476,8 +2540,75 @@ class ProxyEngine extends EventEmitter {
         this._sendToRelay(prompt);
       }
     } else if (this.activePermissionPrompts.has(sessionId)) {
-      this._log('info', `[${sessionId}] [perm] Permission dialog dismissed`);
+      const { prompt_id } = this.activePermissionPrompts.get(sessionId);
+      this._log('info', `[${sessionId}] [perm] Dialog dismissed (prompt_id=${prompt_id})`);
       this.activePermissionPrompts.delete(sessionId);
+      this._sendToRelay({
+        type: 'permission_prompt_expired',
+        protocol_version: proto.PROTOCOL_VERSION,
+        session_id: sessionId,
+        prompt_id,
+        expired_at: new Date().toISOString(),
+      });
+    }
+
+    // ── Rate limit processing (claude, codex) ──
+    if (rateLimit !== undefined && rateLimit !== null) {
+      const wasActive = session.rateLimitActive || false;
+      const nowActive = rateLimit?.rate_limited === true;
+      const untilText = rateLimit?.until_text || null;
+      const pctUsed   = rateLimit?.percent_used ?? null;
+      const hasBanner = pctUsed != null;
+      const sig = `${nowActive}|${pctUsed}|${untilText}`;
+      if (sig !== session._rateLimitSig) {
+        session._rateLimitSig = sig;
+        session.rateLimitActive    = nowActive;
+        session.rate_limited_until = nowActive ? (untilText || 'unknown') : null;
+        session.percentUsed        = hasBanner ? pctUsed : null;
+        if (nowActive) {
+          if (!wasActive) session._rateLimitDetectedAt = Date.now();
+          this._log('info', `[${sessionId}] [rate-limit] Active: ${pctUsed != null ? pctUsed + '%' : ''} resets ${untilText || 'unknown'}`);
+          this._sendToRelay(proto.rateLimitActive(sessionId, untilText, pctUsed));
+        } else if (hasBanner) {
+          this._log('info', `[${sessionId}] [rate-limit] Usage: ${pctUsed}% resets ${untilText || 'unknown'}`);
+          this._sendToRelay(proto.rateLimitActive(sessionId, untilText, pctUsed));
+        } else if (wasActive || session.percentUsed != null) {
+          this._log('info', `[${sessionId}] [rate-limit] Cleared`);
+          this._sendToRelay(proto.rateLimitCleared(sessionId));
+        }
+        this._broadcastSessionSnapshot();
+      }
+    }
+
+    // ── Codex native queue processing ──
+    if (nativeQueue !== null && nativeQueue !== undefined) {
+      const sig = nativeQueue.map(i => i.text).join('|');
+      const changed = sig !== (session._nativeQueueSig || '');
+      session._nativeQueueResendCount = (session._nativeQueueResendCount || 0) + 1;
+      const forceResend = nativeQueue.length > 0 && session._nativeQueueResendCount >= 10;
+      if (changed || forceResend) {
+        if (forceResend) session._nativeQueueResendCount = 0;
+        session._nativeQueueSig = sig;
+        session.nativeQueue = nativeQueue;
+        if (changed && nativeQueue.length > 0) {
+          this._log('info', `[${sessionId}] [native-queue] ${nativeQueue.length} items detected`);
+        }
+        this._sendToRelay(proto.nativeQueue(sessionId, nativeQueue));
+      }
+    }
+
+    // ── Codex task list processing ──
+    if (taskList !== null && taskList !== undefined) {
+      const sig = JSON.stringify(taskList);
+      if (sig !== (session._taskListSig || '')) {
+        session._taskListSig = sig;
+        session.taskList = taskList;
+        if (!session.activity) {
+          session.activity = { kind: 'idle', label: '', updated_at: new Date().toISOString() };
+        }
+        session.activity.task_list = taskList;
+        this._sendToRelay(proto.proxyStatus(sessionId, session.status || 'healthy', session.activity));
+      }
     }
   }
 
@@ -2487,9 +2618,9 @@ class ProxyEngine extends EventEmitter {
     const session = this.sessions.get(sessionId);
     if (!session) return;
 
-    // Continue: use ephemeral CDP connection to avoid focus/scroll steal
-    if (session.agentType === 'continue') {
-      return this._pollSessionContinue(sessionId, session);
+    // Iframe sessions: use ephemeral CDP connection to avoid focus/scroll steal
+    if (this._isIframeSession(session)) {
+      return this._pollSessionEphemeral(sessionId, session);
     }
 
     try {
@@ -2984,8 +3115,8 @@ class ProxyEngine extends EventEmitter {
   async _pollPermissions(sessionId) {
     const session = this.sessions.get(sessionId);
     if (!session) return;
-    // Continue permissions are read inside _ephemeralCdpPoll — skip here
-    if (session.agentType === 'continue') return;
+    // Iframe session permissions are read inside _ephemeralCdpPoll — skip here
+    if (this._isIframeSession(session)) return;
 
     try {
       const dialog = await selectors.detectPermissionDialog(session.client.Runtime, session.agentType);
@@ -3401,15 +3532,9 @@ class ProxyEngine extends EventEmitter {
         client = await CDP({ port: target._cdpPort || this.CDP_PORTS[0], target: target.id });
         await client.Runtime.enable();
 
-        // Cache inner-frame context ID to avoid active-frame traversal
-        // which causes focus/scroll steal in Continue webviews
-        if (ext.toLowerCase().includes('continue.continue')) {
-          this._log('info', `[discover] [continue-focus] initial context cache:start target=${target.id}`);
-        }
+        // Cache inner-frame context ID so evalInFrame uses the direct contextId
+        // path instead of accessing active-frame.contentDocument (focus steal).
         await selectors.cacheInnerContextId(client.Runtime);
-        if (ext.toLowerCase().includes('continue.continue')) {
-          this._log('info', `[discover] [continue-focus] initial context cache:end target=${target.id} resolved=${client.Runtime?._innerContextId || 'null'}`);
-        }
 
         const agentType = await selectors.detectAgentType(client.Runtime, ext);
         if (!agentType) {
@@ -3504,15 +3629,20 @@ class ProxyEngine extends EventEmitter {
           targetId:         target.id,
           _cdpPort:         target._cdpPort,
           _webviewId:       (target.url.match(/[?&]id=([0-9a-f-]+)/i) || [])[1] || null,
-          _continueInnerContextId: agentType === 'continue' ? (client.Runtime?._innerContextId || null) : null,
+          _innerContextId: client.Runtime?._innerContextId || null,
         });
 
+        // Continue sessions don't keep a persistent client — they use ephemeral
+        // connections for everything (reads AND control operations).
         if (agentType === 'continue') {
           try { await client.close(); } catch {}
           client = null;
           const continueSession = this.sessions.get(sessionId);
           if (continueSession) continueSession.client = null;
         }
+        // Other iframe sessions (claude, codex, gemini) keep the persistent
+        // client for control operations (send, interrupt, etc.) but use
+        // ephemeral connections during polling to avoid focus-stealing.
 
         this._log('info', `[cdp] ${agentType} → ${sessionId} in "${windowTitle}" (${initialCount} existing msgs)`);
 

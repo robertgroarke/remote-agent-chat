@@ -201,6 +201,8 @@ async function evalInPage(Runtime, code) {
     })()`,
     returnByValue: true,
     awaitPromise: false,
+    silent: true,
+    userGesture: false,
   });
   if (result.exceptionDetails) {
     const desc = result.exceptionDetails.exception?.description || result.exceptionDetails.text;
@@ -283,6 +285,8 @@ async function evalInFrame(Runtime, code) {
     })()`,
     returnByValue: true,
     awaitPromise: false,
+    silent: true,
+    userGesture: false,
   });
   if (result.exceptionDetails) {
     const desc = result.exceptionDetails.exception?.description || result.exceptionDetails.text;
@@ -1451,7 +1455,6 @@ async function detectContinuePermissionDialogFromWorkbench(Runtime, webviewId) {
 
 async function sendContinuePrimary(Runtime, text) {
   // Set text in the main TipTap editor via execCommand
-  console.log(`[continue-focus] send primary:start chars=${(text || '').length}`);
   const set = await evalInFrame(Runtime, `
     var input = d.querySelector('${CONTINUE_PRIMARY.input}');
     if (!input) return 'no-input';
@@ -1473,7 +1476,6 @@ async function sendContinuePrimary(Runtime, text) {
   await new Promise(r => setTimeout(r, 200));
 
   // Click the last submit button (the main one)
-  console.log('[continue-focus] send primary:click-submit');
   const click = await evalInFrame(Runtime, `
     var btns = d.querySelectorAll('${CONTINUE_PRIMARY.sendBtn}');
     if (!btns.length) {
@@ -1492,7 +1494,6 @@ async function sendContinuePrimary(Runtime, text) {
 
 async function sendContinueFallback(Runtime, text) {
   // Fallback: try broader selectors and Enter key dispatch
-  console.log(`[continue-focus] send fallback:start chars=${(text || '').length}`);
   const result = await evalInFrame(Runtime, `
     var input = d.querySelector('${CONTINUE_FALLBACK.input}');
     if (!input) return 'no-input';
@@ -3539,7 +3540,6 @@ async function readAgentConfig(Runtime, agentType, workspacePath) {
   if (agentType === 'antigravity' || agentType === 'antigravity_panel') return readAntigravityConfig(Runtime, workspacePath);
   if (agentType === 'continue') {
     try {
-      console.log('[continue-focus] config read:start');
       const raw = await evalInFrame(Runtime, `
         function norm(t) {
           return String(t || '').replace(/\\s+/g, ' ').trim();
@@ -3586,7 +3586,6 @@ async function readAgentConfig(Runtime, agentType, workspacePath) {
           return JSON.stringify({ open: false, model: model_id, available_models: existingModels });
         }
         // Open dropdown to scrape available models
-        console.log('[continue-focus] config read:open-model-dropdown');
         btn.click();
         return JSON.stringify({ open: true, model: model_id });
       `);
@@ -3662,7 +3661,6 @@ async function readAgentConfig(Runtime, agentType, workspacePath) {
               for (var ti = 0; ti < allTexts.length; ti++) pushText(models, allTexts[ti]);
             }
             // Close dropdown
-            console.log('[continue-focus] config read:close-model-dropdown');
             var menuBtn = d.querySelector('[data-testid="model-select-button"]');
             if (menuBtn) menuBtn.click();
             return JSON.stringify({ available_models: models });
@@ -3745,12 +3743,10 @@ async function readAgentConfig(Runtime, agentType, workspacePath) {
 
 async function readContinueConfigFromWorkbench(Runtime, webviewId, workspacePath) {
   try {
-    console.log(`[continue-focus] workbench config read:start webview=${webviewId || 'unknown'}`);
     const raw = await evalInWorkbenchWebview(Runtime, webviewId, `
       var btn = d.querySelector('[data-testid="model-select-button"]');
       if (!btn) return JSON.stringify({ model: 'unknown', available_models: [] });
       var model_id = (btn.textContent || '').trim();
-      console.log('[continue-focus] workbench config read:open-model-dropdown');
       btn.click();
       return JSON.stringify({ open: true, model: model_id });
     `);
@@ -3801,7 +3797,6 @@ async function readContinueConfigFromWorkbench(Runtime, webviewId, workspacePath
             }
           }
           var menuBtn = d.querySelector('[data-testid="model-select-button"]');
-          console.log('[continue-focus] workbench config read:close-model-dropdown');
           if (menuBtn) menuBtn.click();
           return JSON.stringify({ available_models: models });
         `);
@@ -4065,11 +4060,9 @@ async function setAntigravityMode(Runtime, InputDomain, mode, sessionId) {
 // ─── Continue model selection ──────────────────────────────────────────────────
 async function setContinueModel(Runtime, modelId, sessionId) {
   try {
-    console.log(`[${sessionId}] [continue-focus] set-model:start model=${modelId}`);
     const raw = await evalInFrame(Runtime, `
       var btn = d.querySelector('[data-testid="model-select-button"]');
       if (!btn) return JSON.stringify({ error: 'no-model-btn' });
-      console.log('[continue-focus] set-model:open-dropdown');
       btn.click();
       return JSON.stringify({ ok: true });
     `);
@@ -4093,11 +4086,9 @@ async function setContinueModel(Runtime, modelId, sessionId) {
       if (!match) {
         var available = Array.from(d.querySelectorAll('.truncate, span')).map(function(el) { return el.textContent.trim(); }).filter(Boolean).slice(0, 50);
         var menuBtn = d.querySelector('[data-testid="model-select-button"]');
-        console.log('[continue-focus] set-model:close-dropdown-no-match');
         if (menuBtn) menuBtn.click(); // close dropdown
         return JSON.stringify({ error: 'option_not_found', available: available });
       }
-      console.log('[continue-focus] set-model:select-option');
       match.click();
       return JSON.stringify({ ok: true, selected: match.textContent.trim() });
     `);
@@ -4677,7 +4668,6 @@ async function respondToPermissionDialog(Runtime, agentType, choiceId, sessionId
         }
         if (!btn) return 'no-btn';
         if (btn.disabled) return 'disabled';
-        console.log('[continue-focus] permission:dispatch-pointer-sequence');
         var rect = btn.getBoundingClientRect();
         var cx = rect.x + rect.width / 2;
         var cy = rect.y + rect.height / 2;
@@ -4691,7 +4681,6 @@ async function respondToPermissionDialog(Runtime, agentType, choiceId, sessionId
         // Fallback: also try the keyboard shortcut (Ctrl+Enter = Accept)
         var isAccept = '${choiceId}'.indexOf('accept') !== -1;
         if (isAccept) {
-          console.log('[continue-focus] permission:dispatch-ctrl-enter');
           var kbOpts = { key: 'Enter', code: 'Enter', keyCode: 13, ctrlKey: true, bubbles: true, cancelable: true };
           d.body.dispatchEvent(new w.KeyboardEvent('keydown', kbOpts));
           d.body.dispatchEvent(new w.KeyboardEvent('keyup', kbOpts));
