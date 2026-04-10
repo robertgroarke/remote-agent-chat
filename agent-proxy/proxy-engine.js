@@ -2146,6 +2146,44 @@ class ProxyEngine extends EventEmitter {
     return ['claude', 'codex', 'gemini', 'continue'].includes(session.agentType);
   }
 
+  /**
+   * Start a temporary polling burst for a Continue session after a message
+   * is sent.  Polls every 2s until the agent returns to idle, then stops.
+   * This avoids permanent background polling (which steals focus) while
+   * still picking up responses after user-initiated sends.
+   */
+  _startContinueResponsePoll(sessionId) {
+    const session = this.sessions.get(sessionId);
+    if (!session) return;
+    // Clear any existing burst timer
+    if (session._continueResponseTimer) {
+      clearInterval(session._continueResponseTimer);
+    }
+    let burstTicks = 0;
+    const MAX_BURST_TICKS = 300; // 2s × 300 = 10 min max
+    session._continueResponseTimer = setInterval(async () => {
+      burstTicks++;
+      const s = this.sessions.get(sessionId);
+      if (!s || burstTicks > MAX_BURST_TICKS) {
+        clearInterval(session._continueResponseTimer);
+        session._continueResponseTimer = null;
+        return;
+      }
+      try {
+        await this._pollSessionEphemeral(sessionId, s);
+        // Stop polling once agent goes idle (response complete)
+        if (s.activity?.kind === 'idle' && !s.waitingForAssistant && burstTicks > 5) {
+          this._log('info', `[${sessionId}] Continue response poll complete — agent idle after ${burstTicks * 2}s`);
+          clearInterval(session._continueResponseTimer);
+          session._continueResponseTimer = null;
+        }
+      } catch (e) {
+        this._log('warn', `[${sessionId}] Continue response poll error: ${e.message}`);
+      }
+    }, 2000);
+    this._log('info', `[${sessionId}] Started Continue response poll burst`);
+  }
+
   async _ephemeralCdpPoll(session, sessionId) {
     let client;
     try {
@@ -3245,6 +3283,13 @@ class ProxyEngine extends EventEmitter {
       sessionData.activity = genActivity;
       sessionStore.updateSession(sessionId, { activity: genActivity });
       this._sendToRelay(proto.proxyStatus(sessionId, sessionData.status || 'healthy', genActivity));
+
+      // Continue sessions aren't polled in the main loop (CDP steals focus).
+      // After a successful send, start a temporary polling burst to pick up
+      // the response, then stop once the agent goes idle.
+      if (sessionData.agentType === 'continue') {
+        this._startContinueResponsePoll(sessionId);
+      }
     }
 
     if (client_message_id) {
@@ -4075,13 +4120,12 @@ class ProxyEngine extends EventEmitter {
         // Poll all sessions in the selected window
         for (const sessionId of windowGroups.get(activeKey)) {
           const session = this.sessions.get(sessionId);
-          // Throttle Continue sessions — CDP eval on their iframe steals
-          // VS Code panel focus.  Poll every 5s instead of every tick.
-          if (session?.agentType === 'continue') {
-            session._continuePollCount = (session._continuePollCount || 0) + 1;
-            if (session._continuePollCount < 5) continue;
-            session._continuePollCount = 0;
-          }
+          // Skip Continue sessions entirely — ANY CDP interaction with their
+          // iframe target (even just opening the WebSocket) causes Electron
+          // to activate/focus the Continue side panel.  Continue sessions are
+          // still discovered and shown in the UI; send/receive works on-demand
+          // via ephemeral connections triggered by user actions.
+          if (session?.agentType === 'continue') continue;
           await this._pollSession(sessionId);
           await this._pollPermissions(sessionId);
         }
@@ -4100,8 +4144,11 @@ class ProxyEngine extends EventEmitter {
     if (this._snapshotTimer) { clearTimeout(this._snapshotTimer); this._snapshotTimer = null; }
     this._stopHeartbeat();
 
-    // Close all CDP clients
+    // Close all CDP clients and response poll timers
     for (const [sid, session] of this.sessions.entries()) {
+      if (session._continueResponseTimer) {
+        clearInterval(session._continueResponseTimer);
+      }
       if (session.client) {
         try { session.client.close(); } catch {}
       }
