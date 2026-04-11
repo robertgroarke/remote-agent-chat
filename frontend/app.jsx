@@ -1242,6 +1242,14 @@ function TerminalViewer({ entries, onClose, onRefresh }) {
 }
 
 function DiffViewer({ entries, onClose, onRefresh }) {
+  const summaryChips = (summary) => {
+    const text = String(summary || '').trim();
+    if (!text) return [];
+    return text.split(/\s+/).filter(Boolean).map(token => ({
+      text: token,
+      cls: token.startsWith('+') ? 'add' : token.startsWith('-') ? 'del' : 'neutral',
+    }));
+  };
   return (
     <div className="diff-viewer">
       <div className="diff-viewer-header">
@@ -1259,7 +1267,11 @@ function DiffViewer({ entries, onClose, onRefresh }) {
                 <div className="diff-file-header">{entry.file}</div>
               )}
               {entry.summary && (
-                <div className="diff-file-summary">{entry.summary}</div>
+                <div className="diff-file-summary">
+                  {summaryChips(entry.summary).map((chip, ci) => (
+                    <span key={ci} className={`diff-file-summary-chip diff-file-summary-chip-${chip.cls}`}>{chip.text}</span>
+                  ))}
+                </div>
               )}
               {entry.content ? (
                 <pre className="diff-content">{entry.content.split('\n').map((line, li) => {

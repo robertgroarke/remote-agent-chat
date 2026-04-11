@@ -3594,6 +3594,38 @@ select.new-session-workspace option { background: var(--bg2); color: var(--text)
   padding: 4px 0 2px;
   font-weight: 600;
 }
+.diff-file-summary {
+  display: flex;
+  gap: 6px;
+  flex-wrap: wrap;
+  padding: 2px 0 6px;
+}
+.diff-file-summary-chip {
+  display: inline-flex;
+  align-items: center;
+  border-radius: 999px;
+  padding: 2px 8px;
+  font-size: 11px;
+  font-weight: 700;
+  line-height: 1.4;
+  border: 1px solid transparent;
+  font-family: 'SF Mono', 'Consolas', 'Monaco', monospace;
+}
+.diff-file-summary-chip-add {
+  color: #3fb950;
+  background: rgba(35, 134, 54, 0.14);
+  border-color: rgba(63, 185, 80, 0.22);
+}
+.diff-file-summary-chip-del {
+  color: #f85149;
+  background: rgba(218, 54, 51, 0.14);
+  border-color: rgba(248, 81, 73, 0.22);
+}
+.diff-file-summary-chip-neutral {
+  color: #8b949e;
+  background: rgba(110, 118, 129, 0.12);
+  border-color: rgba(110, 118, 129, 0.18);
+}
 .diff-content {
   font-family: 'SF Mono', 'Consolas', 'Monaco', monospace;
   font-size: 12px;
