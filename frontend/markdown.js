@@ -691,7 +691,11 @@ function renderToolSection(name, text, index) {
   // with verbose output that push narrative text off screen. Keep them collapsed
   // like the IDE side pane does. Edit/diff blocks stay expanded if short.
   const isBashBlock = /^Bash\b/i.test(name.trim());
-  const collapsed = lineCount > 50 || isOutputBlock || !hasContent || (isBashBlock && lineCount > 4);
+  const isCommandOnlyBash = isBashBlock && lines.every(line => {
+    const t = line.trim();
+    return !t || /^\$\s+/.test(t);
+  });
+  const collapsed = lineCount > 50 || isOutputBlock || !hasContent || (isBashBlock && !isCommandOnlyBash && lineCount > 4) || (isCommandOnlyBash && lineCount > 12);
   // Output blocks show everything when expanded; other long sections still get the
   // "Show all N lines" affordance so they don't blow out the viewport.
   const showAll = !isOutputBlock && lineCount > 60;

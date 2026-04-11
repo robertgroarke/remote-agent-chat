@@ -1586,19 +1586,36 @@ const CODEX_DESKTOP_READ_EXPR = `
     if (!text) return [];
     var lines = text.split('\\n').map(function(line) { return String(line || '').trim(); }).filter(Boolean);
     if (lines.length === 0) return [];
+    function bodyLinesFrom(startIndex) {
+      var seen = Object.create(null);
+      var out = [];
+      for (var bi = startIndex; bi < lines.length; bi++) {
+        var line = String(lines[bi] || '').trim();
+        if (!line) continue;
+        if (/^Ran\\s+(.+)$/i.test(line)) line = '$ ' + line.replace(/^Ran\\s+/i, '').trim();
+        if (seen[line]) continue;
+        seen[line] = true;
+        out.push(line);
+      }
+      return out;
+    }
+    function toolBlock(name, bodyLines) {
+      var body = Array.isArray(bodyLines) ? bodyLines.filter(Boolean).join('\\n') : '';
+      return '[' + name + ']\\n' + (body ? body + '\\n' : '') + '[end]';
+    }
     var summary = lines[0];
     if (/^Ran(?:\\s+\\d+\\s+commands?)?$/i.test(summary)) {
-      return ['[Bash ' + summary.replace(/^Ran\\s*/i, '').trim() + ']\\n[end]'];
+      return [toolBlock('Bash ' + summary.replace(/^Ran\\s*/i, '').trim(), bodyLinesFrom(1))];
     }
     if (/^Edited(?:\\s+\\d+\\s+files?)?(?:,\\s*ran\\s+\\d+\\s+commands?)?$/i.test(summary)) {
-      return ['[Edit ' + summary.replace(/^Edited\\s*/i, '').trim() + ']\\n[end]'];
+      return [toolBlock('Edit ' + summary.replace(/^Edited\\s*/i, '').trim(), bodyLinesFrom(1))];
     }
     for (var i = 0; i < lines.length; i++) {
       var ranMatch = lines[i].match(/^Ran\\s+(.+)$/i);
-      if (ranMatch) return ['[Bash ' + ranMatch[1].trim() + ']\\n[end]'];
+      if (ranMatch) return [toolBlock('Bash ' + ranMatch[1].trim(), bodyLinesFrom(i + 1))];
       if (/^Edited$/i.test(lines[i])) {
         var file = lines[i + 1] || 'file';
-        return ['[Edit ' + file + ']\\n[end]'];
+        return [toolBlock('Edit ' + file, bodyLinesFrom(i + 2))];
       }
     }
     return [];
