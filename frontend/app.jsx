@@ -1258,12 +1258,19 @@ function DiffViewer({ entries, onClose, onRefresh }) {
               {entry.file && (
                 <div className="diff-file-header">{entry.file}</div>
               )}
-              <pre className="diff-content">{entry.content ? entry.content.split('\n').map((line, li) => {
-                const cls = line.startsWith('+') ? 'diff-add' :
-                            line.startsWith('-') ? 'diff-del' :
-                            line.startsWith('@@') ? 'diff-hunk' : '';
-                return <span key={li} className={cls}>{line}{'\n'}</span>;
-              }) : 'No content'}</pre>
+              {entry.summary && (
+                <div className="diff-file-summary">{entry.summary}</div>
+              )}
+              {entry.content ? (
+                <pre className="diff-content">{entry.content.split('\n').map((line, li) => {
+                  const cls = line.startsWith('+') ? 'diff-add' :
+                              line.startsWith('-') ? 'diff-del' :
+                              line.startsWith('@@') ? 'diff-hunk' : '';
+                  return <span key={li} className={cls}>{line}{'\n'}</span>;
+                })}</pre>
+              ) : (
+                !entry.summary && <pre className="diff-content">No content</pre>
+              )}
             </div>
           ))
         )}

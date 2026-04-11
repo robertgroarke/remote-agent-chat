@@ -1202,7 +1202,12 @@ const CODEX_READ_EXPR = `
       // The group/command element only contains the command header (e.g. "$ command").
       // The actual command output lives in .overflow-hidden descendant of the item,
       // or in a group/output sibling of the command element.
-      var cmdEls = el.querySelectorAll('[class*="group/command"]');
+      var cmdEls = [];
+      if (el.matches && el.matches('[class*="group/command"]')) {
+        cmdEls = [el];
+      } else {
+        cmdEls = Array.from(el.querySelectorAll('[class*="group/command"]'));
+      }
       if (cmdEls.length > 0) {
         for (var ci = 0; ci < cmdEls.length; ci++) {
           var cmdText = (cmdEls[ci].innerText || '').trim();
@@ -1234,27 +1239,42 @@ const CODEX_READ_EXPR = `
       }
 
       // File change cards
-      var fileDiff = el.querySelector('[class*="group/file-diff"], [class*="thread-diff"]');
-      if (fileDiff) {
-        var fnameBtns = fileDiff.querySelectorAll('button[data-state]');
+      var fileDiffEls = [];
+      if (el.matches && el.matches('[class*="group/file-diff"]')) {
+        fileDiffEls = [el];
+      } else {
+        fileDiffEls = Array.from(el.querySelectorAll('[class*="group/file-diff"]'));
+      }
+      if (fileDiffEls.length === 0 && el.matches && el.matches('[class*="thread-diff"]')) {
+        fileDiffEls = [el];
+      }
+      if (fileDiffEls.length > 0) {
         var seenFiles = {};
-        fnameBtns.forEach(function(fb) {
-          var visSpan = fb.querySelector('span:not(.hidden):not([class*="hidden"])');
-          var fname = visSpan ? visSpan.textContent.trim() : (fb.textContent || '').trim();
-          // De-duplicate filename (responsive span renders name twice)
-          if (fname && fname.length > 4) {
-            var fhalf = Math.floor(fname.length / 2);
-            if (fname.substring(0, fhalf) === fname.substring(fhalf)) fname = fname.substring(0, fhalf);
-          }
-          if (fname && fname.length < 200 && !seenFiles[fname]) {
-            seenFiles[fname] = true;
-            var diffContent = _extractDiffFromShadow(el);
-            var block = '[Edit ' + fname + ']\\n';
-            if (diffContent) block += diffContent + '\\n';
-            block += '[end]';
-            pendingAssistant.push(block);
-          }
-        });
+        for (var fdi = 0; fdi < fileDiffEls.length; fdi++) {
+          var fileDiff = fileDiffEls[fdi];
+          var fnameBtns = fileDiff.querySelectorAll('button[data-state]');
+          fnameBtns.forEach(function(fb) {
+            var spanTexts = Array.from(fb.querySelectorAll('span'))
+              .map(function(sp) { return (sp.textContent || '').trim(); })
+              .filter(Boolean);
+            var fname = spanTexts.find(function(t) { return /[\\\\/]/.test(t); })
+              || spanTexts.sort(function(a, b) { return b.length - a.length; })[0]
+              || (fb.textContent || '').trim();
+            // De-duplicate filename (responsive span renders name twice)
+            if (fname && fname.length > 4) {
+              var fhalf = Math.floor(fname.length / 2);
+              if (fname.substring(0, fhalf) === fname.substring(fhalf)) fname = fname.substring(0, fhalf);
+            }
+            if (fname && fname.length < 200 && !seenFiles[fname]) {
+              seenFiles[fname] = true;
+              var diffContent = _extractDiffFromShadow(fileDiff);
+              var block = '[Edit ' + fname + ']\\n';
+              if (diffContent) block += diffContent + '\\n';
+              block += '[end]';
+              pendingAssistant.push(block);
+            }
+          });
+        }
         continue;
       }
       // "N file(s) changed" summary
@@ -1407,6 +1427,12 @@ const CODEX_DESKTOP_READ_EXPR = `
     parts.push(value);
   }
 
+  function uniquePushAny(parts, value) {
+    if (!value) return;
+    if (parts.indexOf(value) !== -1) return;
+    parts.push(value);
+  }
+
   function roleFromUnit(unit) {
     var key = unit.getAttribute('data-content-search-unit-key') || '';
     var parts = key.split(':');
@@ -1554,6 +1580,48 @@ const CODEX_DESKTOP_READ_EXPR = `
     return cleanText(text, role === 'tool' ? 'assistant' : role);
   }
 
+  function parseCollapsedToolActivity(block) {
+    if (!block) return [];
+    var text = cleanText(block.innerText || block.textContent || '', 'assistant');
+    if (!text) return [];
+    var lines = text.split('\\n').map(function(line) { return String(line || '').trim(); }).filter(Boolean);
+    if (lines.length === 0) return [];
+    var summary = lines[0];
+    if (/^Ran(?:\\s+\\d+\\s+commands?)?$/i.test(summary)) {
+      return ['[Bash ' + summary.replace(/^Ran\\s*/i, '').trim() + ']\\n[end]'];
+    }
+    if (/^Edited(?:\\s+\\d+\\s+files?)?(?:,\\s*ran\\s+\\d+\\s+commands?)?$/i.test(summary)) {
+      return ['[Edit ' + summary.replace(/^Edited\\s*/i, '').trim() + ']\\n[end]'];
+    }
+    for (var i = 0; i < lines.length; i++) {
+      var ranMatch = lines[i].match(/^Ran\\s+(.+)$/i);
+      if (ranMatch) return ['[Bash ' + ranMatch[1].trim() + ']\\n[end]'];
+      if (/^Edited$/i.test(lines[i])) {
+        var file = lines[i + 1] || 'file';
+        return ['[Edit ' + file + ']\\n[end]'];
+      }
+    }
+    return [];
+  }
+
+  function parseVisibleCommandBlock(block) {
+    if (!block) return '';
+    var text = cleanText(block.innerText || block.textContent || '', 'assistant');
+    if (!text) return '';
+    var lines = text.split('\\n').map(function(line) { return String(line || '').trim(); });
+    var commandLine = lines.find(function(line) { return /^\\$\\s+/.test(line); }) || '';
+    var bodyStart = commandLine ? lines.indexOf(commandLine) + 1 : 0;
+    var body = squashNewlines(lines.slice(bodyStart).join('\\n'));
+    if (commandLine) {
+      return '[Bash ' + commandLine.replace(/^\\$\\s+/, '').trim() + ']\\n' + (body ? body + '\\n' : '') + '[end]';
+    }
+    var first = lines.find(function(line) { return !!line; }) || '';
+    if (/^Ran\\s+/i.test(first)) {
+      return '[Bash ' + first.replace(/^Ran\\s+/i, '').trim() + ']\\n[end]';
+    }
+    return '';
+  }
+
   var convo = d.querySelector('[data-thread-find-target="conversation"]');
   if (!convo) return JSON.stringify([]);
 
@@ -1579,6 +1647,20 @@ const CODEX_DESKTOP_READ_EXPR = `
       } else if (role === 'assistant' || role === 'tool') {
         uniquePush(assistantParts, text);
       }
+    }
+
+    var collapsedTools = Array.from(turn.querySelectorAll('[class*="group/collapsed-tool-activity"]'));
+    for (var ci = 0; ci < collapsedTools.length; ci++) {
+      var parsedTools = parseCollapsedToolActivity(collapsedTools[ci]);
+      for (var pi = 0; pi < parsedTools.length; pi++) {
+        uniquePushAny(assistantParts, parsedTools[pi]);
+      }
+    }
+
+    var commandBlocks = Array.from(turn.querySelectorAll('[class*="group/command"]'));
+    for (var cbi = 0; cbi < commandBlocks.length; cbi++) {
+      var parsedCommand = parseVisibleCommandBlock(commandBlocks[cbi]);
+      if (parsedCommand) uniquePushAny(assistantParts, parsedCommand);
     }
 
     if (userParts.length > 0) {
@@ -3455,6 +3537,40 @@ async function writeCodexTerminalInput(Runtime, usePageEval, text) {
 
 const READ_CODEX_FILE_CHANGES_EXPR = `
   var results = [];
+  var seen = {};
+
+  function pushResult(entry) {
+    if (!entry) return;
+    var key = (entry.file || '') + '::' + (entry.summary || '') + '::' + (entry.content || '');
+    if (seen[key]) return;
+    seen[key] = true;
+    results.push(entry);
+  }
+
+  // Strategy 0: Read compact inline diff cards, which match the visible
+  // Codex Desktop "Review changes" summaries even when no full diff is expanded.
+  var diffCards = Array.from(d.querySelectorAll('[class*="group/file-diff"]'));
+  for (var di = 0; di < diffCards.length; di++) {
+    var card = diffCards[di];
+    var btn = card.querySelector('button[data-state]');
+    var spans = btn ? Array.from(btn.querySelectorAll('span')).map(function(s) {
+      return (s.innerText || s.textContent || '').trim();
+    }).filter(Boolean) : [];
+    var file = spans.find(function(t) { return /[\\\\/]/.test(t); })
+      || spans.sort(function(a, b) { return b.length - a.length; })[0]
+      || null;
+    var statWrap = card.querySelector('[data-thread-find-skip="true"]');
+    var statSpans = statWrap ? Array.from(statWrap.querySelectorAll('span')).map(function(s) {
+      return (s.innerText || s.textContent || '').trim();
+    }).filter(Boolean) : [];
+    var expanded = card.querySelector('pre, code');
+    pushResult({
+      file: file,
+      content: expanded ? expanded.textContent.trim().substring(0, 8000) : '',
+      summary: statSpans.join(' ') || null,
+      type: 'diff'
+    });
+  }
 
   // Strategy 1: Read from the Codex Desktop diff panel (main-surface z-30)
   var diffPanel = null;
@@ -3475,9 +3591,10 @@ const READ_CODEX_FILE_CHANGES_EXPR = `
         // Look for associated diff content
         var parent = fileHeaders[fi].closest('[class*="overflow-hidden"]') || fileHeaders[fi].parentElement;
         var codeContent = parent ? parent.querySelector('pre, code, [class*="diff"]') : null;
-        results.push({
+        pushResult({
           file: headerText,
           content: codeContent ? codeContent.textContent.trim().substring(0, 8000) : '',
+          summary: null,
           type: 'diff',
           panelVisible: isVisible
         });
@@ -3488,9 +3605,10 @@ const READ_CODEX_FILE_CHANGES_EXPR = `
     if (results.length === 0 && isVisible) {
       var panelText = diffPanel.textContent.trim();
       if (panelText && !panelText.includes('No unstaged changes')) {
-        results.push({
+        pushResult({
           file: null,
           content: panelText.substring(0, 8000),
+          summary: null,
           type: 'diff',
           panelVisible: true
         });
@@ -3514,9 +3632,10 @@ const READ_CODEX_FILE_CHANGES_EXPR = `
       // Check if this looks like a file change (has +/- diff markers or file path header)
       if (/^(---|\\+\\+\\+|@@|diff )/.test(text) || /^[+-]\\s/.test(text.split('\\n')[1] || '')) {
         var fileMatch = text.match(/^(?:---|\\+\\+\\+)\\s+(?:a\\/|b\\/)?(.+)/m);
-        results.push({
+        pushResult({
           file: fileMatch ? fileMatch[1] : null,
           content: text.substring(0, 8000),
+          summary: null,
           type: 'inline'
         });
       }
