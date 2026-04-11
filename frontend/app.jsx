@@ -69,6 +69,15 @@ function hasVisibleMessageContent(content) {
   return normalizeMessageContent(content).trim().length > 0;
 }
 
+function hasSubstantiveLiveText(content) {
+  const text = normalizeMessageContent(content).trim();
+  if (!text) return false;
+  if (text.length < 4) return false;
+  if (/^[\s*._|`~•·▌]+$/.test(text)) return false;
+  if (!/[A-Za-z0-9]/.test(text)) return false;
+  return true;
+}
+
 function isUuidLike(value) {
   return typeof value === 'string'
     && /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(value);
@@ -99,7 +108,10 @@ function sessionSubLabel(sessionOrId, fallbackId, agentConfig) {
     const scopeBasename = agentConfig?.file_access_scope
       ? agentConfig.file_access_scope.replace(/\\/g, '/').split('/').filter(Boolean).pop()
       : null;
-    const workspacePart = sessionOrId.workspace_name || scopeBasename || sessionOrId.window_title || sessionOrId.workspace_path || fallbackId || 'Session';
+    const panelSuffix = sessionOrId.agent_type === 'antigravity_panel' && sessionOrId.panel_title
+      ? ` / ${sessionOrId.panel_title}`
+      : '';
+    const workspacePart = (sessionOrId.workspace_name || scopeBasename || sessionOrId.window_title || sessionOrId.workspace_path || fallbackId || 'Session') + panelSuffix;
     // Append chat_title (first user message preview) when available and workspace name isn't already a full conversation title
     if (sessionOrId.chat_title && !workspacePart.includes('/')) {
       return `${workspacePart} / ${sessionOrId.chat_title}`;
@@ -111,6 +123,65 @@ function sessionSubLabel(sessionOrId, fallbackId, agentConfig) {
   if (isUuidLike(id)) return 'Connected session';
   const parts = id.split('-');
   return parts.slice(1).join('-') || id;
+}
+
+function workspaceKeyOf(sessionOrId) {
+  if (!sessionOrId || typeof sessionOrId !== 'object') return null;
+  if (sessionOrId.workspace_path) return safeString(sessionOrId.workspace_path).toLowerCase();
+  const raw = safeString(sessionOrId.workspace_name || sessionOrId.window_title || '');
+  if (!raw) return null;
+  return raw.split(' / ')[0].trim().toLowerCase() || null;
+}
+
+function findVisiblePaneSession(sessionList, targetSession) {
+  const targetId = sessionIdOf(targetSession);
+  const targetKey = workspaceKeyOf(targetSession);
+  if (!targetKey) return null;
+  return (sessionList || []).find(session =>
+    session
+    && typeof session === 'object'
+    && session.agent_type === 'antigravity_panel'
+    && sessionIdOf(session) !== targetId
+    && workspaceKeyOf(session) === targetKey
+  ) || null;
+}
+
+function formatPaneSummary(session) {
+  if (!session || typeof session !== 'object') return '';
+  return [
+    session.panel_title || null,
+    session.panel_model || null,
+    session.panel_mode || null,
+  ].filter(Boolean).join(' · ');
+}
+
+function sortSessionsForDisplay(sessionList) {
+  return [...(sessionList || [])].sort((left, right) => {
+    const a = typeof left === 'object' ? left : { session_id: left };
+    const b = typeof right === 'object' ? right : { session_id: right };
+    const aPanel = a.agent_type === 'antigravity_panel' ? 1 : 0;
+    const bPanel = b.agent_type === 'antigravity_panel' ? 1 : 0;
+    if (aPanel !== bPanel) return bPanel - aPanel;
+    const aSeen = safeString(a.last_seen_at || '');
+    const bSeen = safeString(b.last_seen_at || '');
+    return bSeen.localeCompare(aSeen);
+  });
+}
+
+function formatVisiblePaneSummary(session) {
+  if (!session || typeof session !== 'object') return '';
+  if (session.visible_pane_visible) {
+    return [
+      session.visible_pane_title || null,
+      session.visible_pane_location === 'right' ? 'Right Pane' : null,
+    ].filter(Boolean).join(' · ');
+  }
+  return formatPaneSummary(session);
+}
+
+function agentTypeLabel(agentType) {
+  if (!agentType) return '';
+  return AGENT_CONFIG[agentType]?.name || agentType;
 }
 
 const HEALTH_COLOR = {
@@ -311,32 +382,39 @@ function ActivityRow({ activity, thinkingText, isClaude, pinned = false }) {
   const label = activity?.label || kind.replaceAll('_', ' ');
   const isThinkingKind = kind === 'thinking' || kind === 'generating';
   const showBlob = isClaude && isThinkingKind;
-  const [expanded, setExpanded] = React.useState(false);
+  const visibleThinkingText = (thinkingText || '').trim()
+    || (
+      showBlob
+      && label
+      && !/^(Thinking|Generating)$/i.test(label)
+        ? label
+        : ''
+    );
 
   return (
     <div className={`activity-row ${meta.tone}${isActive ? ' active' : ''}${showBlob ? ' claude-thinking' : ''}${pinned ? ' pinned' : ''}`}>
-      <div className="activity-icon">
-        {showBlob
-          ? <ClaudeSpinner />
-          : isActive
+      {!showBlob && (
+        <div className="activity-icon">
+          {isActive
             ? <div className="activity-spinner" />
             : meta.icon}
-      </div>
+        </div>
+      )}
       <div className="activity-copy">
-        <div className="activity-label">{label}</div>
-        {showBlob && thinkingText && (
-          <div
-            className={`thinking-content${expanded ? ' expanded' : ''}`}
-            onClick={() => setExpanded(prev => !prev)}
-            title={expanded ? 'Click to collapse' : 'Click to expand thinking text'}
-          >
-            <div className="thinking-content-text">{thinkingText}</div>
-          </div>
-        )}
-        {!showBlob && isActive && thinkingText && (
-          <div className="activity-command">
-            <code>{thinkingText}</code>
-          </div>
+        <div className={`activity-label${showBlob ? ' inline-blob' : ''}`}>
+          {showBlob && <ClaudeSpinner />}
+          <span>{label}</span>
+        </div>
+        {isActive && visibleThinkingText && (
+          showBlob ? (
+            <div className="thinking-inline-text">
+              {visibleThinkingText}
+            </div>
+          ) : (
+            <div className="activity-command">
+              <code>{visibleThinkingText}</code>
+            </div>
+          )
         )}
       </div>
     </div>
@@ -1001,12 +1079,12 @@ function ChatListPanel({ chats, sessionId, onSwitch, onNew, onClose }) {
 // ─── Thread history panel (Epic 2) ────────────────────────────────────────────
 // Collapsible panel showing Codex Desktop threads with switch/new actions.
 // Reuses the same visual style as ChatListPanel.
-function ThreadHistoryPanel({ threads, sessionId, onSwitch, onNew, onClose }) {
+function ThreadHistoryPanel({ threads, sessionId, onSwitch, onNew, onClose, newLabel = 'New thread' }) {
   return (
     <div className="chat-list-panel">
       <div className="chat-list-header">
         <span className="chat-list-title">Threads</span>
-        <button className="chat-list-new-btn" onClick={onNew} title="New thread">+</button>
+        <button className="chat-list-new-btn" onClick={onNew} title={newLabel}>+</button>
         <button className="chat-list-close-btn" onClick={onClose} title="Close">✕</button>
       </div>
       <div className="chat-list-body">
@@ -1026,6 +1104,39 @@ function ThreadHistoryPanel({ threads, sessionId, onSwitch, onNew, onClose }) {
             </button>
           ))
         )}
+      </div>
+    </div>
+  );
+}
+
+function ThreadTabsBar({ threads, activeThreadId, onSwitch, onNew, onOpenHistory, showDraftTab = false, newLabel = 'New chat' }) {
+  return (
+    <div className="thread-tabs-bar">
+      <div className="thread-tabs-scroll">
+        {showDraftTab && (
+          <button className="thread-tab active draft" type="button" title={newLabel}>
+            <span className="thread-tab-title">{newLabel}</span>
+          </button>
+        )}
+        {(threads || []).map((thread, i) => {
+          const isActive = activeThreadId ? thread.id === activeThreadId : !!thread.active;
+          return (
+            <button
+              key={thread.id || i}
+              className={`thread-tab${isActive ? ' active' : ''}`}
+              type="button"
+              title={thread.title || 'Untitled'}
+              onClick={() => onSwitch(thread.id)}
+            >
+              <span className="thread-tab-title">{thread.title || 'Untitled'}</span>
+              {thread.age && <span className="thread-tab-age">{thread.age}</span>}
+            </button>
+          );
+        })}
+      </div>
+      <div className="thread-tabs-actions">
+        <button className="thread-tabs-btn" type="button" onClick={onOpenHistory} title="Show all threads">All</button>
+        <button className="thread-tabs-btn accent" type="button" onClick={onNew} title={newLabel}>+</button>
       </div>
     </div>
   );
@@ -1801,7 +1912,7 @@ class AppErrorBoundary extends React.Component {
 }
 
 function App() {
-  const { sessions, messages, connected, unread, setUnread, thinking, thinkingContent, activities, health, deliveryStates, launchStates, justLaunched, setJustLaunched, permissionPrompts, respondToPrompt, interruptSession, agentConfigs, requestAgentConfig, setAgentModel, setAgentPermissionMode, setAntigravityMode, setCodexConfig, newThread, openPanel, requestChatList, switchChat, newChat, chatLists, requestThreadList, switchThread, threadLists, switchWorkspace, requestTerminalOutput, terminalOutputs, requestFileChanges, fileChanges, sendAttachment, send, sendToSession, steerMessage, discardQueuedMessage, editQueuedMessage, queuedMessages, launchSession, resumeSession, closeSession, activeSessionRef, workspaces, branchLists, requestBranchList, switchBranch, createBranch, skillLists, requestSkillList, controlResults, directoryListings, requestDirectoryListing, fileContents, requestFileContent } = useRelay();
+  const { sessions, messages, connected, unread, setUnread, thinking, thinkingContent, activities, health, deliveryStates, launchStates, justLaunched, setJustLaunched, permissionPrompts, respondToPrompt, interruptSession, agentConfigs, requestAgentConfig, setAgentModel, setAgentPermissionMode, setAntigravityMode, setCodexConfig, newThread, openPanel, requestChatList, switchChat, newChat, chatLists, requestThreadList, switchThread, threadLists, switchWorkspace, requestTerminalOutput, terminalOutputs, requestFileChanges, fileChanges, sendAttachment, send, sendToSession, steerMessage, discardQueuedMessage, editQueuedMessage, queuedMessages, launchSession, resumeSession, closeSession, activeSessionRef, workspaces, branchLists, requestBranchList, switchBranch, createBranch, skillLists, requestSkillList, controlResults, directoryListings, requestDirectoryListing, fileContents, requestFileContent, requestHistory } = useRelay();
   const [activeSession, setActiveSession] = useState(null);
   const [drafts, setDrafts]             = useState({});
   const [draftFiles, setDraftFiles]     = useState({});
@@ -1816,6 +1927,9 @@ function App() {
   const [showJumpButton, setShowJumpButton] = useState(false);
   const [showChatList, setShowChatList]     = useState(false);
   const [showThreadList, setShowThreadList] = useState(false);
+  const [pendingDraftThreads, setPendingDraftThreads] = useState({});
+  const [optimisticThreadFocus, setOptimisticThreadFocus] = useState({});
+  const [draftMessageBaselines, setDraftMessageBaselines] = useState({});
   const [showTerminal, setShowTerminal]   = useState(false);
   const [showDiffViewer, setShowDiffViewer] = useState(false);
   const [showBranchSelector, setShowBranchSelector] = useState(false);
@@ -1827,6 +1941,7 @@ function App() {
   const [theme, setTheme]                           = useState(() => {
     try { return localStorage.getItem('remote-agent-chat-theme') || 'dark'; } catch { return 'dark'; }
   });
+  const orderedSessions = sortSessionsForDisplay(sessions);
   const messagesEndRef  = useRef(null);
   const messagesListRef = useRef(null);
   const isAtBottom      = useRef(true);   // updated by scroll listener before DOM changes
@@ -1892,22 +2007,22 @@ function App() {
 
   // Auto-select first session when list arrives
   useEffect(() => {
-    if (!activeSession && sessions.length > 0) {
-      const first = sessions[0];
+    if (!activeSession && orderedSessions.length > 0) {
+      const first = orderedSessions[0];
       const id    = typeof first === 'string' ? first : first?.session_id;
       if (id) selectSession(id, first);
     }
-  }, [sessions]);
+  }, [orderedSessions, activeSession]);
 
   // Auto-select a just-launched session once it appears in the sessions list
   useEffect(() => {
     if (!justLaunched) return;
-    const found = sessions.find(s => (typeof s === 'string' ? s : s?.session_id) === justLaunched);
+    const found = orderedSessions.find(s => (typeof s === 'string' ? s : s?.session_id) === justLaunched);
     if (found) {
       selectSession(justLaunched, found);
       setJustLaunched(null);
     }
-  }, [justLaunched, sessions]);
+  }, [justLaunched, orderedSessions]);
 
   // Track whether the user is near the bottom via a scroll listener.
   // Updates isAtBottom.current and shows/hides the "Jump to Newest" button.
@@ -2177,6 +2292,11 @@ function App() {
     }
 
     sendToSession(activeSession, content);
+    setPendingDraftThreads(prev => ({ ...prev, [activeSession]: false }));
+    setDraftMessageBaselines(prev => ({
+      ...prev,
+      [activeSession]: Math.min(prev[activeSession] || 0, (messages[activeSession] || []).length),
+    }));
     setDraftForSession(activeSession, '');
     setDraftFileForSession(activeSession, null);
     setShowSlashMenu(false);
@@ -2207,7 +2327,9 @@ function App() {
   const isStopPending    = activeSession ? !!stopPending[activeSession] : false;
   const currentInput    = activeSession ? (drafts[activeSession] || '') : '';
   const attachedFiles   = activeSession ? (draftFiles[activeSession] || []) : [];
-  const currentMessages = messages[activeSession] || [];
+  const rawCurrentMessages = messages[activeSession] || [];
+  const draftBaseline = activeSession ? (draftMessageBaselines[activeSession] || 0) : 0;
+  const currentMessages = rawCurrentMessages.slice(Math.min(draftBaseline, rawCurrentMessages.length));
   const activePrompt    = activeSession ? permissionPrompts[activeSession] || null : null;
   const canSend         = !!(currentInput.trim() || attachedFiles.length > 0) && !!activeSession && connected && !uploading && !activePrompt;
   const unreadTotal     = Object.values(unread).reduce((a, b) => a + b, 0);
@@ -2218,8 +2340,62 @@ function App() {
 
   // Resolve display label for the active session
   const activeConfig = activeSession ? (agentConfigs[activeSession] || null) : null;
-  const activeSessionMeta = sessions.find(s =>
+  const activeSessionMeta = orderedSessions.find(s =>
     sessionIdOf(s) === activeSession
+  );
+  const visiblePaneSession = activeSessionMeta ? findVisiblePaneSession(orderedSessions, activeSessionMeta) : null;
+  const codexWorkbenchPaneSummary = activeSessionMeta?.agent_type === 'codex' && activeSessionMeta?.visible_pane_visible
+    ? {
+        pane_agent: activeSessionMeta.visible_pane_agent || null,
+        summary: formatVisiblePaneSummary(activeSessionMeta),
+        sourceSession: activeSessionMeta,
+      }
+    : null;
+  const fallbackPaneSummary = visiblePaneSession
+    ? {
+        pane_agent: visiblePaneSession.panel_agent || null,
+        summary: formatVisiblePaneSummary(visiblePaneSession),
+        sourceSession: visiblePaneSession,
+      }
+    : null;
+  const effectiveVisiblePane = codexWorkbenchPaneSummary || fallbackPaneSummary;
+  const rawVisiblePaneSummary = effectiveVisiblePane?.summary || '';
+  const visiblePaneAgent = effectiveVisiblePane?.pane_agent || null;
+  const visiblePaneLabel = rawVisiblePaneSummary
+    || agentTypeLabel(visiblePaneAgent)
+    || sessionSubLabel(effectiveVisiblePane?.sourceSession, sessionIdOf(effectiveVisiblePane?.sourceSession));
+  const visiblePaneSummary = visiblePaneLabel;
+  const activeCodexPaneLive = !!(
+    activeSessionMeta
+    && activeSessionMeta.agent_type === 'codex'
+    && activeSessionMeta.visible_pane_visible
+    && activeSessionMeta.visible_pane_agent === 'codex'
+  );
+  const activeCodexPaneMismatch = !!(
+    activeSessionMeta
+    && activeSessionMeta.agent_type === 'codex'
+    && activeSessionMeta.visible_pane_visible
+    && activeSessionMeta.visible_pane_agent
+    && activeSessionMeta.visible_pane_agent !== 'codex'
+  );
+  const paneAwareSession = !!(
+    activeSessionMeta
+    && (
+      activeSessionMeta.agent_type === 'codex'
+      || activeSessionMeta.agent_type === 'antigravity_panel'
+    )
+  );
+  const showVisiblePaneBanner = !!(
+    paneAwareSession
+    && (
+      (activeCodexPaneMismatch && visiblePaneSession)
+      || (
+        activeSessionMeta.agent_type === 'codex'
+        && !codexWorkbenchPaneSummary
+        && visiblePaneSession
+        && (visiblePaneSession.panel_agent === 'antigravity_panel' || visiblePaneSummary)
+      )
+    )
   );
   const activeLabel = activeSession ? sessionLabel(activeSessionMeta, activeSession) : 'Agent Chat';
   const activeAgent = sessionAgent(activeSessionMeta || activeSession, activeConfig);
@@ -2230,6 +2406,9 @@ function App() {
   const activeWorkspaceBasename = activeWorkspacePath
     ? activeWorkspacePath.split(/[\\/]/).filter(Boolean).pop() || activeWorkspacePath
     : '';
+  const canLaunchNewThread = !!activeConfig?.capabilities?.new_thread;
+  const isCodexDesktop = activeSessionMeta?.agent_type === 'codex-desktop';
+  const newThreadLabel = isCodexDesktop ? 'New chat' : 'New thread';
   const activeMachine = activeSessionMeta && typeof activeSessionMeta === 'object'
     ? activeSessionMeta.machine_label
     : '';
@@ -2250,15 +2429,126 @@ function App() {
         : (activeSessionMeta && typeof activeSessionMeta === 'object' ? activeSessionMeta.activity : null))
     : null;
   const assistantMonospace = activeSessionMeta?.agent_type === 'codex';
+  const lastAssistantMsg = [...currentMessages].reverse().find(m => m.role === 'assistant');
+  const liveThinkingText = activeSession ? (thinkingContent[activeSession] || '').trim() : '';
+  const lastAssistantText = lastAssistantMsg ? normalizeMessageContent(lastAssistantMsg.content).trim() : '';
+  const showLiveAssistantDraft = !!(
+    activeSession
+    && activeActivity
+    && (activeActivity.kind === 'thinking' || activeActivity.kind === 'generating')
+    && hasSubstantiveLiveText(liveThinkingText)
+    && (
+      activeSessionMeta?.agent_type === 'codex'
+      || activeSessionMeta?.agent_type === 'codex-desktop'
+      || activeSessionMeta?.agent_type === 'claude'
+      || activeSessionMeta?.agent_type === 'antigravity_panel'
+    )
+    && liveThinkingText !== lastAssistantText
+    && !lastAssistantText.includes(liveThinkingText)
+  );
 
   // Auto-fetch thread list for desktop sessions with no messages (e.g. Codex Desktop showing chat picker)
   const hasThreadCap = activeConfig?.capabilities?.thread_list;
+  const showDesktopThreadTabs = !!(
+    activeSession
+    && activeSessionMeta?.agent_type === 'codex-desktop'
+    && hasThreadCap
+    && (threadLists[activeSession]?.length > 0 || pendingDraftThreads[activeSession])
+    && !showFileBrowser
+  );
+  const desktopThreadTabs = React.useMemo(() => {
+    const list = [...(threadLists[activeSession] || [])];
+    if (list.length === 0) return list;
+    const focusId = optimisticThreadFocus[activeSession];
+    const focusIndex = focusId ? list.findIndex(thread => thread.id === focusId) : -1;
+    const activeIndex = focusIndex >= 0 ? focusIndex : list.findIndex(thread => thread.active);
+    if (activeIndex > 0) {
+      const [activeThread] = list.splice(activeIndex, 1);
+      list.unshift(activeThread);
+    }
+    return list.slice(0, 8);
+  }, [activeSession, threadLists, optimisticThreadFocus]);
   const noMessages = currentMessages.length === 0;
   React.useEffect(() => {
     if (activeSession && hasThreadCap && noMessages) {
       requestThreadList(activeSession);
     }
   }, [activeSession, hasThreadCap, noMessages]);
+  React.useEffect(() => {
+    if (!(activeSession && activeSessionMeta?.agent_type === 'codex-desktop' && hasThreadCap)) return undefined;
+    requestThreadList(activeSession);
+    const intervalId = setInterval(() => requestThreadList(activeSession), 5000);
+    return () => clearInterval(intervalId);
+  }, [activeSession, activeSessionMeta?.agent_type, hasThreadCap]);
+  React.useEffect(() => {
+    if (!(activeSession && hasThreadCap && showThreadList)) return undefined;
+    requestThreadList(activeSession);
+    const intervalId = setInterval(() => requestThreadList(activeSession), 3000);
+    return () => clearInterval(intervalId);
+  }, [activeSession, hasThreadCap, showThreadList]);
+  React.useEffect(() => {
+    if (!activeSession) return;
+    const baseline = draftMessageBaselines[activeSession] || 0;
+    const rawCount = rawCurrentMessages.length;
+    if (baseline > rawCount) {
+      setDraftMessageBaselines(prev => ({ ...prev, [activeSession]: rawCount }));
+    }
+  }, [activeSession, draftMessageBaselines, rawCurrentMessages.length]);
+  React.useEffect(() => {
+    if (!activeSession || currentMessages.length === 0) return;
+    setPendingDraftThreads(prev => (
+      prev[activeSession]
+        ? { ...prev, [activeSession]: false }
+        : prev
+    ));
+  }, [activeSession, currentMessages.length]);
+  React.useEffect(() => {
+    if (!activeSession) return;
+    const liveThreads = threadLists[activeSession] || [];
+    const focusedThreadId = optimisticThreadFocus[activeSession];
+    if (!focusedThreadId) return;
+    if (liveThreads.some(thread => thread.id === focusedThreadId && thread.active)) {
+      setOptimisticThreadFocus(prev => {
+        const next = { ...prev };
+        delete next[activeSession];
+        return next;
+      });
+    }
+  }, [activeSession, threadLists, optimisticThreadFocus]);
+
+  function handleNewThread(sessionId = activeSession) {
+    if (!sessionId) return;
+    setPendingDraftThreads(prev => ({ ...prev, [sessionId]: true }));
+    setOptimisticThreadFocus(prev => {
+      const next = { ...prev };
+      delete next[sessionId];
+      return next;
+    });
+    setDraftMessageBaselines(prev => ({
+      ...prev,
+      [sessionId]: (messages[sessionId] || []).length,
+    }));
+    setShowThreadList(false);
+    newThread(sessionId);
+    if (agentConfigs[sessionId]?.capabilities?.thread_list) {
+      setTimeout(() => requestHistory(sessionId), 150);
+      setTimeout(() => requestHistory(sessionId), 650);
+      setTimeout(() => requestThreadList(sessionId), 400);
+      setTimeout(() => requestThreadList(sessionId), 1400);
+    }
+  }
+
+  function handleSwitchThread(sessionId, threadId) {
+    if (!(sessionId && threadId)) return;
+    setPendingDraftThreads(prev => ({ ...prev, [sessionId]: false }));
+    setOptimisticThreadFocus(prev => ({ ...prev, [sessionId]: threadId }));
+    setDraftMessageBaselines(prev => ({ ...prev, [sessionId]: 0 }));
+    switchThread(sessionId, threadId);
+    setTimeout(() => requestHistory(sessionId), 120);
+    setTimeout(() => requestHistory(sessionId), 550);
+    setTimeout(() => requestThreadList(sessionId), 300);
+    setTimeout(() => requestThreadList(sessionId), 1200);
+  }
 
   function updateInput(value) {
     if (!activeSession) return;
@@ -2307,10 +2597,10 @@ function App() {
           />
         )}
         <div className="session-list">
-          {sessions.length === 0 && !showNewSession && (
+          {orderedSessions.length === 0 && !showNewSession && (
             <div className="session-empty">No agents connected</div>
           )}
-          {sessions.map(s => {
+          {orderedSessions.map(s => {
             const id = typeof s === 'string' ? s : s?.session_id;
             return (
               <SessionCard
@@ -2431,6 +2721,14 @@ function App() {
                   </span>
                   {activeMachine && (
                     <span className="context-pill" title="Remote machine">{activeMachine}</span>
+                  )}
+                  {activeSessionMeta?.agent_type === 'codex' && activeSessionMeta?.visible_pane_visible && (
+                    <span
+                      className={`context-pill ${activeCodexPaneLive ? 'ok' : 'warn'}`}
+                      title={activeCodexPaneLive ? 'This Codex session is the visible right-hand pane' : `Visible right-hand pane is ${visiblePaneLabel}`}
+                    >
+                      {activeCodexPaneLive ? 'right pane live' : `right pane: ${agentTypeLabel(activeSessionMeta.visible_pane_agent) || 'other'}`}
+                    </span>
                   )}
                   {currentMessages.length > 0 && (
                     <span className="context-pill" title="Messages in this session">
@@ -2578,10 +2876,39 @@ function App() {
           />
         )}
         <div className="messages-wrap" style={showFileBrowser ? { display: 'none' } : undefined}>
+        {showDesktopThreadTabs && (
+          <ThreadTabsBar
+            threads={desktopThreadTabs}
+            activeThreadId={optimisticThreadFocus[activeSession] || null}
+            showDraftTab={!!pendingDraftThreads[activeSession]}
+            newLabel={newThreadLabel}
+            onSwitch={(threadId) => handleSwitchThread(activeSession, threadId)}
+            onNew={() => handleNewThread(activeSession)}
+            onOpenHistory={() => {
+              requestThreadList(activeSession);
+              setShowThreadList(true);
+            }}
+          />
+        )}
         {activeSession && lastUserText && (
           <div className="last-user-banner" title={lastUserText}>
             <span className="last-user-banner-icon">↵</span>
             <span className="last-user-banner-text">{lastUserText}</span>
+          </div>
+        )}
+        {showVisiblePaneBanner && (
+          <div className="rate-limit-overlay warning">
+            <span className="rate-limit-icon">⌘</span>
+            <span className="rate-limit-text">
+              The visible right-hand pane for this workspace is showing <strong>{visiblePaneSummary || sessionSubLabel(visiblePaneSession, sessionIdOf(visiblePaneSession))}</strong>, not this transcript.
+            </span>
+            <button
+              className="context-pill"
+              onClick={() => selectSession(sessionIdOf(visiblePaneSession), visiblePaneSession)}
+              title="Switch to the live right-hand pane session"
+            >
+              View live pane
+            </button>
           </div>
         )}
         {showJumpButton && (
@@ -2613,7 +2940,7 @@ function App() {
           )}
           {!activeSession ? (
             <div className="empty-state"><div className="icon">🤖</div><div>Select an agent session</div></div>
-          ) : currentMessages.length === 0 && hasThreadCap && (threadLists[activeSession]?.length > 0) ? (
+          ) : currentMessages.length === 0 && hasThreadCap && (threadLists[activeSession]?.length > 0) && !pendingDraftThreads[activeSession] ? (
             <div className="thread-picker-empty">
               <div className="thread-picker-header">Select a chat</div>
               <div className="thread-picker-list">
@@ -2621,7 +2948,9 @@ function App() {
                   <button
                     key={thread.id || i}
                     className={`thread-picker-item${thread.active ? ' active' : ''}`}
-                    onClick={() => switchThread(activeSession, thread.id)}
+                    onClick={() => {
+                      handleSwitchThread(activeSession, thread.id);
+                    }}
                     title={thread.title}
                   >
                     <span className="thread-picker-title">{thread.title || 'Untitled'}</span>
@@ -2631,7 +2960,7 @@ function App() {
               </div>
               <button
                 className="thread-picker-new"
-                onClick={() => newThread(activeSession)}
+                onClick={() => handleNewThread(activeSession)}
               >+ New Thread</button>
             </div>
           ) : (activeSessionMeta?.is_list_view && chatLists[activeSession]?.length > 0) ? (
@@ -2689,6 +3018,22 @@ function App() {
               )
             ))
           )}
+          {showLiveAssistantDraft && (
+            <div className={`message assistant live-draft${assistantMonospace ? ' monospace' : ''}`}>
+              <div className="assistant-gutter">
+                <div
+                  className="agent-badge transcript-agent-badge"
+                  style={{ color: activeAgent.color, borderColor: activeAgent.color + '55', background: activeAgent.color + '18' }}
+                >
+                  {activeAgent.abbr}
+                </div>
+              </div>
+              <div className="assistant-content">
+                <div className="message-role"><span>{activeAgent.name}</span></div>
+                <MarkdownContent content={liveThinkingText} monospace={assistantMonospace} />
+              </div>
+            </div>
+          )}
           {activeActivity && !activeActivity?.task_list && <ActivityRow
             activity={activeActivity}
             thinkingText={activeSession ? (thinkingContent[activeSession] || '') : ''}
@@ -2732,12 +3077,13 @@ function App() {
           <ThreadHistoryPanel
             threads={threadLists[activeSession] || []}
             sessionId={activeSession}
+            newLabel={newThreadLabel}
             onSwitch={(threadId) => {
-              switchThread(activeSession, threadId);
+              handleSwitchThread(activeSession, threadId);
               setShowThreadList(false);
             }}
             onNew={() => {
-              newThread(activeSession);
+              handleNewThread(activeSession);
               setShowThreadList(false);
             }}
             onClose={() => setShowThreadList(false)}
@@ -2838,11 +3184,11 @@ function App() {
                     title="Toggle settings"
                   >⚙</button>
                 )}
-                {activeConfig?.capabilities?.new_thread && (
+                {canLaunchNewThread && (
                   <button
                     className="composer-gear-btn mobile-hide"
-                    onClick={() => newThread(activeSession)}
-                    title="New thread"
+                    onClick={() => handleNewThread(activeSession)}
+                    title={newThreadLabel}
                   >✎</button>
                 )}
                 {activeConfig?.capabilities?.chat_list && (
@@ -3022,7 +3368,7 @@ function App() {
                   </span>
                 )}
                 <div className="composer-mobile-actions">
-                  {activeConfig?.capabilities?.new_thread && (
+                  {canLaunchNewThread && (
                     <button className="composer-mobile-action" onClick={() => newThread(activeSession)}>✎ New thread</button>
                   )}
                   {activeConfig?.capabilities?.chat_list && (

@@ -820,6 +820,97 @@ body {
   border-color: var(--accent);
 }
 
+.thread-tabs-bar {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 10px 14px 0;
+}
+
+.thread-tabs-scroll {
+  display: flex;
+  gap: 8px;
+  min-width: 0;
+  flex: 1 1 auto;
+  overflow-x: auto;
+  padding-bottom: 2px;
+  scrollbar-width: thin;
+}
+
+.thread-tab {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  min-width: 0;
+  max-width: 220px;
+  padding: 8px 12px;
+  border-radius: 999px;
+  border: 1px solid var(--border);
+  background: var(--bg2);
+  color: var(--text2);
+  cursor: pointer;
+  transition: border-color 0.15s ease, background 0.15s ease, color 0.15s ease;
+  flex: 0 0 auto;
+}
+
+.thread-tab:hover {
+  border-color: var(--accent2);
+  color: var(--text);
+}
+
+.thread-tab.active {
+  background: rgba(104, 179, 255, 0.12);
+  border-color: var(--accent2);
+  color: var(--text);
+}
+
+.thread-tab.draft {
+  border-style: dashed;
+}
+
+.thread-tab-title {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-size: 12px;
+  font-weight: 600;
+}
+
+.thread-tab-age {
+  color: var(--text3);
+  font-size: 11px;
+  white-space: nowrap;
+}
+
+.thread-tabs-actions {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  flex: 0 0 auto;
+}
+
+.thread-tabs-btn {
+  height: 32px;
+  padding: 0 10px;
+  border-radius: 999px;
+  border: 1px solid var(--border);
+  background: var(--bg2);
+  color: var(--text2);
+  cursor: pointer;
+  transition: border-color 0.15s ease, background 0.15s ease, color 0.15s ease;
+}
+
+.thread-tabs-btn:hover {
+  border-color: var(--accent2);
+  color: var(--text);
+}
+
+.thread-tabs-btn.accent {
+  color: var(--accent);
+  border-color: var(--accent2);
+}
+
 .message {
   display: grid;
   grid-template-columns: 32px minmax(0, 1fr);
@@ -882,6 +973,15 @@ body {
 
 .message.assistant {
   /* inherits base grid layout */
+}
+
+.message.assistant.live-draft {
+  opacity: 0.92;
+}
+
+.message.assistant.live-draft .assistant-content {
+  border-left: 2px solid rgba(88, 166, 255, 0.24);
+  padding-left: 12px;
 }
 
 .assistant-gutter {
@@ -1494,40 +1594,34 @@ body {
 .activity-row.claude-thinking {
   border-left-color: var(--accent);
   background: rgba(104,179,255,0.04);
+  gap: 0;
 }
 
-.thinking-content {
-  max-height: 2.8em;
-  overflow: hidden;
-  cursor: pointer;
-  transition: max-height 0.3s ease;
-  margin-top: 4px;
-  position: relative;
+.activity-row.claude-thinking .activity-copy {
+  gap: 4px;
 }
 
-.thinking-content.expanded {
-  max-height: 400px;
-  overflow-y: auto;
+.activity-label.inline-blob {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
 }
 
-.thinking-content:not(.expanded)::after {
-  content: '';
-  position: absolute;
-  bottom: 0;
-  left: 0;
-  right: 0;
-  height: 1.2em;
-  background: linear-gradient(transparent, var(--bg));
-  pointer-events: none;
+.activity-label.inline-blob .claude-spinner-icon {
+  width: 12px;
+  height: 12px;
+  font-size: 12px;
+  transform: translateY(-0.5px);
 }
 
-.thinking-content-text {
+.thinking-inline-text {
   font-size: 11px;
   line-height: 1.4;
   color: var(--text3);
   font-family: 'Cascadia Code', 'SF Mono', Consolas, monospace;
   white-space: pre-wrap;
   word-break: break-word;
+  margin-top: 2px;
 }
 
 /* ── Code blocks ───────────────────────────────────────────── */

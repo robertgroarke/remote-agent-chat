@@ -161,9 +161,21 @@ async function captureDiagnostic(Runtime, sessionId) {
   try {
     const result = await Runtime.evaluate({
       expression: `(function() {
-        const f = document.getElementById('active-frame');
-        if (!f || !f.contentDocument) return JSON.stringify({ error: 'no-active-frame' });
-        const d = f.contentDocument;
+        const webviewId = ${JSON.stringify(null)}; // diagnostic path uses generic frame resolution only
+        function resolveDoc() {
+          const active = document.getElementById('active-frame');
+          if (active && active.contentDocument) return active.contentDocument;
+          if (document.body && document.body.children.length > 0) return document;
+          const frames = Array.from(document.querySelectorAll('iframe.webview.ready, iframe'));
+          const visible = frames.filter(function(frame) {
+            if (!frame || !frame.contentDocument) return false;
+            const rect = frame.getBoundingClientRect();
+            return rect.width > 40 && rect.height > 40;
+          });
+          return (visible[0] && visible[0].contentDocument) || null;
+        }
+        const d = resolveDoc();
+        if (!d) return JSON.stringify({ error: 'no-webview-frame' });
         return JSON.stringify({
           title: d.title,
           url: d.URL ? d.URL.substring(0, 120) : '',
@@ -201,8 +213,6 @@ async function evalInPage(Runtime, code) {
     })()`,
     returnByValue: true,
     awaitPromise: false,
-    silent: true,
-    userGesture: false,
   });
   if (result.exceptionDetails) {
     const desc = result.exceptionDetails.exception?.description || result.exceptionDetails.text;
@@ -252,6 +262,7 @@ async function evalInWorkbenchWebview(Runtime, webviewId, code) {
 // ─── Core frame eval helper ───────────────────────────────────────────────────
 
 async function evalInFrame(Runtime, code) {
+  const webviewId = Runtime._webviewId || '';
   // If the session has a cached inner-frame contextId, evaluate directly
   // in that context to avoid accessing active-frame.contentDocument which
   // can trigger focus/scroll changes in Electron webviews.
@@ -278,15 +289,50 @@ async function evalInFrame(Runtime, code) {
 
   const result = await Runtime.evaluate({
     expression: `(function() {
-      const f = document.getElementById('active-frame');
-      if (!f || !f.contentDocument) return null;
-      const d = f.contentDocument;
+      const webviewId = ${JSON.stringify(webviewId)};
+      function resolveDoc() {
+        const active = document.getElementById('active-frame');
+        if (active && active.contentDocument) return active.contentDocument;
+
+        if (webviewId) {
+          let iframe = document.querySelector('iframe[name="' + webviewId + '"]');
+          if (iframe && iframe.contentDocument) return iframe.contentDocument;
+
+          const editorEl = document.querySelector('[aria-flowto="' + webviewId + '"]');
+          if (editorEl) {
+            iframe = editorEl.querySelector('iframe');
+            if (iframe && iframe.contentDocument) return iframe.contentDocument;
+          }
+
+          const exact = Array.from(document.querySelectorAll('iframe')).find(function(frame) {
+            return frame && (frame.name === webviewId || frame.id === webviewId);
+          });
+          if (exact && exact.contentDocument) return exact.contentDocument;
+        }
+
+        const frames = Array.from(document.querySelectorAll('iframe.webview.ready, iframe'));
+        const visible = frames.filter(function(frame) {
+          if (!frame || !frame.contentDocument) return false;
+          const rect = frame.getBoundingClientRect();
+          return rect.width > 40 && rect.height > 40;
+        });
+        if (visible.length === 1) return visible[0].contentDocument;
+        const withBody = visible.find(function(frame) {
+          const txt = frame.contentDocument && frame.contentDocument.body
+            ? (frame.contentDocument.body.innerText || '').trim()
+            : '';
+          return txt.length > 0;
+        });
+        if (withBody) return withBody.contentDocument;
+        if (document.body && document.body.children.length > 0) return document;
+        return null;
+      }
+      const d = resolveDoc();
+      if (!d) return null;
       ${code}
     })()`,
     returnByValue: true,
     awaitPromise: false,
-    silent: true,
-    userGesture: false,
   });
   if (result.exceptionDetails) {
     const desc = result.exceptionDetails.exception?.description || result.exceptionDetails.text;
@@ -312,8 +358,10 @@ async function cacheInnerContextId(Runtime) {
             Runtime.removeListener('executionContextCreated', handler);
           }
         } catch {}
-        // The inner active-frame context has a higher id than the outer webview
-        if (contexts.length > 1) {
+        // In practice the relevant webview app context tends to have the highest id.
+        // Some newer Antigravity/Claude webviews expose only one useful context, so
+        // keep the best available context instead of requiring >1.
+        if (contexts.length > 0) {
           contexts.sort((a, b) => b.id - a.id);
           Runtime._innerContextId = contexts[0].id;
         }
@@ -326,11 +374,34 @@ async function cacheInnerContextId(Runtime) {
 // ─── Agent type detection ─────────────────────────────────────────────────────
 
 async function detectAgentType(Runtime, extensionIdHint) {
+  const webviewId = Runtime._webviewId || '';
   const result = await Runtime.evaluate({
     expression: `(function() {
-      const f = document.getElementById('active-frame');
-      if (!f || !f.contentDocument) return null;
-      const d = f.contentDocument;
+      const webviewId = ${JSON.stringify(webviewId)};
+      function resolveDoc() {
+        const active = document.getElementById('active-frame');
+        if (active && active.contentDocument) return active.contentDocument;
+        if (webviewId) {
+          let iframe = document.querySelector('iframe[name="' + webviewId + '"]');
+          if (iframe && iframe.contentDocument) return iframe.contentDocument;
+          const editorEl = document.querySelector('[aria-flowto="' + webviewId + '"]');
+          if (editorEl) {
+            iframe = editorEl.querySelector('iframe');
+            if (iframe && iframe.contentDocument) return iframe.contentDocument;
+          }
+        }
+        const frames = Array.from(document.querySelectorAll('iframe.webview.ready, iframe'));
+        const visible = frames.find(function(frame) {
+          if (!frame || !frame.contentDocument) return false;
+          const rect = frame.getBoundingClientRect();
+          return rect.width > 40 && rect.height > 40;
+        });
+        if (visible) return visible.contentDocument;
+        if (document.body && document.body.children.length > 0) return document;
+        return null;
+      }
+      const d = resolveDoc();
+      if (!d) return null;
       if (d.querySelector('${CLAUDE_PRIMARY.detect}')) return 'claude';
       if (d.querySelector('${CONTINUE_PRIMARY.detect}')) return 'continue';
       if (d.querySelector('${CODEX_PRIMARY.detect}')) return 'codex';
@@ -380,20 +451,28 @@ async function detectThinking(Runtime, agentType) {
         if (stopBtn && stopBtn.offsetParent !== null) {
           isThinking = true;
         }
-        // Check for visible "Thinking" or "Generating" text — Codex shows this
-        // as a spinner label even when no stop button is present.
+        // Check for the Codex "Thinking" shimmer indicator.
+        // IMPORTANT: Only match spans with the shimmer class — Codex uses
+        // "loading-shimmer-pure-text" for active thinking indicators.  Regular
+        // message content may contain the literal word "Thinking" and must be
+        // excluded.  Also require the span to be in the viewport (top >= 0)
+        // because Codex leaves residual shimmer spans in old chat history.
         if (!isThinking) {
-          var spans = d.querySelectorAll('span');
-          for (var si = 0; si < spans.length; si++) {
-            var st = (spans[si].textContent || '').trim();
-            if ((st === 'Thinking' || st === 'Generating') && spans[si].offsetParent !== null && spans[si].children.length === 0) {
-              isThinking = true;
-              break;
+          var shimmers = d.querySelectorAll('span[class*="loading-shimmer"]');
+          for (var si = 0; si < shimmers.length; si++) {
+            var st = (shimmers[si].textContent || '').trim();
+            if ((st === 'Thinking' || st === 'Generating') && shimmers[si].offsetParent !== null) {
+              var rect = shimmers[si].getBoundingClientRect();
+              if (rect.top >= 0) {
+                isThinking = true;
+                break;
+              }
             }
           }
         }
-        // Fallback: check send button opacity — when generating, it may have full opacity
-        // with a different SVG. The idle send button has opacity-50.
+        // Fallback: check send button for a rect-based stop icon (square).
+        // Do NOT use SVG path matching — Codex updates send arrow paths
+        // frequently and unknown paths cause permanent false "thinking" state.
         if (!isThinking) {
           var pm = d.querySelector('.ProseMirror');
           if (pm) {
@@ -406,16 +485,7 @@ async function detectThinking(Runtime, agentType) {
               var btns = Array.from(container.querySelectorAll('button'));
               var lastBtn = btns[btns.length - 1];
               if (lastBtn) {
-                var svg = lastBtn.querySelector('svg path');
-                // Idle send arrow: "M9.334" (old) or "M4.5 5.75" (new).
-                // Stop icon uses a rect or a very different path (e.g. square).
-                // Only trigger thinking if we see a STOP icon, not just an unknown send arrow.
-                if (svg) {
-                  var pathD = svg.getAttribute('d') || '';
-                  var isKnownSendArrow = pathD.startsWith('M9.334') || pathD.startsWith('M4.5 5.75') || pathD.startsWith('M4.5 ');
-                  if (!isKnownSendArrow) isThinking = true;
-                }
-                // Also check for rect-based stop icon (square)
+                // Only check for rect-based stop icon (square) — this is reliable
                 var stopRect = lastBtn.querySelector('svg rect');
                 if (stopRect) isThinking = true;
               }
@@ -429,6 +499,86 @@ async function detectThinking(Runtime, agentType) {
         var label = 'Generating';
         var thinkingContent = '';
         try {
+          var bt = String.fromCharCode(96);
+          var fence = bt + bt + bt;
+          function shouldIgnoreDraftText(txt) {
+            if (!txt) return true;
+            if (txt.length < 8) return true;
+            return /^(Thinking|Generating|Worked for .*|Undo|Review|Context automatically compacted|Running command(?: for [\\dsmh ]+)?|Reading|Writing|Editing|Searching|Creating|Applying)$/i.test(txt);
+          }
+
+          function inlineText(node) {
+            if (!node) return '';
+            if (node.nodeType === 3) return node.textContent || '';
+            if (node.nodeType !== 1) return '';
+            var tag = node.nodeName.toUpperCase();
+            if (tag === 'BR') return '\\n';
+            if (tag === 'PRE') return '';
+            if (tag === 'CODE') {
+              var codeText = (node.textContent || '').trim();
+              return codeText ? bt + codeText + bt : '';
+            }
+            if (tag === 'BUTTON' || tag === 'SVG' || tag === 'PATH' || tag === 'SUMMARY') return '';
+            return Array.from(node.childNodes).map(inlineText).join('');
+          }
+
+          function nodeToMarkdown(node) {
+            if (!node) return '';
+            if (node.nodeType === 3) return node.textContent || '';
+            if (node.nodeType !== 1) return '';
+            var tag = node.nodeName.toUpperCase();
+            if (tag === 'PRE') {
+              var codeEl = node.querySelector('code');
+              var cls = codeEl ? (codeEl.className || '') : '';
+              var lang = (cls.match(/language-(\\w+)/) || [])[1] || '';
+              var codeText = ((codeEl || node).textContent || '').trim();
+              return codeText ? ('\\n' + fence + lang + '\\n' + codeText + '\\n' + fence + '\\n\\n') : '';
+            }
+            if (tag === 'CODE') return bt + ((node.textContent || '').trim()) + bt;
+            if (tag === 'P') {
+              var para = inlineText(node).replace(/\\n{3,}/g, '\\n\\n').trim();
+              return para ? (para + '\\n\\n') : '';
+            }
+            if (tag === 'UL' || tag === 'OL') {
+              var idx = 1;
+              var out = [];
+              Array.from(node.children).forEach(function(li) {
+                if (!li || li.nodeName.toUpperCase() !== 'LI') return;
+                var body = inlineText(li).replace(/\\n{3,}/g, '\\n\\n').trim();
+                if (!body) return;
+                out.push((tag === 'OL' ? (idx++ + '. ') : '- ') + body);
+              });
+              return out.length > 0 ? out.join('\\n') + '\\n\\n' : '';
+            }
+            return Array.from(node.childNodes).map(nodeToMarkdown).join('');
+          }
+
+          function findVisibleAssistantDraft() {
+            var convo = d.querySelector('[data-thread-find-target="conversation"]') || d.body;
+            var selectors = [
+              '[data-content-search-unit-key$=":assistant"]',
+              '.overflow-x-auto',
+              '[class*="prose"]',
+              '[data-message-author-role="assistant"]',
+            ];
+            for (var si = 0; si < selectors.length; si++) {
+              var nodes = Array.from(convo.querySelectorAll(selectors[si]));
+              for (var ni = nodes.length - 1; ni >= 0; ni--) {
+                var node = nodes[ni];
+                if (!node || !node.offsetParent) continue;
+                if (node.closest('[class*="items-end"]')) continue;
+                if (node.closest('button, summary, dialog, [role="dialog"]')) continue;
+                var txt = nodeToMarkdown(node).replace(/\\n{3,}/g, '\\n\\n').trim();
+                if (!txt) {
+                  txt = (node.innerText || '').replace(/\\n{3,}/g, '\\n\\n').trim();
+                }
+                if (shouldIgnoreDraftText(txt)) continue;
+                return txt.substring(0, 4000);
+              }
+            }
+            return '';
+          }
+
           // Priority 1: "Running command for Ns" / "Reading file" / "Searching" etc.
           // These are DIVs with class containing "loading-shimmer" or matching text pattern.
           var activityDivs = d.querySelectorAll('div, span');
@@ -493,6 +643,10 @@ async function detectThinking(Runtime, agentType) {
               }
             }
           }
+          var liveDraft = findVisibleAssistantDraft();
+          if (liveDraft && (!thinkingContent || liveDraft.length > thinkingContent.length + 40)) {
+            thinkingContent = liveDraft;
+          }
         } catch(e) {}
 
         return JSON.stringify({ thinking: true, label: label, thinkingContent: thinkingContent });
@@ -507,6 +661,67 @@ async function detectThinking(Runtime, agentType) {
     const raw = await evalInFrame(Runtime, `
       var result = { thinking: false, label: '', thinkingContent: '', spinnerVerb: '' };
 
+      function appendThinkingText(target, txt) {
+        txt = (txt || '').trim();
+        if (!txt) return target;
+        if (!target) return txt;
+        if (target.includes(txt)) return target;
+        return target + '\\n' + txt;
+      }
+
+      function collectDetailsText(detailsEl) {
+        if (!detailsEl) return '';
+        var parts = [];
+        var nodes = Array.from(detailsEl.querySelectorAll('p, li, pre, code, div, span'));
+        for (var i = 0; i < nodes.length; i++) {
+          var node = nodes[i];
+          if (!node || !node.offsetParent) continue;
+          if (node.closest('summary')) continue;
+          if (node.children.length > 0 && node.tagName !== 'PRE' && node.tagName !== 'CODE') continue;
+          var txt = (node.innerText || node.textContent || '').trim();
+          if (!txt) continue;
+          if (/^(Thinking|Generating|Show thinking|Hide thinking)$/i.test(txt)) continue;
+          parts.push(txt);
+        }
+        var joined = parts.join('\\n').replace(/\\n{3,}/g, '\\n\\n').trim();
+        return joined.substring(0, 3000);
+      }
+
+      function collectAssistantDraftText(root) {
+        if (!root) return '';
+        var blocks = Array.from(root.querySelectorAll('p, li, pre, code, div, span'));
+        var parts = [];
+        for (var i = 0; i < blocks.length; i++) {
+          var block = blocks[i];
+          if (!block || !block.offsetParent) continue;
+          if (block.closest('details, summary, button')) continue;
+          if (block.children.length > 0 && block.tagName !== 'PRE' && block.tagName !== 'CODE') continue;
+          var txt = (block.innerText || block.textContent || '').trim();
+          if (!txt) continue;
+          if (/^(Thinking|Generating|Show thinking|Hide thinking|Claude Code|Bash|Retry)$/i.test(txt)) continue;
+          if (/^[*._|~•·▌]+$/.test(txt)) continue;
+          parts.push(txt);
+        }
+        return parts.join('\\n').replace(/\\n{3,}/g, '\\n\\n').trim().substring(0, 3000);
+      }
+
+      function collectThinkingSummaryHints(root) {
+        if (!root) return '';
+        var parts = [];
+        var seen = {};
+        var summaries = Array.from(root.querySelectorAll('details summary, summary'));
+        for (var i = 0; i < summaries.length; i++) {
+          var txt = (summaries[i].innerText || summaries[i].textContent || '').trim();
+          if (!txt) continue;
+          if (/^(Show thinking|Hide thinking)$/i.test(txt)) continue;
+          if (/^Thinking$/i.test(txt)) continue;
+          if (seen[txt]) continue;
+          seen[txt] = true;
+          parts.push(txt);
+        }
+        return parts.join('\\n').trim().substring(0, 1000);
+      }
+
       // Check for the spinner verb text (e.g. "Cerebrating...", "Spelunking...")
       var spinnerRow = d.querySelector('${CLAUDE_PRIMARY.spinnerRow}');
       if (spinnerRow) {
@@ -518,12 +733,12 @@ async function detectThinking(Runtime, agentType) {
       }
 
       var msgs = d.querySelectorAll('[data-testid="${CLAUDE_PRIMARY.assistantTestId}"]');
-      if (msgs.length > 0) {
-        var last = msgs[msgs.length - 1];
+        if (msgs.length > 0) {
+          var last = msgs[msgs.length - 1];
         // Check for OPEN thinking details (actively thinking)
         var openDetails = last.querySelector('${CLAUDE_PRIMARY.thinkingDetails}') ||
                           last.querySelector('details[open]');
-        if (openDetails) {
+          if (openDetails) {
           var summary = openDetails.querySelector('${CLAUDE_PRIMARY.thinkingSummary}') ||
                         openDetails.querySelector('summary');
           // Use spinner verb if available, otherwise summary text
@@ -531,14 +746,9 @@ async function detectThinking(Runtime, agentType) {
           result.label = result.spinnerVerb || (summary ? summary.textContent.trim() : 'Thinking');
           // Extract thinking content text (skip the summary element itself)
           try {
-            var children = openDetails.childNodes;
-            for (var ci = 0; ci < children.length; ci++) {
-              var child = children[ci];
-              if (child.nodeName.toUpperCase() === 'SUMMARY') continue;
-              var txt = (child.innerText || child.textContent || '').trim();
-              if (txt) result.thinkingContent += (result.thinkingContent ? '\\n' : '') + txt;
-            }
-            if (result.thinkingContent.length > 2000) result.thinkingContent = result.thinkingContent.substring(0, 2000) + '…';
+            result.thinkingContent = appendThinkingText(result.thinkingContent, collectDetailsText(openDetails));
+            result.thinkingContent = appendThinkingText(result.thinkingContent, collectThinkingSummaryHints(openDetails));
+            if (result.thinkingContent.length > 3000) result.thinkingContent = result.thinkingContent.substring(0, 3000) + '…';
           } catch(e) {}
           return JSON.stringify(result);
         }
@@ -546,6 +756,14 @@ async function detectThinking(Runtime, agentType) {
         if (result.spinnerVerb) {
           result.thinking = true;
           result.label = result.spinnerVerb;
+          try {
+            result.thinkingContent = appendThinkingText(result.thinkingContent, collectDetailsText(last.querySelector('details[open]') || d.querySelector('details[open]')));
+            result.thinkingContent = appendThinkingText(result.thinkingContent, collectAssistantDraftText(last));
+            if (!result.thinkingContent) {
+              result.thinkingContent = appendThinkingText(result.thinkingContent, collectThinkingSummaryHints(last));
+              result.thinkingContent = appendThinkingText(result.thinkingContent, collectThinkingSummaryHints(d));
+            }
+          } catch(e) {}
           return JSON.stringify(result);
         }
         // Check for CLOSED thinking details — thinking finished, now generating
@@ -564,6 +782,13 @@ async function detectThinking(Runtime, agentType) {
         // Spinner visible but no assistant messages yet (first response)
         result.thinking = true;
         result.label = result.spinnerVerb;
+        try {
+          result.thinkingContent = appendThinkingText(result.thinkingContent, collectDetailsText(d.querySelector('details[open]')));
+          result.thinkingContent = appendThinkingText(result.thinkingContent, collectAssistantDraftText(d.querySelector('[data-testid="${CLAUDE_PRIMARY.assistantTestId}"]:last-of-type') || d.body));
+          if (!result.thinkingContent) {
+            result.thinkingContent = appendThinkingText(result.thinkingContent, collectThinkingSummaryHints(d));
+          }
+        } catch(e) {}
         return JSON.stringify(result);
       }
 
@@ -1141,13 +1366,239 @@ const CODEX_READ_EXPR = `
   return JSON.stringify(msgs);
 `;
 
+const CODEX_DESKTOP_READ_EXPR = `
+  var bt = String.fromCharCode(96);
+  var fence = bt + bt + bt;
+  var BLOCK_TAGS = { DIV:1, P:1, LI:1, TR:1, H1:1, H2:1, H3:1, H4:1, H5:1, H6:1, BLOCKQUOTE:1, SECTION:1, ARTICLE:1 };
+
+  function squashNewlines(text) {
+    return String(text || '').replace(/\\n{3,}/g, '\\n\\n').trim();
+  }
+
+  function cleanLine(line, role) {
+    var trimmed = String(line || '').trim();
+    if (!trimmed) return '';
+    if (/^\\d{1,2}:\\d{2}\\s*(AM|PM)$/i.test(trimmed)) return '';
+    if (/^(Playground|Commit|Undo|Review|Show more|Threads|Plugins|Automations|Search|New chat|Settings|Copy|Copy message|Fork from this message)$/i.test(trimmed)) return '';
+    if (role === 'assistant' && /^(Worked for .*|Working for .*)$/i.test(trimmed)) return '';
+    return String(line || '').replace(/\\s+$/g, '');
+  }
+
+  function cleanText(text, role) {
+    if (!text) return '';
+    var lines = String(text).split('\\n');
+    var kept = [];
+    for (var i = 0; i < lines.length; i++) {
+      var raw = cleanLine(lines[i], role);
+      if (!raw) {
+        if (kept.length > 0 && kept[kept.length - 1] !== '') kept.push('');
+        continue;
+      }
+      kept.push(raw);
+    }
+    while (kept.length > 0 && kept[0] === '') kept.shift();
+    while (kept.length > 0 && kept[kept.length - 1] === '') kept.pop();
+    return squashNewlines(kept.join('\\n'));
+  }
+
+  function uniquePush(parts, value) {
+    if (!value) return;
+    if (parts.length > 0 && parts[parts.length - 1] === value) return;
+    parts.push(value);
+  }
+
+  function roleFromUnit(unit) {
+    var key = unit.getAttribute('data-content-search-unit-key') || '';
+    var parts = key.split(':');
+    return parts.length >= 3 ? parts[parts.length - 1] : '';
+  }
+
+  function stripControls(root) {
+    if (!root) return root;
+    var clone = root.cloneNode(true);
+    Array.from(clone.querySelectorAll('button, svg, path, [aria-label*="Copy"], [aria-label*="Fork"]')).forEach(function(node) {
+      if (node && node.parentNode) node.parentNode.removeChild(node);
+    });
+    Array.from(clone.querySelectorAll('span, div')).forEach(function(node) {
+      var txt = (node.innerText || node.textContent || '').trim();
+      if (/^\\d{1,2}:\\d{2}\\s*(AM|PM)$/i.test(txt)) {
+        if (node.parentNode) node.parentNode.removeChild(node);
+      }
+    });
+    return clone;
+  }
+
+  function inlineText(node) {
+    if (!node) return '';
+    if (node.nodeType === 3) return node.textContent || '';
+    if (node.nodeType !== 1) return '';
+    var tag = node.nodeName.toUpperCase();
+    if (tag === 'BR') return '\\n';
+    if (tag === 'PRE') return '';
+    if (tag === 'CODE') {
+      var codeText = squashNewlines(node.textContent || '');
+      return codeText ? bt + codeText + bt : '';
+    }
+    if (tag === 'BUTTON' || tag === 'SVG' || tag === 'PATH') return '';
+    var inner = Array.from(node.childNodes).map(inlineText).join('');
+    if ((tag === 'P' || tag === 'DIV') && !node.querySelector('pre, ul, ol, li, h1, h2, h3, h4, h5, h6')) {
+      return inner;
+    }
+    return inner;
+  }
+
+  function listItemText(li) {
+    var parts = [];
+    Array.from(li.childNodes).forEach(function(child) {
+      if (child.nodeType === 1) {
+        var tag = child.nodeName.toUpperCase();
+        if (tag === 'UL' || tag === 'OL') return;
+      }
+      parts.push(inlineText(child));
+    });
+    return squashNewlines(parts.join(''));
+  }
+
+  function nodeToMarkdown(node, depth, role) {
+    if (!node) return '';
+    if (node.nodeType === 3) return node.textContent || '';
+    if (node.nodeType !== 1) return '';
+    var tag = node.nodeName.toUpperCase();
+    if (tag === 'PRE') {
+      var codeEl = node.querySelector('code');
+      var cls = codeEl ? (codeEl.className || '') : '';
+      var lang = (cls.match(/language-(\\w+)/) || [])[1] || '';
+      var codeText = squashNewlines((codeEl || node).textContent || '');
+      return codeText ? ('\\n' + fence + lang + '\\n' + codeText + '\\n' + fence + '\\n\\n') : '';
+    }
+    if (tag === 'CODE') return bt + squashNewlines(node.textContent || '') + bt;
+    if (tag === 'BR') return '\\n';
+    if (tag === 'BUTTON' || tag === 'SVG' || tag === 'PATH') return '';
+    if (/^H[1-6]$/.test(tag)) {
+      var heading = squashNewlines(inlineText(node));
+      return heading ? ('**' + heading + '**\\n\\n') : '';
+    }
+    if (tag === 'P') {
+      var para = squashNewlines(inlineText(node));
+      return para ? (para + '\\n\\n') : '';
+    }
+    if (tag === 'UL' || tag === 'OL') {
+      var items = [];
+      var idx = 1;
+      Array.from(node.children).forEach(function(li) {
+        if (!li || li.nodeName.toUpperCase() !== 'LI') return;
+        var body = listItemText(li);
+        if (body) {
+          var marker = tag === 'OL' ? (idx + '. ') : '- ';
+          items.push(marker + body);
+          idx++;
+        }
+        Array.from(li.children).forEach(function(child) {
+          var childTag = child.nodeName.toUpperCase();
+          if (childTag === 'UL' || childTag === 'OL') {
+            var nested = squashNewlines(nodeToMarkdown(child, depth + 1, role));
+            if (nested) items.push(nested);
+          }
+        });
+      });
+      return items.length > 0 ? items.join('\\n') + '\\n\\n' : '';
+    }
+    if (tag === 'BLOCKQUOTE') {
+      var quote = squashNewlines(Array.from(node.childNodes).map(function(child) {
+        return nodeToMarkdown(child, depth + 1, role);
+      }).join(''));
+      if (!quote) return '';
+      return quote.split('\\n').map(function(line) { return line ? '> ' + line : '>'; }).join('\\n') + '\\n\\n';
+    }
+    var hasBlockChildren = Array.from(node.children || []).some(function(child) {
+      return BLOCK_TAGS[child.nodeName.toUpperCase()] || child.nodeName.toUpperCase() === 'PRE' || child.nodeName.toUpperCase() === 'UL' || child.nodeName.toUpperCase() === 'OL';
+    });
+    if (!hasBlockChildren) {
+      return inlineText(node);
+    }
+    return Array.from(node.childNodes).map(function(child) {
+      return nodeToMarkdown(child, depth + 1, role);
+    }).join('');
+  }
+
+  function toolify(text) {
+    if (!text) return '';
+    var lines = String(text).split('\\n');
+    var first = (lines[0] || '').trim();
+    var rest = squashNewlines(lines.slice(1).join('\\n'));
+    var m = first.match(/^Ran\\s+(.+)$/i);
+    if (m) return '[Bash ' + m[1].trim() + ']\\n' + (rest || '') + '\\n[end]';
+    m = first.match(/^Bash\\s+(.+)$/i);
+    if (m) return '[Bash ' + m[1].trim() + ']\\n' + (rest || '') + '\\n[end]';
+    m = first.match(/^Read\\s+(.+)$/i);
+    if (m) return '[Read ' + m[1].trim() + ']\\n' + (rest || '') + '\\n[end]';
+    m = first.match(/^Search(?:ed)?\\s+(.+)$/i);
+    if (m) return '[Search ' + m[1].trim() + ']\\n' + (rest || '') + '\\n[end]';
+    if (/^Edited file/i.test(first)) {
+      var target = lines.find(function(line) {
+        var t = String(line || '').trim();
+        return t && t !== first && /[A-Za-z0-9_./\\\\-]+\\.[A-Za-z0-9]+/.test(t);
+      }) || 'file';
+      return '[Edit ' + target.trim() + ']\\n' + (rest || '') + '\\n[end]';
+    }
+    return text;
+  }
+
+  function extractUnitText(unit, role) {
+    if (!unit) return '';
+    var root = stripControls(unit);
+    var markdownHost = root.querySelector('._markdownContent_tcy7y_41, [class*="_markdownContent"], [class*="markdownContent"]') || root;
+    var text = squashNewlines(nodeToMarkdown(markdownHost, 0, role));
+    if (!text) text = cleanText(root.innerText || root.textContent || '', role);
+    if (role === 'tool') text = toolify(text);
+    return cleanText(text, role === 'tool' ? 'assistant' : role);
+  }
+
+  var convo = d.querySelector('[data-thread-find-target="conversation"]');
+  if (!convo) return JSON.stringify([]);
+
+  var turns = Array.from(convo.querySelectorAll('[data-content-search-turn-key]'));
+  var msgs = [];
+
+  for (var ti = 0; ti < turns.length; ti++) {
+    var turn = turns[ti];
+    var userParts = [];
+    var assistantParts = [];
+    var units = Array.from(turn.querySelectorAll('[data-content-search-unit-key]'));
+
+    for (var ui = 0; ui < units.length; ui++) {
+      var unit = units[ui];
+      var role = roleFromUnit(unit);
+      if (!role) continue;
+
+      var text = extractUnitText(unit, role);
+      if (!text) continue;
+
+      if (role === 'user') {
+        uniquePush(userParts, text);
+      } else if (role === 'assistant' || role === 'tool') {
+        uniquePush(assistantParts, text);
+      }
+    }
+
+    if (userParts.length > 0) {
+      msgs.push({ role: 'user', content: userParts.join('\\n\\n') });
+    }
+    if (assistantParts.length > 0) {
+      msgs.push({ role: 'assistant', content: assistantParts.join('\\n\\n') });
+    }
+  }
+
+  return JSON.stringify(msgs);
+`;
+
 async function readCodexMessages(Runtime, sessionId, usePageEval) {
   // Keep background polling read-only.
   // Expanding/collapsing Codex disclosure rows during every poll causes visible
   // UI thrash in the desktop app, so we only read what is already rendered.
   try {
     const raw = usePageEval
-      ? await evalInPage(Runtime, CODEX_READ_EXPR)
+      ? await evalInPage(Runtime, CODEX_DESKTOP_READ_EXPR)
       : await evalInFrame(Runtime, CODEX_READ_EXPR);
     if (raw !== null) { resetReadFailures(sessionId); return raw; }
   } catch (e) {
@@ -1455,6 +1906,7 @@ async function detectContinuePermissionDialogFromWorkbench(Runtime, webviewId) {
 
 async function sendContinuePrimary(Runtime, text) {
   // Set text in the main TipTap editor via execCommand
+  console.log(`[continue-focus] send primary:start chars=${(text || '').length}`);
   const set = await evalInFrame(Runtime, `
     var input = d.querySelector('${CONTINUE_PRIMARY.input}');
     if (!input) return 'no-input';
@@ -1476,6 +1928,7 @@ async function sendContinuePrimary(Runtime, text) {
   await new Promise(r => setTimeout(r, 200));
 
   // Click the last submit button (the main one)
+  console.log('[continue-focus] send primary:click-submit');
   const click = await evalInFrame(Runtime, `
     var btns = d.querySelectorAll('${CONTINUE_PRIMARY.sendBtn}');
     if (!btns.length) {
@@ -1494,6 +1947,7 @@ async function sendContinuePrimary(Runtime, text) {
 
 async function sendContinueFallback(Runtime, text) {
   // Fallback: try broader selectors and Enter key dispatch
+  console.log(`[continue-focus] send fallback:start chars=${(text || '').length}`);
   const result = await evalInFrame(Runtime, `
     var input = d.querySelector('${CONTINUE_FALLBACK.input}');
     if (!input) return 'no-input';
@@ -1776,6 +2230,43 @@ const ANTIGRAVITY_PANEL_TITLE_EXPR = `
   return titleEl ? (titleEl.innerText || '').trim() : null;
 `;
 
+const ANTIGRAVITY_PANEL_SUMMARY_EXPR = `
+  var panel = d.querySelector('.antigravity-agent-side-panel');
+  if (!panel) return null;
+
+  function uniqPush(arr, value) {
+    if (!value) return;
+    if (!arr.includes(value)) arr.push(value);
+  }
+
+  var text = (panel.innerText || '').replace(/\\s+/g, ' ').trim();
+  var titleEl = panel.querySelector('.flex.min-w-0');
+  var title = titleEl ? (titleEl.innerText || '').trim() : null;
+  var buttons = Array.from(panel.querySelectorAll('button, [role="button"]'));
+  var labels = [];
+  buttons.forEach(function(btn) {
+    var raw = (btn.innerText || btn.textContent || btn.getAttribute('aria-label') || '').replace(/\\s+/g, ' ').trim();
+    if (!raw || raw.length > 120) return;
+    uniqPush(labels, raw);
+  });
+
+  var mode = labels.find(function(label) { return /^(Planning|Fast)$/i.test(label); }) || null;
+  var model = labels.find(function(label) { return /\\b(Claude|Opus|Sonnet|GPT|Gemini|Flash|Pro)\\b/i.test(label); }) || null;
+  var paneAgent = null;
+  if (/\\bAsk anything, @ to mention, \\/ for workflows\\b/i.test(text) || /^Agent$/i.test(title || '')) {
+    paneAgent = 'antigravity_panel';
+  } else if (/\\bCodex\\b/i.test(title || '') || /\\bGPT-5(?:\\.|\\b)/i.test(text)) {
+    paneAgent = 'codex';
+  }
+
+  return JSON.stringify({
+    title: title || null,
+    mode: mode || null,
+    model: model || null,
+    pane_agent: paneAgent || null,
+  });
+`;
+
 async function detectAntigravityPanelHasContent(Runtime) {
   try {
     const raw = await evalInPage(Runtime, ANTIGRAVITY_PANEL_HAS_CONTENT_EXPR);
@@ -1787,6 +2278,16 @@ async function readAntigravityPanelTitle(Runtime) {
   try {
     return await evalInPage(Runtime, ANTIGRAVITY_PANEL_TITLE_EXPR);
   } catch { return null; }
+}
+
+async function readAntigravityPanelSummary(Runtime) {
+  try {
+    const raw = await evalInPage(Runtime, ANTIGRAVITY_PANEL_SUMMARY_EXPR);
+    if (!raw) return null;
+    return JSON.parse(raw);
+  } catch {
+    return null;
+  }
 }
 
 // Panel-scoped read expression — identical logic to ANTIGRAVITY_READ_EXPR but
@@ -2110,7 +2611,30 @@ async function detectAntigravityPanelThinking(Runtime) {
   try {
     const raw = await evalInPage(Runtime, `
       var panel = d.querySelector('.antigravity-agent-side-panel');
-      if (!panel) return JSON.stringify({ thinking: false, label: '' });
+      if (!panel) return JSON.stringify({ thinking: false, label: '', thinkingContent: '' });
+      function appendThinkingText(target, txt) {
+        txt = (txt || '').trim();
+        if (!txt) return target;
+        if (!target) return txt;
+        if (target.includes(txt)) return target;
+        return target + '\\n' + txt;
+      }
+      function collectDetailsText(detailsEl) {
+        if (!detailsEl) return '';
+        var parts = [];
+        var nodes = Array.from(detailsEl.querySelectorAll('p, li, pre, code, div, span'));
+        for (var i = 0; i < nodes.length; i++) {
+          var node = nodes[i];
+          if (!node || !node.offsetParent) continue;
+          if (node.closest('summary')) continue;
+          if (node.children.length > 0 && node.tagName !== 'PRE' && node.tagName !== 'CODE') continue;
+          var txt = (node.innerText || node.textContent || '').trim();
+          if (!txt) continue;
+          if (/^(Thinking|Generating|Show thinking|Hide thinking)$/i.test(txt)) continue;
+          parts.push(txt);
+        }
+        return parts.join('\\n').replace(/\\n{3,}/g, '\\n\\n').trim().substring(0, 3000);
+      }
       var btns = Array.from(panel.querySelectorAll('button'));
       // Only match actual stop/abort buttons, NOT "Cancel" from permission prompts
       // (permission prompts have "Always run" + "Cancel" side by side)
@@ -2131,11 +2655,15 @@ async function detectAntigravityPanelThinking(Runtime) {
         return false;
       });
       var isThinking = !!stopBtn && stopBtn.offsetParent !== null;
-      return JSON.stringify({ thinking: isThinking, label: isThinking ? 'Working' : '' });
+      var thinkingContent = '';
+      try {
+        thinkingContent = appendThinkingText(thinkingContent, collectDetailsText(panel.querySelector('details[open]')));
+      } catch(e) {}
+      return JSON.stringify({ thinking: isThinking, label: isThinking ? 'Working' : '', thinkingContent: thinkingContent });
     `);
-    try { return JSON.parse(raw); } catch { return { thinking: false, label: '' }; }
+    try { return JSON.parse(raw); } catch { return { thinking: false, label: '', thinkingContent: '' }; }
   } catch {
-    return { thinking: false, label: '' };
+    return { thinking: false, label: '', thinkingContent: '' };
   }
 }
 
@@ -3540,6 +4068,7 @@ async function readAgentConfig(Runtime, agentType, workspacePath) {
   if (agentType === 'antigravity' || agentType === 'antigravity_panel') return readAntigravityConfig(Runtime, workspacePath);
   if (agentType === 'continue') {
     try {
+      console.log('[continue-focus] config read:start');
       const raw = await evalInFrame(Runtime, `
         function norm(t) {
           return String(t || '').replace(/\\s+/g, ' ').trim();
@@ -3586,6 +4115,7 @@ async function readAgentConfig(Runtime, agentType, workspacePath) {
           return JSON.stringify({ open: false, model: model_id, available_models: existingModels });
         }
         // Open dropdown to scrape available models
+        console.log('[continue-focus] config read:open-model-dropdown');
         btn.click();
         return JSON.stringify({ open: true, model: model_id });
       `);
@@ -3661,6 +4191,7 @@ async function readAgentConfig(Runtime, agentType, workspacePath) {
               for (var ti = 0; ti < allTexts.length; ti++) pushText(models, allTexts[ti]);
             }
             // Close dropdown
+            console.log('[continue-focus] config read:close-model-dropdown');
             var menuBtn = d.querySelector('[data-testid="model-select-button"]');
             if (menuBtn) menuBtn.click();
             return JSON.stringify({ available_models: models });
@@ -3743,10 +4274,12 @@ async function readAgentConfig(Runtime, agentType, workspacePath) {
 
 async function readContinueConfigFromWorkbench(Runtime, webviewId, workspacePath) {
   try {
+    console.log(`[continue-focus] workbench config read:start webview=${webviewId || 'unknown'}`);
     const raw = await evalInWorkbenchWebview(Runtime, webviewId, `
       var btn = d.querySelector('[data-testid="model-select-button"]');
       if (!btn) return JSON.stringify({ model: 'unknown', available_models: [] });
       var model_id = (btn.textContent || '').trim();
+      console.log('[continue-focus] workbench config read:open-model-dropdown');
       btn.click();
       return JSON.stringify({ open: true, model: model_id });
     `);
@@ -3797,6 +4330,7 @@ async function readContinueConfigFromWorkbench(Runtime, webviewId, workspacePath
             }
           }
           var menuBtn = d.querySelector('[data-testid="model-select-button"]');
+          console.log('[continue-focus] workbench config read:close-model-dropdown');
           if (menuBtn) menuBtn.click();
           return JSON.stringify({ available_models: models });
         `);
@@ -4060,9 +4594,11 @@ async function setAntigravityMode(Runtime, InputDomain, mode, sessionId) {
 // ─── Continue model selection ──────────────────────────────────────────────────
 async function setContinueModel(Runtime, modelId, sessionId) {
   try {
+    console.log(`[${sessionId}] [continue-focus] set-model:start model=${modelId}`);
     const raw = await evalInFrame(Runtime, `
       var btn = d.querySelector('[data-testid="model-select-button"]');
       if (!btn) return JSON.stringify({ error: 'no-model-btn' });
+      console.log('[continue-focus] set-model:open-dropdown');
       btn.click();
       return JSON.stringify({ ok: true });
     `);
@@ -4086,9 +4622,11 @@ async function setContinueModel(Runtime, modelId, sessionId) {
       if (!match) {
         var available = Array.from(d.querySelectorAll('.truncate, span')).map(function(el) { return el.textContent.trim(); }).filter(Boolean).slice(0, 50);
         var menuBtn = d.querySelector('[data-testid="model-select-button"]');
+        console.log('[continue-focus] set-model:close-dropdown-no-match');
         if (menuBtn) menuBtn.click(); // close dropdown
         return JSON.stringify({ error: 'option_not_found', available: available });
       }
+      console.log('[continue-focus] set-model:select-option');
       match.click();
       return JSON.stringify({ ok: true, selected: match.textContent.trim() });
     `);
@@ -4273,8 +4811,90 @@ async function setAgentModel(Runtime, agentType, modelId, sessionId, InputDomain
 // Response: given a choice_id (derived from button label), we re-locate the
 // dialog and click the matching button.
 
+async function setAgentPermissionMode(Runtime, agentType, mode, sessionId) {
+  if (agentType !== 'claude') {
+    return { ok: false, code: 'not_supported', detail: `Permission mode selection not supported for ${agentType}` };
+  }
+
+  const targetMap = {
+    default: 'askbeforeedits',
+    bypassPermissions: 'bypasspermissions',
+  };
+  const targetToken = targetMap[mode];
+  if (!targetToken) {
+    return { ok: false, code: 'invalid_mode', detail: `Unsupported permission mode: ${mode}` };
+  }
+
+  try {
+    const result = await evalInFrame(Runtime, `
+      function norm(text) {
+        return String(text || '')
+          .toLowerCase()
+          .replace(/[^a-z0-9]+/g, '');
+      }
+
+      var fieldset = d.querySelector('fieldset[data-permission-mode]');
+      if (!fieldset) return JSON.stringify({ error: 'no_fieldset' });
+
+      var currentMode = fieldset.getAttribute('data-permission-mode') || '';
+      if (currentMode === ${JSON.stringify(mode)}) {
+        return JSON.stringify({ ok: true, already: true, mode: currentMode });
+      }
+
+      var trigger = Array.from(fieldset.querySelectorAll('button')).find(function(btn) {
+        var label = (btn.textContent || '').trim();
+        var title = btn.getAttribute('title') || '';
+        return /approval|edit/i.test(title) || /ask|bypass|default|plan/i.test(label);
+      });
+      if (!trigger) return JSON.stringify({ error: 'no_trigger' });
+
+      trigger.click();
+
+      var menuItems = Array.from(d.querySelectorAll('button[class*="menuItem"], [class*="menuItemV2"]'))
+        .filter(function(el) { return !!el.offsetParent; });
+      if (menuItems.length === 0) return JSON.stringify({ error: 'no_menu_items' });
+
+      var target = null;
+      for (var i = 0; i < menuItems.length; i++) {
+        var token = norm(menuItems[i].textContent || '');
+        if (token.indexOf(${JSON.stringify(targetToken)}) !== -1) {
+          target = menuItems[i];
+          break;
+        }
+      }
+      if (!target) {
+        return JSON.stringify({
+          error: 'no_matching_option',
+          available: menuItems.map(function(el) { return (el.textContent || '').replace(/\\s+/g, ' ').trim(); }),
+        });
+      }
+
+      target.click();
+      return JSON.stringify({
+        ok: true,
+        clicked: (target.textContent || '').replace(/\\s+/g, ' ').trim(),
+        mode: fieldset.getAttribute('data-permission-mode') || '',
+      });
+    `);
+    if (!result) return { ok: false, code: 'eval_null', detail: 'No result from frame' };
+    const parsed = JSON.parse(result);
+    if (parsed.error) {
+      return {
+        ok: false,
+        code: parsed.error,
+        detail: parsed.available ? `Available options: ${parsed.available.join(', ')}` : `Permission mode update failed: ${parsed.error}`,
+      };
+    }
+    console.log(`[${sessionId}] [perm-mode] Selected: ${parsed.clicked || parsed.mode || mode}`);
+    return { ok: true, selected: parsed.clicked || mode, already: !!parsed.already };
+  } catch (e) {
+    return { ok: false, code: 'exception', detail: e.message };
+  }
+}
+
 const PERMISSION_DIALOG_EXPR = `
   var dlg = null;
+  var isClaudePermissionPrompt = false;
 
   // 0. Claude Code specific: permissionRequestContainer is the inline permission prompt
   //    It has buttons like Reject/Run/Allow and a description of what's being requested.
@@ -4284,7 +4904,9 @@ const PERMISSION_DIALOG_EXPR = `
   for (var pi = 0; pi < ccPerm.length; pi++) {
     var p = ccPerm[pi];
     if (p.offsetParent !== null && p.querySelectorAll('button').length >= 1) {
-      dlg = p; break;
+      dlg = p;
+      isClaudePermissionPrompt = true;
+      break;
     }
   }
 
@@ -4342,12 +4964,37 @@ const PERMISSION_DIALOG_EXPR = `
   }
 
   if (choices.length === 0) return null;
+  var hasRejectChoice = choices.some(function(c) { return /^reject\\b/i.test(c.label); });
+  var hasActionChoice = choices.some(function(c) {
+    return /^(allow|allow once|always allow|run|always run|approve|accept|deny|cancel|continue|proceed|block|not now)\\b/i.test(c.label);
+  });
+  var hasPermissionText = /permission|approve|approval|allow|reject|run command\\??|edit file\\??|requires? input|requires? approval|tool call|terminal command|execute|write file|delete file|create file|access to|want to proceed/i.test(msg);
+  if (!isClaudePermissionPrompt && !(hasRejectChoice || (hasActionChoice && hasPermissionText))) return null;
   return JSON.stringify({ message: msg, choices: choices });
 `;
 
 function _buildPermissionClickExpr(choiceId) {
   return `
     var dlg = null;
+    function dispatchPress(el) {
+      var w = d.defaultView || (typeof f !== 'undefined' && f && f.contentWindow) || window;
+      if (typeof el.focus === 'function') {
+        try { el.focus(); } catch (_) {}
+      }
+      var rect = el.getBoundingClientRect();
+      var cx = rect.x + rect.width / 2;
+      var cy = rect.y + rect.height / 2;
+      var opts = { bubbles: true, cancelable: true, view: w, clientX: cx, clientY: cy, button: 0 };
+      if (w.PointerEvent) {
+        el.dispatchEvent(new w.PointerEvent('pointerdown', opts));
+      }
+      el.dispatchEvent(new w.MouseEvent('mousedown', opts));
+      if (w.PointerEvent) {
+        el.dispatchEvent(new w.PointerEvent('pointerup', opts));
+      }
+      el.dispatchEvent(new w.MouseEvent('mouseup', opts));
+      el.dispatchEvent(new w.MouseEvent('click', opts));
+    }
     // Claude Code specific: inline permission prompt
     var ccPerm = d.querySelectorAll('[class*="permissionRequestContainer"]');
     for (var pci = 0; pci < ccPerm.length; pci++) {
@@ -4384,7 +5031,7 @@ function _buildPermissionClickExpr(choiceId) {
     }
     if (!found) return 'no-match';
     if (found.disabled || found.getAttribute('aria-disabled') === 'true') return 'disabled';
-    found.click();
+    dispatchPress(found);
     return 'clicked';
   `;
 }
@@ -4403,6 +5050,9 @@ function _buildPermissionClickExpr(choiceId) {
 const ANTIGRAVITY_PANEL_PERMISSION_EXPR = `
   var panel = d.querySelector('.antigravity-agent-side-panel');
   if (!panel) return null;
+  function choiceId(label, idx) {
+    return label.toLowerCase().replace(/[^a-z0-9]+/g, '_').replace(/^_+|_+$/g, '') || ('choice_' + idx);
+  }
 
   // Strategy 1: Find buttons with "Reject" text — the permission prompt always has one
   var allBtns = Array.from(panel.querySelectorAll('button'));
@@ -4447,7 +5097,12 @@ const ANTIGRAVITY_PANEL_PERMISSION_EXPR = `
   while (container && container !== panel) {
     // Stop when we find a container that has descriptive text beyond just button labels
     var containerText = (container.innerText || '').trim();
-    if (containerText.length > 30 && container.querySelectorAll('button').length >= 2) break;
+    var interactiveCount = container.querySelectorAll('button, select, [role="button"]').length;
+    if (
+      containerText.length > 30 &&
+      interactiveCount >= 2 &&
+      /permission required|ran command|run command\\??|edit file\\??|auto-choice|always run|reject|allow|approve/i.test(containerText)
+    ) break;
     container = container.parentElement;
   }
   if (!container || container === panel) container = rejectBtn.parentElement;
@@ -4474,7 +5129,7 @@ const ANTIGRAVITY_PANEL_PERMISSION_EXPR = `
   }
 
   // Extract button choices from the container
-  var btns = Array.from(container.querySelectorAll('button'));
+  var btns = Array.from(container.querySelectorAll('button, [role="button"]'));
   var choices = [];
   for (var bi = 0; bi < btns.length; bi++) {
     var btn = btns[bi];
@@ -4486,7 +5141,7 @@ const ANTIGRAVITY_PANEL_PERMISSION_EXPR = `
     // Use \\s* (not \\s+) because Antigravity sometimes omits the space before the modifier
     label = label.replace(/\\s*(Alt|Ctrl|Shift|Cmd|Meta)\\+\\S+$/i, '').trim();
     if (!label) continue;
-    var cid = label.toLowerCase().replace(/[^a-z0-9]+/g, '_').replace(/^_+|_+$/g, '') || ('choice_' + bi);
+    var cid = choiceId(label, bi);
     choices.push({ choice_id: cid, label: label });
   }
 
@@ -4498,7 +5153,7 @@ const ANTIGRAVITY_PANEL_PERMISSION_EXPR = `
     for (var oi = 0; oi < opts.length; oi++) {
       var optLabel = (opts[oi].textContent || '').trim();
       if (optLabel && optLabel.length < 30) {
-        var optCid = optLabel.toLowerCase().replace(/[^a-z0-9]+/g, '_').replace(/^_+|_+$/g, '');
+        var optCid = choiceId(optLabel, oi);
         // Only add if not already present
         if (!choices.some(function(c) { return c.choice_id === optCid; })) {
           choices.push({ choice_id: optCid, label: optLabel });
@@ -4507,6 +5162,9 @@ const ANTIGRAVITY_PANEL_PERMISSION_EXPR = `
     }
   }
 
+  if (choices.some(function(c) { return c.choice_id !== 'open'; })) {
+    choices = choices.filter(function(c) { return c.choice_id !== 'open'; });
+  }
   if (choices.length < 2) return null;
   return JSON.stringify({ message: msg, choices: choices });
 `;
@@ -4516,6 +5174,25 @@ function _buildPanelPermissionClickExpr(choiceId) {
   return `
     var panel = d.querySelector('.antigravity-agent-side-panel');
     if (!panel) return 'no-panel';
+    function dispatchPress(el) {
+      var w = d.defaultView || window;
+      if (typeof el.focus === 'function') {
+        try { el.focus(); } catch (_) {}
+      }
+      var rect = el.getBoundingClientRect();
+      var cx = rect.x + rect.width / 2;
+      var cy = rect.y + rect.height / 2;
+      var opts = { bubbles: true, cancelable: true, view: w, clientX: cx, clientY: cy, button: 0 };
+      if (w.PointerEvent) {
+        el.dispatchEvent(new w.PointerEvent('pointerdown', opts));
+      }
+      el.dispatchEvent(new w.MouseEvent('mousedown', opts));
+      if (w.PointerEvent) {
+        el.dispatchEvent(new w.PointerEvent('pointerup', opts));
+      }
+      el.dispatchEvent(new w.MouseEvent('mouseup', opts));
+      el.dispatchEvent(new w.MouseEvent('click', opts));
+    }
 
     var allBtns = Array.from(panel.querySelectorAll('button'));
     var rejectBtn = null;
@@ -4579,16 +5256,7 @@ function _buildPanelPermissionClickExpr(choiceId) {
 
     if (!found) return 'no-match';
     if (found.disabled || found.getAttribute('aria-disabled') === 'true') return 'disabled';
-    // Dispatch full pointer+mouse event sequence for React compatibility
-    var rect = found.getBoundingClientRect();
-    var cx = rect.x + rect.width / 2;
-    var cy = rect.y + rect.height / 2;
-    var opts = { bubbles: true, cancelable: true, view: window, clientX: cx, clientY: cy, button: 0 };
-    found.dispatchEvent(new PointerEvent('pointerdown', opts));
-    found.dispatchEvent(new MouseEvent('mousedown', opts));
-    found.dispatchEvent(new PointerEvent('pointerup', opts));
-    found.dispatchEvent(new MouseEvent('mouseup', opts));
-    found.dispatchEvent(new MouseEvent('click', opts));
+    dispatchPress(found);
     return 'clicked';
   `;
 }
@@ -4632,9 +5300,11 @@ async function detectPermissionDialog(Runtime, agentType) {
   // Antigravity panel: use panel-specific inline prompt detection
   if (agentType === 'antigravity_panel') {
     try {
-      const raw = await evalInPage(Runtime, ANTIGRAVITY_PANEL_PERMISSION_EXPR);
-      if (!raw) return null;
-      return JSON.parse(raw);
+      const pageRaw = await evalInPage(Runtime, PERMISSION_DIALOG_EXPR);
+      if (pageRaw) return JSON.parse(pageRaw);
+      const panelRaw = await evalInPage(Runtime, ANTIGRAVITY_PANEL_PERMISSION_EXPR);
+      if (!panelRaw) return null;
+      return JSON.parse(panelRaw);
     } catch { return null; }
   }
 
@@ -4654,6 +5324,8 @@ async function detectPermissionDialog(Runtime, agentType) {
 async function respondToPermissionDialog(Runtime, agentType, choiceId, sessionId) {
   try {
     let r;
+    let verifyAntigravityPanel = false;
+    let verifyGenericPrompt = false;
     if (agentType === 'continue') {
       // Continue uses data-testid for accept/reject buttons.
       // Simple .click() doesn't trigger React's synthetic event system inside
@@ -4668,6 +5340,7 @@ async function respondToPermissionDialog(Runtime, agentType, choiceId, sessionId
         }
         if (!btn) return 'no-btn';
         if (btn.disabled) return 'disabled';
+        console.log('[continue-focus] permission:dispatch-pointer-sequence');
         var rect = btn.getBoundingClientRect();
         var cx = rect.x + rect.width / 2;
         var cy = rect.y + rect.height / 2;
@@ -4681,6 +5354,7 @@ async function respondToPermissionDialog(Runtime, agentType, choiceId, sessionId
         // Fallback: also try the keyboard shortcut (Ctrl+Enter = Accept)
         var isAccept = '${choiceId}'.indexOf('accept') !== -1;
         if (isAccept) {
+          console.log('[continue-focus] permission:dispatch-ctrl-enter');
           var kbOpts = { key: 'Enter', code: 'Enter', keyCode: 13, ctrlKey: true, bubbles: true, cancelable: true };
           d.body.dispatchEvent(new w.KeyboardEvent('keydown', kbOpts));
           d.body.dispatchEvent(new w.KeyboardEvent('keyup', kbOpts));
@@ -4689,10 +5363,28 @@ async function respondToPermissionDialog(Runtime, agentType, choiceId, sessionId
       `);
     } else if (agentType === 'antigravity_panel') {
       r = await evalInPage(Runtime, _buildPanelPermissionClickExpr(choiceId));
+      verifyAntigravityPanel = (r === 'clicked');
     } else {
       const usePageEval = agentType === 'codex-desktop' || agentType === 'antigravity';
       const evalFn = usePageEval ? evalInPage : evalInFrame;
       r = await evalFn(Runtime, _buildPermissionClickExpr(choiceId));
+      verifyGenericPrompt = (r === 'clicked');
+    }
+    if (verifyAntigravityPanel) {
+      await new Promise(resolve => setTimeout(resolve, 350));
+      const followup = await detectPermissionDialog(Runtime, 'antigravity_panel');
+      if (followup && Array.isArray(followup.choices) && followup.choices.some(c => c.choice_id === choiceId)) {
+        console.warn(`[${sessionId}] [perm] Antigravity panel prompt persisted after click '${choiceId}'`);
+        return { ok: false, code: 'click_not_applied', detail: 'Prompt remained visible after click' };
+      }
+    }
+    if (verifyGenericPrompt) {
+      await new Promise(resolve => setTimeout(resolve, 350));
+      const followup = await detectPermissionDialog(Runtime, agentType);
+      if (followup && Array.isArray(followup.choices) && followup.choices.some(c => c.choice_id === choiceId)) {
+        console.warn(`[${sessionId}] [perm] Prompt persisted after click '${choiceId}'`);
+        return { ok: false, code: 'click_not_applied', detail: 'Prompt remained visible after click' };
+      }
     }
     if (r === 'clicked') {
       console.log(`[${sessionId}] [perm] Clicked choice '${choiceId}'`);
@@ -4843,35 +5535,103 @@ async function setCodexDesktopConfig(Runtime, { model_id, effort, access_mode })
 
 async function newCodexThread(Runtime, usePageEval) {
   const evalFn = usePageEval ? evalInPage : evalInFrame;
+  let beforeThreadList = null;
+  let beforeDraftState = false;
+  try {
+    beforeThreadList = await readCodexThreadList(Runtime, usePageEval);
+  } catch {}
+  try {
+    const raw = await evalFn(Runtime, `
+      JSON.stringify({
+        body: (d.body && d.body.innerText ? d.body.innerText : '').slice(0, 1200)
+      })
+    `);
+    let payload = raw;
+    if (typeof raw === 'string') {
+      try { payload = JSON.parse(raw); } catch { payload = { body: raw }; }
+    }
+    const bodyText = payload && typeof payload.body === 'string' ? payload.body : '';
+    beforeDraftState = !!(bodyText && /let.?s build|message codex|what can i help|start typing/i.test(bodyText.toLowerCase()));
+  } catch {}
+
+  // Codex Desktop can already be on the blank draft/new-chat screen without a
+  // persisted thread yet. Treat that as a valid "new chat" state.
+  if (beforeDraftState) return true;
 
   // Try to find and click a "New thread" button
   const res = await evalFn(Runtime, `
+    function dispatchPress(el) {
+      var w = d.defaultView || window;
+      if (typeof el.focus === 'function') {
+        try { el.focus(); } catch (_) {}
+      }
+      var rect = el.getBoundingClientRect();
+      var cx = rect.x + rect.width / 2;
+      var cy = rect.y + rect.height / 2;
+      var opts = { bubbles: true, cancelable: true, view: w, clientX: cx, clientY: cy, button: 0 };
+      if (w.PointerEvent) {
+        el.dispatchEvent(new w.PointerEvent('pointerdown', opts));
+      }
+      el.dispatchEvent(new w.MouseEvent('mousedown', opts));
+      if (w.PointerEvent) {
+        el.dispatchEvent(new w.PointerEvent('pointerup', opts));
+      }
+      el.dispatchEvent(new w.MouseEvent('mouseup', opts));
+      el.dispatchEvent(new w.MouseEvent('click', opts));
+    }
     var allEls = Array.from(d.querySelectorAll('button, [role="button"], [role="menuitem"]'));
     var btn = allEls.find(function(el) {
       var t = (el.textContent || el.getAttribute('aria-label') || '').trim().toLowerCase();
       return t === 'new thread' || t === 'new chat' || t === 'new conversation';
     });
-    if (btn) { btn.click(); return 'clicked'; }
+    if (btn) { dispatchPress(btn); return 'clicked'; }
     // Also try aria-label="New chat"
     var ariaBtn = d.querySelector('button[aria-label="New chat"], button[aria-label="New thread"]');
-    if (ariaBtn) { ariaBtn.click(); return 'clicked-aria'; }
+    if (ariaBtn) { dispatchPress(ariaBtn); return 'clicked-aria'; }
     return 'not-found';
   `);
 
-  if (res === 'clicked') return true;
-
-  // Fallback: keyboard shortcut (Ctrl+N is common "new" action in Codex)
+  let attempted = res === 'clicked' || res === 'clicked-aria';
+  // Fallback: keyboard shortcut (Ctrl+Shift+N is common "new thread" action in Codex)
   try {
     const { Input } = Runtime._cdp || {};
     if (Input) {
-      await evalFn(Runtime, `
-        d.dispatchEvent(new KeyboardEvent('keydown', {
-          key: 'n', code: 'KeyN', ctrlKey: true, shiftKey: true, bubbles: true
-        }));
-      `);
-      return true;
+      await Input.dispatchKeyEvent({ type: 'keyDown', key: 'Control', code: 'ControlLeft', windowsVirtualKeyCode: 17, nativeVirtualKeyCode: 17 });
+      await Input.dispatchKeyEvent({ type: 'keyDown', key: 'Shift', code: 'ShiftLeft', windowsVirtualKeyCode: 16, nativeVirtualKeyCode: 16 });
+      await Input.dispatchKeyEvent({ type: 'keyDown', key: 'N', code: 'KeyN', windowsVirtualKeyCode: 78, nativeVirtualKeyCode: 78, modifiers: 10 });
+      await Input.dispatchKeyEvent({ type: 'keyUp', key: 'N', code: 'KeyN', windowsVirtualKeyCode: 78, nativeVirtualKeyCode: 78, modifiers: 10 });
+      await Input.dispatchKeyEvent({ type: 'keyUp', key: 'Shift', code: 'ShiftLeft', windowsVirtualKeyCode: 16, nativeVirtualKeyCode: 16, modifiers: 2 });
+      await Input.dispatchKeyEvent({ type: 'keyUp', key: 'Control', code: 'ControlLeft', windowsVirtualKeyCode: 17, nativeVirtualKeyCode: 17 });
+      attempted = true;
     }
   } catch {}
+
+  if (!attempted) return false;
+
+  for (let i = 0; i < 8; i++) {
+    await new Promise(r => setTimeout(r, 300));
+    try {
+      const afterThreadList = await readCodexThreadList(Runtime, usePageEval);
+      const beforeSig = JSON.stringify(beforeThreadList || []);
+      const afterSig = JSON.stringify(afterThreadList || []);
+      if (afterSig !== beforeSig) return true;
+      const activeExists = Array.isArray(afterThreadList) && afterThreadList.some(t => t.active);
+      if (activeExists && (!beforeThreadList || !beforeThreadList.some(t => t.active))) return true;
+    } catch {}
+    try {
+      const raw = await evalFn(Runtime, `
+        JSON.stringify({
+          body: (d.body && d.body.innerText ? d.body.innerText : '').slice(0, 400)
+        })
+      `);
+      const bodyText = typeof raw === 'string'
+        ? raw
+        : (raw && typeof raw.body === 'string' ? raw.body : '');
+      if (bodyText && /what can i help|let.?s build|message codex|start typing/i.test(bodyText.toLowerCase())) {
+        return true;
+      }
+    } catch {}
+  }
 
   return false;
 }
@@ -5054,8 +5814,11 @@ async function readCodexThreadList(Runtime, usePageEval) {
         for (var i = 0; i < threadDivs.length; i++) {
           var clickable = threadDivs[i];
           var fullText = (clickable.textContent || '').trim();
+          var lines = fullText.split('\\n').map(function(line) { return line.trim(); }).filter(Boolean);
+          var titleLine = lines.find(function(line) { return !/^\\d+[smhd]$/.test(line); }) || fullText;
           // Strip trailing age suffixes like "2d", "15m", "3h" that got concatenated
-          var text = fullText.replace(/\\d+[smhd]$/, '').trim();
+          var text = titleLine.replace(/\\d+[smhd]$/, '').trim();
+          text = text.replace(/[\\uFFFD{}\\]\\[]+/g, ' ').replace(/\\s{2,}/g, ' ').trim();
           if (!text || text.length < 2) continue;
           // Try to extract the age badge from remaining text
           var ageMatch = fullText.match(/(\\d+[smhd])$/);
@@ -5085,54 +5848,105 @@ async function readCodexThreadList(Runtime, usePageEval) {
 async function switchCodexThread(Runtime, threadId, usePageEval) {
   const evalFn = usePageEval ? evalInPage : evalInFrame;
   try {
+    let beforeThreadList = [];
+    try {
+      beforeThreadList = await readCodexThreadList(Runtime, usePageEval);
+    } catch {}
     const raw = await evalFn(Runtime, `
       (function() {
+        function dispatchPress(el) {
+          var w = d.defaultView || window;
+          if (typeof el.focus === 'function') {
+            try { el.focus(); } catch (_) {}
+          }
+          var rect = el.getBoundingClientRect();
+          var cx = rect.x + rect.width / 2;
+          var cy = rect.y + rect.height / 2;
+          var opts = { bubbles: true, cancelable: true, view: w, clientX: cx, clientY: cy, button: 0 };
+          if (w.PointerEvent) {
+            el.dispatchEvent(new w.PointerEvent('pointerdown', opts));
+          }
+          el.dispatchEvent(new w.MouseEvent('mousedown', opts));
+          if (w.PointerEvent) {
+            el.dispatchEvent(new w.PointerEvent('pointerup', opts));
+          }
+          el.dispatchEvent(new w.MouseEvent('mouseup', opts));
+          el.dispatchEvent(new w.MouseEvent('click', opts));
+        }
         var targetId = ${JSON.stringify(threadId)};
 
         // Strategy 1: Find by data attribute
         var el = d.querySelector('[data-thread-id="' + targetId + '"]') ||
                  d.querySelector('[data-conversation-id="' + targetId + '"]');
-        if (el) { el.click(); return JSON.stringify({ ok: true, method: 'data-attr' }); }
+        if (el) { dispatchPress(el); return JSON.stringify({ ok: true, method: 'data-attr' }); }
 
         // Strategy 2: Find by index (thread-N pattern) — matches readCodexThreadList
         var idxMatch = targetId.match(/^thread-(\\d+)$/);
         if (idxMatch) {
           var idx = parseInt(idxMatch[1], 10);
 
-          // Build same thread list as readCodexThreadList to find by index
           var clickables = [];
-          var active = d.querySelector('[aria-current="page"]');
-          if (active) {
-            var wrapper = active.parentElement;
-            var container = wrapper ? wrapper.parentElement : null;
-            if (container) {
-              Array.from(container.children).forEach(function(sib) {
-                var c = sib.querySelector('[class*="cursor-interaction"]');
-                if (c && (c.textContent || '').trim().length > 1) clickables.push(c);
-              });
-            }
-          }
-          // Fallback: overflow-hidden wrappers in nav
-          if (clickables.length === 0) {
-            var nav = d.querySelector('nav');
-            if (nav) {
-              Array.from(nav.querySelectorAll('[class*="overflow-hidden"][class*="will-change"]')).forEach(function(w) {
-                var c = w.querySelector('[class*="cursor-interaction"]');
-                if (c && (c.textContent || '').trim().length > 1) clickables.push(c);
-              });
+          var nav = d.querySelector('nav');
+          if (nav) {
+            var threadDivs = Array.from(nav.querySelectorAll('div[class*="group"][class*="cursor-interaction"][class*="rounded-lg"]'));
+            for (var i = 0; i < threadDivs.length; i++) {
+              var clickable = threadDivs[i];
+              var fullText = (clickable.textContent || '').trim();
+              var text = fullText.replace(/\\d+[smhd]$/, '').trim();
+              if (!text || text.length < 2) continue;
+              clickables.push(clickable);
             }
           }
 
           if (clickables[idx]) {
-            clickables[idx].click();
-            return JSON.stringify({ ok: true, method: 'index-thread' });
+            dispatchPress(clickables[idx]);
+            return JSON.stringify({ ok: true, method: 'index-thread', index: idx });
           }
         }
 
         return JSON.stringify({ ok: false, detail: 'thread-not-found: ' + targetId });
       })()
     `);
-    try { return JSON.parse(raw); } catch { return { ok: false, detail: 'eval-failed' }; }
+    let initial;
+    try { initial = JSON.parse(raw); } catch { initial = null; }
+    const attempted = !!initial?.ok || /^thread-\d+$/.test(String(threadId || ''));
+
+    for (let i = 0; i < 8; i++) {
+      await new Promise(r => setTimeout(r, 350));
+      const idxMatch = String(threadId || '').match(/^thread-(\d+)$/);
+      const targetIndex = idxMatch ? parseInt(idxMatch[1], 10) : null;
+      const targetTitle = (targetIndex != null && beforeThreadList[targetIndex]?.title) ? beforeThreadList[targetIndex].title : null;
+      try {
+        const afterThreadList = await readCodexThreadList(Runtime, usePageEval);
+        if (targetIndex != null && afterThreadList[targetIndex]?.active) {
+          return { ok: true, method: initial.method, verified: 'active-thread' };
+        }
+        if (JSON.stringify(afterThreadList || []) !== JSON.stringify(beforeThreadList || [])) {
+          return { ok: true, method: initial.method, verified: 'thread-list-changed' };
+        }
+      } catch {}
+      try {
+        const rawBody = await evalFn(Runtime, `
+          JSON.stringify({ body: (d.body && d.body.innerText ? d.body.innerText : '').slice(0, 500) })
+        `);
+        const bodyText = typeof rawBody === 'string'
+          ? rawBody
+          : (rawBody && typeof rawBody.body === 'string' ? rawBody.body : '');
+        if (bodyText) {
+          const lowerBody = bodyText.toLowerCase();
+          if (targetTitle && lowerBody.includes(targetTitle.toLowerCase()) && !/let.?s build|enable now/i.test(lowerBody)) {
+            return { ok: true, method: initial?.method, verified: 'target-title-visible' };
+          }
+          if (!/let.?s build|enable now/i.test(lowerBody)) {
+            return { ok: true, method: initial?.method, verified: 'body-changed' };
+          }
+        }
+      } catch {}
+    }
+    if (!attempted) {
+      return initial || { ok: false, detail: 'switch-not-attempted' };
+    }
+    return { ok: false, detail: 'thread-switch-not-observed', method: initial?.method };
   } catch (e) {
     return { ok: false, code: 'cdp_error', detail: e.message };
   }
@@ -5212,17 +6026,31 @@ async function openCodexPanel(Runtime) {
  *   - A dropdown/header menu
  *   - Thread items with titles
  */
-async function readCodexChatList(Runtime, usePageEval) {
+async function readCodexChatList(Runtime, usePageEval, navigateToList = false) {
   const evalFn = usePageEval ? evalInPage : evalInFrame;
 
-  // If we're in a chat (Back button visible), click Back to show the list
-  const needsBack = await evalFn(Runtime, `
-    var back = d.querySelector('button[aria-label="Back"]');
-    if (back && back.offsetParent !== null) { back.click(); return 'clicked'; }
-    return 'already-list';
-  `);
-  if (needsBack === 'clicked') {
-    await new Promise(r => setTimeout(r, 800));
+  // Only click Back to navigate to the list when explicitly requested
+  // (e.g. from the web UI chat_list_request). During background polling,
+  // navigateToList=false so we only read what's already visible — clicking
+  // Back during polling would yank the user out of their active conversation.
+  if (navigateToList) {
+    const needsBack = await evalFn(Runtime, `
+      var back = d.querySelector('button[aria-label="Back"]');
+      if (back && back.offsetParent !== null) { back.click(); return 'clicked'; }
+      return 'already-list';
+    `);
+    if (needsBack === 'clicked') {
+      await new Promise(r => setTimeout(r, 800));
+    }
+  } else {
+    // During background polling, check if we're inside an active conversation
+    // (Back button visible = we're in a chat, not on the list).  Return empty
+    // so the caller doesn't misinterpret in-chat DOM elements as a chat list.
+    const inChat = await evalFn(Runtime, `
+      var back = d.querySelector('button[aria-label="Back"]');
+      return (back && back.offsetParent !== null) ? 'in-chat' : 'on-list';
+    `);
+    if (inChat === 'in-chat') return [];
   }
 
   const raw = await evalFn(Runtime, `
@@ -5376,6 +6204,80 @@ async function detectAntigravityPanelOpen(Runtime) {
     `);
     return result === true;
   } catch { return false; }
+}
+
+const WORKBENCH_PANE_SUMMARY_EXPR = `
+  return (function() {
+    function readPane(partSelector) {
+      var part = d.querySelector(partSelector);
+      if (!part) return null;
+      var style = window.getComputedStyle(part);
+      var visible = !(style.display === 'none' || style.visibility === 'hidden' || (part.offsetWidth === 0 && part.offsetHeight === 0));
+      var text = (part.innerText || '').replace(/\\s+/g, ' ').trim();
+      var title = null;
+      var titleSelectors = [
+        '.composite.title .title-label',
+        '.pane-header .title',
+        '.pane-header .pane-header-title',
+        '.title-label',
+        '.monaco-breadcrumbs',
+        'h1, h2, h3'
+      ];
+      for (var i = 0; i < titleSelectors.length && !title; i++) {
+        var el = part.querySelector(titleSelectors[i]);
+        var candidate = el ? (el.innerText || el.textContent || '').replace(/\\s+/g, ' ').trim() : '';
+        if (candidate) title = candidate;
+      }
+      if (!title && text) {
+        title = text.split(/\\n+/)[0].trim();
+      }
+      return {
+        visible: !!visible,
+        title: title || null,
+        text: text ? text.slice(0, 800) : ''
+      };
+    }
+
+    function inferAgent(title, text) {
+      var hay = ((title || '') + ' ' + (text || '')).toLowerCase();
+      if (!hay) return null;
+      if (hay.includes('codex') || hay.includes('gpt-5')) return 'codex';
+      if (hay.includes('continue')) return 'continue';
+      if (
+        hay.includes('antigravity')
+        || hay.includes('agent')
+        || hay.includes('ask anything, @ to mention')
+        || hay.includes('claude')
+        || hay.includes('gemini')
+        || hay.includes('opus')
+        || hay.includes('sonnet')
+        || hay.includes('flash')
+        || hay.includes('google ai pro')
+      ) return 'antigravity_panel';
+      return null;
+    }
+
+    var sidebar = readPane('.part.sidebar');
+    var auxiliary = readPane('.part.auxiliarybar');
+    return JSON.stringify({
+      sidebar_visible: !!(sidebar && sidebar.visible),
+      sidebar_title: (sidebar && sidebar.title) || null,
+      sidebar_agent: inferAgent(sidebar && sidebar.title, sidebar && sidebar.text),
+      auxiliary_visible: !!(auxiliary && auxiliary.visible),
+      auxiliary_title: (auxiliary && auxiliary.title) || null,
+      auxiliary_agent: inferAgent(auxiliary && auxiliary.title, auxiliary && auxiliary.text),
+    });
+  })()
+`;
+
+async function readWorkbenchPaneSummary(Runtime) {
+  try {
+    const raw = await evalInPage(Runtime, WORKBENCH_PANE_SUMMARY_EXPR);
+    if (!raw) return null;
+    return JSON.parse(raw);
+  } catch {
+    return null;
+  }
 }
 
 /**
@@ -5981,6 +6883,7 @@ module.exports = {
   readMessages,
   readAgentConfig,
   setAgentModel,
+  setAgentPermissionMode,
   setAntigravityMode,
   interruptAgent,
   detectPermissionDialog,
@@ -5993,6 +6896,7 @@ module.exports = {
   evalInPage,
   readAntigravitySessionTitle,
   readAntigravityPanelTitle,
+  readAntigravityPanelSummary,
   detectAntigravityPanelHasContent,
   readCodexRateLimit,
   readClaudeRateLimit,
@@ -6024,6 +6928,7 @@ module.exports = {
   // Epic 10 — Antigravity Panel management
   detectAntigravityPanelOpen,
   openAntigravityPanel,
+  readWorkbenchPaneSummary,
   readAntigravityPanelChatList,
   switchAntigravityPanelChat,
   newAntigravityPanelChat,

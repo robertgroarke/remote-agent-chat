@@ -1,6 +1,6 @@
 'use strict';
 
-const CACHE_NAME = 'agent-chat-v29';
+const CACHE_NAME = 'agent-chat-v38';
 
 const SHELL_ASSETS = [
   '/',
@@ -67,7 +67,28 @@ self.addEventListener('fetch', event => {
     return;
   }
 
-  // Static shell assets: cache-first
+  // Shell JS/CSS should be network-first so UI fixes aren't masked by stale SW cache.
+  if (
+    url.pathname === '/styles.css' ||
+    url.pathname === '/hooks.jsx' ||
+    url.pathname === '/app.jsx' ||
+    url.pathname === '/dist/bundle.js'
+  ) {
+    event.respondWith(
+      fetch(event.request)
+        .then(response => {
+          if (response.ok) {
+            const clone = response.clone();
+            caches.open(CACHE_NAME).then(cache => cache.put(event.request, clone));
+          }
+          return response;
+        })
+        .catch(() => caches.match(event.request))
+    );
+    return;
+  }
+
+  // Other static shell assets: cache-first
   event.respondWith(
     caches.match(event.request).then(cached => {
       if (cached) return cached;

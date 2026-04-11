@@ -81,6 +81,15 @@ export function useRelay() {
       if (id) send({ type: 'get_history', session: id });
     }
 
+    function clearSessionTranscript(sessionId) {
+      if (!sessionId) return;
+      setMessages(prev => ({ ...prev, [sessionId]: [] }));
+      setQueuedMessages(prev => ({ ...prev, [sessionId]: [] }));
+      setThinking(prev => ({ ...prev, [sessionId]: false }));
+      setThinkingContent(prev => ({ ...prev, [sessionId]: '' }));
+      setActivities(prev => ({ ...prev, [sessionId]: false }));
+    }
+
     // Responds to a permission prompt.
     function respondToPrompt(sessionId, promptId, choiceId) {
       const requestId = `prompt-${Date.now()}-${Math.random().toString(36).slice(2, 7)}`;
@@ -137,6 +146,7 @@ export function useRelay() {
 
     function newThread(sessionId) {
       const requestId = `new-thread-${Date.now()}-${Math.random().toString(36).slice(2, 7)}`;
+      clearSessionTranscript(sessionId);
       send({ type: 'new_thread', session_id: sessionId, request_id: requestId });
       return requestId;
     }
@@ -173,6 +183,7 @@ export function useRelay() {
 
     function switchThread(sessionId, threadId) {
       const requestId = `swthread-${Date.now()}-${Math.random().toString(36).slice(2, 7)}`;
+      clearSessionTranscript(sessionId);
       send({ type: 'switch_thread', session_id: sessionId, thread_id: threadId, request_id: requestId });
       return requestId;
     }
@@ -554,6 +565,12 @@ export function useRelay() {
         if (msg.request_id) {
           setControlResults(prev => ({ ...prev, [msg.request_id]: { ...msg, received_at: Date.now() } }));
         }
+        if (sid && msg.result === 'ok' && (msg.command === 'new_thread' || msg.command === 'switch_thread')) {
+          clearSessionTranscript(sid);
+          requestHistory(sid);
+          setTimeout(() => requestHistory(sid), 300);
+          setTimeout(() => requestHistory(sid), 900);
+        }
         if (msg.command === 'permission_response' && sid) {
           if (msg.result === 'ok') {
             setPermissionPrompts(prev => { const { [sid]: _, ...rest } = prev; return rest; });
@@ -741,7 +758,7 @@ export function useRelay() {
       }
     }
 
-    return { sessions, messages, connected, unread, setUnread, thinking, thinkingContent, activities, health, deliveryStates, launchStates, justLaunched, setJustLaunched, permissionPrompts, respondToPrompt, interruptSession, agentConfigs, requestAgentConfig, setAgentModel, setAgentPermissionMode, setAntigravityMode, setCodexConfig, newThread, openPanel, requestChatList, switchChat, newChat, chatLists, requestThreadList, switchThread, threadLists, switchWorkspace, requestTerminalOutput, terminalOutputs, requestFileChanges, fileChanges, sendAttachment, send, sendToSession, steerMessage, discardQueuedMessage, editQueuedMessage, queuedMessages, launchSession, resumeSession, closeSession, activeSessionRef, workspaces, branchLists, requestBranchList, switchBranch, createBranch, skillLists, requestSkillList, controlResults, directoryListings, requestDirectoryListing, fileContents, requestFileContent };
+    return { sessions, messages, connected, unread, setUnread, thinking, thinkingContent, activities, health, deliveryStates, launchStates, justLaunched, setJustLaunched, permissionPrompts, respondToPrompt, interruptSession, agentConfigs, requestAgentConfig, setAgentModel, setAgentPermissionMode, setAntigravityMode, setCodexConfig, newThread, openPanel, requestChatList, switchChat, newChat, chatLists, requestThreadList, switchThread, threadLists, switchWorkspace, requestTerminalOutput, terminalOutputs, requestFileChanges, fileChanges, sendAttachment, send, sendToSession, steerMessage, discardQueuedMessage, editQueuedMessage, queuedMessages, launchSession, resumeSession, closeSession, activeSessionRef, workspaces, branchLists, requestBranchList, switchBranch, createBranch, skillLists, requestSkillList, controlResults, directoryListings, requestDirectoryListing, fileContents, requestFileContent, requestHistory };
   }
 
 // (removed window.useRelay — now an ES module export)

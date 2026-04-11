@@ -719,7 +719,22 @@ app.get('/manifest.json', (req, res) => {
   res.sendFile(path.join(PUBLIC_DIR, 'manifest.json'));
 });
 
-app.use('/', requireAuth, express.static(PUBLIC_DIR));
+app.use('/', requireAuth, express.static(PUBLIC_DIR, {
+  setHeaders: (res, filePath) => {
+    const lower = String(filePath || '').toLowerCase();
+    if (lower.endsWith(path.sep + 'index.html') || lower.endsWith('/index.html') || lower.endsWith('\\index.html')) {
+      res.setHeader('Cache-Control', 'no-store, no-cache, must-revalidate');
+      return;
+    }
+    if (lower.endsWith(path.sep + 'sw.js') || lower.endsWith('/sw.js') || lower.endsWith('\\sw.js')) {
+      res.setHeader('Cache-Control', 'no-store, no-cache, must-revalidate');
+      return;
+    }
+    if (/([\\/])dist[\\/].+\.js$/i.test(lower) || lower.endsWith('.css')) {
+      res.setHeader('Cache-Control', 'public, max-age=300, must-revalidate');
+    }
+  },
+}));
 
 // ── Runtime state ─────────────────────────────────────────────────────────────
 
@@ -757,6 +772,7 @@ const pendingPrompts  = new Map();
 const agentConfigs    = new Map();
 // In-flight control request routing: request_id → browser WebSocket
 const pendingCtrlReqs = new Map();
+const pendingPromptResponses = new Map();
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
 
@@ -1498,6 +1514,32 @@ function handleProxyConnection(ws, req) {
       const requestId = msg.request_id;
       const targetWs  = requestId ? pendingCtrlReqs.get(requestId) : null;
       if (requestId) pendingCtrlReqs.delete(requestId);
+      const promptMeta = requestId ? pendingPromptResponses.get(requestId) : null;
+      if (requestId) pendingPromptResponses.delete(requestId);
+      if (msg.command === 'permission_response' && promptMeta) {
+        const entry = pendingPrompts.get(promptMeta.key);
+        if (msg.result === 'ok') {
+          if (entry) {
+            clearTimeout(entry.timer);
+            pendingPrompts.delete(promptMeta.key);
+          }
+          broadcastToBrowsers({
+            type:             'permission_prompt_expired',
+            protocol_version: PROTOCOL_VERSION,
+            session_id:       promptMeta.sessionId,
+            prompt_id:        promptMeta.promptId,
+            applied_choice:   promptMeta.choiceId,
+            server_ts:        new Date().toISOString(),
+          });
+        } else if (entry) {
+          entry.prompt = {
+            ...entry.prompt,
+            submitting_choice_id: null,
+            error: msg.error?.message || 'Permission action did not apply',
+          };
+          broadcastToBrowsers(entry.prompt);
+        }
+      }
       if (targetWs && targetWs.readyState === WebSocket.OPEN) {
         targetWs.send(JSON.stringify(msg));
       }
@@ -2010,9 +2052,6 @@ function handleClientConnection(ws, req) {
         }));
         return;
       }
-      // Remove optimistically to prevent duplicate answers
-      clearTimeout(entry.timer);
-      pendingPrompts.delete(key);
       const proxyWs = proxySockets.get(sessionId);
       if (!proxyWs || proxyWs.readyState !== WebSocket.OPEN) {
         ws.send(JSON.stringify({
@@ -2025,9 +2064,27 @@ function handleClientConnection(ws, req) {
           error:            { code: 'no_proxy_connected', message: 'Proxy not connected' },
           server_ts:        new Date().toISOString(),
         }));
+        entry.prompt = {
+          ...entry.prompt,
+          submitting_choice_id: null,
+          error: 'Session not connected',
+        };
+        broadcastToBrowsers(entry.prompt);
         return;
       }
+      entry.prompt = {
+        ...entry.prompt,
+        submitting_choice_id: msg.choice_id || null,
+        error: null,
+      };
+      broadcastToBrowsers(entry.prompt);
       if (msg.request_id) pendingCtrlReqs.set(msg.request_id, ws);
+      if (msg.request_id) pendingPromptResponses.set(msg.request_id, {
+        key,
+        sessionId,
+        promptId,
+        choiceId: msg.choice_id || null,
+      });
       proxyWs.send(JSON.stringify({ ...msg, type: 'permission_response' }));
       log('info', 'prompt', 'Permission response forwarded', { session: sessionId, prompt_id: promptId, choice: msg.choice_id });
 

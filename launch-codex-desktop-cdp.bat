@@ -1,9 +1,20 @@
 @echo off
 setlocal
 
+REM Self-elevate to Administrator so the launched Codex process has elevated privileges.
+net session >nul 2>&1
+if %errorlevel% neq 0 (
+    powershell -NoProfile -Command "Start-Process '%~f0' -Verb RunAs"
+    exit /b
+)
+
 set "CDP_PORT=9225"
 set "AUMID=OpenAI.Codex_2p2nqsd0c76g0!App"
 set "TEMP_PS1=%TEMP%\launch-codex-cdp.ps1"
+set "ICON_DST=%~dp0codex-desktop.ico"
+
+REM Refresh the stable icon from the current Codex package (survives updates)
+powershell -NoProfile -Command "try { $p = (Get-AppxPackage -Name 'OpenAI.Codex').InstallLocation; $s = Join-Path $p 'app\resources\icon.ico'; if (Test-Path $s) { Copy-Item $s '%ICON_DST%' -Force } } catch {}" 2>nul
 
 REM Kill the WindowsApps Codex instance only.
 REM The Antigravity Codex extension also runs codex.exe from a different path.

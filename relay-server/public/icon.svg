@@ -1,0 +1,11 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512">
+  <rect width="512" height="512" rx="96" fill="#1a1a1a"/>
+  <rect x="80" y="140" width="352" height="232" rx="28" fill="#2a2a2a"/>
+  <rect x="80" y="140" width="352" height="48" rx="28" fill="#333"/>
+  <rect x="80" y="168" width="352" height="20" fill="#333"/>
+  <circle cx="116" cy="164" r="10" fill="#ff5f57"/>
+  <circle cx="148" cy="164" r="10" fill="#ffbd2e"/>
+  <circle cx="180" cy="164" r="10" fill="#28ca42"/>
+  <text x="112" y="262" font-family="monospace" font-size="52" fill="#7c6aff" font-weight="bold">›_</text>
+  <text x="112" y="320" font-family="monospace" font-size="32" fill="#888">claude-1</text>
+</svg>

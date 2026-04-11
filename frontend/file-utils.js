@@ -20,13 +20,22 @@ function isTextFile(filename) {
 }
 
 // Session display label — handles both legacy string IDs and protocol v1 metadata objects
-const AGENT_DISPLAY = { claude: 'Claude Code', codex: 'Codex', gemini: 'Gemini', continue: 'Continue' };
+const AGENT_DISPLAY = {
+  claude: 'Claude Code',
+  codex: 'Codex',
+  gemini: 'Gemini',
+  continue: 'Continue',
+  antigravity: 'Antigravity',
+  antigravity_panel: 'Antigravity Chat',
+  'codex-desktop': 'Codex Desktop',
+  'claude-desktop': 'Claude Desktop',
+};
 const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
 
 function sessionLabel(sessionOrId, fallbackId) {
   // Protocol v1: metadata object with display_name / workspace_name
   if (sessionOrId && typeof sessionOrId === 'object') {
-    const name      = sessionOrId.display_name || AGENT_DISPLAY[sessionOrId.agent_type] || sessionOrId.agent_type || 'Agent';
+    const name      = AGENT_DISPLAY[sessionOrId.agent_type] || sessionOrId.display_name || sessionOrId.agent_type || 'Agent';
     const workspace = sessionOrId.workspace_name || sessionOrId.window_title || '';
     return workspace ? name + ' \u2014 ' + workspace : name;
   }
