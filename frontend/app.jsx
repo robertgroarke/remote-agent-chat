@@ -2397,27 +2397,22 @@ function App() {
     && activeSessionMeta.visible_pane_agent
     && activeSessionMeta.visible_pane_agent !== 'codex'
   );
-  const paneAwareSession = !!(
-    activeSessionMeta
-    && (
-      activeSessionMeta.agent_type === 'codex'
-      || activeSessionMeta.agent_type === 'antigravity_panel'
-    )
-  );
+  const activeLabel = activeSession ? sessionLabel(activeSessionMeta, activeSession) : 'Agent Chat';
+  const activeAgent = sessionAgent(activeSessionMeta || activeSession, activeConfig);
+  const activeLooksLikeCodex = activeAgent?.name === 'Codex' || /^Codex\b/.test(activeLabel || '');
   const showVisiblePaneBanner = !!(
-    paneAwareSession
+    activeLooksLikeCodex
+    && activeSessionMeta
+    && activeSessionMeta.agent_type === 'codex'
     && (
       (activeCodexPaneMismatch && visiblePaneSession)
       || (
-        activeSessionMeta.agent_type === 'codex'
-        && !codexWorkbenchPaneSummary
+        !codexWorkbenchPaneSummary
         && visiblePaneSession
         && (visiblePaneSession.panel_agent === 'antigravity_panel' || visiblePaneSummary)
       )
     )
   );
-  const activeLabel = activeSession ? sessionLabel(activeSessionMeta, activeSession) : 'Agent Chat';
-  const activeAgent = sessionAgent(activeSessionMeta || activeSession, activeConfig);
   const activeWindowLabel = activeSession ? sessionSubLabel(activeSessionMeta, activeSession) : '';
   const activeWorkspacePath = activeSessionMeta && typeof activeSessionMeta === 'object'
     ? activeSessionMeta.workspace_path
