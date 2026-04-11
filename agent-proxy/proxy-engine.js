@@ -3496,6 +3496,7 @@ class ProxyEngine extends EventEmitter {
         })
         .filter(Boolean);
 
+      let sessionMetaChanged = false;
       const openWithPaths = this.openWorkspaces.filter(w => w.path);
       for (const [sid, session] of this.sessions.entries()) {
         const nameBad = !session.workspace_name || /^window-\d+$/.test(session.workspace_name);
@@ -3519,6 +3520,7 @@ class ProxyEngine extends EventEmitter {
                 window_title: resolvedTitle,
               });
               this._log('info', `[discover] Corrected workspace for ${sid}: "${wsMatch.title}" (${wsMatch.path})`);
+              sessionMetaChanged = true;
             }
             continue;
           }
@@ -3530,6 +3532,7 @@ class ProxyEngine extends EventEmitter {
           session.workspace_name = derived;
           sessionStore.updateSession(sid, { workspace_name: derived });
           this._log('info', `[discover] Derived workspace name for ${sid}: "${derived}"`);
+          sessionMetaChanged = true;
           continue;
         }
         if (session.workspace_path) continue;
@@ -3545,13 +3548,18 @@ class ProxyEngine extends EventEmitter {
           session.workspace_name = resolvedTitle;
           sessionStore.updateSession(sid, { window_title: resolvedTitle, workspace_name: resolvedTitle });
           this._log('info', `[discover] Fixed window title for ${sid}: "${resolvedTitle}"`);
+          sessionMetaChanged = true;
         }
         if (wsMatch) {
           session.workspace_path = wsMatch.path;
           session.workspace_name = wsMatch.title;
           sessionStore.updateSession(sid, { workspace_path: wsMatch.path, workspace_name: wsMatch.title });
           this._log('info', `[discover] Resolved workspace for ${sid}: ${wsMatch.path}`);
+          sessionMetaChanged = true;
         }
+      }
+      if (sessionMetaChanged) {
+        this._broadcastSessionSnapshot();
       }
     }
 
