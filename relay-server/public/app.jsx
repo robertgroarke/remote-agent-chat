@@ -382,14 +382,7 @@ function ActivityRow({ activity, thinkingText, isClaude, pinned = false }) {
   const label = activity?.label || kind.replaceAll('_', ' ');
   const isThinkingKind = kind === 'thinking' || kind === 'generating';
   const showBlob = isClaude && isThinkingKind;
-  const visibleThinkingText = (thinkingText || '').trim()
-    || (
-      showBlob
-      && label
-      && !/^(Thinking|Generating)$/i.test(label)
-        ? label
-        : ''
-    );
+  const visibleThinkingText = showBlob ? '' : (thinkingText || '').trim();
 
   return (
     <div className={`activity-row ${meta.tone}${isActive ? ' active' : ''}${showBlob ? ' claude-thinking' : ''}${pinned ? ' pinned' : ''}`}>
@@ -2446,21 +2439,34 @@ function App() {
   const lastAssistantMsg = [...currentMessages].reverse().find(m => m.role === 'assistant');
   const liveThinkingText = activeSession ? (thinkingContent[activeSession] || '').trim() : '';
   const lastAssistantText = lastAssistantMsg ? normalizeMessageContent(lastAssistantMsg.content).trim() : '';
+  const showPinnedThinkingRow = !!(
+    activeActivity
+    && !activeActivity?.task_list
+    && hasSubstantiveLiveText(liveThinkingText)
+  );
   const showLiveAssistantDraft = !!(
     activeSession
     && activeActivity
     && (activeActivity.kind === 'thinking' || activeActivity.kind === 'generating')
+    && !showPinnedThinkingRow
     && hasSubstantiveLiveText(liveThinkingText)
     && (
       activeSessionMeta?.agent_type === 'codex'
       || activeSessionMeta?.agent_type === 'codex-desktop'
-      || activeSessionMeta?.agent_type === 'claude'
       || activeSessionMeta?.agent_type === 'antigravity_panel'
     )
     && liveThinkingText !== lastAssistantText
     && !lastAssistantText.includes(liveThinkingText)
   );
-
+  const showInlineClaudeActivity = !!(
+    activeActivity
+    && !activeActivity?.task_list
+    && activeSessionMeta?.agent_type === 'claude'
+  );
+  const shouldBottomAlignMessages = !!(
+    activeSession
+    && (currentMessages.length > 0 || showLiveAssistantDraft || showInlineClaudeActivity)
+  );
   // Auto-fetch thread list for desktop sessions with no messages (e.g. Codex Desktop showing chat picker)
   const hasThreadCap = activeConfig?.capabilities?.thread_list;
   const showDesktopThreadTabs = !!(
@@ -2529,7 +2535,6 @@ function App() {
       });
     }
   }, [activeSession, threadLists, optimisticThreadFocus]);
-
   function handleNewThread(sessionId = activeSession) {
     if (!sessionId) return;
     setPendingDraftThreads(prev => ({ ...prev, [sessionId]: true }));
@@ -2929,7 +2934,7 @@ function App() {
             }}
           >↓ Jump to Newest</button>
         )}
-        <div className="messages" ref={messagesListRef}>
+        <div className={`messages${shouldBottomAlignMessages ? ' align-end' : ''}${showInlineClaudeActivity ? ' compact-footer-gap' : ''}`} ref={messagesListRef}>
           {activePrompt && (
             <PermissionOverlay
               prompt={activePrompt}
@@ -3044,13 +3049,19 @@ function App() {
               </div>
             </div>
           )}
-          {activeActivity && !activeActivity?.task_list && <ActivityRow
+          {showInlineClaudeActivity && <ActivityRow
             activity={activeActivity}
             thinkingText={activeSession ? (thinkingContent[activeSession] || '') : ''}
-            isClaude={activeSessionMeta?.agent_type === 'claude'}
+            isClaude
           />}
           <div ref={messagesEndRef} />
         </div>
+        {activeActivity && !activeActivity?.task_list && !showInlineClaudeActivity && <ActivityRow
+          activity={activeActivity}
+          thinkingText={activeSession ? (thinkingContent[activeSession] || '') : ''}
+          isClaude={activeSessionMeta?.agent_type === 'claude'}
+          pinned
+        />}
         </div>
 
         {showSettings && activeSession && (

@@ -669,6 +669,33 @@ async function detectThinking(Runtime, agentType) {
         return target + '\\n' + txt;
       }
 
+      function isToolTraceLine(txt) {
+        txt = (txt || '').trim();
+        if (!txt) return true;
+        if (/^(Thinking|Generating|Show thinking|Hide thinking|Claude Code|Retry)$/i.test(txt)) return true;
+        if (/^(Bash|Read|Write|Edit|Edited|Update|Updated|Search|Searched|Find|Found|Glob pattern|Grep|LS|Cat|Kill|Launch|Rebuild|Inject|Poll|Check)\\b/i.test(txt)) return true;
+        if (/^[A-Za-z]:\\\\/.test(txt)) return true;
+        if (/^[/~.][\\\\/]/.test(txt)) return true;
+        if (/^[*._|~â€¢Â·â–Œ-]+$/.test(txt)) return true;
+        return false;
+      }
+
+      function compactNarrativeText(txt) {
+        txt = (txt || '').replace(/\\r\\n/g, '\\n').trim();
+        if (!txt) return '';
+        var paras = txt.split(/\\n{2,}/);
+        var kept = [];
+        for (var i = 0; i < paras.length; i++) {
+          var para = paras[i].trim();
+          if (!para) continue;
+          var lines = para.split('\\n').map(function(line) { return line.trim(); }).filter(Boolean);
+          var useful = lines.filter(function(line) { return !isToolTraceLine(line); });
+          if (useful.length === 0) continue;
+          kept.push(useful.join('\\n'));
+        }
+        return kept.join('\\n\\n').trim().substring(0, 3000);
+      }
+
       function collectDetailsText(detailsEl) {
         if (!detailsEl) return '';
         var parts = [];
@@ -678,9 +705,8 @@ async function detectThinking(Runtime, agentType) {
           if (!node || !node.offsetParent) continue;
           if (node.closest('summary')) continue;
           if (node.children.length > 0 && node.tagName !== 'PRE' && node.tagName !== 'CODE') continue;
-          var txt = (node.innerText || node.textContent || '').trim();
+          var txt = compactNarrativeText(node.innerText || node.textContent || '');
           if (!txt) continue;
-          if (/^(Thinking|Generating|Show thinking|Hide thinking)$/i.test(txt)) continue;
           parts.push(txt);
         }
         var joined = parts.join('\\n').replace(/\\n{3,}/g, '\\n\\n').trim();
@@ -696,9 +722,8 @@ async function detectThinking(Runtime, agentType) {
           if (!block || !block.offsetParent) continue;
           if (block.closest('details, summary, button')) continue;
           if (block.children.length > 0 && block.tagName !== 'PRE' && block.tagName !== 'CODE') continue;
-          var txt = (block.innerText || block.textContent || '').trim();
+          var txt = compactNarrativeText(block.innerText || block.textContent || '');
           if (!txt) continue;
-          if (/^(Thinking|Generating|Show thinking|Hide thinking|Claude Code|Bash|Retry)$/i.test(txt)) continue;
           if (/^[*._|~•·▌]+$/.test(txt)) continue;
           parts.push(txt);
         }
@@ -810,6 +835,27 @@ function buildClaudeReadExpr(userClass, userText, userTextAlt) {
 
     var BLOCK_TAGS = { DIV:1, P:1, LI:1, TR:1, H1:1, H2:1, H3:1, H4:1, H5:1, H6:1, BLOCKQUOTE:1, SECTION:1, ARTICLE:1 };
 
+    function compactToolBody(header, bodyText) {
+      var text = (bodyText || '').replace(/\\r\\n/g, '\\n').trim();
+      if (!text) return '';
+      var lowerHeader = String(header || '').toLowerCase();
+      var lines = text.split('\\n').map(function(line) { return line.trim(); }).filter(Boolean);
+      var filtered = [];
+      var seen = {};
+      lines.forEach(function(line) {
+        var lower = line.toLowerCase();
+        if (!line) return;
+        if (lower === lowerHeader) return;
+        if (seen[lower]) return;
+        seen[lower] = true;
+        filtered.push(line);
+      });
+      if (filtered.length === 0) return '';
+      if (/^read\b/i.test(lowerHeader)) return '';
+      var limit = (/^(glob|grep|search|find)\b/i.test(lowerHeader)) ? 2 : 3;
+      return filtered.slice(0, limit).join('\\n').substring(0, 600).trim();
+    }
+
     function nodeToText(node) {
       if (node.nodeType === 3) return node.textContent;
       if (node.nodeType !== 1) return '';
@@ -872,7 +918,9 @@ function buildClaudeReadExpr(userClass, userText, userTextAlt) {
               var ctxEndOrig = Math.min(maxOrig, maxOrig - suffixLen + 2);
               var ctxEndMod = Math.min(maxMod, maxMod - suffixLen + 2);
               for (var li = ctxStart; li < ctxEndOrig || li < ctxEndMod; li++) {
-                if (li < prefixLen || li >= maxOrig - suffixLen) {
+                var inSharedPrefix = li < prefixLen;
+                var inSharedSuffix = li >= (maxOrig - suffixLen) && li >= (maxMod - suffixLen);
+                if (inSharedPrefix || inSharedSuffix) {
                   // Context line (same in both)
                   if (li < maxMod) body += ' ' + modLines[li] + '\\n';
                 } else {
@@ -903,12 +951,13 @@ function buildClaudeReadExpr(userClass, userText, userTextAlt) {
             var monacoEditor = bodyEl.querySelector('.monaco-editor:not(.original-in-monaco-diff-editor):not(.modified-in-monaco-diff-editor)');
             if (monacoEditor) {
               var lines = Array.from(monacoEditor.querySelectorAll('.view-line')).map(function(l) { return l.textContent; });
-              body = lines.join('\\n');
+              body = compactToolBody(header, lines.join('\\n'));
             } else if (!bodyEl.querySelector('.monaco-diff-editor')) {
-              body = bodyEl.textContent.trim();
+              body = compactToolBody(header, bodyEl.textContent);
             }
           }
         }
+        if (!body) return '\\n[' + header + ']\\n[end]\\n';
         return '\\n[' + header + ']\\n' + body + '[end]\\n';
       }
       if (tag === 'PRE') {

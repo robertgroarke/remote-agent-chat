@@ -812,7 +812,7 @@ function parseIOBlock(content) {
   return null;
 }
 
-const IO_PREVIEW_LINES = 3; // max OUT lines shown without expanding
+const IO_PREVIEW_LINES = 10; // keep Claude IN/OUT blocks much closer to native fidelity
 
 function renderIOBlock(io, index) {
   const inLines  = (io.inText || '').trimEnd().split('\n');
@@ -824,9 +824,10 @@ function renderIOBlock(io, index) {
     const previewHtml = escapeHtml(preview.join('\n'));
     const emptyNote = lines.length === 0 || (lines.length === 1 && !lines[0].trim())
       ? '<span class="tool-io-empty">(no output)</span>' : '';
+    const rowClass = overflow.length > 0 ? 'tool-io-row has-overflow' : 'tool-io-row';
     if (!emptyNote && overflow.length > 0) {
       // Wrap preview and full content in sibling divs — toggled on expand/collapse
-      return `<div class="tool-io-row">
+      return `<div class="${rowClass}">
         <span class="tool-io-label">${label}</span>
         <div class="tool-io-content">
           <div class="tool-io-preview"><code class="tool-io-code">${previewHtml}</code><button class="tool-io-more-btn" type="button" data-full="${escapeAttr(lines.join('\n'))}">▸ ${overflow.length} more line${overflow.length === 1 ? '' : 's'}</button></div>
@@ -834,7 +835,7 @@ function renderIOBlock(io, index) {
         </div>
       </div>`;
     }
-    return `<div class="tool-io-row">
+    return `<div class="${rowClass}">
       <span class="tool-io-label">${label}</span>
       <div class="tool-io-content">${emptyNote || `<code class="tool-io-code">${previewHtml}</code>`}</div>
     </div>`;
