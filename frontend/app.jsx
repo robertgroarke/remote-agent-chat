@@ -2938,7 +2938,8 @@ function App() {
             }}
           >↓ Jump to Newest</button>
         )}
-        <div className={`messages${shouldBottomAlignMessages ? ' align-end' : ''}${showInlineClaudeActivity ? ' compact-footer-gap' : ''}`} ref={messagesListRef}>
+        <div className={`messages${showInlineClaudeActivity ? ' compact-footer-gap' : ''}`} ref={messagesListRef}>
+          {shouldBottomAlignMessages && <div className="messages-flex-spacer" />}
           {activePrompt && (
             <PermissionOverlay
               prompt={activePrompt}

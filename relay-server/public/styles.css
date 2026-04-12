@@ -711,8 +711,9 @@ body {
   touch-action: pan-y;
 }
 
-.messages.align-end {
-  justify-content: flex-end;
+.messages-flex-spacer {
+  flex: 1 1 auto;
+  min-height: 0;
 }
 
 .messages.compact-footer-gap {
