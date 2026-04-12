@@ -710,8 +710,8 @@ class ProxyEngine extends EventEmitter {
       }
 
       this._log('info', `[ctrl] agent_interrupt for ${sid} (${sessionData.agentType})`);
-      const interruptPromise = sessionData.agentType === 'continue'
-        ? this._withContinueClient(sessionData, client =>
+      const interruptPromise = this._isEphemeralIframeAgent(sessionData.agentType)
+        ? this._withEphemeralIframeClient(sessionData, client =>
             selectors.interruptAgent(client.Runtime, sessionData.agentType, sid)
           , 'interrupt')
         : selectors.interruptAgent(sessionData.client.Runtime, sessionData.agentType, sid);
@@ -754,8 +754,8 @@ class ProxyEngine extends EventEmitter {
         return;
       }
 
-      const permissionPromise = sessionData.agentType === 'continue'
-        ? this._withContinueClient(sessionData, client =>
+      const permissionPromise = this._isEphemeralIframeAgent(sessionData.agentType)
+        ? this._withEphemeralIframeClient(sessionData, client =>
             selectors.respondToPermissionDialog(client.Runtime, sessionData.agentType, choiceId, sid)
           , 'permission_response')
         : selectors.respondToPermissionDialog(sessionData.client.Runtime, sessionData.agentType, choiceId, sid);
@@ -793,8 +793,8 @@ class ProxyEngine extends EventEmitter {
       }
       const modelId = msg.model_id;
       this._log('info', `[ctrl] agent_set_model for ${sid} model=${modelId}`);
-      const setModelPromise = sessionData.agentType === 'continue'
-        ? this._withContinueClient(sessionData, client =>
+      const setModelPromise = this._isEphemeralIframeAgent(sessionData.agentType)
+        ? this._withEphemeralIframeClient(sessionData, client =>
             selectors.setAgentModel(client.Runtime, sessionData.agentType, modelId, sid, client.Input)
           , 'set_model')
         : selectors.setAgentModel(sessionData.client.Runtime, sessionData.agentType, modelId, sid, sessionData.client.Input);
@@ -910,7 +910,9 @@ class ProxyEngine extends EventEmitter {
 
       this._log('info', `[ctrl] agent_set_permission_mode for ${sid} mode=${mode}`);
       const persisted = this._writeAntigravitySetting('claudeCode.initialPermissionMode', mode);
-      selectors.setAgentPermissionMode(sessionData.client.Runtime, agentT, mode, sid)
+      this._withEphemeralIframeClient(sessionData, client =>
+        selectors.setAgentPermissionMode(client.Runtime, agentT, mode, sid)
+      , 'set_permission_mode')
         .then(result => {
           if (!persisted) {
             this._sendToRelay(proto.agentControlResult(sid, msg.request_id, 'agent_set_permission_mode', 'failed', {
@@ -1332,7 +1334,7 @@ class ProxyEngine extends EventEmitter {
 
       // Claude Code extension: send /clear to start a new conversation
       if (agentT === 'claude') {
-        selectors.sendMessage(sessionData.client.Runtime, 'claude', '/clear', sid)
+        this._sendSessionMessage(sessionData, '/clear', sid)
           .then(result => {
             this._sendToRelay(proto.agentControlResult(sid, requestId, 'new_chat', result.ok ? 'ok' : 'failed',
               result.ok ? undefined : { code: result.code || 'new_chat_failed', message: result.detail }));
@@ -2217,57 +2219,75 @@ class ProxyEngine extends EventEmitter {
   // perform all reads, then immediately disconnect.  This prevents the
   // webview from staying activated between polls.
 
-  async _ephemeralCdpPoll(session, sessionId) {
+  _isEphemeralIframeAgent(agentType) {
+    return agentType === 'continue' || agentType === 'claude';
+  }
+
+  async _ephemeralCdpPoll(session, sessionId, options = {}) {
+    const { includeConfig = false, includeRateLimit = false, forceRefreshContext = false } = options;
+    const focusTag = session.agentType === 'claude' ? 'claude-focus' : 'continue-focus';
     let client;
     try {
-      this._log('info', `[${sessionId}] [continue-focus] poll attach:start target=${session.targetId}`);
+      this._log('info', `[${sessionId}] [${focusTag}] poll attach:start target=${session.targetId}`);
       client = await CDP({ port: session._cdpPort || this.CDP_PORTS[0], target: session.targetId });
-      await this._primeContinueRuntime(session, client.Runtime);
+      client.Runtime._webviewId = session._webviewId || null;
+      await this._primeEphemeralIframeRuntime(session, client.Runtime, forceRefreshContext);
 
       let raw      = await selectors.readMessages(client.Runtime, session.agentType, sessionId);
       let thinking = await selectors.detectThinking(client.Runtime, session.agentType);
       const perm   = await selectors.detectPermissionDialog(client.Runtime, session.agentType);
+      const config = includeConfig
+        ? await selectors.readAgentConfig(client.Runtime, session.agentType, session.workspace_path).catch(() => null)
+        : null;
+      const rateLimit = includeRateLimit
+        ? await selectors.readClaudeRateLimit(client.Runtime).catch(() => null)
+        : null;
 
       if (raw === JSON.stringify([]) && (session.lastObservedCount || 0) > 0) {
-        await this._primeContinueRuntime(session, client.Runtime, true);
+        await this._primeEphemeralIframeRuntime(session, client.Runtime, true);
         raw = await selectors.readMessages(client.Runtime, session.agentType, sessionId);
         thinking = await selectors.detectThinking(client.Runtime, session.agentType);
       }
 
-      return { raw, thinking, perm, config: null };
+      return { raw, thinking, perm, config, rateLimit };
     } finally {
-      this._log('info', `[${sessionId}] [continue-focus] poll attach:end`);
+      this._log('info', `[${sessionId}] [${focusTag}] poll attach:end`);
       if (client) try { await client.close(); } catch {}
     }
   }
 
-  async _withContinueClient(session, work, reason = 'unknown') {
+  async _withEphemeralIframeClient(session, work, reason = 'unknown') {
+    const focusTag = session.agentType === 'claude' ? 'claude-focus' : 'continue-focus';
     let client;
     try {
-      this._log('info', `[${session.session_id}] [continue-focus] client attach:start reason=${reason} target=${session.targetId}`);
+      this._log('info', `[${session.session_id}] [${focusTag}] client attach:start reason=${reason} target=${session.targetId}`);
       client = await CDP({ port: session._cdpPort || this.CDP_PORTS[0], target: session.targetId });
-      await this._primeContinueRuntime(session, client.Runtime);
+      client.Runtime._webviewId = session._webviewId || null;
+      await this._primeEphemeralIframeRuntime(session, client.Runtime);
       return await work(client);
     } finally {
-      this._log('info', `[${session.session_id}] [continue-focus] client attach:end reason=${reason}`);
+      this._log('info', `[${session.session_id}] [${focusTag}] client attach:end reason=${reason}`);
       if (client) try { await client.close(); } catch {}
     }
   }
 
-  async _primeContinueRuntime(session, Runtime, forceRefresh = false) {
-    if (!forceRefresh && session._continueInnerContextId) {
-      Runtime._innerContextId = session._continueInnerContextId;
-      return session._continueInnerContextId;
+  async _primeEphemeralIframeRuntime(session, Runtime, forceRefresh = false) {
+    const focusTag = session.agentType === 'claude' ? 'claude-focus' : 'continue-focus';
+    const cachedContextId = session._iframeInnerContextId || session._continueInnerContextId || null;
+    if (!forceRefresh && cachedContextId) {
+      Runtime._innerContextId = cachedContextId;
+      return cachedContextId;
     }
-    this._log('info', `[${session.session_id}] [continue-focus] context cache:start force=${forceRefresh}`);
+    this._log('info', `[${session.session_id}] [${focusTag}] context cache:start force=${forceRefresh}`);
     const contextId = await selectors.cacheInnerContextId(Runtime);
     if (contextId) {
+      session._iframeInnerContextId = contextId;
       session._continueInnerContextId = contextId;
       Runtime._innerContextId = contextId;
-    } else if (session._continueInnerContextId) {
-      Runtime._innerContextId = session._continueInnerContextId;
+    } else if (cachedContextId) {
+      Runtime._innerContextId = cachedContextId;
     }
-    this._log('info', `[${session.session_id}] [continue-focus] context cache:end resolved=${Runtime._innerContextId || 'null'}`);
+    this._log('info', `[${session.session_id}] [${focusTag}] context cache:end resolved=${Runtime._innerContextId || 'null'}`);
     return Runtime._innerContextId || null;
   }
 
@@ -2314,8 +2334,8 @@ class ProxyEngine extends EventEmitter {
   }
 
   async _readSessionMessages(session, sessionId) {
-    if (session.agentType === 'continue') {
-      return this._withContinueClient(session, client =>
+    if (this._isEphemeralIframeAgent(session.agentType)) {
+      return this._withEphemeralIframeClient(session, client =>
         selectors.readMessages(client.Runtime, session.agentType, sessionId)
       , 'read_messages');
     }
@@ -2328,12 +2348,17 @@ class ProxyEngine extends EventEmitter {
       if (!forceRefresh && session._continueConfigCache) {
         return session._continueConfigCache;
       }
-      return this._withContinueClient(session, client =>
+      return this._withEphemeralIframeClient(session, client =>
         selectors.readAgentConfig(client.Runtime, session.agentType, workspacePath)
       , forceRefresh ? 'read_config_force' : 'read_config').then(cfg => {
         if (cfg) session._continueConfigCache = cfg;
         return cfg;
       });
+    }
+    if (session.agentType === 'claude') {
+      return this._withEphemeralIframeClient(session, client =>
+        selectors.readAgentConfig(client.Runtime, session.agentType, workspacePath)
+      , forceRefresh ? 'read_config_force' : 'read_config');
     }
     return selectors.readAgentConfig(session.client.Runtime, session.agentType, workspacePath);
   }
@@ -2373,8 +2398,8 @@ class ProxyEngine extends EventEmitter {
   }
 
   async _sendSessionMessage(session, content, sessionId) {
-    if (session.agentType === 'continue') {
-      return this._withContinueClient(session, client =>
+    if (this._isEphemeralIframeAgent(session.agentType)) {
+      return this._withEphemeralIframeClient(session, client =>
         selectors.sendMessage(client.Runtime, session.agentType, content, sessionId)
       , 'send_message');
     }
@@ -2596,13 +2621,288 @@ class ProxyEngine extends EventEmitter {
 
   // ─── Session polling ─────────────────────────────────────────────────
 
+  async _pollSessionClaude(sessionId, session) {
+    if (session.rateLimitActive && session.rate_limited_until && session.rate_limited_until !== 'unknown') {
+      const untilStr = session.rate_limited_until;
+      let resetMs = null;
+      const hmMatch = untilStr.match(/^(\d{1,2}):(\d{2})\s*(AM|PM)?$/i);
+      if (hmMatch) {
+        let h = parseInt(hmMatch[1], 10);
+        const m = parseInt(hmMatch[2], 10);
+        const ampm = (hmMatch[3] || '').toUpperCase();
+        if (ampm === 'PM' && h < 12) h += 12;
+        if (ampm === 'AM' && h === 12) h = 0;
+        const now = new Date();
+        const resetDate = new Date(now);
+        resetDate.setHours(h, m, 0, 0);
+        resetMs = resetDate.getTime();
+      }
+      const durationMatch = untilStr.match(/^(\d+)\s*h(?:\s*(\d+)\s*m)?$|^(\d+)\s*m$/i);
+      if (durationMatch && session._rateLimitDetectedAt) {
+        const hours = parseInt(durationMatch[1] || '0', 10);
+        const mins = parseInt(durationMatch[2] || durationMatch[3] || '0', 10);
+        resetMs = session._rateLimitDetectedAt + (hours * 3600000) + (mins * 60000);
+      }
+      if (resetMs && Date.now() > resetMs) {
+        this._log('info', `[${sessionId}] [rate-limit] Time-based auto-clear: ${untilStr} has passed`);
+        session.rateLimitActive = false;
+        session.rate_limited_until = null;
+        session.percentUsed = null;
+        session._rateLimitSig = null;
+        this._sendToRelay(proto.rateLimitCleared(sessionId));
+        this._broadcastSessionSnapshot();
+      }
+    }
+
+    const configNow = Date.now();
+    const includeConfig = !session._lastConfigPollAt || configNow - session._lastConfigPollAt > 15000;
+    const includeRateLimit = (session._rateLimitPollCount || 0) + 1 >= 10;
+    if (includeConfig) session._lastConfigPollAt = configNow;
+
+    let pollResult;
+    try {
+      pollResult = await this._ephemeralCdpPoll(session, sessionId, {
+        includeConfig,
+        includeRateLimit,
+      });
+    } catch (e) {
+      this._log('error', `[${sessionId}] Claude ephemeral poll error: ${e.message}`);
+      session.nullPollCount = (session.nullPollCount || 0) + 1;
+      if (session.nullPollCount >= 15) {
+        this._log('warn', `[${sessionId}] 15 consecutive Claude poll failures - removing session for re-discovery`);
+        sessionStore.markDisconnected(sessionId);
+        if (session.client) try { await session.client.close(); } catch {}
+        this.sessions.delete(sessionId);
+        this.activePermissionPrompts.delete(sessionId);
+        this._broadcastSessionSnapshot();
+      }
+      return;
+    }
+
+    const { raw, thinking: ts, perm, config, rateLimit } = pollResult;
+    const thinkingState = ts && typeof ts === 'object'
+      ? ts
+      : { thinking: false, label: '', thinkingContent: '' };
+
+    if (!raw) {
+      session.nullPollCount = (session.nullPollCount || 0) + 1;
+      if (session.nullPollCount === 5 && session.status === 'healthy') {
+        const failures = selectors.getSelectorFailures(sessionId);
+        this._log('warn', `[${sessionId}] 5 null reads - marking degraded`);
+        session.status = 'degraded';
+        sessionStore.updateSession(sessionId, { status: 'degraded' });
+        this._sendToRelay(proto.proxyStatus(sessionId, 'degraded', session.activity, failures));
+      }
+      if (session.nullPollCount >= 15) {
+        this._log('warn', `[${sessionId}] 15 null - removing session for re-discovery`);
+        sessionStore.markDisconnected(sessionId);
+        if (session.client) try { await session.client.close(); } catch {}
+        this.sessions.delete(sessionId);
+        this.activePermissionPrompts.delete(sessionId);
+        this._broadcastSessionSnapshot();
+      }
+      return;
+    }
+
+    if (session.nullPollCount > 0 && session.status === 'degraded') {
+      this._log('info', `[${sessionId}] Reads recovered - marking healthy`);
+      session.status = 'healthy';
+      sessionStore.updateSession(sessionId, { status: 'healthy' });
+      this._sendToRelay(proto.proxyStatus(sessionId, 'healthy', session.activity));
+    }
+    session.nullPollCount = 0;
+
+    if (config) {
+      try {
+        const merged = this._mergeAgentConfig(session.agentType, config, session.workspace_path);
+        const cfgSig = `${merged.branch}|${merged.model_id}|${merged.permission_mode}`;
+        if (cfgSig !== session._lastConfigSig) {
+          session._lastConfigSig = cfgSig;
+          const capabilities = this._buildCapabilities(session.agentType);
+          this._sendToRelay(proto.agentConfig(sessionId, { ...merged, capabilities }));
+        }
+      } catch {}
+    }
+
+    const messages = JSON.parse(raw);
+    const effectiveMessages = messages;
+    const transcriptSig = this._transcriptSignature(effectiveMessages);
+    const prevObservedCount = session.lastObservedCount ?? session.lastMessageCount;
+
+    if (effectiveMessages.length < prevObservedCount) {
+      this._log('warn', `[${sessionId}] Transcript regressed ${prevObservedCount} -> ${effectiveMessages.length}, forcing history snapshot`);
+      this._sendToRelay(proto.historySnapshot(sessionId, effectiveMessages));
+      session.lastMessageCount = effectiveMessages.length;
+      session.lastObservedCount = effectiveMessages.length;
+      session.lastTranscriptSig = transcriptSig;
+      session.pendingLast = null;
+      session.resyncCandidateSig = null;
+      session.waitingForAssistant = effectiveMessages.length > 0 && effectiveMessages[effectiveMessages.length - 1].role === 'user';
+    } else if (
+      session.lastTranscriptSig &&
+      transcriptSig !== session.lastTranscriptSig &&
+      effectiveMessages.length === prevObservedCount
+    ) {
+      if (session.resyncCandidateSig === transcriptSig) {
+        this._log('warn', `[${sessionId}] Transcript mutated in place, forcing history snapshot`);
+        this._sendToRelay(proto.historySnapshot(sessionId, effectiveMessages));
+        session.lastMessageCount = effectiveMessages.length;
+        session.lastObservedCount = effectiveMessages.length;
+        session.lastTranscriptSig = transcriptSig;
+        session.pendingLast = null;
+        session.resyncCandidateSig = null;
+        session.waitingForAssistant = effectiveMessages.length > 0 && effectiveMessages[effectiveMessages.length - 1].role === 'user';
+      } else {
+        session.resyncCandidateSig = transcriptSig;
+        session.lastObservedCount = effectiveMessages.length;
+        session.lastTranscriptSig = transcriptSig;
+      }
+    } else {
+      if (session.resyncCandidateSig && session.resyncCandidateSig === transcriptSig) {
+        this._log('warn', `[${sessionId}] Mutated transcript stabilized - resyncing`);
+        this._sendToRelay(proto.historySnapshot(sessionId, effectiveMessages));
+        session.lastMessageCount = effectiveMessages.length;
+        session.lastObservedCount = effectiveMessages.length;
+        session.lastTranscriptSig = transcriptSig;
+        session.pendingLast = null;
+        session.resyncCandidateSig = null;
+        session.waitingForAssistant = effectiveMessages.length > 0 && effectiveMessages[effectiveMessages.length - 1].role === 'user';
+      } else {
+        if (effectiveMessages.length < session.lastMessageCount) {
+          this._log('warn', `[${sessionId}] Msg count regressed ${session.lastMessageCount} -> ${effectiveMessages.length}, resetting`);
+          session.lastMessageCount = effectiveMessages.length;
+          session.pendingLast = null;
+        }
+
+        if (session.pendingLast !== null) {
+          const p = session.pendingLast;
+          const current = effectiveMessages[session.lastMessageCount];
+          if (current && current.role === p.role && current.content === p.content) {
+            this._log('info', `[${sessionId}] Stable ${p.role} msg (${p.content.length} chars)`);
+            this._sendToRelay(proto.proxyMessage(sessionId, p.role, p.content));
+            session.lastMessageCount++;
+            session.pendingLast = null;
+            session._pendingFirstSeenAt = null;
+            if (p.role === 'user') session.waitingForAssistant = true;
+            if (p.role === 'assistant') session.waitingForAssistant = false;
+          } else if (current) {
+            if (!session._pendingFirstSeenAt) session._pendingFirstSeenAt = Date.now();
+            const pendingAge = Date.now() - session._pendingFirstSeenAt;
+            if (pendingAge > 5000 && current.content !== session._lastStreamedContent) {
+              session._lastStreamedContent = current.content;
+              this._sendToRelay(proto.historySnapshot(sessionId, effectiveMessages));
+              this._log('info', `[${sessionId}] Streaming flush (${effectiveMessages.length} msgs, pending ${Math.round(pendingAge / 1000)}s)`);
+            }
+            session.pendingLast = { role: current.role, content: current.content };
+            session.lastObservedCount = effectiveMessages.length;
+            session.lastTranscriptSig = transcriptSig;
+          }
+        }
+
+        const prev = session.lastMessageCount;
+        if (effectiveMessages.length > prev && session.pendingLast === null) {
+          for (let i = prev; i < effectiveMessages.length - 1; i++) {
+            this._log('info', `[${sessionId}] New ${effectiveMessages[i].role} msg (${effectiveMessages[i].content.length} chars)`);
+            this._sendToRelay(proto.proxyMessage(sessionId, effectiveMessages[i].role, effectiveMessages[i].content));
+            if (effectiveMessages[i].role === 'user') session.waitingForAssistant = true;
+            if (effectiveMessages[i].role === 'assistant') session.waitingForAssistant = false;
+          }
+          session.lastMessageCount = effectiveMessages.length - 1;
+          const last = effectiveMessages[effectiveMessages.length - 1];
+          session.pendingLast = { role: last.role, content: last.content };
+        }
+
+        session.lastObservedCount = effectiveMessages.length;
+        session.lastTranscriptSig = transcriptSig;
+        session.resyncCandidateSig = null;
+      }
+    }
+
+    const active = session.pendingLast !== null || session.waitingForAssistant;
+    const kind = thinkingState.thinking ? 'thinking' : active ? 'generating' : 'idle';
+    const label = thinkingState.label || (active ? 'Generating' : '');
+    const newActivity = { kind, label, updated_at: new Date().toISOString() };
+    if (session.taskList) newActivity.task_list = session.taskList;
+    if (thinkingState.thinkingContent) newActivity.thinkingContent = thinkingState.thinkingContent;
+
+    const prevKind = session.activity?.kind || 'idle';
+    const prevThinkingContent = session.thinkingContent || '';
+    const currThinkingContent = thinkingState.thinkingContent || '';
+    if (thinkingState.thinking !== session.thinking || label !== session.thinkingLabel || kind !== prevKind || currThinkingContent !== prevThinkingContent) {
+      session.thinking = thinkingState.thinking;
+      session.thinkingLabel = label;
+      session.thinkingContent = currThinkingContent;
+      session.activity = newActivity;
+      sessionStore.updateSession(sessionId, { activity: newActivity });
+      this._sendToRelay(proto.proxyStatus(sessionId, session.status || 'healthy', newActivity));
+      if ((prevKind === 'generating' || prevKind === 'thinking') && kind === 'idle') {
+        this._processMessageQueue(sessionId);
+      }
+    }
+
+    if (perm) {
+      const promptId = this._makePromptId(sessionId, perm.message, perm.choices);
+      const last = this.activePermissionPrompts.get(sessionId);
+      if (!last || last.prompt_id !== promptId) {
+        this._log('info', `[${sessionId}] [perm] Permission dialog detected: "${perm.message.substring(0, 60)}..."`);
+        const prompt = {
+          type: 'permission_prompt',
+          protocol_version: proto.PROTOCOL_VERSION,
+          session_id: sessionId,
+          prompt_id: promptId,
+          message: perm.message,
+          choices: perm.choices,
+          timeout_ms: 300000,
+          detected_at: new Date().toISOString(),
+        };
+        this.activePermissionPrompts.set(sessionId, { prompt_id: promptId, prompt });
+        this._sendToRelay(prompt);
+      }
+    } else if (this.activePermissionPrompts.has(sessionId)) {
+      this._log('info', `[${sessionId}] [perm] Permission dialog dismissed`);
+      this.activePermissionPrompts.delete(sessionId);
+    }
+
+    session._rateLimitPollCount = includeRateLimit ? 0 : ((session._rateLimitPollCount || 0) + 1);
+    if (includeRateLimit) {
+      const rl = rateLimit;
+      const wasActive = session.rateLimitActive || false;
+      const nowActive = rl?.rate_limited === true;
+      const untilText = rl?.until_text || null;
+      const pctUsed = rl?.percent_used ?? null;
+      const hasBanner = pctUsed != null;
+      const sig = `${nowActive}|${pctUsed}|${untilText}`;
+      if (sig !== session._rateLimitSig) {
+        session._rateLimitSig = sig;
+        session.rateLimitActive = nowActive;
+        session.rate_limited_until = nowActive ? (untilText || 'unknown') : null;
+        session.percentUsed = hasBanner ? pctUsed : null;
+        if (nowActive) {
+          if (!wasActive) session._rateLimitDetectedAt = Date.now();
+          this._log('info', `[${sessionId}] [rate-limit] Active: ${pctUsed != null ? pctUsed + '%' : ''} resets ${untilText || 'unknown'}`);
+          this._sendToRelay(proto.rateLimitActive(sessionId, untilText, pctUsed));
+        } else if (hasBanner) {
+          this._log('info', `[${sessionId}] [rate-limit] Usage: ${pctUsed}% resets ${untilText || 'unknown'}`);
+          this._sendToRelay(proto.rateLimitActive(sessionId, untilText, pctUsed));
+        } else if (wasActive || session.percentUsed != null) {
+          this._log('info', `[${sessionId}] [rate-limit] Cleared`);
+          this._sendToRelay(proto.rateLimitCleared(sessionId));
+        }
+        this._broadcastSessionSnapshot();
+      }
+    }
+  }
+
   async _pollSession(sessionId) {
     const session = this.sessions.get(sessionId);
     if (!session) return;
 
-    // Continue: use ephemeral CDP connection to avoid focus/scroll steal
+    // Continue and Claude: use ephemeral CDP connection to avoid focus/scroll steal
     if (session.agentType === 'continue') {
       return this._pollSessionContinue(sessionId, session);
+    }
+    if (session.agentType === 'claude') {
+      return this._pollSessionClaude(sessionId, session);
     }
 
     try {
@@ -3035,7 +3335,7 @@ class ProxyEngine extends EventEmitter {
       }
 
       // Rate limit / usage warning check — Codex and Claude
-      if (session.agentType === 'codex' || session.agentType === 'claude') {
+      if (session.agentType === 'codex') {
         // Time-based auto-clear: if we have a reset time and it's passed, clear immediately
         if (session.rateLimitActive && session.rate_limited_until && session.rate_limited_until !== 'unknown') {
           const untilStr = session.rate_limited_until;
@@ -3169,8 +3469,8 @@ class ProxyEngine extends EventEmitter {
   async _pollPermissions(sessionId) {
     const session = this.sessions.get(sessionId);
     if (!session) return;
-    // Continue permissions are read inside _ephemeralCdpPoll — skip here
-    if (session.agentType === 'continue') return;
+    // Continue and Claude permissions are read inside _ephemeralCdpPoll — skip here
+    if (session.agentType === 'continue' || session.agentType === 'claude') return;
 
     try {
       const dialog = await selectors.detectPermissionDialog(session.client.Runtime, session.agentType);
@@ -3596,13 +3896,15 @@ class ProxyEngine extends EventEmitter {
         client.Runtime._webviewId = (target.url.match(/[?&]id=([0-9a-f-]+)/i) || [])[1] || null;
 
         // Cache inner-frame context ID to avoid active-frame traversal
-        // which causes focus/scroll steal in Continue webviews
-        if (ext.toLowerCase().includes('continue.continue')) {
-          this._log('info', `[discover] [continue-focus] initial context cache:start target=${target.id}`);
+        // which causes focus/scroll steal in iframe-backed editor webviews
+        if (ext.toLowerCase().includes('continue.continue') || ext.toLowerCase().includes('anthropic') || ext.toLowerCase().includes('claude')) {
+          const focusTag = (ext.toLowerCase().includes('anthropic') || ext.toLowerCase().includes('claude')) ? 'claude-focus' : 'continue-focus';
+          this._log('info', `[discover] [${focusTag}] initial context cache:start target=${target.id}`);
         }
         await selectors.cacheInnerContextId(client.Runtime);
-        if (ext.toLowerCase().includes('continue.continue')) {
-          this._log('info', `[discover] [continue-focus] initial context cache:end target=${target.id} resolved=${client.Runtime?._innerContextId || 'null'}`);
+        if (ext.toLowerCase().includes('continue.continue') || ext.toLowerCase().includes('anthropic') || ext.toLowerCase().includes('claude')) {
+          const focusTag = (ext.toLowerCase().includes('anthropic') || ext.toLowerCase().includes('claude')) ? 'claude-focus' : 'continue-focus';
+          this._log('info', `[discover] [${focusTag}] initial context cache:end target=${target.id} resolved=${client.Runtime?._innerContextId || 'null'}`);
         }
 
         const agentType = await selectors.detectAgentType(client.Runtime, ext);
@@ -3712,6 +4014,7 @@ class ProxyEngine extends EventEmitter {
           targetId:         target.id,
           _cdpPort:         target._cdpPort,
           _webviewId:       (target.url.match(/[?&]id=([0-9a-f-]+)/i) || [])[1] || null,
+          _iframeInnerContextId: this._isEphemeralIframeAgent(agentType) ? (client.Runtime?._innerContextId || null) : null,
           _continueInnerContextId: agentType === 'continue' ? (client.Runtime?._innerContextId || null) : null,
           _listView:        initialListView,
           _lastChatListSig: initialChatList ? JSON.stringify(initialChatList.map(c => `${c.id || ''}:${c.title || ''}:${!!c.active}`)) : '',
@@ -3723,11 +4026,11 @@ class ProxyEngine extends EventEmitter {
           } catch {}
         }
 
-        if (agentType === 'continue') {
+        if (agentType === 'continue' || agentType === 'claude') {
           try { await client.close(); } catch {}
           client = null;
-          const continueSession = this.sessions.get(sessionId);
-          if (continueSession) continueSession.client = null;
+          const ephemeralSession = this.sessions.get(sessionId);
+          if (ephemeralSession) ephemeralSession.client = null;
         }
 
         this._log('info', `[cdp] ${agentType} → ${sessionId} in "${windowTitle}" (${initialCount} existing msgs)`);
