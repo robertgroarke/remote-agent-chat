@@ -30,6 +30,7 @@ export function useRelay() {
     const [fileChanges,       setFileChanges]       = useState({});   // sessionId -> [{ file?, content, type }] — Codex file changes/diff
     const [branchLists,       setBranchLists]       = useState({});   // sessionId -> { branches: string[], current: string }
     const [skillLists,        setSkillLists]        = useState({});   // sessionId -> { installed: [...], recommended: [...] }
+    const [automationViews,   setAutomationViews]   = useState({});   // sessionId -> Codex Desktop native automation pane snapshot
     const [controlResults,    setControlResults]    = useState({});   // requestId -> latest agent_control_result
     const [directoryListings, setDirectoryListings] = useState({});  // sessionId -> { path, entries }
     const [fileContents,      setFileContents]      = useState({});  // sessionId:path -> { path, content, truncated }
@@ -253,6 +254,12 @@ export function useRelay() {
     function requestSkillList(sessionId) {
       const requestId = `skills-${Date.now()}-${Math.random().toString(36).slice(2, 7)}`;
       send({ type: 'skill_list', session_id: sessionId, request_id: requestId });
+      return requestId;
+    }
+
+    function showCodexAutomation(sessionId) {
+      const requestId = `automation-${Date.now()}-${Math.random().toString(36).slice(2, 7)}`;
+      send({ type: 'automation_view_action', session_id: sessionId, request_id: requestId });
       return requestId;
     }
 
@@ -581,6 +588,12 @@ export function useRelay() {
         return;
       }
 
+      if (t === 'codex_automation_view') {
+        const sid = msg.session_id || msg.session;
+        if (sid) setAutomationViews(prev => ({ ...prev, [sid]: msg.view || null }));
+        return;
+      }
+
       // ── Terminal output (Epic 4) ──────────────────────────────────────────
       if (t === 'terminal_output') {
         const sid = msg.session_id || msg.session;
@@ -865,7 +878,7 @@ export function useRelay() {
     // where `sessions` / `messages` would be frozen at initial render values).
     handleRelayMessageRef.current = handleRelayMessage;
 
-    return { sessions, messages, connected, unread, setUnread, thinking, thinkingContent, activities, health, deliveryStates, launchStates, justLaunched, setJustLaunched, permissionPrompts, respondToPrompt, errorPrompts, respondToErrorPrompt, interruptSession, agentConfigs, requestAgentConfig, setAgentModel, setAgentPermissionMode, setAutoApprovePermissions, setAntigravityMode, setCodexConfig, newThread, openPanel, requestChatList, switchChat, newChat, chatLists, requestThreadList, switchThread, threadLists, switchWorkspace, requestTerminalOutput, terminalOutputs, requestFileChanges, fileChanges, sendAttachment, send, sendToSession, steerMessage, discardQueuedMessage, editQueuedMessage, queuedMessages, launchSession, resumeSession, closeSession, activeSessionRef, workspaces, branchLists, requestBranchList, switchBranch, createBranch, skillLists, requestSkillList, controlResults, directoryListings, requestDirectoryListing, fileContents, requestFileContent, requestHistory };
+    return { sessions, messages, connected, unread, setUnread, thinking, thinkingContent, activities, health, deliveryStates, launchStates, justLaunched, setJustLaunched, permissionPrompts, respondToPrompt, errorPrompts, respondToErrorPrompt, interruptSession, agentConfigs, requestAgentConfig, setAgentModel, setAgentPermissionMode, setAutoApprovePermissions, setAntigravityMode, setCodexConfig, newThread, openPanel, requestChatList, switchChat, newChat, chatLists, requestThreadList, switchThread, threadLists, switchWorkspace, requestTerminalOutput, terminalOutputs, requestFileChanges, fileChanges, sendAttachment, send, sendToSession, steerMessage, discardQueuedMessage, editQueuedMessage, queuedMessages, launchSession, resumeSession, closeSession, activeSessionRef, workspaces, branchLists, requestBranchList, switchBranch, createBranch, skillLists, requestSkillList, automationViews, showCodexAutomation, controlResults, directoryListings, requestDirectoryListing, fileContents, requestFileContent, requestHistory };
   }
 
 // (removed window.useRelay — now an ES module export)

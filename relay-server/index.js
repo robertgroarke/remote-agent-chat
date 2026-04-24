@@ -492,8 +492,13 @@ app.post('/fcm-token', requireBearerToken, express.json(), (req, res) => {
 app.get('/auth/logout', (req, res) => req.logout(() => res.redirect('/auth/google')));
 
 // Auth gate middleware
-const PRIVATE_CLASS_C_PREFIX = ['192', '168', ''].join('.');
-const LAN_PREFIXES = [PRIVATE_CLASS_C_PREFIX, '10.', '172.16.', `::ffff:${PRIVATE_CLASS_C_PREFIX}`, '::ffff:10.'];
+const LAN_PREFIXES = [
+  [192, 168].join('.') + '.',
+  '10.',
+  '172.16.',
+  '::ffff:' + [192, 168].join('.') + '.',
+  '::ffff:10.',
+];
 function isLAN(req) {
   const ip = req.ip || req.connection?.remoteAddress || '';
   return LAN_PREFIXES.some(p => ip.startsWith(p));
@@ -838,6 +843,7 @@ function getEffectiveHistory(sessionId) {
   const persistedMeta = stmtGetSessionMeta.get(sessionId);
   const meta = liveMeta || persistedMeta;
   if (!meta || meta.agent_type !== 'codex-desktop') return direct;
+  if (liveMeta) return direct;
 
   let candidate = null;
   if (meta.workspace_path) {
@@ -845,7 +851,7 @@ function getEffectiveHistory(sessionId) {
       sessionId,
       meta.workspace_path,
       'codex-desktop',
-      'codex',
+      'codex-desktop',
       'codex-desktop'
     );
   }
@@ -854,7 +860,7 @@ function getEffectiveHistory(sessionId) {
       sessionId,
       meta.workspace_name,
       'codex-desktop',
-      'codex',
+      'codex-desktop',
       'codex-desktop'
     );
   }
@@ -1004,7 +1010,7 @@ const KNOWN_PROXY_TYPES = new Set([
   'history', 'history_snapshot',
   'rate_limit_active', 'rate_limit_cleared',
   'chat_list', 'thread_list', 'terminal_output', 'file_changes',
-  'branch_list', 'skill_list',
+  'branch_list', 'skill_list', 'codex_automation_view',
   'directory_listing', 'file_content',
   'message_queued', 'queue_delivered', 'steer_result', 'proxy_send_result',
   'native_queue',
@@ -1022,7 +1028,7 @@ const KNOWN_CLIENT_TYPES = new Set([
   'thread_list', 'switch_thread', 'switch_workspace', 'terminal_output',
   'file_changes', 'send_attachment', 'terminal_input',
   'branch_list', 'switch_branch', 'create_branch',
-  'skill_list', 'list_directory', 'read_file',
+  'skill_list', 'automation_view_action', 'list_directory', 'read_file',
   'steer', 'discard_queued', 'edit_queued',
   'automations_list', 'automations_create', 'automations_update', 'automations_delete', 'automations_run',
 ]);
@@ -1592,6 +1598,12 @@ function handleProxyConnection(ws, req) {
       log('info', 'ctrl', 'Skill list received', { session: sessionId, installed: (msg.installed || []).length, recommended: (msg.recommended || []).length });
 
     // ── File browser: directory listing (proxy → browsers) ─────────────
+    } else if (t === 'codex_automation_view') {
+      const sessionId = msg.session_id || msg.session;
+      if (sessionId) touchSession(sessionId);
+      broadcastToBrowsers(msg);
+      log('info', 'ctrl', 'Codex automation view received', { session: sessionId, visible: !!msg.view });
+
     } else if (t === 'directory_listing') {
       const requestId = msg.request_id;
       const targetWs  = requestId ? pendingCtrlReqs.get(requestId) : null;
@@ -2472,7 +2484,7 @@ function handleClientConnection(ws, req) {
       log('info', 'ctrl', 'Set codex config forwarded', { session: sessionId, request_id: requestId });
 
     // ── Panel/agent control commands (Epics 2, 3, 4, 9) ──────────────────
-    } else if (t === 'new_thread' || t === 'open_panel' || t === 'chat_list' || t === 'switch_chat' || t === 'new_chat' || t === 'thread_list' || t === 'switch_thread' || t === 'switch_workspace' || t === 'terminal_output' || t === 'file_changes' || t === 'send_attachment' || t === 'terminal_input' || t === 'branch_list' || t === 'switch_branch' || t === 'create_branch' || t === 'skill_list' || t === 'list_directory' || t === 'read_file') {
+    } else if (t === 'new_thread' || t === 'open_panel' || t === 'chat_list' || t === 'switch_chat' || t === 'new_chat' || t === 'thread_list' || t === 'switch_thread' || t === 'switch_workspace' || t === 'terminal_output' || t === 'file_changes' || t === 'send_attachment' || t === 'terminal_input' || t === 'branch_list' || t === 'switch_branch' || t === 'create_branch' || t === 'skill_list' || t === 'automation_view_action' || t === 'list_directory' || t === 'read_file') {
       const sessionId = msg.session_id || msg.session;
       const requestId = msg.request_id;
       const proxyWs   = proxySockets.get(sessionId);

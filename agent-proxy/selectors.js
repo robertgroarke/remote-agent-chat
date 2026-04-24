@@ -8134,6 +8134,169 @@ async function readCodexSkillsList(Runtime, usePageEval) {
   }
 }
 
+// Codex Desktop native automation detail pane.
+// Reads the side pane shown inside a Codex Desktop thread after an automation is
+// proposed or selected. This is intentionally non-mutating so polling does not
+// move the user between Automations/Skills/thread views.
+async function readCodexAutomationView(Runtime, usePageEval) {
+  const evalFn = usePageEval ? evalInPage : evalInFrame;
+  try {
+    const raw = await evalFn(Runtime, `
+      (function() {
+        function clean(text) {
+          return String(text || '').replace(/\\s+/g, ' ').trim();
+        }
+        function visible(el) {
+          if (!el) return false;
+          var r = el.getBoundingClientRect();
+          var style = window.getComputedStyle(el);
+          return r.width >= 220 && r.height >= 160 && style.visibility !== 'hidden' && style.display !== 'none';
+        }
+        function linesOf(el) {
+          return (el.innerText || el.textContent || '')
+            .split('\\n')
+            .map(function(line) { return clean(line); })
+            .filter(Boolean);
+        }
+        function parseRows(lines, startLabel, endLabels) {
+          var start = lines.findIndex(function(line) { return line.toLowerCase() === startLabel.toLowerCase(); });
+          if (start < 0) return [];
+          var known = ['Status', 'Next run', 'Last ran', 'Chat', 'Interval'];
+          var end = lines.length;
+          for (var i = start + 1; i < lines.length; i++) {
+            if (endLabels.indexOf(lines[i].toLowerCase()) >= 0) {
+              end = i;
+              break;
+            }
+          }
+          var rows = [];
+          for (var j = start + 1; j < end; j++) {
+            var line = lines[j];
+            var label = null;
+            var value = '';
+            for (var k = 0; k < known.length; k++) {
+              var candidate = known[k];
+              if (line === candidate) {
+                label = candidate;
+                value = lines[j + 1] || '';
+                j++;
+                break;
+              }
+              if (line.toLowerCase().startsWith(candidate.toLowerCase() + ' ')) {
+                label = candidate;
+                value = line.slice(candidate.length).trim();
+                break;
+              }
+            }
+            if (label && value && !/^(Status|Details)$/i.test(value)) {
+              rows.push({ label: label, value: value });
+            }
+          }
+          return rows;
+        }
+        function pickTitle(el, lines) {
+          var heading = Array.from(el.querySelectorAll('h1,h2,h3')).find(function(h) {
+            var text = clean(h.textContent);
+            return text && !/^(Status|Details)$/i.test(text);
+          });
+          if (heading) return clean(heading.textContent).slice(0, 120);
+          return (lines.find(function(line) {
+            return !/^(Status|Details|Show Automation|Active|Inactive)$/i.test(line);
+          }) || '').slice(0, 120);
+        }
+
+        var viewportWidth = window.innerWidth || d.documentElement.clientWidth || 0;
+        var candidates = Array.from(d.querySelectorAll('aside, [role="complementary"], section, main > div, body > div, div'))
+          .filter(visible)
+          .map(function(el) {
+            var r = el.getBoundingClientRect();
+            var text = clean(el.innerText || el.textContent || '');
+            var lower = text.toLowerCase();
+            var score = 0;
+            if (r.left > viewportWidth * 0.45) score += 2;
+            if (/\\bshow automation\\b/i.test(text)) score += 8;
+            if (/\\bnext run\\b/i.test(text)) score += 4;
+            if (/\\blast ran\\b/i.test(text)) score += 4;
+            if (/\\binterval\\b/i.test(text)) score += 3;
+            if (lower.includes('details')) score += 2;
+            if (lower.includes('status')) score += 2;
+            if (text.length > 40 && text.length < 2500) score += 1;
+            return { el: el, score: score, right: r.right, area: r.width * r.height };
+          })
+          .filter(function(item) { return item.score >= 8; })
+          .sort(function(a, b) {
+            return (b.score - a.score) || (b.right - a.right) || (a.area - b.area);
+          });
+
+        if (!candidates.length) return JSON.stringify(null);
+
+        var pane = candidates[0].el;
+        var lines = linesOf(pane);
+        var title = pickTitle(pane, lines);
+        if (!title) return JSON.stringify(null);
+
+        var statusIndex = lines.findIndex(function(line) { return /^Status$/i.test(line); });
+        var detailsIndex = lines.findIndex(function(line) { return /^Details$/i.test(line); });
+        var titleIndex = lines.indexOf(title);
+        var descStart = titleIndex >= 0 ? titleIndex + 1 : 1;
+        var descEnd = statusIndex >= 0 ? statusIndex : (detailsIndex >= 0 ? detailsIndex : lines.length);
+        var description = lines.slice(descStart, descEnd)
+          .filter(function(line) { return !/^Show Automation/i.test(line); })
+          .join(' ')
+          .slice(0, 1200);
+        var actionLine = lines.find(function(line) { return /^Show Automation\\b/i.test(line); }) || '';
+        var statusRows = parseRows(lines, 'Status', ['details']);
+        var detailRows = parseRows(lines, 'Details', []);
+        var statusRow = statusRows.find(function(row) { return row.label === 'Status'; });
+
+        return JSON.stringify({
+          visible: true,
+          title: title,
+          description: description,
+          status: statusRow ? statusRow.value : '',
+          status_rows: statusRows,
+          detail_rows: detailRows,
+          action_label: actionLine || 'Show Automation',
+          updated_at: new Date().toISOString()
+        });
+      })()
+    `);
+    return raw ? JSON.parse(raw) : null;
+  } catch {
+    return null;
+  }
+}
+
+async function clickCodexAutomationAction(Runtime, usePageEval) {
+  const evalFn = usePageEval ? evalInPage : evalInFrame;
+  try {
+    const raw = await evalFn(Runtime, `
+      (function() {
+        function press(el) {
+          if (!el) return false;
+          try { el.focus(); } catch (_) {}
+          var r = el.getBoundingClientRect();
+          var opts = { bubbles: true, cancelable: true, view: window, clientX: r.left + r.width / 2, clientY: r.top + r.height / 2, button: 0 };
+          if (window.PointerEvent) el.dispatchEvent(new PointerEvent('pointerdown', opts));
+          el.dispatchEvent(new MouseEvent('mousedown', opts));
+          if (window.PointerEvent) el.dispatchEvent(new PointerEvent('pointerup', opts));
+          el.dispatchEvent(new MouseEvent('mouseup', opts));
+          el.dispatchEvent(new MouseEvent('click', opts));
+          return true;
+        }
+        var controls = Array.from(d.querySelectorAll('button, a, [role="button"]'));
+        var target = controls.find(function(el) {
+          return /^Show Automation\\b/i.test((el.innerText || el.textContent || el.getAttribute('aria-label') || '').trim());
+        });
+        return JSON.stringify({ ok: press(target), detail: target ? 'clicked-show-automation' : 'show-automation-not-found' });
+      })()
+    `);
+    return JSON.parse(raw || '{"ok":false,"detail":"no-result"}');
+  } catch (e) {
+    return { ok: false, detail: e.message };
+  }
+}
+
 /** Navigate back from Skills/Automations to the thread view by clicking a thread entry. */
 async function _navigateCodexBack(evalFn, Runtime) {
   await new Promise(r => setTimeout(r, 100));
@@ -8380,6 +8543,8 @@ module.exports = {
   // Skills — Codex Desktop skills list
   readCodexSkillsList,
   navigateCodexSkills,
+  readCodexAutomationView,
+  clickCodexAutomationAction,
   // Session close — click the tab/panel close button
   closeSessionTab,
   // Continue extension

@@ -353,7 +353,7 @@ function findContiguousWindow(needleMessages, haystackMessages) {
 }
 
 function allowsAccumulatedWebui(surface) {
-  return surface === 'codex' || surface === 'codex-desktop';
+  return surface === 'codex';
 }
 
 function detectTrailingPartialMismatch(nativeMessages, webuiMessages, comparison) {
@@ -512,10 +512,10 @@ function createDbReader(dbPath) {
 
       let candidate = null;
       if (meta.workspace_path) {
-        candidate = stmtFindRelatedHistoryByPath.get(sessionId, meta.workspace_path, 'codex-desktop', 'codex', 'codex-desktop');
+        candidate = stmtFindRelatedHistoryByPath.get(sessionId, meta.workspace_path, 'codex-desktop', 'codex-desktop', 'codex-desktop');
       }
       if (!candidate && meta.workspace_name) {
-        candidate = stmtFindRelatedHistoryByName.get(sessionId, meta.workspace_name, 'codex-desktop', 'codex', 'codex-desktop');
+        candidate = stmtFindRelatedHistoryByName.get(sessionId, meta.workspace_name, 'codex-desktop', 'codex-desktop', 'codex-desktop');
       }
       if (!candidate?.session_id) return { source: 'relay_db', messages: direct };
       return { source: 'relay_db_fallback', messages: stmtGetHistory.all(candidate.session_id) };

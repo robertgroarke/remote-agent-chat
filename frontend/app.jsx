@@ -2111,6 +2111,53 @@ function AutomationsView({ sessions, onBack }) {
 
 // ─── Skills View ────────────────────────────────────────────────────────────
 // Displays installed and recommended skills read from Codex Desktop via CDP.
+function CodexAutomationPane({ view, onShow }) {
+  if (!view?.visible) return null;
+  const statusRows = Array.isArray(view.status_rows) ? view.status_rows : [];
+  const detailRows = Array.isArray(view.detail_rows) ? view.detail_rows : [];
+  const status = view.status || statusRows.find(row => row.label === 'Status')?.value || '';
+  return (
+    <aside className="codex-automation-pane" aria-label="Codex automation">
+      <div className="codex-automation-pane-header">
+        <div className="codex-automation-pane-icon">o</div>
+        <div className="codex-automation-pane-title">{view.title || 'Automation'}</div>
+      </div>
+      {view.description && (
+        <div className="codex-automation-pane-desc">{view.description}</div>
+      )}
+      {(statusRows.length > 0 || status) && (
+        <div className="codex-automation-pane-section">
+          <div className="codex-automation-pane-section-title">Status</div>
+          {statusRows.length > 0 ? statusRows.map((row, i) => (
+            <div key={`${row.label}-${i}`} className="codex-automation-pane-row">
+              <span>{row.label}</span>
+              <strong className={row.label === 'Status' && /active/i.test(row.value) ? 'active' : ''}>{row.value}</strong>
+            </div>
+          )) : (
+            <div className="codex-automation-pane-row"><span>Status</span><strong>{status}</strong></div>
+          )}
+        </div>
+      )}
+      {detailRows.length > 0 && (
+        <div className="codex-automation-pane-section">
+          <div className="codex-automation-pane-section-title">Details</div>
+          {detailRows.map((row, i) => (
+            <div key={`${row.label}-${i}`} className="codex-automation-pane-row">
+              <span>{row.label}</span>
+              <strong>{row.value}</strong>
+            </div>
+          ))}
+        </div>
+      )}
+      {view.action_label && (
+        <button className="codex-automation-pane-action" onClick={onShow}>
+          {view.action_label}
+        </button>
+      )}
+    </aside>
+  );
+}
+
 function SkillsView({ skills, onRefresh, onBack }) {
   const installed   = skills?.installed   || [];
   const recommended = skills?.recommended || [];
@@ -2217,7 +2264,7 @@ class AppErrorBoundary extends React.Component {
 }
 
 function App() {
-  const { sessions, messages, connected, unread, setUnread, thinking, thinkingContent, activities, health, deliveryStates, launchStates, justLaunched, setJustLaunched, permissionPrompts, respondToPrompt, errorPrompts, respondToErrorPrompt, interruptSession, agentConfigs, requestAgentConfig, setAgentModel, setAgentPermissionMode, setAutoApprovePermissions, setAntigravityMode, setCodexConfig, newThread, openPanel, requestChatList, switchChat, newChat, chatLists, requestThreadList, switchThread, threadLists, switchWorkspace, requestTerminalOutput, terminalOutputs, requestFileChanges, fileChanges, sendAttachment, send, sendToSession, steerMessage, discardQueuedMessage, editQueuedMessage, queuedMessages, launchSession, resumeSession, closeSession, activeSessionRef, workspaces, branchLists, requestBranchList, switchBranch, createBranch, skillLists, requestSkillList, controlResults, directoryListings, requestDirectoryListing, fileContents, requestFileContent, requestHistory } = useRelay();
+  const { sessions, messages, connected, unread, setUnread, thinking, thinkingContent, activities, health, deliveryStates, launchStates, justLaunched, setJustLaunched, permissionPrompts, respondToPrompt, errorPrompts, respondToErrorPrompt, interruptSession, agentConfigs, requestAgentConfig, setAgentModel, setAgentPermissionMode, setAutoApprovePermissions, setAntigravityMode, setCodexConfig, newThread, openPanel, requestChatList, switchChat, newChat, chatLists, requestThreadList, switchThread, threadLists, switchWorkspace, requestTerminalOutput, terminalOutputs, requestFileChanges, fileChanges, sendAttachment, send, sendToSession, steerMessage, discardQueuedMessage, editQueuedMessage, queuedMessages, launchSession, resumeSession, closeSession, activeSessionRef, workspaces, branchLists, requestBranchList, switchBranch, createBranch, skillLists, requestSkillList, automationViews, showCodexAutomation, controlResults, directoryListings, requestDirectoryListing, fileContents, requestFileContent, requestHistory } = useRelay();
   const [activeSession, setActiveSession] = useState(null);
   const [drafts, setDrafts]             = useState({});
   const [draftFiles, setDraftFiles]     = useState({});
@@ -2700,6 +2747,7 @@ async function uploadBinaryDraft(sessionId, base64, mimeType, filename) {
   );
   const activeLabel = activeSession ? sessionLabel(activeSessionMeta, activeSession) : 'Agent Chat';
   const activeAgent = sessionAgent(activeSessionMeta || activeSession, activeConfig);
+  const activeAutomationView = activeSession ? automationViews[activeSession] : null;
   const activeLooksLikeCodex = activeAgent?.name === 'Codex' || /^Codex\b/.test(activeLabel || '');
   const showVisiblePaneBanner = !!(
     activeLooksLikeCodex
@@ -3155,6 +3203,11 @@ async function uploadBinaryDraft(sessionId, base64, mimeType, filename) {
                       changes
                     </button>
                   )}
+                  {activeAutomationView?.visible && (
+                    <span className="context-pill ok" title={activeAutomationView.title || 'Automation'}>
+                      automation
+                    </span>
+                  )}
                   {activeConfig?.capabilities?.file_browser && (
                     <button
                       className={`context-pill files-toggle${showFileBrowser ? ' active' : ''}`}
@@ -3243,7 +3296,7 @@ async function uploadBinaryDraft(sessionId, base64, mimeType, filename) {
             }}
           />
         )}
-        <div className="messages-wrap" style={showFileBrowser ? { display: 'none' } : undefined}>
+        <div className={`messages-wrap${activeAutomationView?.visible ? ' has-automation-pane' : ''}`} style={showFileBrowser ? { display: 'none' } : undefined}>
         {showDesktopThreadTabs && (
           <ThreadTabsBar
             threads={desktopThreadTabs}
@@ -3452,6 +3505,10 @@ async function uploadBinaryDraft(sessionId, base64, mimeType, filename) {
           isClaude={activeSessionMeta?.agent_type === 'claude'}
           pinned
         />}
+        <CodexAutomationPane
+          view={activeAutomationView}
+          onShow={() => activeSession && showCodexAutomation(activeSession)}
+        />
         </div>
 
         {showSettings && activeSession && (

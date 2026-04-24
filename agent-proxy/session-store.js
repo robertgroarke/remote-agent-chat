@@ -15,10 +15,33 @@ const os = require('os');
 
 const STORE_PATH      = path.join(__dirname, 'session-store.json');
 const MAX_SESSIONS    = parseInt(process.env.SESSION_STORE_MAX || '200', 10);
+const MAX_ACCUMULATED_BYTES = parseInt(process.env.SESSION_STORE_MAX_ACCUMULATED_BYTES || '2000000', 10);
 
 // ─── Persistence ──────────────────────────────────────────────────────────────
 
 let _store = _loadStore();
+
+function _copyForSave() {
+  const sessions = {};
+  for (const [sid, sess] of Object.entries(_store.sessions || {})) {
+    const copy = { ...sess };
+    if (Array.isArray(copy.accumulated_messages)) {
+      const size = Buffer.byteLength(JSON.stringify(copy.accumulated_messages), 'utf8');
+      if (size > MAX_ACCUMULATED_BYTES) {
+        delete copy.accumulated_messages;
+        copy.accumulated_messages_omitted = {
+          reason: 'size_limit',
+          message_count: sess.accumulated_messages.length,
+          bytes: size,
+          limit: MAX_ACCUMULATED_BYTES,
+          updated_at: new Date().toISOString(),
+        };
+      }
+    }
+    sessions[sid] = copy;
+  }
+  return { sessions, preferences: _store.preferences || {} };
+}
 
 function _loadStore() {
   try {
@@ -38,8 +61,21 @@ function _loadStore() {
 function _saveStore() {
   const tmpPath = `${STORE_PATH}.${process.pid}.${Date.now()}.tmp`;
   try {
-    fs.writeFileSync(tmpPath, JSON.stringify(_store, null, 2));
-    fs.renameSync(tmpPath, STORE_PATH);
+    fs.writeFileSync(tmpPath, JSON.stringify(_copyForSave(), null, 2));
+    let lastError = null;
+    for (let attempt = 0; attempt < 5; attempt++) {
+      try {
+        fs.renameSync(tmpPath, STORE_PATH);
+        return;
+      } catch (e) {
+        lastError = e;
+        // Windows file watchers and sync providers can briefly hold the JSON
+        // file. A short blocking retry is cheaper than dropping the save and
+        // leaving temp files behind during busy polling.
+        if (attempt < 4) Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 25 * (attempt + 1));
+      }
+    }
+    throw lastError;
   } catch (e) {
     console.warn('[session-store] Failed to save:', e.message);
     try {
@@ -92,7 +128,7 @@ function resolveSession({ target, windowTitle, agentType, workspaceName, workspa
       if (workspacePath) sess.workspace_path = workspacePath;
       _saveStore();
       console.log(`[session-store] Matched ${sid} via sig=${targetSignature}`);
-      return { ...sess };
+      return { ...sess, _matched_existing: true };
     }
   }
 
@@ -109,7 +145,7 @@ function resolveSession({ target, windowTitle, agentType, workspaceName, workspa
       if (workspacePath) sess.workspace_path  = workspacePath;
       _saveStore();
       console.log(`[session-store] Matched ${sid} via target_id=${target.id} (sig updated)`);
-      return { ...sess };
+      return { ...sess, _matched_existing: true };
     }
   }
 
@@ -137,7 +173,7 @@ function resolveSession({ target, windowTitle, agentType, workspaceName, workspa
   _store.sessions[session_id] = session;
   _saveStore();
   console.log(`[session-store] New session ${session_id} (${agentType}, sig=${targetSignature})`);
-  return { ...session };
+  return { ...session, _matched_existing: false };
 }
 
 // ─── Session updates ──────────────────────────────────────────────────────────

@@ -308,6 +308,17 @@ function skillsList(sessionId, skills) {
   };
 }
 
+// Sent by proxy when Codex Desktop shows a native automation detail pane.
+function codexAutomationView(sessionId, view) {
+  return {
+    type:             'codex_automation_view',
+    protocol_version: PROTOCOL_VERSION,
+    session_id:       sessionId,
+    view:             view || null,
+    read_at:          new Date().toISOString(),
+  };
+}
+
 // ─── File browser events ─────────────────────────────────────────────────────
 
 // Sent by proxy in response to a list_directory request from the browser.
@@ -411,6 +422,7 @@ module.exports = {
   terminalOutput,
   fileChanges,
   skillsList,
+  codexAutomationView,
   directoryListing,
   fileContent,
   messageQueued,

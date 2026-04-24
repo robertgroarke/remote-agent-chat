@@ -294,6 +294,7 @@ class ProxyEngine extends EventEmitter {
       switch_branch:          true,
       create_branch:          true,
       skill_list:             agentType === 'codex-desktop',
+      automation_view:        agentType === 'codex-desktop',
       file_browser:           true, // all session types support workspace file browsing
     };
   }
@@ -657,8 +658,24 @@ class ProxyEngine extends EventEmitter {
     return agentType === 'antigravity_panel'
       || agentType === 'antigravity'
       || agentType === 'claude'
-      || agentType === 'codex'
-      || agentType === 'codex-desktop';
+      || agentType === 'codex';
+  }
+
+  _shouldResetAccumulatorOnNoOverlap(agentType) {
+    return false;
+  }
+
+  _maybePersistAccumulatedMessages(sessionId, session, options = {}) {
+    if (!session || !Array.isArray(session._accumulatedMessages)) return;
+    if (!session._accumulatedDirty && !options.force) return;
+    const now = Date.now();
+    const minIntervalMs = options.force ? 0 : 15000;
+    if (!options.force && session._lastAccumulatedPersistAt && now - session._lastAccumulatedPersistAt < minIntervalMs) {
+      return;
+    }
+    sessionStore.updateSession(sessionId, { accumulated_messages: session._accumulatedMessages });
+    session._accumulatedDirty = false;
+    session._lastAccumulatedPersistAt = now;
   }
 
   _transcriptWindowOffset(accumulated, windowMessages) {
@@ -754,10 +771,27 @@ class ProxyEngine extends EventEmitter {
     return delay;
   }
 
+  _withTimeout(promise, timeoutMs, label) {
+    let timer = null;
+    return Promise.race([
+      promise,
+      new Promise((_, reject) => {
+        timer = setTimeout(() => reject(new Error(`${label} timed out after ${timeoutMs}ms`)), timeoutMs);
+      }),
+    ]).finally(() => {
+      if (timer) clearTimeout(timer);
+    });
+  }
+
+  _connectCdpTarget(target, port, label, timeoutMs = 4000) {
+    const targetId = typeof target === 'string' ? target : target.id;
+    return this._withTimeout(CDP({ port, target: targetId }), timeoutMs, label || `CDP connect ${targetId?.substring?.(0, 8) || targetId}`);
+  }
+
   // ─── CDP target resolution ───────────────────────────────────────────────
 
   async _listTargetsOnPort(port) {
-    return CDP.List({ port });
+    return this._withTimeout(CDP.List({ port }), 3000, `CDP list port ${port}`);
   }
 
   async _resolveCdpTargets() {
@@ -1457,8 +1491,8 @@ class ProxyEngine extends EventEmitter {
           if (result.ok) {
             try {
               const freshMessages = await selectors.readMessages(sessionData.client.Runtime, sessionData.agentType, sid);
-              sessionData._accumulatedMessages = (agentT === 'codex-desktop') ? freshMessages.slice() : null;
-              sessionStore.updateSession(sid, { accumulated_messages: sessionData._accumulatedMessages });
+              sessionData._accumulatedMessages = null;
+              sessionStore.updateSession(sid, { accumulated_messages: null });
               sessionData.lastMessageCount = freshMessages.length;
               sessionData.lastObservedCount = freshMessages.length;
               sessionData.pendingLast = null;
@@ -1510,8 +1544,8 @@ class ProxyEngine extends EventEmitter {
           if (finalOk) {
             try {
               const freshMessages = await selectors.readMessages(sessionData.client.Runtime, sessionData.agentType, sid);
-              sessionData._accumulatedMessages = (agentT === 'codex-desktop') ? freshMessages.slice() : null;
-              sessionStore.updateSession(sid, { accumulated_messages: sessionData._accumulatedMessages });
+              sessionData._accumulatedMessages = null;
+              sessionStore.updateSession(sid, { accumulated_messages: null });
               sessionData.lastMessageCount = freshMessages.length;
               sessionData.lastObservedCount = freshMessages.length;
               sessionData.pendingLast = null;
@@ -2230,6 +2264,36 @@ class ProxyEngine extends EventEmitter {
     }
 
     // ── Launch / close ──────────────────────────────────────────────────
+    if (type === 'automation_view_action') {
+      const sid = msg.session_id || msg.session;
+      const sessionData = this.sessions.get(sid);
+      const agentT = sessionData?.agentType;
+      const requestId = msg.request_id;
+
+      if (agentT !== 'codex-desktop') {
+        this._sendToRelay(proto.agentControlResult(sid, requestId, 'automation_view_action', 'failed', {
+          code: 'not_supported', message: `automation_view_action not supported for ${agentT || 'unknown'}`,
+        }));
+        return;
+      }
+
+      selectors.clickCodexAutomationAction(sessionData.client.Runtime, true)
+        .then(result => {
+          if (result?.ok) {
+            this._sendToRelay(proto.agentControlResult(sid, requestId, 'automation_view_action', 'ok'));
+          } else {
+            this._sendToRelay(proto.agentControlResult(sid, requestId, 'automation_view_action', 'failed', {
+              code: 'action_not_found', message: result?.detail || 'Show Automation action not found',
+            }));
+          }
+        })
+        .catch(err => {
+          this._log('warn', `[ctrl] automation_view_action failed for ${sid}: ${err.message}`);
+          this._sendToRelay(proto.agentControlResult(sid, requestId, 'automation_view_action', 'failed', { code: 'cdp_error' }));
+        });
+      return;
+    }
+
     if (type === 'launch_session') {
       const agentType    = msg.agent_type;
       const requestId    = msg.request_id;
@@ -3210,6 +3274,16 @@ class ProxyEngine extends EventEmitter {
       }
     } else {
       if (session.resyncCandidateSig && session.resyncCandidateSig === transcriptSig) {
+        if (session.agentType === 'codex-desktop') {
+          try {
+            const ts = await selectors.detectThinking(session.client.Runtime, session.agentType);
+            if (ts?.thinking) {
+              session.lastObservedCount = effectiveMessages.length;
+              session.lastTranscriptSig = transcriptSig;
+              return;
+            }
+          } catch {}
+        }
         this._log('warn', `[${sessionId}] Mutated transcript stabilized — resyncing`);
         this._sendHistorySnapshot(sessionId, effectiveMessages, 'message count drift');
         session.lastMessageCount = effectiveMessages.length;
@@ -3565,23 +3639,32 @@ class ProxyEngine extends EventEmitter {
   async _pollSession(sessionId) {
     const session = this.sessions.get(sessionId);
     if (!session) return;
-
-    // Continue uses ephemeral CDP.  Claude used to but now uses persistent
-    // connections (see _isEphemeralIframeAgent for rationale) because ephemeral
-    // attach itself steals focus in Electron.
-    if (session.agentType === 'continue' || session.agentType === 'continue_yolo') {
-      return this._pollSessionContinue(sessionId, session);
+    if (session._pollInProgress) {
+      session._skippedOverlappingPolls = (session._skippedOverlappingPolls || 0) + 1;
+      if (session._skippedOverlappingPolls === 1 || session._skippedOverlappingPolls % 10 === 0) {
+        this._log('warn', `[${sessionId}] Skipping overlapping poll (${session._skippedOverlappingPolls})`);
+      }
+      return;
     }
+    session._pollInProgress = true;
 
     try {
+      // Continue uses ephemeral CDP.  Claude used to but now uses persistent
+      // connections (see _isEphemeralIframeAgent for rationale) because ephemeral
+      // attach itself steals focus in Electron.
+      if (session.agentType === 'continue' || session.agentType === 'continue_yolo') {
+        return await this._pollSessionContinue(sessionId, session);
+      }
+
       // Task list detection — runs before readMessages so it isn't skipped
       // by early returns in null-read or pending-stabilisation paths
       if (session.agentType === 'codex' || session.agentType === 'codex-desktop') {
         session._taskListPollCount = (session._taskListPollCount || 0) + 1;
-        if (session._taskListPollCount >= 5) {
+        const taskListPollEvery = session.agentType === 'codex-desktop' ? 10 : 5;
+        if (session._taskListPollCount >= taskListPollEvery) {
           session._taskListPollCount = 0;
           const usePageEval = session.agentType === 'codex-desktop';
-          selectors.readCodexTaskList(session.client.Runtime, usePageEval).then(taskList => {
+          const handleTaskList = (taskList) => {
             const sig = taskList ? JSON.stringify(taskList) : '';
             if (sig !== (session._taskListSig || '')) {
               session._taskListSig = sig;
@@ -3593,7 +3676,18 @@ class ProxyEngine extends EventEmitter {
               session.activity.task_list = taskList;
               this._sendToRelay(proto.proxyStatus(sessionId, session.status || 'healthy', session.activity));
             }
-          }).catch(e => { this._log('warn', `[${sessionId}] task_list error: ${e.message}`); });
+          };
+          if (session.agentType === 'codex-desktop') {
+            try {
+              handleTaskList(await selectors.readCodexTaskList(session.client.Runtime, usePageEval));
+            } catch (e) {
+              this._log('warn', `[${sessionId}] task_list error: ${e.message}`);
+            }
+          } else {
+            selectors.readCodexTaskList(session.client.Runtime, usePageEval)
+              .then(handleTaskList)
+              .catch(e => { this._log('warn', `[${sessionId}] task_list error: ${e.message}`); });
+          }
         }
       }
 
@@ -3814,11 +3908,13 @@ class ProxyEngine extends EventEmitter {
       // messages in session._accumulatedMessages and merge new DOM content
       // into that buffer.
       const isAccumulating = this._isTranscriptAccumulating(session.agentType);
+      let skipUnstableNoOverlap = false;
 
       if (isAccumulating) {
         if (!session._accumulatedMessages) {
           // First poll — seed with whatever the DOM has
           session._accumulatedMessages = messages.slice();
+          session._accumulatedDirty = true;
         } else {
           // Merge: find where current DOM messages overlap with the accumulated tail
           // The DOM always shows the newest N messages, so we match backwards.
@@ -3840,33 +3936,76 @@ class ProxyEngine extends EventEmitter {
             }
 
             if (overlapLen > 0) {
+              const accStart = acc.length - overlapLen;
+              if (
+                this._shouldResetAccumulatorOnNoOverlap(session.agentType) &&
+                accStart === 0 &&
+                dom.length < acc.length
+              ) {
+                const domSig = this._transcriptSignature(dom);
+                if (session._accumulatorPrefixTruncateSig === domSig) {
+                  this._log('warn', `[${sessionId}] Codex Desktop transcript tail disappeared twice; trimming accumulated history to active thread`);
+                  session._accumulatedMessages = dom.slice();
+                  session._accumulatedDirty = true;
+                  session._forceHistoryResync = 'codex-desktop accumulator trim';
+                  session._accumulatorPrefixTruncateSig = null;
+                } else {
+                  this._log('warn', `[${sessionId}] Codex Desktop transcript is a shorter prefix; waiting for stable repeat before trimming`);
+                  session._accumulatorPrefixTruncateSig = domSig;
+                  skipUnstableNoOverlap = true;
+                }
+              }
               // Update overlapping tail (content may have grown from streaming)
-              for (let k = 0; k < overlapLen; k++) {
+              for (let k = 0; !skipUnstableNoOverlap && !session._forceHistoryResync && k < overlapLen; k++) {
                 const accIdx = acc.length - overlapLen + k;
                 const domIdx = k;
                 // Keep the longer version
                 if (this._messageContentText(dom[domIdx]).length > this._messageContentText(acc[accIdx]).length) {
                   acc[accIdx] = dom[domIdx];
+                  session._accumulatedDirty = true;
                 }
               }
               // Append truly new messages
-              for (let k = overlapLen; k < dom.length; k++) {
+              for (let k = overlapLen; !skipUnstableNoOverlap && !session._forceHistoryResync && k < dom.length; k++) {
                 acc.push(dom[k]);
+                session._accumulatedDirty = true;
+              }
+              if (!skipUnstableNoOverlap && !session._forceHistoryResync) {
+                session._accumulatorNoOverlapCandidateSig = null;
+                session._accumulatorPrefixTruncateSig = null;
               }
             } else {
               // No overlap — the DOM jumped to completely new content.
               // This can happen after a /clear or new_chat. Check if all DOM
               // messages are already in the tail of acc (subset check).
-              const lastAccContent = acc.length > 0 ? acc[acc.length - 1].content : '';
-              const firstDomContent = dom[0]?.content || '';
-              // If the DOM first message matches nothing in recent history, append all
-              if (!lastAccContent || !firstDomContent.startsWith(lastAccContent.substring(0, 80))) {
-                for (const m of dom) acc.push(m);
+              if (this._shouldResetAccumulatorOnNoOverlap(session.agentType)) {
+                const domSig = this._transcriptSignature(dom);
+                if (session._accumulatorNoOverlapCandidateSig === domSig) {
+                  this._log('warn', `[${sessionId}] Codex Desktop transcript window lost overlap twice; resetting accumulated history to active thread`);
+                  session._accumulatedMessages = dom.slice();
+                  session._accumulatedDirty = true;
+                  session._forceHistoryResync = 'codex-desktop accumulator reset';
+                  session._accumulatorNoOverlapCandidateSig = null;
+                } else {
+                  this._log('warn', `[${sessionId}] Codex Desktop transcript window lost overlap; waiting for a stable repeat before resetting`);
+                  session._accumulatorNoOverlapCandidateSig = domSig;
+                  skipUnstableNoOverlap = true;
+                }
+              } else {
+                const lastAccContent = acc.length > 0 ? acc[acc.length - 1].content : '';
+                const firstDomContent = dom[0]?.content || '';
+                // If the DOM first message matches nothing in recent history, append all
+                if (!lastAccContent || !firstDomContent.startsWith(lastAccContent.substring(0, 80))) {
+                  for (const m of dom) {
+                    acc.push(m);
+                    session._accumulatedDirty = true;
+                  }
+                }
               }
             }
           }
         }
-        sessionStore.updateSession(sessionId, { accumulated_messages: session._accumulatedMessages });
+        this._maybePersistAccumulatedMessages(sessionId, session);
       }
 
       // Use accumulated messages for antigravity sessions, DOM snapshot for others
@@ -3874,10 +4013,18 @@ class ProxyEngine extends EventEmitter {
       const transcriptSig = this._transcriptSignature(effectiveMessages);
       const prevObservedCount = session.lastObservedCount ?? session.lastMessageCount;
 
+      if (skipUnstableNoOverlap) {
+        session.lastObservedCount = effectiveMessages.length;
+        session.lastTranscriptSig = transcriptSig;
+        return;
+      }
+
       if (session._forceHistoryResync) {
         const reason = session._forceHistoryResync;
         session._forceHistoryResync = null;
         this._sendHistorySnapshot(sessionId, effectiveMessages, reason);
+        this._maybePersistAccumulatedMessages(sessionId, session, { force: true });
+        session._lastRegressionSnapshotSig = null;
         session.lastMessageCount = effectiveMessages.length;
         session.lastObservedCount = effectiveMessages.length;
         session.lastTranscriptSig = transcriptSig;
@@ -3889,8 +4036,20 @@ class ProxyEngine extends EventEmitter {
 
       if (effectiveMessages.length < prevObservedCount) {
         // For accumulating sessions this should rarely happen (new chat / clear)
+        const regressionSig = `${prevObservedCount}->${effectiveMessages.length}:${transcriptSig}`;
+        if (session._lastRegressionSnapshotSig === regressionSig) {
+          session.lastMessageCount = effectiveMessages.length;
+          session.lastObservedCount = effectiveMessages.length;
+          session.lastTranscriptSig = transcriptSig;
+          session.pendingLast = null;
+          session.resyncCandidateSig = null;
+          session.waitingForAssistant = effectiveMessages.length > 0 && effectiveMessages[effectiveMessages.length - 1].role === 'user';
+          return;
+        }
+        session._lastRegressionSnapshotSig = regressionSig;
         this._log('warn', `[${sessionId}] Transcript regressed ${prevObservedCount} -> ${effectiveMessages.length}${isAccumulating ? ' (accumulated)' : ''}, forcing history snapshot`);
         this._sendHistorySnapshot(sessionId, effectiveMessages, 'transcript regression');
+        this._maybePersistAccumulatedMessages(sessionId, session, { force: true });
         session.lastMessageCount = effectiveMessages.length;
         session.lastObservedCount = effectiveMessages.length;
         session.lastTranscriptSig = transcriptSig;
@@ -3908,6 +4067,7 @@ class ProxyEngine extends EventEmitter {
         if (session.resyncCandidateSig === transcriptSig) {
           this._log('warn', `[${sessionId}] Transcript mutated in place, forcing history snapshot`);
           this._sendHistorySnapshot(sessionId, effectiveMessages, 'transcript mutation');
+          this._maybePersistAccumulatedMessages(sessionId, session, { force: true });
           session.lastMessageCount = effectiveMessages.length;
           session.lastObservedCount = effectiveMessages.length;
           session.lastTranscriptSig = transcriptSig;
@@ -3925,6 +4085,7 @@ class ProxyEngine extends EventEmitter {
       if (session.resyncCandidateSig && session.resyncCandidateSig === transcriptSig) {
         this._log('warn', `[${sessionId}] Mutated transcript stabilized — resyncing`);
         this._sendHistorySnapshot(sessionId, effectiveMessages, 'message count drift');
+        this._maybePersistAccumulatedMessages(sessionId, session, { force: true });
         session.lastMessageCount = effectiveMessages.length;
         session.lastObservedCount = effectiveMessages.length;
         session.lastTranscriptSig = transcriptSig;
@@ -3945,6 +4106,29 @@ class ProxyEngine extends EventEmitter {
         const p       = session.pendingLast;
         const current = effectiveMessages[session.lastMessageCount];
         if (current && current.role === p.role && current.content === p.content) {
+          if (session.agentType === 'codex-desktop' && p.role === 'assistant') {
+            try {
+              const ts = await selectors.detectThinking(session.client.Runtime, session.agentType);
+              if (ts?.thinking) {
+                const genActivity = {
+                  kind: 'thinking',
+                  label: ts.label || 'Thinking',
+                  updated_at: new Date().toISOString(),
+                };
+                if (session.taskList) genActivity.task_list = session.taskList;
+                if (ts.thinkingContent) genActivity.thinkingContent = ts.thinkingContent;
+                session.thinking = true;
+                session.thinkingLabel = genActivity.label;
+                session.thinkingContent = ts.thinkingContent || '';
+                session.activity = genActivity;
+                sessionStore.updateSession(sessionId, { activity: genActivity });
+                this._sendToRelay(proto.proxyStatus(sessionId, session.status || 'healthy', genActivity));
+                session.lastObservedCount = effectiveMessages.length;
+                session.lastTranscriptSig = transcriptSig;
+                return;
+              }
+            } catch {}
+          }
           this._log('info', `[${sessionId}] Stable ${p.role} msg (${p.content.length} chars)`);
           this._sendToRelay(proto.proxyMessage(sessionId, p.role, p.content));
           session.lastMessageCount++;
@@ -3961,7 +4145,8 @@ class ProxyEngine extends EventEmitter {
           // threshold because its transcript/tool output evolves rapidly.
           const isCodexAny = session.agentType === 'codex' || session.agentType === 'codex-desktop';
           const streamFlushMs = isCodexAny ? 1500 : 5000;
-          if (pendingAge > streamFlushMs && current.content !== session._lastStreamedContent) {
+          const holdCodexDesktopAssistant = session.agentType === 'codex-desktop' && current.role === 'assistant';
+          if (!holdCodexDesktopAssistant && pendingAge > streamFlushMs && current.content !== session._lastStreamedContent) {
             session._lastStreamedContent = current.content;
             this._sendHistorySnapshot(sessionId, effectiveMessages, 'assistant completion');
             this._log('info', `[${sessionId}] Streaming flush (${effectiveMessages.length} msgs, pending ${Math.round(pendingAge / 1000)}s)`);
@@ -4033,9 +4218,9 @@ class ProxyEngine extends EventEmitter {
       // Polls every 10 cycles (~30-50s) to keep the thread list current.
       if (session.agentType === 'codex-desktop') {
         session._threadListPollCount = (session._threadListPollCount || 0) + 1;
-        if (session._threadListPollCount >= 10) {
+        if (session._threadListPollCount >= 30) {
           session._threadListPollCount = 0;
-          selectors.readCodexThreadList(session.client.Runtime, true)
+          await selectors.readCodexThreadList(session.client.Runtime, true)
             .then(threads => {
               if (threads.length > 0) {
                 this._sendToRelay(proto.threadList(sessionId, threads));
@@ -4129,10 +4314,11 @@ class ProxyEngine extends EventEmitter {
       // Native queue detection — Codex side-panel queue items (messages with Steer buttons)
       if (session.agentType === 'codex' || session.agentType === 'codex-desktop') {
         session._nativeQueuePollCount = (session._nativeQueuePollCount || 0) + 1;
-        if (session._nativeQueuePollCount >= 3) {
+        const nativeQueuePollEvery = session.agentType === 'codex-desktop' ? 10 : 3;
+        if (session._nativeQueuePollCount >= nativeQueuePollEvery) {
           session._nativeQueuePollCount = 0;
           const usePageEval = session.agentType === 'codex-desktop';
-          selectors.readCodexNativeQueue(session.client.Runtime, usePageEval).then(items => {
+          const nativeQueuePromise = selectors.readCodexNativeQueue(session.client.Runtime, usePageEval).then(items => {
             const sig = items.map(i => i.text).join('|');
             const changed = sig !== (session._nativeQueueSig || '');
             // Always re-send every ~10 polls (~30s) so new browsers pick it up
@@ -4148,16 +4334,62 @@ class ProxyEngine extends EventEmitter {
               this._sendToRelay(proto.nativeQueue(sessionId, items));
             }
           }).catch((e) => { this._log('warn', `[${sessionId}] [native-queue] Error: ${e.message}`); });
+          if (session.agentType === 'codex-desktop') await nativeQueuePromise;
+        }
+      }
+
+      if (session.agentType === 'codex-desktop') {
+        session._automationViewPollCount = (session._automationViewPollCount || 0) + 1;
+        if (session._automationViewPollCount >= 5) {
+          session._automationViewPollCount = 0;
+          try {
+            const view = await selectors.readCodexAutomationView(session.client.Runtime, true);
+            const sig = view ? JSON.stringify(view) : '';
+            if (sig !== (session._automationViewSig || '')) {
+              session._automationViewSig = sig;
+              this._sendToRelay(proto.codexAutomationView(sessionId, view));
+            }
+          } catch (e) {
+            this._log('warn', `[${sessionId}] automation_view error: ${e.message}`);
+          }
         }
       }
 
 
     } catch (e) {
       this._log('error', `[${sessionId}] Poll error: ${e.message}`);
+    } finally {
+      session._pollInProgress = false;
     }
   }
 
   // ─── Permission dialog polling ───────────────────────────────────────
+
+  async _pollSessionBounded(sessionId) {
+    const session = this.sessions.get(sessionId);
+    if (!session) return;
+    const timeoutMs =
+      session.agentType === 'codex-desktop' ? 8000 :
+      (session.agentType === 'continue' || session.agentType === 'continue_yolo') ? 10000 :
+      12000;
+    let timer = null;
+    try {
+      await Promise.race([
+        this._pollSession(sessionId),
+        new Promise((_, reject) => {
+          timer = setTimeout(() => reject(new Error(`poll timeout after ${timeoutMs}ms`)), timeoutMs);
+        }),
+      ]);
+    } catch (e) {
+      this._log('warn', `[${sessionId}] ${e.message}; closing CDP client for rediscovery`);
+      sessionStore.markDisconnected(sessionId);
+      try { await session.client?.close(); } catch {}
+      this.sessions.delete(sessionId);
+      this._broadcastSessionSnapshot();
+    } finally {
+      if (timer) clearTimeout(timer);
+    }
+  }
 
   _makePromptId(sessionId, message, choices) {
     const raw = `${sessionId}||${message}||${choices.map(c => c.choice_id).join('|')}`;
@@ -4612,12 +4844,12 @@ class ProxyEngine extends EventEmitter {
       }
       let pageClient;
       try {
-        pageClient = await CDP({ port: 9223, target: page.id });
-        await pageClient.Runtime.enable();
-        const res = await pageClient.Runtime.evaluate({
+        pageClient = await this._connectCdpTarget(page, 9223, `workbench page ${page.id.substring(0, 8)}`);
+        await this._withTimeout(pageClient.Runtime.enable(), 3000, `Runtime.enable workbench ${page.id.substring(0, 8)}`);
+        const res = await this._withTimeout(pageClient.Runtime.evaluate({
           expression: '(typeof window.vscodeWindowId !== "undefined") ? String(window.vscodeWindowId) : null',
           returnByValue: true,
-        });
+        }), 3000, `window id read ${page.id.substring(0, 8)}`);
         const winId = res.result?.value;
         if (winId) {
           windowIdToPage.set(winId, page);
@@ -4750,8 +4982,8 @@ class ProxyEngine extends EventEmitter {
 
       let client;
       try {
-        client = await CDP({ port: target._cdpPort || this.CDP_PORTS[0], target: target.id });
-        await client.Runtime.enable();
+        client = await this._connectCdpTarget(target, target._cdpPort || this.CDP_PORTS[0], `iframe ${target.id.substring(0, 8)} connect`);
+        await this._withTimeout(client.Runtime.enable(), 3000, `Runtime.enable iframe ${target.id.substring(0, 8)}`);
         client.Runtime._webviewId = (target.url.match(/[?&]id=([0-9a-f-]+)/i) || [])[1] || null;
 
         // Cache inner-frame context ID to avoid active-frame traversal
@@ -4760,13 +4992,13 @@ class ProxyEngine extends EventEmitter {
           const focusTag = (ext.toLowerCase().includes('anthropic') || ext.toLowerCase().includes('claude')) ? 'claude-focus' : 'continue-focus';
           this._log('info', `[discover] [${focusTag}] initial context cache:start target=${target.id}`);
         }
-        await selectors.cacheInnerContextId(client.Runtime);
+        await this._withTimeout(selectors.cacheInnerContextId(client.Runtime), 3000, `context cache ${target.id.substring(0, 8)}`);
         if (ext.toLowerCase().includes('continue.continue') || ext.toLowerCase().includes('continue-yolo') || ext.toLowerCase().includes('anthropic') || ext.toLowerCase().includes('claude')) {
           const focusTag = (ext.toLowerCase().includes('anthropic') || ext.toLowerCase().includes('claude')) ? 'claude-focus' : 'continue-focus';
           this._log('info', `[discover] [${focusTag}] initial context cache:end target=${target.id} resolved=${client.Runtime?._innerContextId || 'null'}`);
         }
 
-        const agentType = await selectors.detectAgentType(client.Runtime, ext);
+        const agentType = await this._withTimeout(selectors.detectAgentType(client.Runtime, ext), 3000, `agent detect ${target.id.substring(0, 8)}`);
         if (!agentType) {
           this._log('info', `[discover] ${target.id.substring(0, 8)}: detectAgentType=null, skipping`);
           await client.close();
@@ -4822,14 +5054,18 @@ class ProxyEngine extends EventEmitter {
           }
         }
 
-        const raw          = await selectors.readMessages(client.Runtime, agentType, sessionId);
+        const raw          = await this._withTimeout(selectors.readMessages(client.Runtime, agentType, sessionId), 5000, `initial read ${sessionId.substring(0, 8)}`);
         const domMsgs      = raw ? JSON.parse(raw) : [];
         const isAccumAccum = this._isTranscriptAccumulating(agentType);
         let initialListView = false;
         let initialChatList = null;
         if (agentType === 'codex') {
           try {
-            initialChatList = await selectors.readCodexChatList(client.Runtime, false);
+            initialChatList = await this._withTimeout(
+              selectors.readCodexChatList(client.Runtime, false),
+              3000,
+              `initial codex chat list ${sessionId.substring(0, 8)}`
+            );
             const hasChats = Array.isArray(initialChatList) && initialChatList.length > 0;
             const hasActiveChat = hasChats && initialChatList.some(c => c && c.active);
             initialListView = hasChats && !hasActiveChat;
@@ -4838,10 +5074,13 @@ class ProxyEngine extends EventEmitter {
           }
         }
         const storedAccumulated = Array.isArray(sessionMeta.accumulated_messages) ? sessionMeta.accumulated_messages : null;
-        const useStoredAccumulated = isAccumAccum
-          && storedAccumulated
-          && domMsgs.length > 0
-          && this._accumulatedTranscriptContainsWindow(storedAccumulated, domMsgs);
+        let useStoredAccumulated = false;
+        if (isAccumAccum && storedAccumulated && domMsgs.length > 0) {
+          const windowOffset = this._transcriptWindowOffset(storedAccumulated, domMsgs);
+          useStoredAccumulated = agentType === 'codex-desktop'
+            ? (windowOffset >= 0 && windowOffset + domMsgs.length === storedAccumulated.length)
+            : windowOffset >= 0;
+        }
         const initialMsgs  = initialListView
           ? []
           : (useStoredAccumulated ? storedAccumulated : domMsgs);
@@ -4897,14 +5136,22 @@ class ProxyEngine extends EventEmitter {
 
         if (agentType === 'codex') {
           try {
-            await this._refreshWorkbenchPaneMeta(this.sessions.get(sessionId));
+            await this._withTimeout(
+              this._refreshWorkbenchPaneMeta(this.sessions.get(sessionId)),
+              3000,
+              `initial workbench pane meta ${sessionId.substring(0, 8)}`
+            );
           } catch {}
         }
         if (agentType === 'continue') {
           try {
             const continueSession = this.sessions.get(sessionId);
-            const continueChatList = await this._withWorkbenchClient(continueSession, wbClient =>
-              selectors.readContinueWorkbenchChatList(wbClient.Runtime, continueSession._webviewId)
+            const continueChatList = await this._withTimeout(
+              this._withWorkbenchClient(continueSession, wbClient =>
+                selectors.readContinueWorkbenchChatList(wbClient.Runtime, continueSession._webviewId)
+              ),
+              3000,
+              `initial continue chat list ${sessionId.substring(0, 8)}`
             );
             if (Array.isArray(continueChatList) && continueChatList.length > 0) {
               continueSession._lastChatListSig = JSON.stringify(continueChatList.map(c => `${c.id || ''}:${c.title || ''}:${!!c.active}`));
@@ -4931,7 +5178,12 @@ class ProxyEngine extends EventEmitter {
 
         this._log('info', `[cdp] ${agentType} → ${sessionId} in "${windowTitle}" (${initialCount} existing msgs)`);
 
-        if (raw && initialCount > 0) {
+        const shouldSendInitialHistory = raw && initialCount > 0 && (
+          !isAccumAccum ||
+          useStoredAccumulated ||
+          sessionMeta._matched_existing === false
+        );
+        if (shouldSendInitialHistory) {
           this._sendHistorySnapshot(sessionId, initialMsgs, 'initial discovery');
         }
         if (initialChatList) {
@@ -5016,10 +5268,14 @@ class ProxyEngine extends EventEmitter {
 
       let client;
       try {
-        client = await CDP({ port: target._cdpPort || this.CDP_PORTS[0], target: target.id });
-        await client.Runtime.enable();
+        client = await this._connectCdpTarget(target, target._cdpPort || this.CDP_PORTS[0], `manager ${target.id.substring(0, 8)} connect`);
+        await this._withTimeout(client.Runtime.enable(), 3000, `Runtime.enable manager ${target.id.substring(0, 8)}`);
 
-        const convoTitle = await selectors.readAntigravitySessionTitle(client.Runtime);
+        const convoTitle = await this._withTimeout(
+          selectors.readAntigravitySessionTitle(client.Runtime),
+          3000,
+          `manager title ${target.id.substring(0, 8)}`
+        );
         const displayName = convoTitle || target.title || 'Antigravity Agent';
 
         const sigSource = `${target.url}::${target.title}`;
@@ -5039,7 +5295,11 @@ class ProxyEngine extends EventEmitter {
           continue;
         }
 
-        const raw          = await selectors.readMessages(client.Runtime, 'antigravity', sessionId);
+        const raw          = await this._withTimeout(
+          selectors.readMessages(client.Runtime, 'antigravity', sessionId),
+          5000,
+          `manager initial read ${sessionId.substring(0, 8)}`
+        );
         const initialMsgs  = raw ? JSON.parse(raw) : [];
         const initialCount = initialMsgs.length;
 
@@ -5120,17 +5380,29 @@ class ProxyEngine extends EventEmitter {
 
       let client;
       try {
-        client = await CDP({ port: target._cdpPort || this.CDP_PORTS[0], target: target.id });
-        await client.Runtime.enable();
+        client = await this._connectCdpTarget(target, target._cdpPort || this.CDP_PORTS[0], `antigravity panel ${target.id.substring(0, 8)} connect`);
+        await this._withTimeout(client.Runtime.enable(), 3000, `Runtime.enable antigravity panel ${target.id.substring(0, 8)}`);
 
-        const hasContent = await selectors.detectAntigravityPanelHasContent(client.Runtime);
+        const hasContent = await this._withTimeout(
+          selectors.detectAntigravityPanelHasContent(client.Runtime),
+          3000,
+          `antigravity panel content ${target.id.substring(0, 8)}`
+        );
         this._log('info', `[discover] Side-panel ${target.id.substring(0,8)} "${target.title.substring(0,40)}" hasContent=${hasContent}`);
         // Register the panel even when empty so it shows in the web UI immediately.
         // The user can start typing and the session will persist.
 
         const workspaceName = (target.title || '').replace(/ - Antigravity.*/, '').trim() || target.title;
-        const panelSummary  = await selectors.readAntigravityPanelSummary(client.Runtime);
-        const panelTitle    = panelSummary?.title || await selectors.readAntigravityPanelTitle(client.Runtime);
+        const panelSummary  = await this._withTimeout(
+          selectors.readAntigravityPanelSummary(client.Runtime),
+          3000,
+          `antigravity panel summary ${target.id.substring(0, 8)}`
+        );
+        const panelTitle    = panelSummary?.title || await this._withTimeout(
+          selectors.readAntigravityPanelTitle(client.Runtime),
+          3000,
+          `antigravity panel title ${target.id.substring(0, 8)}`
+        );
         const displayName   = panelTitle ? `${workspaceName} / ${panelTitle}` : workspaceName;
 
         this._log('info', `[discover] Probing Antigravity side-panel in "${workspaceName}" (${target.id.substring(0, 8)})`);
@@ -5160,7 +5432,11 @@ class ProxyEngine extends EventEmitter {
           continue;
         }
 
-        const raw          = await selectors.readMessages(client.Runtime, 'antigravity_panel', sessionId);
+        const raw          = await this._withTimeout(
+          selectors.readMessages(client.Runtime, 'antigravity_panel', sessionId),
+          5000,
+          `antigravity panel initial read ${sessionId.substring(0, 8)}`
+        );
         const initialMsgs  = raw ? JSON.parse(raw) : [];
         const initialCount = initialMsgs.length;
 
@@ -5238,8 +5514,8 @@ class ProxyEngine extends EventEmitter {
 
       let client;
       try {
-        client = await CDP({ port: target._cdpPort, target: target.id });
-        await client.Runtime.enable();
+        client = await this._connectCdpTarget(target, target._cdpPort, `${agentType} ${target.id.substring(0, 8)} connect`);
+        await this._withTimeout(client.Runtime.enable(), 3000, `Runtime.enable ${agentType} ${target.id.substring(0, 8)}`);
 
         const sigSource = `${agentType}::${target.url}`;
         const sessionMeta = sessionStore.resolveSession({
@@ -5258,7 +5534,11 @@ class ProxyEngine extends EventEmitter {
           continue;
         }
 
-        const raw         = await selectors.readMessages(client.Runtime, agentType, sessionId).catch(() => null);
+        const raw         = await this._withTimeout(
+          selectors.readMessages(client.Runtime, agentType, sessionId),
+          5000,
+          `${agentType} initial read ${sessionId.substring(0, 8)}`
+        ).catch(() => null);
         const initialMsgs = raw ? JSON.parse(raw) : [];
         const initialCount = initialMsgs.length;
 
@@ -5356,6 +5636,15 @@ class ProxyEngine extends EventEmitter {
     let tick = 0;
     this._pollTimer = setInterval(async () => {
       if (!this._running) return;
+      if (this._pollLoopInProgress) {
+        this._skippedPollTicks = (this._skippedPollTicks || 0) + 1;
+        if (this._skippedPollTicks === 1 || this._skippedPollTicks % 10 === 0) {
+          this._log('warn', `[poll] Previous tick still running; skipped ${this._skippedPollTicks} tick(s)`);
+        }
+        return;
+      }
+      this._pollLoopInProgress = true;
+      try {
       tick++;
 
       if (tick % 10 === 0) await this._discoverTargets();
@@ -5381,8 +5670,7 @@ class ProxyEngine extends EventEmitter {
         if (
           session.agentType === 'codex-desktop' ||
           session.agentType === 'claude-desktop' ||
-          session.agentType === 'codex' ||
-          session.agentType === 'continue_yolo'
+          session.agentType === 'codex'
         ) {
           everyTickIds.push(sessionId);
           continue;
@@ -5396,7 +5684,7 @@ class ProxyEngine extends EventEmitter {
         const session = this.sessions.get(sessionId);
         if (!session) continue;
         if (session.agentType === 'continue_yolo') {
-          await this._pollSession(sessionId);
+          await this._pollSessionBounded(sessionId);
           continue;
         }
         // Throttle desktop apps when idle — the user is most likely typing
@@ -5413,7 +5701,14 @@ class ProxyEngine extends EventEmitter {
             session._desktopIdlePollCount = 0;
           }
         }
-        await this._pollSession(sessionId);
+        if (session.agentType === 'codex') {
+          const isActive = session.activity?.kind === 'generating' || session.activity?.kind === 'thinking';
+          const threshold = isActive ? 2 : 4;
+          session._codexPollCount = (session._codexPollCount || 0) + 1;
+          if (session._codexPollCount < threshold) continue;
+          session._codexPollCount = 0;
+        }
+        await this._pollSessionBounded(sessionId);
         await this._pollPermissions(sessionId);
       }
 
@@ -5424,7 +5719,9 @@ class ProxyEngine extends EventEmitter {
         const activeKey = windowKeys[this._pollWindowIndex];
         this._pollWindowIndex++;
 
-        // Poll all sessions in the selected window
+        // Poll a small slice of the selected window. Polling every session in
+        // a busy window can monopolize the tick and starve desktop app reads.
+        let polledWindowSessions = 0;
         for (const sessionId of windowGroups.get(activeKey)) {
           const session = this.sessions.get(sessionId);
           if (!session) continue;
@@ -5445,12 +5742,21 @@ class ProxyEngine extends EventEmitter {
             session._continuePollCount = (session._continuePollCount || 0) + 1;
             if (session._continuePollCount < 5) continue;
             session._continuePollCount = 0;
-            await this._pollSession(sessionId);
+            await this._pollSessionBounded(sessionId);
+            polledWindowSessions++;
+            if (polledWindowSessions >= 2) break;
             continue;
           }
-          await this._pollSession(sessionId);
+          await this._pollSessionBounded(sessionId);
           await this._pollPermissions(sessionId);
+          polledWindowSessions++;
+          if (polledWindowSessions >= 2) break;
         }
+      }
+      } catch (e) {
+        this._log('error', `[poll] Tick error: ${e.message}`);
+      } finally {
+        this._pollLoopInProgress = false;
       }
     }, this.POLL_INTERVAL_MS);
   }
