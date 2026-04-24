@@ -1,0 +1,21 @@
+services:
+  relay:
+    build: ./relay-server
+    restart: unless-stopped
+    env_file: .env
+    volumes:
+      - relay-data:/data
+    ports:
+      - "3500:3500"   # optional: LAN access at http://<your-machine-ip>:3500
+
+  cloudflared:
+    image: cloudflare/cloudflared:latest
+    restart: unless-stopped
+    command: tunnel --no-autoupdate run
+    environment:
+      - TUNNEL_TOKEN=${CLOUDFLARE_TUNNEL_TOKEN}
+    depends_on:
+      - relay
+
+volumes:
+  relay-data:
