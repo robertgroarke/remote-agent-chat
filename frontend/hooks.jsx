@@ -177,9 +177,9 @@ export function useRelay() {
       return requestId;
     }
 
-    function setCodexConfig(sessionId, { model_id, effort, access_mode, workspace_mode }) {
+    function setCodexConfig(sessionId, { model_id, effort, speed, access_mode, workspace_mode }) {
       const requestId = `codex-cfg-${Date.now()}-${Math.random().toString(36).slice(2, 7)}`;
-      send({ type: 'set_codex_config', session_id: sessionId, model_id, effort, access_mode, workspace_mode, request_id: requestId });
+      send({ type: 'set_codex_config', session_id: sessionId, model_id, effort, speed, access_mode, workspace_mode, request_id: requestId });
       return requestId;
     }
 

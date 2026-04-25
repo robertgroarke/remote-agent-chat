@@ -2479,6 +2479,7 @@ function handleClientConnection(ws, req) {
         session_id:       sessionId,
         model_id:         msg.model_id,
         effort:           msg.effort,
+        speed:            msg.speed,
         access_mode:      msg.access_mode,
       }));
       log('info', 'ctrl', 'Set codex config forwarded', { session: sessionId, request_id: requestId });

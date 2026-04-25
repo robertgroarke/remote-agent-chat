@@ -1174,6 +1174,21 @@ function AgentSettingsPanel({ session, config, onRequestRefresh, onSetModel, onS
                 ))}
               </select>
             </div>
+            <div className="settings-row">
+              <span className="settings-label">Speed</span>
+              <select
+                className="settings-perm-select"
+                value={(config?.speed || 'standard').toLowerCase()}
+                onChange={e => { onSetCodexConfig && onSetCodexConfig({ speed: e.target.value }); setCodexOk(agentType === 'codex-desktop' ? 'Saved' : 'Saved — restart Codex to apply'); setTimeout(() => setCodexOk(null), 3000); }}
+              >
+                {(config?.available_speeds || []).map(m => (
+                  <option key={m.id} value={m.id}>{m.label}</option>
+                ))}
+                {config?.speed && !(config?.available_speeds || []).some(m => m.id === config.speed) && config.speed !== 'unknown' && (
+                  <option value={config.speed}>{config.speed}</option>
+                )}
+              </select>
+            </div>
             {agentType === 'codex-desktop' && config?.branch && config.branch !== 'unknown' && (
               <div className="settings-row">
                 <span className="settings-label">Branch</span>
@@ -3835,6 +3850,19 @@ async function uploadBinaryDraft(sessionId, base64, mimeType, filename) {
                       {(activeConfig.available_efforts || []).map(m => (
                         <option key={m.id} value={m.id}>{m.label}</option>
                       ))}
+                    </select>
+                    <select
+                      className="composer-setting-select"
+                      value={(activeConfig.speed || 'standard').toLowerCase()}
+                      onChange={e => setCodexConfig(activeSession, { speed: e.target.value })}
+                      title="Speed"
+                    >
+                      {(activeConfig.available_speeds || []).map(m => (
+                        <option key={m.id} value={m.id}>{m.label}</option>
+                      ))}
+                      {activeConfig.speed && !(activeConfig.available_speeds || []).some(m => m.id === activeConfig.speed) && activeConfig.speed !== 'unknown' && (
+                        <option value={activeConfig.speed}>{activeConfig.speed}</option>
+                      )}
                     </select>
                     <select
                       className="composer-setting-select"

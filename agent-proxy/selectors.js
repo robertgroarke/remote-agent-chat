@@ -3723,12 +3723,12 @@ async function interruptAgent(Runtime, agentType, sessionId) {
 
 // ─── Codex config reading ─────────────────────────────────────────────────────
 //
-// Reads model, effort, and access level from the Codex (openai.chatgpt) composer
+// Reads model, effort, speed, and access level from the Codex (openai.chatgpt) composer
 // toolbar buttons.  These values are displayed as read-only — Codex does not
 // expose its settings via in-DOM dropdowns (they use VS Code host APIs instead).
 
 const READ_CODEX_CONFIG_EXPR = `
-  var config = { model_id: null, effort: null, access: null };
+  var config = { model_id: null, effort: null, speed: null, access: null };
   var btns = Array.from(d.querySelectorAll('button'));
   var lastBtns = btns.slice(-25);
   function norm(t) {
@@ -3783,6 +3783,24 @@ const READ_CODEX_CONFIG_EXPR = `
   });
   if (accessBtn) config.access = norm(accessBtn.textContent);
 
+  // Speed is usually only visible while the combined model menu is open. If a
+  // menu is already open, capture the checked Standard/Fast item without
+  // opening menus during passive polling.
+  var speedItems = Array.from(d.querySelectorAll('[role="menuitem"],[role="option"],button')).filter(function(el) {
+    if (!(el.offsetWidth || el.offsetHeight || el.getClientRects().length)) return false;
+    var t = norm(el.innerText || el.textContent || '');
+    return /^(standard|fast)(\\s|$)/i.test(t);
+  });
+  var checkedSpeed = speedItems.find(function(el) {
+    return el.getAttribute('aria-checked') === 'true' ||
+      /check|selected|active/i.test(String(el.className || '')) ||
+      !!el.querySelector('svg');
+  }) || null;
+  if (checkedSpeed) {
+    var speedText = norm(checkedSpeed.innerText || checkedSpeed.textContent || '').split(' ')[0];
+    config.speed = speedText;
+  }
+
   return JSON.stringify(config);
 `;
 
@@ -3826,6 +3844,7 @@ async function readCodexConfig(Runtime, usePageEval) {
     if (cfg.access)   cfg.access   = _normalizeCodexAccess(cfg.access);
     if (cfg.effort)   cfg.effort   = _normalizeCodexEffort(cfg.effort);
     if (cfg.model_id) cfg.model_id = cfg.model_id.toLowerCase().trim(); // "GPT-5.4" → "gpt-5.4"
+    if (cfg.speed) cfg.speed = String(cfg.speed).toLowerCase().trim();
     return cfg;
   } catch {
     return null;
@@ -4963,6 +4982,7 @@ async function readAgentConfig(Runtime, agentType, workspacePath) {
       model_id:          cfg?.model_id  || 'unknown',
       permission_mode:   cfg?.access    || 'unknown',
       effort:            cfg?.effort    || 'unknown',
+      speed:             cfg?.speed     || 'unknown',
       file_access_scope: workspacePath  || 'unknown',
     };
     // Epic 7: read sandbox status for codex-desktop
@@ -6043,32 +6063,105 @@ function _buildPanelPermissionClickExpr(choiceId) {
 async function detectPermissionDialog(Runtime, agentType) {
   if (agentType === 'gemini') return null;
 
-  // Continue: check for accept/reject tool call buttons.
-  // Multiple tool-call blocks may exist in the DOM from previous turns;
-  // pick the LAST visible accept button (the active permission prompt).
+  // Continue: check for accept/reject tool call and file-change buttons.
+  // Multiple blocks may exist in the DOM from previous turns; pick the LAST
+  // visible active prompt controls.
   if (isContinueAgentType(agentType)) {
     try {
       const raw = await evalInFrame(Runtime, `
+        function hasVisibleBox(el) {
+          if (!el || !el.getBoundingClientRect) return false;
+          var rect = el.getBoundingClientRect();
+          return rect.width > 0 && rect.height > 0;
+        }
+        function isVisible(el) {
+          if (!el || !hasVisibleBox(el)) return false;
+          var style = window.getComputedStyle ? window.getComputedStyle(el) : null;
+          if (style && (style.display === 'none' || style.visibility === 'hidden' || style.opacity === '0' || style.pointerEvents === 'none')) return false;
+          return true;
+        }
+        function norm(text) {
+          return String(text || '').replace(/\\s+/g, ' ').trim();
+        }
+        function controlLabel(el) {
+          return norm([
+            el && (el.innerText || el.textContent || ''),
+            el && el.getAttribute && el.getAttribute('aria-label'),
+            el && el.getAttribute && el.getAttribute('title')
+          ].filter(Boolean).join(' '));
+        }
+        function actionForLabel(label) {
+          var t = norm(label).toLowerCase();
+          if (/^accept\\b|\\baccept\\s+ctrl|\\baccept\\s+changes?\\b/.test(t)) return 'accept';
+          if (/^reject\\b|\\breject\\s+ctrl|\\breject\\s+changes?\\b/.test(t)) return 'reject';
+          return null;
+        }
         var allAccept = d.querySelectorAll('[data-testid^="accept-tool-call-button-"]');
         var acceptBtn = null;
         for (var i = allAccept.length - 1; i >= 0; i--) {
-          if (allAccept[i].offsetParent !== null) { acceptBtn = allAccept[i]; break; }
+          if (isVisible(allAccept[i])) { acceptBtn = allAccept[i]; break; }
         }
-        if (!acceptBtn) return null;
-        // Find the matching reject button (same call ID suffix)
-        var callId = acceptBtn.getAttribute('data-testid').replace('accept-tool-call-button-', '');
-        var rejectBtn = d.querySelector('[data-testid="reject-tool-call-button-' + callId + '"]');
-        // Find the last tool-call-title (closest to the active accept button)
-        var allTitles = d.querySelectorAll('[data-testid="tool-call-title"]');
-        var titleEl = allTitles.length > 0 ? allTitles[allTitles.length - 1] : null;
-        var message = titleEl ? (titleEl.textContent || '').trim() : 'Tool call pending';
-        return JSON.stringify({
-          message: message,
-          choices: [
-            { choice_id: acceptBtn.getAttribute('data-testid'), label: 'Accept' },
-            { choice_id: rejectBtn ? rejectBtn.getAttribute('data-testid') : 'reject-tool-call-button-' + callId, label: 'Reject' },
-          ],
-        });
+        if (acceptBtn) {
+          // Find the matching reject button (same call ID suffix)
+          var callId = acceptBtn.getAttribute('data-testid').replace('accept-tool-call-button-', '');
+          var rejectBtn = d.querySelector('[data-testid="reject-tool-call-button-' + callId + '"]');
+          // Find the last tool-call-title (closest to the active accept button)
+          var allTitles = d.querySelectorAll('[data-testid="tool-call-title"]');
+          var titleEl = allTitles.length > 0 ? allTitles[allTitles.length - 1] : null;
+          var message = titleEl ? (titleEl.textContent || '').trim() : 'Tool call pending';
+          return JSON.stringify({
+            message: message,
+            choices: [
+              { choice_id: acceptBtn.getAttribute('data-testid'), label: 'Accept' },
+              { choice_id: rejectBtn ? rejectBtn.getAttribute('data-testid') : 'reject-tool-call-button-' + callId, label: 'Reject' },
+            ],
+          });
+        }
+
+        function rootLooksLikeFileChange(root) {
+          var text = norm(root && (root.innerText || root.textContent || ''));
+          return /\\b\\d+\\s+diffs?\\b|\\bis\\s+editing\\b|\\bContinue\\s+is\\s+editing\\b|\\bediting\\s+[^\\s]+\\.[A-Za-z0-9]{1,8}\\b/i.test(text);
+        }
+        function collectFileChangeSummary(root) {
+          var text = String(root && (root.innerText || root.textContent || '') || '');
+          var lines = text.split(/\\n+/).map(norm).filter(Boolean);
+          var files = [];
+          lines.forEach(function(line) {
+            var m = line.match(/(?:^|\\s)([^\\s\\\\/]+\\.(?:ts|tsx|js|jsx|mjs|cjs|json|md|py|cpp|cc|cxx|h|hpp|cs|java|go|rs|rb|php|css|scss|html|xml|yaml|yml|toml|ini|txt))(?:\\s|$)/i);
+            if (m && files.indexOf(m[1]) === -1) files.push(m[1]);
+          });
+          var diff = text.match(/\\b\\d+\\s+diffs?\\b/i);
+          var parts = [];
+          if (files.length > 0 && files.length <= 10) {
+            parts.push(files.slice(0, 3).join(', ') + (files.length > 3 ? ' +' + (files.length - 3) + ' more' : ''));
+          }
+          if (diff) parts.push(norm(diff[0]));
+          return parts.join(' - ');
+        }
+        var controls = Array.from(d.querySelectorAll('button, [role="button"], [aria-label], [title], a, [class*="button"], [class*="Button"]'))
+          .filter(function(el) { return isVisible(el) && !!actionForLabel(controlLabel(el)); });
+        var acceptControls = controls.filter(function(el) { return actionForLabel(controlLabel(el)) === 'accept'; });
+        for (var a = acceptControls.length - 1; a >= 0; a--) {
+          var accept = acceptControls[a];
+          var root = accept;
+          while (root && root !== d.body) {
+            var reject = Array.from(root.querySelectorAll('button, [role="button"], [aria-label], [title], a, [class*="button"], [class*="Button"]'))
+              .filter(function(el) { return el !== accept && isVisible(el) && actionForLabel(controlLabel(el)) === 'reject'; })
+              .pop();
+            if (reject && rootLooksLikeFileChange(root)) {
+              var summary = collectFileChangeSummary(root);
+              return JSON.stringify({
+                message: 'Continue is requesting approval for file changes' + (summary ? ': ' + summary : ''),
+                choices: [
+                  { choice_id: 'continue-file-change-accept', label: controlLabel(accept) || 'Accept file changes' },
+                  { choice_id: 'continue-file-change-reject', label: controlLabel(reject) || 'Reject file changes' },
+                ],
+              });
+            }
+            root = root.parentElement;
+          }
+        }
+        return null;
       `);
       if (!raw) return null;
       return JSON.parse(raw);
@@ -6445,37 +6538,106 @@ async function respondToPermissionDialog(Runtime, agentType, choiceId, sessionId
     let verifyAntigravityPanel = false;
     let verifyGenericPrompt = false;
     if (isContinueAgentType(agentType)) {
-      // Continue uses data-testid for accept/reject buttons.
-      // Simple .click() doesn't trigger React's synthetic event system inside
-      // the iframe — dispatch the full pointer+mouse event sequence instead.
+      // Continue uses data-testid for tool calls, while file-change prompts
+      // expose visible Accept/Reject controls. Dispatch the full pointer+mouse
+      // sequence so React handlers inside the iframe receive the action.
       r = await evalInFrame(Runtime, `
-        var btn = d.querySelector('[data-testid="${choiceId}"]');
-        if (!btn) {
-          // Try finding by partial match (call ID may have changed)
-          var prefix = '${choiceId}'.split('-').slice(0, -1).join('-');
-          var all = d.querySelectorAll('[data-testid^="' + prefix + '"]');
-          btn = all.length > 0 ? all[all.length - 1] : null;
+        var choiceId = ${JSON.stringify(choiceId)};
+        function hasVisibleBox(el) {
+          if (!el || !el.getBoundingClientRect) return false;
+          var rect = el.getBoundingClientRect();
+          return rect.width > 0 && rect.height > 0;
         }
-        if (!btn) return 'no-btn';
-        if (btn.disabled) return 'disabled';
-        console.log('[continue-focus] permission:dispatch-pointer-sequence');
-        var rect = btn.getBoundingClientRect();
-        var cx = rect.x + rect.width / 2;
-        var cy = rect.y + rect.height / 2;
+        function isVisible(el) {
+          if (!el || !hasVisibleBox(el)) return false;
+          var style = window.getComputedStyle ? window.getComputedStyle(el) : null;
+          if (style && (style.display === 'none' || style.visibility === 'hidden' || style.opacity === '0' || style.pointerEvents === 'none')) return false;
+          return true;
+        }
+        function norm(text) {
+          return String(text || '').replace(/\\s+/g, ' ').trim();
+        }
+        function controlLabel(el) {
+          return norm([
+            el && (el.innerText || el.textContent || ''),
+            el && el.getAttribute && el.getAttribute('aria-label'),
+            el && el.getAttribute && el.getAttribute('title')
+          ].filter(Boolean).join(' '));
+        }
+        function actionForLabel(label) {
+          var t = norm(label).toLowerCase();
+          if (/^accept\\b|\\baccept\\s+ctrl|\\baccept\\s+changes?\\b/.test(t)) return 'accept';
+          if (/^reject\\b|\\breject\\s+ctrl|\\breject\\s+changes?\\b/.test(t)) return 'reject';
+          return null;
+        }
+        function rootLooksLikeFileChange(root) {
+          var text = norm(root && (root.innerText || root.textContent || ''));
+          return /\\b\\d+\\s+diffs?\\b|\\bis\\s+editing\\b|\\bContinue\\s+is\\s+editing\\b|\\bediting\\s+[^\\s]+\\.[A-Za-z0-9]{1,8}\\b/i.test(text);
+        }
+        function candidateControls(root) {
+          return Array.from(root.querySelectorAll('button, [role="button"], [aria-label], [title], a, [class*="button"], [class*="Button"]'));
+        }
+        function findFileChangeButton(action) {
+          var controls = candidateControls(d).filter(function(el) {
+            return isVisible(el) && actionForLabel(controlLabel(el)) === action;
+          });
+          for (var i = controls.length - 1; i >= 0; i--) {
+            var control = controls[i];
+            var root = control;
+            while (root && root !== d.body) {
+              var opposite = action === 'accept' ? 'reject' : 'accept';
+              var paired = candidateControls(root).some(function(el) {
+                return el !== control && isVisible(el) && actionForLabel(controlLabel(el)) === opposite;
+              });
+              if (paired && rootLooksLikeFileChange(root)) return control;
+              root = root.parentElement;
+            }
+          }
+          return null;
+        }
         var w = d.defaultView || f.contentWindow || window;
-        var opts = { bubbles: true, cancelable: true, view: w, clientX: cx, clientY: cy, button: 0 };
-        btn.dispatchEvent(new w.PointerEvent('pointerdown', opts));
-        btn.dispatchEvent(new w.MouseEvent('mousedown', opts));
-        btn.dispatchEvent(new w.PointerEvent('pointerup', opts));
-        btn.dispatchEvent(new w.MouseEvent('mouseup', opts));
-        btn.dispatchEvent(new w.MouseEvent('click', opts));
-        // Fallback: also try the keyboard shortcut (Ctrl+Enter = Accept)
-        var isAccept = '${choiceId}'.indexOf('accept') !== -1;
-        if (isAccept) {
+        function dispatchShortcut(action) {
+          var opts = action === 'accept'
+            ? { key: 'Enter', code: 'Enter', keyCode: 13, which: 13, ctrlKey: true, bubbles: true, cancelable: true }
+            : { key: 'Backspace', code: 'Backspace', keyCode: 8, which: 8, ctrlKey: true, bubbles: true, cancelable: true };
+          d.body.dispatchEvent(new w.KeyboardEvent('keydown', opts));
+          d.body.dispatchEvent(new w.KeyboardEvent('keyup', opts));
+          return 'clicked';
+        }
+        function press(btn) {
+          var rect = btn.getBoundingClientRect();
+          var cx = rect.x + rect.width / 2;
+          var cy = rect.y + rect.height / 2;
+          var opts = { bubbles: true, cancelable: true, view: w, clientX: cx, clientY: cy, button: 0 };
+          if (w.PointerEvent) btn.dispatchEvent(new w.PointerEvent('pointerdown', opts));
+          btn.dispatchEvent(new w.MouseEvent('mousedown', opts));
+          if (w.PointerEvent) btn.dispatchEvent(new w.PointerEvent('pointerup', opts));
+          btn.dispatchEvent(new w.MouseEvent('mouseup', opts));
+          btn.dispatchEvent(new w.MouseEvent('click', opts));
+        }
+        var isFileChange = choiceId.indexOf('continue-file-change-') === 0;
+        var isAccept = choiceId.indexOf('accept') !== -1;
+        var btn = null;
+        if (isFileChange) {
+          btn = findFileChangeButton(isAccept ? 'accept' : 'reject');
+          if (!btn) return dispatchShortcut(isAccept ? 'accept' : 'reject');
+        } else {
+          btn = d.querySelector('[data-testid="' + choiceId + '"]');
+          if (!btn) {
+            // Try finding by partial match (call ID may have changed)
+            var prefix = choiceId.split('-').slice(0, -1).join('-');
+            var all = d.querySelectorAll('[data-testid^="' + prefix + '"]');
+            btn = all.length > 0 ? all[all.length - 1] : null;
+          }
+          if (!btn) return 'no-btn';
+        }
+        if (btn.disabled || btn.getAttribute('aria-disabled') === 'true') return 'disabled';
+        console.log('[continue-focus] permission:dispatch-pointer-sequence');
+        press(btn);
+        // Keep the existing tool-call fallback: Ctrl+Enter = Accept.
+        if (!isFileChange && isAccept) {
           console.log('[continue-focus] permission:dispatch-ctrl-enter');
-          var kbOpts = { key: 'Enter', code: 'Enter', keyCode: 13, ctrlKey: true, bubbles: true, cancelable: true };
-          d.body.dispatchEvent(new w.KeyboardEvent('keydown', kbOpts));
-          d.body.dispatchEvent(new w.KeyboardEvent('keyup', kbOpts));
+          dispatchShortcut('accept');
         }
         return 'clicked';
       `);
@@ -6572,12 +6734,13 @@ async function sendMessage(Runtime, agentType, text, sessionId) {
 // by clicking the relevant toolbar buttons and selecting the desired option.
 // Operates on page-level DOM (usePageEval=true).
 
-async function setCodexDesktopConfig(Runtime, { model_id, effort, access_mode }) {
+async function setCodexDesktopConfig(Runtime, { model_id, effort, access_mode, speed }, usePageEval = true) {
   const results = {};
+  const evalFn = usePageEval ? evalInPage : evalInFrame;
 
   async function closeMenus() {
     try {
-      await evalInPage(Runtime, `
+      await evalFn(Runtime, `
         return (function() {
           var w = d.defaultView || window;
           d.dispatchEvent(new w.KeyboardEvent('keydown', { key: 'Escape', code: 'Escape', bubbles: true, cancelable: true }));
@@ -6594,7 +6757,7 @@ async function setCodexDesktopConfig(Runtime, { model_id, effort, access_mode })
 
   async function clickOpenCombinedModelMenu() {
     await closeMenus();
-    const triggerClicked = await evalInPage(Runtime, `
+    const triggerClicked = await evalFn(Runtime, `
       return (function() {
         function norm(t) { return String(t || '').replace(/\\s+/g, ' ').trim(); }
         function press(el) {
@@ -6625,7 +6788,7 @@ async function setCodexDesktopConfig(Runtime, { model_id, effort, access_mode })
   async function clickVisibleMenuItem(optionText) {
     const optLower = optionText.toLowerCase();
     const optStr = JSON.stringify(optLower);
-    const optClicked = await evalInPage(Runtime, `
+    const optClicked = await evalFn(Runtime, `
       return (function() {
         function norm(t) { return String(t || '').replace(/\\s+/g, ' ').trim(); }
         function press(el) {
@@ -6643,7 +6806,10 @@ async function setCodexDesktopConfig(Runtime, { model_id, effort, access_mode })
         var item = candidates.find(function(el) {
           if (!(el.offsetWidth || el.offsetHeight || el.getClientRects().length)) return false;
           var t = norm(el.innerText || el.textContent || '').toLowerCase();
-          return t === target || t.replace(/\\s+/g,'') === target.replace(/\\s+/g,'');
+          var firstLine = t.split(/\\n|\\r/)[0].trim();
+          return t === target || firstLine === target ||
+            t.indexOf(target + ' ') === 0 ||
+            t.replace(/\\s+/g,'') === target.replace(/\\s+/g,'');
         });
         if (!item) return 'no-option';
         press(item);
@@ -6654,7 +6820,7 @@ async function setCodexDesktopConfig(Runtime, { model_id, effort, access_mode })
   }
 
   async function clickAnyVisibleModelMenuItem() {
-    const optClicked = await evalInPage(Runtime, `
+    const optClicked = await evalFn(Runtime, `
       return (function() {
         function norm(t) { return String(t || '').replace(/\\s+/g, ' ').trim(); }
         function press(el) {
@@ -6684,7 +6850,7 @@ async function setCodexDesktopConfig(Runtime, { model_id, effort, access_mode })
   // This is the legacy fallback for older Codex builds with separate model/effort/access buttons.
   async function clickOption(triggerPatternFn, optionText) {
     await closeMenus();
-    const triggerClicked = await evalInPage(Runtime, `
+    const triggerClicked = await evalFn(Runtime, `
       return (function() {
         function press(el) {
           var w = d.defaultView || window;
@@ -6747,6 +6913,31 @@ async function setCodexDesktopConfig(Runtime, { model_id, effort, access_mode })
       results.effort = await clickOption(
         'function(t){ return /^(low|medium|high|extra\\s*high)$/i.test(t); }',
         effortLabel
+      );
+    }
+  }
+
+  if (speed) {
+    const speedLabels = {
+      standard: 'Standard',
+      fast:     'Fast',
+    };
+    const speedLabel = speedLabels[String(speed).toLowerCase()] || speed;
+    const combinedOpen = await clickOpenCombinedModelMenu();
+    if (combinedOpen.ok) {
+      await new Promise(r => setTimeout(r, 350));
+      const speedMenu = await clickVisibleMenuItem('Speed');
+      if (speedMenu.ok) {
+        await new Promise(r => setTimeout(r, 250));
+        results.speed = await clickVisibleMenuItem(speedLabel);
+      } else {
+        results.speed = speedMenu;
+      }
+      await closeMenus();
+    } else {
+      results.speed = await clickOption(
+        'function(t){ return /^speed$/i.test(t); }',
+        speedLabel
       );
     }
   }

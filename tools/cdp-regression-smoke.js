@@ -207,6 +207,7 @@ async function runCodexDesktopSuite(targets, reporter) {
       (
         (config.model_id && config.model_id !== 'unknown') ||
         (config.effort && config.effort !== 'unknown') ||
+        (config.speed && config.speed !== 'unknown') ||
         (config.permission_mode && config.permission_mode !== 'unknown')
       )
     );
@@ -393,6 +394,7 @@ async function runIframeSurfaceSuite(targets, reporter, surface) {
       (
         (config.model_id && config.model_id !== 'unknown') ||
         (config.effort && config.effort !== 'unknown') ||
+        (config.speed && config.speed !== 'unknown') ||
         (config.permission_mode && config.permission_mode !== 'unknown')
       )
     );
@@ -477,7 +479,16 @@ async function runSmokeSuite(options = {}) {
     codex_desktop_error: Array.isArray(targetsByPort.codexDesktop) ? null : targetsByPort.codexDesktop.error,
   };
 
-  if (!Array.isArray(targetsByPort.antigravity)) {
+  const needsAntigravityPort = options.surfaces.some(surface =>
+    surface === 'workbench' ||
+    surface === 'antigravity_panel' ||
+    surface === 'claude' ||
+    surface === 'codex' ||
+    surface === 'continue'
+  );
+  const needsCodexDesktopPort = options.surfaces.includes('codex-desktop');
+
+  if (needsAntigravityPort && !Array.isArray(targetsByPort.antigravity)) {
     reporter.add({
       surface: 'workbench',
       test_id: 'workbench.port.connect',
@@ -487,7 +498,7 @@ async function runSmokeSuite(options = {}) {
     });
   }
 
-  if (!Array.isArray(targetsByPort.codexDesktop)) {
+  if (needsCodexDesktopPort && !Array.isArray(targetsByPort.codexDesktop)) {
     reporter.add({
       surface: 'codex-desktop',
       test_id: 'codex-desktop.port.connect',

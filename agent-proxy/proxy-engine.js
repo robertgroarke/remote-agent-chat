@@ -53,6 +53,21 @@ const CODEX_ACCESS_MODES = [
   { id: 'workspace-write',    label: 'Workspace write' },
   { id: 'danger-full-access', label: 'Full access' },
 ];
+const CODEX_SPEEDS = [
+  { id: 'standard', label: 'Standard' },
+  { id: 'fast',     label: 'Fast' },
+];
+
+function normalizeCodexSpeed(value) {
+  const speed = String(value || '').toLowerCase().trim();
+  if (!speed || speed === 'unknown') return 'standard';
+  if (speed === 'default' || speed === 'auto') return 'standard';
+  return speed;
+}
+
+function codexSpeedToConfigValue(speed) {
+  return normalizeCodexSpeed(speed) === 'standard' ? 'default' : normalizeCodexSpeed(speed);
+}
 
 // ─── Retriable send codes ───────────────────────────────────────────────────
 
@@ -275,7 +290,7 @@ class ProxyEngine extends EventEmitter {
       set_model:              ['claude', 'antigravity', 'antigravity_panel', 'gemini', 'continue', 'continue_yolo'].includes(agentType),
       set_mode:               agentType === 'antigravity',
       permission_mode_change: agentType === 'claude' || agentType === 'continue_yolo',
-      auto_approve_permissions_toggle: agentType === 'continue' || agentType === 'antigravity_panel',
+      auto_approve_permissions_toggle: agentType === 'continue' || agentType === 'continue_yolo' || agentType === 'antigravity_panel',
       permission_dialogs:     isClaude || isCodex || agentType === 'antigravity' || agentType === 'antigravity_panel' || isContinue,
       set_codex_config:       isCodex,
       new_thread:             isDesktop,
@@ -326,14 +341,19 @@ class ProxyEngine extends EventEmitter {
       const permissionMode = (domCfg?.permission_mode && domCfg.permission_mode !== 'unknown')
         ? domCfg.permission_mode
         : (codexCfg.sandbox_mode || 'unknown');
+      const speed = normalizeCodexSpeed((domCfg?.speed && domCfg.speed !== 'unknown')
+        ? domCfg.speed
+        : (codexCfg.service_tier || codexCfg.model_speed || codexCfg.speed || 'standard'));
       return {
         model_id:           modelId,
         permission_mode:    permissionMode,
         effort:             effort,
+        speed:              speed,
         file_access_scope:  workspacePath || domCfg?.file_access_scope || 'unknown',
         available_models:   CODEX_MODELS,
         available_efforts:  CODEX_EFFORTS,
         available_access:   CODEX_ACCESS_MODES,
+        available_speeds:   CODEX_SPEEDS,
         branch:             branch || 'unknown',
       };
     }
@@ -347,14 +367,19 @@ class ProxyEngine extends EventEmitter {
       const permissionMode = (domCfg?.permission_mode && domCfg.permission_mode !== 'unknown')
         ? domCfg.permission_mode
         : (codexCfg.sandbox_mode || 'unknown');
+      const speed = normalizeCodexSpeed((domCfg?.speed && domCfg.speed !== 'unknown')
+        ? domCfg.speed
+        : (codexCfg.service_tier || codexCfg.model_speed || codexCfg.speed || 'standard'));
       return {
         model_id:           modelId,
         permission_mode:    permissionMode,
         effort:             effort,
+        speed:              speed,
         file_access_scope:  workspacePath || domCfg?.file_access_scope || 'unknown',
         available_models:   CODEX_MODELS,
         available_efforts:  CODEX_EFFORTS,
         available_access:   CODEX_ACCESS_MODES,
+        available_speeds:   CODEX_SPEEDS,
         branch:             branch || 'unknown',
         sandbox_status:     domCfg?.sandbox_status  || null,
       };
@@ -386,7 +411,7 @@ class ProxyEngine extends EventEmitter {
   }
 
   _supportsAutoApprovePermissions(agentType) {
-    return agentType === 'continue' || agentType === 'antigravity_panel';
+    return agentType === 'continue' || agentType === 'continue_yolo' || agentType === 'antigravity_panel';
   }
 
   _normalizeAutoApprovePreferencePart(value) {
@@ -1353,6 +1378,7 @@ class ProxyEngine extends EventEmitter {
       if (msg.model_id)      updates.model             = msg.model_id;
       if (msg.effort)        updates.reasoning_effort   = msg.effort;
       if (msg.access_mode)   updates.sandbox_mode       = msg.access_mode;
+      if (msg.speed)         updates.service_tier       = codexSpeedToConfigValue(msg.speed);
 
       if (Object.keys(updates).length === 0) {
         this._sendToRelay(proto.agentControlResult(sid, msg.request_id, 'set_codex_config', 'failed', {
@@ -1363,12 +1389,13 @@ class ProxyEngine extends EventEmitter {
 
       this._log('info', `[ctrl] set_codex_config for ${sid}: ${JSON.stringify(updates)}`);
 
-      if (agentT === 'codex-desktop') {
+      if (agentT === 'codex' || agentT === 'codex-desktop') {
         const cdpUpdates = {};
         if (msg.model_id)    cdpUpdates.model_id    = msg.model_id;
         if (msg.effort)      cdpUpdates.effort      = msg.effort;
         if (msg.access_mode) cdpUpdates.access_mode = msg.access_mode;
-        selectors.setCodexDesktopConfig(sessionData.client.Runtime, cdpUpdates).catch(() => {});
+        if (msg.speed)       cdpUpdates.speed       = msg.speed;
+        selectors.setCodexDesktopConfig(sessionData.client.Runtime, cdpUpdates, agentT === 'codex-desktop').catch(() => {});
       }
 
       const ok = this._writeCodexConfigValues(updates);
@@ -1380,6 +1407,7 @@ class ProxyEngine extends EventEmitter {
             if (msg.model_id)    merged.model_id        = msg.model_id;
             if (msg.effort)      merged.effort           = msg.effort;
             if (msg.access_mode) merged.permission_mode  = msg.access_mode;
+            if (msg.speed)       merged.speed            = msg.speed;
             this._sendToRelay(proto.agentConfig(sid, { ...merged, capabilities: this._buildCapabilities(agentT) }));
           })
           .catch(() => {});

@@ -734,6 +734,106 @@ body {
   scroll-padding-bottom: 12px;
 }
 
+.codex-automation-pane {
+  position: absolute;
+  top: 0;
+  right: 0;
+  bottom: 0;
+  width: 320px;
+  padding: 18px 20px;
+  border-left: 1px solid var(--border);
+  background: var(--bg);
+  box-shadow: -12px 0 24px rgba(0, 0, 0, 0.18);
+  overflow-y: auto;
+  z-index: 3;
+}
+.messages-wrap.has-automation-pane .messages {
+  padding-right: 340px;
+}
+.codex-automation-pane-header {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  margin-bottom: 18px;
+}
+.codex-automation-pane-icon {
+  width: 18px;
+  height: 18px;
+  border-radius: 50%;
+  border: 1px solid var(--border2);
+  color: var(--text2);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  font-size: 10px;
+  flex: 0 0 auto;
+}
+.codex-automation-pane-title {
+  min-width: 0;
+  font-size: 22px;
+  font-weight: 500;
+  color: var(--text);
+  overflow-wrap: anywhere;
+}
+.codex-automation-pane-desc {
+  color: var(--text2);
+  font-size: 13px;
+  line-height: 1.55;
+  margin-bottom: 28px;
+}
+.codex-automation-pane-section {
+  margin-bottom: 24px;
+}
+.codex-automation-pane-section-title {
+  color: var(--text3);
+  font-size: 12px;
+  font-weight: 500;
+  margin-bottom: 14px;
+}
+.codex-automation-pane-row {
+  display: grid;
+  grid-template-columns: minmax(74px, 0.8fr) minmax(0, 1.4fr);
+  gap: 12px;
+  align-items: center;
+  min-height: 28px;
+  font-size: 13px;
+}
+.codex-automation-pane-row span {
+  color: var(--text2);
+}
+.codex-automation-pane-row strong {
+  min-width: 0;
+  justify-self: end;
+  max-width: 100%;
+  color: var(--text2);
+  font-weight: 500;
+  text-align: right;
+  overflow-wrap: anywhere;
+}
+.codex-automation-pane-row strong.active {
+  color: #9ee6bb;
+  border: 1px solid rgba(70, 195, 123, 0.24);
+  border-radius: 999px;
+  padding: 2px 8px;
+  background: rgba(70, 195, 123, 0.08);
+}
+.codex-automation-pane-action {
+  display: block;
+  margin: 28px auto 0;
+  padding: 8px 14px;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  background: var(--bg2);
+  color: var(--text);
+  cursor: pointer;
+  font: inherit;
+  font-size: 13px;
+}
+.codex-automation-pane-action:hover {
+  border-color: var(--accent2);
+  color: var(--accent);
+}
+
 .messages::-webkit-scrollbar { width: 6px; }
 .messages::-webkit-scrollbar-thumb { background: var(--border); border-radius: 3px; }
 
@@ -3154,6 +3254,17 @@ select.new-session-workspace option { background: var(--bg2); color: var(--text)
   }
   .topbar-meta { justify-content: flex-start; }
   .messages { padding: 8px 12px 88px; scroll-padding-bottom: 88px; }
+  .messages-wrap.has-automation-pane .messages { padding-right: 12px; }
+  .codex-automation-pane {
+    position: relative;
+    width: auto;
+    inset: auto;
+    max-height: 42vh;
+    border-left: none;
+    border-top: 1px solid var(--border);
+    box-shadow: none;
+    order: 5;
+  }
   .message {
     grid-template-columns: 24px minmax(0, 1fr);
     gap: 8px;
