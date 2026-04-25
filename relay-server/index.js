@@ -492,13 +492,7 @@ app.post('/fcm-token', requireBearerToken, express.json(), (req, res) => {
 app.get('/auth/logout', (req, res) => req.logout(() => res.redirect('/auth/google')));
 
 // Auth gate middleware
-const LAN_PREFIXES = [
-  [192, 168].join('.') + '.',
-  '10.',
-  '172.16.',
-  '::ffff:' + [192, 168].join('.') + '.',
-  '::ffff:10.',
-];
+const LAN_PREFIXES = ['192.168.', '10.', '172.16.', '::ffff:192.168.', '::ffff:10.'];
 function isLAN(req) {
   const ip = req.ip || req.connection?.remoteAddress || '';
   return LAN_PREFIXES.some(p => ip.startsWith(p));

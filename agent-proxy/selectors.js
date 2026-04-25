@@ -1128,52 +1128,38 @@ function buildClaudeReadExpr(userClass, userText, userTextAlt) {
 // We temporarily open them before reading, wait for React to render, then restore.
 
 async function _expandOutputDetails(Runtime) {
+  // Open closed "N lines of output" <details> so their content is in the DOM
+  // for reading.  We INTENTIONALLY leave them open after reading — closing
+  // them every poll caused open/close DOM mutation cycles that shifted focus
+  // between Electron renderer processes (visible as rapid focus shifts
+  // between Claude Code windows in different Antigravity instances).
+  //
+  // Trade-off: tool output sections in the user's Claude Code UI will appear
+  // expanded.  This is purely visual; the user can collapse them manually if
+  // they want.  Re-collapsing here would re-introduce the focus issue.
   try {
     const count = await evalInFrame(Runtime, `
-      window.__rac_exp = Array.from(d.querySelectorAll('details:not([open])')).filter(function(el) {
+      var toOpen = Array.from(d.querySelectorAll('details:not([open])')).filter(function(el) {
         var s = el.querySelector('summary');
         return s && /^\\d+\\s+lines?(?:\\s+of\\s+output)?$/i.test(s.textContent.trim());
       });
-      window.__rac_exp.forEach(function(el) {
-        el.open = true;
-        // NOTE: do NOT dispatch synthetic click events here — they can propagate
-        // focus to the host BrowserWindow, causing focus-stealing between
-        // multiple Antigravity windows.  Setting el.open = true is sufficient
-        // to expose the DOM content for reading.
-      });
-      return window.__rac_exp.length;
+      toOpen.forEach(function(el) { el.open = true; });
+      return toOpen.length;
     `);
     const n = Number(count) || 0;
     if (n === 0) return 0;
-    // Poll until all expanded details have non-summary DOM content (React lazy render).
-    // Up to 20 × 150 ms = 3 s total.
-    for (let i = 0; i < 20; i++) {
-      await new Promise(r => setTimeout(r, 150));
-      const ready = await evalInFrame(Runtime, `
-        var all = window.__rac_exp || [];
-        var done = all.every(function(el) {
-          return Array.from(el.childNodes).some(function(n) {
-            return n.nodeName.toUpperCase() !== 'SUMMARY' && (n.textContent || '').trim().length > 0;
-          });
-        });
-        return done;
-      `).catch(() => true); // if eval fails, stop waiting
-      if (ready) break;
-    }
+    // Wait briefly for React to lazy-render the newly-expanded content.
+    // We can't poll readiness without another eval per check (more focus risk),
+    // so use a single short fixed delay.  React typically renders within ~50ms.
+    await new Promise(r => setTimeout(r, 200));
     return n;
   } catch {
     return 0;
   }
 }
 
-function _collapseOutputDetails(Runtime) {
-  evalInFrame(Runtime, `
-    if (window.__rac_exp) {
-      window.__rac_exp.forEach(function(el) { el.open = false; });
-      window.__rac_exp = null;
-    }
-  `).catch(() => {});
-}
+// No-op now: details stay open after expanding.  Kept for callsite compatibility.
+function _collapseOutputDetails() {}
 
 async function readClaudeMessages(Runtime, sessionId) {
   // Pre-flight: open lazy-rendered output <details> so their content is in the DOM.
