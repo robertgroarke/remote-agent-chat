@@ -6187,15 +6187,76 @@ const ANTIGRAVITY_PANEL_PERMISSION_EXPR = `
   //   it lives in the editor area when Antigravity proposes file edits.
   var fcAccept = null;
   var fcReject = null;
-  var topBtns = Array.from(d.querySelectorAll('button, [role="button"]'));
-  for (var fi = 0; fi < topBtns.length; fi++) {
-    var fb = topBtns[fi];
-    if (!fb.offsetParent) continue;
-    if (fb.disabled || fb.getAttribute('aria-disabled') === 'true') continue;
-    var ft = (fb.textContent || '').trim().toLowerCase();
-    if (ft === 'accept all') fcAccept = fcAccept || fb;
-    else if (ft === 'reject all') fcReject = fcReject || fb;
-    if (fcAccept && fcReject) break;
+  function fcLabelOf(el) {
+    var t = (el.innerText || el.textContent || el.getAttribute('aria-label') || '').trim();
+    t = t.replace(/\\s*(Alt|Ctrl|Shift|Cmd|Meta)\\+\\S+$/i, '');
+    t = t.replace(/\\s+/g, ' ').trim().toLowerCase();
+    return t;
+  }
+  // Walk same-origin iframes so we cover both workbench-page renders and
+  // any nested webviews (kept for cline/roo agents that DO render in iframes).
+  function fcCollectDocs(rootDoc) {
+    var docs = [rootDoc];
+    var stack = [rootDoc];
+    while (stack.length) {
+      var cur = stack.pop();
+      var iframes = cur.querySelectorAll ? cur.querySelectorAll('iframe, frame') : [];
+      for (var ii = 0; ii < iframes.length; ii++) {
+        var iframe = iframes[ii];
+        var rect = iframe.getBoundingClientRect ? iframe.getBoundingClientRect() : null;
+        if (rect && (rect.width === 0 || rect.height === 0)) continue;
+        var inner = null;
+        try { inner = iframe.contentDocument; } catch (_) { inner = null; }
+        if (inner && docs.indexOf(inner) === -1) {
+          docs.push(inner);
+          stack.push(inner);
+        }
+      }
+    }
+    return docs;
+  }
+  var fcDocs = fcCollectDocs(d);
+  // Antigravity renders diff-bar buttons as <span class="cursor-pointer"> with
+  // no role, not <button>. Match a leaf element whose own text is exactly
+  // "accept all" / "reject all" (no nested children) AND looks clickable.
+  function fcLooksClickable(el) {
+    if (!el) return false;
+    if (el.tagName === 'BUTTON' || el.tagName === 'A') return true;
+    var role = el.getAttribute && el.getAttribute('role');
+    if (role === 'button' || role === 'link') return true;
+    var cls = (el.className && el.className.toString) ? el.className.toString() : '';
+    if (cls.indexOf('cursor-pointer') !== -1) return true;
+    if (el.onclick) return true;
+    if (el.tabIndex >= 0) return true;
+    return false;
+  }
+  for (var di = 0; di < fcDocs.length && !(fcAccept && fcReject); di++) {
+    var fcDoc = fcDocs[di];
+    if (!fcDoc.querySelectorAll) continue;
+    var allEls = fcDoc.querySelectorAll('*');
+    for (var fi = 0; fi < allEls.length; fi++) {
+      var fb = allEls[fi];
+      // Leaf-only — avoid container ancestors that include the same text.
+      if (fb.children && fb.children.length > 0) continue;
+      if (!fb.offsetParent) continue;
+      if (fb.disabled || (fb.getAttribute && fb.getAttribute('aria-disabled') === 'true')) continue;
+      var ft = fcLabelOf(fb);
+      if (ft.length > 30) continue;
+      var isAccept = ft === 'accept all' || ft.indexOf('accept all') === 0;
+      var isReject = ft === 'reject all' || ft.indexOf('reject all') === 0;
+      if (!isAccept && !isReject) continue;
+      // Walk up to the nearest clickable ancestor (the span itself often handles
+      // the click; for button-style components it may be the parent).
+      var clickTarget = fb;
+      for (var up = 0; up < 4 && clickTarget; up++) {
+        if (fcLooksClickable(clickTarget)) break;
+        clickTarget = clickTarget.parentElement;
+      }
+      if (!clickTarget || !fcLooksClickable(clickTarget)) continue;
+      if (isAccept && !fcAccept) fcAccept = clickTarget;
+      else if (isReject && !fcReject) fcReject = clickTarget;
+      if (fcAccept && fcReject) break;
+    }
   }
   if (fcAccept && fcReject) {
     var fcContainer = fcAccept.parentElement;
@@ -6256,7 +6317,51 @@ const ANTIGRAVITY_PANEL_PERMISSION_EXPR = `
     }) || actionBtns[0];
   }
 
-  if (!rejectBtn) return null;
+  if (!rejectBtn) {
+    // Diagnostic: when "Files With Changes" text is on the page somewhere but
+    // we couldn't reach the Accept all/Reject all buttons (Strategy 0 failed)
+    // AND no other panel-style prompt exists (Strategies 1/2 also failed),
+    // surface what we DID see so we can debug from logs. Choices=[] keeps
+    // auto-approve and the relay UI from acting on it.
+    function _fcAnyDocHasFwcText(docs) {
+      for (var x = 0; x < docs.length; x++) {
+        var body = docs[x].body || docs[x].documentElement;
+        if (body && /\\d+\\s+files?\\s+with\\s+changes?/i.test(body.innerText || '')) return true;
+      }
+      return false;
+    }
+    if (_fcAnyDocHasFwcText(fcDocs)) {
+      var allSeenLabels = [];
+      for (var ddi = 0; ddi < fcDocs.length; ddi++) {
+        var btns2 = Array.from(fcDocs[ddi].querySelectorAll('button, [role="button"], a, [onclick], [tabindex]'));
+        for (var bi2 = 0; bi2 < btns2.length; bi2++) {
+          var b2 = btns2[bi2];
+          if (!b2.offsetParent) continue;
+          var l2 = fcLabelOf(b2);
+          if (!l2 || l2.length > 60) continue;
+          allSeenLabels.push(l2);
+        }
+      }
+      var iframeUrls = [];
+      var dstack = [d];
+      while (dstack.length) {
+        var dcur = dstack.pop();
+        var ifs = dcur.querySelectorAll ? dcur.querySelectorAll('iframe, frame') : [];
+        for (var ki = 0; ki < ifs.length; ki++) {
+          var ifr = ifs[ki];
+          var same = false;
+          try { same = !!ifr.contentDocument; } catch (_) { same = false; }
+          iframeUrls.push((same ? '[same] ' : '[cross] ') + ((ifr.src || ifr.name || '<no-src>').substring(0, 80)));
+          if (same) dstack.push(ifr.contentDocument);
+        }
+      }
+      return JSON.stringify({
+        message: '[fwc-diag] docs=' + fcDocs.length + ' iframes=' + JSON.stringify(iframeUrls.slice(0, 12)) + ' labels=' + JSON.stringify(allSeenLabels.slice(0, 40)),
+        choices: [],
+      });
+    }
+    return null;
+  }
 
   // Walk up to find the prompt container — look for the nearest ancestor that
   // contains both the reject button and descriptive text
@@ -6361,16 +6466,66 @@ function _buildPanelPermissionClickExpr(choiceId) {
 
     var target = ${JSON.stringify(choiceId)};
 
-    // Page-level "N File(s) With Changes" diff bar — Accept all / Reject all
+    // Page-level "N File(s) With Changes" diff bar — Accept all / Reject all.
+    // The diff bar can live in a same-origin child iframe inside the panel,
+    // so walk into iframe.contentDocument and search there too.
     if (target === 'accept_all' || target === 'reject_all') {
-      var wantLabel = (target === 'accept_all') ? 'accept all' : 'reject all';
-      var pageBtns = Array.from(d.querySelectorAll('button, [role="button"]'));
-      for (var pbi = 0; pbi < pageBtns.length; pbi++) {
-        var pb = pageBtns[pbi];
-        if (!pb.offsetParent) continue;
-        if ((pb.textContent || '').trim().toLowerCase() === wantLabel) {
-          if (pb.disabled || pb.getAttribute('aria-disabled') === 'true') return 'disabled';
-          dispatchPress(pb);
+      var wantText = (target === 'accept_all') ? 'accept all' : 'reject all';
+      function pageLabelOf(el) {
+        var t = (el.innerText || el.textContent || el.getAttribute('aria-label') || '').trim();
+        t = t.replace(/\\s*(Alt|Ctrl|Shift|Cmd|Meta)\\+\\S+$/i, '');
+        return t.replace(/\\s+/g, ' ').trim().toLowerCase();
+      }
+      function pageLooksClickable(el) {
+        if (!el) return false;
+        if (el.tagName === 'BUTTON' || el.tagName === 'A') return true;
+        var role = el.getAttribute && el.getAttribute('role');
+        if (role === 'button' || role === 'link') return true;
+        var cls = (el.className && el.className.toString) ? el.className.toString() : '';
+        if (cls.indexOf('cursor-pointer') !== -1) return true;
+        if (el.onclick) return true;
+        if (el.tabIndex >= 0) return true;
+        return false;
+      }
+      function pageCollectDocs(rootDoc) {
+        var docs = [rootDoc];
+        var stack = [rootDoc];
+        while (stack.length) {
+          var cur = stack.pop();
+          var iframes = cur.querySelectorAll ? cur.querySelectorAll('iframe, frame') : [];
+          for (var ii = 0; ii < iframes.length; ii++) {
+            var iframe = iframes[ii];
+            var rect = iframe.getBoundingClientRect ? iframe.getBoundingClientRect() : null;
+            if (rect && (rect.width === 0 || rect.height === 0)) continue;
+            var inner = null;
+            try { inner = iframe.contentDocument; } catch (_) { inner = null; }
+            if (inner && docs.indexOf(inner) === -1) {
+              docs.push(inner);
+              stack.push(inner);
+            }
+          }
+        }
+        return docs;
+      }
+      var pageDocs = pageCollectDocs(d);
+      for (var pdi = 0; pdi < pageDocs.length; pdi++) {
+        if (!pageDocs[pdi].querySelectorAll) continue;
+        var allEls = pageDocs[pdi].querySelectorAll('*');
+        for (var pbi = 0; pbi < allEls.length; pbi++) {
+          var pb = allEls[pbi];
+          if (pb.children && pb.children.length > 0) continue;
+          if (!pb.offsetParent) continue;
+          if (pb.disabled || (pb.getAttribute && pb.getAttribute('aria-disabled') === 'true')) continue;
+          var lbl = pageLabelOf(pb);
+          if (lbl.length > 30) continue;
+          if (lbl !== wantText && lbl.indexOf(wantText) !== 0) continue;
+          var clickTarget = pb;
+          for (var up = 0; up < 4 && clickTarget; up++) {
+            if (pageLooksClickable(clickTarget)) break;
+            clickTarget = clickTarget.parentElement;
+          }
+          if (!clickTarget || !pageLooksClickable(clickTarget)) continue;
+          dispatchPress(clickTarget);
           return 'clicked';
         }
       }
@@ -6586,15 +6741,18 @@ async function detectPermissionDialog(Runtime, agentType) {
 
   // Antigravity (manager page) and antigravity_panel both render the inline
   // "Run command? / Always run / Reject / Run" prompt at the page level rather
-  // than as a modal dialog, so PERMISSION_DIALOG_EXPR misses it. Try the
-  // generic dialog selector first, then fall back to the panel-style detector.
+  // than as a modal dialog, so PERMISSION_DIALOG_EXPR misses it. Run the
+  // panel-style detector FIRST — its strategy 0 surfaces the "Accept all" /
+  // "Reject all" diff bar which always co-exists with the chat-history
+  // "Running background command" prompt that PERMISSION_DIALOG_EXPR would
+  // otherwise capture and lock onto.
   if (agentType === 'antigravity_panel' || agentType === 'antigravity') {
     try {
-      const pageRaw = await evalInPage(Runtime, PERMISSION_DIALOG_EXPR);
-      if (pageRaw) return JSON.parse(pageRaw);
       const panelRaw = await evalInPage(Runtime, ANTIGRAVITY_PANEL_PERMISSION_EXPR);
-      if (!panelRaw) return null;
-      return JSON.parse(panelRaw);
+      if (panelRaw) return JSON.parse(panelRaw);
+      const pageRaw = await evalInPage(Runtime, PERMISSION_DIALOG_EXPR);
+      if (!pageRaw) return null;
+      return JSON.parse(pageRaw);
     } catch { return null; }
   }
 

@@ -576,6 +576,12 @@ class ProxyEngine extends EventEmitter {
         return;
       }
 
+      // Diagnostic-only prompts (no actionable choices) — log and skip relay.
+      if (perm.message?.startsWith?.('[fwc-diag]')) {
+        this._log('info', `[${sessionId}] [perm] ${perm.message.substring(0, 1500)}`);
+        return;
+      }
+
       this._log('info', `[${sessionId}] [perm] Permission dialog detected: "${perm.message.substring(0, 60)}..."`);
       this.activePermissionPrompts.set(sessionId, { prompt_id: promptId, prompt, surfaced: true });
       this._sendToRelay(prompt);
