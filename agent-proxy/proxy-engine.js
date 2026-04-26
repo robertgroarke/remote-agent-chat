@@ -285,22 +285,23 @@ class ProxyEngine extends EventEmitter {
     const isClaude  = agentType === 'claude' || agentType === 'claude-desktop';
     const isDesktop = agentType === 'codex-desktop' || agentType === 'claude-desktop';
     const isContinue = agentType === 'continue' || agentType === 'continue_yolo';
+    const isRooCode = agentType === 'roo_code';
     return {
-      interrupt:              ['claude', 'codex', 'gemini', 'continue', 'continue_yolo', 'antigravity', 'antigravity_panel', 'claude-desktop', 'codex-desktop'].includes(agentType),
-      set_model:              ['claude', 'antigravity', 'antigravity_panel', 'gemini', 'continue', 'continue_yolo'].includes(agentType),
+      interrupt:              ['claude', 'codex', 'gemini', 'continue', 'continue_yolo', 'antigravity', 'antigravity_panel', 'claude-desktop', 'codex-desktop', 'roo_code', 'cline'].includes(agentType),
+      set_model:              ['claude', 'antigravity', 'antigravity_panel', 'gemini', 'continue', 'continue_yolo', 'roo_code', 'cline'].includes(agentType),
       set_mode:               agentType === 'antigravity',
-      permission_mode_change: agentType === 'claude' || agentType === 'continue_yolo',
-      auto_approve_permissions_toggle: agentType === 'continue' || agentType === 'continue_yolo' || agentType === 'antigravity_panel',
-      permission_dialogs:     isClaude || isCodex || agentType === 'antigravity' || agentType === 'antigravity_panel' || isContinue,
+      permission_mode_change: agentType === 'claude' || agentType === 'continue_yolo' || isRooCode || agentType === 'cline',
+      auto_approve_permissions_toggle: agentType === 'continue' || agentType === 'continue_yolo' || agentType === 'antigravity_panel' || isRooCode || agentType === 'cline',
+      permission_dialogs:     isClaude || isCodex || agentType === 'antigravity' || agentType === 'antigravity_panel' || isContinue || isRooCode || agentType === 'cline',
       set_codex_config:       isCodex,
       new_thread:             isDesktop,
       thread_list:            isDesktop,
       switch_thread:          isDesktop,
       switch_workspace:       isDesktop,
       open_panel:             false, // Codex side pane is already open if session exists
-      chat_list:              agentType === 'codex' || agentType === 'continue' || agentType === 'antigravity_panel' || agentType === 'claude-desktop',
-      switch_chat:            agentType === 'codex' || agentType === 'continue' || agentType === 'antigravity_panel' || agentType === 'claude-desktop',
-      new_chat:               agentType === 'codex' || agentType === 'continue_yolo' || agentType === 'antigravity_panel' || agentType === 'claude-desktop' || agentType === 'claude',
+      chat_list:              agentType === 'codex' || agentType === 'continue' || agentType === 'antigravity_panel' || agentType === 'claude-desktop' || isRooCode || agentType === 'cline',
+      switch_chat:            agentType === 'codex' || agentType === 'continue' || agentType === 'antigravity_panel' || agentType === 'claude-desktop' || isRooCode || agentType === 'cline',
+      new_chat:               agentType === 'codex' || agentType === 'continue_yolo' || agentType === 'antigravity_panel' || agentType === 'claude-desktop' || agentType === 'claude' || isRooCode || agentType === 'cline',
       terminal_output:        isCodex || agentType === 'claude-desktop',
       terminal_input:         agentType === 'codex-desktop',
       file_changes:           isCodex || agentType === 'claude-desktop',
@@ -394,6 +395,26 @@ class ProxyEngine extends EventEmitter {
         branch:             branch || 'unknown',
       };
     }
+    if (agentType === 'roo_code') {
+      return {
+        model_id:           domCfg?.model_id        || 'unknown',
+        mode:               domCfg?.mode            || 'unknown',
+        permission_mode:    domCfg?.permission_mode || 'unknown',
+        file_access_scope:  workspacePath || 'unknown',
+        available_models:   domCfg?.available_models || [],
+        branch:             branch || 'unknown',
+      };
+    }
+    if (agentType === 'cline') {
+      return {
+        model_id:           domCfg?.model_id        || 'unknown',
+        mode:               domCfg?.mode            || 'unknown',
+        permission_mode:    domCfg?.permission_mode || 'unknown',
+        file_access_scope:  workspacePath || 'unknown',
+        available_models:   domCfg?.available_models || [],
+        branch:             branch || 'unknown',
+      };
+    }
     return {
       model_id:           domCfg?.model_id           || 'unknown',
       conversation_mode:  domCfg?.conversation_mode  || 'unknown',
@@ -411,7 +432,7 @@ class ProxyEngine extends EventEmitter {
   }
 
   _supportsAutoApprovePermissions(agentType) {
-    return agentType === 'continue' || agentType === 'continue_yolo' || agentType === 'antigravity_panel';
+    return agentType === 'continue' || agentType === 'continue_yolo' || agentType === 'antigravity_panel' || agentType === 'roo_code' || agentType === 'cline';
   }
 
   _normalizeAutoApprovePreferencePart(value) {
@@ -465,11 +486,21 @@ class ProxyEngine extends EventEmitter {
       /\brun\b/i,
       /\bcontinue\b/i,
       /\bproceed\b/i,
+      // Antigravity surfaces a "Running background command" prompt with
+      // [Relocate / Always run / Cancel] after a long-running command starts.
+      // Relocate just dismisses the UI prompt (the command keeps running),
+      // so treat it as the auto-approve action to clear the dialog.
+      /\brelocate\b/i,
     ];
-    const negativePattern = /\b(reject|deny|cancel|block|stop|not now)\b/i;
+    // "always run"/"allow always" are mode toggles on dropdowns (e.g. Antigravity
+    // side panel) — selecting them changes the permission setting but does not
+    // actually approve the pending action. Skip them so we fall through to the
+    // real Run/Accept button.
+    const negativePattern = /\b(reject|deny|cancel|block|stop|not now|always)\b/i;
     for (const choice of choices) {
       const label = String(choice?.label || choice?.title || choice?.text || choice?.choice_id || '').trim();
-      if (!label || negativePattern.test(label)) continue;
+      const cid = String(choice?.choice_id || choice?.id || choice?.value || '').trim();
+      if (!label || negativePattern.test(label) || negativePattern.test(cid)) continue;
       if (positivePatterns.some(pattern => pattern.test(label))) {
         return choice.choice_id || choice.id || choice.value || null;
       }
@@ -2830,9 +2861,9 @@ class ProxyEngine extends EventEmitter {
     //   - silent:true + userGesture:false on all evaluate calls
     //   - no synthetic click dispatches in _expandOutputDetails
     // persistent CDP should no longer cause focus steal for Claude sessions.
-    // Continue and Continue YOLO remain ephemeral because they show distinct
-    // focus-stealing symptoms there.
-    return agentType === 'continue' || agentType === 'continue_yolo';
+    // Continue, Continue YOLO, and Roo Code remain ephemeral because they show
+    // distinct focus-stealing symptoms there.
+    return agentType === 'continue' || agentType === 'continue_yolo' || agentType === 'roo_code' || agentType === 'cline';
   }
 
   async _ephemeralCdpPoll(session, sessionId, options = {}) {
@@ -3677,10 +3708,10 @@ class ProxyEngine extends EventEmitter {
     session._pollInProgress = true;
 
     try {
-      // Continue uses ephemeral CDP.  Claude used to but now uses persistent
+      // Continue and Roo Code use ephemeral CDP.  Claude used to but now uses persistent
       // connections (see _isEphemeralIframeAgent for rationale) because ephemeral
       // attach itself steals focus in Electron.
-      if (session.agentType === 'continue' || session.agentType === 'continue_yolo') {
+      if (session.agentType === 'continue' || session.agentType === 'continue_yolo' || session.agentType === 'roo_code' || session.agentType === 'cline') {
         return await this._pollSessionContinue(sessionId, session);
       }
 
@@ -5003,7 +5034,10 @@ class ProxyEngine extends EventEmitter {
                       ext.toLowerCase().includes('gemini')    ||
                       ext.toLowerCase().includes('continue.continue') ||
                       ext.toLowerCase().includes('continue.continue-yolo') ||
-                      ext.toLowerCase().includes('continue-yolo');
+                      ext.toLowerCase().includes('continue-yolo') ||
+                      ext.toLowerCase().includes('roo') ||
+                      ext.toLowerCase().includes('saoudrizwan.claude-dev') ||
+                      ext.toLowerCase().includes('cline');
       if (!isAgent) continue;
 
       this._log('info', `[discover] Probing ${target.id.substring(0, 8)} ext=${ext}`);

@@ -29,6 +29,8 @@ const SURFACE_SET = new Set([
   'claude',
   'codex',
   'continue',
+  'roo_code',
+  'cline',
   'antigravity_panel',
   'workbench',
 ]);
@@ -37,6 +39,8 @@ const PATTERNS = {
   claude: [/Anthropic\.claude-code/i],
   codex: [/openai\.chatgpt/i, /openai/i],
   continue: [/Continue\.continue/i, /continue/i],
+  roo_code: [/RooVeterinaryInc\.roo-cline/i, /roo-cline/i, /roo/i],
+  cline: [/saoudrizwan\.claude-dev/i, /cline/i],
 };
 
 function truncate(value, limit = 160) {
@@ -165,6 +169,35 @@ function findWorkbenchTarget(targets) {
 
 function findFirstMatchingTarget(targets, patterns) {
   return targets.find((t) => t.type === 'iframe' && patterns.some((pattern) => pattern.test((t.url || '') + ' ' + (t.title || ''))));
+}
+
+async function findBestRooCodeTarget(targets) {
+  const candidates = targets.filter((t) => t.type === 'iframe' && PATTERNS.roo_code.some((pattern) => pattern.test((t.url || '') + ' ' + (t.title || ''))));
+  if (candidates.length === 0) return null;
+  // Roo Code uses a nested iframe architecture: the outer iframe (index.html)
+  // contains a script that loads an inner iframe (fake.html) where the actual
+  // React UI lives.  The inner iframe is the one we need to talk to.
+  const inner = candidates.find((t) => (t.url || '').includes('fake.html'));
+  if (inner) return inner;
+  if (candidates.length === 1) return candidates[0];
+  // Fallback: prefer targets with non-empty textContent
+  for (const t of candidates) {
+    try {
+      const client = await CDP({ port: PORTS.antigravity, target: t.id });
+      try {
+        await client.Runtime.enable();
+        const res = await client.Runtime.evaluate({
+          expression: `(function() { return (document.body ? (document.body.textContent || '').length : 0); })()`,
+          returnByValue: true,
+        });
+        const len = res.result?.value || 0;
+        if (len > 100) return t;
+      } finally {
+        await client.close();
+      }
+    } catch {}
+  }
+  return candidates[0];
 }
 
 async function runCodexDesktopSuite(targets, reporter) {
@@ -355,7 +388,12 @@ async function runWorkbenchSuite(targets, reporter) {
 async function runIframeSurfaceSuite(targets, reporter, surface) {
   const patterns = PATTERNS[surface];
   if (!patterns) return;
-  const target = Array.isArray(targets) ? findFirstMatchingTarget(targets, patterns) : null;
+  let target;
+  if (surface === 'roo_code') {
+    target = Array.isArray(targets) ? await findBestRooCodeTarget(targets) : null;
+  } else {
+    target = Array.isArray(targets) ? findFirstMatchingTarget(targets, patterns) : null;
+  }
   if (!target) {
     reporter.add({
       surface,
@@ -395,7 +433,9 @@ async function runIframeSurfaceSuite(targets, reporter, surface) {
         (config.model_id && config.model_id !== 'unknown') ||
         (config.effort && config.effort !== 'unknown') ||
         (config.speed && config.speed !== 'unknown') ||
-        (config.permission_mode && config.permission_mode !== 'unknown')
+        (config.permission_mode && config.permission_mode !== 'unknown') ||
+        (config.mode && config.mode !== 'unknown') ||
+        (config.version && config.version !== 'unknown')
       )
     );
     reporter.add({
@@ -465,6 +505,50 @@ async function runIframeSurfaceSuite(targets, reporter, surface) {
         investigation_hint: 'Check detectPermissionDialog for claude in selectors.js',
       });
     }
+
+    if (surface === 'roo_code') {
+      const dialog = await selectors.detectPermissionDialog(Runtime, 'roo_code');
+      reporter.add({
+        surface,
+        test_id: 'roo_code.permission-dialog.detect',
+        status: STATUS_PASS,
+        detail: dialog ? 'Visible Roo Code permission dialog detected' : 'No Roo Code permission dialog visible',
+        native_evidence: dialog,
+        investigation_hint: 'Check detectPermissionDialog for roo_code in selectors.js',
+      });
+    }
+
+    if (surface === 'cline') {
+      const dialog = await selectors.detectPermissionDialog(Runtime, 'cline');
+      reporter.add({
+        surface,
+        test_id: 'cline.permission-dialog.detect',
+        status: STATUS_PASS,
+        detail: dialog ? 'Visible Cline permission dialog detected' : 'No Cline permission dialog visible',
+        native_evidence: dialog,
+        investigation_hint: 'Check detectPermissionDialog for cline in selectors.js',
+      });
+
+      const mode = await selectors.readClineMode(Runtime);
+      reporter.add({
+        surface,
+        test_id: 'cline.mode.read',
+        status: mode ? STATUS_PASS : STATUS_SKIP,
+        detail: mode ? 'Read Cline mode: ' + truncate(mode.label || '') : 'Cline mode not available',
+        native_evidence: mode,
+        investigation_hint: 'Check readClineMode in selectors.js',
+      });
+
+      const context = await selectors.readClineContextUsage(Runtime);
+      reporter.add({
+        surface,
+        test_id: 'cline.context-usage.read',
+        status: context ? STATUS_PASS : STATUS_SKIP,
+        detail: context ? 'Read Cline context: ' + truncate(context.label || '') : 'Cline context usage not available',
+        native_evidence: context,
+        investigation_hint: 'Check readClineContextUsage in selectors.js',
+      });
+    }
   });
 }
 
@@ -484,7 +568,9 @@ async function runSmokeSuite(options = {}) {
     surface === 'antigravity_panel' ||
     surface === 'claude' ||
     surface === 'codex' ||
-    surface === 'continue'
+    surface === 'continue' ||
+    surface === 'roo_code' ||
+    surface === 'cline'
   );
   const needsCodexDesktopPort = options.surfaces.includes('codex-desktop');
 
@@ -516,7 +602,7 @@ async function runSmokeSuite(options = {}) {
     await runCodexDesktopSuite(Array.isArray(targetsByPort.codexDesktop) ? targetsByPort.codexDesktop : [], reporter);
   }
 
-  for (const surface of ['claude', 'codex', 'continue']) {
+  for (const surface of ['claude', 'codex', 'continue', 'roo_code', 'cline']) {
     if (!options.surfaces.includes(surface)) continue;
     await runIframeSurfaceSuite(Array.isArray(targetsByPort.antigravity) ? targetsByPort.antigravity : [], reporter, surface);
   }

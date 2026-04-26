@@ -1,6 +1,6 @@
 # Remote Agent Chat
 
-Access and chat with your [Antigravity IDE](https://antigravity.dev) AI agents (Claude Code, Codex, Gemini, Continue, Continue YOLO) from your phone or any browser — no inbound firewall rules, no VPS required.
+Access and chat with your [Antigravity IDE](https://antigravity.dev) AI agents (Claude Code, Codex, Gemini, Continue, Continue YOLO, Roo Code, Cline) from your phone or any browser — no inbound firewall rules, no VPS required.
 
 <p align="center">
   <img src="docs/architecture.png" alt="Remote Agent Chat architecture — CDP proxy, WebSocket relay, Cloudflare tunnel, mobile UI" width="100%">
@@ -16,7 +16,7 @@ Access and chat with your [Antigravity IDE](https://antigravity.dev) AI agents (
 
 ## The Problem
 
-Running autonomous AI coding agents (like Claude Code, OpenAI Codex, Gemini Code Assist, or Continue) often requires you to stay tethered to your desktop IDE to monitor progress, approve file changes, or unblock stuck terminal loops.
+Running autonomous AI coding agents (like Claude Code, OpenAI Codex, Gemini Code Assist, Continue, Roo Code, or Cline) often requires you to stay tethered to your desktop IDE to monitor progress, approve file changes, or unblock stuck terminal loops.
 
 **Remote Agent Chat** solves this by bridging your local IDE with your mobile device. It uses a lightweight WebSocket relay and the Chrome DevTools Protocol (CDP) to securely expose your running IDE agents to a responsive web UI you self-host with Docker and a free Cloudflare Tunnel.
 
@@ -27,7 +27,7 @@ Whether you are using Antigravity, VS Code, or standalone desktop apps, you can 
 | | Remote Agent Chat | Claude RC (`claude --remote`) | CursorRemote |
 |---|---|---|---|
 | **IDE support** | Any IDE with CDP (Antigravity, VS Code, Electron apps) | Claude Code CLI only | Cursor only |
-| **Multi-agent** | Claude + Codex + Gemini + Continue in one UI | Claude only | Cursor's built-in agent only |
+| **Multi-agent** | Claude + Codex + Gemini + Continue + Roo Code + Cline in one UI | Claude only | Cursor's built-in agent only |
 | **Infrastructure** | Self-hosted (Docker + Cloudflare Tunnel, free) | Anthropic's servers | Cursor's servers |
 | **Data privacy** | Your code never leaves your network | Routed through Anthropic | Routed through Cursor |
 | **Open source** | Yes (MIT) | No | No |
@@ -41,7 +41,8 @@ Whether you are using Antigravity, VS Code, or standalone desktop apps, you can 
  ║  │ Codex        :9223      │  ║   WSS    ║  │  (Node.js)         │  ║
  ║  │ Gemini       :9223      │  ║  ──────► ║  │                    │  ║
  ║  │ Continue     :9223      │  ║  outbound║  │  · session registry│  ║
- ║  │ Codex Desktop  :9225    │  ║          ║  │  · SQLite history  │  ║
+ ║  │ Roo Code     :9223      │  ║          ║  │  · SQLite history  │  ║
+ ║  │ Codex Desktop  :9225    │  ║          ║  │                    │  ║
  ║  └──────────┬──────────────┘  ║          ║  │  · Google OAuth    │  ║
  ║             │ (DevTools       ║          ║  └────────┬───────────┘  ║
  ║             │  Protocol)      ║          ║           │ :3500        ║
@@ -80,6 +81,8 @@ The agent proxy connects **outbound** to the relay — no port forwarding or inb
 | Gemini Code Assist (Antigravity extension) | Working |
 | Continue (Antigravity extension) | Working — local models via Ollama, etc. |
 | Continue YOLO (Antigravity extension) | Working — editor-tab sessions with bypass-permissions support |
+| Roo Code (Antigravity extension) | Working — side-pane sessions with permission dialog support |
+| Cline (Antigravity extension) | Working — side-pane sessions with Plan/Act mode, context usage, and permission dialog support |
 | Antigravity Chat (built-in agent) | Working |
 | Codex Desktop (MSIX) | Working (separate CDP port) |
 | Claude Desktop (MSIX) | Blocked — Anthropic requires a signed `CLAUDE_CDP_AUTH` token to allow CDP |
@@ -222,7 +225,7 @@ launch-antigravity-cdp.bat
 
 This kills any running Antigravity instance and relaunches it with `--remote-debugging-port=9223`.
 
-Verify CDP is working by opening `http://localhost:9223/json/list` in your browser — you should see a list of targets including entries with `Anthropic.claude-code`, `openai.chatgpt`, or `continue.continue-yolo` in the URL.
+Verify CDP is working by opening `http://localhost:9223/json/list` in your browser — you should see a list of targets including entries with `Anthropic.claude-code`, `openai.chatgpt`, `continue.continue-yolo`, or `saoudrizwan.claude-dev` in the URL.
 
 > **Note:** `argv.json` does NOT support `remote-debugging-port`. Always use the launcher script.
 
@@ -259,7 +262,7 @@ Install the proxy as an Antigravity/VS Code extension. No separate process, no s
 4. Open **Settings** (Ctrl+,) and search for `remoteAgentProxy`, then configure:
    - **Relay URL**: `wss://agents.yourdomain.com/proxy-ws`
    - **Proxy Secret**: same value as your relay's `PROXY_SECRET`
-   - **CDP Ports**: `9223` (add `,9225` if using Codex Desktop)
+    - **CDP Ports**: `9223` (add `,9225` if using Codex Desktop)
 5. The proxy starts automatically. Look for `$(broadcast) Proxy (N)` in the status bar.
 
 Click the status bar item for a quick menu (Stop, Restart, Show Logs).

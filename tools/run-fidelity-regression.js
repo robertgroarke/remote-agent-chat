@@ -35,6 +35,7 @@ const PATTERNS = {
   claude: [/Anthropic\.claude-code/i],
   codex: [/openai\.chatgpt/i, /openai/i],
   continue: [/Continue\.continue/i, /continue/i],
+  roo_code: [/RooVeterinaryInc\.roo-cline/i, /roo-cline/i, /roo/i],
 };
 
 function truncate(value, limit = 180) {
@@ -58,7 +59,7 @@ function parseArgs(argv) {
     json: false,
     strict: false,
     allowActive: false,
-    surfaces: ['codex-desktop', 'claude', 'codex', 'continue', 'antigravity_panel'],
+    surfaces: ['codex-desktop', 'claude', 'codex', 'continue', 'roo_code', 'antigravity_panel'],
     jsonFile: null,
     tail: null,
     relayBaseUrl: null,
@@ -560,6 +561,12 @@ async function collectNativeTranscript(surface, target, sessionId) {
   if (surface === 'antigravity_panel') {
     return withTarget(PORTS.antigravity, target, async (Runtime) => {
       return parseMaybeJson(await selectors.readMessages(Runtime, 'antigravity_panel', sessionId || `fidelity-${surface}`), []);
+    });
+  }
+
+  if (surface === 'roo_code') {
+    return withTarget(PORTS.antigravity, target, async (Runtime) => {
+      return parseMaybeJson(await selectors.readMessages(Runtime, 'roo_code', sessionId || `fidelity-${surface}`), []);
     });
   }
 

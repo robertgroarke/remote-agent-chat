@@ -119,6 +119,35 @@ const CONTINUE_FALLBACK = {
   sendBtn: 'button[data-testid="submit-input-button"]',
 };
 
+// ─── Roo Code selector sets ──────────────────────────────────────────────────
+// Roo Code (RooVeterinaryInc.roo-cline) VS Code extension.
+// Runs in a side-pane webview like Continue.
+// Selectors confirmed via live CDP DOM inspection (2026-04-26).
+//
+// DOM structure:
+//   - #root > [data-testid="chat-view"]           ← root chat container
+//   - textarea[placeholder*="task" i]              ← input (also "Type a message...")
+//   - button[aria-label="Press Enter to send"]     ← send button
+//   - button[aria-label="Stop"]                     ← stop button (visible while generating)
+//   - [data-testid="virtuoso-item-list"]             ← virtualized message list
+//   - [data-testid="virtuoso-item-list"] > div       ← individual message rows
+//   - Text prefixes: "Roo said", "Roo wants", "You said", "API Request", "Checkpoint"
+//   - Mode button text: "🏗️ Architect", "💻 Code", etc.
+
+const ROO_CODE_PRIMARY = {
+  detect:    'textarea[placeholder*="task" i], textarea[placeholder*="message" i]',
+  input:     'textarea[placeholder*="task" i], textarea[placeholder*="message" i]',
+  sendBtn:   'button[aria-label="Press Enter to send"]',
+  stopBtn:   'button[aria-label="Stop"]',
+  virtuoso:  '[data-testid="virtuoso-item-list"]',
+  chatView:  '[data-testid="chat-view"]',
+};
+
+const ROO_CODE_FALLBACK = {
+  input:   'textarea',
+  sendBtn: 'button[aria-label*="send" i]',
+};
+
 // ─── Failure tracking ─────────────────────────────────────────────────────────
 
 const selectorFailures = new Map(); // sessionId -> { readFails, sendFails, lastDiagAt }
@@ -464,6 +493,14 @@ async function cacheInnerContextId(Runtime) {
 async function detectAgentType(Runtime, extensionIdHint) {
   const webviewId = Runtime._webviewId || '';
   const hint = String(extensionIdHint || '').toLowerCase();
+
+  // 0. Extension-ID-based pre-classification for Cline forks.
+  //    Roo Code (rooveterinaryinc.roo-cline) and Cline (saoudrizwan.claude-dev)
+  //    share identical DOM, so DOM selectors cannot distinguish them.
+  //    Check ext ID first — this is the most reliable discriminator.
+  const isClineHint = hint.includes('saoudrizwan.claude-dev');
+  const isRooHint   = hint.includes('rooveterinaryinc') || hint.includes('roo-code');
+
   const result = await Runtime.evaluate({
     expression: `(function() {
       const webviewId = ${JSON.stringify(webviewId)};
@@ -487,6 +524,7 @@ async function detectAgentType(Runtime, extensionIdHint) {
         });
         if (visible) return visible.contentDocument;
         if (document.body && document.body.children.length > 0) return document;
+        if (document.documentElement) return document;
         return null;
       }
       const d = resolveDoc();
@@ -495,19 +533,30 @@ async function detectAgentType(Runtime, extensionIdHint) {
       if (d.querySelector('${CONTINUE_PRIMARY.detect}')) return ${JSON.stringify(hint.includes('continue-yolo') || hint.includes('continue.continue-yolo') ? 'continue_yolo' : 'continue')};
       if (d.querySelector('${CODEX_PRIMARY.detect}')) return 'codex';
       if (d.querySelector('${GEMINI_PRIMARY.detect}')) return 'gemini';
+      if (d.querySelector('${ROO_CODE_PRIMARY.detect}')) return 'roo_code_or_cline';
       if (d.querySelector('${CLAUDE_FALLBACK.detect}')) return 'claude';
       return null;
     })()`,
     returnByValue: true,
     awaitPromise: false,
   });
-  const detected = result.result?.value ?? null;
+  let detected = result.result?.value ?? null;
+
+  // Disambiguate roo_code vs cline using ext ID when DOM detection
+  // returns the shared marker.
+  if (detected === 'roo_code_or_cline') {
+    if (isClineHint) detected = 'cline';
+    else if (isRooHint) detected = 'roo_code';
+    else detected = 'roo_code'; // default to roo_code if no hint
+  }
   if (detected) return detected;
 
   // Last resort: use extension ID hint (covers empty/loading panels)
   if (hint.includes('gemini') || hint.includes('googlecloud') || hint.includes('geminicodeassist')) return 'gemini';
   if (hint.includes('continue.continue-yolo') || hint.includes('continue-yolo')) return 'continue_yolo';
   if (hint.includes('continue.continue')) return 'continue';
+  if (isClineHint) return 'cline';
+  if (isRooHint || hint.includes('roo')) return 'roo_code';
   return null;
 }
 
@@ -515,9 +564,14 @@ function isContinueAgentType(agentType) {
   return agentType === 'continue' || agentType === 'continue_yolo';
 }
 
+function isRooCodeAgentType(agentType) {
+  return agentType === 'roo_code' || agentType === 'cline';
+}
+
 // ─── Thinking detection ───────────────────────────────────────────────────────
 
 async function detectThinking(Runtime, agentType) {
+  if (isRooCodeAgentType(agentType)) return detectRooCodeThinking(Runtime);
   if (isContinueAgentType(agentType)) return detectContinueThinking(Runtime);
   if (agentType === 'antigravity_panel') return detectAntigravityPanelThinking(Runtime);
   if (agentType === 'antigravity') return detectAntigravityThinking(Runtime);
@@ -2519,6 +2573,248 @@ async function readContinueConfig(Runtime) {
   } catch { return null; }
 }
 
+// ─── Roo Code helpers ─────────────────────────────────────────────────────────
+// Selectors confirmed via live CDP DOM inspection (2026-04-26).
+//
+// Message list: [data-testid="virtuoso-item-list"] > div (virtualized rows)
+// Each row text starts with a prefix indicating the role:
+//   "You said"          → user
+//   "Roo said"          → assistant
+//   "Roo wants"         → assistant (tool intent)
+//   "Roo wants to edit" → assistant (file edit)
+//   "Roo wants to read" → assistant (file read)
+//   "API Request"       → assistant (tool call)
+//   "Checkpoint"        → assistant (checkpoint)
+//   "Running(PID:...)"  → assistant (command execution)
+//   "Updated the to-do list" → assistant (status)
+
+const ROO_CODE_READ_EXPR = `
+  function norm(text) {
+    return String(text || '').replace(/\\s+/g, ' ').trim();
+  }
+  function cleanText(text) {
+    return norm(text).replace(/\\u200B/g, '').replace(/\\u00A0/g, ' ');
+  }
+
+  var msgs = [];
+  var virtuoso = d.querySelector('${ROO_CODE_PRIMARY.virtuoso}');
+  var items = virtuoso ? Array.from(virtuoso.children) : [];
+
+  for (var i = 0; i < items.length; i++) {
+    var item = items[i];
+    var rawText = cleanText(item.innerText || item.textContent || '');
+    if (!rawText) continue;
+
+    // Determine role from text prefix
+    var role = null;
+    var content = rawText;
+
+    if (rawText.indexOf('You said') === 0) {
+      role = 'user';
+      content = rawText.substring('You said'.length).trim();
+    } else if (rawText.indexOf('Roo said') === 0) {
+      role = 'assistant';
+      content = rawText.substring('Roo said'.length).trim();
+    } else if (rawText.indexOf('Roo wants') === 0) {
+      role = 'assistant';
+      // Keep full text including "Roo wants" for context
+    } else if (rawText.indexOf('API Request') === 0) {
+      role = 'assistant';
+      // Keep full text
+    } else if (rawText.indexOf('Checkpoint') === 0) {
+      role = 'assistant';
+      // Keep full text
+    } else if (/^Running\\(PID:/.test(rawText)) {
+      role = 'assistant';
+      // Keep full text
+    } else if (rawText.indexOf('Updated the to-do list') === 0) {
+      role = 'assistant';
+      // Keep full text
+    }
+
+    if (!role) continue;
+
+    // Skip duplicate consecutive messages with same content
+    var last = msgs[msgs.length - 1];
+    if (last && last.role === role && last.content === content) continue;
+
+    msgs.push({ role: role, content: content });
+  }
+
+  return JSON.stringify(msgs);
+`;
+
+async function evalInRooCodeFrame(Runtime, code) {
+  const result = await Runtime.evaluate({
+    expression: `(function() {
+      const active = document.getElementById('active-frame');
+      const d = active && active.contentDocument ? active.contentDocument : document;
+      if (!d) return null;
+      ${code}
+    })()`,
+    returnByValue: true,
+    awaitPromise: false,
+    silent: true,
+    userGesture: false,
+  });
+  if (result.exceptionDetails) {
+    const desc = result.exceptionDetails.exception?.description || result.exceptionDetails.text;
+    throw new Error(`JS exception: ${desc}`);
+  }
+  return result.result?.value ?? null;
+}
+
+async function readRooCodeMessages(Runtime, sessionId) {
+  try {
+    const raw = await evalInRooCodeFrame(Runtime, ROO_CODE_READ_EXPR);
+    if (raw !== null) { resetReadFailures(sessionId); return raw; }
+  } catch (e) {
+    console.warn(`[${sessionId}] [sel] Roo Code read error: ${e.message}`);
+  }
+
+  const f = recordReadFailure(sessionId);
+  if (f.readFails === 1 || f.readFails % 5 === 0) {
+    console.warn(`[${sessionId}] [sel] Roo Code read null x${f.readFails}`);
+    await captureDiagnostic(Runtime, sessionId);
+  }
+  return JSON.stringify([]);
+}
+
+async function detectRooCodeThinking(Runtime) {
+  try {
+    const raw = await evalInRooCodeFrame(Runtime, `
+      function isVisible(el) {
+        if (!el || !el.getBoundingClientRect) return false;
+        var rect = el.getBoundingClientRect();
+        if (rect.width <= 0 || rect.height <= 0) return false;
+        var style = window.getComputedStyle ? window.getComputedStyle(el) : null;
+        if (style && (style.display === 'none' || style.visibility === 'hidden' || style.opacity === '0')) return false;
+        return true;
+      }
+      // Check for explicit stop button (visible while generating)
+      var stopBtn = d.querySelector('${ROO_CODE_PRIMARY.stopBtn}');
+      if (stopBtn && isVisible(stopBtn)) {
+        return JSON.stringify({ thinking: true, label: 'Generating' });
+      }
+      // Fallback: any button with aria-label containing "Stop"
+      var allBtns = d.querySelectorAll('button');
+      for (var i = 0; i < allBtns.length; i++) {
+        var aria = (allBtns[i].getAttribute('aria-label') || '').toLowerCase();
+        if (aria.indexOf('stop') !== -1 && isVisible(allBtns[i])) {
+          return JSON.stringify({ thinking: true, label: 'Generating' });
+        }
+      }
+      return JSON.stringify({ thinking: false, label: '' });
+    `);
+    try { return JSON.parse(raw); } catch { return { thinking: false, label: '' }; }
+  } catch {
+    return { thinking: false, label: '' };
+  }
+}
+
+async function sendRooCodePrimary(Runtime, text) {
+  const set = await evalInRooCodeFrame(Runtime, `
+    var input = d.querySelector('${ROO_CODE_PRIMARY.input}');
+    if (!input) return 'no-input';
+    input.focus();
+    input.value = ${JSON.stringify(text)};
+    input.dispatchEvent(new Event('input', { bubbles: true }));
+    // Also dispatch a change event for React form bindings
+    input.dispatchEvent(new Event('change', { bubbles: true }));
+    return input.value === ${JSON.stringify(text)} ? 'ok' : 'empty';
+  `);
+  if (set !== 'ok') return { ok: false, code: 'input_not_found', detail: set };
+
+  await new Promise(r => setTimeout(r, 200));
+
+  const click = await evalInRooCodeFrame(Runtime, `
+    var btn = d.querySelector('${ROO_CODE_PRIMARY.sendBtn}');
+    if (!btn) return 'no-btn';
+    if (btn.disabled) return 'disabled';
+    btn.click();
+    return 'sent';
+  `);
+  if (click === 'sent') return { ok: true };
+  return { ok: false, code: 'send_button_failed', detail: click };
+}
+
+async function sendRooCodeFallback(Runtime, text) {
+  const result = await evalInRooCodeFrame(Runtime, `
+    var input = d.querySelector('${ROO_CODE_FALLBACK.input}');
+    if (!input) return 'no-input';
+    input.focus();
+    input.value = ${JSON.stringify(text)};
+    input.dispatchEvent(new Event('input', { bubbles: true }));
+    input.dispatchEvent(new Event('change', { bubbles: true }));
+    var btn = d.querySelector('${ROO_CODE_FALLBACK.sendBtn}');
+    if (btn && !btn.disabled) {
+      btn.click();
+      return 'sent-btn';
+    }
+    input.dispatchEvent(new KeyboardEvent('keydown', { key: 'Enter', code: 'Enter', bubbles: true, cancelable: true }));
+    input.dispatchEvent(new KeyboardEvent('keyup',   { key: 'Enter', code: 'Enter', bubbles: true }));
+    return 'dispatched';
+  `);
+  if (result === 'sent-btn' || result === 'dispatched') return { ok: true };
+  return { ok: false, code: 'fallback_enter_failed', detail: result };
+}
+
+async function readRooCodeConfig(Runtime) {
+  try {
+    const raw = await evalInRooCodeFrame(Runtime, `
+      function norm(t) {
+        return String(t || '').replace(/\\s+/g, ' ').trim();
+      }
+      function gatherText() {
+        var root = d.body || d.documentElement;
+        if (!root) return '';
+        return norm(root.textContent || '');
+      }
+      var bodyText = gatherText();
+
+      // Mode detection from body text
+      var modeMatch = bodyText.match(/[🏗️💻🔍🐛]\\s*(Architect|Code|Ask|Debug)/i);
+      var mode = modeMatch ? modeMatch[0] : 'unknown';
+
+      // Model detection
+      var modelMatch = bodyText.match(/(claude|gpt|gemini|o3|o4|sonnet|opus|haiku|deepseek|llama)[-\\s\\w]*/i);
+      var model = modelMatch ? norm(modelMatch[0]) : 'unknown';
+
+      // Auto-approve detection
+      var autoApprove = /auto-approved?/i.test(bodyText) ? 'auto_approved' : 'unknown';
+
+      // Version detection
+      var versionMatch = bodyText.match(/v\\d+\\.\\d+\\.\\d+/);
+      var version = versionMatch ? versionMatch[0] : 'unknown';
+
+      return JSON.stringify({
+        model_id: model,
+        mode: mode,
+        permission_mode: autoApprove,
+        version: version,
+      });
+    `);
+    return raw ? JSON.parse(raw) : null;
+  } catch { return null; }
+}
+
+async function setRooCodeModel(Runtime, modelId, sessionId) {
+  // Placeholder — Roo Code model selection via DOM clicks will be added after live inspection
+  console.warn(`[${sessionId}] [sel] setRooCodeModel not yet implemented (modelId=${modelId})`);
+  return { ok: false, code: 'not_implemented', detail: 'Roo Code model selection requires live DOM inspection' };
+}
+
+async function setRooCodePermissionMode(Runtime, mode, sessionId) {
+  // Placeholder — Roo Code permission mode selection via DOM clicks will be added after live inspection
+  console.warn(`[${sessionId}] [sel] setRooCodePermissionMode not yet implemented (mode=${mode})`);
+  return { ok: false, code: 'not_implemented', detail: 'Roo Code permission mode selection requires live DOM inspection' };
+}
+
+async function detectRooCodePermissionDialog(Runtime) {
+  // Placeholder — Roo Code permission dialog detection will be added after live inspection
+  return null;
+}
+
 // ─── Antigravity native agent (workbench-jetski-agent.html) ─────────────────
 //
 // Selectors confirmed via live CDP DOM inspection of the Manager page.
@@ -3233,25 +3529,47 @@ async function readAntigravityConfig(Runtime, workspacePath) {
   try {
     const raw = await evalInPage(Runtime, `
       // --- Model name ---
-      // The model name sits in a div.min-w-0 in the toolbar left-div (confirmed by DOM inspection).
-      // Strategy: find Send button, walk up to toolbar, parse innerText lines.
+      // Antigravity surfaces the active model as a clickable [role="button"]
+      // (or <button>) labeled like "Claude Opus 4.6 (Thinking)" or
+      // "Gemini 3.1 Pro (High)" right next to the chat input. Walking up from
+      // Send was reading the wrong toolbar (sibling panel / hidden settings),
+      // so look for the element that directly displays a model name instead.
       var model = null;
-      var sendBtn = Array.from(d.querySelectorAll('button')).find(function(b){ return b.textContent.trim() === 'Send'; });
-      if (sendBtn) {
-        var toolbar = sendBtn.parentElement;
-        while (toolbar && toolbar.querySelectorAll('button').length < 3) {
-          toolbar = toolbar.parentElement;
-        }
-        if (toolbar) {
-          var lines = toolbar.innerText.split('\\n').map(function(s){ return s.trim(); }).filter(Boolean);
-          // Match only lines that look like model names (contain known model keywords,
-          // are short enough to not be description text, and aren't UI labels).
-          var knownLabels = ['Planning', 'Fast', 'Send', 'Conversation mode', 'Model', 'Mode'];
-          var modelPat = /gemini|claude|gpt|flash|pro|mini|sonnet|opus|haiku/i;
-          var modelLines = lines.filter(function(l) {
-            return knownLabels.indexOf(l) === -1 && l.length > 2 && l.length < 60 && modelPat.test(l);
-          });
-          if (modelLines.length > 0) model = modelLines[0];
+      var searchRoot = d.querySelector('.antigravity-agent-side-panel') || d;
+      // Reject UI noise that happens to contain a family keyword.
+      var skipExact = ['Planning', 'Fast', 'Send', 'Conversation mode', 'Model', 'Mode', 'Stop', 'New Chat'];
+      // Match labels with both a model family keyword and a digit (version)
+      // to avoid grabbing strings like "Conversation mode" or "Pro plan".
+      var modelFamilyPat = /\\b(claude|gemini|gpt|llama|mistral|sonnet|opus|haiku|flash)\\b/i;
+      var versionPat = /\\d/;
+      var modelCandidates = Array.from(searchRoot.querySelectorAll('button, [role="button"]'))
+        .filter(function(el){
+          if (!el.offsetParent) return false;
+          var t = (el.innerText || '').trim();
+          if (!t) return false;
+          var first = t.split('\\n')[0].trim();
+          if (skipExact.indexOf(first) !== -1) return false;
+          if (first.length < 4 || first.length > 60) return false;
+          return modelFamilyPat.test(first) && versionPat.test(first);
+        })
+        .map(function(el){ return (el.innerText || '').split('\\n')[0].trim(); });
+      if (modelCandidates.length > 0) {
+        model = modelCandidates[0];
+      } else {
+        // Fallback: original toolbar-from-Send strategy.
+        var sendBtn = Array.from(searchRoot.querySelectorAll('button')).find(function(b){ return b.textContent.trim() === 'Send'; });
+        if (sendBtn) {
+          var toolbar = sendBtn.parentElement;
+          while (toolbar && toolbar.querySelectorAll('button').length < 3) {
+            toolbar = toolbar.parentElement;
+          }
+          if (toolbar) {
+            var lines = toolbar.innerText.split('\\n').map(function(s){ return s.trim(); }).filter(Boolean);
+            var modelLines = lines.filter(function(l) {
+              return skipExact.indexOf(l) === -1 && l.length > 2 && l.length < 60 && modelFamilyPat.test(l) && versionPat.test(l);
+            });
+            if (modelLines.length > 0) model = modelLines[0];
+          }
         }
       }
 
@@ -3259,7 +3577,7 @@ async function readAntigravityConfig(Runtime, workspacePath) {
       // The Planning button ([role="button"][aria-haspopup="dialog"]) has a sibling [role="dialog"]
       // that contains 'Planning' and 'Fast' items.  The active item has bg-gray-500/20 in className.
       var mode = 'unknown';
-      var planBtn = Array.from(d.querySelectorAll('[role="button"][aria-haspopup="dialog"]')).find(function(el) {
+      var planBtn = Array.from(searchRoot.querySelectorAll('[role="button"][aria-haspopup="dialog"]')).find(function(el) {
         var t = el.innerText ? el.innerText.trim() : '';
         return t === 'Planning' || t === 'Fast';
       });
@@ -3304,6 +3622,7 @@ async function readMessages(Runtime, agentType, sessionId) {
   if (agentType === 'codex-desktop')      return readCodexMessages(Runtime, sessionId, true);
   if (agentType === 'codex')              return readCodexMessages(Runtime, sessionId, false);
   if (agentType === 'gemini')             return readGeminiMessages(Runtime, sessionId);
+  if (isRooCodeAgentType(agentType))      return readRooCodeMessages(Runtime, sessionId);
   if (isContinueAgentType(agentType))     return readContinueMessages(Runtime, sessionId);
   if (agentType === 'antigravity')        return readAntigravityMessages(Runtime, sessionId);
   if (agentType === 'antigravity_panel')  return readAntigravityPanelMessages(Runtime, sessionId);
@@ -3611,6 +3930,18 @@ const STOP_SELECTORS = {
     ].join(', '),
     escapeOnFail: false,
   },
+  roo_code: {
+    primary: [
+      'button[aria-label*="Stop" i]',
+      'button[aria-label*="Cancel" i]',
+      'button[data-testid*="stop" i]',
+    ].join(', '),
+    fallback: [
+      'button[class*="stop"]',
+      'button[class*="cancel"]',
+    ].join(', '),
+    escapeOnFail: false,
+  },
 };
 
 // Try clicking the stop button using the given selector string.
@@ -3655,7 +3986,8 @@ async function interruptAgent(Runtime, agentType, sessionId) {
   const normalised = (agentType === 'antigravity' || agentType === 'antigravity_panel') ? 'claude'
     : agentType === 'claude-desktop' ? 'claude'
     : agentType === 'codex-desktop'  ? 'codex'
-    : agentType; // 'continue', 'gemini', 'claude', 'codex' pass through
+    : agentType === 'cline'          ? 'roo_code'
+    : agentType; // 'continue', 'gemini', 'claude', 'codex', 'roo_code' pass through
   const sels = STOP_SELECTORS[normalised] || STOP_SELECTORS.claude;
   const evalFn = (agentType === 'codex-desktop') ? evalInPage : evalInFrame;
 
@@ -4961,6 +5293,20 @@ async function readAgentConfig(Runtime, agentType, workspacePath) {
     }
   }
 
+  if (isRooCodeAgentType(agentType)) {
+    try {
+      const cfg = await readRooCodeConfig(Runtime);
+      return {
+        model_id:          cfg?.model_id        || 'unknown',
+        mode:              cfg?.mode            || 'unknown',
+        permission_mode:   cfg?.permission_mode || 'unknown',
+        file_access_scope: workspacePath || 'unknown',
+      };
+    } catch {
+      return { model_id: 'unknown', mode: 'unknown', permission_mode: 'unknown', file_access_scope: workspacePath || 'unknown' };
+    }
+  }
+
   if (agentType === 'codex' || agentType === 'codex-desktop') {
     const usePageEval = agentType === 'codex-desktop';
     const cfg = await readCodexConfig(Runtime, usePageEval);
@@ -5832,11 +6178,48 @@ function _buildPermissionClickExpr(choiceId) {
 // both a "Reject" button and at least one other action button (Run, Allow, etc.).
 
 const ANTIGRAVITY_PANEL_PERMISSION_EXPR = `
-  var panel = d.querySelector('.antigravity-agent-side-panel');
-  if (!panel) return null;
   function choiceId(label, idx) {
     return label.toLowerCase().replace(/[^a-z0-9]+/g, '_').replace(/^_+|_+$/g, '') || ('choice_' + idx);
   }
+
+  // Strategy 0: Page-level "N File(s) With Changes" diff bar with
+  //   [Reject all] [Accept all] buttons. This isn't inside the side panel —
+  //   it lives in the editor area when Antigravity proposes file edits.
+  var fcAccept = null;
+  var fcReject = null;
+  var topBtns = Array.from(d.querySelectorAll('button, [role="button"]'));
+  for (var fi = 0; fi < topBtns.length; fi++) {
+    var fb = topBtns[fi];
+    if (!fb.offsetParent) continue;
+    if (fb.disabled || fb.getAttribute('aria-disabled') === 'true') continue;
+    var ft = (fb.textContent || '').trim().toLowerCase();
+    if (ft === 'accept all') fcAccept = fcAccept || fb;
+    else if (ft === 'reject all') fcReject = fcReject || fb;
+    if (fcAccept && fcReject) break;
+  }
+  if (fcAccept && fcReject) {
+    var fcContainer = fcAccept.parentElement;
+    while (fcContainer && fcContainer !== d.body && !fcContainer.contains(fcReject)) {
+      fcContainer = fcContainer.parentElement;
+    }
+    var fcMsg = fcContainer
+      ? (fcContainer.innerText || '').replace(/\\s+/g, ' ').trim().substring(0, 400)
+      : 'Files With Changes';
+    return JSON.stringify({
+      message: fcMsg || 'Files With Changes',
+      choices: [
+        { choice_id: 'accept_all', label: 'Accept all' },
+        { choice_id: 'reject_all', label: 'Reject all' },
+      ],
+    });
+  }
+
+  // Manager-page sessions don't have .antigravity-agent-side-panel — fall back
+  // to scanning the whole body. Strategies 1 and 2 are tight enough (require an
+  // exact "Reject" button, or specific prompt text + action buttons) that this
+  // is safe.
+  var panel = d.querySelector('.antigravity-agent-side-panel') || d.body;
+  if (!panel) return null;
 
   // Strategy 1: Find buttons with "Reject" text — the permission prompt always has one
   var allBtns = Array.from(panel.querySelectorAll('button'));
@@ -5956,8 +6339,6 @@ const ANTIGRAVITY_PANEL_PERMISSION_EXPR = `
 // Click handler for Antigravity panel inline permission prompts
 function _buildPanelPermissionClickExpr(choiceId) {
   return `
-    var panel = d.querySelector('.antigravity-agent-side-panel');
-    if (!panel) return 'no-panel';
     function dispatchPress(el) {
       var w = d.defaultView || window;
       if (typeof el.focus === 'function') {
@@ -5978,7 +6359,36 @@ function _buildPanelPermissionClickExpr(choiceId) {
       el.dispatchEvent(new w.MouseEvent('click', opts));
     }
 
-    var allBtns = Array.from(panel.querySelectorAll('button'));
+    var target = ${JSON.stringify(choiceId)};
+
+    // Page-level "N File(s) With Changes" diff bar — Accept all / Reject all
+    if (target === 'accept_all' || target === 'reject_all') {
+      var wantLabel = (target === 'accept_all') ? 'accept all' : 'reject all';
+      var pageBtns = Array.from(d.querySelectorAll('button, [role="button"]'));
+      for (var pbi = 0; pbi < pageBtns.length; pbi++) {
+        var pb = pageBtns[pbi];
+        if (!pb.offsetParent) continue;
+        if ((pb.textContent || '').trim().toLowerCase() === wantLabel) {
+          if (pb.disabled || pb.getAttribute('aria-disabled') === 'true') return 'disabled';
+          dispatchPress(pb);
+          return 'clicked';
+        }
+      }
+      // fall through — maybe the same slug exists inside a panel prompt
+    }
+
+    // Manager-page sessions don't have .antigravity-agent-side-panel — fall
+    // back to the document body so the same slug-match logic still runs.
+    var panel = d.querySelector('.antigravity-agent-side-panel') || d.body;
+    if (!panel) return 'no-panel';
+
+    function slugOf(el) {
+      var lbl = (el.textContent || el.getAttribute('aria-label') || '').trim();
+      lbl = lbl.replace(/\\s*(Alt|Ctrl|Shift|Cmd|Meta)\\+\\S+$/i, '').trim();
+      return lbl.toLowerCase().replace(/[^a-z0-9]+/g, '_').replace(/^_+|_+$/g, '');
+    }
+
+    var allBtns = Array.from(panel.querySelectorAll('button, [role="button"]'));
     var rejectBtn = null;
     for (var ri = 0; ri < allBtns.length; ri++) {
       var rText = (allBtns[ri].textContent || '').trim().toLowerCase();
@@ -6003,15 +6413,15 @@ function _buildPanelPermissionClickExpr(choiceId) {
     var container = rejectBtn.parentElement;
     while (container && container !== panel) {
       var containerText = (container.innerText || '').trim();
-      if (containerText.length > 30 && container.querySelectorAll('button').length >= 2) break;
+      var btnCount = container.querySelectorAll('button, [role="button"]').length;
+      if (containerText.length > 30 && btnCount >= 2) break;
       container = container.parentElement;
     }
     if (!container || container === panel) container = rejectBtn.parentElement;
 
-    var target = ${JSON.stringify(choiceId)};
-
-    // First try buttons
-    var btns = Array.from(container.querySelectorAll('button'));
+    // First try buttons (and role=button — detection includes them, so the
+    // click handler must too, or matching choice IDs return 'no-match').
+    var btns = Array.from(container.querySelectorAll('button, [role="button"]'));
     var found = null;
     for (var bi = 0; bi < btns.length; bi++) {
       var btn = btns[bi];
@@ -6038,7 +6448,27 @@ function _buildPanelPermissionClickExpr(choiceId) {
       }
     }
 
-    if (!found) return 'no-match';
+    // Fallback: the container walk can stop at a node that doesn't include
+    // every button (e.g. when the Run button lives in a sibling/footer
+    // container of the Reject button). Scan the whole panel/body for any
+    // visible non-disabled button whose slug matches the target.
+    if (!found) {
+      for (var gi = 0; gi < allBtns.length; gi++) {
+        var gb = allBtns[gi];
+        if (!gb.offsetParent) continue;
+        if (gb.disabled || gb.getAttribute('aria-disabled') === 'true') continue;
+        if (slugOf(gb) === target) { found = gb; break; }
+      }
+    }
+
+    if (!found) {
+      // Surface what's available so we can debug "no-match" quickly.
+      var available = allBtns
+        .filter(function(b){ return b.offsetParent && !b.disabled && b.getAttribute('aria-disabled') !== 'true'; })
+        .map(slugOf)
+        .filter(function(s){ return s; });
+      return 'no-match:' + target + ':[' + available.slice(0, 20).join(',') + ']';
+    }
     if (found.disabled || found.getAttribute('aria-disabled') === 'true') return 'disabled';
     dispatchPress(found);
     return 'clicked';
@@ -6154,8 +6584,11 @@ async function detectPermissionDialog(Runtime, agentType) {
     } catch { return null; }
   }
 
-  // Antigravity panel: use panel-specific inline prompt detection
-  if (agentType === 'antigravity_panel') {
+  // Antigravity (manager page) and antigravity_panel both render the inline
+  // "Run command? / Always run / Reject / Run" prompt at the page level rather
+  // than as a modal dialog, so PERMISSION_DIALOG_EXPR misses it. Try the
+  // generic dialog selector first, then fall back to the panel-style detector.
+  if (agentType === 'antigravity_panel' || agentType === 'antigravity') {
     try {
       const pageRaw = await evalInPage(Runtime, PERMISSION_DIALOG_EXPR);
       if (pageRaw) return JSON.parse(pageRaw);
@@ -6166,7 +6599,7 @@ async function detectPermissionDialog(Runtime, agentType) {
   }
 
   try {
-    const usePageEval = agentType === 'codex-desktop' || agentType === 'antigravity';
+    const usePageEval = agentType === 'codex-desktop';
     const evalFn = usePageEval ? evalInPage : evalInFrame;
     const raw = await evalFn(Runtime, PERMISSION_DIALOG_EXPR);
     if (!raw) return null;
@@ -6627,11 +7060,17 @@ async function respondToPermissionDialog(Runtime, agentType, choiceId, sessionId
         }
         return 'clicked';
       `);
-    } else if (agentType === 'antigravity_panel') {
-      r = await evalInPage(Runtime, _buildPanelPermissionClickExpr(choiceId));
+    } else if (agentType === 'antigravity_panel' || agentType === 'antigravity') {
+      // Try the generic dialog click first, then fall back to the panel-style
+      // click — same ordering as detectPermissionDialog so click & detect stay
+      // in sync.
+      r = await evalInPage(Runtime, _buildPermissionClickExpr(choiceId));
+      if (r !== 'clicked') {
+        r = await evalInPage(Runtime, _buildPanelPermissionClickExpr(choiceId));
+      }
       verifyAntigravityPanel = (r === 'clicked');
     } else {
-      const usePageEval = agentType === 'codex-desktop' || agentType === 'antigravity';
+      const usePageEval = agentType === 'codex-desktop';
       const evalFn = usePageEval ? evalInPage : evalInFrame;
       r = await evalFn(Runtime, _buildPermissionClickExpr(choiceId));
       verifyGenericPrompt = (r === 'clicked');
@@ -6688,6 +7127,12 @@ async function sendMessage(Runtime, agentType, text, sessionId) {
     if (!result.ok) {
       console.warn(`[${sessionId}] [sel] Gemini primary send failed (${result.code}:${result.detail}), trying fallback`);
       result = await sendGeminiFallback(Runtime, text);
+    }
+  } else if (isRooCodeAgentType(agentType)) {
+    result = await sendRooCodePrimary(Runtime, text);
+    if (!result.ok) {
+      console.warn(`[${sessionId}] [sel] Roo Code primary send failed (${result.code}:${result.detail}), trying fallback`);
+      result = await sendRooCodeFallback(Runtime, text);
     }
   } else if (isContinueAgentType(agentType)) {
     result = await sendContinuePrimary(Runtime, text);
@@ -8675,6 +9120,15 @@ module.exports = {
   evalInFrame,
   cacheInnerContextId,
   evalInPage,
+  // Roo Code
+  readRooCodeMessages,
+  detectRooCodeThinking,
+  sendRooCodePrimary,
+  sendRooCodeFallback,
+  readRooCodeConfig,
+  setRooCodeModel,
+  setRooCodePermissionMode,
+  detectRooCodePermissionDialog,
   readAntigravitySessionTitle,
   readAntigravityPanelTitle,
   readAntigravityPanelSummary,

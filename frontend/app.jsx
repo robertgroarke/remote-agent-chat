@@ -25,6 +25,8 @@ const AGENT_CONFIG = {
   gemini:            { name: 'Gemini',           color: '#4285f4', abbr: 'GC', logo: '/logo-gemini-in-ag.svg' },
   continue:          { name: 'Continue',         color: '#d29922', abbr: 'CN', logo: '/logo-continue.png' },
   continue_yolo:     { name: 'Continue YOLO',    color: '#f59e0b', abbr: 'CY', logo: '/logo-continue.png' },
+  roo_code:          { name: 'Roo Code',         color: '#f97316', abbr: 'RC', logo: '/logo-continue.png' },
+  cline:             { name: 'Cline',            color: '#6366f1', abbr: 'CL', logo: '/logo-continue.png' },
   antigravity:       { name: 'Antigravity',      color: '#a855f7', abbr: 'AG', logo: '/logo-antigravity.svg' },
   antigravity_panel: { name: 'Antigravity Chat', color: '#a855f7', abbr: 'AC', logo: '/logo-antigravity.svg' },
 };
@@ -32,6 +34,14 @@ const DEFAULT_AGENT = { name: 'Agent', color: '#8b949e', abbr: 'AG' };
 
 function isContinueLikeAgentType(agentType) {
   return agentType === 'continue' || agentType === 'continue_yolo';
+}
+
+function isClineLikeAgentType(agentType) {
+  return agentType === 'cline' || agentType === 'roo_code';
+}
+
+function isRooCodeLikeAgentType(agentType) {
+  return agentType === 'roo_code';
 }
 
 function safeString(value, fallback = '') {
@@ -841,12 +851,19 @@ const PERMISSION_MODES = {
     { value: 'ask',    label: 'Ask for permissions' },
     { value: 'bypass', label: 'Bypass permissions' },
   ],
+  roo_code: [
+    { value: 'ask',    label: 'Ask for permissions' },
+  ],
+  cline: [
+    { value: 'ask',    label: 'Ask for permissions' },
+    { value: 'bypass', label: 'Bypass permissions' },
+  ],
   codex:  [],  // Codex permission mode not configurable via settings
   gemini: [],  // Gemini permission mode not configurable via settings
 };
 
 function defaultPermissionModeFor(agentType) {
-  if (agentType === 'continue_yolo') return 'ask';
+  if (agentType === 'continue_yolo' || agentType === 'roo_code' || agentType === 'cline') return 'ask';
   return 'default';
 }
 
@@ -893,7 +910,7 @@ function composerModelOptionsFor(agentType, config) {
       typeof model === 'string' ? { id: model, label: model } : model
     ));
   }
-  if (agentType === 'continue_yolo' || agentType === 'continue') return [];
+  if (agentType === 'continue_yolo' || agentType === 'continue' || agentType === 'roo_code' || agentType === 'cline') return [];
   if (agentType === 'antigravity' || agentType === 'antigravity_panel') return KNOWN_ANTIGRAVITY_MODELS;
   if (agentType === 'gemini') return KNOWN_GEMINI_MODELS;
   return KNOWN_CLAUDE_MODELS;
@@ -3740,10 +3757,10 @@ async function uploadBinaryDraft(sessionId, base64, mimeType, filename) {
               </div>
             </div>
             <div className="composer-meta">
-              {isContinueLikeAgentType(activeSessionMeta?.agent_type) && activeConfig?.mode && activeConfig.mode !== 'unknown' && (
+              {(isContinueLikeAgentType(activeSessionMeta?.agent_type) || isClineLikeAgentType(activeSessionMeta?.agent_type)) && activeConfig?.mode && activeConfig.mode !== 'unknown' && (
                 <span className="composer-hint" style={{ color: '#d29922' }}>{activeConfig.mode}</span>
               )}
-              {isContinueLikeAgentType(activeSessionMeta?.agent_type) && activeConfig?.model_id && activeConfig.model_id !== 'unknown' && (
+              {(isContinueLikeAgentType(activeSessionMeta?.agent_type) || isClineLikeAgentType(activeSessionMeta?.agent_type)) && activeConfig?.model_id && activeConfig.model_id !== 'unknown' && (
                 <span className="composer-hint" style={{ color: '#d29922' }}>{activeConfig.model_id}</span>
               )}
               {(activeSessionMeta?.agent_type === 'antigravity' || activeSessionMeta?.agent_type === 'antigravity_panel') && (
