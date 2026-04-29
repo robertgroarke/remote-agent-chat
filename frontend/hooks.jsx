@@ -72,6 +72,7 @@ export function useRelay() {
           label:     session.activity.label || 'Working',
           updatedAt: session.activity.updated_at || null,
           task_list: session.activity.task_list || null,
+          context_card: session.activity.context_card || null,
         };
       });
       if (Object.keys(next).length > 0) {
@@ -100,6 +101,11 @@ export function useRelay() {
     function requestHistory(sessionOrId) {
       const id = typeof sessionOrId === 'string' ? sessionOrId : sessionOrId?.session_id;
       if (id) send({ type: 'get_history', session: id });
+    }
+
+    function shouldPreserveTranscriptInListView(session) {
+      if (!session || typeof session !== 'object') return false;
+      return ['codex', 'codex-desktop', 'roo_code', 'cline'].includes(session.agent_type);
     }
 
     function clearSessionTranscript(sessionId) {
@@ -378,20 +384,17 @@ export function useRelay() {
 
       // ── Session list (legacy) ───────────────────────────────────────────────
       if (t === 'session_list') {
-        const prevIds = new Set(sessions.map(s => typeof s === 'string' ? s : s?.session_id).filter(Boolean));
         setSessions(msg.sessions || []);
         mergeSessionMetadataActivity(msg.sessions || []);
         mergeSessionConfigHints(msg.sessions || []);
         (msg.sessions || []).forEach(s => {
           const id = s && typeof s === 'object' ? s.session_id : s;
-          const preserveCodexDesktopHistory = s && typeof s === 'object' && s.agent_type === 'codex-desktop';
-          if (s && typeof s === 'object' && s.is_list_view && !preserveCodexDesktopHistory) {
+          const preserveListViewHistory = shouldPreserveTranscriptInListView(s);
+          if (s && typeof s === 'object' && s.is_list_view && !preserveListViewHistory) {
             if (id) setMessages(prev => {
               if (prev[id] && prev[id].length > 0) return { ...prev, [id]: [] };
               return prev;
             });
-          } else if (!prevIds.has(id) || (preserveCodexDesktopHistory && (!messages[id] || messages[id].length === 0))) {
-            requestHistory(s);
           }
         });
         if (Array.isArray(msg.workspaces)) setWorkspaces(msg.workspaces);
@@ -400,23 +403,18 @@ export function useRelay() {
 
       // ── Session snapshot (v1) ───────────────────────────────────────────────
       if (t === 'session_snapshot' || t === 'proxy_session_snapshot') {
-        const prevSessions = sessions;
-        const prevIds = new Set(prevSessions.map(s => typeof s === 'string' ? s : s?.session_id).filter(Boolean));
         setSessions(msg.sessions || []);
         mergeSessionMetadataActivity(msg.sessions || []);
         mergeSessionConfigHints(msg.sessions || []);
         (msg.sessions || []).forEach(s => {
           const id = s && typeof s === 'object' ? s.session_id : s;
-          const preserveCodexDesktopHistory = s && typeof s === 'object' && s.agent_type === 'codex-desktop';
-          if (s && typeof s === 'object' && s.is_list_view && !preserveCodexDesktopHistory) {
+          const preserveListViewHistory = shouldPreserveTranscriptInListView(s);
+          if (s && typeof s === 'object' && s.is_list_view && !preserveListViewHistory) {
             // Panel is in list/new-chat mode — clear stale messages instead of fetching
             if (id) setMessages(prev => {
               if (prev[id] && prev[id].length > 0) return { ...prev, [id]: [] };
               return prev;
             });
-          } else if (!prevIds.has(id) || (preserveCodexDesktopHistory && (!messages[id] || messages[id].length === 0))) {
-            // Request history for new sessions, and recover Codex Desktop history if it was previously blanked.
-            requestHistory(s);
           }
         });
         return;
@@ -429,15 +427,13 @@ export function useRelay() {
           mergeSessionMetadataActivity(msg.sessions);
           mergeSessionConfigHints(msg.sessions);
           msg.sessions.forEach(s => {
-            const preserveCodexDesktopHistory = s && typeof s === 'object' && s.agent_type === 'codex-desktop';
-            if (s && typeof s === 'object' && s.is_list_view && !preserveCodexDesktopHistory) {
+            const preserveListViewHistory = shouldPreserveTranscriptInListView(s);
+            if (s && typeof s === 'object' && s.is_list_view && !preserveListViewHistory) {
               const id = s.session_id;
               if (id) setMessages(prev => {
                 if (prev[id] && prev[id].length > 0) return { ...prev, [id]: [] };
                 return prev;
               });
-            } else {
-              requestHistory(s);
             }
           });
         }
@@ -486,8 +482,8 @@ export function useRelay() {
         if (!id) return;
         // Don't overwrite cleared messages for sessions in list-view mode
         const sessionObj = sessions.find(s => (typeof s === 'object' ? s.session_id : s) === id);
-        const preserveCodexDesktopHistory = sessionObj && typeof sessionObj === 'object' && sessionObj.agent_type === 'codex-desktop';
-        if (sessionObj && typeof sessionObj === 'object' && sessionObj.is_list_view && msg.messages?.length > 0 && !preserveCodexDesktopHistory) return;
+        const preserveListViewHistory = shouldPreserveTranscriptInListView(sessionObj);
+        if (sessionObj && typeof sessionObj === 'object' && sessionObj.is_list_view && msg.messages?.length > 0 && !preserveListViewHistory) return;
         setMessages(prev => ({ ...prev, [id]: msg.messages || [] }));
         return;
       }
@@ -514,6 +510,7 @@ export function useRelay() {
               label,
               updatedAt: msg.activity?.updated_at || null,
               task_list: msg.activity?.task_list || null,
+              context_card: msg.activity?.context_card || null,
             }
           : false;
         if (isThinking) {

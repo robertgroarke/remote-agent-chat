@@ -113,7 +113,9 @@ function parseToolSections(content) {
     // summaries as non-<details> DOM nodes in some versions, so nodeToText emits
     // the summary text as plain text.  Treat it the same as [N lines of output].
     // Matches both "74 lines" and "81 lines of output".
-    const bareOutputBlock = !inFence && !currentTool && line.match(/^(\d+\s+lines?(?:\s+of\s+output)?)$/i);
+    // Allow this to close a prior tool section (drop the !currentTool guard) so
+    // it's recognised even after an unterminated [Bash ...] or [Edit ...] block.
+    const bareOutputBlock = !inFence && line.match(/^(\d+\s+lines?(?:\s+of\s+output)?)$/i);
     if (match) {
       // [end] closes the current tool section and returns to markdown
       if (match[1].trim() === 'end') {
@@ -685,12 +687,10 @@ codeRenderer.code = function(code, infostring) {
   const ctxCollapseToggle = (isDiff && diffResult && diffResult.hasHunks)
     ? `<button class="diff-ctx-collapse-all" title="Collapse/expand all context lines">Context</button>`
     : '';
-  const lineCount = body.split('\n').length;
-  const collapseLimit = isPlainTextBlock ? 220 : BLOCK_COLLAPSE_LINES;
-  const collapsible = lineCount > collapseLimit;
-  const expandToggle = collapsible
-    ? `<button class="code-expand-toggle" title="Expand block">Expand</button>`
-    : '';
+  // Transcript fidelity takes precedence over compactness: render full code
+  // blocks inline instead of hiding large outputs behind an expand control.
+  const collapsible = false;
+  const expandToggle = '';
   // Wrap toggle — applies saved global preference on first render (A11-04)
   const wrapOn = typeof localStorage !== 'undefined' && localStorage.getItem('codeblock_wrap_pref') === '1';
   const wrapToggle = `<button class="code-wrap-toggle${wrapOn ? ' active' : ''}" title="${wrapOn ? 'Disable word wrap' : 'Enable word wrap'}">${wrapOn ? 'No Wrap' : 'Wrap'}</button>`;
@@ -762,11 +762,7 @@ function renderToolSection(name, text, index) {
     return !t || /^\$\s+/.test(t);
   });
   const collapsed = !hasContent;
-  // Output blocks show everything when expanded; other long sections still get the
-  // "Show all N lines" affordance so they don't blow out the viewport.
-  const showAll = !isOutputBlock && lineCount > 60;
-  const shownLines = showAll && collapsed ? 24 : lineCount;
-  const visibleText = showAll && collapsed ? lines.slice(0, shownLines).join('\n') : lines.join('\n');
+  const visibleText = lines.join('\n');
   const stats = countDiffStats(text);
   const renderAsDiff = isDiffContent(text) || (hasEditLikeToolName(name) && (stats.adds || stats.dels));
   const filepath = renderAsDiff ? (extractDiffFilename(text) || path) : path;
@@ -848,7 +844,6 @@ function renderToolSection(name, text, index) {
               if (trimmed.startsWith('```')) return `<div class="tool-body-md">${marked.parse(trimmed)}</div>`;
               return `<pre class="tool-body-pre"><code>${escapeHtml(visibleText)}</code></pre>`;
             })()}
-      ${showAll && collapsed ? `<button class="tool-show-all tool-io-more-btn" type="button" data-lines="${lineCount}">▸ ${lineCount} lines</button>` : ''}
     </div>` : ''}
   </section>`;
 }
@@ -880,37 +875,115 @@ function parseIOBlock(content) {
   return null;
 }
 
-const IO_PREVIEW_LINES = 10; // keep Claude IN/OUT blocks much closer to native fidelity
-
 function renderIOBlock(io, index) {
   const inLines  = (io.inText || '').trimEnd().split('\n');
   const outLines = (io.outText || '').trimEnd().split('\n');
 
   const renderRow = (label, lines) => {
-    const preview  = lines.slice(0, IO_PREVIEW_LINES);
-    const overflow = lines.slice(IO_PREVIEW_LINES);
-    const previewHtml = escapeHtml(preview.join('\n'));
+    const fullHtml = escapeHtml(lines.join('\n'));
     const emptyNote = lines.length === 0 || (lines.length === 1 && !lines[0].trim())
       ? '<span class="tool-io-empty">(no output)</span>' : '';
-    const rowClass = overflow.length > 0 ? 'tool-io-row has-overflow' : 'tool-io-row';
-    if (!emptyNote && overflow.length > 0) {
-      // Wrap preview and full content in sibling divs — toggled on expand/collapse
-      return `<div class="${rowClass}">
-        <span class="tool-io-label">${label}</span>
-        <div class="tool-io-content">
-          <div class="tool-io-preview"><code class="tool-io-code">${previewHtml}</code><button class="tool-io-more-btn" type="button" data-full="${escapeAttr(lines.join('\n'))}">▸ ${overflow.length} more line${overflow.length === 1 ? '' : 's'}</button></div>
-          <div class="tool-io-full" hidden><code class="tool-io-full-code">${escapeHtml(lines.join('\n'))}</code><button class="tool-io-collapse-btn" type="button">▴ collapse</button></div>
-        </div>
-      </div>`;
-    }
-    return `<div class="${rowClass}">
+    return `<div class="tool-io-row">
       <span class="tool-io-label">${label}</span>
-      <div class="tool-io-content">${emptyNote || `<code class="tool-io-code">${previewHtml}</code>`}</div>
+      <div class="tool-io-content">${emptyNote || `<code class="tool-io-code">${fullHtml}</code>`}</div>
     </div>`;
   };
 
   const outEmpty = outLines.length === 0 || (outLines.length === 1 && !outLines[0].trim());
   return `<div class="tool-io-block" data-tool-index="${index}">${renderRow('IN', inLines)}${outEmpty ? '' : renderRow('OUT', outLines)}</div>`;
+}
+
+function parseFileChangesBlock(content) {
+  const text = String(content || '').replace(/\r\n/g, '\n').trim();
+  if (!text) return null;
+  const lines = text.split('\n').map(line => line.trim()).filter(Boolean);
+  const headerIndex = lines.findIndex(line => /^\d+\s+file(?:\(s\)|s?)\s+changed/i.test(line));
+  if (headerIndex === -1) return null;
+
+  const header = lines[headerIndex];
+  const countMatch = header.match(/^(\d+)\s+file(?:\(s\)|s?)\s+changed(?:\s+in\s+this\s+conversation)?/i);
+  if (!countMatch) return null;
+
+  const totalsFromLine = (line) => {
+    const match = String(line || '').match(/\+(\d+)\s+(?:Â·|·|-|\s)\s*-?(\d+)/);
+    return match ? { adds: Number(match[1]) || 0, dels: Number(match[2]) || 0 } : null;
+  };
+
+  let totals = totalsFromLine(header);
+  let pendingAdds = null;
+  const entries = [];
+  let pendingPath = '';
+  for (const line of lines.slice(headerIndex + 1)) {
+    if (!totals) totals = totalsFromLine(line);
+    const addsOnly = line.match(/^\+(\d+)$/);
+    if (addsOnly) {
+      pendingAdds = Number(addsOnly[1]) || 0;
+      continue;
+    }
+    const delsOnly = line.match(/^-(\d+)$/);
+    if (delsOnly && pendingAdds != null && !totals) {
+      totals = { adds: pendingAdds, dels: Number(delsOnly[1]) || 0 };
+      pendingAdds = null;
+      continue;
+    }
+    const statsOnly = line.match(/^\+(\d+)\s+(?:Â·|·|-|\s)\s*-?(\d+)$/);
+    if (statsOnly && pendingPath) {
+      entries.push({
+        filepath: pendingPath,
+        adds: Number(statsOnly[1]) || 0,
+        dels: Number(statsOnly[2]) || 0,
+      });
+      pendingPath = '';
+      continue;
+    }
+    const entry = line.match(/^(.+?)\s+\+(\d+)\s+(?:Â·|·|-|\s)\s*-?(\d+)(?:\s+.*)?$/);
+    if (!entry) {
+      if (looksLikePath(line)) pendingPath = line;
+      continue;
+    }
+    const filepath = entry[1].trim();
+    if (!filepath || /^\+?\d+$/.test(filepath)) continue;
+    entries.push({
+      filepath,
+      adds: Number(entry[2]) || 0,
+      dels: Number(entry[3]) || 0,
+    });
+    pendingPath = '';
+  }
+
+  const adds = totals?.adds ?? entries.reduce((sum, entry) => sum + entry.adds, 0);
+  const dels = totals?.dels ?? entries.reduce((sum, entry) => sum + entry.dels, 0);
+  return {
+    count: Number(countMatch[1]) || entries.length,
+    title: header.replace(/\s+\+\d+.*$/, '').trim(),
+    adds,
+    dels,
+    entries,
+  };
+}
+
+function renderFileChangesBlock(content, index) {
+  const parsed = parseFileChangesBlock(content);
+  if (!parsed) return null;
+  const entryHtml = parsed.entries.map(entry => {
+    const path = escapeHtml(entry.filepath);
+    return `<div class="file-changes-item">
+      <span class="file-changes-path">${path}</span>
+      <span class="file-changes-stats"><span class="diff-stat-add">+${entry.adds}</span><span class="diff-stat-del">-${entry.dels}</span></span>
+    </div>`;
+  }).join('');
+  return `<section class="file-changes-section collapsed" data-file-changes-index="${index}">
+    <button class="file-changes-toggle" type="button" aria-expanded="false">
+      <span class="file-changes-chevron">â–¸</span>
+      <span class="file-changes-icon">â‡„</span>
+      <span class="file-changes-title">${escapeHtml(parsed.title || `${parsed.count} file(s) changed`)}</span>
+      <span class="file-changes-summary">
+        <span class="diff-stat-add">+${parsed.adds}</span>
+        <span class="diff-stat-del">-${parsed.dels}</span>
+      </span>
+    </button>
+    ${parsed.entries.length ? `<div class="file-changes-list" hidden>${entryHtml}</div>` : ''}
+  </section>`;
 }
 
 function renderStructuredContent(content) {
@@ -920,6 +993,8 @@ function renderStructuredContent(content) {
       // Detect compact IN/OUT block before falling through to full markdown rendering
       const io = parseIOBlock(chunk.content);
       if (io) return renderIOBlock(io, index);
+      const fileChanges = renderFileChangesBlock(chunk.content, index);
+      if (fileChanges) return fileChanges;
       // Skip empty/whitespace-only markdown chunks
       if (!(chunk.content || '').trim()) return '';
       return marked.parse(chunk.content || '');
@@ -1126,7 +1201,7 @@ function _extractLastOpenBlock(text) {
   return { lang, code };
 }
 
-function MarkdownContent({ content, monospace = false, onOpenPath = null }) {
+function MarkdownContent({ content, monospace = false, onOpenPath = null, autoExpandLongCodeBlocks = false }) {
   const ref          = React.useRef(null);
   const lastContent  = React.useRef(null);  // A11-11: skip re-render when content is identical
 
@@ -1159,26 +1234,6 @@ function MarkdownContent({ content, monospace = false, onOpenPath = null }) {
           codeEl.innerHTML = addLineNumbers(highlighted);
           // Update raw data attr so the copy button gets fresh content
           codeEl.dataset.raw = openBlock.code;
-          // Add collapsible class if the block just grew large enough
-          const lineCount = openBlock.code.split('\n').length;
-          if (lineCount > BLOCK_COLLAPSE_LINES && !lastBlock.classList.contains('code-collapsible')) {
-            lastBlock.classList.add('code-collapsible');
-            if (!lastBlock.querySelector('.code-expand-toggle')) {
-              const btn = document.createElement('button');
-              btn.className = 'code-expand-toggle';
-              btn.title = 'Expand block';
-              btn.textContent = 'Expand';
-              btn.onclick = () => {
-                const expanded = lastBlock.classList.toggle('code-expanded');
-                btn.textContent = expanded ? 'Collapse' : 'Expand';
-                btn.title = expanded ? 'Collapse block' : 'Expand block';
-                if (!expanded) lastBlock.scrollIntoView({ behavior: 'smooth', block: 'nearest' });
-              };
-              const header = lastBlock.querySelector('.code-header');
-              const copyBtn = header?.querySelector('.code-copy');
-              if (header && copyBtn) header.insertBefore(btn, copyBtn);
-            }
-          }
           pre.scrollTop = scrollTop;
           lastContent.current = content;
           return; // skip full re-render
@@ -1189,10 +1244,13 @@ function MarkdownContent({ content, monospace = false, onOpenPath = null }) {
     // A11-11: Snapshot interactive state before full re-render so we can restore it.
     // This preserves tool-section collapsed/expanded state and code-block scroll
     // positions when the same message's content is updated (e.g. streaming append).
-    const snap = { toolCollapsed: {}, codeScroll: [], ctxHidden: {}, ctxCollapseActive: {} };
+    const snap = { toolCollapsed: {}, fileChangesCollapsed: {}, codeScroll: [], ctxHidden: {}, ctxCollapseActive: {} };
     if (lastContent.current !== null) {
       ref.current.querySelectorAll('.tool-section[data-tool-index]').forEach(s => {
         snap.toolCollapsed[s.dataset.toolIndex] = s.classList.contains('collapsed');
+      });
+      ref.current.querySelectorAll('.file-changes-section[data-file-changes-index]').forEach(s => {
+        snap.fileChangesCollapsed[s.dataset.fileChangesIndex] = s.classList.contains('collapsed');
       });
       ref.current.querySelectorAll('.code-block pre').forEach((pre, i) => {
         snap.codeScroll[i] = pre.scrollTop;
@@ -1228,6 +1286,23 @@ function MarkdownContent({ content, monospace = false, onOpenPath = null }) {
         if (body)    body.hidden = want;
         if (chevron) chevron.textContent = want ? '▸' : '▾';
         if (btn)     btn.setAttribute('aria-expanded', want ? 'false' : 'true');
+      }
+    });
+
+    // Restore Roo/Cline file-change visual collapse states
+    ref.current.querySelectorAll('.file-changes-section[data-file-changes-index]').forEach(s => {
+      const idx = s.dataset.fileChangesIndex;
+      if (!(idx in snap.fileChangesCollapsed)) return;
+      const want = snap.fileChangesCollapsed[idx];
+      const has = s.classList.contains('collapsed');
+      if (want !== has) {
+        s.classList.toggle('collapsed', want);
+        const list = s.querySelector('.file-changes-list');
+        const chevron = s.querySelector('.file-changes-chevron');
+        const btn = s.querySelector('.file-changes-toggle');
+        if (list) list.hidden = want;
+        if (chevron) chevron.textContent = want ? 'â–¸' : 'â–¾';
+        if (btn) btn.setAttribute('aria-expanded', want ? 'false' : 'true');
       }
     });
 
@@ -1275,6 +1350,18 @@ function MarkdownContent({ content, monospace = false, onOpenPath = null }) {
         const collapsed = section.classList.toggle('collapsed');
         if (body) body.hidden = collapsed;
         if (chevron) chevron.textContent = collapsed ? '▸' : '▾';
+        btn.setAttribute('aria-expanded', collapsed ? 'false' : 'true');
+      };
+    });
+
+    ref.current.querySelectorAll('.file-changes-toggle').forEach(btn => {
+      btn.onclick = () => {
+        const section = btn.closest('.file-changes-section');
+        const list = section?.querySelector('.file-changes-list');
+        const chevron = btn.querySelector('.file-changes-chevron');
+        const collapsed = section.classList.toggle('collapsed');
+        if (list) list.hidden = collapsed;
+        if (chevron) chevron.textContent = collapsed ? 'â–¸' : 'â–¾';
         btn.setAttribute('aria-expanded', collapsed ? 'false' : 'true');
       };
     });
@@ -1363,6 +1450,16 @@ function MarkdownContent({ content, monospace = false, onOpenPath = null }) {
         }
       };
     });
+    if (autoExpandLongCodeBlocks) {
+      ref.current.querySelectorAll('.code-collapsible').forEach(block => {
+        block.classList.add('code-expanded');
+        const btn = block.querySelector('.code-expand-toggle');
+        if (btn) {
+          btn.textContent = 'Collapse';
+          btn.title = 'Collapse block';
+        }
+      });
+    }
     ref.current.querySelectorAll('.code-wrap-toggle').forEach(btn => {
       btn.onclick = () => {
         const wrapped = localStorage.getItem('codeblock_wrap_pref') !== '1';
@@ -1509,7 +1606,7 @@ function MarkdownContent({ content, monospace = false, onOpenPath = null }) {
       }
     }
     return () => { if (cleanupObserver) cleanupObserver(); };
-  }, [content, onOpenPath]);
+  }, [content, onOpenPath, autoExpandLongCodeBlocks]);
   return <div className={`message-body${monospace ? ' monospace-body' : ''}`} ref={ref} />;
 }
 

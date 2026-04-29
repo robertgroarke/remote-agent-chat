@@ -1,6 +1,6 @@
 'use strict';
 
-const CACHE_NAME = 'agent-chat-v39';
+const CACHE_NAME = 'agent-chat-v40';
 
 const SHELL_ASSETS = [
   '/',
@@ -13,6 +13,7 @@ const SHELL_ASSETS = [
   '/icon.png',
   '/logo-antigravity.svg',
   '/logo-codex.svg',
+  '/logo-cline.svg',
   '/logo-claude-in-ag.svg',
   '/logo-codex-in-ag.svg',
   '/logo-gemini-in-ag.svg',

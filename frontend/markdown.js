@@ -893,6 +893,99 @@ function renderIOBlock(io, index) {
   return `<div class="tool-io-block" data-tool-index="${index}">${renderRow('IN', inLines)}${outEmpty ? '' : renderRow('OUT', outLines)}</div>`;
 }
 
+function parseFileChangesBlock(content) {
+  const text = String(content || '').replace(/\r\n/g, '\n').trim();
+  if (!text) return null;
+  const lines = text.split('\n').map(line => line.trim()).filter(Boolean);
+  const headerIndex = lines.findIndex(line => /^\d+\s+file(?:\(s\)|s?)\s+changed/i.test(line));
+  if (headerIndex === -1) return null;
+
+  const header = lines[headerIndex];
+  const countMatch = header.match(/^(\d+)\s+file(?:\(s\)|s?)\s+changed(?:\s+in\s+this\s+conversation)?/i);
+  if (!countMatch) return null;
+
+  const totalsFromLine = (line) => {
+    const match = String(line || '').match(/\+(\d+)\s+(?:Â·|·|-|\s)\s*-?(\d+)/);
+    return match ? { adds: Number(match[1]) || 0, dels: Number(match[2]) || 0 } : null;
+  };
+
+  let totals = totalsFromLine(header);
+  let pendingAdds = null;
+  const entries = [];
+  let pendingPath = '';
+  for (const line of lines.slice(headerIndex + 1)) {
+    if (!totals) totals = totalsFromLine(line);
+    const addsOnly = line.match(/^\+(\d+)$/);
+    if (addsOnly) {
+      pendingAdds = Number(addsOnly[1]) || 0;
+      continue;
+    }
+    const delsOnly = line.match(/^-(\d+)$/);
+    if (delsOnly && pendingAdds != null && !totals) {
+      totals = { adds: pendingAdds, dels: Number(delsOnly[1]) || 0 };
+      pendingAdds = null;
+      continue;
+    }
+    const statsOnly = line.match(/^\+(\d+)\s+(?:Â·|·|-|\s)\s*-?(\d+)$/);
+    if (statsOnly && pendingPath) {
+      entries.push({
+        filepath: pendingPath,
+        adds: Number(statsOnly[1]) || 0,
+        dels: Number(statsOnly[2]) || 0,
+      });
+      pendingPath = '';
+      continue;
+    }
+    const entry = line.match(/^(.+?)\s+\+(\d+)\s+(?:Â·|·|-|\s)\s*-?(\d+)(?:\s+.*)?$/);
+    if (!entry) {
+      if (looksLikePath(line)) pendingPath = line;
+      continue;
+    }
+    const filepath = entry[1].trim();
+    if (!filepath || /^\+?\d+$/.test(filepath)) continue;
+    entries.push({
+      filepath,
+      adds: Number(entry[2]) || 0,
+      dels: Number(entry[3]) || 0,
+    });
+    pendingPath = '';
+  }
+
+  const adds = totals?.adds ?? entries.reduce((sum, entry) => sum + entry.adds, 0);
+  const dels = totals?.dels ?? entries.reduce((sum, entry) => sum + entry.dels, 0);
+  return {
+    count: Number(countMatch[1]) || entries.length,
+    title: header.replace(/\s+\+\d+.*$/, '').trim(),
+    adds,
+    dels,
+    entries,
+  };
+}
+
+function renderFileChangesBlock(content, index) {
+  const parsed = parseFileChangesBlock(content);
+  if (!parsed) return null;
+  const entryHtml = parsed.entries.map(entry => {
+    const path = escapeHtml(entry.filepath);
+    return `<div class="file-changes-item">
+      <span class="file-changes-path">${path}</span>
+      <span class="file-changes-stats"><span class="diff-stat-add">+${entry.adds}</span><span class="diff-stat-del">-${entry.dels}</span></span>
+    </div>`;
+  }).join('');
+  return `<section class="file-changes-section collapsed" data-file-changes-index="${index}">
+    <button class="file-changes-toggle" type="button" aria-expanded="false">
+      <span class="file-changes-chevron">â–¸</span>
+      <span class="file-changes-icon">â‡„</span>
+      <span class="file-changes-title">${escapeHtml(parsed.title || `${parsed.count} file(s) changed`)}</span>
+      <span class="file-changes-summary">
+        <span class="diff-stat-add">+${parsed.adds}</span>
+        <span class="diff-stat-del">-${parsed.dels}</span>
+      </span>
+    </button>
+    ${parsed.entries.length ? `<div class="file-changes-list" hidden>${entryHtml}</div>` : ''}
+  </section>`;
+}
+
 function renderStructuredContent(content) {
   const html = parseToolSections(content).map((chunk, index) => {
     try {
@@ -900,6 +993,8 @@ function renderStructuredContent(content) {
       // Detect compact IN/OUT block before falling through to full markdown rendering
       const io = parseIOBlock(chunk.content);
       if (io) return renderIOBlock(io, index);
+      const fileChanges = renderFileChangesBlock(chunk.content, index);
+      if (fileChanges) return fileChanges;
       // Skip empty/whitespace-only markdown chunks
       if (!(chunk.content || '').trim()) return '';
       return marked.parse(chunk.content || '');
@@ -1149,10 +1244,13 @@ function MarkdownContent({ content, monospace = false, onOpenPath = null, autoEx
     // A11-11: Snapshot interactive state before full re-render so we can restore it.
     // This preserves tool-section collapsed/expanded state and code-block scroll
     // positions when the same message's content is updated (e.g. streaming append).
-    const snap = { toolCollapsed: {}, codeScroll: [], ctxHidden: {}, ctxCollapseActive: {} };
+    const snap = { toolCollapsed: {}, fileChangesCollapsed: {}, codeScroll: [], ctxHidden: {}, ctxCollapseActive: {} };
     if (lastContent.current !== null) {
       ref.current.querySelectorAll('.tool-section[data-tool-index]').forEach(s => {
         snap.toolCollapsed[s.dataset.toolIndex] = s.classList.contains('collapsed');
+      });
+      ref.current.querySelectorAll('.file-changes-section[data-file-changes-index]').forEach(s => {
+        snap.fileChangesCollapsed[s.dataset.fileChangesIndex] = s.classList.contains('collapsed');
       });
       ref.current.querySelectorAll('.code-block pre').forEach((pre, i) => {
         snap.codeScroll[i] = pre.scrollTop;
@@ -1188,6 +1286,23 @@ function MarkdownContent({ content, monospace = false, onOpenPath = null, autoEx
         if (body)    body.hidden = want;
         if (chevron) chevron.textContent = want ? '▸' : '▾';
         if (btn)     btn.setAttribute('aria-expanded', want ? 'false' : 'true');
+      }
+    });
+
+    // Restore Roo/Cline file-change visual collapse states
+    ref.current.querySelectorAll('.file-changes-section[data-file-changes-index]').forEach(s => {
+      const idx = s.dataset.fileChangesIndex;
+      if (!(idx in snap.fileChangesCollapsed)) return;
+      const want = snap.fileChangesCollapsed[idx];
+      const has = s.classList.contains('collapsed');
+      if (want !== has) {
+        s.classList.toggle('collapsed', want);
+        const list = s.querySelector('.file-changes-list');
+        const chevron = s.querySelector('.file-changes-chevron');
+        const btn = s.querySelector('.file-changes-toggle');
+        if (list) list.hidden = want;
+        if (chevron) chevron.textContent = want ? 'â–¸' : 'â–¾';
+        if (btn) btn.setAttribute('aria-expanded', want ? 'false' : 'true');
       }
     });
 
@@ -1235,6 +1350,18 @@ function MarkdownContent({ content, monospace = false, onOpenPath = null, autoEx
         const collapsed = section.classList.toggle('collapsed');
         if (body) body.hidden = collapsed;
         if (chevron) chevron.textContent = collapsed ? '▸' : '▾';
+        btn.setAttribute('aria-expanded', collapsed ? 'false' : 'true');
+      };
+    });
+
+    ref.current.querySelectorAll('.file-changes-toggle').forEach(btn => {
+      btn.onclick = () => {
+        const section = btn.closest('.file-changes-section');
+        const list = section?.querySelector('.file-changes-list');
+        const chevron = btn.querySelector('.file-changes-chevron');
+        const collapsed = section.classList.toggle('collapsed');
+        if (list) list.hidden = collapsed;
+        if (chevron) chevron.textContent = collapsed ? 'â–¸' : 'â–¾';
         btn.setAttribute('aria-expanded', collapsed ? 'false' : 'true');
       };
     });

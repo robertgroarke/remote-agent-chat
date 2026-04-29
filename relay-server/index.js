@@ -42,6 +42,7 @@ const HEARTBEAT_INTERVAL_MS   = 30_000;
 const HEARTBEAT_TIMEOUT_MS    = 10_000;
 const HEALTH_DEGRADE_AFTER_MS = 120_000;  // inactivity threshold → degraded
 const LAUNCH_TIMEOUT_MS       = 30_000;   // max wait for proxy to confirm a new session
+const LARGE_HISTORY_BROADCAST_LIMIT = 250;
 
 // ── Structured logger ─────────────────────────────────────────────────────────
 
@@ -222,6 +223,11 @@ function historiesMatch(existingRows, incomingRows) {
     }
   }
   return true;
+}
+
+function shouldBroadcastHistoryResync(existingRows, incomingRows) {
+  if (incomingRows.length <= LARGE_HISTORY_BROADCAST_LIMIT) return true;
+  return false;
 }
 
 // ── Prepared statements ───────────────────────────────────────────────────────
@@ -1690,7 +1696,10 @@ function handleProxyConnection(ws, req) {
         });
         resync(messages);
         log('info', 'history', `Resynced ${existing.length}→${messages.length}`, { session: id });
-        broadcastToBrowsers({ type: 'history', session: id, messages: stmtGetHistory.all(id) });
+        const shouldBroadcast = shouldBroadcastHistoryResync(existing, messages);
+        if (shouldBroadcast) {
+          broadcastToBrowsers({ type: 'history', session: id, messages: stmtGetHistory.all(id) });
+        }
       } else if (existing.length === 0 && messages.length > 0) {
         db.transaction((msgs) => {
           msgs.forEach(m => stmtInsert.run(id, m.role, m.content, null, 'delivered', nextSeq(id)));

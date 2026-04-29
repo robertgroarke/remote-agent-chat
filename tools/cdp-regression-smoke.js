@@ -174,30 +174,36 @@ function findFirstMatchingTarget(targets, patterns) {
 async function findBestRooCodeTarget(targets) {
   const candidates = targets.filter((t) => t.type === 'iframe' && PATTERNS.roo_code.some((pattern) => pattern.test((t.url || '') + ' ' + (t.title || ''))));
   if (candidates.length === 0) return null;
-  // Roo Code uses a nested iframe architecture: the outer iframe (index.html)
-  // contains a script that loads an inner iframe (fake.html) where the actual
-  // React UI lives.  The inner iframe is the one we need to talk to.
-  const inner = candidates.find((t) => (t.url || '').includes('fake.html'));
-  if (inner) return inner;
   if (candidates.length === 1) return candidates[0];
-  // Fallback: prefer targets with non-empty textContent
+  let best = null;
+  let bestScore = -1;
   for (const t of candidates) {
     try {
       const client = await CDP({ port: PORTS.antigravity, target: t.id });
       try {
         await client.Runtime.enable();
         const res = await client.Runtime.evaluate({
-          expression: `(function() { return (document.body ? (document.body.textContent || '').length : 0); })()`,
+          expression: `(function() {
+            const d = document.getElementById('active-frame')?.contentDocument || document;
+            const text = d.body ? (d.body.innerText || d.body.textContent || '') : '';
+            const rows = d.querySelectorAll('[data-testid="virtuoso-item-list"] > div').length;
+            const hasChat = !!d.querySelector('[data-testid="chat-view"]');
+            const onboarding = /Help Improve Roo Code|Roo is a whole AI dev team/i.test(text);
+            return { score: (hasChat ? 1000 : 0) + rows * 100 + Math.min(text.length, 5000) - (onboarding ? 2000 : 0), rows, len: text.length };
+          })()`,
           returnByValue: true,
         });
-        const len = res.result?.value || 0;
-        if (len > 100) return t;
+        const score = Number(res.result?.value?.score || 0);
+        if (score > bestScore) {
+          bestScore = score;
+          best = t;
+        }
       } finally {
         await client.close();
       }
     } catch {}
   }
-  return candidates[0];
+  return best || candidates[0];
 }
 
 async function runCodexDesktopSuite(targets, reporter) {
@@ -507,6 +513,16 @@ async function runIframeSurfaceSuite(targets, reporter, surface) {
     }
 
     if (surface === 'roo_code') {
+      const promptView = await selectors.readRooCodePromptView(Runtime);
+      reporter.add({
+        surface,
+        test_id: 'roo_code.prompt-view.read',
+        status: promptView ? STATUS_PASS : STATUS_SKIP,
+        detail: promptView ? 'Read Roo Code prompt view: ' + truncate(promptView.label || promptView.title || '') : 'Roo Code prompt view not available',
+        native_evidence: promptView,
+        investigation_hint: 'Check readRooCodePromptView in selectors.js',
+      });
+
       const dialog = await selectors.detectPermissionDialog(Runtime, 'roo_code');
       reporter.add({
         surface,

@@ -21,6 +21,7 @@ export function useRelay() {
     const [launchStates,      setLaunchStates]      = useState({});   // requestId -> { status:'launching'|'failed', agentType, error? }
     const [justLaunched,      setJustLaunched]      = useState(null); // session_id of most recently launched session (for auto-select)
     const [permissionPrompts, setPermissionPrompts] = useState({});   // session_id -> prompt object (one active prompt per session)
+    const [errorPrompts,      setErrorPrompts]      = useState({});   // session_id -> error prompt object
     const [agentConfigs,      setAgentConfigs]      = useState({});   // session_id -> agent_config object { model_id, permission_mode, file_access_scope, capabilities, ... }
     const [workspaces,        setWorkspaces]        = useState([]);   // [{title, path}] — open Antigravity windows for the launch dropdown
     const [chatLists,         setChatLists]         = useState({});   // sessionId -> [{ id, title, active }] — Codex chat/conversation lists
@@ -29,6 +30,7 @@ export function useRelay() {
     const [fileChanges,       setFileChanges]       = useState({});   // sessionId -> [{ file?, content, type }] — Codex file changes/diff
     const [branchLists,       setBranchLists]       = useState({});   // sessionId -> { branches: string[], current: string }
     const [skillLists,        setSkillLists]        = useState({});   // sessionId -> { installed: [...], recommended: [...] }
+    const [automationViews,   setAutomationViews]   = useState({});   // sessionId -> Codex Desktop native automation pane snapshot
     const [controlResults,    setControlResults]    = useState({});   // requestId -> latest agent_control_result
     const [directoryListings, setDirectoryListings] = useState({});  // sessionId -> { path, entries }
     const [fileContents,      setFileContents]      = useState({});  // sessionId:path -> { path, content, truncated }
@@ -36,6 +38,7 @@ export function useRelay() {
     const thinkingTimers   = useRef({});
     const wsRef            = useRef(null);
     const activeSessionRef = useRef(null);
+    const handleRelayMessageRef = useRef(null);
 
     const send = useCallback((msg) => {
       if (wsRef.current?.readyState === WebSocket.OPEN) {
@@ -54,7 +57,7 @@ export function useRelay() {
       ws.onmessage = (e) => {
         let msg;
         try { msg = JSON.parse(e.data); } catch { return; }
-        handleRelayMessage(msg);
+        handleRelayMessageRef.current(msg);
       };
     }, [send]); // eslint-disable-line react-hooks/exhaustive-deps
 
@@ -69,6 +72,7 @@ export function useRelay() {
           label:     session.activity.label || 'Working',
           updatedAt: session.activity.updated_at || null,
           task_list: session.activity.task_list || null,
+          context_card: session.activity.context_card || null,
         };
       });
       if (Object.keys(next).length > 0) {
@@ -76,9 +80,41 @@ export function useRelay() {
       }
     }
 
+    function mergeSessionConfigHints(sessionList) {
+      const next = {};
+      (sessionList || []).forEach(session => {
+        if (!session || typeof session !== 'object' || !session.session_id) return;
+        if (typeof session.auto_approve_permissions !== 'boolean') return;
+        next[session.session_id] = { auto_approve_permissions: session.auto_approve_permissions };
+      });
+      if (Object.keys(next).length > 0) {
+        setAgentConfigs(prev => {
+          const merged = { ...prev };
+          Object.entries(next).forEach(([sid, hints]) => {
+            merged[sid] = { ...(merged[sid] || {}), ...hints };
+          });
+          return merged;
+        });
+      }
+    }
+
     function requestHistory(sessionOrId) {
       const id = typeof sessionOrId === 'string' ? sessionOrId : sessionOrId?.session_id;
       if (id) send({ type: 'get_history', session: id });
+    }
+
+    function shouldPreserveTranscriptInListView(session) {
+      if (!session || typeof session !== 'object') return false;
+      return ['codex', 'codex-desktop', 'roo_code', 'cline'].includes(session.agent_type);
+    }
+
+    function clearSessionTranscript(sessionId) {
+      if (!sessionId) return;
+      setMessages(prev => ({ ...prev, [sessionId]: [] }));
+      setQueuedMessages(prev => ({ ...prev, [sessionId]: [] }));
+      setThinking(prev => ({ ...prev, [sessionId]: false }));
+      setThinkingContent(prev => ({ ...prev, [sessionId]: '' }));
+      setActivities(prev => ({ ...prev, [sessionId]: false }));
     }
 
     // Responds to a permission prompt.
@@ -88,6 +124,14 @@ export function useRelay() {
         ? { ...prev, [sessionId]: { ...prev[sessionId], submitting_choice_id: choiceId, request_id: requestId, error: null } }
         : prev);
       send({ type: 'permission_response', session_id: sessionId, prompt_id: promptId, choice_id: choiceId, request_id: requestId });
+    }
+
+    function respondToErrorPrompt(sessionId, promptId, actionId) {
+      const requestId = `errprompt-${Date.now()}-${Math.random().toString(36).slice(2, 7)}`;
+      setErrorPrompts(prev => prev[sessionId]
+        ? { ...prev, [sessionId]: { ...prev[sessionId], submitting_action_id: actionId, request_id: requestId, error: null } }
+        : prev);
+      send({ type: 'error_prompt_action', session_id: sessionId, prompt_id: promptId, action_id: actionId, request_id: requestId });
     }
 
     function interruptSession(sessionId) {
@@ -123,20 +167,31 @@ export function useRelay() {
       return requestId;
     }
 
+    function setAutoApprovePermissions(sessionId, enabled) {
+      const requestId = `autoperm-${Date.now()}-${Math.random().toString(36).slice(2, 7)}`;
+      setAgentConfigs(prev => {
+        const existing = prev[sessionId] || {};
+        return { ...prev, [sessionId]: { ...existing, auto_approve_permissions: !!enabled } };
+      });
+      send({ type: 'agent_set_auto_approve_permissions', session_id: sessionId, enabled: !!enabled, request_id: requestId });
+      return requestId;
+    }
+
     function setAntigravityMode(sessionId, mode) {
       const requestId = `mode-${Date.now()}-${Math.random().toString(36).slice(2, 7)}`;
       send({ type: 'agent_set_mode', session_id: sessionId, mode, request_id: requestId });
       return requestId;
     }
 
-    function setCodexConfig(sessionId, { model_id, effort, access_mode, workspace_mode }) {
+    function setCodexConfig(sessionId, { model_id, effort, speed, access_mode, workspace_mode }) {
       const requestId = `codex-cfg-${Date.now()}-${Math.random().toString(36).slice(2, 7)}`;
-      send({ type: 'set_codex_config', session_id: sessionId, model_id, effort, access_mode, workspace_mode, request_id: requestId });
+      send({ type: 'set_codex_config', session_id: sessionId, model_id, effort, speed, access_mode, workspace_mode, request_id: requestId });
       return requestId;
     }
 
     function newThread(sessionId) {
       const requestId = `new-thread-${Date.now()}-${Math.random().toString(36).slice(2, 7)}`;
+      clearSessionTranscript(sessionId);
       send({ type: 'new_thread', session_id: sessionId, request_id: requestId });
       return requestId;
     }
@@ -173,6 +228,7 @@ export function useRelay() {
 
     function switchThread(sessionId, threadId) {
       const requestId = `swthread-${Date.now()}-${Math.random().toString(36).slice(2, 7)}`;
+      clearSessionTranscript(sessionId);
       send({ type: 'switch_thread', session_id: sessionId, thread_id: threadId, request_id: requestId });
       return requestId;
     }
@@ -204,6 +260,12 @@ export function useRelay() {
     function requestSkillList(sessionId) {
       const requestId = `skills-${Date.now()}-${Math.random().toString(36).slice(2, 7)}`;
       send({ type: 'skill_list', session_id: sessionId, request_id: requestId });
+      return requestId;
+    }
+
+    function showCodexAutomation(sessionId) {
+      const requestId = `automation-${Date.now()}-${Math.random().toString(36).slice(2, 7)}`;
+      send({ type: 'automation_view_action', session_id: sessionId, request_id: requestId });
       return requestId;
     }
 
@@ -323,16 +385,16 @@ export function useRelay() {
       // ── Session list (legacy) ───────────────────────────────────────────────
       if (t === 'session_list') {
         setSessions(msg.sessions || []);
+        mergeSessionMetadataActivity(msg.sessions || []);
+        mergeSessionConfigHints(msg.sessions || []);
         (msg.sessions || []).forEach(s => {
-          const preserveCodexDesktopHistory = s && typeof s === 'object' && s.agent_type === 'codex-desktop';
-          if (s && typeof s === 'object' && s.is_list_view && !preserveCodexDesktopHistory) {
-            const id = s.session_id;
+          const id = s && typeof s === 'object' ? s.session_id : s;
+          const preserveListViewHistory = shouldPreserveTranscriptInListView(s);
+          if (s && typeof s === 'object' && s.is_list_view && !preserveListViewHistory) {
             if (id) setMessages(prev => {
               if (prev[id] && prev[id].length > 0) return { ...prev, [id]: [] };
               return prev;
             });
-          } else {
-            requestHistory(s);
           }
         });
         if (Array.isArray(msg.workspaces)) setWorkspaces(msg.workspaces);
@@ -341,22 +403,18 @@ export function useRelay() {
 
       // ── Session snapshot (v1) ───────────────────────────────────────────────
       if (t === 'session_snapshot' || t === 'proxy_session_snapshot') {
-        const prevSessions = sessions;
-        const prevIds = new Set(prevSessions.map(s => typeof s === 'string' ? s : s?.session_id).filter(Boolean));
         setSessions(msg.sessions || []);
         mergeSessionMetadataActivity(msg.sessions || []);
+        mergeSessionConfigHints(msg.sessions || []);
         (msg.sessions || []).forEach(s => {
           const id = s && typeof s === 'object' ? s.session_id : s;
-          const preserveCodexDesktopHistory = s && typeof s === 'object' && s.agent_type === 'codex-desktop';
-          if (s && typeof s === 'object' && s.is_list_view && !preserveCodexDesktopHistory) {
+          const preserveListViewHistory = shouldPreserveTranscriptInListView(s);
+          if (s && typeof s === 'object' && s.is_list_view && !preserveListViewHistory) {
             // Panel is in list/new-chat mode — clear stale messages instead of fetching
             if (id) setMessages(prev => {
               if (prev[id] && prev[id].length > 0) return { ...prev, [id]: [] };
               return prev;
             });
-          } else if (!prevIds.has(id) || (preserveCodexDesktopHistory && (!messages[id] || messages[id].length === 0))) {
-            // Request history for new sessions, and recover Codex Desktop history if it was previously blanked.
-            requestHistory(s);
           }
         });
         return;
@@ -367,16 +425,15 @@ export function useRelay() {
         if (msg.sessions && msg.sessions.length > 0) {
           setSessions(msg.sessions);
           mergeSessionMetadataActivity(msg.sessions);
+          mergeSessionConfigHints(msg.sessions);
           msg.sessions.forEach(s => {
-            const preserveCodexDesktopHistory = s && typeof s === 'object' && s.agent_type === 'codex-desktop';
-            if (s && typeof s === 'object' && s.is_list_view && !preserveCodexDesktopHistory) {
+            const preserveListViewHistory = shouldPreserveTranscriptInListView(s);
+            if (s && typeof s === 'object' && s.is_list_view && !preserveListViewHistory) {
               const id = s.session_id;
               if (id) setMessages(prev => {
                 if (prev[id] && prev[id].length > 0) return { ...prev, [id]: [] };
                 return prev;
               });
-            } else {
-              requestHistory(s);
             }
           });
         }
@@ -393,13 +450,21 @@ export function useRelay() {
           setAgentConfigs(prev => ({ ...prev, ...msg.agent_configs }));
         }
         // Restore open permission prompts on reconnect
-        if (msg.open_prompts && msg.open_prompts.length > 0) {
+        {
           const restored = {};
-          msg.open_prompts.forEach(p => {
+          (msg.open_prompts || []).forEach(p => {
             const sid = p.session_id || p.session;
             if (sid) restored[sid] = { ...p, received_at: Date.now() };
           });
           setPermissionPrompts(restored);
+        }
+        {
+          const restored = {};
+          (msg.open_error_prompts || []).forEach(p => {
+            const sid = p.session_id || p.session;
+            if (sid) restored[sid] = { ...p, received_at: Date.now() };
+          });
+          setErrorPrompts(restored);
         }
         return;
       }
@@ -417,8 +482,8 @@ export function useRelay() {
         if (!id) return;
         // Don't overwrite cleared messages for sessions in list-view mode
         const sessionObj = sessions.find(s => (typeof s === 'object' ? s.session_id : s) === id);
-        const preserveCodexDesktopHistory = sessionObj && typeof sessionObj === 'object' && sessionObj.agent_type === 'codex-desktop';
-        if (sessionObj && typeof sessionObj === 'object' && sessionObj.is_list_view && msg.messages?.length > 0 && !preserveCodexDesktopHistory) return;
+        const preserveListViewHistory = shouldPreserveTranscriptInListView(sessionObj);
+        if (sessionObj && typeof sessionObj === 'object' && sessionObj.is_list_view && msg.messages?.length > 0 && !preserveListViewHistory) return;
         setMessages(prev => ({ ...prev, [id]: msg.messages || [] }));
         return;
       }
@@ -445,6 +510,7 @@ export function useRelay() {
               label,
               updatedAt: msg.activity?.updated_at || null,
               task_list: msg.activity?.task_list || null,
+              context_card: msg.activity?.context_card || null,
             }
           : false;
         if (isThinking) {
@@ -479,6 +545,18 @@ export function useRelay() {
         return;
       }
 
+      if (t === 'session_error_prompt') {
+        const sid = msg.session_id || msg.session;
+        if (sid) setErrorPrompts(prev => ({ ...prev, [sid]: { ...msg, received_at: Date.now() } }));
+        return;
+      }
+
+      if (t === 'session_error_prompt_cleared') {
+        const sid = msg.session_id || msg.session;
+        if (sid) setErrorPrompts(prev => { const { [sid]: _, ...rest } = prev; return rest; });
+        return;
+      }
+
       // ── Chat list (Epic 9) ──────────────────────────────────────────────────
       if (t === 'chat_list') {
         const sid = msg.session_id || msg.session;
@@ -504,6 +582,12 @@ export function useRelay() {
       if (t === 'skill_list') {
         const sid = msg.session_id || msg.session;
         if (sid) setSkillLists(prev => ({ ...prev, [sid]: { installed: msg.installed || [], recommended: msg.recommended || [] } }));
+        return;
+      }
+
+      if (t === 'codex_automation_view') {
+        const sid = msg.session_id || msg.session;
+        if (sid) setAutomationViews(prev => ({ ...prev, [sid]: msg.view || null }));
         return;
       }
 
@@ -559,9 +643,10 @@ export function useRelay() {
           setControlResults(prev => ({ ...prev, [msg.request_id]: { ...msg, received_at: Date.now() } }));
         }
         if (sid && msg.result === 'ok' && (msg.command === 'new_thread' || msg.command === 'switch_thread')) {
-          setMessages(prev => ({ ...prev, [sid]: [] }));
-          setQueuedMessages(prev => ({ ...prev, [sid]: [] }));
+          clearSessionTranscript(sid);
           requestHistory(sid);
+          setTimeout(() => requestHistory(sid), 300);
+          setTimeout(() => requestHistory(sid), 900);
         }
         if (msg.command === 'permission_response' && sid) {
           if (msg.result === 'ok') {
@@ -571,6 +656,11 @@ export function useRelay() {
               ? { ...prev, [sid]: { ...prev[sid], submitting_choice_id: null, error: msg.error?.message || 'Permission response failed' } }
               : prev);
           }
+        }
+        if (msg.command === 'error_prompt_action' && sid && msg.result === 'failed') {
+          setErrorPrompts(prev => prev[sid]
+            ? { ...prev, [sid]: { ...prev[sid], submitting_action_id: null, error: msg.error?.message || 'Error prompt action failed' } }
+            : prev);
         }
         return;
       }
@@ -780,7 +870,12 @@ export function useRelay() {
       }
     }
 
-    return { sessions, messages, connected, unread, setUnread, thinking, thinkingContent, activities, health, deliveryStates, launchStates, justLaunched, setJustLaunched, permissionPrompts, respondToPrompt, interruptSession, agentConfigs, requestAgentConfig, setAgentModel, setAgentPermissionMode, setAntigravityMode, setCodexConfig, newThread, openPanel, requestChatList, switchChat, newChat, chatLists, requestThreadList, switchThread, threadLists, switchWorkspace, requestTerminalOutput, terminalOutputs, requestFileChanges, fileChanges, sendAttachment, send, sendToSession, steerMessage, discardQueuedMessage, editQueuedMessage, queuedMessages, launchSession, resumeSession, closeSession, activeSessionRef, workspaces, branchLists, requestBranchList, switchBranch, createBranch, skillLists, requestSkillList, controlResults, directoryListings, requestDirectoryListing, fileContents, requestFileContent };
+    // Keep ref in sync so the WebSocket onmessage handler always calls
+    // the latest render's handleRelayMessage (avoids stale closure issues
+    // where `sessions` / `messages` would be frozen at initial render values).
+    handleRelayMessageRef.current = handleRelayMessage;
+
+    return { sessions, messages, connected, unread, setUnread, thinking, thinkingContent, activities, health, deliveryStates, launchStates, justLaunched, setJustLaunched, permissionPrompts, respondToPrompt, errorPrompts, respondToErrorPrompt, interruptSession, agentConfigs, requestAgentConfig, setAgentModel, setAgentPermissionMode, setAutoApprovePermissions, setAntigravityMode, setCodexConfig, newThread, openPanel, requestChatList, switchChat, newChat, chatLists, requestThreadList, switchThread, threadLists, switchWorkspace, requestTerminalOutput, terminalOutputs, requestFileChanges, fileChanges, sendAttachment, send, sendToSession, steerMessage, discardQueuedMessage, editQueuedMessage, queuedMessages, launchSession, resumeSession, closeSession, activeSessionRef, workspaces, branchLists, requestBranchList, switchBranch, createBranch, skillLists, requestSkillList, automationViews, showCodexAutomation, controlResults, directoryListings, requestDirectoryListing, fileContents, requestFileContent, requestHistory };
   }
 
 // (removed window.useRelay — now an ES module export)

@@ -2577,72 +2577,83 @@ async function readContinueConfig(Runtime) {
 // Selectors confirmed via live CDP DOM inspection (2026-04-26).
 //
 // Message list: [data-testid="virtuoso-item-list"] > div (virtualized rows)
-// Each row text starts with a prefix indicating the role:
-//   "You said"          → user
-//   "Roo said"          → assistant
-//   "Roo wants"         → assistant (tool intent)
-//   "Roo wants to edit" → assistant (file edit)
-//   "Roo wants to read" → assistant (file read)
-//   "API Request"       → assistant (tool call)
-//   "Checkpoint"        → assistant (checkpoint)
-//   "Running(PID:...)"  → assistant (command execution)
-//   "Updated the to-do list" → assistant (status)
+// DOM structure discovered via CDP inspection:
+//   - Outer iframe (index.html) contains inner iframe via <iframe id="active-frame">
+//   - Inner iframe loads fake.html which renders the actual Roo Code UI
+//   - Messages live in [data-testid="virtuoso-item-list"] > div items
+//   - Each item has child div with class px-[15px] py-[10px] pr-[6px]
+//   - User prompts are NOT virtuoso items — they appear in a div BEFORE
+//     the [data-testid="virtuoso-scroller"] inside [data-testid="chat-view"]
+//   - All virtuoso items are assistant/tool actions
 
-const ROO_CODE_READ_EXPR = `
-  function norm(text) {
-    return String(text || '').replace(/\\s+/g, ' ').trim();
-  }
+// Expression to extract the user's task prompt from the chat-view header.
+// This is always in the DOM (not virtualized).
+const ROO_CODE_PROMPT_EXPR = `
   function cleanText(text) {
-    return norm(text).replace(/\\u200B/g, '').replace(/\\u00A0/g, ' ');
+    return String(text || '').replace(/\\u200B/g, '').replace(/\\u00A0/g, ' ').trim();
   }
-
-  var msgs = [];
-  var virtuoso = d.querySelector('${ROO_CODE_PRIMARY.virtuoso}');
-  var items = virtuoso ? Array.from(virtuoso.children) : [];
-
-  for (var i = 0; i < items.length; i++) {
-    var item = items[i];
-    var rawText = cleanText(item.innerText || item.textContent || '');
-    if (!rawText) continue;
-
-    // Determine role from text prefix
-    var role = null;
-    var content = rawText;
-
-    if (rawText.indexOf('You said') === 0) {
-      role = 'user';
-      content = rawText.substring('You said'.length).trim();
-    } else if (rawText.indexOf('Roo said') === 0) {
-      role = 'assistant';
-      content = rawText.substring('Roo said'.length).trim();
-    } else if (rawText.indexOf('Roo wants') === 0) {
-      role = 'assistant';
-      // Keep full text including "Roo wants" for context
-    } else if (rawText.indexOf('API Request') === 0) {
-      role = 'assistant';
-      // Keep full text
-    } else if (rawText.indexOf('Checkpoint') === 0) {
-      role = 'assistant';
-      // Keep full text
-    } else if (/^Running\\(PID:/.test(rawText)) {
-      role = 'assistant';
-      // Keep full text
-    } else if (rawText.indexOf('Updated the to-do list') === 0) {
-      role = 'assistant';
-      // Keep full text
+  var chatView = d.querySelector('[data-testid="chat-view"]');
+  if (!chatView) return JSON.stringify(null);
+  var scroller = chatView.querySelector('[data-testid="virtuoso-scroller"]');
+  var allChildren = Array.from(chatView.children);
+  var scrollerIdx = scroller ? allChildren.indexOf(scroller) : -1;
+  var prompt = null;
+  for (var k = 0; k < (scrollerIdx > 0 ? scrollerIdx : allChildren.length); k++) {
+    var el = allChildren[k];
+    var txt = cleanText(el.innerText || '');
+    if (txt && txt.length > 40 &&
+        txt.indexOf('Help Improve Roo Code') === -1 &&
+        txt.indexOf('Roo is a whole AI dev team') === -1 &&
+        txt.indexOf('\u00d7') !== 0) {
+      prompt = txt;
+      break;
     }
+  }
+  return JSON.stringify(prompt);
+`;
 
-    if (!role) continue;
+// Classify visible DOM text from a Roo/Cline row into a message object.
+function classifyRooCodeItem(rawText) {
+  rawText = String(rawText || '').trim();
+  if (!rawText) return null;
+  if (rawText.indexOf('API Request') === 0) return null;
+  if (rawText.indexOf('Checkpoint') === 0) return null;
+  if (rawText.indexOf('Context Condensed') === 0) return null;
+  if (rawText.indexOf('Auto-approved commands') !== -1) return null;
 
-    // Skip duplicate consecutive messages with same content
-    var last = msgs[msgs.length - 1];
-    if (last && last.role === role && last.content === content) continue;
+  let content = rawText;
+  let type = 'unknown';
 
-    msgs.push({ role: role, content: content });
+  if (rawText.indexOf('Roo said') === 0) {
+    type = 'assistant_text';
+    content = rawText.substring('Roo said'.length).replace(/^[\n\s]+/, '');
+  } else if (rawText.indexOf('Cline says') === 0 || rawText.indexOf('Cline said') === 0) {
+    type = 'assistant_text';
+    content = rawText.replace(/^Cline\s+(?:says|said)\s*/i, '').replace(/^[\n\s]+/, '');
+  } else if (rawText.indexOf('Running') === 0) {
+    type = 'running';
+  } else if (/^(Roo|Cline) wants/.test(rawText)) {
+    type = 'tool_intent';
+  } else if (/\+\d+\s*(?:·|-)\s*-\d+/.test(rawText)) {
+    type = 'file_edit';
+  } else if (/^Task Completed/i.test(rawText) || rawText.indexOf('\u2705') === 0) {
+    type = 'task_completed';
+  } else if (/^Updated the to-do list/i.test(rawText)) {
+    type = 'todo_update';
   }
 
-  return JSON.stringify(msgs);
-`;
+  return { role: 'assistant', content, type };
+}
+
+// Simple string hash for deduplication.
+function simpleHash(str) {
+  let hash = 0;
+  for (let i = 0; i < str.length; i++) {
+    hash = ((hash << 5) - hash) + str.charCodeAt(i);
+    hash |= 0;
+  }
+  return hash;
+}
 
 async function evalInRooCodeFrame(Runtime, code) {
   const result = await Runtime.evaluate({
@@ -2666,8 +2677,182 @@ async function evalInRooCodeFrame(Runtime, code) {
 
 async function readRooCodeMessages(Runtime, sessionId) {
   try {
-    const raw = await evalInRooCodeFrame(Runtime, ROO_CODE_READ_EXPR);
-    if (raw !== null) { resetReadFailures(sessionId); return raw; }
+    const raw = await evalInRooCodeFrame(Runtime, `
+      function cleanText(text) {
+        return String(text || '').replace(/\\u200B/g, '').replace(/\\u00A0/g, ' ').trim();
+      }
+      function compact(text) {
+        return cleanText(text).replace(/\\n{3,}/g, '\\n\\n');
+      }
+      function tryParseJson(text) {
+        try { return JSON.parse(String(text || '')); } catch (_) { return null; }
+      }
+      var agentName = /\\bCline\\b/i.test((d.body || d.documentElement || {}).innerText || '') ? 'Cline' : 'Roo';
+      function formatToolJson(payload) {
+        if (!payload || typeof payload !== 'object') return '';
+        var tool = payload.tool || payload.name || payload.type || 'tool';
+        if (tool === 'updateTodoList' && Array.isArray(payload.todos)) {
+          var lines = ['Updated the to-do list'];
+          payload.todos.forEach(function(todo) {
+            var status = String(todo.status || '').toLowerCase();
+            var box = status === 'completed' ? '[x]' : status === 'in_progress' ? '[~]' : '[ ]';
+            lines.push('- ' + box + ' ' + cleanText(todo.content || todo.text || todo.id || 'task'));
+          });
+          return lines.join('\\n');
+        }
+        if (tool === 'readFile' || tool === 'read_file') {
+          return agentName + ' wants to read this file\\n' + compact([payload.path, payload.reason].filter(Boolean).join(' '));
+        }
+        if (tool === 'writeToFile' || tool === 'write_to_file' || tool === 'editedExistingFile' || tool === 'applyDiff') {
+          var path = payload.path || payload.file || payload.filepath || '';
+          return agentName + ' wants to edit this file' + (path ? '\\n' + path : '');
+        }
+        if (tool === 'executeCommand' || tool === 'execute_command' || tool === 'command') {
+          return agentName + ' wants to execute this command\\n' + compact(payload.command || payload.cmd || payload.text || '');
+        }
+        return String(tool) + '\\n~~~json\\n' + JSON.stringify(payload, null, 2) + '\\n~~~';
+      }
+      function messageToTranscript(message) {
+        if (!message || typeof message !== 'object') return null;
+        var kind = message.type || '';
+        var text = compact(message.text || message.content || message.message || '');
+        if (kind === 'say') {
+          var say = message.say || '';
+          if (say === 'api_req_started' || say === 'api_req_finished' || say === 'checkpoint_created' || say === 'checkpoint_diff') return null;
+          if (say === 'completion_result') return text ? { role: 'assistant', content: 'Task Completed\\n\\n' + text, ts: message.ts || null, type: 'task_completed' } : null;
+          if (say === 'text' || say === 'reasoning' || say === 'condense_context') return text ? { role: 'assistant', content: text, ts: message.ts || null, type: 'assistant_text' } : null;
+          if (say === 'tool') {
+            var toolPayload = tryParseJson(text);
+            var formattedTool = toolPayload ? formatToolJson(toolPayload) : text;
+            return formattedTool ? { role: 'assistant', content: formattedTool, ts: message.ts || null, type: 'tool' } : null;
+          }
+          return text ? { role: 'assistant', content: text, ts: message.ts || null, type: say || 'say' } : null;
+        }
+        if (kind === 'ask') {
+          var ask = message.ask || '';
+          if (ask === 'completion_result') return text ? { role: 'assistant', content: 'Task Completed\\n\\n' + text, ts: message.ts || null, type: 'task_completed' } : null;
+          if (ask === 'command') return text ? { role: 'assistant', content: 'Running\\n' + text, ts: message.ts || null, type: 'running' } : null;
+          if (ask === 'tool') {
+            var askPayload = tryParseJson(text);
+            var formattedAsk = askPayload ? formatToolJson(askPayload) : text;
+            return formattedAsk ? { role: 'assistant', content: formattedAsk, ts: message.ts || null, type: 'tool_intent' } : null;
+          }
+          if (ask === 'followup' || ask === 'question') return text ? { role: 'assistant', content: text, ts: message.ts || null, type: 'question' } : null;
+          return text ? { role: 'assistant', content: text, ts: message.ts || null, type: ask || 'ask' } : null;
+        }
+        return text ? { role: 'assistant', content: text, ts: message.ts || null, type: kind || 'unknown' } : null;
+      }
+      function collectReactMessages(node, out, seen) {
+        if (!node || out.length > 5000) return;
+        if (typeof node !== 'object') return;
+        if (seen.has(node)) return;
+        seen.add(node);
+        if ((node.type === 'say' || node.type === 'ask') && (node.say || node.ask || node.text || node.content)) {
+          out.push(node);
+          return;
+        }
+        if (node.message && typeof node.message === 'object') collectReactMessages(node.message, out, seen);
+        if (Array.isArray(node.groupedMessages)) node.groupedMessages.forEach(function(item) { collectReactMessages(item, out, seen); });
+        if (Array.isArray(node)) node.forEach(function(item) { collectReactMessages(item, out, seen); });
+        if (node.props) collectReactMessages(node.props, out, seen);
+        if (node.children) collectReactMessages(node.children, out, seen);
+      }
+      function extractPrompt() {
+        var chatView = d.querySelector('[data-testid="chat-view"]') || d.body;
+        if (!chatView) return null;
+        var scroller = chatView.querySelector('[data-testid="virtuoso-scroller"]');
+        var children = Array.from(chatView.children || []);
+        var scrollerIdx = scroller ? children.indexOf(scroller) : -1;
+        var limit = scrollerIdx > 0 ? scrollerIdx : children.length;
+        for (var k = 0; k < limit; k++) {
+          var txt = compact(children[k].innerText || '');
+          if (!txt || txt.length < 20) continue;
+          if (/You need to enable JavaScript|Help Improve Roo Code|Roo is a whole AI dev team|What can I do for you\\?|RECENT\\s+View All/i.test(txt)) continue;
+          if (/^\\(@ to add context|^Worktree:/i.test(txt)) continue;
+          return txt;
+        }
+        return null;
+      }
+      function extractBottomFrames() {
+        var result = [];
+        var chatView = d.querySelector('[data-testid="chat-view"]') || d.body;
+        if (!chatView) return result;
+        var scroller = chatView.querySelector('[data-testid="virtuoso-scroller"]');
+        var children = Array.from(chatView.children || []);
+        var scrollerIdx = scroller ? children.indexOf(scroller) : -1;
+        for (var k = Math.max(scrollerIdx + 1, 0); k < children.length; k++) {
+          var txt = compact(children[k].innerText || '');
+          if (!txt) continue;
+          if (/^Start New Task$/i.test(txt)) continue;
+          if (/^\\(@ to add context/i.test(txt)) continue;
+          if (/^(\\d+\\s+file\\(s\\) changed|Task Completed)/i.test(txt)) result.push(txt);
+        }
+        return result;
+      }
+
+      var virtuoso = d.querySelector('[data-testid="virtuoso-item-list"]');
+      var msgs = [];
+      var prompt = extractPrompt();
+      if (prompt) msgs.push({ role: 'user', content: prompt });
+
+      var reactMessages = [];
+      var seen = new Set();
+      if (virtuoso) {
+        Array.from(virtuoso.children || []).forEach(function(row) {
+          var fiberKey = Object.keys(row).find(function(k) {
+            return k.indexOf('__reactFiber') === 0 || k.indexOf('__reactInternalInstance') === 0;
+          });
+          if (fiberKey) collectReactMessages(row[fiberKey], reactMessages, seen);
+        });
+        var rootFiberKey = Object.keys(virtuoso).find(function(k) {
+          return k.indexOf('__reactFiber') === 0 || k.indexOf('__reactInternalInstance') === 0;
+        });
+        if (rootFiberKey) {
+          var cur = virtuoso[rootFiberKey];
+          for (var walk = 0; walk < 60 && cur; walk++) {
+            collectReactMessages(cur.memoizedProps, reactMessages, seen);
+            collectReactMessages(cur.memoizedState, reactMessages, seen);
+            cur = cur.return;
+          }
+        }
+      }
+
+      var bySig = new Set();
+      reactMessages
+        .map(messageToTranscript)
+        .filter(Boolean)
+        .sort(function(a, b) { return (a.ts || 0) - (b.ts || 0); })
+        .forEach(function(msg) {
+          var sig = (msg.ts || '') + '|' + msg.content;
+          if (bySig.has(sig)) return;
+          bySig.add(sig);
+          msgs.push(msg);
+        });
+
+      if (reactMessages.length === 0 && virtuoso) {
+        Array.from(virtuoso.children || []).forEach(function(el) {
+          var rawText = compact(el.innerText || '');
+          if (!rawText) return;
+          if (/^API Request\\b/i.test(rawText) || /^Checkpoint\\b/i.test(rawText)) return;
+          msgs.push({ role: 'assistant', content: rawText });
+        });
+      }
+
+      extractBottomFrames().forEach(function(content) {
+        var sig = 'bottom|' + content;
+        if (bySig.has(sig)) return;
+        if (msgs.some(function(m) { return m.content === content; })) return;
+        bySig.add(sig);
+        msgs.push({ role: 'assistant', content: content, type: /^Task Completed/i.test(content) ? 'task_completed' : 'file_changes' });
+      });
+      return JSON.stringify(msgs);
+    `);
+
+    const msgs = raw ? JSON.parse(raw) : [];
+
+    resetReadFailures(sessionId);
+    return JSON.stringify(msgs);
+
   } catch (e) {
     console.warn(`[${sessionId}] [sel] Roo Code read error: ${e.message}`);
   }
@@ -2709,6 +2894,248 @@ async function detectRooCodeThinking(Runtime) {
     try { return JSON.parse(raw); } catch { return { thinking: false, label: '' }; }
   } catch {
     return { thinking: false, label: '' };
+  }
+}
+
+async function readRooCodeTaskList(Runtime) {
+  try {
+    const raw = await evalInRooCodeFrame(Runtime, `
+      function cleanText(text) {
+        return String(text || '').replace(/\\u200B/g, '').replace(/\\u00A0/g, ' ').trim();
+      }
+      function tryParseJson(text) {
+        try { return JSON.parse(String(text || '')); } catch (_) { return null; }
+      }
+      function collectMessages(node, out, seen) {
+        if (!node || out.length > 3000 || typeof node !== 'object') return;
+        if (seen.has(node)) return;
+        seen.add(node);
+        if ((node.type === 'say' || node.type === 'ask') && (node.say || node.ask || node.text)) {
+          out.push(node);
+          return;
+        }
+        if (node.message && typeof node.message === 'object') collectMessages(node.message, out, seen);
+        if (Array.isArray(node.groupedMessages)) node.groupedMessages.forEach(function(item) { collectMessages(item, out, seen); });
+        if (Array.isArray(node)) node.forEach(function(item) { collectMessages(item, out, seen); });
+        if (node.props) collectMessages(node.props, out, seen);
+        if (node.children) collectMessages(node.children, out, seen);
+      }
+      var virtuoso = d.querySelector('[data-testid="virtuoso-item-list"]');
+      var messages = [];
+      var seen = new Set();
+      if (virtuoso) {
+        Array.from(virtuoso.children || []).forEach(function(row) {
+          var fiberKey = Object.keys(row).find(function(k) {
+            return k.indexOf('__reactFiber') === 0 || k.indexOf('__reactInternalInstance') === 0;
+          });
+          if (fiberKey) collectMessages(row[fiberKey], messages, seen);
+        });
+        var rootFiberKey = Object.keys(virtuoso).find(function(k) {
+          return k.indexOf('__reactFiber') === 0 || k.indexOf('__reactInternalInstance') === 0;
+        });
+        if (rootFiberKey) {
+          var cur = virtuoso[rootFiberKey];
+          for (var walk = 0; walk < 60 && cur; walk++) {
+            collectMessages(cur.memoizedProps, messages, seen);
+            collectMessages(cur.memoizedState, messages, seen);
+            cur = cur.return;
+          }
+        }
+      }
+      var latest = null;
+      messages.forEach(function(message) {
+        var payload = tryParseJson(message.text || '');
+        if (payload && payload.tool === 'updateTodoList' && Array.isArray(payload.todos)) {
+          latest = payload.todos;
+        }
+      });
+      if (!latest) {
+        var rows = Array.from((virtuoso && virtuoso.children) || []);
+        for (var i = rows.length - 1; i >= 0; i--) {
+          var txt = cleanText(rows[i].innerText || '');
+          if (!/^Updated the to-do list/i.test(txt)) continue;
+          latest = txt.split(/\\n+/).slice(1).map(function(line) {
+            return { content: line.replace(/^[-*]\\s*(?:\\[[ x~]\\]\\s*)?/i, '').trim(), status: /\\[x\\]/i.test(line) ? 'completed' : /\\[~\\]/.test(line) ? 'in_progress' : 'pending' };
+          }).filter(function(item) { return item.content; });
+          break;
+        }
+      }
+      if (!latest || !latest.length) return JSON.stringify(null);
+      var tasks = latest.map(function(todo, idx) {
+        var status = String(todo.status || '').toLowerCase();
+        return {
+          id: todo.id || String(idx),
+          text: cleanText(todo.content || todo.text || todo.id || 'task'),
+          state: status === 'completed' ? 'completed' : status === 'in_progress' ? 'in_progress' : 'pending',
+        };
+      }).filter(function(task) { return task.text; });
+      if (!tasks.length) return JSON.stringify(null);
+      return JSON.stringify({
+        completed: tasks.filter(function(task) { return task.state === 'completed'; }).length,
+        total: tasks.length,
+        tasks: tasks,
+      });
+    `);
+    return raw ? JSON.parse(raw) : null;
+  } catch {
+    return null;
+  }
+}
+
+async function readClineMode(Runtime) {
+  const cfg = await readRooCodeConfig(Runtime);
+  if (!cfg || !cfg.mode || cfg.mode === 'unknown') return null;
+  return { label: cfg.mode, value: String(cfg.mode).toLowerCase() };
+}
+
+async function readClineContextUsage(Runtime) {
+  try {
+    const raw = await evalInRooCodeFrame(Runtime, `
+      function norm(t) { return String(t || '').replace(/\\u00A0/g, ' ').replace(/\\s+/g, ' ').trim(); }
+      function cleanLine(t) { return norm(t).replace(/^[\\u25be\\u25b8\\u2715\\-\\s]+/, '').trim(); }
+      function isVisible(el) {
+        if (!el || !el.getBoundingClientRect) return false;
+        var rect = el.getBoundingClientRect();
+        if (rect.width <= 0 || rect.height <= 0) return false;
+        var style = window.getComputedStyle ? window.getComputedStyle(el) : null;
+        if (style && (style.display === 'none' || style.visibility === 'hidden' || style.opacity === '0')) return false;
+        return true;
+      }
+      function toNumber(token) {
+        var m = String(token || '').trim().match(/(\\d+(?:\\.\\d+)?)([kKmM]?)/);
+        if (!m) return null;
+        var n = parseFloat(m[1]);
+        var unit = m[2].toLowerCase();
+        if (unit === 'k') n *= 1000;
+        if (unit === 'm') n *= 1000000;
+        return Math.round(n);
+      }
+      var usageRe = /(\\d+(?:\\.\\d+)?\\s*[kKmM])\\s*\\/\\s*(\\d+(?:\\.\\d+)?\\s*[kKmM])/;
+      var unitTokenRe = /\\d+(?:\\.\\d+)?\\s*[kKmM]/g;
+      var candidates = Array.from(d.querySelectorAll('div, section, article'))
+        .filter(function(el) {
+          if (!isVisible(el)) return false;
+          var txt = el.innerText || el.textContent || '';
+          if (!usageRe.test(txt) && (txt.match(unitTokenRe) || []).length < 2) return false;
+          var meaningfulLines = String(txt || '').split(/\\n+/).map(cleanLine).filter(function(line) {
+            if (!line) return false;
+            if (/^[\\d.]+\\s*[kKmM]?\\s*\\/\\s*[\\d.]+\\s*[kKmM]?/.test(line)) return false;
+            if (/^\\d+(?:\\.\\d+)?\\s*[kKmM]$/.test(line)) return false;
+            return /[A-Za-z]/.test(line);
+          });
+          if (meaningfulLines.length === 0) return false;
+          if (txt.length > 5000) return false;
+          var rect = el.getBoundingClientRect();
+          return rect.bottom > 0 && rect.top < Math.max(window.innerHeight * 0.55, 420);
+        })
+        .map(function(el) {
+          var rect = el.getBoundingClientRect();
+          var txt = String(el.innerText || el.textContent || '');
+          return { el: el, text: txt, top: rect.top, area: rect.width * rect.height, len: txt.length };
+        })
+        .sort(function(a, b) {
+          if (Math.abs(a.top - b.top) > 2) return a.top - b.top;
+          return a.len - b.len;
+        });
+      var source = candidates.length ? candidates[0].text : ((d.body || d.documentElement || {}).innerText || (d.body || d.documentElement || {}).textContent || '');
+      var match = source.match(usageRe);
+      var usedToken = match ? match[1] : null;
+      var totalToken = match ? match[2] : null;
+      if (!match) {
+        var tokens = source.match(unitTokenRe) || [];
+        if (tokens.length >= 2) {
+          usedToken = tokens[0];
+          totalToken = tokens[tokens.length - 1];
+        }
+      }
+      if (!usedToken || !totalToken) {
+        var allText = norm((d.body || d.documentElement || {}).innerText || (d.body || d.documentElement || {}).textContent || '');
+        var fallback = allText.match(/context.{0,80}?(\\d+(?:\\.\\d+)?\\s*\\/\\s*\\d+(?:\\.\\d+)?)/i);
+        if (fallback) {
+          var fallbackParts = fallback[1].split('/');
+          usedToken = fallbackParts[0];
+          totalToken = fallbackParts[1];
+        }
+        source = allText;
+      }
+      if (!usedToken || !totalToken) return JSON.stringify(null);
+      var lines = String(source || '')
+        .split(/\\n+/)
+        .map(cleanLine)
+        .filter(function(line) {
+          if (!line) return false;
+          if (/^[\\d.]+\\s*[kKmM]?\\s*\\/\\s*[\\d.]+\\s*[kKmM]?/.test(line)) return false;
+          if (/^\\d+(?:\\.\\d+)?\\s*[kKmM]$/.test(line)) return false;
+          if (/^(Cline|Auto-approve|YOLO mode|Disable it|Plan|Act)$/i.test(line)) return false;
+          return true;
+        });
+      var usageLabel = norm(usedToken + ' / ' + totalToken);
+      var used = toNumber(usedToken);
+      var total = toNumber(totalToken);
+      return JSON.stringify({
+        label: usageLabel,
+        title: lines[0] || null,
+        subtitle: lines[1] || null,
+        detail: lines[2] || null,
+        used: used,
+        total: total,
+        percent_used: used != null && total ? Math.round((used / total) * 100) : null,
+      });
+    `);
+    return raw ? JSON.parse(raw) : null;
+  } catch {
+    return null;
+  }
+}
+
+async function readRooCodePromptView(Runtime) {
+  try {
+    const raw = await evalInRooCodeFrame(Runtime, `
+      function norm(t) { return String(t || '').replace(/\\u00A0/g, ' ').replace(/\\s+/g, ' ').trim(); }
+      function isVisible(el) {
+        if (!el || !el.getBoundingClientRect) return false;
+        var rect = el.getBoundingClientRect();
+        if (rect.width <= 0 || rect.height <= 0) return false;
+        var style = window.getComputedStyle ? window.getComputedStyle(el) : null;
+        if (style && (style.display === 'none' || style.visibility === 'hidden' || style.opacity === '0')) return false;
+        return true;
+      }
+      var chatView = d.querySelector('[data-testid="chat-view"]') || d.body;
+      if (!chatView) return JSON.stringify(null);
+
+      var scroller = chatView.querySelector('[data-testid="virtuoso-scroller"]');
+      var children = Array.from(chatView.children || []);
+      var scrollerIdx = scroller ? children.indexOf(scroller) : -1;
+      var limit = scrollerIdx > 0 ? scrollerIdx : Math.min(children.length, 4);
+      var card = null;
+      for (var i = 0; i < limit; i++) {
+        var child = children[i];
+        if (!isVisible(child)) continue;
+        var text = norm(child.innerText || child.textContent || '');
+        if (!text || text.length < 20) continue;
+        if (/Help Improve Roo Code|Roo is a whole AI dev team|Check our docs to get started|Worktree:/i.test(text)) continue;
+        card = child;
+        break;
+      }
+      if (!card) return JSON.stringify(null);
+
+      var rawText = norm(card.innerText || card.textContent || '');
+      var percentMatch = rawText.match(/(\\d+(?:\\.\\d+)?)\\s*%/);
+      if (!percentMatch) return JSON.stringify(null);
+      var percent = percentMatch ? Number(percentMatch[1]) : null;
+      var title = rawText.slice(0, percentMatch.index).trim();
+      if (!title) return JSON.stringify(null);
+      return JSON.stringify({
+        label: percentMatch ? percentMatch[0].replace(/\\s+/g, '') : '',
+        title: title,
+        subtitle: null,
+        detail: null,
+        percent_used: Number.isFinite(percent) ? Math.round(percent) : null,
+      });
+    `);
+    return raw ? JSON.parse(raw) : null;
+  } catch {
+    return null;
   }
 }
 
@@ -2763,48 +3190,140 @@ async function readRooCodeConfig(Runtime) {
   try {
     const raw = await evalInRooCodeFrame(Runtime, `
       function norm(t) {
-        return String(t || '').replace(/\\s+/g, ' ').trim();
+        return String(t || '').replace(/\\u00A0/g, ' ').replace(/\\s+/g, ' ').trim();
       }
-      function gatherText() {
-        var root = d.body || d.documentElement;
-        if (!root) return '';
-        return norm(root.textContent || '');
+      function firstLine(t) {
+        return norm(String(t || '').split(/\\n|\\r/)[0] || t);
       }
-      var bodyText = gatherText();
+      function cleanLabel(t) {
+        return firstLine(t).replace(/^[^A-Za-z0-9]+/, '').replace(/\\s+/g, ' ').trim();
+      }
+      function option(id, label) { return { id: id, label: label || id }; }
+      function visible(el) {
+        if (!el || !el.getBoundingClientRect) return false;
+        var r = el.getBoundingClientRect();
+        if (r.width <= 0 || r.height <= 0) return false;
+        var s = window.getComputedStyle ? window.getComputedStyle(el) : null;
+        return !s || (s.display !== 'none' && s.visibility !== 'hidden' && s.opacity !== '0');
+      }
 
-      // Mode detection from body text
-      var modeMatch = bodyText.match(/[🏗️💻🔍🐛]\\s*(Architect|Code|Ask|Debug)/i);
-      var mode = modeMatch ? modeMatch[0] : 'unknown';
+      var model = 'unknown';
+      var modelEl = d.querySelector('[data-testid="dropdown-trigger"]');
+      var hasRooProfileDropdown = !!(modelEl && visible(modelEl));
+      var hasClineModeSwitch = !!d.querySelector('[data-testid="mode-switch"]');
+      var hasRooModeSelector = !!d.querySelector('[data-testid="mode-selector-trigger"]');
+      if (hasRooProfileDropdown) model = firstLine(modelEl.innerText || modelEl.textContent || '');
+      if (!model || model === 'unknown') {
+        var apiLink = Array.from(d.querySelectorAll('a, [role="button"], button')).find(function(el) {
+          var title = norm(el.getAttribute('title') || '');
+          var txt = norm(el.innerText || el.textContent || '');
+          return /Open API Settings/i.test(title) || /^(?:anthropic|openai|ollama|openrouter|gemini|lmstudio|vscode-lm):/i.test(txt);
+        });
+        if (apiLink) model = norm(apiLink.innerText || apiLink.textContent || apiLink.getAttribute('title') || '');
+      }
+      if (!model || model === 'unknown') {
+        var bodyTextForModel = norm((d.body || d.documentElement || {}).textContent || '');
+        var fm = bodyTextForModel.match(/((?:ollama|anthropic|openai|openrouter|gemini|lmstudio|vscode-lm):[a-z0-9_.:\\/-]+|(?:kimi|claude|gpt|gemini|deepseek|llama|qwen|glm)[a-z0-9_.:\\/-]*)/i);
+        if (fm) model = norm(fm[1]);
+      }
 
-      // Model detection
-      var modelMatch = bodyText.match(/(claude|gpt|gemini|o3|o4|sonnet|opus|haiku|deepseek|llama)[-\\s\\w]*/i);
-      var model = modelMatch ? norm(modelMatch[0]) : 'unknown';
+      var mode = 'unknown';
+      var modeEl = d.querySelector('[data-testid="mode-selector-trigger"], [data-testid="mode-switch"]');
+      if (modeEl && visible(modeEl)) {
+        var activeSwitch = Array.from(modeEl.querySelectorAll('[aria-checked="true"], [aria-selected="true"], button, [class]')).find(function(el) {
+          var txt = norm(el.innerText || el.textContent || '');
+          var cls = String(el.className || '');
+          return /^(Plan|Act|Architect|Code|Ask|Debug|Orchestrator)$/i.test(txt) && (
+            /text-white|selected|active|checked|bg-primary|bg-vscode-button-background/i.test(cls) ||
+            el.getAttribute('aria-checked') === 'true' ||
+            el.getAttribute('aria-selected') === 'true'
+          );
+        });
+        var modeText = activeSwitch ? norm(activeSwitch.innerText || activeSwitch.textContent || '') : firstLine(modeEl.innerText || modeEl.textContent || '');
+        if (modeText) {
+          var modeMatch = cleanLabel(modeText).match(/\\b(Plan|Act|Architect|Code|Ask|Debug|Orchestrator)\\b/i);
+          mode = modeMatch ? modeMatch[1] : cleanLabel(modeText);
+        }
+      }
+      if (mode === 'unknown') {
+        var modeButtons = Array.from(d.querySelectorAll('button, [role="button"]')).filter(visible);
+        for (var m = 0; m < modeButtons.length; m++) {
+          var btnT = norm(modeButtons[m].innerText || modeButtons[m].textContent || '');
+          if (/\\b(Architect|Code|Ask|Debug|Orchestrator|Plan|Act)\\b/i.test(btnT) && btnT.length < 80) {
+            mode = btnT.match(/\\b(Architect|Code|Ask|Debug|Orchestrator|Plan|Act)\\b/i)[1];
+            break;
+          }
+        }
+      }
 
-      // Auto-approve detection
-      var autoApprove = /auto-approved?/i.test(bodyText) ? 'auto_approved' : 'unknown';
+      var permissionMode = 'unknown';
+      var permEl = d.querySelector('[data-testid="auto-approve-dropdown-trigger"]');
+      var hasAutoApproveDropdown = !!(permEl && visible(permEl));
+      if (hasAutoApproveDropdown) permissionMode = firstLine(permEl.innerText || permEl.textContent || '');
+      if (!permissionMode || permissionMode === 'unknown') {
+        var rawBodyText = String((d.body || d.documentElement || {}).innerText || (d.body || d.documentElement || {}).textContent || '');
+        var bodyText = norm(rawBodyText);
+        var pm = rawBodyText.match(/Auto-approve:\\s*([^\\n\\r]+)/i);
+        if (pm) permissionMode = norm(pm[1]);
+        else if (/YOLO mode is enabled/i.test(bodyText)) permissionMode = 'YOLO';
+      }
+      if (/^\\d+$/.test(permissionMode) || permissionMode.length > 40) {
+        permissionMode = /YOLO/i.test(permissionMode) ? 'YOLO' : 'unknown';
+      }
 
-      // Version detection
-      var versionMatch = bodyText.match(/v\\d+\\.\\d+\\.\\d+/);
-      var version = versionMatch ? versionMatch[0] : 'unknown';
+      var version = 'unknown';
+      var versionText = norm((d.body || d.documentElement || {}).textContent || '');
+      var vm = versionText.match(/v\\d+\\.\\d+\\.\\d+/);
+      if (vm) version = vm[0];
+
+      var models = [];
+      if (model && model !== 'unknown') {
+        models.push({ id: model, label: model });
+      }
+      if (hasRooProfileDropdown && !models.some(function(m) { return m.id === 'default'; })) {
+        models.push({ id: 'default', label: 'default' });
+      }
+
+      var availableModes = hasClineModeSwitch
+        ? [option('Plan', 'Plan'), option('Act', 'Act')]
+        : hasRooModeSelector
+          ? [option('Architect', 'Architect'), option('Code', 'Code'), option('Ask', 'Ask'), option('Debug', 'Debug'), option('Orchestrator', 'Orchestrator')]
+          : [];
+
+      var permissionModes = [];
+      if (permissionMode && permissionMode !== 'unknown') permissionModes.push(option(permissionMode, permissionMode));
+      if (hasAutoApproveDropdown) {
+        ['BRRR', 'YOLO', 'Ask', 'Auto-approve'].forEach(function(label) {
+          if (!permissionModes.some(function(m) { return m.id.toLowerCase() === label.toLowerCase(); })) {
+            permissionModes.push(option(label, label));
+          }
+        });
+      }
 
       return JSON.stringify({
-        model_id: model,
-        mode: mode,
-        permission_mode: autoApprove,
+        model_id: model || 'unknown',
+        mode: mode || 'unknown',
+        permission_mode: permissionMode || 'unknown',
         version: version,
+        available_models: models,
+        available_modes: availableModes,
+        available_permission_modes: permissionModes,
+        has_model_dropdown: hasRooProfileDropdown,
+        has_mode_control: hasRooModeSelector || hasClineModeSwitch,
+        has_permission_dropdown: hasAutoApproveDropdown,
       });
     `);
     return raw ? JSON.parse(raw) : null;
   } catch { return null; }
 }
 
-async function setRooCodeModel(Runtime, modelId, sessionId) {
+async function setRooCodeModelLegacy(Runtime, modelId, sessionId) {
   // Placeholder — Roo Code model selection via DOM clicks will be added after live inspection
   console.warn(`[${sessionId}] [sel] setRooCodeModel not yet implemented (modelId=${modelId})`);
   return { ok: false, code: 'not_implemented', detail: 'Roo Code model selection requires live DOM inspection' };
 }
 
-async function setRooCodePermissionMode(Runtime, mode, sessionId) {
+async function setRooCodePermissionModeLegacy(Runtime, mode, sessionId) {
   // Placeholder — Roo Code permission mode selection via DOM clicks will be added after live inspection
   console.warn(`[${sessionId}] [sel] setRooCodePermissionMode not yet implemented (mode=${mode})`);
   return { ok: false, code: 'not_implemented', detail: 'Roo Code permission mode selection requires live DOM inspection' };
@@ -2829,6 +3348,133 @@ async function detectRooCodePermissionDialog(Runtime) {
 //         > div.flex.flex-col.space-y-2            ← ASSISTANT indicator
 //           > div.flex.flex-row.my-2...            ← response rows; "Thought for Xs" rows skipped
 //           > div.pt-3                             ← "Copy" button row (skip)
+
+async function clickRooCodeControl(Runtime, InputDomain, selector) {
+  const raw = await evalInRooCodeFrame(Runtime, `
+    function norm(t) { return String(t || '').replace(/\\u00A0/g, ' ').replace(/\\s+/g, ' ').trim(); }
+    function visible(el) {
+      if (!el || !el.getBoundingClientRect) return false;
+      var r = el.getBoundingClientRect();
+      if (r.width <= 0 || r.height <= 0) return false;
+      var s = window.getComputedStyle ? window.getComputedStyle(el) : null;
+      return !s || (s.display !== 'none' && s.visibility !== 'hidden' && s.opacity !== '0');
+    }
+    var el = d.querySelector(${JSON.stringify(selector)});
+    if (!el || !visible(el)) return JSON.stringify({ error: 'control_not_found', detail: ${JSON.stringify(selector)} });
+    var r = el.getBoundingClientRect();
+    return JSON.stringify({
+      ok: true,
+      x: r.left + r.width / 2,
+      y: r.top + r.height / 2,
+      label: norm(el.innerText || el.textContent || el.getAttribute('aria-label') || '')
+    });
+  `);
+  const point = raw ? JSON.parse(raw) : null;
+  if (!point || point.error) return { ok: false, code: point?.error || 'control_not_found', detail: point?.detail || selector };
+  if (InputDomain) {
+    await InputDomain.dispatchMouseEvent({ type: 'mouseMoved', x: point.x, y: point.y });
+    await InputDomain.dispatchMouseEvent({ type: 'mousePressed', x: point.x, y: point.y, button: 'left', clickCount: 1 });
+    await InputDomain.dispatchMouseEvent({ type: 'mouseReleased', x: point.x, y: point.y, button: 'left', clickCount: 1 });
+  } else {
+    await evalInRooCodeFrame(Runtime, `
+      var el = d.querySelector(${JSON.stringify(selector)});
+      if (el) el.click();
+      return true;
+    `);
+  }
+  return { ok: true, label: point.label };
+}
+
+async function selectRooCodeMenuOption(Runtime, wanted) {
+  const raw = await evalInRooCodeFrame(Runtime, `
+    function norm(t) { return String(t || '').replace(/\\u00A0/g, ' ').replace(/\\s+/g, ' ').trim(); }
+    function firstLine(t) { return norm(String(t || '').split(/\\n|\\r/)[0] || t); }
+    function cleanLabel(t) { return firstLine(t).replace(/^[^A-Za-z0-9]+/, '').trim(); }
+    function visible(el) {
+      if (!el || !el.getBoundingClientRect) return false;
+      var r = el.getBoundingClientRect();
+      if (r.width <= 0 || r.height <= 0) return false;
+      var s = window.getComputedStyle ? window.getComputedStyle(el) : null;
+      return !s || (s.display !== 'none' && s.visibility !== 'hidden' && s.opacity !== '0');
+    }
+    var wanted = norm(${JSON.stringify(wanted)}).toLowerCase();
+    var candidates = Array.from(d.querySelectorAll('[role="option"], [role="menuitem"], [data-testid*="option"], button, li, div.cursor-pointer, div[class*="cursor-pointer"]'))
+      .filter(visible)
+      .map(function(el) {
+        var label = cleanLabel(el.innerText || el.textContent || el.getAttribute('aria-label') || '');
+        return { el: el, label: label, raw: norm(el.innerText || el.textContent || '') };
+      })
+      .filter(function(item) {
+        if (!item.label || item.label.length > 120) return false;
+        if (/^(start new task|type a message|open api settings)$/i.test(item.label)) return false;
+        return true;
+      });
+    var match = candidates.find(function(item) {
+      var label = item.label.toLowerCase();
+      var first = label.split(/\\s+/)[0];
+      return label === wanted || first === wanted;
+    });
+    if (!match) {
+      return JSON.stringify({ error: 'option_not_found', available: candidates.map(function(item) { return item.label; }).slice(0, 30) });
+    }
+    match.el.click();
+    return JSON.stringify({ ok: true, selected: match.label });
+  `);
+  const parsed = raw ? JSON.parse(raw) : null;
+  if (!parsed || parsed.error) return { ok: false, code: parsed?.error || 'option_not_found', detail: 'Option not found', available: parsed?.available || [] };
+  return { ok: true, selected: parsed.selected };
+}
+
+async function setRooCodeModel(Runtime, modelId, sessionId, InputDomain) {
+  try {
+    const click = await clickRooCodeControl(Runtime, InputDomain, '[data-testid="dropdown-trigger"]');
+    if (!click.ok) return click;
+    await new Promise(r => setTimeout(r, 200));
+    const selected = await selectRooCodeMenuOption(Runtime, modelId);
+    if (!selected.ok) return selected;
+    console.log(`[${sessionId}] [roo-model] Selected: ${selected.selected}`);
+    return selected;
+  } catch (e) {
+    return { ok: false, code: 'exception', detail: e.message };
+  }
+}
+
+async function setRooCodeMode(Runtime, mode, sessionId, InputDomain) {
+  try {
+    const before = await readRooCodeConfig(Runtime).catch(() => null);
+    if (before?.mode && String(before.mode).toLowerCase() === String(mode).toLowerCase()) {
+      return { ok: true, selected: before.mode };
+    }
+    const click = await clickRooCodeControl(Runtime, InputDomain, '[data-testid="mode-selector-trigger"], [data-testid="mode-switch"]');
+    if (!click.ok) return click;
+    await new Promise(r => setTimeout(r, 200));
+    const afterClick = await readRooCodeConfig(Runtime).catch(() => null);
+    if (afterClick?.mode && String(afterClick.mode).toLowerCase() === String(mode).toLowerCase()) {
+      console.log(`[${sessionId}] [roo-mode] Selected: ${afterClick.mode}`);
+      return { ok: true, selected: afterClick.mode };
+    }
+    const selected = await selectRooCodeMenuOption(Runtime, mode);
+    if (!selected.ok) return selected;
+    console.log(`[${sessionId}] [roo-mode] Selected: ${selected.selected}`);
+    return selected;
+  } catch (e) {
+    return { ok: false, code: 'exception', detail: e.message };
+  }
+}
+
+async function setRooCodePermissionMode(Runtime, mode, sessionId, InputDomain) {
+  try {
+    const click = await clickRooCodeControl(Runtime, InputDomain, '[data-testid="auto-approve-dropdown-trigger"]');
+    if (!click.ok) return click;
+    await new Promise(r => setTimeout(r, 200));
+    const selected = await selectRooCodeMenuOption(Runtime, mode);
+    if (!selected.ok) return selected;
+    console.log(`[${sessionId}] [roo-perm-mode] Selected: ${selected.selected}`);
+    return selected;
+  } catch (e) {
+    return { ok: false, code: 'exception', detail: e.message };
+  }
+}
 
 const ANTIGRAVITY_READ_EXPR = `
   var bt = String.fromCharCode(96);
@@ -5300,10 +5946,11 @@ async function readAgentConfig(Runtime, agentType, workspacePath) {
         model_id:          cfg?.model_id        || 'unknown',
         mode:              cfg?.mode            || 'unknown',
         permission_mode:   cfg?.permission_mode || 'unknown',
+        available_models:  cfg?.available_models || [],
         file_access_scope: workspacePath || 'unknown',
       };
     } catch {
-      return { model_id: 'unknown', mode: 'unknown', permission_mode: 'unknown', file_access_scope: workspacePath || 'unknown' };
+      return { model_id: 'unknown', mode: 'unknown', permission_mode: 'unknown', available_models: [], file_access_scope: workspacePath || 'unknown' };
     }
   }
 
@@ -5860,6 +6507,9 @@ async function setAgentModel(Runtime, agentType, modelId, sessionId, InputDomain
   if (isContinueAgentType(agentType)) {
     return setContinueModel(Runtime, modelId, sessionId);
   }
+  if (isRooCodeAgentType(agentType)) {
+    return setRooCodeModel(Runtime, modelId, sessionId, InputDomain);
+  }
   if (agentType !== 'claude') {
     return { ok: false, code: 'not_supported', detail: `Model selection not supported for ${agentType}` };
   }
@@ -5905,7 +6555,7 @@ async function setAgentModel(Runtime, agentType, modelId, sessionId, InputDomain
 // Response: given a choice_id (derived from button label), we re-locate the
 // dialog and click the matching button.
 
-async function setAgentPermissionMode(Runtime, agentType, mode, sessionId) {
+async function setAgentPermissionMode(Runtime, agentType, mode, sessionId, InputDomain) {
   if (agentType === 'continue_yolo') {
     const allowed = new Set(['ask', 'bypass']);
     if (!allowed.has(mode)) {
@@ -5940,6 +6590,10 @@ async function setAgentPermissionMode(Runtime, agentType, mode, sessionId) {
     } catch (e) {
       return { ok: false, code: 'exception', detail: e.message };
     }
+  }
+
+  if (isRooCodeAgentType(agentType)) {
+    return setRooCodePermissionMode(Runtime, mode, sessionId, InputDomain);
   }
 
   if (agentType !== 'claude') {
@@ -6282,6 +6936,25 @@ const ANTIGRAVITY_PANEL_PERMISSION_EXPR = `
   var panel = d.querySelector('.antigravity-agent-side-panel') || d.body;
   if (!panel) return null;
 
+  // If the panel has a prompt-like text but the Run/Reject buttons aren't
+  // rendered (virtualized list, or just scrolled out), scrolling the chat
+  // container to its bottom forces the latest content to render. Only do this
+  // when prompt text suggests a prompt is present, to avoid thrashing
+  // scroll position on every poll.
+  var _panelTextEarly = (panel.innerText || '');
+  if (/Run command\\??|Edit file\\??|Steps? Requires? Input|Run tool\\??|Allow .* access|Allow directory/i.test(_panelTextEarly)) {
+    var scrollables = panel.querySelectorAll('*');
+    for (var si0 = 0; si0 < scrollables.length; si0++) {
+      var sEl = scrollables[si0];
+      if (!sEl.scrollHeight || !sEl.clientHeight) continue;
+      if (sEl.scrollHeight <= sEl.clientHeight) continue;
+      // Only scroll containers near the bottom already (within 400px) so
+      // we don't yank the user back to the bottom while they're reading.
+      if (sEl.scrollHeight - sEl.scrollTop - sEl.clientHeight > 400) continue;
+      sEl.scrollTop = sEl.scrollHeight;
+    }
+  }
+
   // Strategy 1: Find buttons with "Reject" text — the permission prompt always has one
   var allBtns = Array.from(panel.querySelectorAll('button'));
   var rejectBtn = null;
@@ -6446,6 +7119,16 @@ function _buildPanelPermissionClickExpr(choiceId) {
   return `
     function dispatchPress(el) {
       var w = d.defaultView || window;
+      // Scroll into view first — the button may be in DOM but outside the
+      // viewport (especially in chat panels where the user is reading older
+      // history). Synthetic mouse events at off-screen clientX/clientY get
+      // dropped by hit-testing, so we need to bring it on-screen.
+      if (typeof el.scrollIntoView === 'function') {
+        try { el.scrollIntoView({block: 'center', inline: 'center', behavior: 'instant'}); }
+        catch (_) {
+          try { el.scrollIntoView(); } catch (__) {}
+        }
+      }
       if (typeof el.focus === 'function') {
         try { el.focus(); } catch (_) {}
       }
@@ -6462,6 +7145,12 @@ function _buildPanelPermissionClickExpr(choiceId) {
       }
       el.dispatchEvent(new w.MouseEvent('mouseup', opts));
       el.dispatchEvent(new w.MouseEvent('click', opts));
+      // Fallback: native el.click() doesn't depend on viewport coordinates,
+      // so it works even if hit-testing rejected the synthetic events. Some
+      // React handlers attach to onClick which fires from this too.
+      if (typeof el.click === 'function') {
+        try { el.click(); } catch (_) {}
+      }
     }
 
     var target = ${JSON.stringify(choiceId)};
@@ -9284,7 +9973,12 @@ module.exports = {
   sendRooCodePrimary,
   sendRooCodeFallback,
   readRooCodeConfig,
+  readRooCodeTaskList,
+  readRooCodePromptView,
+  readClineMode,
+  readClineContextUsage,
   setRooCodeModel,
+  setRooCodeMode,
   setRooCodePermissionMode,
   detectRooCodePermissionDialog,
   readAntigravitySessionTitle,

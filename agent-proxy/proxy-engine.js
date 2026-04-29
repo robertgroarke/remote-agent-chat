@@ -286,22 +286,23 @@ class ProxyEngine extends EventEmitter {
     const isDesktop = agentType === 'codex-desktop' || agentType === 'claude-desktop';
     const isContinue = agentType === 'continue' || agentType === 'continue_yolo';
     const isRooCode = agentType === 'roo_code';
+    const isClineLike = isRooCode || agentType === 'cline';
     return {
       interrupt:              ['claude', 'codex', 'gemini', 'continue', 'continue_yolo', 'antigravity', 'antigravity_panel', 'claude-desktop', 'codex-desktop', 'roo_code', 'cline'].includes(agentType),
-      set_model:              ['claude', 'antigravity', 'antigravity_panel', 'gemini', 'continue', 'continue_yolo', 'roo_code', 'cline'].includes(agentType),
-      set_mode:               agentType === 'antigravity',
-      permission_mode_change: agentType === 'claude' || agentType === 'continue_yolo' || isRooCode || agentType === 'cline',
-      auto_approve_permissions_toggle: agentType === 'continue' || agentType === 'continue_yolo' || agentType === 'antigravity_panel' || isRooCode || agentType === 'cline',
-      permission_dialogs:     isClaude || isCodex || agentType === 'antigravity' || agentType === 'antigravity_panel' || isContinue || isRooCode || agentType === 'cline',
+      set_model:              ['claude', 'antigravity', 'antigravity_panel', 'gemini', 'continue', 'continue_yolo'].includes(agentType) || isRooCode,
+      set_mode:               agentType === 'antigravity' || isClineLike,
+      permission_mode_change: agentType === 'claude' || agentType === 'continue_yolo' || isRooCode,
+      auto_approve_permissions_toggle: agentType === 'continue' || agentType === 'continue_yolo' || agentType === 'antigravity_panel',
+      permission_dialogs:     isClaude || isCodex || agentType === 'antigravity' || agentType === 'antigravity_panel' || isContinue || isClineLike,
       set_codex_config:       isCodex,
       new_thread:             isDesktop,
       thread_list:            isDesktop,
       switch_thread:          isDesktop,
       switch_workspace:       isDesktop,
       open_panel:             false, // Codex side pane is already open if session exists
-      chat_list:              agentType === 'codex' || agentType === 'continue' || agentType === 'antigravity_panel' || agentType === 'claude-desktop' || isRooCode || agentType === 'cline',
-      switch_chat:            agentType === 'codex' || agentType === 'continue' || agentType === 'antigravity_panel' || agentType === 'claude-desktop' || isRooCode || agentType === 'cline',
-      new_chat:               agentType === 'codex' || agentType === 'continue_yolo' || agentType === 'antigravity_panel' || agentType === 'claude-desktop' || agentType === 'claude' || isRooCode || agentType === 'cline',
+      chat_list:              agentType === 'codex' || agentType === 'continue' || agentType === 'antigravity_panel' || agentType === 'claude-desktop' || isClineLike,
+      switch_chat:            agentType === 'codex' || agentType === 'continue' || agentType === 'antigravity_panel' || agentType === 'claude-desktop' || isClineLike,
+      new_chat:               agentType === 'codex' || agentType === 'continue_yolo' || agentType === 'antigravity_panel' || agentType === 'claude-desktop' || agentType === 'claude' || isClineLike,
       terminal_output:        isCodex || agentType === 'claude-desktop',
       terminal_input:         agentType === 'codex-desktop',
       file_changes:           isCodex || agentType === 'claude-desktop',
@@ -402,6 +403,11 @@ class ProxyEngine extends EventEmitter {
         permission_mode:    domCfg?.permission_mode || 'unknown',
         file_access_scope:  workspacePath || 'unknown',
         available_models:   domCfg?.available_models || [],
+        available_modes:    domCfg?.available_modes || [],
+        available_permission_modes: domCfg?.available_permission_modes || [],
+        has_model_dropdown: !!domCfg?.has_model_dropdown,
+        has_mode_control:   !!domCfg?.has_mode_control,
+        has_permission_dropdown: !!domCfg?.has_permission_dropdown,
         branch:             branch || 'unknown',
       };
     }
@@ -412,6 +418,11 @@ class ProxyEngine extends EventEmitter {
         permission_mode:    domCfg?.permission_mode || 'unknown',
         file_access_scope:  workspacePath || 'unknown',
         available_models:   domCfg?.available_models || [],
+        available_modes:    domCfg?.available_modes || [],
+        available_permission_modes: domCfg?.available_permission_modes || [],
+        has_model_dropdown: !!domCfg?.has_model_dropdown,
+        has_mode_control:   !!domCfg?.has_mode_control,
+        has_permission_dropdown: !!domCfg?.has_permission_dropdown,
         branch:             branch || 'unknown',
       };
     }
@@ -432,7 +443,7 @@ class ProxyEngine extends EventEmitter {
   }
 
   _supportsAutoApprovePermissions(agentType) {
-    return agentType === 'continue' || agentType === 'continue_yolo' || agentType === 'antigravity_panel' || agentType === 'roo_code' || agentType === 'cline';
+    return agentType === 'continue' || agentType === 'continue_yolo' || agentType === 'antigravity_panel';
   }
 
   _normalizeAutoApprovePreferencePart(value) {
@@ -559,7 +570,21 @@ class ProxyEngine extends EventEmitter {
     if (perm) {
       const promptId = this._makePromptId(sessionId, perm.message, perm.choices);
       const last = this.activePermissionPrompts.get(sessionId);
-      if (last && last.prompt_id === promptId) return;
+      const isSameAsLast = last && last.prompt_id === promptId;
+
+      // Same prompt as last poll — if it's already been surfaced to the webui
+      // and auto-approve is now on (or a previous auto-approve attempt failed),
+      // retry the click so the webui prompt clears once the click lands.
+      // Without this, a prompt that fails initial auto-approve (e.g. button
+      // not rendered yet) gets stuck on the webui forever.
+      if (isSameAsLast) {
+        if (session?.autoApprovePermissions && last.surfaced) {
+          if (await this._attemptAutoApprovePrompt(sessionId, session, last.prompt, true)) {
+            return;
+          }
+        }
+        return;
+      }
 
       const prompt = {
         type:             'permission_prompt',
@@ -1276,13 +1301,14 @@ class ProxyEngine extends EventEmitter {
         }));
         return;
       }
-      if (sessionData.agentType !== 'antigravity') {
+      const isRooCodeLike = sessionData.agentType === 'roo_code' || sessionData.agentType === 'cline';
+      if (sessionData.agentType !== 'antigravity' && !isRooCodeLike) {
         this._sendToRelay(proto.agentControlResult(sid, msg.request_id, 'agent_set_mode', 'failed', {
           code: 'not_supported', message: `Conversation mode not supported for ${sessionData.agentType}`,
         }));
         return;
       }
-      if (!sessionData.client.Input) {
+      if (!isRooCodeLike && !sessionData.client.Input) {
         this._sendToRelay(proto.agentControlResult(sid, msg.request_id, 'agent_set_mode', 'failed', {
           code: 'no_input_domain', message: 'CDP Input domain not available',
         }));
@@ -1290,11 +1316,16 @@ class ProxyEngine extends EventEmitter {
       }
       const mode = msg.mode;
       this._log('info', `[ctrl] agent_set_mode for ${sid} mode=${mode}`);
-      selectors.setAntigravityMode(sessionData.client.Runtime, sessionData.client.Input, mode, sid)
+      const setModePromise = isRooCodeLike
+        ? this._withEphemeralIframeClient(sessionData, client =>
+            selectors.setRooCodeMode(client.Runtime, mode, sid, client.Input)
+          , 'set_mode')
+        : selectors.setAntigravityMode(sessionData.client.Runtime, sessionData.client.Input, mode, sid);
+      setModePromise
         .then(result => {
           if (result.ok) {
             this._sendToRelay(proto.agentControlResult(sid, msg.request_id, 'agent_set_mode', 'ok'));
-            return selectors.readAgentConfig(sessionData.client.Runtime, sessionData.agentType, sessionData.workspace_path)
+            return this._readSessionConfig(sessionData, sessionData.workspace_path, { forceRefresh: true })
               .then(cfg => {
                 const merged = this._decorateAgentConfig(sessionData, this._mergeAgentConfig(sessionData.agentType, cfg, sessionData.workspace_path));
                 this._sendToRelay(proto.agentConfig(sid, { ...merged, capabilities: this._buildCapabilities(sessionData.agentType) }));
@@ -1351,7 +1382,8 @@ class ProxyEngine extends EventEmitter {
       const sessionData = this.sessions.get(sid);
       const agentT = sessionData?.agentType;
 
-      if (agentT !== 'claude' && agentT !== 'continue_yolo') {
+      const isRooCodeLike = agentT === 'roo_code' || agentT === 'cline';
+      if (agentT !== 'claude' && agentT !== 'continue_yolo' && !isRooCodeLike) {
         this._sendToRelay(proto.agentControlResult(sid, msg.request_id, 'agent_set_permission_mode', 'failed', {
           code: 'not_supported', message: `Permission mode change not supported for ${agentT || 'unknown'} agent`,
         }));
@@ -1363,7 +1395,7 @@ class ProxyEngine extends EventEmitter {
         ? this._writeAntigravitySetting('claudeCode.initialPermissionMode', mode)
         : true;
       this._withEphemeralIframeClient(sessionData, client =>
-        selectors.setAgentPermissionMode(client.Runtime, agentT, mode, sid)
+        selectors.setAgentPermissionMode(client.Runtime, agentT, mode, sid, client.Input)
       , 'set_permission_mode')
         .then(result => {
           if (agentT === 'claude' && !persisted) {
@@ -2889,6 +2921,14 @@ class ProxyEngine extends EventEmitter {
       const config = includeConfig
         ? await selectors.readAgentConfig(client.Runtime, session.agentType, session.workspace_path).catch(() => null)
         : null;
+      const taskList = (session.agentType === 'roo_code' || session.agentType === 'cline')
+        ? await selectors.readRooCodeTaskList(client.Runtime).catch(() => null)
+        : null;
+      const contextUsage = session.agentType === 'cline'
+        ? await selectors.readClineContextUsage(client.Runtime).catch(() => null)
+        : session.agentType === 'roo_code'
+          ? await selectors.readRooCodePromptView(client.Runtime).catch(() => null)
+          : null;
       const rateLimit = includeRateLimit
         ? await selectors.readClaudeRateLimit(client.Runtime).catch(() => null)
         : null;
@@ -2899,7 +2939,7 @@ class ProxyEngine extends EventEmitter {
         thinking = await selectors.detectThinking(client.Runtime, session.agentType);
       }
 
-      return { raw, thinking, perm, errorPrompt, config, rateLimit };
+      return { raw, thinking, perm, errorPrompt, config, taskList, contextUsage, rateLimit };
     } finally {
       this._log('info', `[${sessionId}] [${focusTag}] poll attach:end`);
       if (client) try { await client.close(); } catch {}
@@ -3222,7 +3262,7 @@ class ProxyEngine extends EventEmitter {
       return;
     }
 
-    let { raw, thinking: ts, perm, errorPrompt, config } = pollResult;
+    let { raw, thinking: ts, perm, errorPrompt, config, taskList, contextUsage } = pollResult;
     if (includeConfig && session.agentType === 'continue_yolo' && session._webviewId) {
       try {
         const wbConfig = await this._withWorkbenchClient(session, client =>
@@ -3278,6 +3318,35 @@ class ProxyEngine extends EventEmitter {
           this._sendToRelay(proto.agentConfig(sessionId, { ...merged, capabilities }));
         }
       } catch {}
+    }
+
+    if (taskList !== undefined) {
+      const sig = taskList ? JSON.stringify(taskList) : '';
+      if (sig !== (session._taskListSig || '')) {
+        session._taskListSig = sig;
+        session.taskList = taskList;
+        this._log('info', `[${sessionId}] task_list update: ${taskList ? taskList.tasks.length + ' tasks, ' + taskList.completed + '/' + taskList.total + ' done' : 'null'}`);
+        if (!session.activity) {
+          session.activity = { kind: 'idle', label: '', updated_at: new Date().toISOString() };
+        }
+        session.activity.task_list = taskList;
+        if (session.contextCard) session.activity.context_card = session.contextCard;
+        this._sendToRelay(proto.proxyStatus(sessionId, session.status || 'healthy', session.activity));
+      }
+    }
+
+    if (session.agentType === 'cline' || session.agentType === 'roo_code') {
+      const contextSig = contextUsage ? JSON.stringify(contextUsage) : '';
+      if (contextSig !== (session._contextCardSig || '')) {
+        session._contextCardSig = contextSig;
+        session.contextCard = contextUsage || null;
+        if (!session.activity) {
+          session.activity = { kind: 'idle', label: '', updated_at: new Date().toISOString() };
+        }
+        session.activity.context_card = session.contextCard;
+        sessionStore.updateSession(sessionId, { activity: session.activity });
+        this._sendToRelay(proto.proxyStatus(sessionId, session.status || 'healthy', session.activity));
+      }
     }
 
     // ── Message processing ── (same logic as generic _pollSession)
@@ -3424,12 +3493,15 @@ class ProxyEngine extends EventEmitter {
     const label = thinkingState.label || (active ? 'Generating' : '');
     const newActivity = { kind, label, updated_at: new Date().toISOString() };
     if (session.taskList) newActivity.task_list = session.taskList;
+    if (session.contextCard) newActivity.context_card = session.contextCard;
     if (thinkingState.thinkingContent) newActivity.thinkingContent = thinkingState.thinkingContent;
 
     const prevKind = session.activity?.kind || 'idle';
     const prevThinkingContent = session.thinkingContent || '';
     const currThinkingContent = thinkingState.thinkingContent || '';
-    if (thinkingState.thinking !== session.thinking || label !== session.thinkingLabel || kind !== prevKind || currThinkingContent !== prevThinkingContent) {
+    const prevContextSig = session.activity?.context_card ? JSON.stringify(session.activity.context_card) : '';
+    const currContextSig = newActivity.context_card ? JSON.stringify(newActivity.context_card) : '';
+    if (thinkingState.thinking !== session.thinking || label !== session.thinkingLabel || kind !== prevKind || currThinkingContent !== prevThinkingContent || currContextSig !== prevContextSig) {
       session.thinking = thinkingState.thinking;
       session.thinkingLabel = label;
       session.thinkingContent = currThinkingContent;
@@ -4495,6 +4567,39 @@ class ProxyEngine extends EventEmitter {
       await this._handlePermissionDialogState(sessionId, session, dialog);
     } catch (e) {
       this._log('error', `[${sessionId}] [perm] Poll error: ${e.message}`);
+    }
+  }
+
+  async _pollPermissionsBounded(sessionId) {
+    const session = this.sessions.get(sessionId);
+    if (!session) return;
+    if (session._permissionPollInProgress) return;
+
+    const timeoutMs =
+      session.agentType === 'continue' || session.agentType === 'continue_yolo' || session.agentType === 'roo_code' || session.agentType === 'cline'
+        ? 5000
+        : 3500;
+
+    session._permissionPollInProgress = true;
+    let timer = null;
+    try {
+      await Promise.race([
+        this._pollPermissions(sessionId),
+        new Promise((_, reject) => {
+          timer = setTimeout(() => reject(new Error(`permission poll timeout after ${timeoutMs}ms`)), timeoutMs);
+        }),
+      ]);
+    } catch (e) {
+      this._log('warn', `[${sessionId}] [perm] ${e.message}`);
+      if (!this._isEphemeralIframeAgent(session.agentType)) {
+        try { await session.client?.close(); } catch {}
+        sessionStore.markDisconnected(sessionId);
+        this.sessions.delete(sessionId);
+        this._broadcastSessionSnapshot();
+      }
+    } finally {
+      if (timer) clearTimeout(timer);
+      session._permissionPollInProgress = false;
     }
   }
 
@@ -5777,7 +5882,7 @@ class ProxyEngine extends EventEmitter {
           session._codexPollCount = 0;
         }
         await this._pollSessionBounded(sessionId);
-        await this._pollPermissions(sessionId);
+        await this._pollPermissionsBounded(sessionId);
       }
 
       const windowKeys = Array.from(windowGroups.keys());
@@ -5798,12 +5903,12 @@ class ProxyEngine extends EventEmitter {
           if (session.agentType === 'continue' || session.agentType === 'continue_yolo') {
             const shouldFastPollPermissions = session.autoApprovePermissions || this.activePermissionPrompts.has(sessionId);
             if (shouldFastPollPermissions) {
-              await this._pollPermissions(sessionId);
+              await this._pollPermissionsBounded(sessionId);
             } else {
               session._continuePermissionPollCount = (session._continuePermissionPollCount || 0) + 1;
               if (session._continuePermissionPollCount >= 2) {
                 session._continuePermissionPollCount = 0;
-                await this._pollPermissions(sessionId);
+                await this._pollPermissionsBounded(sessionId);
               }
             }
 
@@ -5816,7 +5921,7 @@ class ProxyEngine extends EventEmitter {
             continue;
           }
           await this._pollSessionBounded(sessionId);
-          await this._pollPermissions(sessionId);
+          await this._pollPermissionsBounded(sessionId);
           polledWindowSessions++;
           if (polledWindowSessions >= 2) break;
         }

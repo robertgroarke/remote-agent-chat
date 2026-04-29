@@ -25,10 +25,24 @@ const AGENT_CONFIG = {
   gemini:            { name: 'Gemini',           color: '#4285f4', abbr: 'GC', logo: '/logo-gemini-in-ag.svg' },
   continue:          { name: 'Continue',         color: '#d29922', abbr: 'CN', logo: '/logo-continue.png' },
   continue_yolo:     { name: 'Continue YOLO',    color: '#f59e0b', abbr: 'CY', logo: '/logo-continue.png' },
+  roo_code:          { name: 'Roo Code',         color: '#06b6d4', abbr: 'RC', logo: '/logo-continue.png' },
+  cline:             { name: 'Cline',            color: '#6366f1', abbr: 'CL', logo: '/logo-cline.svg' },
   antigravity:       { name: 'Antigravity',      color: '#a855f7', abbr: 'AG', logo: '/logo-antigravity.svg' },
   antigravity_panel: { name: 'Antigravity Chat', color: '#a855f7', abbr: 'AC', logo: '/logo-antigravity.svg' },
 };
 const DEFAULT_AGENT = { name: 'Agent', color: '#8b949e', abbr: 'AG' };
+
+function isContinueLikeAgentType(agentType) {
+  return agentType === 'continue' || agentType === 'continue_yolo';
+}
+
+function isClineLikeAgentType(agentType) {
+  return agentType === 'cline' || agentType === 'roo_code';
+}
+
+function isRooCodeLikeAgentType(agentType) {
+  return agentType === 'roo_code';
+}
 
 function safeString(value, fallback = '') {
   if (typeof value === 'string') return value;
@@ -114,16 +128,50 @@ function agentFromId(id) {
   return AGENT_CONFIG[prefix] || DEFAULT_AGENT;
 }
 
+function normalizeAgentTypeHint(value) {
+  const raw = safeString(value).toLowerCase();
+  if (!raw) return null;
+  if (raw.includes('roo code') || raw.includes('roo_code') || raw.includes('roo-cline')) return 'roo_code';
+  if (raw.includes('cline') || raw.includes('claude-dev')) return 'cline';
+  if (raw.includes('continue yolo') || raw.includes('continue_yolo')) return 'continue_yolo';
+  if (raw.includes('continue')) return 'continue';
+  if (raw.includes('codex desktop')) return 'codex-desktop';
+  if (raw.includes('codex')) return 'codex';
+  if (raw.includes('claude code') || raw.includes('claude')) return 'claude';
+  if (raw.includes('antigravity chat') || raw.includes('antigravity_panel')) return 'antigravity_panel';
+  return null;
+}
+
+function normalizedSessionAgentType(sessionOrId) {
+  if (sessionOrId && typeof sessionOrId === 'object') {
+    const direct = sessionOrId.agent_type;
+    if (AGENT_CONFIG[direct]) return direct;
+    return normalizeAgentTypeHint(sessionOrId.display_name)
+      || normalizeAgentTypeHint(sessionOrId.agent_type)
+      || normalizeAgentTypeHint(sessionOrId.session_title)
+      || normalizeAgentTypeHint(sessionOrId.window_title)
+      || normalizeAgentTypeHint(sessionOrId.chat_title)
+      || normalizeAgentTypeHint(sessionOrId.session_id);
+  }
+  if (typeof sessionOrId === 'string') {
+    const prefix = sessionOrId.split('-')[0].toLowerCase();
+    if (AGENT_CONFIG[prefix]) return prefix;
+    return normalizeAgentTypeHint(sessionOrId);
+  }
+  return null;
+}
+
 function sessionIdOf(sessionOrId) {
   return typeof sessionOrId === 'string' ? sessionOrId : sessionOrId?.session_id;
 }
 
 function sessionAgent(sessionOrId, agentConfig) {
   if (sessionOrId && typeof sessionOrId === 'object') {
-    const type = sessionOrId.agent_type;
+    const type = normalizedSessionAgentType(sessionOrId);
     return AGENT_CONFIG[type] || agentFromId(sessionOrId.session_id);
   }
-  return agentFromId(sessionOrId);
+  const type = normalizedSessionAgentType(sessionOrId);
+  return AGENT_CONFIG[type] || agentFromId(sessionOrId);
 }
 
 function sessionSubLabel(sessionOrId, fallbackId, agentConfig) {
@@ -202,6 +250,33 @@ function formatVisiblePaneSummary(session) {
     ].filter(Boolean).join(' · ');
   }
   return formatPaneSummary(session);
+}
+
+function formatAntigravityQuotaLabel(modelName) {
+  const raw = safeString(modelName);
+  if (!raw) return '';
+  return raw
+    .replace(/^Gemini\s+/i, 'G ')
+    .replace(/^Claude\s+/i, '')
+    .replace(/\s*\(Thinking\)\s*/i, '')
+    .replace(/\s*\(Medium\)\s*/i, '')
+    .replace(/\s+/g, ' ')
+    .trim();
+}
+
+function formatAntigravityQuotaSummary(models, maxItems = 3) {
+  if (!Array.isArray(models) || models.length === 0) return '';
+  return models
+    .slice(0, maxItems)
+    .map(entry => {
+      const pct = entry?.percent_used;
+      if (pct == null) return null;
+      const label = formatAntigravityQuotaLabel(entry?.model);
+      if (!label) return null;
+      return `${label} ${pct}%`;
+    })
+    .filter(Boolean)
+    .join(' · ');
 }
 
 function agentTypeLabel(agentType) {
@@ -320,7 +395,7 @@ function QueuedItem({ qm, onSteer, onDiscard, onEdit }) {
 // Each card shows: colored agent badge, agent name, window label, health dot,
 // and either a thinking spinner or an unread count badge.
 
-function SessionCard({ session, health, unread, isThinking, isActive, agentConfig, activity, hasPermissionPrompt, onSelect, onClose, onAutomations, showAutomationsActive, onSkills, showSkillsActive }) {
+function SessionCard({ session, health, unread, isThinking, isActive, agentConfig, activity, hasBlockingPrompt, blockingPromptLabel, onSelect, onClose, onAutomations, showAutomationsActive, onSkills, showSkillsActive }) {
   const sessionId = sessionIdOf(session);
   const agent    = sessionAgent(session, agentConfig);
   const winLabel = sessionSubLabel(session, sessionId, agentConfig);
@@ -328,7 +403,8 @@ function SessionCard({ session, health, unread, isThinking, isActive, agentConfi
   const rateLimitedUntil = session?.rate_limited_until || null;
   const isHardLimited = session?.rate_limit_active === true;
   const pctUsed = session?.percent_used;
-  // Show granular activity label when thinking (Epic 8)
+  const isAntigravitySession = session?.agent_type === 'antigravity' || session?.agent_type === 'antigravity_panel';
+  const quotaSummary = isAntigravitySession ? formatAntigravityQuotaSummary(session?.antigravity_quota_models, 3) : '';
   const activityLabel = isThinking && activity?.label ? activity.label : null;
 
   return (
@@ -347,18 +423,20 @@ function SessionCard({ session, health, unread, isThinking, isActive, agentConfi
       </div>
       <div className="session-card-body">
         <div className="session-card-name">{agent.name}</div>
-        <div className={`session-card-sub${hasPermissionPrompt ? ' perm-active' : ''}`}>
-          {hasPermissionPrompt ? 'Permission required'
+        <div className={`session-card-sub${hasBlockingPrompt ? ' perm-active' : ''}`}>
+          {hasBlockingPrompt ? (blockingPromptLabel || 'Action required')
             : isHardLimited ? `⏳ Rate limited${rateLimitedUntil && rateLimitedUntil !== 'unknown' ? ` · ${rateLimitedUntil}` : ''}`
+            : quotaSummary ? quotaSummary
+            : isAntigravitySession && pctUsed != null ? `📊 ${pctUsed}% used${rateLimitedUntil && rateLimitedUntil !== 'unknown' ? ` · ${rateLimitedUntil}` : ''}`
             : pctUsed >= 80 ? `📊 ${pctUsed}% used`
             : activityLabel ? activityLabel
             : (winLabel || sessionId)}
         </div>
       </div>
       <div className="session-card-right">
-        {hasPermissionPrompt && <div className="session-card-perm-badge" title="Permission required">⚠</div>}
+        {hasBlockingPrompt && <div className="session-card-perm-badge" title={blockingPromptLabel || 'Action required'}>⚠</div>}
         {isThinking  && <div className="session-card-spinner" title={activityLabel || 'Thinking…'} />}
-        {!isThinking && !hasPermissionPrompt && unread > 0 && (
+        {!isThinking && !hasBlockingPrompt && unread > 0 && (
           <div className="session-card-badge">{unread > 99 ? '99+' : unread}</div>
         )}
         {onAutomations && (
@@ -439,19 +517,90 @@ function ActivityRow({ activity, thinkingText, isClaude, pinned = false }) {
   );
 }
 
-function TaskList({ taskList }) {
+function TaskList({ taskList, sessionId }) {
   if (!taskList || !taskList.tasks || taskList.tasks.length === 0) return null;
+  const storageKey = sessionId ? `remote-agent-chat:task-list-collapsed:${sessionId}` : null;
+  const defaultCollapsed = taskList.tasks.length > 8;
+  const [collapsed, setCollapsed] = React.useState(() => {
+    if (!storageKey) return defaultCollapsed;
+    const saved = localStorage.getItem(storageKey);
+    return saved == null ? defaultCollapsed : saved === '1';
+  });
+
+  React.useEffect(() => {
+    if (!storageKey) {
+      setCollapsed(defaultCollapsed);
+      return;
+    }
+    const saved = localStorage.getItem(storageKey);
+    setCollapsed(saved == null ? defaultCollapsed : saved === '1');
+  }, [storageKey, defaultCollapsed]);
+
+  const toggleCollapsed = () => {
+    setCollapsed(prev => {
+      const next = !prev;
+      if (storageKey) localStorage.setItem(storageKey, next ? '1' : '0');
+      return next;
+    });
+  };
+
   const stateIcon = { completed: '\u2713', in_progress: '\u25CC', pending: '\u25CB' };
   const stateCls = { completed: 'done', in_progress: 'active', pending: '' };
+  const activeTask = taskList.tasks.find(t => t.state === 'in_progress');
   return (
-    <div className="codex-task-list">
-      <div className="codex-task-header">{taskList.completed}/{taskList.total} tasks</div>
-      {taskList.tasks.map((t, i) => (
-        <div key={i} className={`codex-task-item ${stateCls[t.state] || ''}`}>
-          <span className="codex-task-icon">{stateIcon[t.state] || '\u25CB'}</span>
-          <span className="codex-task-text">{t.text}</span>
+    <div className={`codex-task-list${collapsed ? ' collapsed' : ''}`}>
+      <button
+        type="button"
+        className="codex-task-header"
+        onClick={toggleCollapsed}
+        aria-expanded={!collapsed}
+        title={collapsed ? 'Expand task list' : 'Collapse task list'}
+      >
+        <span className="codex-task-chevron">{collapsed ? '\u25B8' : '\u25BE'}</span>
+        <span className="codex-task-count">{taskList.completed}/{taskList.total} tasks</span>
+        {collapsed && activeTask?.text && (
+          <span className="codex-task-active-summary">{activeTask.text}</span>
+        )}
+      </button>
+      {!collapsed && (
+        <div className="codex-task-items">
+          {taskList.tasks.map((t, i) => (
+            <div key={i} className={`codex-task-item ${stateCls[t.state] || ''}`}>
+              <span className="codex-task-icon">{stateIcon[t.state] || '\u25CB'}</span>
+              <span className="codex-task-text">{t.text}</span>
+            </div>
+          ))}
         </div>
-      ))}
+      )}
+    </div>
+  );
+}
+
+function ClineContextCard({ card, tone = 'cline' }) {
+  if (!card) return null;
+  const pct = Number.isFinite(Number(card.percent_used))
+    ? Math.max(0, Math.min(100, Number(card.percent_used)))
+    : null;
+  const title = safeString(card.title || 'Current context');
+  const subtitle = safeString(card.subtitle || '');
+  const detail = safeString(card.detail || '');
+  const usageLabel = safeString(card.label || card.usage_label || '');
+
+  return (
+    <div className={`cline-context-card ${tone}-context-card`}>
+      <div className="cline-context-header">
+        <div className="cline-context-copy">
+          <div className="cline-context-title">{title}</div>
+          {subtitle && <div className="cline-context-subtitle">{subtitle}</div>}
+          {detail && <div className="cline-context-detail">{detail}</div>}
+        </div>
+        {usageLabel && <div className="cline-context-usage">{usageLabel}</div>}
+      </div>
+      {pct != null && (
+        <div className="cline-context-meter" title={`${card.percent_used}% of context window used`}>
+          <div className="cline-context-meter-fill" style={{ width: `${pct}%` }} />
+        </div>
+      )}
     </div>
   );
 }
@@ -519,6 +668,87 @@ function PermissionOverlay({ prompt, sessionId, onRespond }) {
             );
           })}
         </div>
+      </div>
+    </div>
+  );
+}
+
+function errorPromptActionLabel(action) {
+  return safeString(action?.label, 'Action');
+}
+
+function isBlockingErrorPrompt(prompt) {
+  return !!prompt && prompt.blocking !== false && prompt.display_mode !== 'inline';
+}
+
+function ErrorPromptOverlay({ prompt, sessionId, onRespond }) {
+  const actions = Array.isArray(prompt?.actions) ? prompt.actions : [];
+  const submittingActionId = prompt?.submitting_action_id || null;
+  const errorOutput = safeString(prompt?.error_output).trim();
+
+  return (
+    <div className="permission-overlay">
+      <div className="permission-card error-prompt-card">
+        <div className="permission-eyebrow error-prompt-eyebrow">Action Required</div>
+        <div className="permission-title">{safeString(prompt?.title, 'Error handling model response')}</div>
+        <div className="permission-body">{safeString(prompt?.message, 'There was an error handling the model response.')}</div>
+        {errorOutput && (
+          <div className="error-prompt-output-wrap">
+            <div className="error-prompt-output-label">Error Output</div>
+            <pre className="error-prompt-output">{errorOutput}</pre>
+          </div>
+        )}
+        {prompt?.error && <div className="permission-error">{prompt.error}</div>}
+        <div className="permission-actions">
+          {actions.map(action => {
+            const actionId = safeString(action?.action_id);
+            const isPending = submittingActionId === actionId;
+            return (
+              <button
+                key={actionId || errorPromptActionLabel(action)}
+                className={`permission-action error-prompt-action${isPending ? ' pending' : ''}`}
+                disabled={!!submittingActionId}
+                onClick={() => onRespond(sessionId, prompt.prompt_id, actionId)}
+              >
+                <span>{errorPromptActionLabel(action)}</span>
+                {isPending && <span className="permission-action-state">Sending...</span>}
+              </button>
+            );
+          })}
+        </div>
+      </div>
+    </div>
+  );
+}
+
+function ErrorPromptInline({ prompt, sessionId, onRespond }) {
+  const actions = Array.isArray(prompt?.actions) ? prompt.actions : [];
+  const submittingActionId = prompt?.submitting_action_id || null;
+  const errorOutput = safeString(prompt?.error_output).trim();
+
+  return (
+    <div className="inline-error-prompt">
+      <div className="inline-error-prompt-body">
+        <div className="inline-error-prompt-message">{safeString(prompt?.message, 'There was an error handling the model response.')}</div>
+        {errorOutput && <pre className="inline-error-prompt-output">{errorOutput}</pre>}
+        {prompt?.error && <div className="permission-error">{prompt.error}</div>}
+      </div>
+      <div className="inline-error-prompt-actions">
+        {actions.map(action => {
+          const actionId = safeString(action?.action_id);
+          const isPending = submittingActionId === actionId;
+          return (
+            <button
+              key={actionId || errorPromptActionLabel(action)}
+              className={`permission-action error-prompt-action${isPending ? ' pending' : ''}`}
+              disabled={!!submittingActionId}
+              onClick={() => onRespond(sessionId, prompt.prompt_id, actionId)}
+            >
+              <span>{errorPromptActionLabel(action)}</span>
+              {isPending && <span className="permission-action-state">Sending...</span>}
+            </button>
+          );
+        })}
       </div>
     </div>
   );
@@ -722,9 +952,27 @@ const PERMISSION_MODES = {
     { value: 'bypassPermissions', label: 'Bypass (allow all)' },
     { value: 'default',           label: 'Default (ask each time)' },
   ],
+  continue_yolo: [
+    { value: 'ask',    label: 'Ask for permissions' },
+    { value: 'bypass', label: 'Bypass permissions' },
+  ],
+  roo_code: [
+    { value: 'BRRR',         label: 'BRRR' },
+    { value: 'YOLO',         label: 'YOLO' },
+    { value: 'Ask',          label: 'Ask' },
+    { value: 'Auto-approve', label: 'Auto-approve' },
+  ],
+  cline: [
+    { value: 'YOLO', label: 'YOLO' },
+  ],
   codex:  [],  // Codex permission mode not configurable via settings
   gemini: [],  // Gemini permission mode not configurable via settings
 };
+
+function defaultPermissionModeFor(agentType) {
+  if (agentType === 'continue_yolo' || agentType === 'roo_code' || agentType === 'cline') return 'ask';
+  return 'default';
+}
 
 const KNOWN_CLAUDE_MODELS = [
   { id: 'default',                 label: 'Auto' },
@@ -745,6 +993,19 @@ const ANTIGRAVITY_MODES = [
   { id: 'Fast',     label: 'Fast' },
 ];
 
+const ROO_CODE_MODES = [
+  { id: 'Architect',    label: 'Architect' },
+  { id: 'Code',         label: 'Code' },
+  { id: 'Ask',          label: 'Ask' },
+  { id: 'Debug',        label: 'Debug' },
+  { id: 'Orchestrator', label: 'Orchestrator' },
+];
+
+const CLINE_MODES = [
+  { id: 'Plan', label: 'Plan' },
+  { id: 'Act',  label: 'Act' },
+];
+
 const KNOWN_ANTIGRAVITY_MODELS = [
   { id: 'Gemini 3.1 Pro (High)',        label: 'Gemini 3.1 Pro (High)' },
   { id: 'Gemini 3.1 Pro (Low)',         label: 'Gemini 3.1 Pro (Low)' },
@@ -763,11 +1024,46 @@ const KNOWN_GEMINI_MODELS = [
   { id: '3.1 Pro Preview',  label: 'Gemini 3.1 Pro Preview' },
 ];
 
-function AgentSettingsPanel({ session, config, onRequestRefresh, onSetModel, onSetPermissionMode, onSetMode, onSetCodexConfig, onSwitchWorkspace, onClose }) {
+function composerModelOptionsFor(agentType, config) {
+  if (Array.isArray(config?.available_models) && config.available_models.length > 0) {
+    return config.available_models.map(model => (
+      typeof model === 'string' ? { id: model, label: model } : model
+    ));
+  }
+  if (agentType === 'continue_yolo' || agentType === 'continue' || agentType === 'roo_code' || agentType === 'cline') return [];
+  if (agentType === 'antigravity' || agentType === 'antigravity_panel') return KNOWN_ANTIGRAVITY_MODELS;
+  if (agentType === 'gemini') return KNOWN_GEMINI_MODELS;
+  return KNOWN_CLAUDE_MODELS;
+}
+
+function modeOptionsFor(agentType, config) {
+  if (Array.isArray(config?.available_modes) && config.available_modes.length > 0) {
+    return config.available_modes.map(mode => (
+      typeof mode === 'string' ? { id: mode, label: mode } : mode
+    ));
+  }
+  if (agentType === 'roo_code') return ROO_CODE_MODES;
+  if (agentType === 'cline') return CLINE_MODES;
+  if (agentType === 'antigravity' || agentType === 'antigravity_panel') return ANTIGRAVITY_MODES;
+  return [];
+}
+
+function permissionModeOptionsFor(agentType, config) {
+  if (Array.isArray(config?.available_permission_modes) && config.available_permission_modes.length > 0) {
+    return config.available_permission_modes.map(mode => (
+      typeof mode === 'string' ? { value: mode, label: mode } : { value: mode.id || mode.value, label: mode.label || mode.id || mode.value }
+    )).filter(mode => mode.value);
+  }
+  return PERMISSION_MODES[agentType] || [];
+}
+
+function AgentSettingsPanel({ session, config, onRequestRefresh, onSetModel, onSetPermissionMode, onSetAutoApprovePermissions, onSetMode, onSetCodexConfig, onSwitchWorkspace, onClose }) {
   const [pendingModel, setPendingModel] = React.useState(null);
   const [modelOk, setModelOk]           = React.useState(null);
   const [pendingPerm, setPendingPerm]   = React.useState(null);
   const [permOk, setPermOk]             = React.useState(null);
+  const [pendingAutoApprove, setPendingAutoApprove] = React.useState(null);
+  const [autoApproveOk, setAutoApproveOk]           = React.useState(null);
   const [pendingMode, setPendingMode]   = React.useState(null);
   const [modeOk, setModeOk]             = React.useState(null);
   const [codexOk, setCodexOk]           = React.useState(null);
@@ -777,11 +1073,18 @@ function AgentSettingsPanel({ session, config, onRequestRefresh, onSetModel, onS
   const caps         = config?.capabilities || {};
   const currentModel   = config?.model_id || 'unknown';
   const rateLimitedUntil = (session && typeof session === 'object') ? session.rate_limited_until || null : null;
+  const antigravityQuotaModels = Array.isArray(session?.antigravity_quota_models) ? session.antigravity_quota_models : [];
+  const activeQuotaModel = session?.active_quota_model || null;
   const permMode       = config?.permission_mode || 'unknown';
   const convMode       = config?.conversation_mode || 'unknown';
+  const currentMode    = (config?.mode && config.mode !== 'unknown') ? config.mode : convMode;
+  const autoApproveEnabled = typeof config?.auto_approve_permissions === 'boolean'
+    ? config.auto_approve_permissions
+    : !!session?.auto_approve_permissions;
   const effortLevel    = config?.effort || null;
   const fileScope    = config?.file_access_scope || 'unknown';
-  const permModes    = PERMISSION_MODES[agentType] || [];
+  const permModes    = permissionModeOptionsFor(agentType, config);
+  const modeOptions  = modeOptionsFor(agentType, config);
   let modelOptions = agentType === 'claude' ? KNOWN_CLAUDE_MODELS
     : (agentType === 'antigravity' || agentType === 'antigravity_panel') ? KNOWN_ANTIGRAVITY_MODELS
     : agentType === 'gemini' ? KNOWN_GEMINI_MODELS
@@ -810,10 +1113,17 @@ function AgentSettingsPanel({ session, config, onRequestRefresh, onSetModel, onS
   }
 
   function handleModeChange(mode) {
-    if (!mode || mode === convMode) return;
+    if (!mode || mode === currentMode) return;
     setModeOk(null);
     setPendingMode(mode);
     onSetMode && onSetMode(sessionId, mode);
+  }
+
+  function handleAutoApproveChange(enabled) {
+    if (autoApproveEnabled === !!enabled) return;
+    setAutoApproveOk(null);
+    setPendingAutoApprove(!!enabled);
+    onSetAutoApprovePermissions && onSetAutoApprovePermissions(sessionId, !!enabled);
   }
 
   // Clear pending states when config updates confirm the change
@@ -834,12 +1144,20 @@ function AgentSettingsPanel({ session, config, onRequestRefresh, onSetModel, onS
   }, [config?.permission_mode]);
 
   React.useEffect(() => {
-    if (pendingMode && config?.conversation_mode && config.conversation_mode === pendingMode) {
+    if (pendingMode && ((config?.conversation_mode && config.conversation_mode === pendingMode) || (config?.mode && config.mode === pendingMode))) {
       setModeOk('Saved');
       setPendingMode(null);
       setTimeout(() => setModeOk(null), 2000);
     }
-  }, [config?.conversation_mode]);
+  }, [config?.conversation_mode, config?.mode]);
+
+  React.useEffect(() => {
+    if (pendingAutoApprove != null && autoApproveEnabled === pendingAutoApprove) {
+      setAutoApproveOk('Saved');
+      setPendingAutoApprove(null);
+      setTimeout(() => setAutoApproveOk(null), 2000);
+    }
+  }, [autoApproveEnabled]);
 
   return (
     <div className="settings-panel">
@@ -893,13 +1211,48 @@ function AgentSettingsPanel({ session, config, onRequestRefresh, onSetModel, onS
           {modelOk && <span className="settings-inline-ok">{modelOk}</span>}
         </div>
 
+        {(agentType === 'antigravity' || agentType === 'antigravity_panel') && antigravityQuotaModels.length > 0 && (
+          <div className="settings-row" style={{ alignItems: 'flex-start' }}>
+            <span className="settings-label">Quotas</span>
+            <div style={{ display: 'flex', flexDirection: 'column', gap: 6, flex: 1, minWidth: 0 }}>
+              {session?.available_ai_credits != null && (
+                <span className="settings-value">AI credits: {session.available_ai_credits}</span>
+              )}
+              <div style={{ display: 'flex', flexWrap: 'wrap', gap: 6 }}>
+                {antigravityQuotaModels.map((entry, index) => {
+                  const pct = entry?.percent_used;
+                  const label = formatAntigravityQuotaLabel(entry?.model);
+                  const tone = pct >= 90 ? '#f85149' : pct >= 75 ? '#d29922' : '#8b949e';
+                  const isActiveQuota = !!activeQuotaModel && activeQuotaModel === entry?.model;
+                  return (
+                    <span
+                      key={entry?.model || `quota-${index}`}
+                      className="composer-hint"
+                      title={entry?.refreshes_in ? `${entry.model} · resets in ${entry.refreshes_in}` : entry?.model || ''}
+                      style={{
+                        color: tone,
+                        border: `1px solid ${isActiveQuota ? tone : '#30363d'}`,
+                        borderRadius: 999,
+                        padding: '2px 8px',
+                        background: isActiveQuota ? `${tone}18` : 'rgba(110,118,129,0.08)',
+                      }}
+                    >
+                      {label} {pct != null ? `${pct}%` : 'n/a'}
+                    </span>
+                  );
+                })}
+              </div>
+            </div>
+          </div>
+        )}
+
         {/* Conversation mode — Antigravity only (Planning | Fast) */}
         {(agentType === 'antigravity' || agentType === 'antigravity_panel') && (
           <div className="settings-row">
             <span className="settings-label">Mode</span>
             <select
               className="settings-perm-select"
-              value={convMode === 'unknown' ? 'Planning' : convMode}
+              value={currentMode === 'unknown' ? 'Planning' : currentMode}
               disabled={!!pendingMode}
               onChange={e => handleModeChange(e.target.value)}
             >
@@ -911,14 +1264,34 @@ function AgentSettingsPanel({ session, config, onRequestRefresh, onSetModel, onS
           </div>
         )}
 
-        {/* Permission mode — Claude dropdown, Codex handled separately below */}
-        {agentType === 'claude' && (
+        {/* Permission mode — Claude and Continue YOLO, Codex handled separately below */}
+        {isClineLikeAgentType(agentType) && caps.set_mode && modeOptions.length > 0 && (
+          <div className="settings-row">
+            <span className="settings-label">Mode</span>
+            <select
+              className="settings-perm-select"
+              value={currentMode === 'unknown' ? modeOptions[0].id : currentMode}
+              disabled={!!pendingMode}
+              onChange={e => handleModeChange(e.target.value)}
+            >
+              {modeOptions.map(m => (
+                <option key={m.id} value={m.id}>{m.label}</option>
+              ))}
+              {currentMode !== 'unknown' && !modeOptions.some(m => m.id === currentMode) && (
+                <option value={currentMode}>{currentMode}</option>
+              )}
+            </select>
+            {modeOk && <span className="settings-inline-ok">{modeOk}</span>}
+          </div>
+        )}
+
+        {(agentType === 'claude' || agentType === 'continue_yolo' || isClineLikeAgentType(agentType)) && (
           <div className="settings-row">
             <span className="settings-label">Permission mode</span>
             {caps.permission_mode_change && permModes.length > 0 ? (
               <select
                 className="settings-perm-select"
-                value={permMode}
+                value={permMode === 'unknown' ? defaultPermissionModeFor(agentType) : permMode}
                 disabled={!!pendingPerm}
                 onChange={e => handlePermModeChange(e.target.value)}
               >
@@ -981,6 +1354,21 @@ function AgentSettingsPanel({ session, config, onRequestRefresh, onSetModel, onS
                 ))}
               </select>
             </div>
+            <div className="settings-row">
+              <span className="settings-label">Speed</span>
+              <select
+                className="settings-perm-select"
+                value={(config?.speed || 'standard').toLowerCase()}
+                onChange={e => { onSetCodexConfig && onSetCodexConfig({ speed: e.target.value }); setCodexOk(agentType === 'codex-desktop' ? 'Saved' : 'Saved — restart Codex to apply'); setTimeout(() => setCodexOk(null), 3000); }}
+              >
+                {(config?.available_speeds || []).map(m => (
+                  <option key={m.id} value={m.id}>{m.label}</option>
+                ))}
+                {config?.speed && !(config?.available_speeds || []).some(m => m.id === config.speed) && config.speed !== 'unknown' && (
+                  <option value={config.speed}>{config.speed}</option>
+                )}
+              </select>
+            </div>
             {agentType === 'codex-desktop' && config?.branch && config.branch !== 'unknown' && (
               <div className="settings-row">
                 <span className="settings-label">Branch</span>
@@ -1026,10 +1414,26 @@ function AgentSettingsPanel({ session, config, onRequestRefresh, onSetModel, onS
         )}
 
         {/* Continue-specific: mode (read-only, configured in Continue UI) */}
-        {agentType === 'continue' && config?.mode && config.mode !== 'unknown' && (
+        {isContinueLikeAgentType(agentType) && config?.mode && config.mode !== 'unknown' && (
           <div className="settings-row">
             <span className="settings-label">Mode</span>
             <span className="settings-value">{config.mode}</span>
+          </div>
+        )}
+
+        {caps.auto_approve_permissions_toggle && (
+          <div className="settings-row settings-row-checkbox">
+            <span className="settings-label">Tool Prompts</span>
+            <label className="settings-checkbox">
+              <input
+                type="checkbox"
+                checked={autoApproveEnabled}
+                disabled={pendingAutoApprove != null}
+                onChange={e => handleAutoApproveChange(e.target.checked)}
+              />
+              <span>Auto-approve permission prompts</span>
+            </label>
+            {autoApproveOk && <span className="settings-inline-ok">{autoApproveOk}</span>}
           </div>
         )}
 
@@ -1902,6 +2306,53 @@ function AutomationsView({ sessions, onBack }) {
 
 // ─── Skills View ────────────────────────────────────────────────────────────
 // Displays installed and recommended skills read from Codex Desktop via CDP.
+function CodexAutomationPane({ view, onShow }) {
+  if (!view?.visible) return null;
+  const statusRows = Array.isArray(view.status_rows) ? view.status_rows : [];
+  const detailRows = Array.isArray(view.detail_rows) ? view.detail_rows : [];
+  const status = view.status || statusRows.find(row => row.label === 'Status')?.value || '';
+  return (
+    <aside className="codex-automation-pane" aria-label="Codex automation">
+      <div className="codex-automation-pane-header">
+        <div className="codex-automation-pane-icon">o</div>
+        <div className="codex-automation-pane-title">{view.title || 'Automation'}</div>
+      </div>
+      {view.description && (
+        <div className="codex-automation-pane-desc">{view.description}</div>
+      )}
+      {(statusRows.length > 0 || status) && (
+        <div className="codex-automation-pane-section">
+          <div className="codex-automation-pane-section-title">Status</div>
+          {statusRows.length > 0 ? statusRows.map((row, i) => (
+            <div key={`${row.label}-${i}`} className="codex-automation-pane-row">
+              <span>{row.label}</span>
+              <strong className={row.label === 'Status' && /active/i.test(row.value) ? 'active' : ''}>{row.value}</strong>
+            </div>
+          )) : (
+            <div className="codex-automation-pane-row"><span>Status</span><strong>{status}</strong></div>
+          )}
+        </div>
+      )}
+      {detailRows.length > 0 && (
+        <div className="codex-automation-pane-section">
+          <div className="codex-automation-pane-section-title">Details</div>
+          {detailRows.map((row, i) => (
+            <div key={`${row.label}-${i}`} className="codex-automation-pane-row">
+              <span>{row.label}</span>
+              <strong>{row.value}</strong>
+            </div>
+          ))}
+        </div>
+      )}
+      {view.action_label && (
+        <button className="codex-automation-pane-action" onClick={onShow}>
+          {view.action_label}
+        </button>
+      )}
+    </aside>
+  );
+}
+
 function SkillsView({ skills, onRefresh, onBack }) {
   const installed   = skills?.installed   || [];
   const recommended = skills?.recommended || [];
@@ -2008,7 +2459,7 @@ class AppErrorBoundary extends React.Component {
 }
 
 function App() {
-  const { sessions, messages, connected, unread, setUnread, thinking, thinkingContent, activities, health, deliveryStates, launchStates, justLaunched, setJustLaunched, permissionPrompts, respondToPrompt, interruptSession, agentConfigs, requestAgentConfig, setAgentModel, setAgentPermissionMode, setAntigravityMode, setCodexConfig, newThread, openPanel, requestChatList, switchChat, newChat, chatLists, requestThreadList, switchThread, threadLists, switchWorkspace, requestTerminalOutput, terminalOutputs, requestFileChanges, fileChanges, sendAttachment, send, sendToSession, steerMessage, discardQueuedMessage, editQueuedMessage, queuedMessages, launchSession, resumeSession, closeSession, activeSessionRef, workspaces, branchLists, requestBranchList, switchBranch, createBranch, skillLists, requestSkillList, controlResults, directoryListings, requestDirectoryListing, fileContents, requestFileContent, requestHistory } = useRelay();
+  const { sessions, messages, connected, unread, setUnread, thinking, thinkingContent, activities, health, deliveryStates, launchStates, justLaunched, setJustLaunched, permissionPrompts, respondToPrompt, errorPrompts, respondToErrorPrompt, interruptSession, agentConfigs, requestAgentConfig, setAgentModel, setAgentPermissionMode, setAutoApprovePermissions, setAntigravityMode, setCodexConfig, newThread, openPanel, requestChatList, switchChat, newChat, chatLists, requestThreadList, switchThread, threadLists, switchWorkspace, requestTerminalOutput, terminalOutputs, requestFileChanges, fileChanges, sendAttachment, send, sendToSession, steerMessage, discardQueuedMessage, editQueuedMessage, queuedMessages, launchSession, resumeSession, closeSession, activeSessionRef, workspaces, branchLists, requestBranchList, switchBranch, createBranch, skillLists, requestSkillList, automationViews, showCodexAutomation, controlResults, directoryListings, requestDirectoryListing, fileContents, requestFileContent, requestHistory } = useRelay();
   const [activeSession, setActiveSession] = useState(null);
   const [drafts, setDrafts]             = useState({});
   const [draftFiles, setDraftFiles]     = useState({});
@@ -2160,6 +2611,14 @@ function App() {
     if (activeSession) requestAgentConfig(activeSession);
   }, [activeSession]);
 
+  // Full transcript history is loaded lazily for the selected session only.
+  // Fetching every session on reconnect can flood the browser with large
+  // histories and cause missed WebSocket heartbeats.
+  useEffect(() => {
+    if (!activeSession || !connected) return;
+    requestHistory(activeSession);
+  }, [activeSession, connected]);
+
   // Clear stop-pending when the agent stops thinking
   useEffect(() => {
     setStopPending(prev => {
@@ -2267,6 +2726,7 @@ async function uploadBinaryDraft(sessionId, base64, mimeType, filename) {
   function selectSession(id, sessionMeta) {
     setActiveSession(id);
     activeSessionRef.current = id;
+    requestHistory(id);
     setUnread(prev => ({ ...prev, [id]: 0 }));
     setSidebarOpen(false);
     setShowSlashMenu(false);
@@ -2429,10 +2889,21 @@ async function uploadBinaryDraft(sessionId, base64, mimeType, filename) {
   const currentInput    = activeSession ? (drafts[activeSession] || '') : '';
   const attachedFiles   = activeSession ? (draftFiles[activeSession] || []) : [];
   const rawCurrentMessages = messages[activeSession] || [];
-  const draftBaseline = activeSession ? (draftMessageBaselines[activeSession] || 0) : 0;
+  const draftBaseline = activeSession && pendingDraftThreads[activeSession]
+    ? (draftMessageBaselines[activeSession] || 0)
+    : 0;
   const currentMessages = rawCurrentMessages.slice(Math.min(draftBaseline, rawCurrentMessages.length));
   const activePrompt    = activeSession ? permissionPrompts[activeSession] || null : null;
-  const canSend         = !!(currentInput.trim() || attachedFiles.length > 0) && !!activeSession && connected && !uploading && !activePrompt;
+  const activeErrorPrompt = activeSession ? errorPrompts[activeSession] || null : null;
+  const activeBlockingErrorPrompt = isBlockingErrorPrompt(activeErrorPrompt) ? activeErrorPrompt : null;
+  const activeInlineErrorPrompt = activeErrorPrompt && !isBlockingErrorPrompt(activeErrorPrompt) ? activeErrorPrompt : null;
+  const activeBlockingPrompt = activePrompt || activeBlockingErrorPrompt;
+  const activeBlockingPromptLabel = activePrompt
+    ? 'Permission required'
+    : activeBlockingErrorPrompt
+      ? safeString(activeBlockingErrorPrompt.title, 'Action required')
+      : null;
+  const canSend         = !!(currentInput.trim() || attachedFiles.length > 0) && !!activeSession && connected && !uploading && !activeBlockingPrompt;
   const unreadTotal     = Object.values(unread).reduce((a, b) => a + b, 0);
   const slashQuery      = currentInput.startsWith('/') ? currentInput.slice(1).trim().toLowerCase() : '';
   const filteredSlashCommands = currentInput.startsWith('/')
@@ -2444,6 +2915,7 @@ async function uploadBinaryDraft(sessionId, base64, mimeType, filename) {
   const activeSessionMeta = orderedSessions.find(s =>
     sessionIdOf(s) === activeSession
   );
+  const autoExpandLongCodeBlocks = activeSessionMeta?.agent_type === 'antigravity' || activeSessionMeta?.agent_type === 'antigravity_panel';
   const visiblePaneSession = activeSessionMeta ? findVisiblePaneSession(orderedSessions, activeSessionMeta) : null;
   const codexWorkbenchPaneSummary = activeSessionMeta?.agent_type === 'codex' && activeSessionMeta?.visible_pane_visible
     ? {
@@ -2481,6 +2953,7 @@ async function uploadBinaryDraft(sessionId, base64, mimeType, filename) {
   );
   const activeLabel = activeSession ? sessionLabel(activeSessionMeta, activeSession) : 'Agent Chat';
   const activeAgent = sessionAgent(activeSessionMeta || activeSession, activeConfig);
+  const activeAutomationView = activeSession ? automationViews[activeSession] : null;
   const activeLooksLikeCodex = activeAgent?.name === 'Codex' || /^Codex\b/.test(activeLabel || '');
   const showVisiblePaneBanner = !!(
     activeLooksLikeCodex
@@ -2556,6 +3029,12 @@ async function uploadBinaryDraft(sessionId, base64, mimeType, filename) {
         ? activities[activeSession]
         : (activeSessionMeta && typeof activeSessionMeta === 'object' ? activeSessionMeta.activity : null))
     : null;
+  const activeContextCard = activeActivity?.context_card || null;
+  const showLastUserBanner = !!(
+    activeSession
+    && lastUserText
+    && !((activeSessionMeta?.agent_type === 'cline' || activeSessionMeta?.agent_type === 'roo_code') && activeContextCard)
+  );
   const assistantMonospace = activeSessionMeta?.agent_type === 'codex';
   const lastAssistantMsg = [...currentMessages].reverse().find(m => m.role === 'assistant');
   const liveThinkingText = activeSession ? (thinkingContent[activeSession] || '').trim() : '';
@@ -2758,7 +3237,8 @@ async function uploadBinaryDraft(sessionId, base64, mimeType, filename) {
                 isActive={id === activeSession}
                 agentConfig={agentConfigs[id] || null}
                 activity={activities[id] || null}
-                hasPermissionPrompt={!!permissionPrompts[id]}
+                hasBlockingPrompt={!!permissionPrompts[id] || !!isBlockingErrorPrompt(errorPrompts[id])}
+                blockingPromptLabel={permissionPrompts[id] ? 'Permission required' : (errorPrompts[id]?.title || 'Action required')}
                 onSelect={() => selectSession(id, s)}
                 onClose={() => {
                   const isDisconnected = health[id] === 'disconnected' || !health[id];
@@ -2935,6 +3415,11 @@ async function uploadBinaryDraft(sessionId, base64, mimeType, filename) {
                       changes
                     </button>
                   )}
+                  {activeAutomationView?.visible && (
+                    <span className="context-pill ok" title={activeAutomationView.title || 'Automation'}>
+                      automation
+                    </span>
+                  )}
                   {activeConfig?.capabilities?.file_browser && (
                     <button
                       className={`context-pill files-toggle${showFileBrowser ? ' active' : ''}`}
@@ -2979,7 +3464,16 @@ async function uploadBinaryDraft(sessionId, base64, mimeType, filename) {
 
         {activeActivity?.task_list && (
           <div className="session-tasklist-strip">
-            <TaskList taskList={activeActivity.task_list} />
+            <TaskList taskList={activeActivity.task_list} sessionId={activeSession} />
+          </div>
+        )}
+
+        {(activeSessionMeta?.agent_type === 'cline' || activeSessionMeta?.agent_type === 'roo_code') && activeContextCard && (
+          <div className={`cline-context-strip ${activeSessionMeta?.agent_type === 'roo_code' ? 'roo-context-strip' : ''}`}>
+            <ClineContextCard
+              card={activeContextCard}
+              tone={activeSessionMeta?.agent_type === 'roo_code' ? 'roo' : 'cline'}
+            />
           </div>
         )}
 
@@ -3023,7 +3517,7 @@ async function uploadBinaryDraft(sessionId, base64, mimeType, filename) {
             }}
           />
         )}
-        <div className="messages-wrap" style={showFileBrowser ? { display: 'none' } : undefined}>
+        <div className={`messages-wrap${activeAutomationView?.visible ? ' has-automation-pane' : ''}`} style={showFileBrowser ? { display: 'none' } : undefined}>
         {showDesktopThreadTabs && (
           <ThreadTabsBar
             threads={desktopThreadTabs}
@@ -3038,7 +3532,7 @@ async function uploadBinaryDraft(sessionId, base64, mimeType, filename) {
             }}
           />
         )}
-        {activeSession && lastUserText && (
+        {showLastUserBanner && (
           <div className="last-user-banner" title={lastUserText}>
             <span className="last-user-banner-icon">↵</span>
             <span className="last-user-banner-text">{lastUserText}</span>
@@ -3074,6 +3568,13 @@ async function uploadBinaryDraft(sessionId, base64, mimeType, filename) {
               prompt={activePrompt}
               sessionId={activeSession}
               onRespond={respondToPrompt}
+            />
+          )}
+          {activeBlockingErrorPrompt && !activePrompt && (
+            <ErrorPromptOverlay
+              prompt={activeBlockingErrorPrompt}
+              sessionId={activeSession}
+              onRespond={respondToErrorPrompt}
             />
           )}
           {(activeSessionMeta?.rate_limit_active || (activeSessionMeta?.percent_used != null && activeSessionMeta.percent_used >= 80)) && (
@@ -3112,7 +3613,7 @@ async function uploadBinaryDraft(sessionId, base64, mimeType, filename) {
                 onClick={() => handleNewThread(activeSession)}
               >+ New Thread</button>
             </div>
-          ) : (activeSessionMeta?.is_list_view && chatLists[activeSession]?.length > 0) ? (
+          ) : currentMessages.length === 0 && activeSessionMeta?.is_list_view && chatLists[activeSession]?.length > 0 ? (
             <div className="thread-picker-empty">
               <div className="thread-picker-header">Select a conversation or type a new message</div>
               <div className="thread-picker-list">
@@ -3173,7 +3674,7 @@ async function uploadBinaryDraft(sessionId, base64, mimeType, filename) {
                       <span>{activeAgent.name}</span>
                       {timestampLabel && <span className="message-timestamp">{timestampLabel}</span>}
                     </div>
-                    <MarkdownContent content={normalizeMessageContent(msg.content)} monospace={assistantMonospace} onOpenPath={(path) => openTranscriptPreview(messageKey, path)} />
+                    <MarkdownContent content={normalizeMessageContent(msg.content)} monospace={assistantMonospace} autoExpandLongCodeBlocks={autoExpandLongCodeBlocks} onOpenPath={(path) => openTranscriptPreview(messageKey, path)} />
                     {transcriptPreview?.sessionId === activeSession && transcriptPreview?.messageKey === messageKey && (
                       <TranscriptInlineFilePreview
                         sessionId={transcriptPreview.sessionId}
@@ -3201,7 +3702,7 @@ async function uploadBinaryDraft(sessionId, base64, mimeType, filename) {
               </div>
               <div className="assistant-content">
                 <div className="message-role"><span>{activeAgent.name}</span></div>
-                <MarkdownContent content={liveThinkingText} monospace={assistantMonospace} onOpenPath={(path) => openTranscriptPreview('live-draft', path)} />
+                <MarkdownContent content={liveThinkingText} monospace={assistantMonospace} autoExpandLongCodeBlocks={autoExpandLongCodeBlocks} onOpenPath={(path) => openTranscriptPreview('live-draft', path)} />
               </div>
             </div>
           )}
@@ -3210,6 +3711,13 @@ async function uploadBinaryDraft(sessionId, base64, mimeType, filename) {
             thinkingText={activeSession ? (thinkingContent[activeSession] || '') : ''}
             isClaude
           />}
+          {activeInlineErrorPrompt && !activePrompt && (
+            <ErrorPromptInline
+              prompt={activeInlineErrorPrompt}
+              sessionId={activeSession}
+              onRespond={respondToErrorPrompt}
+            />
+          )}
           <div ref={messagesEndRef} />
         </div>
         {activeActivity && !activeActivity?.task_list && !showInlineClaudeActivity && <ActivityRow
@@ -3218,6 +3726,10 @@ async function uploadBinaryDraft(sessionId, base64, mimeType, filename) {
           isClaude={activeSessionMeta?.agent_type === 'claude'}
           pinned
         />}
+        <CodexAutomationPane
+          view={activeAutomationView}
+          onShow={() => activeSession && showCodexAutomation(activeSession)}
+        />
         </div>
 
         {showSettings && activeSession && (
@@ -3227,6 +3739,7 @@ async function uploadBinaryDraft(sessionId, base64, mimeType, filename) {
             onRequestRefresh={requestAgentConfig}
             onSetModel={(sid, modelId) => setAgentModel(sid, modelId)}
             onSetPermissionMode={(sid, mode) => setAgentPermissionMode(sid, mode)}
+            onSetAutoApprovePermissions={(sid, enabled) => setAutoApprovePermissions(sid, enabled)}
             onSetMode={(sid, mode) => setAntigravityMode && setAntigravityMode(sid, mode)}
             onSetCodexConfig={(updates) => setCodexConfig(activeSession, updates)}
             onSwitchWorkspace={(sid, folderPath) => switchWorkspace(sid, folderPath)}
@@ -3293,7 +3806,7 @@ async function uploadBinaryDraft(sessionId, base64, mimeType, filename) {
         )}
 
         <div className="input-area" style={showFileBrowser ? { display: 'none' } : undefined}>
-          <label className={`attach-btn ${!activeSession || !connected || !!activePrompt ? 'disabled' : ''}`} title="Attach file">
+          <label className={`attach-btn ${!activeSession || !connected || !!activeBlockingPrompt ? 'disabled' : ''}`} title="Attach file">
             <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
               <path d="M21.44 11.05l-9.19 9.19a6 6 0 0 1-8.49-8.49l9.19-9.19a4 4 0 0 1 5.66 5.66l-9.2 9.19a2 2 0 0 1-2.83-2.83l8.49-8.48" />
             </svg>
@@ -3303,7 +3816,7 @@ async function uploadBinaryDraft(sessionId, base64, mimeType, filename) {
               multiple
               ref={fileInputRef}
               onChange={handleFileSelect}
-              disabled={!activeSession || !connected || !!activePrompt}
+              disabled={!activeSession || !connected || !!activeBlockingPrompt}
             />
           </label>
 
@@ -3354,12 +3867,12 @@ async function uploadBinaryDraft(sessionId, base64, mimeType, filename) {
                 onChange={e => updateInput(e.target.value)}
                 onKeyDown={onKeyDown}
                 onPaste={handlePaste}
-                placeholder={activePrompt
-                  ? 'Resolve the permission prompt above to continue'
+                placeholder={activeBlockingPrompt
+                  ? `Resolve the ${activePrompt ? 'permission prompt' : 'error prompt'} above to continue`
                   : activeSession
                     ? (window.innerWidth < 600 ? 'Enter message…' : 'Message… (/ for commands)')
                     : 'Select a session'}
-                disabled={!activeSession || !connected || !!activePrompt}
+                disabled={!activeSession || !connected || !!activeBlockingPrompt}
                 rows={1}
               />
               <div className="textarea-btns">
@@ -3433,11 +3946,22 @@ async function uploadBinaryDraft(sessionId, base64, mimeType, filename) {
               </div>
             </div>
             <div className="composer-meta">
-              {activeSessionMeta?.agent_type === 'continue' && activeConfig?.mode && activeConfig.mode !== 'unknown' && (
+              {(isContinueLikeAgentType(activeSessionMeta?.agent_type) || isClineLikeAgentType(activeSessionMeta?.agent_type)) && activeConfig?.mode && activeConfig.mode !== 'unknown' && (
                 <span className="composer-hint" style={{ color: '#d29922' }}>{activeConfig.mode}</span>
               )}
-              {activeSessionMeta?.agent_type === 'continue' && activeConfig?.model_id && activeConfig.model_id !== 'unknown' && (
+              {(isContinueLikeAgentType(activeSessionMeta?.agent_type) || isClineLikeAgentType(activeSessionMeta?.agent_type)) && activeConfig?.model_id && activeConfig.model_id !== 'unknown' && (
                 <span className="composer-hint" style={{ color: '#d29922' }}>{activeConfig.model_id}</span>
+              )}
+              {(activeSessionMeta?.agent_type === 'antigravity' || activeSessionMeta?.agent_type === 'antigravity_panel') && (
+                Array.isArray(activeSessionMeta?.antigravity_quota_models) && activeSessionMeta.antigravity_quota_models.length > 0 ? (
+                  <span className="composer-hint" style={{ color: '#8b949e' }}>
+                    {formatAntigravityQuotaSummary(activeSessionMeta.antigravity_quota_models, 4)}
+                  </span>
+                ) : activeSessionMeta?.percent_used != null ? (
+                  <span className="composer-hint" style={{ color: activeSessionMeta.percent_used >= 90 ? '#f85149' : activeSessionMeta.percent_used >= 75 ? '#d29922' : '#8b949e' }}>
+                    Quota {activeSessionMeta.percent_used}%{activeSessionMeta?.rate_limited_until && activeSessionMeta.rate_limited_until !== 'unknown' ? ` · ${activeSessionMeta.rate_limited_until}` : ''}
+                  </span>
+                ) : null
               )}
               <span className="composer-hint">Enter send</span>
               <span className="composer-hint">Shift+Enter newline</span>
@@ -3456,12 +3980,10 @@ async function uploadBinaryDraft(sessionId, base64, mimeType, filename) {
                       value={activeConfig?.model_id || 'default'}
                       onChange={e => setAgentModel(activeSession, e.target.value)}
                     >
-                      {((activeSessionMeta?.agent_type === 'antigravity' || activeSessionMeta?.agent_type === 'antigravity_panel') ? KNOWN_ANTIGRAVITY_MODELS
-                        : activeSessionMeta?.agent_type === 'gemini' ? KNOWN_GEMINI_MODELS
-                        : KNOWN_CLAUDE_MODELS).map(m => (
+                      {composerModelOptionsFor(activeSessionMeta?.agent_type, activeConfig).map(m => (
                         <option key={m.id} value={m.id}>{m.label}</option>
                       ))}
-                      {activeSessionMeta?.agent_type !== 'antigravity' && activeSessionMeta?.agent_type !== 'antigravity_panel' && activeSessionMeta?.agent_type !== 'gemini' && activeConfig?.model_id && !(KNOWN_CLAUDE_MODELS).some(m => m.id === activeConfig.model_id) && activeConfig.model_id !== 'unknown' && (
+                      {!composerModelOptionsFor(activeSessionMeta?.agent_type, activeConfig).some(m => m.id === activeConfig.model_id) && activeConfig?.model_id && activeConfig.model_id !== 'unknown' && (
                         <option value={activeConfig.model_id}>{activeConfig.model_id}</option>
                       )}
                     </select>
@@ -3481,20 +4003,51 @@ async function uploadBinaryDraft(sessionId, base64, mimeType, filename) {
                     </select>
                   </label>
                 )}
+                {isClineLikeAgentType(activeSessionMeta?.agent_type) && activeConfig?.capabilities?.set_mode && modeOptionsFor(activeSessionMeta?.agent_type, activeConfig).length > 0 && (
+                  <label className="composer-setting-label">
+                    <span className="composer-setting-key">Mode</span>
+                    <select
+                      className="composer-setting-select"
+                      value={activeConfig?.mode || modeOptionsFor(activeSessionMeta?.agent_type, activeConfig)[0]?.id || 'unknown'}
+                      onChange={e => setAntigravityMode(activeSession, e.target.value)}
+                    >
+                      {modeOptionsFor(activeSessionMeta?.agent_type, activeConfig).map(m => (
+                        <option key={m.id} value={m.id}>{m.label}</option>
+                      ))}
+                      {activeConfig?.mode && activeConfig.mode !== 'unknown' && !modeOptionsFor(activeSessionMeta?.agent_type, activeConfig).some(m => m.id === activeConfig.mode) && (
+                        <option value={activeConfig.mode}>{activeConfig.mode}</option>
+                      )}
+                    </select>
+                  </label>
+                )}
                 {activeConfig?.capabilities?.permission_mode_change && (
                   <select
                     className="composer-setting-select"
-                    value={activeConfig.permission_mode || 'default'}
+                    value={activeConfig.permission_mode || defaultPermissionModeFor(activeSessionMeta?.agent_type)}
                     onChange={e => setAgentPermissionMode(activeSession, e.target.value)}
                     title="Permission mode"
                   >
-                    {PERMISSION_MODES[activeSessionMeta?.agent_type || 'claude']?.map(m => (
+                    {permissionModeOptionsFor(activeSessionMeta?.agent_type || 'claude', activeConfig).map(m => (
                       <option key={m.value} value={m.value}>{m.label}</option>
                     ))}
-                    {activeConfig.permission_mode && !PERMISSION_MODES[activeSessionMeta?.agent_type]?.some(m => m.value === activeConfig.permission_mode) && activeConfig.permission_mode !== 'unknown' && (
+                    {activeConfig.permission_mode && !permissionModeOptionsFor(activeSessionMeta?.agent_type, activeConfig).some(m => m.value === activeConfig.permission_mode) && activeConfig.permission_mode !== 'unknown' && (
                       <option value={activeConfig.permission_mode}>{activeConfig.permission_mode}</option>
                     )}
                   </select>
+                )}
+                {activeConfig?.capabilities?.auto_approve_permissions_toggle && (
+                  <label className="composer-setting-toggle" title="Automatically approve permission prompts for this session">
+                    <input
+                      type="checkbox"
+                      checked={
+                        typeof activeConfig?.auto_approve_permissions === 'boolean'
+                          ? activeConfig.auto_approve_permissions
+                          : !!activeSessionMeta?.auto_approve_permissions
+                      }
+                      onChange={e => setAutoApprovePermissions(activeSession, e.target.checked)}
+                    />
+                    <span>Auto-approve prompts</span>
+                  </label>
                 )}
                 {activeConfig?.capabilities?.set_codex_config && (
                   <>
@@ -3520,6 +4073,19 @@ async function uploadBinaryDraft(sessionId, base64, mimeType, filename) {
                       {(activeConfig.available_efforts || []).map(m => (
                         <option key={m.id} value={m.id}>{m.label}</option>
                       ))}
+                    </select>
+                    <select
+                      className="composer-setting-select"
+                      value={(activeConfig.speed || 'standard').toLowerCase()}
+                      onChange={e => setCodexConfig(activeSession, { speed: e.target.value })}
+                      title="Speed"
+                    >
+                      {(activeConfig.available_speeds || []).map(m => (
+                        <option key={m.id} value={m.id}>{m.label}</option>
+                      ))}
+                      {activeConfig.speed && !(activeConfig.available_speeds || []).some(m => m.id === activeConfig.speed) && activeConfig.speed !== 'unknown' && (
+                        <option value={activeConfig.speed}>{activeConfig.speed}</option>
+                      )}
                     </select>
                     <select
                       className="composer-setting-select"
