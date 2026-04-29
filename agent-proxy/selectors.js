@@ -1453,6 +1453,129 @@ const CODEX_READ_EXPR = `
       return diffLines.length > 0 ? diffLines.join('\\n') : '';
     }
 
+    function _looksLikePathText(value) {
+      var text = String(value || '').trim();
+      return !!text && (/[\\\\/]/.test(text) || /\\.[A-Za-z0-9]{1,8}$/.test(text));
+    }
+
+    function _parseStatText(value) {
+      var text = String(value || '').replace(/\\s+/g, '').trim();
+      var both = text.match(/^\\+(\\d+)-(\\d+)$/);
+      if (both) return { adds: parseInt(both[1], 10) || 0, dels: parseInt(both[2], 10) || 0 };
+      var plus = text.match(/^\\+(\\d+)$/);
+      if (plus) return { adds: parseInt(plus[1], 10) || 0, dels: null };
+      var minus = text.match(/^-(\\d+)$/);
+      if (minus) return { adds: null, dels: parseInt(minus[1], 10) || 0 };
+      return null;
+    }
+
+    function _extractFileChangeSummaryCards(container) {
+      if (!container || !container.querySelectorAll) return [];
+      var candidates = Array.from(container.querySelectorAll('[class*="rounded-xl"], .mt-3'))
+        .filter(function(card) {
+          var t = (card.innerText || card.textContent || '').trim();
+          return /^\\d+\\s+files?\\s+changed/i.test(t);
+        });
+      candidates = candidates.filter(function(card) {
+        return !candidates.some(function(other) { return other !== card && card.contains(other); });
+      });
+
+      var seen = {};
+      var blocks = [];
+      candidates.forEach(function(card) {
+        var spans = Array.from(card.querySelectorAll('span'))
+          .map(function(sp) { return (sp.innerText || sp.textContent || '').trim(); })
+          .filter(Boolean);
+        var headerIdx = spans.findIndex(function(t) { return /^\\d+\\s+files?\\s+changed/i.test(t); });
+        if (headerIdx < 0) {
+          var first = (card.innerText || '').split('\\n').map(function(t) { return t.trim(); }).find(Boolean) || '';
+          if (/^\\d+\\s+files?\\s+changed/i.test(first)) {
+            spans.unshift(first);
+            headerIdx = 0;
+          }
+        }
+        if (headerIdx < 0) return;
+
+        var header = spans[headerIdx].replace(/\\s+/g, ' ').trim();
+        var totals = [];
+        for (var si = headerIdx + 1; si < spans.length && totals.length < 2; si++) {
+          if (/^[+-]\\d+$/.test(spans[si])) totals.push(spans[si]);
+        }
+        var lines = [header + (totals.length === 2 ? ' ' + totals[0] + ' ' + totals[1] : '')];
+
+        var entries = [];
+        for (var idx = headerIdx + 1; idx < spans.length; idx++) {
+          var current = spans[idx];
+          if (!current || /^(Undo|Review)$/i.test(current) || /^[+-]\\d+$/.test(current) || /^\\+\\d+-\\d+$/.test(current)) continue;
+          if (!_looksLikePathText(current)) continue;
+
+          var path = current;
+          if (!/[\\\\/]/.test(path) && idx + 1 < spans.length && _looksLikePathText(spans[idx + 1]) && /[\\\\/]/.test(spans[idx + 1])) {
+            path = spans[idx + 1];
+            idx++;
+          }
+
+          var adds = null;
+          var dels = null;
+          for (var sj = idx + 1; sj < spans.length && sj <= idx + 5; sj++) {
+            var stat = _parseStatText(spans[sj]);
+            if (!stat) continue;
+            if (stat.adds != null && stat.dels != null) { adds = stat.adds; dels = stat.dels; break; }
+            if (stat.adds != null && adds == null) adds = stat.adds;
+            if (stat.dels != null && dels == null) dels = stat.dels;
+            if (adds != null && dels != null) break;
+          }
+          if (adds == null || dels == null) continue;
+          var key = path + ':' + adds + ':' + dels;
+          if (entries.indexOf(key) !== -1) continue;
+          entries.push(key);
+          lines.push(path + ' +' + adds + ' -' + dels);
+        }
+
+        var block = lines.join('\\n');
+        if (!seen[block]) {
+          seen[block] = true;
+          blocks.push(block);
+        }
+      });
+      return blocks;
+    }
+
+    function _extractCompletedTaskText(container, statusText) {
+      if (!container || !container.querySelectorAll) return '';
+      var hosts = Array.from(container.querySelectorAll('[class*="_markdownContent"], [class*="markdownContent"], [data-selected-text-overlay-target]'));
+      var parts = [];
+      hosts.forEach(function(host) {
+        var t = (host.innerText || host.textContent || '').trim();
+        if (t && parts.indexOf(t) === -1) parts.push(t);
+      });
+      if (parts.length === 0) return '';
+
+      var status = String(statusText || '').replace(/\\s+/g, ' ').trim();
+      var text = parts.join('\\n\\n');
+      var lines = text.split('\\n');
+      var kept = [];
+      for (var i = 0; i < lines.length; i++) {
+        var line = String(lines[i] || '').trim();
+        if (!line) {
+          if (kept.length > 0 && kept[kept.length - 1] !== '') kept.push('');
+          continue;
+        }
+        if (status && line.replace(/\\s+/g, ' ').trim() === status) continue;
+        if (/^\\d{1,2}:\\d{2}\\s*(AM|PM)$/i.test(line)) continue;
+        if (/^\\d+\\s+previous\\s+messages$/i.test(line)) continue;
+        if (/^(Undo|Review|Copy|Fork)$/i.test(line)) continue;
+        if (/^\\d+\\s+files?\\s+changed/i.test(line)) continue;
+        if (/^[+-]\\d+$/.test(line) || /^\\+\\d+-\\d+$/.test(line)) continue;
+        kept.push(line);
+      }
+      while (kept.length > 0 && kept[0] === '') kept.shift();
+      while (kept.length > 0 && kept[kept.length - 1] === '') kept.pop();
+      var cleaned = kept.join('\\n').trim();
+      if (!cleaned || cleaned.length > 8000) return '';
+      return cleaned;
+    }
+
     var items = allItems;
     for (var i = 0; i < items.length; i++) {
       var el = items[i];
@@ -1510,7 +1633,12 @@ const CODEX_READ_EXPR = `
       // "Worked for Xs" — marks end of a turn, flush accumulated content first
       var statusBtn = el.querySelector('button[aria-expanded]');
       if (statusBtn && /Worked for/i.test(statusBtn.textContent)) {
-        pendingAssistant.push((statusBtn.textContent || '').trim());
+        var workedText = (statusBtn.textContent || '').trim();
+        pendingAssistant.push(workedText);
+        var completedText = _extractCompletedTaskText(el, workedText);
+        if (completedText) pendingAssistant.push(completedText);
+        var completedFileSummaries = _extractFileChangeSummaryCards(el);
+        completedFileSummaries.forEach(function(block) { pendingAssistant.push(block); });
         flushAssistant();
         continue;
       }
@@ -1556,6 +1684,17 @@ const CODEX_READ_EXPR = `
         // Include any visible output below the "Ran" header
         var ranOutput = text.split('\\n').slice(1).join('\\n').trim();
         pendingAssistant.push('[Bash ' + ranLine + ']\\n' + (ranOutput || 'Command completed') + '\\n[end]');
+        continue;
+      }
+
+      // Completed task summary cards ("N files changed +A -D" with per-file rows).
+      // These are separate Codex UI cards, not normal markdown, and should render
+      // as WebUI file-change summaries instead of loose Edit blocks.
+      var fileChangeSummaries = _extractFileChangeSummaryCards(el);
+      if (fileChangeSummaries.length > 0) {
+        var completedSummaryText = _extractCompletedTaskText(el, '');
+        if (completedSummaryText) pendingAssistant.push(completedSummaryText);
+        fileChangeSummaries.forEach(function(block) { pendingAssistant.push(block); });
         continue;
       }
 
@@ -3011,33 +3150,46 @@ async function readRooCodeMessages(Runtime, sessionId) {
       var subagentGroups = extractSubagentRows();
       if (subagentGroups.length) {
         subagentGroups.forEach(function(g) {
+          var isRunning = g.items.some(function(it) { return it.status === 'running'; });
+          // While the group is running, Cline pins the card to the bottom
+          // of the chat (subsequent inner tool calls collapse into it).
+          // Mirror that on the WebUI by re-stamping the ts past the latest
+          // message so the block sorts to the end. Once every card is
+          // done/failed, settle back to the real start ts.
+          var startTs = g.ts ? Number(g.ts) : null;
+          var effectiveTs = startTs;
+          if (isRunning) {
+            var maxTs = 0;
+            for (var ti = 0; ti < msgs.length; ti++) {
+              var mt = Number(msgs[ti].ts || 0);
+              if (mt > maxTs) maxTs = mt;
+            }
+            effectiveTs = Math.max(startTs || 0, maxTs) + 1;
+          }
           var payload = JSON.stringify({ title: g.title, items: g.items });
           var content = '~~~subagents\\n' + payload + '\\n~~~';
-          var newMsg = { role: 'assistant', content: content, ts: g.ts || null, type: 'subagents' };
-          // Drop any prior message that represents this same subagent row:
-          //   - the react walker's "subagent" JSON snapshot (matched by ts)
-          //   - any plain-text dump containing the group's stats markers
+          var newMsg = { role: 'assistant', content: content, ts: effectiveTs, type: 'subagents' };
           var dropMarkers = g.items.map(function(it) { return it.stats || ''; }).filter(Boolean);
           var insertIdx = -1;
           for (var mi = msgs.length - 1; mi >= 0; mi--) {
             var m = msgs[mi];
             if (m.role !== 'assistant') continue;
-            var sameTs = g.ts && m.ts && Number(m.ts) === Number(g.ts);
+            var sameStartTs = startTs != null && m.ts != null && Number(m.ts) === startTs;
             var statsHit = dropMarkers.length && dropMarkers.every(function(mk) {
               return m.content && m.content.indexOf(mk) !== -1;
             });
-            if (sameTs || statsHit) {
+            if (sameStartTs || statsHit) {
               if (insertIdx === -1) insertIdx = mi;
               msgs.splice(mi, 1);
             }
           }
-          if (insertIdx === -1) {
-            // Find ts-ordered insertion point so the group appears in the
-            // correct position in the timeline rather than at the end.
-            if (g.ts != null) {
+          if (isRunning) {
+            insertIdx = msgs.length;
+          } else if (insertIdx === -1) {
+            if (startTs != null) {
               for (var k = 0; k < msgs.length; k++) {
-                var mt = Number(msgs[k].ts || 0);
-                if (mt && mt > Number(g.ts)) { insertIdx = k; break; }
+                var mt2 = Number(msgs[k].ts || 0);
+                if (mt2 && mt2 > startTs) { insertIdx = k; break; }
               }
             }
             if (insertIdx === -1) insertIdx = msgs.length;

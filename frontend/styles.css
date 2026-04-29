@@ -2435,6 +2435,46 @@ mark.code-search-mark.current {
   overflow: hidden;
 }
 
+/* ── Cline / Roo task completed callout ─────────────────────────────────── */
+.task-completed-section {
+  margin: 8px 0;
+  border: 1px solid rgba(78, 201, 176, 0.35);
+  border-radius: 8px;
+  background: rgba(78, 201, 176, 0.08);
+  padding: 8px 12px 12px;
+}
+.task-completed-header {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  font-weight: 700;
+  color: var(--green, #4ec9b0);
+  margin-bottom: 8px;
+  padding-bottom: 6px;
+  border-bottom: 1px solid rgba(78, 201, 176, 0.18);
+  font-size: 13px;
+}
+.task-completed-icon {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 16px;
+  height: 16px;
+  font-size: 13px;
+  line-height: 1;
+}
+.task-completed-body > :first-child { margin-top: 0; }
+.task-completed-body > :last-child { margin-bottom: 0; }
+.task-completed-body ol,
+.task-completed-body ul { padding-left: 22px; }
+.task-completed-body li { margin: 4px 0; }
+.task-completed-body code {
+  background: rgba(255, 255, 255, 0.06);
+  padding: 1px 5px;
+  border-radius: 3px;
+  font-size: 0.9em;
+}
+
 /* ── Cline / Roo subagent cards ─────────────────────────────────────────── */
 .subagents-section {
   margin: 8px 0;

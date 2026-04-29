@@ -1015,6 +1015,27 @@ function renderSubagentsBlock(payload, index) {
   </section>`;
 }
 
+function extractTaskCompletedWrapper(content) {
+  // Cline/Roo emit "Task Completed\n\n<markdown body>" (sometimes with a
+  // trailing "HAS_CHANGES" sentinel). The IDE renders this as a green-bordered
+  // callout — we mirror that by extracting the body, rendering it as normal
+  // markdown, and wrapping the result.
+  const m = String(content || '').match(/^Task Completed\s*\n+([\s\S]*?)\s*$/);
+  if (!m) return { content, wrap: false };
+  let body = m[1].replace(/HAS_CHANGES\s*$/i, '').trimEnd();
+  return { content: body, wrap: true };
+}
+
+function wrapTaskCompletedHtml(innerHtml) {
+  return `<section class="task-completed-section">
+    <div class="task-completed-header">
+      <span class="task-completed-icon" aria-hidden="true">&#10003;</span>
+      <span class="task-completed-title">Task Completed</span>
+    </div>
+    <div class="task-completed-body">${innerHtml}</div>
+  </section>`;
+}
+
 function extractSubagentsBlocks(content) {
   // Replace each ~~~subagents\n{json}\n~~~ block with a placeholder so the
   // rest of the content can flow through the normal markdown pipeline. Returns
@@ -1030,6 +1051,8 @@ function extractSubagentsBlocks(content) {
 }
 
 function renderStructuredContent(content) {
+  const { content: stripped, wrap: wrapTaskCompleted } = extractTaskCompletedWrapper(content);
+  content = stripped;
   const { content: prepped, blocks: subagentBlocks } = extractSubagentsBlocks(content);
   content = prepped;
   const html = parseToolSections(content).map((chunk, index) => {
@@ -1104,6 +1127,7 @@ function renderStructuredContent(content) {
     tmp.insertBefore(bar, tmp.firstChild);
   }
 
+  if (wrapTaskCompleted) return wrapTaskCompletedHtml(tmp.innerHTML);
   return tmp.innerHTML;
 }
 
