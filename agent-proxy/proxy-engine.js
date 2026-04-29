@@ -2805,6 +2805,83 @@ class ProxyEngine extends EventEmitter {
     return left.startsWith(rightProbe) || right.startsWith(leftProbe);
   }
 
+  _extractToolBlocks(content) {
+    const text = this._messageContentText({ content });
+    const blocks = [];
+    const re = /\[([^\]\n]+)\]\n([\s\S]*?)\n?\[end\]/g;
+    let match;
+    while ((match = re.exec(text)) !== null) {
+      blocks.push({
+        raw: match[0],
+        name: String(match[1] || '').trim(),
+        body: String(match[2] || '').trim(),
+      });
+    }
+    return blocks;
+  }
+
+  _codexToolKey(block) {
+    if (!block || !block.name) return '';
+    const name = block.name.replace(/\s+/g, ' ').trim();
+    const bash = name.match(/^Bash\s+(.+)$/i);
+    if (bash) {
+      return `bash:${bash[1]
+        .replace(/\s+for\s+\d+(?:ms|s|m)\s*$/i, '')
+        .replace(/^Ran\s+/i, '')
+        .replace(/\s+/g, ' ')
+        .trim()
+        .toLowerCase()}`;
+    }
+    const edit = name.match(/^(Edit|Write|Read|Created|Deleted)\s+(.+)$/i);
+    if (edit) {
+      return `file:${edit[2].replace(/\s+/g, ' ').trim().toLowerCase()}`;
+    }
+    return '';
+  }
+
+  _isRicherCodexToolBody(previous, next) {
+    const prevBody = String(previous?.body || '').trim();
+    const nextBody = String(next?.body || '').trim();
+    if (!prevBody) return false;
+    if (!nextBody) return true;
+    const prevDiff = /(^|\n)(\+|-|@@)/.test(prevBody);
+    const nextDiff = /(^|\n)(\+|-|@@)/.test(nextBody);
+    if (prevDiff && !nextDiff) return true;
+    return prevBody.length > nextBody.length + 80;
+  }
+
+  _mergeCodexExpandedToolContent(previousMsg, nextMsg) {
+    if (!previousMsg || !nextMsg || previousMsg.role !== 'assistant' || nextMsg.role !== 'assistant') return nextMsg;
+    const previousContent = this._messageContentText(previousMsg);
+    const nextContent = this._messageContentText(nextMsg);
+    if (!previousContent || !nextContent || previousContent === nextContent) return nextMsg;
+
+    const previousBlocks = this._extractToolBlocks(previousContent);
+    const nextBlocks = this._extractToolBlocks(nextContent);
+    if (previousBlocks.length === 0 || nextBlocks.length === 0) return nextMsg;
+
+    const previousByKey = new Map();
+    for (const block of previousBlocks) {
+      const key = this._codexToolKey(block);
+      if (!key) continue;
+      const existing = previousByKey.get(key);
+      if (!existing || this._isRicherCodexToolBody(block, existing)) previousByKey.set(key, block);
+    }
+
+    let merged = nextContent;
+    let changed = false;
+    for (const block of nextBlocks) {
+      const key = this._codexToolKey(block);
+      const previous = key ? previousByKey.get(key) : null;
+      if (!previous || !this._isRicherCodexToolBody(previous, block)) continue;
+      merged = merged.replace(block.raw, previous.raw);
+      changed = true;
+    }
+
+    if (!changed) return nextMsg;
+    return { ...nextMsg, content: merged };
+  }
+
   _startHeartbeat() {
     this._stopHeartbeat();
     this.hbTimer = setInterval(() => {
@@ -4096,6 +4173,12 @@ class ProxyEngine extends EventEmitter {
               for (let k = 0; !skipUnstableNoOverlap && !session._forceHistoryResync && k < overlapLen; k++) {
                 const accIdx = acc.length - overlapLen + k;
                 const domIdx = k;
+                const mergedMsg = (session.agentType === 'codex' || session.agentType === 'codex-desktop')
+                  ? this._mergeCodexExpandedToolContent(acc[accIdx], dom[domIdx])
+                  : dom[domIdx];
+                if (mergedMsg !== dom[domIdx]) {
+                  dom[domIdx] = mergedMsg;
+                }
                 // Keep the longer version
                 if (this._messageContentText(dom[domIdx]).length > this._messageContentText(acc[accIdx]).length) {
                   acc[accIdx] = dom[domIdx];

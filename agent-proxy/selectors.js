@@ -67,6 +67,109 @@ const CODEX_FALLBACK = {
   input: '.ProseMirror, [contenteditable]',
 };
 
+function _codexToolBlock(name, body) {
+  const safeName = String(name || '').trim();
+  if (!safeName) return '';
+  const safeBody = String(body || '').trim();
+  return `[${safeName}]\n${safeBody ? safeBody + '\n' : ''}[end]`;
+}
+
+function _expandCodexCommandGroup(body) {
+  const lines = String(body || '').split('\n').map(line => String(line || '').trim()).filter(Boolean);
+  const blocks = [];
+  let current = null;
+  for (const line of lines) {
+    const ran = line.match(/^Ran\s+(.+)$/i);
+    if (ran) {
+      if (current) blocks.push(current);
+      current = { command: ran[1].trim(), body: [] };
+      continue;
+    }
+    if (current) current.body.push(line);
+  }
+  if (current) blocks.push(current);
+  if (blocks.length === 0) return null;
+  return blocks
+    .filter(block => block.command)
+    .map(block => _codexToolBlock(`Bash ${block.command}`, block.body.join('\n') || 'Command completed'))
+    .join('\n\n');
+}
+
+function _expandCodexCompactFileLines(text) {
+  const lines = String(text || '').split('\n');
+  const out = [];
+  for (let i = 0; i < lines.length; i++) {
+    const line = String(lines[i] || '');
+    const ran = line.trim().match(/^Ran\s+(.+)$/i);
+    if (ran && ran[1]) {
+      out.push(_codexToolBlock(`Bash ${ran[1].trim()}`, 'Command completed'));
+      continue;
+    }
+    const op = line.trim().match(/^(Created|Edited|Deleted) file$/i);
+    if (!op) {
+      out.push(line);
+      continue;
+    }
+    const file = String(lines[i + 1] || '').trim();
+    if (!file || file === '[end]' || /^\[/.test(file)) {
+      out.push(line);
+      continue;
+    }
+    i++;
+    const body = [`${op[1][0].toUpperCase()}${op[1].slice(1).toLowerCase()} file`];
+    while (i + 1 < lines.length) {
+      const next = String(lines[i + 1] || '').trim();
+      if (!next) break;
+      if (/^(Created|Edited|Deleted) file$/i.test(next)) break;
+      if (/^Ran\s+/i.test(next)) break;
+      if (/^\[end\]$/i.test(next)) break;
+      if (/^\[[^\]\n]+\]$/.test(next)) break;
+      body.push(next);
+      i++;
+    }
+    out.push(_codexToolBlock(`Edit ${file}`, body.join('\n')));
+  }
+  return out.join('\n');
+}
+
+function _expandCodexCompactActivities(content) {
+  let text = String(content || '');
+  text = text.replace(/\[Bash\s+\d+\s+commands?\]\n([\s\S]*?)\n?\[end\]/gi, (match, body) => {
+    return _expandCodexCommandGroup(body) || match;
+  });
+  const re = /\[[^\]\n]+\]\n[\s\S]*?\n?\[end\]/g;
+  let out = '';
+  let last = 0;
+  let match;
+  while ((match = re.exec(text)) !== null) {
+    out += _expandCodexCompactFileLines(text.slice(last, match.index));
+    out += match[0];
+    last = re.lastIndex;
+  }
+  out += _expandCodexCompactFileLines(text.slice(last));
+  return out;
+}
+
+function expandCodexMessagesRaw(raw) {
+  if (typeof raw !== 'string' || !raw.trim()) return raw;
+  try {
+    const messages = JSON.parse(raw);
+    if (!Array.isArray(messages)) return raw;
+    let changed = false;
+    for (const msg of messages) {
+      if (!msg || msg.role !== 'assistant' || typeof msg.content !== 'string') continue;
+      const next = _expandCodexCompactActivities(msg.content);
+      if (next !== msg.content) {
+        msg.content = next;
+        changed = true;
+      }
+    }
+    return changed ? JSON.stringify(messages) : raw;
+  } catch {
+    return raw;
+  }
+}
+
 // Gemini Code Assist (google.geminicodeassist extension)
 // Selectors confirmed from webview/app_bundle.js static analysis.
 // The UI is an Angular Material app. class names are stable Angular component selectors.
@@ -1441,7 +1544,7 @@ const CODEX_READ_EXPR = `
           }
           if (!outputEl) outputEl = el.querySelector('.overflow-hidden');
           var cmdOutput = outputEl ? (outputEl.innerText || '').trim() : '';
-          var block = '[Bash ' + cmdLine + ']\\n' + (cmdOutput || '') + '\\n[end]';
+          var block = '[Bash ' + cmdLine + ']\\n' + (cmdOutput || 'Command completed') + '\\n[end]';
           pendingAssistant.push(block);
         }
         continue;
@@ -1452,7 +1555,7 @@ const CODEX_READ_EXPR = `
         var ranLine = text.split('\\n')[0].trim().substring(4);
         // Include any visible output below the "Ran" header
         var ranOutput = text.split('\\n').slice(1).join('\\n').trim();
-        pendingAssistant.push('[Bash ' + ranLine + ']\\n' + (ranOutput || '') + '\\n[end]');
+        pendingAssistant.push('[Bash ' + ranLine + ']\\n' + (ranOutput || 'Command completed') + '\\n[end]');
         continue;
       }
 
@@ -1487,7 +1590,7 @@ const CODEX_READ_EXPR = `
               seenFiles[fname] = true;
               var diffContent = _extractDiffFromShadow(fileDiff);
               var block = '[Edit ' + fname + ']\\n';
-              if (diffContent) block += diffContent + '\\n';
+              block += (diffContent || 'Edited file') + '\\n';
               block += '[end]';
               pendingAssistant.push(block);
             }
@@ -1523,7 +1626,7 @@ const CODEX_READ_EXPR = `
         var diffContent = _extractDiffFromShadow(el);
         if (editName) {
           var block = '[Edit ' + editName + ']\\n';
-          if (diffContent) block += diffContent + '\\n';
+          block += (diffContent || 'Edited file') + '\\n';
           block += '[end]';
           pendingAssistant.push(block);
         }
@@ -1805,7 +1908,7 @@ const CODEX_DESKTOP_READ_EXPR = `
         var t = String(line || '').trim();
         return t && t !== first && /[A-Za-z0-9_./\\\\-]+\\.[A-Za-z0-9]+/.test(t);
       }) || 'file';
-      return '[Edit ' + target.trim() + ']\\n' + (rest || '') + '\\n[end]';
+      return '[Edit ' + target.trim() + ']\\n' + (rest || 'Edited file') + '\\n[end]';
     }
     // "Shell" header — Codex Desktop uses this for running/completed commands
     if (/^Shell$/i.test(first)) {
@@ -1850,6 +1953,8 @@ const CODEX_DESKTOP_READ_EXPR = `
     if (lines.length === 0) return [];
     function toolBlock(name, body) {
       var safeBody = typeof body === 'string' ? body.trim() : '';
+      if (!safeBody && /^Bash\\b/i.test(name)) safeBody = 'Command completed';
+      if (!safeBody && /^Edit\\b/i.test(name)) safeBody = 'Edited file';
       return '[' + name + ']\\n' + (safeBody ? safeBody + '\\n' : '') + '[end]';
     }
     var summary = lines[0];
@@ -1888,7 +1993,7 @@ const CODEX_DESKTOP_READ_EXPR = `
     }
     var first = lines.find(function(line) { return !!line; }) || '';
     if (/^Ran\\s+/i.test(first)) {
-      return '[Bash ' + first.replace(/^Ran\\s+/i, '').trim() + ']\\n[end]';
+      return '[Bash ' + first.replace(/^Ran\\s+/i, '').trim() + ']\\nCommand completed\\n[end]';
     }
     return '';
   }
@@ -1951,7 +2056,7 @@ async function readCodexMessages(Runtime, sessionId, usePageEval) {
     const raw = usePageEval
       ? await evalInPage(Runtime, CODEX_DESKTOP_READ_EXPR)
       : await evalInFrame(Runtime, CODEX_READ_EXPR);
-    if (raw !== null) { resetReadFailures(sessionId); return raw; }
+    if (raw !== null) { resetReadFailures(sessionId); return expandCodexMessagesRaw(raw); }
   } catch (e) {
     console.warn(`[${sessionId}] [sel] Codex read error: ${e.message}`);
   }
@@ -2876,19 +2981,81 @@ async function detectRooCodeThinking(Runtime) {
         if (style && (style.display === 'none' || style.visibility === 'hidden' || style.opacity === '0')) return false;
         return true;
       }
-      // Check for explicit stop button (visible while generating)
+      function btnText(b) {
+        return ((b.getAttribute('aria-label') || '') + ' ' + (b.textContent || '') + ' ' + (b.getAttribute('title') || '')).toLowerCase();
+      }
+
+      // 1. Explicit Stop button (top-level Generate-in-progress indicator).
       var stopBtn = d.querySelector('${ROO_CODE_PRIMARY.stopBtn}');
       if (stopBtn && isVisible(stopBtn)) {
         return JSON.stringify({ thinking: true, label: 'Generating' });
       }
-      // Fallback: any button with aria-label containing "Stop"
-      var allBtns = d.querySelectorAll('button');
+
+      // 2. Any button with aria-label/text/title containing "Stop"
+      //    (covers Roo/Cline forks that rename the button).
+      var allBtns = Array.from(d.querySelectorAll('button, [role="button"]'));
       for (var i = 0; i < allBtns.length; i++) {
-        var aria = (allBtns[i].getAttribute('aria-label') || '').toLowerCase();
-        if (aria.indexOf('stop') !== -1 && isVisible(allBtns[i])) {
+        if (!isVisible(allBtns[i])) continue;
+        var t = btnText(allBtns[i]);
+        if (/\\bstop\\b/.test(t) && !/auto[- ]?stop|stop terminal/.test(t)) {
           return JSON.stringify({ thinking: true, label: 'Generating' });
         }
       }
+
+      // 3. Sub-agent / tool-running indicator: "Cancel" button visible inside
+      //    the chat view. Cline & Roo show "Cancel" while a delegated sub-agent
+      //    or long-running tool is executing — top-level Stop disappears.
+      var chatView = d.querySelector('${ROO_CODE_PRIMARY.chatView}') || d.body;
+      if (chatView) {
+        var chatText = (chatView.innerText || chatView.textContent || '').toLowerCase();
+        var cancelBtn = null;
+        var chatBtns = chatView.querySelectorAll('button, [role="button"], vscode-button');
+        for (var j = 0; j < chatBtns.length; j++) {
+          if (!isVisible(chatBtns[j])) continue;
+          var ct = btnText(chatBtns[j]);
+          if (/^\\s*cancel\\s*$/.test(ct) || /\\bcancel\\b/.test(ct) && !/cancelled/.test(ct)) {
+            cancelBtn = chatBtns[j];
+            break;
+          }
+        }
+        // Pair Cancel with an activity hint: subagent block, tool call counter,
+        // "thinking", "generating", "running", "API request".
+        var hasActivity = /subagent|sub[- ]agent|tools?\\s+called|tokens|api\\s+req|thinking|generating|running|executing|streaming/.test(chatText);
+        if (cancelBtn && hasActivity) {
+          var label = 'Generating';
+          if (/subagent|sub[- ]agent/.test(chatText)) label = 'Sub-agent';
+          else if (/api\\s+req/.test(chatText)) label = 'API Request';
+          else if (/thinking/.test(chatText)) label = 'Thinking';
+          else if (/executing|running/.test(chatText)) label = 'Running tool';
+          return JSON.stringify({ thinking: true, label: label });
+        }
+      }
+
+      // 4. Spinner / loading icon visible inside chat view.
+      var spinnerSel = '.codicon-loading, .codicon-modifier-spin, .codicon-sync~.codicon-modifier-spin, [class*="spinner" i], [class*="Spinner"], [class*="loading-dots"], [class*="LoadingDots"], svg[class*="animate-spin"]';
+      var spinners = (chatView || d).querySelectorAll(spinnerSel);
+      for (var k = 0; k < spinners.length; k++) {
+        if (isVisible(spinners[k])) {
+          return JSON.stringify({ thinking: true, label: 'Generating' });
+        }
+      }
+
+      // 5. Last virtuoso row has an in-progress API request / tool call.
+      //    Cline emits "API Request..." with trailing ellipsis while streaming.
+      var rows = d.querySelectorAll('${ROO_CODE_PRIMARY.virtuoso} > div');
+      if (rows.length) {
+        var last = rows[rows.length - 1];
+        if (last && isVisible(last)) {
+          var lastText = (last.innerText || last.textContent || '');
+          if (/API Request\\.\\.\\.|API Request…/.test(lastText)) {
+            return JSON.stringify({ thinking: true, label: 'API Request' });
+          }
+          if (/Thinking\\.\\.\\.|Thinking…/.test(lastText)) {
+            return JSON.stringify({ thinking: true, label: 'Thinking' });
+          }
+        }
+      }
+
       return JSON.stringify({ thinking: false, label: '' });
     `);
     try { return JSON.parse(raw); } catch { return { thinking: false, label: '' }; }
@@ -10037,4 +10204,5 @@ module.exports = {
   detectContinueThinkingFromWorkbench,
   detectContinuePermissionDialogFromWorkbench,
   evalInWorkbenchWebview,
+  expandCodexMessagesRaw,
 };
