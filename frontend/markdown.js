@@ -986,7 +986,52 @@ function renderFileChangesBlock(content, index) {
   </section>`;
 }
 
+function renderSubagentsBlock(payload, index) {
+  let parsed;
+  try { parsed = JSON.parse(payload); } catch { return null; }
+  if (!parsed || !Array.isArray(parsed.items) || !parsed.items.length) return null;
+  const titleText = parsed.title || 'Subagents';
+  const items = parsed.items.map((it, i) => {
+    const status = String(it.status || 'unknown').toLowerCase();
+    const icon = status === 'running' ? '<span class="subagent-spinner" aria-hidden="true"></span>'
+      : status === 'done'   ? '<span class="subagent-icon subagent-icon-done" aria-hidden="true">&#10003;</span>'
+      : status === 'failed' ? '<span class="subagent-icon subagent-icon-fail" aria-hidden="true">&#10007;</span>'
+      :                       '<span class="subagent-icon subagent-icon-unknown" aria-hidden="true">&#9679;</span>';
+    const promptText = String(it.prompt || '').trim();
+    const stats = String(it.stats || '').trim();
+    const calls = Array.isArray(it.tool_calls) ? it.tool_calls.filter(Boolean) : [];
+    const callsHtml = calls.length
+      ? `<ul class="subagent-calls">${calls.map(c => `<li><code>${escapeHtml(c)}</code></li>`).join('')}</ul>`
+      : '';
+    return `<li class="subagent-item subagent-status-${escapeHtml(status)}">
+      <div class="subagent-row">${icon}<div class="subagent-prompt" title="${escapeHtml(promptText)}">${escapeHtml(promptText)}</div></div>
+      ${stats ? `<div class="subagent-stats">${escapeHtml(stats)}</div>` : ''}
+      ${callsHtml}
+    </li>`;
+  }).join('');
+  return `<section class="subagents-section" data-subagents-index="${index}">
+    <div class="subagents-header"><span class="subagents-icon" aria-hidden="true">&#9783;</span><span class="subagents-title">${escapeHtml(titleText)}</span></div>
+    <ul class="subagents-list">${items}</ul>
+  </section>`;
+}
+
+function extractSubagentsBlocks(content) {
+  // Replace each ~~~subagents\n{json}\n~~~ block with a placeholder so the
+  // rest of the content can flow through the normal markdown pipeline. Returns
+  // { content, blocks } where blocks[i] is the rendered HTML for placeholder i.
+  const blocks = [];
+  const re = /^~~~subagents\s*\n([\s\S]*?)\n~~~\s*$/gm;
+  const replaced = String(content || '').replace(re, (_m, payload) => {
+    const html = renderSubagentsBlock(payload, blocks.length) || '';
+    blocks.push(html);
+    return ` SUBAGENTS_BLOCK_${blocks.length - 1} `;
+  });
+  return { content: replaced, blocks };
+}
+
 function renderStructuredContent(content) {
+  const { content: prepped, blocks: subagentBlocks } = extractSubagentsBlocks(content);
+  content = prepped;
   const html = parseToolSections(content).map((chunk, index) => {
     try {
       if (chunk.type === 'tool') return renderToolSection(chunk.name, chunk.content, index);
@@ -1004,14 +1049,22 @@ function renderStructuredContent(content) {
     }
   }).join('');
 
+  // Substitute subagent placeholders back with rendered card HTML.
+  let htmlWithSubagents = html;
+  if (subagentBlocks.length) {
+    htmlWithSubagents = htmlWithSubagents.replace(/\s*SUBAGENTS_BLOCK_(\d+)\s*/g, (_m, i) => {
+      return subagentBlocks[Number(i)] || '';
+    });
+  }
+
   // ── Multi-file diff summary bar ───────────────────────────────────────────
   // Parse into a temporary element so we can query real DOM nodes — no regex.
   // Sanitize before touching the DOM to prevent XSS from agent-controlled content.
   const tmp = document.createElement('div');
   if (typeof DOMPurify !== 'undefined') {
-    tmp.innerHTML = DOMPurify.sanitize(html, { ADD_DATA_URI_TAGS: ['img'], ALLOW_DATA_ATTR: true });
+    tmp.innerHTML = DOMPurify.sanitize(htmlWithSubagents, { ADD_DATA_URI_TAGS: ['img'], ALLOW_DATA_ATTR: true });
   } else {
-    tmp.textContent = html; // safe fallback — no HTML rendering if DOMPurify unavailable
+    tmp.textContent = htmlWithSubagents; // safe fallback — no HTML rendering if DOMPurify unavailable
   }
 
   const diffBlocks = Array.from(tmp.querySelectorAll('.diff-block'));

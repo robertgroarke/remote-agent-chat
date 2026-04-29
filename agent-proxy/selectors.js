@@ -2878,6 +2878,59 @@ async function readRooCodeMessages(Runtime, sessionId) {
         }
         return null;
       }
+      function classifyCardIcon(svg) {
+        if (!svg) return 'unknown';
+        var cls = (svg.getAttribute('class') || '').toLowerCase();
+        if (cls.indexOf('animate-spin') !== -1 || cls.indexOf('lucide-loader') !== -1 || cls.indexOf('lucide-refresh') !== -1) return 'running';
+        if (cls.indexOf('text-success') !== -1 || cls.indexOf('lucide-check') !== -1) return 'done';
+        if (cls.indexOf('text-error') !== -1 || cls.indexOf('text-destructive') !== -1 || cls.indexOf('lucide-x') !== -1) return 'failed';
+        return 'unknown';
+      }
+      function extractToolCallsFromCard(card) {
+        // Each card may also contain expanded tool output. We surface the
+        // single tool-call line shown beneath the stats (e.g. "read_file(path=...)").
+        var calls = [];
+        var codeNodes = card.querySelectorAll('code, pre');
+        for (var ci = 0; ci < codeNodes.length && calls.length < 6; ci++) {
+          var t = compact(codeNodes[ci].innerText || codeNodes[ci].textContent || '');
+          if (t && /^[a-z_][a-z0-9_]*\\s*\\(/i.test(t)) calls.push(t);
+        }
+        return calls;
+      }
+      function extractSubagentRows() {
+        // Returns array of { ts, title, items } for any virtuoso row that is
+        // a Cline/Roo "wants to use subagents" group. ts is taken from the
+        // [data-message-ts] attr so the message slots into the timeline at
+        // the right position.
+        var virtuosoEl = d.querySelector('[data-testid="virtuoso-item-list"]');
+        if (!virtuosoEl) return [];
+        var groups = [];
+        Array.from(virtuosoEl.children || []).forEach(function(row) {
+          var header = row.querySelector('span.font-bold, [class*="font-bold"]');
+          var headerText = header ? compact(header.textContent || '') : '';
+          if (!/wants to use subagents?/i.test(headerText)) return;
+          var tsNode = row.querySelector('[data-message-ts]');
+          var ts = tsNode ? Number(tsNode.getAttribute('data-message-ts')) || null : null;
+          var cards = Array.from(row.querySelectorAll('div.rounded-xs.border'));
+          var items = cards.map(function(card) {
+            var svg = card.querySelector('svg');
+            var status = classifyCardIcon(svg);
+            var promptEl = card.querySelector('.text-xs.font-medium, [class*="font-medium"]');
+            var promptText = promptEl ? compact(promptEl.textContent || '') : '';
+            // Strip surrounding quotes Cline adds to the prompt preview.
+            promptText = promptText.replace(/^[\\"“]+/, '').replace(/[\\"”]+$/, '').trim();
+            var statsEl = Array.from(card.querySelectorAll('span')).find(function(s) {
+              return /tools?\\s+called/i.test(s.textContent || '');
+            });
+            var stats = statsEl ? compact(statsEl.textContent || '') : '';
+            var toolCalls = extractToolCallsFromCard(card);
+            return { status: status, prompt: promptText, stats: stats, tool_calls: toolCalls };
+          }).filter(function(it) { return it.prompt || it.stats; });
+          if (!items.length) return;
+          groups.push({ ts: ts, title: headerText, items: items });
+        });
+        return groups;
+      }
       function extractBottomFrames() {
         var result = [];
         var chatView = d.querySelector('[data-testid="chat-view"]') || d.body;
@@ -2950,6 +3003,48 @@ async function readRooCodeMessages(Runtime, sessionId) {
         bySig.add(sig);
         msgs.push({ role: 'assistant', content: content, type: /^Task Completed/i.test(content) ? 'task_completed' : 'file_changes' });
       });
+
+      // Subagent groups: emit a structured message that the frontend
+      // renders as a card list. Replace any plain-text duplicate produced
+      // by the react-state walker (its serialized form is just the raw
+      // innerText, which we don't want shown twice).
+      var subagentGroups = extractSubagentRows();
+      if (subagentGroups.length) {
+        subagentGroups.forEach(function(g) {
+          var payload = JSON.stringify({ title: g.title, items: g.items });
+          var content = '~~~subagents\\n' + payload + '\\n~~~';
+          var newMsg = { role: 'assistant', content: content, ts: g.ts || null, type: 'subagents' };
+          // Drop any prior message that represents this same subagent row:
+          //   - the react walker's "subagent" JSON snapshot (matched by ts)
+          //   - any plain-text dump containing the group's stats markers
+          var dropMarkers = g.items.map(function(it) { return it.stats || ''; }).filter(Boolean);
+          var insertIdx = -1;
+          for (var mi = msgs.length - 1; mi >= 0; mi--) {
+            var m = msgs[mi];
+            if (m.role !== 'assistant') continue;
+            var sameTs = g.ts && m.ts && Number(m.ts) === Number(g.ts);
+            var statsHit = dropMarkers.length && dropMarkers.every(function(mk) {
+              return m.content && m.content.indexOf(mk) !== -1;
+            });
+            if (sameTs || statsHit) {
+              if (insertIdx === -1) insertIdx = mi;
+              msgs.splice(mi, 1);
+            }
+          }
+          if (insertIdx === -1) {
+            // Find ts-ordered insertion point so the group appears in the
+            // correct position in the timeline rather than at the end.
+            if (g.ts != null) {
+              for (var k = 0; k < msgs.length; k++) {
+                var mt = Number(msgs[k].ts || 0);
+                if (mt && mt > Number(g.ts)) { insertIdx = k; break; }
+              }
+            }
+            if (insertIdx === -1) insertIdx = msgs.length;
+          }
+          msgs.splice(insertIdx, 0, newMsg);
+        });
+      }
       return JSON.stringify(msgs);
     `);
 

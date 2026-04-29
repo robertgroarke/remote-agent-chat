@@ -2435,6 +2435,100 @@ mark.code-search-mark.current {
   overflow: hidden;
 }
 
+/* ── Cline / Roo subagent cards ─────────────────────────────────────────── */
+.subagents-section {
+  margin: 8px 0;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  background: rgba(255, 255, 255, 0.025);
+  padding: 10px 12px;
+}
+.subagents-header {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  font-weight: 600;
+  margin-bottom: 8px;
+  font-size: 13px;
+}
+.subagents-icon { opacity: 0.75; }
+.subagents-list {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+.subagent-item {
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  padding: 6px 8px;
+  background: rgba(255, 255, 255, 0.02);
+}
+.subagent-row {
+  display: flex;
+  align-items: flex-start;
+  gap: 8px;
+  font-size: 12px;
+}
+.subagent-prompt {
+  flex: 1;
+  min-width: 0;
+  white-space: pre-wrap;
+  overflow: hidden;
+  display: -webkit-box;
+  -webkit-line-clamp: 2;
+  -webkit-box-orient: vertical;
+  opacity: 0.95;
+}
+.subagent-stats {
+  margin-top: 4px;
+  font-size: 11px;
+  opacity: 0.65;
+}
+.subagent-icon {
+  flex: 0 0 auto;
+  width: 14px;
+  height: 14px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  font-size: 12px;
+  line-height: 1;
+  margin-top: 1px;
+}
+.subagent-icon-done { color: var(--green, #4ec9b0); }
+.subagent-icon-fail { color: var(--red, #f26d78); }
+.subagent-icon-unknown { color: var(--muted, #888); }
+.subagent-spinner {
+  flex: 0 0 auto;
+  width: 12px;
+  height: 12px;
+  margin-top: 2px;
+  border: 2px solid currentColor;
+  border-right-color: transparent;
+  border-radius: 50%;
+  animation: subagent-spin 0.9s linear infinite;
+  opacity: 0.85;
+}
+@keyframes subagent-spin {
+  to { transform: rotate(360deg); }
+}
+.subagent-calls {
+  margin: 4px 0 0 22px;
+  padding: 0;
+  list-style: none;
+  font-size: 11px;
+  opacity: 0.75;
+}
+.subagent-calls li { margin: 2px 0; }
+.subagent-calls code {
+  background: rgba(255, 255, 255, 0.04);
+  padding: 1px 5px;
+  border-radius: 3px;
+}
+
 .file-changes-toggle {
   width: 100%;
   display: flex;
