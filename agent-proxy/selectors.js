@@ -1523,7 +1523,50 @@ const CODEX_READ_EXPR = `
       pendingAssistant = [];
     }
 
-    async function _primeCodexCollapsedCommandOutputCache(root) {
+    // Ephemeral, non-interactive prime: Codex collapses the command output
+    // visually with overflow-clip / max-height tricks, but the underlying
+    // children typically stay in the DOM. textContent ignores CSS visibility
+    // so we can read the body without clicking the row. Reading via the
+    // React fiber's memoized props gives us the rest when the DOM truly is
+    // detached. No clicks, no UI thrash.
+    function _readCodexCollapsedRowBody(row) {
+      // 1. Try textContent on the surrounding "overflow-clip" box. If the
+      //    expanded body is CSS-hidden (the common case in Codex side pane)
+      //    this returns the full content even while the row is collapsed.
+      var box = row.closest('.relative.flex.flex-col.overflow-clip')
+        || row.closest('[style*="overflow: hidden"]')
+        || row.parentElement;
+      if (box) {
+        var visible = (row.innerText || '').length;
+        var raw = String(box.textContent || '');
+        if (raw.length > visible + 30) return raw;
+      }
+      // 2. Fallback: walk the React fiber on the row to find a stored
+      //    output/stdout/text prop. Codex's component sometimes carries
+      //    the expanded body in memoizedProps even when the JSX child is
+      //    not yet mounted.
+      try {
+        var fiberKey = Object.keys(row).find(function(k) {
+          return k.indexOf('__reactFiber') === 0 || k.indexOf('__reactInternalInstance') === 0;
+        });
+        if (!fiberKey) return '';
+        var fiber = row[fiberKey];
+        for (var hops = 0; hops < 10 && fiber; hops++) {
+          var props = fiber.memoizedProps || (fiber.stateNode && fiber.stateNode.props) || null;
+          if (props && typeof props === 'object') {
+            var keys = ['output', 'stdout', 'commandOutput', 'expandedText', 'body', 'text'];
+            for (var ki = 0; ki < keys.length; ki++) {
+              var v = props[keys[ki]];
+              if (typeof v === 'string' && v.length > 0) return v;
+            }
+          }
+          fiber = fiber.return;
+        }
+      } catch (_) { /* ignore */ }
+      return '';
+    }
+
+    function _primeCodexCollapsedCommandOutputCache(root) {
       var cache = _codexCommandCache();
       var rows = Array.from(root.querySelectorAll('.cursor-interaction, [role="button"]'))
         .filter(function(row) {
@@ -1540,28 +1583,16 @@ const CODEX_READ_EXPR = `
         var row = rows[ri];
         var label = (row.innerText || row.textContent || '').trim();
         var command = label.replace(/^Ran\\s+/i, '').split('\\n')[0].trim();
-        var box = row.closest('.relative.flex.flex-col.overflow-clip')
-          || row.closest('[style*="overflow: hidden"]')
-          || row.parentElement;
-        try {
-          row.click();
-          await new Promise(function(resolve) { setTimeout(resolve, 120); });
-          var expandedText = (box && (box.innerText || box.textContent)) || (row.innerText || row.textContent) || '';
-          var parsed = _parseExpandedCodexCommandOutput(expandedText, command);
-          if (parsed && parsed.output) {
-            cache[_normalizeCodexCommandKey(parsed.command || command)] = parsed.output;
-          }
-        } catch (_) {
-        } finally {
-          try {
-            row.click();
-            await new Promise(function(resolve) { setTimeout(resolve, 20); });
-          } catch (_) {}
+        var raw = _readCodexCollapsedRowBody(row);
+        if (!raw) continue;
+        var parsed = _parseExpandedCodexCommandOutput(raw, command);
+        if (parsed && parsed.output) {
+          cache[_normalizeCodexCommandKey(parsed.command || command)] = parsed.output;
         }
       }
     }
 
-    await _primeCodexCollapsedCommandOutputCache(d);
+    _primeCodexCollapsedCommandOutputCache(d);
 
     // Extract diff content from a diffs-container shadow DOM.
     // The shadow DOM uses: <code data-code><div data-gutter>...<div data-content>
@@ -1995,6 +2026,110 @@ const CODEX_DESKTOP_READ_EXPR = `
   var fence = bt + bt + bt;
   var BLOCK_TAGS = { DIV:1, P:1, LI:1, TR:1, H1:1, H2:1, H3:1, H4:1, H5:1, H6:1, BLOCKQUOTE:1, SECTION:1, ARTICLE:1 };
 
+  // ─── Desktop command-output cache ────────────────────────────────────
+  // Codex Desktop renders multi-command turns as a collapsed "Ran N commands"
+  // button. The actual command list + outputs only mount in the DOM when the
+  // user expands it — every poll otherwise loses everything past the header.
+  // To keep the WebUI rich, prime a per-page cache keyed by the rendered
+  // turn (data-content-search-turn-key) → captured expanded text. We click
+  // each collapsed button once, snapshot, then re-click to collapse so the
+  // user sees no permanent change. Subsequent polls hit the cache without
+  // touching the DOM.
+  function _desktopCmdCache() {
+    try {
+      var w = d.defaultView || window;
+      w.__remoteAgentCodexDesktopCmdCache = w.__remoteAgentCodexDesktopCmdCache || {};
+      return w.__remoteAgentCodexDesktopCmdCache;
+    } catch (_) {
+      return {};
+    }
+  }
+
+  function _desktopRanButtonKey(btn) {
+    // Stable key per collapsed run-block. Combine the turn-key (if any) with
+    // the button's first child text so re-rendered buttons match.
+    var turn = btn.closest && btn.closest('[data-content-search-turn-key]');
+    var turnKey = turn ? (turn.getAttribute('data-content-search-turn-key') || '') : '';
+    var label = String((btn.innerText || btn.textContent || '')).trim().slice(0, 80);
+    var idx = -1;
+    if (turn) {
+      var siblings = Array.from(turn.querySelectorAll('button'))
+        .filter(function(b) { return /^Ran\\s+/i.test((b.innerText || '').trim()); });
+      idx = siblings.indexOf(btn);
+    }
+    return turnKey + '|' + label + '|' + idx;
+  }
+
+  function _desktopCaptureExpandedBox(btn) {
+    // Walk up to find the closest container that holds the expanded body.
+    // Use textContent (not innerText) so we read the body even when Codex
+    // visually collapses it via overflow/max-height — no clicks needed.
+    var box = btn.parentElement;
+    var btnText = (btn.textContent || '');
+    for (var i = 0; i < 6 && box; i++) {
+      var t = (box.textContent || '');
+      if (t.length > btnText.length + 50) break;
+      box = box.parentElement;
+    }
+    if (!box) return '';
+    return String(box.textContent || '').trim();
+  }
+
+  function _readDesktopRunFromFiber(btn) {
+    // Fiber fallback if the body truly isn't in the DOM yet.
+    try {
+      var fiberKey = Object.keys(btn).find(function(k) {
+        return k.indexOf('__reactFiber') === 0 || k.indexOf('__reactInternalInstance') === 0;
+      });
+      if (!fiberKey) return '';
+      var fiber = btn[fiberKey];
+      for (var hops = 0; hops < 12 && fiber; hops++) {
+        var props = fiber.memoizedProps || (fiber.stateNode && fiber.stateNode.props) || null;
+        if (props && typeof props === 'object') {
+          var keys = ['output', 'stdout', 'commandOutput', 'expandedText', 'body', 'text', 'children'];
+          for (var ki = 0; ki < keys.length; ki++) {
+            var v = props[keys[ki]];
+            if (typeof v === 'string' && v.length > 50) return v;
+          }
+        }
+        fiber = fiber.return;
+      }
+    } catch (_) { /* ignore */ }
+    return '';
+  }
+
+  function _primeDesktopCollapsedRuns() {
+    // Ephemeral, non-interactive prime: read whatever the DOM already holds
+    // (Codex Desktop CSS-collapses the body but typically keeps the children
+    // mounted, so textContent picks them up). Falls back to React fiber
+    // memoizedProps when the body is genuinely detached. No clicks → no
+    // visible expand/collapse thrash in the desktop app UI.
+    var cache = _desktopCmdCache();
+    var convoEl = d.querySelector('[data-thread-find-target="conversation"]');
+    if (!convoEl) return;
+    var btns = Array.from(convoEl.querySelectorAll('button[aria-expanded="false"]'))
+      .filter(function(b) {
+        var t = (b.innerText || b.textContent || '').trim();
+        return /^Ran\\s+/i.test(t);
+      })
+      .slice(-30);
+
+    for (var bi = 0; bi < btns.length; bi++) {
+      var btn = btns[bi];
+      var key = _desktopRanButtonKey(btn);
+      if (cache[key]) continue;
+      var captured = _desktopCaptureExpandedBox(btn);
+      if (!captured) captured = _readDesktopRunFromFiber(btn);
+      if (captured) cache[key] = captured;
+    }
+  }
+
+  function _desktopCachedRunBody(btn) {
+    var cache = _desktopCmdCache();
+    var key = _desktopRanButtonKey(btn);
+    return key && cache[key] ? String(cache[key]) : '';
+  }
+
   function squashNewlines(text) {
     return String(text || '').replace(/\\n{3,}/g, '\\n\\n').trim();
   }
@@ -2378,6 +2513,9 @@ const CODEX_DESKTOP_READ_EXPR = `
   var convo = d.querySelector('[data-thread-find-target="conversation"]');
   if (!convo) return JSON.stringify([]);
 
+  // Prime the cache for collapsed multi-command runs before walking turns.
+  await _primeDesktopCollapsedRuns();
+
   var turns = Array.from(convo.querySelectorAll('[data-content-search-turn-key]'));
   var msgs = [];
 
@@ -2414,6 +2552,43 @@ const CODEX_DESKTOP_READ_EXPR = `
       if (parsedCommand) uniquePushAny(assistantParts, parsedCommand);
     }
 
+    // Harvest "Ran ..." rows in this turn. Codex Desktop renders multi-command
+    // turns as a button (collapsed "Ran N commands" or single "Ran <cmd>"),
+    // and the actual body sits in a sibling/parent box that's only mounted
+    // when the row is expanded. We use whichever source is available:
+    //   1. Live expanded box text (when the row is currently expanded)
+    //   2. Cached body captured on a prior poll (filled by the prime step)
+    // The rows live OUTSIDE [data-content-search-unit-key] elements while the
+    // assistant is mid-flight, so we have to scan at the turn level here.
+    // Skip when an assistant unit already exists in this turn — the unit
+    // text covers the same content and we'd double-emit.
+    var hasAssistantUnit = units.some(function(u) { return roleFromUnit(u) === 'assistant'; });
+    var ranBtnsInTurn = hasAssistantUnit
+      ? []
+      : Array.from(turn.querySelectorAll('button'))
+          .filter(function(b) { return /^Ran\\s+/i.test((b.innerText || '').trim()); });
+    for (var rbi = 0; rbi < ranBtnsInTurn.length; rbi++) {
+      var rbtn = ranBtnsInTurn[rbi];
+      var hdr = (rbtn.innerText || '').trim().split('\\n')[0];
+      var body = '';
+      if (rbtn.getAttribute('aria-expanded') === 'true') {
+        body = _desktopCaptureExpandedBox(rbtn);
+      }
+      if (!body) body = _desktopCachedRunBody(rbtn);
+      if (!body) continue;
+      // Strip the leading header line(s) from the captured body so we don't
+      // double-print "Ran N commands" inside the [Bash ...] block.
+      var bodyLines = body.split('\\n');
+      while (bodyLines.length && (bodyLines[0].trim() === hdr.trim() || !bodyLines[0].trim())) {
+        bodyLines.shift();
+      }
+      var bodyText = bodyLines.join('\\n').trim();
+      if (!bodyText) continue;
+      var headerLabel = hdr.replace(/^Ran\\s+/i, '').trim() || 'commands';
+      var block = '[Bash ' + headerLabel + ']\\n' + bodyText + '\\n[end]';
+      uniquePushAny(assistantParts, block);
+    }
+
     // File-change summary cards ("N files changed +A -D" with per-file rows).
     // These show up after a "Worked for" header on completed turns and were
     // previously dropped on Codex Desktop, so collapsed turns lost the file
@@ -2441,12 +2616,9 @@ const CODEX_DESKTOP_READ_EXPR = `
 `;
 
 async function readCodexMessages(Runtime, sessionId, usePageEval) {
-  // Keep background polling read-only.
-  // Expanding/collapsing Codex disclosure rows during every poll causes visible
-  // UI thrash in the desktop app, so we only read what is already rendered.
   try {
     const raw = usePageEval
-      ? await evalInPage(Runtime, CODEX_DESKTOP_READ_EXPR)
+      ? await evalInPage(Runtime, CODEX_DESKTOP_READ_EXPR, { awaitPromise: true })
       : await evalInFrame(Runtime, CODEX_READ_EXPR, { awaitPromise: true });
     if (raw !== null) { resetReadFailures(sessionId); return expandCodexMessagesRaw(raw); }
   } catch (e) {
