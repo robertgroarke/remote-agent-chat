@@ -972,17 +972,17 @@ function renderFileChangesBlock(content, index) {
       <span class="file-changes-stats"><span class="diff-stat-add">+${entry.adds}</span><span class="diff-stat-del">-${entry.dels}</span></span>
     </div>`;
   }).join('');
-  return `<section class="file-changes-section collapsed" data-file-changes-index="${index}">
-    <button class="file-changes-toggle" type="button" aria-expanded="false">
-      <span class="file-changes-chevron">â–¸</span>
-      <span class="file-changes-icon">â‡„</span>
+  return `<section class="file-changes-section" data-file-changes-index="${index}">
+    <button class="file-changes-toggle" type="button" aria-expanded="true">
+      <span class="file-changes-chevron">v</span>
+      <span class="file-changes-icon">files</span>
       <span class="file-changes-title">${escapeHtml(parsed.title || `${parsed.count} file(s) changed`)}</span>
       <span class="file-changes-summary">
         <span class="diff-stat-add">+${parsed.adds}</span>
         <span class="diff-stat-del">-${parsed.dels}</span>
       </span>
     </button>
-    ${parsed.entries.length ? `<div class="file-changes-list" hidden>${entryHtml}</div>` : ''}
+    ${parsed.entries.length ? `<div class="file-changes-list">${entryHtml}</div>` : ''}
   </section>`;
 }
 
@@ -1301,7 +1301,7 @@ function MarkdownContent({ content, monospace = false, onOpenPath = null, autoEx
         const chevron = s.querySelector('.file-changes-chevron');
         const btn = s.querySelector('.file-changes-toggle');
         if (list) list.hidden = want;
-        if (chevron) chevron.textContent = want ? 'â–¸' : 'â–¾';
+        if (chevron) chevron.textContent = want ? '>' : 'v';
         if (btn) btn.setAttribute('aria-expanded', want ? 'false' : 'true');
       }
     });
@@ -1361,7 +1361,7 @@ function MarkdownContent({ content, monospace = false, onOpenPath = null, autoEx
         const chevron = btn.querySelector('.file-changes-chevron');
         const collapsed = section.classList.toggle('collapsed');
         if (list) list.hidden = collapsed;
-        if (chevron) chevron.textContent = collapsed ? 'â–¸' : 'â–¾';
+        if (chevron) chevron.textContent = collapsed ? '>' : 'v';
         btn.setAttribute('aria-expanded', collapsed ? 'false' : 'true');
       };
     });

@@ -29,6 +29,22 @@ const launchers    = require('./launchers');
 
 function sleep(ms) { return new Promise(r => setTimeout(r, ms)); }
 
+// Deterministic per-session stagger offset so different periodic reads
+// (task_list, rate_limit, native_queue, automation_view…) don't fire on the
+// same poll tick. Without this, every counter starts at 0 and they all hit
+// their threshold together, which fires a burst of 4-5 heavy CDP evals at
+// once and visibly locks up the renderer for codex / codex-desktop.
+function staggerOffset(sessionId, key, modulo) {
+  if (!modulo || modulo <= 1) return 0;
+  let h = 2166136261;
+  const s = String(sessionId || '') + '|' + String(key || '');
+  for (let i = 0; i < s.length; i++) {
+    h ^= s.charCodeAt(i);
+    h = (h * 16777619) >>> 0;
+  }
+  return h % modulo;
+}
+
 // ─── Codex model/effort/access constants ────────────────────────────────────
 
 const CODEX_MODELS = [
@@ -2805,6 +2821,73 @@ class ProxyEngine extends EventEmitter {
     return left.startsWith(rightProbe) || right.startsWith(leftProbe);
   }
 
+  _isCodexCompletionSummaryMessage(msg) {
+    if (!msg || msg.role !== 'assistant') return false;
+    const text = this._messageContentText(msg).replace(/\s+/g, ' ').trim();
+    if (!text) return false;
+    return /^Worked for\s+/i.test(text)
+      || /\bTask completed\b/i.test(text)
+      || /\bImplemented and (?:committed|pushed)\b/i.test(text)
+      || /\bWhat changed:\b/i.test(text)
+      || /\bVerified:\b/i.test(text)
+      || /\b\d+\s+files?\s+changed\b/i.test(text);
+  }
+
+  _findMatchingMessageIndex(messages, needle, startAt = 0) {
+    const list = Array.isArray(messages) ? messages : [];
+    for (let i = Math.max(0, startAt); i < list.length; i++) {
+      if (this._messagesSoftMatch(list[i], needle)) return i;
+    }
+    return -1;
+  }
+
+  _mergeCodexCompletionCollapse(accumulated, domMessages) {
+    const acc = Array.isArray(accumulated) ? accumulated : [];
+    const dom = Array.isArray(domMessages) ? domMessages : [];
+    if (acc.length === 0 || dom.length < 2) return { matched: false, changed: false, messages: acc };
+
+    const domUserIdx = dom.findIndex(m => m && m.role === 'user');
+    if (domUserIdx < 0) return { matched: false, changed: false, messages: acc };
+
+    const completionIdx = dom.reduce((last, msg, idx) => (
+      this._isCodexCompletionSummaryMessage(msg) ? idx : last
+    ), -1);
+    if (completionIdx <= domUserIdx) return { matched: false, changed: false, messages: acc };
+
+    const accUserIdx = this._findMatchingMessageIndex(acc, dom[domUserIdx]);
+    if (accUserIdx < 0) return { matched: false, changed: false, messages: acc };
+
+    const priorWork = acc.slice(accUserIdx + 1).some(msg =>
+      msg &&
+      msg.role === 'assistant' &&
+      !this._isCodexCompletionSummaryMessage(msg) &&
+      this._messageContentText(msg).trim().length > 120
+    );
+    if (!priorWork) return { matched: false, changed: false, messages: acc };
+
+    let changed = false;
+    const merged = acc.slice();
+    for (let i = domUserIdx + 1; i < dom.length; i++) {
+      const msg = dom[i];
+      if (!msg || msg.role !== 'assistant') continue;
+      if (!this._isCodexCompletionSummaryMessage(msg)) continue;
+
+      const existingIdx = this._findMatchingMessageIndex(merged, msg, accUserIdx + 1);
+      if (existingIdx >= 0) {
+        if (this._messageContentText(msg).length > this._messageContentText(merged[existingIdx]).length) {
+          merged[existingIdx] = msg;
+          changed = true;
+        }
+        continue;
+      }
+
+      merged.push(msg);
+      changed = true;
+    }
+
+    return { matched: true, changed, messages: merged };
+  }
+
   _extractToolBlocks(content) {
     const text = this._messageContentText({ content });
     const blocks = [];
@@ -3873,8 +3956,11 @@ class ProxyEngine extends EventEmitter {
       // Task list detection — runs before readMessages so it isn't skipped
       // by early returns in null-read or pending-stabilisation paths
       if (session.agentType === 'codex' || session.agentType === 'codex-desktop') {
-        session._taskListPollCount = (session._taskListPollCount || 0) + 1;
         const taskListPollEvery = session.agentType === 'codex-desktop' ? 10 : 5;
+        if (session._taskListPollCount === undefined) {
+          session._taskListPollCount = staggerOffset(sessionId, 'taskList', taskListPollEvery);
+        }
+        session._taskListPollCount += 1;
         if (session._taskListPollCount >= taskListPollEvery) {
           session._taskListPollCount = 0;
           const usePageEval = session.agentType === 'codex-desktop';
@@ -4130,12 +4216,27 @@ class ProxyEngine extends EventEmitter {
           session._accumulatedMessages = messages.slice();
           session._accumulatedDirty = true;
         } else {
+          let completionCollapseMatched = false;
+          if (session.agentType === 'codex' || session.agentType === 'codex-desktop') {
+            const completionMerge = this._mergeCodexCompletionCollapse(session._accumulatedMessages, messages);
+            if (completionMerge.matched) {
+              completionCollapseMatched = true;
+              if (completionMerge.changed) {
+                session._accumulatedMessages = completionMerge.messages;
+                session._accumulatedDirty = true;
+                session._forceHistoryResync = 'codex completion collapse retained';
+                this._log('info', `[${sessionId}] Retained Codex work transcript across completed-task collapse`);
+              }
+              this._maybePersistAccumulatedMessages(sessionId, session);
+            }
+          }
+
           // Merge: find where current DOM messages overlap with the accumulated tail
           // The DOM always shows the newest N messages, so we match backwards.
           const acc  = session._accumulatedMessages;
           const dom  = messages;
 
-          if (dom.length > 0) {
+          if (dom.length > 0 && !completionCollapseMatched) {
             // Find the longest suffix of `acc` that is a prefix of `dom`
             // (i.e. how many of the last accumulated messages are still visible)
             let overlapLen = 0;
@@ -4437,7 +4538,10 @@ class ProxyEngine extends EventEmitter {
       // Thread list polling — Codex Desktop only (Epic 2)
       // Polls every 10 cycles (~30-50s) to keep the thread list current.
       if (session.agentType === 'codex-desktop') {
-        session._threadListPollCount = (session._threadListPollCount || 0) + 1;
+        if (session._threadListPollCount === undefined) {
+          session._threadListPollCount = staggerOffset(sessionId, 'threadList', 30);
+        }
+        session._threadListPollCount += 1;
         if (session._threadListPollCount >= 30) {
           session._threadListPollCount = 0;
           await selectors.readCodexThreadList(session.client.Runtime, true)
@@ -4495,7 +4599,10 @@ class ProxyEngine extends EventEmitter {
           }
         }
 
-        session._rateLimitPollCount = (session._rateLimitPollCount || 0) + 1;
+        if (session._rateLimitPollCount === undefined) {
+          session._rateLimitPollCount = staggerOffset(sessionId, 'rateLimit', 10);
+        }
+        session._rateLimitPollCount += 1;
         if (session._rateLimitPollCount >= 10) {
           session._rateLimitPollCount = 0;
           const readFn = session.agentType === 'codex'
@@ -4533,8 +4640,11 @@ class ProxyEngine extends EventEmitter {
 
       // Native queue detection — Codex side-panel queue items (messages with Steer buttons)
       if (session.agentType === 'codex' || session.agentType === 'codex-desktop') {
-        session._nativeQueuePollCount = (session._nativeQueuePollCount || 0) + 1;
         const nativeQueuePollEvery = session.agentType === 'codex-desktop' ? 10 : 3;
+        if (session._nativeQueuePollCount === undefined) {
+          session._nativeQueuePollCount = staggerOffset(sessionId, 'nativeQueue', nativeQueuePollEvery);
+        }
+        session._nativeQueuePollCount += 1;
         if (session._nativeQueuePollCount >= nativeQueuePollEvery) {
           session._nativeQueuePollCount = 0;
           const usePageEval = session.agentType === 'codex-desktop';
@@ -4559,7 +4669,10 @@ class ProxyEngine extends EventEmitter {
       }
 
       if (session.agentType === 'codex-desktop') {
-        session._automationViewPollCount = (session._automationViewPollCount || 0) + 1;
+        if (session._automationViewPollCount === undefined) {
+          session._automationViewPollCount = staggerOffset(sessionId, 'automationView', 5);
+        }
+        session._automationViewPollCount += 1;
         if (session._automationViewPollCount >= 5) {
           session._automationViewPollCount = 0;
           try {
@@ -4593,6 +4706,7 @@ class ProxyEngine extends EventEmitter {
       (session.agentType === 'continue' || session.agentType === 'continue_yolo') ? 10000 :
       12000;
     let timer = null;
+    const pollStartedAt = Date.now();
     try {
       await Promise.race([
         this._pollSession(sessionId),
@@ -4600,6 +4714,14 @@ class ProxyEngine extends EventEmitter {
           timer = setTimeout(() => reject(new Error(`poll timeout after ${timeoutMs}ms`)), timeoutMs);
         }),
       ]);
+      // Surface unusually slow polls — these correspond to long-blocking
+      // CDP evals on the agent's renderer, which the user perceives as the
+      // Codex / Codex Desktop UI being locked up.
+      const dur = Date.now() - pollStartedAt;
+      const slowThresh = (session.agentType === 'codex' || session.agentType === 'codex-desktop') ? 1500 : 3000;
+      if (dur >= slowThresh) {
+        this._log('warn', `[${sessionId}] slow poll: ${dur}ms (agent=${session.agentType})`);
+      }
     } catch (e) {
       this._log('warn', `[${sessionId}] ${e.message}; closing CDP client for rediscovery`);
       sessionStore.markDisconnected(sessionId);
@@ -5329,13 +5451,23 @@ class ProxyEngine extends EventEmitter {
             this._log('warn', `[discover] initial readCodexChatList failed for ${sessionId}: ${e.message}`);
           }
         }
-        const storedAccumulated = Array.isArray(sessionMeta.accumulated_messages) ? sessionMeta.accumulated_messages : null;
+        let storedAccumulated = Array.isArray(sessionMeta.accumulated_messages) ? sessionMeta.accumulated_messages : null;
         let useStoredAccumulated = false;
         if (isAccumAccum && storedAccumulated && domMsgs.length > 0) {
           const windowOffset = this._transcriptWindowOffset(storedAccumulated, domMsgs);
           useStoredAccumulated = agentType === 'codex-desktop'
             ? (windowOffset >= 0 && windowOffset + domMsgs.length === storedAccumulated.length)
             : windowOffset >= 0;
+          if (!useStoredAccumulated && (agentType === 'codex' || agentType === 'codex-desktop')) {
+            const completionMerge = this._mergeCodexCompletionCollapse(storedAccumulated, domMsgs);
+            if (completionMerge.matched) {
+              storedAccumulated = completionMerge.messages;
+              useStoredAccumulated = true;
+              if (completionMerge.changed) {
+                sessionStore.updateSession(sessionId, { accumulated_messages: storedAccumulated });
+              }
+            }
+          }
         }
         const initialMsgs  = initialListView
           ? []

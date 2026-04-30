@@ -81,6 +81,7 @@ function _expandCodexCommandGroup(body) {
   for (const line of lines) {
     const ran = line.match(/^Ran\s+(.+)$/i);
     if (ran) {
+      if (/^\d+\s+commands?$/i.test(ran[1].trim())) continue;
       if (current) blocks.push(current);
       current = { command: ran[1].trim(), body: [] };
       continue;
@@ -102,6 +103,10 @@ function _expandCodexCompactFileLines(text) {
     const line = String(lines[i] || '');
     const ran = line.trim().match(/^Ran\s+(.+)$/i);
     if (ran && ran[1]) {
+      if (/^\d+\s+commands?$/i.test(ran[1].trim())) {
+        out.push(line);
+        continue;
+      }
       out.push(_codexToolBlock(`Bash ${ran[1].trim()}`, 'Command completed'));
       continue;
     }
@@ -337,14 +342,15 @@ async function captureDiagnostic(Runtime, sessionId) {
 // (workbench-jetski-agent.html), not a VS Code webview iframe.  Its content
 // lives directly in `document`, so we evaluate without the active-frame lookup.
 
-async function evalInPage(Runtime, code) {
+async function evalInPage(Runtime, code, options = {}) {
+  const useAsync = !!options.awaitPromise;
   const result = await Runtime.evaluate({
-    expression: `(function() {
+    expression: `(${useAsync ? 'async ' : ''}function() {
       const d = document;
       ${code}
     })()`,
     returnByValue: true,
-    awaitPromise: false,
+    awaitPromise: useAsync,
     silent: true,
     userGesture: false,
   });
@@ -395,7 +401,8 @@ async function evalInWorkbenchWebview(Runtime, webviewId, code) {
 
 // ─── Core frame eval helper ───────────────────────────────────────────────────
 
-async function evalInFrame(Runtime, code) {
+async function evalInFrame(Runtime, code, options = {}) {
+  const useAsync = !!options.awaitPromise;
   const webviewId = Runtime._webviewId || '';
   // If the session has a cached inner-frame contextId, evaluate directly
   // in that context to avoid accessing active-frame.contentDocument which
@@ -403,13 +410,13 @@ async function evalInFrame(Runtime, code) {
   if (Runtime._innerContextId) {
     try {
       const result = await Runtime.evaluate({
-        expression: `(function() {
+        expression: `(${useAsync ? 'async ' : ''}function() {
           const d = document;
           ${code}
         })()`,
         contextId: Runtime._innerContextId,
         returnByValue: true,
-        awaitPromise: false,
+        awaitPromise: useAsync,
         silent: true,
         userGesture: false,
       });
@@ -442,13 +449,13 @@ async function evalInFrame(Runtime, code) {
     if (Runtime._innerContextId) {
       try {
         const result = await Runtime.evaluate({
-          expression: `(function() {
+          expression: `(${useAsync ? 'async ' : ''}function() {
             const d = document;
             ${code}
           })()`,
           contextId: Runtime._innerContextId,
           returnByValue: true,
-          awaitPromise: false,
+          awaitPromise: useAsync,
           silent: true,
           userGesture: false,
         });
@@ -461,7 +468,7 @@ async function evalInFrame(Runtime, code) {
   }
 
   const result = await Runtime.evaluate({
-    expression: `(function() {
+    expression: `(${useAsync ? 'async ' : ''}function() {
       const webviewId = ${JSON.stringify(webviewId)};
       function resolveDoc() {
         const active = document.getElementById('active-frame');
@@ -505,7 +512,7 @@ async function evalInFrame(Runtime, code) {
       ${code}
     })()`,
     returnByValue: true,
-    awaitPromise: false,
+    awaitPromise: useAsync,
     silent: true,
     userGesture: false,
   });
@@ -1418,12 +1425,143 @@ const CODEX_READ_EXPR = `
     var msgs = [];
     var pendingAssistant = [];
 
+    function _codexCommandCache() {
+      try {
+        var w = d.defaultView || window;
+        w.__remoteAgentCodexCommandOutputCache = w.__remoteAgentCodexCommandOutputCache || {};
+        return w.__remoteAgentCodexCommandOutputCache;
+      } catch (_) {
+        return {};
+      }
+    }
+
+    function _normalizeCodexCommandKey(command) {
+      return String(command || '')
+        .replace(/^\\$\\s+/, '')
+        .replace(/^Ran\\s+/i, '')
+        .replace(/\\s+for\\s+\\d+(?:ms|s|m)\\s*$/i, '')
+        .replace(/\\s+/g, ' ')
+        .trim()
+        .toLowerCase();
+    }
+
+    function _parseExpandedCodexCommandOutput(text, fallbackCommand) {
+      var lines = String(text || '').split('\\n').map(function(line) {
+        return String(line || '').trimEnd();
+      }).filter(function(line) { return String(line || '').trim(); });
+      if (lines.length === 0) return null;
+
+      var commandIndex = -1;
+      var commandLine = '';
+      for (var i = 0; i < lines.length; i++) {
+        var trimmed = String(lines[i] || '').trim();
+        if (/^\\$\\s+/.test(trimmed)) {
+          commandIndex = i;
+          commandLine = trimmed.replace(/^\\$\\s+/, '').trim();
+          break;
+        }
+      }
+      if (commandIndex < 0) {
+        commandLine = String(fallbackCommand || '').trim();
+        var ranIndex = lines.findIndex(function(line) { return /^Ran\\s+/i.test(String(line || '').trim()); });
+        commandIndex = ranIndex >= 0 ? ranIndex : 0;
+      }
+      if (!commandLine) return null;
+
+      var output = lines.slice(commandIndex + 1).join('\\n').trim();
+      output = output
+        .replace(/^(Command completed|Completed)$/i, '')
+        .trim();
+      if (!output) return null;
+      return { command: commandLine, output: output };
+    }
+
+    function _readCodexCachedCommandOutput(command) {
+      var cache = _codexCommandCache();
+      var key = _normalizeCodexCommandKey(command);
+      return key && cache[key] ? String(cache[key]) : '';
+    }
+
+    function _expandCodexCachedCompactActivities(content) {
+      var lines = String(content || '').split('\\n');
+      var out = [];
+      var insideTool = false;
+      for (var i = 0; i < lines.length; i++) {
+        var line = String(lines[i] || '');
+        var trimmed = line.trim();
+        if (/^\\[(?:Bash|Edit|Read|Search|Write|Created|Deleted|Analyzed|\\d+\\s+lines?)[^\\]\\n]*\\]$/i.test(trimmed) && !/^\\[end\\]$/i.test(trimmed)) {
+          insideTool = true;
+          out.push(line);
+          continue;
+        }
+        if (/^\\[end\\]$/i.test(trimmed)) {
+          insideTool = false;
+          out.push(line);
+          continue;
+        }
+        if (!insideTool) {
+          var ran = trimmed.match(/^Ran\\s+(.+)$/i);
+          if (ran && ran[1] && !/^\\d+\\s+commands?$/i.test(ran[1].trim())) {
+            var command = ran[1].trim();
+            var output = _readCodexCachedCommandOutput(command);
+            out.push('[Bash ' + command + ']');
+            out.push(output || 'Command completed');
+            out.push('[end]');
+            continue;
+          }
+        }
+        out.push(line);
+      }
+      return out.join('\\n');
+    }
+
     function flushAssistant() {
       if (pendingAssistant.length === 0) return;
       var content = pendingAssistant.join('\\n\\n').trim();
+      content = _expandCodexCachedCompactActivities(content).trim();
       if (content) msgs.push({ role: 'assistant', content: content });
       pendingAssistant = [];
     }
+
+    async function _primeCodexCollapsedCommandOutputCache(root) {
+      var cache = _codexCommandCache();
+      var rows = Array.from(root.querySelectorAll('.cursor-interaction, [role="button"]'))
+        .filter(function(row) {
+          var text = (row.innerText || row.textContent || '').trim();
+          if (!/^Ran\\s+/i.test(text)) return false;
+          if (/^Ran\\s+\\d+\\s+commands?$/i.test(text)) return false;
+          var command = text.replace(/^Ran\\s+/i, '').split('\\n')[0].trim();
+          if (!command || command.length > 500) return false;
+          return !_readCodexCachedCommandOutput(command);
+        })
+        .slice(-80);
+
+      for (var ri = 0; ri < rows.length; ri++) {
+        var row = rows[ri];
+        var label = (row.innerText || row.textContent || '').trim();
+        var command = label.replace(/^Ran\\s+/i, '').split('\\n')[0].trim();
+        var box = row.closest('.relative.flex.flex-col.overflow-clip')
+          || row.closest('[style*="overflow: hidden"]')
+          || row.parentElement;
+        try {
+          row.click();
+          await new Promise(function(resolve) { setTimeout(resolve, 120); });
+          var expandedText = (box && (box.innerText || box.textContent)) || (row.innerText || row.textContent) || '';
+          var parsed = _parseExpandedCodexCommandOutput(expandedText, command);
+          if (parsed && parsed.output) {
+            cache[_normalizeCodexCommandKey(parsed.command || command)] = parsed.output;
+          }
+        } catch (_) {
+        } finally {
+          try {
+            row.click();
+            await new Promise(function(resolve) { setTimeout(resolve, 20); });
+          } catch (_) {}
+        }
+      }
+    }
+
+    await _primeCodexCollapsedCommandOutputCache(d);
 
     // Extract diff content from a diffs-container shadow DOM.
     // The shadow DOM uses: <code data-code><div data-gutter>...<div data-content>
@@ -1672,6 +1810,7 @@ const CODEX_READ_EXPR = `
           }
           if (!outputEl) outputEl = el.querySelector('.overflow-hidden');
           var cmdOutput = outputEl ? (outputEl.innerText || '').trim() : '';
+          if (!cmdOutput) cmdOutput = _readCodexCachedCommandOutput(cmdLine);
           var block = '[Bash ' + cmdLine + ']\\n' + (cmdOutput || 'Command completed') + '\\n[end]';
           pendingAssistant.push(block);
         }
@@ -1681,8 +1820,13 @@ const CODEX_READ_EXPR = `
       // "Ran ..." summary text (when commands are collapsed — no group/command children)
       if (/^Ran /i.test(text)) {
         var ranLine = text.split('\\n')[0].trim().substring(4);
+        if (/^\\d+\\s+commands?$/i.test(ranLine)) {
+          pendingAssistant.push(_expandCodexCachedCompactActivities(text));
+          continue;
+        }
         // Include any visible output below the "Ran" header
         var ranOutput = text.split('\\n').slice(1).join('\\n').trim();
+        if (!ranOutput) ranOutput = _readCodexCachedCommandOutput(ranLine);
         pendingAssistant.push('[Bash ' + ranLine + ']\\n' + (ranOutput || 'Command completed') + '\\n[end]');
         continue;
       }
@@ -1860,7 +2004,9 @@ const CODEX_DESKTOP_READ_EXPR = `
     if (!trimmed) return '';
     if (/^\\d{1,2}:\\d{2}\\s*(AM|PM)$/i.test(trimmed)) return '';
     if (/^(Playground|Commit|Undo|Review|Show more|Threads|Plugins|Automations|Search|New chat|Settings|Copy|Copy message|Fork from this message)$/i.test(trimmed)) return '';
-    if (role === 'assistant' && /^(Worked for .*|Working for .*)$/i.test(trimmed)) return '';
+    // Keep "Worked for" / "Working for" lines so the WebUI can show the
+    // turn boundary; the proxy accumulator uses them as a completion signal
+    // to retain richer earlier work when the DOM collapses the turn.
     return String(line || '').replace(/\\s+$/g, '');
   }
 
@@ -2137,6 +2283,98 @@ const CODEX_DESKTOP_READ_EXPR = `
     return '';
   }
 
+  // ─── Desktop completion-summary helpers (mirror side-pane behaviour) ───
+  // When Codex Desktop collapses a "Worked for X" turn, the assistant unit
+  // shrinks to a header + summary card. We grab the file-change summary
+  // cards and the completed-task summary text inline so they survive the
+  // collapse and are preserved by the proxy's accumulator merge logic.
+  function _looksLikePathTextDesktop(value) {
+    var t = String(value || '').trim();
+    return !!t && (/[\\\\/]/.test(t) || /\\.[A-Za-z0-9]{1,8}$/.test(t));
+  }
+  function _parseStatTextDesktop(value) {
+    var t = String(value || '').replace(/\\s+/g, '').trim();
+    var both = t.match(/^\\+(\\d+)-(\\d+)$/);
+    if (both) return { adds: parseInt(both[1], 10) || 0, dels: parseInt(both[2], 10) || 0 };
+    var plus = t.match(/^\\+(\\d+)$/);
+    if (plus) return { adds: parseInt(plus[1], 10) || 0, dels: null };
+    var minus = t.match(/^-(\\d+)$/);
+    if (minus) return { adds: null, dels: parseInt(minus[1], 10) || 0 };
+    return null;
+  }
+  function _extractDesktopFileChangeSummaryCards(container) {
+    if (!container || !container.querySelectorAll) return [];
+    var candidates = Array.from(container.querySelectorAll('[class*="rounded-xl"], .mt-3'))
+      .filter(function(card) {
+        var t = (card.innerText || card.textContent || '').trim();
+        return /^\\d+\\s+files?\\s+changed/i.test(t);
+      });
+    candidates = candidates.filter(function(card) {
+      return !candidates.some(function(other) { return other !== card && card.contains(other); });
+    });
+    var seen = {};
+    var blocks = [];
+    candidates.forEach(function(card) {
+      var spans = Array.from(card.querySelectorAll('span'))
+        .map(function(sp) { return (sp.innerText || sp.textContent || '').trim(); })
+        .filter(Boolean);
+      var headerIdx = spans.findIndex(function(t) { return /^\\d+\\s+files?\\s+changed/i.test(t); });
+      if (headerIdx < 0) {
+        var first = (card.innerText || '').split('\\n').map(function(t) { return t.trim(); }).find(Boolean) || '';
+        if (/^\\d+\\s+files?\\s+changed/i.test(first)) {
+          spans.unshift(first);
+          headerIdx = 0;
+        }
+      }
+      if (headerIdx < 0) return;
+      var header = spans[headerIdx].replace(/\\s+/g, ' ').trim();
+      var totals = [];
+      for (var si = headerIdx + 1; si < spans.length && totals.length < 2; si++) {
+        if (/^[+-]\\d+$/.test(spans[si])) totals.push(spans[si]);
+      }
+      var lines = [header + (totals.length === 2 ? ' ' + totals[0] + ' ' + totals[1] : '')];
+      var entries = [];
+      for (var idx = headerIdx + 1; idx < spans.length; idx++) {
+        var current = spans[idx];
+        if (!current || /^(Undo|Review)$/i.test(current) || /^[+-]\\d+$/.test(current) || /^\\+\\d+-\\d+$/.test(current)) continue;
+        if (!_looksLikePathTextDesktop(current)) continue;
+        var path = current;
+        if (!/[\\\\/]/.test(path) && idx + 1 < spans.length && _looksLikePathTextDesktop(spans[idx + 1]) && /[\\\\/]/.test(spans[idx + 1])) {
+          path = spans[idx + 1];
+          idx++;
+        }
+        var adds = null, dels = null;
+        for (var sj = idx + 1; sj < spans.length && sj <= idx + 5; sj++) {
+          var stat = _parseStatTextDesktop(spans[sj]);
+          if (!stat) continue;
+          if (stat.adds != null && stat.dels != null) { adds = stat.adds; dels = stat.dels; break; }
+          if (stat.adds != null && adds == null) adds = stat.adds;
+          if (stat.dels != null && dels == null) dels = stat.dels;
+          if (adds != null && dels != null) break;
+        }
+        if (adds == null || dels == null) continue;
+        var key = path + ':' + adds + ':' + dels;
+        if (entries.indexOf(key) !== -1) continue;
+        entries.push(key);
+        lines.push(path + ' +' + adds + ' -' + dels);
+      }
+      var block = lines.join('\\n');
+      if (!seen[block]) {
+        seen[block] = true;
+        blocks.push(block);
+      }
+    });
+    return blocks;
+  }
+  function _extractDesktopWorkedForHeader(turn) {
+    var btns = Array.from(turn.querySelectorAll('button[aria-expanded]'));
+    for (var i = 0; i < btns.length; i++) {
+      var t = (btns[i].textContent || '').trim();
+      if (/^Worked for /i.test(t) || /^Working for /i.test(t)) return t;
+    }
+    return '';
+  }
+
   var convo = d.querySelector('[data-thread-find-target="conversation"]');
   if (!convo) return JSON.stringify([]);
 
@@ -2176,6 +2414,21 @@ const CODEX_DESKTOP_READ_EXPR = `
       if (parsedCommand) uniquePushAny(assistantParts, parsedCommand);
     }
 
+    // File-change summary cards ("N files changed +A -D" with per-file rows).
+    // These show up after a "Worked for" header on completed turns and were
+    // previously dropped on Codex Desktop, so collapsed turns lost the file
+    // change list.
+    var summaryBlocks = _extractDesktopFileChangeSummaryCards(turn);
+    summaryBlocks.forEach(function(block) { uniquePushAny(assistantParts, block); });
+
+    // Append the "Worked for X" header (if present and not already in
+    // assistantParts) so the turn boundary is visible and the accumulator
+    // merge logic can detect completion.
+    var workedHeader = _extractDesktopWorkedForHeader(turn);
+    if (workedHeader && !assistantParts.some(function(p) { return p && p.indexOf(workedHeader) !== -1; })) {
+      assistantParts.push(workedHeader);
+    }
+
     if (userParts.length > 0) {
       msgs.push({ role: 'user', content: userParts.join('\\n\\n') });
     }
@@ -2194,7 +2447,7 @@ async function readCodexMessages(Runtime, sessionId, usePageEval) {
   try {
     const raw = usePageEval
       ? await evalInPage(Runtime, CODEX_DESKTOP_READ_EXPR)
-      : await evalInFrame(Runtime, CODEX_READ_EXPR);
+      : await evalInFrame(Runtime, CODEX_READ_EXPR, { awaitPromise: true });
     if (raw !== null) { resetReadFailures(sessionId); return expandCodexMessagesRaw(raw); }
   } catch (e) {
     console.warn(`[${sessionId}] [sel] Codex read error: ${e.message}`);

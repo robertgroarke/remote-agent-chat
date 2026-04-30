@@ -225,9 +225,34 @@ function historiesMatch(existingRows, incomingRows) {
   return true;
 }
 
-function shouldBroadcastHistoryResync(existingRows, incomingRows) {
-  if (incomingRows.length <= LARGE_HISTORY_BROADCAST_LIMIT) return true;
-  return false;
+// Per-session throttle for large history broadcasts. The transcript is always
+// persisted to the DB on every resync, but we don't need to push 400+ message
+// payloads to every browser on every poll — that just chews uplink for no UX
+// benefit. Send one broadcast immediately, then at most one per
+// LARGE_HISTORY_BROADCAST_THROTTLE_MS for the same session, with a trailing
+// flush so the latest state still lands.
+const LARGE_HISTORY_BROADCAST_THROTTLE_MS = 1500;
+const lastLargeBroadcastAt = new Map(); // session_id → epoch ms
+const pendingLargeBroadcast = new Map(); // session_id → timer
+
+function scheduleHistoryBroadcast(sessionId, payloadFactory) {
+  const now = Date.now();
+  const last = lastLargeBroadcastAt.get(sessionId) || 0;
+  const elapsed = now - last;
+  if (elapsed >= LARGE_HISTORY_BROADCAST_THROTTLE_MS) {
+    lastLargeBroadcastAt.set(sessionId, now);
+    broadcastToBrowsers(payloadFactory());
+    return;
+  }
+  // Coalesce: replace any pending trailing broadcast with the latest factory.
+  const existing = pendingLargeBroadcast.get(sessionId);
+  if (existing) clearTimeout(existing);
+  const timer = setTimeout(() => {
+    pendingLargeBroadcast.delete(sessionId);
+    lastLargeBroadcastAt.set(sessionId, Date.now());
+    broadcastToBrowsers(payloadFactory());
+  }, LARGE_HISTORY_BROADCAST_THROTTLE_MS - elapsed);
+  pendingLargeBroadcast.set(sessionId, timer);
 }
 
 // ── Prepared statements ───────────────────────────────────────────────────────
@@ -1696,9 +1721,13 @@ function handleProxyConnection(ws, req) {
         });
         resync(messages);
         log('info', 'history', `Resynced ${existing.length}→${messages.length}`, { session: id });
-        const shouldBroadcast = shouldBroadcastHistoryResync(existing, messages);
-        if (shouldBroadcast) {
-          broadcastToBrowsers({ type: 'history', session: id, messages: stmtGetHistory.all(id) });
+        const buildPayload = () => ({ type: 'history', session: id, messages: stmtGetHistory.all(id) });
+        if (messages.length <= LARGE_HISTORY_BROADCAST_LIMIT) {
+          broadcastToBrowsers(buildPayload());
+        } else {
+          // Throttle but always deliver the latest — large transcripts must
+          // still appear live in the WebUI, just not on every single poll.
+          scheduleHistoryBroadcast(id, buildPayload);
         }
       } else if (existing.length === 0 && messages.length > 0) {
         db.transaction((msgs) => {
