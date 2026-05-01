@@ -1479,7 +1479,10 @@ const CODEX_READ_EXPR = `
     function _readCodexCachedCommandOutput(command) {
       var cache = _codexCommandCache();
       var key = _normalizeCodexCommandKey(command);
-      return key && cache[key] ? String(cache[key]) : '';
+      var v = key && cache[key] ? String(cache[key]) : '';
+      // \\x00 is the negative-cache sentinel from the bounded prime.
+      if (v === '\\x00') return '';
+      return v;
     }
 
     function _expandCodexCachedCompactActivities(content) {
@@ -1523,72 +1526,50 @@ const CODEX_READ_EXPR = `
       pendingAssistant = [];
     }
 
-    // Ephemeral, non-interactive prime: Codex collapses the command output
-    // visually with overflow-clip / max-height tricks, but the underlying
-    // children typically stay in the DOM. textContent ignores CSS visibility
-    // so we can read the body without clicking the row. Reading via the
-    // React fiber's memoized props gives us the rest when the DOM truly is
-    // detached. No clicks, no UI thrash.
+    // Bounded ephemeral prime. textContent serializes the entire subtree
+    // synchronously on the renderer thread; the previous version walked up
+    // to 80 rows per poll and read textContent of large parent containers,
+    // which froze the Codex side pane on long sessions. Now: at most 4 rows
+    // per poll, no multi-level container climb, and a negative-cache sentinel
+    // so unreadable rows aren't re-attempted on every subsequent poll.
+    var _CODEX_PRIME_NULL = '\\x00';
+    var _CODEX_PRIME_BUDGET = 4;
+
     function _readCodexCollapsedRowBody(row) {
-      // 1. Try textContent on the surrounding "overflow-clip" box. If the
-      //    expanded body is CSS-hidden (the common case in Codex side pane)
-      //    this returns the full content even while the row is collapsed.
-      var box = row.closest('.relative.flex.flex-col.overflow-clip')
-        || row.closest('[style*="overflow: hidden"]')
-        || row.parentElement;
-      if (box) {
-        var visible = (row.innerText || '').length;
-        var raw = String(box.textContent || '');
-        if (raw.length > visible + 30) return raw;
-      }
-      // 2. Fallback: walk the React fiber on the row to find a stored
-      //    output/stdout/text prop. Codex's component sometimes carries
-      //    the expanded body in memoizedProps even when the JSX child is
-      //    not yet mounted.
-      try {
-        var fiberKey = Object.keys(row).find(function(k) {
-          return k.indexOf('__reactFiber') === 0 || k.indexOf('__reactInternalInstance') === 0;
-        });
-        if (!fiberKey) return '';
-        var fiber = row[fiberKey];
-        for (var hops = 0; hops < 10 && fiber; hops++) {
-          var props = fiber.memoizedProps || (fiber.stateNode && fiber.stateNode.props) || null;
-          if (props && typeof props === 'object') {
-            var keys = ['output', 'stdout', 'commandOutput', 'expandedText', 'body', 'text'];
-            for (var ki = 0; ki < keys.length; ki++) {
-              var v = props[keys[ki]];
-              if (typeof v === 'string' && v.length > 0) return v;
-            }
-          }
-          fiber = fiber.return;
-        }
-      } catch (_) { /* ignore */ }
+      var rowText = String(row.innerText || '');
+      var firstLine = rowText.split('\\n')[0] || '';
+      // Row already has its body inline (user expanded it manually).
+      if (rowText.length > firstLine.length + 30) return rowText;
+      // Otherwise check the row's immediate parent only.
+      var parent = row.parentElement;
+      if (!parent) return '';
+      var raw = String(parent.textContent || '');
+      if (raw.length > rowText.length + 30) return raw;
       return '';
     }
 
     function _primeCodexCollapsedCommandOutputCache(root) {
       var cache = _codexCommandCache();
-      var rows = Array.from(root.querySelectorAll('.cursor-interaction, [role="button"]'))
-        .filter(function(row) {
-          var text = (row.innerText || row.textContent || '').trim();
-          if (!/^Ran\\s+/i.test(text)) return false;
-          if (/^Ran\\s+\\d+\\s+commands?$/i.test(text)) return false;
-          var command = text.replace(/^Ran\\s+/i, '').split('\\n')[0].trim();
-          if (!command || command.length > 500) return false;
-          return !_readCodexCachedCommandOutput(command);
-        })
-        .slice(-80);
-
-      for (var ri = 0; ri < rows.length; ri++) {
-        var row = rows[ri];
-        var label = (row.innerText || row.textContent || '').trim();
-        var command = label.replace(/^Ran\\s+/i, '').split('\\n')[0].trim();
+      var ranRows = root.querySelectorAll('.cursor-interaction, [role="button"]');
+      var primed = 0;
+      // Walk newest-first so our small budget covers the most recent commands.
+      for (var ri = ranRows.length - 1; ri >= 0 && primed < _CODEX_PRIME_BUDGET; ri--) {
+        var row = ranRows[ri];
+        var text = (row.innerText || '').trim();
+        if (!/^Ran\\s+/i.test(text)) continue;
+        if (/^Ran\\s+\\d+\\s+commands?$/i.test(text)) continue;
+        var command = text.replace(/^Ran\\s+/i, '').split('\\n')[0].trim();
+        if (!command || command.length > 500) continue;
+        var key = _normalizeCodexCommandKey(command);
+        if (cache[key]) continue; // already cached (positive or negative)
+        primed++;
         var raw = _readCodexCollapsedRowBody(row);
-        if (!raw) continue;
-        var parsed = _parseExpandedCodexCommandOutput(raw, command);
-        if (parsed && parsed.output) {
-          cache[_normalizeCodexCommandKey(parsed.command || command)] = parsed.output;
+        if (!raw) {
+          cache[key] = _CODEX_PRIME_NULL;
+          continue;
         }
+        var parsed = _parseExpandedCodexCommandOutput(raw, command);
+        cache[key] = (parsed && parsed.output) ? parsed.output : _CODEX_PRIME_NULL;
       }
     }
 
@@ -2060,74 +2041,48 @@ const CODEX_DESKTOP_READ_EXPR = `
     return turnKey + '|' + label + '|' + idx;
   }
 
-  function _desktopCaptureExpandedBox(btn) {
-    // Walk up to find the closest container that holds the expanded body.
-    // Use textContent (not innerText) so we read the body even when Codex
-    // visually collapses it via overflow/max-height — no clicks needed.
-    var box = btn.parentElement;
-    var btnText = (btn.textContent || '');
-    for (var i = 0; i < 6 && box; i++) {
-      var t = (box.textContent || '');
-      if (t.length > btnText.length + 50) break;
-      box = box.parentElement;
-    }
-    if (!box) return '';
-    return String(box.textContent || '').trim();
-  }
+  // Bounded ephemeral prime — see the side-pane comment for the why.
+  // The previous version did a 6-level textContent climb per button which
+  // froze the renderer for seconds on long sessions.
+  var _DESKTOP_PRIME_NULL = '\\x00';
+  var _DESKTOP_PRIME_BUDGET = 4;
 
-  function _readDesktopRunFromFiber(btn) {
-    // Fiber fallback if the body truly isn't in the DOM yet.
-    try {
-      var fiberKey = Object.keys(btn).find(function(k) {
-        return k.indexOf('__reactFiber') === 0 || k.indexOf('__reactInternalInstance') === 0;
-      });
-      if (!fiberKey) return '';
-      var fiber = btn[fiberKey];
-      for (var hops = 0; hops < 12 && fiber; hops++) {
-        var props = fiber.memoizedProps || (fiber.stateNode && fiber.stateNode.props) || null;
-        if (props && typeof props === 'object') {
-          var keys = ['output', 'stdout', 'commandOutput', 'expandedText', 'body', 'text', 'children'];
-          for (var ki = 0; ki < keys.length; ki++) {
-            var v = props[keys[ki]];
-            if (typeof v === 'string' && v.length > 50) return v;
-          }
-        }
-        fiber = fiber.return;
-      }
-    } catch (_) { /* ignore */ }
+  function _desktopCaptureExpandedBox(btn) {
+    var btnText = String(btn.textContent || '');
+    if (btnText.length > 80) return btnText.trim();
+    var parent = btn.parentElement;
+    if (!parent) return '';
+    var pt = String(parent.textContent || '');
+    if (pt.length > btnText.length + 50) return pt.trim();
     return '';
   }
 
   function _primeDesktopCollapsedRuns() {
-    // Ephemeral, non-interactive prime: read whatever the DOM already holds
-    // (Codex Desktop CSS-collapses the body but typically keeps the children
-    // mounted, so textContent picks them up). Falls back to React fiber
-    // memoizedProps when the body is genuinely detached. No clicks → no
-    // visible expand/collapse thrash in the desktop app UI.
     var cache = _desktopCmdCache();
     var convoEl = d.querySelector('[data-thread-find-target="conversation"]');
     if (!convoEl) return;
-    var btns = Array.from(convoEl.querySelectorAll('button[aria-expanded="false"]'))
-      .filter(function(b) {
-        var t = (b.innerText || b.textContent || '').trim();
-        return /^Ran\\s+/i.test(t);
-      })
-      .slice(-30);
-
-    for (var bi = 0; bi < btns.length; bi++) {
+    var btns = convoEl.querySelectorAll('button[aria-expanded="false"]');
+    var primed = 0;
+    // Newest-first so the budget covers the most recent collapsed runs.
+    for (var bi = btns.length - 1; bi >= 0 && primed < _DESKTOP_PRIME_BUDGET; bi--) {
       var btn = btns[bi];
+      var t = (btn.innerText || '').trim();
+      if (!/^Ran\\s+/i.test(t)) continue;
       var key = _desktopRanButtonKey(btn);
       if (cache[key]) continue;
+      primed++;
       var captured = _desktopCaptureExpandedBox(btn);
-      if (!captured) captured = _readDesktopRunFromFiber(btn);
-      if (captured) cache[key] = captured;
+      cache[key] = captured || _DESKTOP_PRIME_NULL;
     }
   }
 
   function _desktopCachedRunBody(btn) {
     var cache = _desktopCmdCache();
     var key = _desktopRanButtonKey(btn);
-    return key && cache[key] ? String(cache[key]) : '';
+    if (!key) return '';
+    var v = cache[key];
+    if (!v || v === '\\x00') return '';
+    return String(v);
   }
 
   function squashNewlines(text) {
