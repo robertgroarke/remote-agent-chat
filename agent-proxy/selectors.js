@@ -7730,32 +7730,43 @@ const ANTIGRAVITY_PANEL_PERMISSION_EXPR = `
   var panel = d.querySelector('.antigravity-agent-side-panel') || d.body;
   if (!panel) return null;
 
-  // If the panel has a prompt-like text but the Run/Reject buttons aren't
-  // rendered (virtualized list, or just scrolled out), scrolling the chat
-  // container to its bottom forces the latest content to render. Only do this
-  // when prompt text suggests a prompt is present, to avoid thrashing
-  // scroll position on every poll.
-  var _panelTextEarly = (panel.innerText || '');
-  if (/Run command\\??|Edit file\\??|Steps? Requires? Input|Run tool\\??|Allow .* access|Allow directory/i.test(_panelTextEarly)) {
-    var scrollables = panel.querySelectorAll('*');
-    for (var si0 = 0; si0 < scrollables.length; si0++) {
-      var sEl = scrollables[si0];
-      if (!sEl.scrollHeight || !sEl.clientHeight) continue;
-      if (sEl.scrollHeight <= sEl.clientHeight) continue;
-      // Only scroll containers near the bottom already (within 400px) so
-      // we don't yank the user back to the bottom while they're reading.
-      if (sEl.scrollHeight - sEl.scrollTop - sEl.clientHeight > 400) continue;
-      sEl.scrollTop = sEl.scrollHeight;
+  function _findRejectBtn() {
+    var btns = Array.from(panel.querySelectorAll('button'));
+    for (var i = 0; i < btns.length; i++) {
+      if ((btns[i].textContent || '').trim().toLowerCase() === 'reject') return btns[i];
     }
+    return null;
   }
 
-  // Strategy 1: Find buttons with "Reject" text — the permission prompt always has one
+  // Strategy 1: Find buttons with "Reject" text — the permission prompt always
+  // has one. Do this BEFORE any scroll mutation so happy-path polls stay
+  // ephemeral; only fall back to scrolling if the button truly isn't in DOM.
   var allBtns = Array.from(panel.querySelectorAll('button'));
-  var rejectBtn = null;
-  for (var ri = 0; ri < allBtns.length; ri++) {
-    var rText = (allBtns[ri].textContent || '').trim().toLowerCase();
-    if (rText === 'reject') {
-      rejectBtn = allBtns[ri]; break;
+  var rejectBtn = _findRejectBtn();
+
+  // Fallback: if the panel has prompt-like text but the Reject button is
+  // missing from the DOM (virtualized list / not yet mounted), scrolling
+  // near-bottom containers forces the latest content to render. Gated on
+  // BOTH "prompt text is present" AND "button not found yet" so a poll
+  // never mutates scroll position when detection has already succeeded.
+  if (!rejectBtn) {
+    var _panelTextEarly = (panel.innerText || '');
+    if (/Run command\\??|Edit file\\??|Steps? Requires? Input|Run tool\\??|Allow .* access|Allow directory/i.test(_panelTextEarly)) {
+      var scrollables = panel.querySelectorAll('*');
+      var didScroll = false;
+      for (var si0 = 0; si0 < scrollables.length; si0++) {
+        var sEl = scrollables[si0];
+        if (!sEl.scrollHeight || !sEl.clientHeight) continue;
+        if (sEl.scrollHeight <= sEl.clientHeight) continue;
+        if (sEl.scrollHeight - sEl.scrollTop - sEl.clientHeight > 400) continue;
+        sEl.scrollTop = sEl.scrollHeight;
+        didScroll = true;
+      }
+      if (didScroll) {
+        // Re-collect buttons after the scroll-induced render
+        allBtns = Array.from(panel.querySelectorAll('button'));
+        rejectBtn = _findRejectBtn();
+      }
     }
   }
 
