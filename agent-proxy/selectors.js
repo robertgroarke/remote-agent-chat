@@ -1780,7 +1780,15 @@ const CODEX_READ_EXPR = `
         continue;
       }
 
-      // "Worked for Xs" — marks end of a turn, flush accumulated content first
+      // "Worked for Xs" — Codex renders this at the TOP of a completed turn,
+      // not at the end. The narrative + file-change cards live in sibling
+      // gap0 children that come AFTER this item. Don't flush here — just
+      // push the header (and any body that happens to be inline with this
+      // node) and let subsequent items accumulate into the same assistant
+      // message. The next user turn (or end of allItems) flushes the
+      // combined message. Flushing here would split each completed turn
+      // into two messages (header alone + body), which the WebUI displays
+      // as collapse / missing content.
       var statusBtn = el.querySelector('button[aria-expanded]');
       if (statusBtn && /Worked for/i.test(statusBtn.textContent)) {
         var workedText = (statusBtn.textContent || '').trim();
@@ -1789,7 +1797,6 @@ const CODEX_READ_EXPR = `
         if (completedText) pendingAssistant.push(completedText);
         var completedFileSummaries = _extractFileChangeSummaryCards(el);
         completedFileSummaries.forEach(function(block) { pendingAssistant.push(block); });
-        flushAssistant();
         continue;
       }
       // "Running command for Ns" — active, add to current accumulation
