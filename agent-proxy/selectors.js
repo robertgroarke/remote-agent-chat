@@ -92,7 +92,7 @@ function _expandCodexCommandGroup(body) {
   if (blocks.length === 0) return null;
   return blocks
     .filter(block => block.command)
-    .map(block => _codexToolBlock(`Bash ${block.command}`, block.body.join('\n') || 'Command completed'))
+    .map(block => _codexToolBlock(`Bash ${block.command}`, block.body.join('\n')))
     .join('\n\n');
 }
 
@@ -107,7 +107,7 @@ function _expandCodexCompactFileLines(text) {
         out.push(line);
         continue;
       }
-      out.push(_codexToolBlock(`Bash ${ran[1].trim()}`, 'Command completed'));
+      out.push(_codexToolBlock(`Bash ${ran[1].trim()}`, ''));
       continue;
     }
     const op = line.trim().match(/^(Created|Edited|Deleted) file$/i);
@@ -1508,7 +1508,7 @@ const CODEX_READ_EXPR = `
             var command = ran[1].trim();
             var output = _readCodexCachedCommandOutput(command);
             out.push('[Bash ' + command + ']');
-            out.push(output || 'Command completed');
+            if (output) out.push(output);
             out.push('[end]');
             continue;
           }
@@ -1830,7 +1830,7 @@ const CODEX_READ_EXPR = `
           if (!outputEl) outputEl = el.querySelector('.overflow-hidden');
           var cmdOutput = outputEl ? (outputEl.innerText || '').trim() : '';
           if (!cmdOutput) cmdOutput = _readCodexCachedCommandOutput(cmdLine);
-          var block = '[Bash ' + cmdLine + ']\\n' + (cmdOutput || 'Command completed') + '\\n[end]';
+          var block = '[Bash ' + cmdLine + ']\\n' + (cmdOutput ? cmdOutput + '\\n' : '') + '[end]';
           pendingAssistant.push(block);
         }
         continue;
@@ -1846,7 +1846,7 @@ const CODEX_READ_EXPR = `
         // Include any visible output below the "Ran" header
         var ranOutput = text.split('\\n').slice(1).join('\\n').trim();
         if (!ranOutput) ranOutput = _readCodexCachedCommandOutput(ranLine);
-        pendingAssistant.push('[Bash ' + ranLine + ']\\n' + (ranOutput || 'Command completed') + '\\n[end]');
+        pendingAssistant.push('[Bash ' + ranLine + ']\\n' + (ranOutput ? ranOutput + '\\n' : '') + '[end]');
         continue;
       }
 
@@ -1892,7 +1892,7 @@ const CODEX_READ_EXPR = `
               seenFiles[fname] = true;
               var diffContent = _extractDiffFromShadow(fileDiff);
               var block = '[Edit ' + fname + ']\\n';
-              block += (diffContent || 'Edited file') + '\\n';
+              if (diffContent) block += diffContent + '\\n';
               block += '[end]';
               pendingAssistant.push(block);
             }
@@ -1928,7 +1928,7 @@ const CODEX_READ_EXPR = `
         var diffContent = _extractDiffFromShadow(el);
         if (editName) {
           var block = '[Edit ' + editName + ']\\n';
-          block += (diffContent || 'Edited file') + '\\n';
+          if (diffContent) block += diffContent + '\\n';
           block += '[end]';
           pendingAssistant.push(block);
         }
@@ -2290,7 +2290,7 @@ const CODEX_DESKTOP_READ_EXPR = `
         var t = String(line || '').trim();
         return t && t !== first && /[A-Za-z0-9_./\\\\-]+\\.[A-Za-z0-9]+/.test(t);
       }) || 'file';
-      return '[Edit ' + target.trim() + ']\\n' + (rest || 'Edited file') + '\\n[end]';
+      return '[Edit ' + target.trim() + ']\\n' + (rest ? rest + '\\n' : '') + '[end]';
     }
     // "Shell" header — Codex Desktop uses this for running/completed commands
     if (/^Shell$/i.test(first)) {
@@ -2335,8 +2335,9 @@ const CODEX_DESKTOP_READ_EXPR = `
     if (lines.length === 0) return [];
     function toolBlock(name, body) {
       var safeBody = typeof body === 'string' ? body.trim() : '';
-      if (!safeBody && /^Bash\\b/i.test(name)) safeBody = 'Command completed';
-      if (!safeBody && /^Edit\\b/i.test(name)) safeBody = 'Edited file';
+      // Don't synthesise "Command completed" / "Edited file" placeholder
+      // bodies — when there's no real output, render just the header so
+      // the WebUI shows the command/edit name without a useless body line.
       return '[' + name + ']\\n' + (safeBody ? safeBody + '\\n' : '') + '[end]';
     }
     var summary = lines[0];
@@ -2375,7 +2376,7 @@ const CODEX_DESKTOP_READ_EXPR = `
     }
     var first = lines.find(function(line) { return !!line; }) || '';
     if (/^Ran\\s+/i.test(first)) {
-      return '[Bash ' + first.replace(/^Ran\\s+/i, '').trim() + ']\\nCommand completed\\n[end]';
+      return '[Bash ' + first.replace(/^Ran\\s+/i, '').trim() + ']\\n[end]';
     }
     return '';
   }
@@ -4228,6 +4229,10 @@ async function selectRooCodeMenuOption(Runtime, wanted) {
 
 async function setRooCodeModel(Runtime, modelId, sessionId, InputDomain) {
   try {
+    const before = await readRooCodeConfig(Runtime).catch(() => null);
+    if (before && !before.has_model_dropdown && before.has_mode_control && /^(plan|act)$/i.test(String(before.mode || ''))) {
+      return await setClineModel(Runtime, modelId, sessionId);
+    }
     const click = await clickRooCodeControl(Runtime, InputDomain, '[data-testid="dropdown-trigger"]');
     if (!click.ok) return click;
     await new Promise(r => setTimeout(r, 200));
@@ -4235,6 +4240,88 @@ async function setRooCodeModel(Runtime, modelId, sessionId, InputDomain) {
     if (!selected.ok) return selected;
     console.log(`[${sessionId}] [roo-model] Selected: ${selected.selected}`);
     return selected;
+  } catch (e) {
+    return { ok: false, code: 'exception', detail: e.message };
+  }
+}
+
+function parseClineModelId(modelId, currentModel) {
+  const raw = String(modelId || '').trim();
+  const current = String(currentModel || '').trim();
+  const providerMatch = raw.match(/^(anthropic|openai|openrouter|gemini|lmstudio|vscode-lm|ollama|hicap|requesty|cline):(.+)$/i);
+  if (providerMatch) return { provider: providerMatch[1].toLowerCase(), model: providerMatch[2].trim() };
+  const currentProvider = current.match(/^(anthropic|openai|openrouter|gemini|lmstudio|vscode-lm|ollama|hicap|requesty|cline):/i);
+  return { provider: currentProvider ? currentProvider[1].toLowerCase() : 'ollama', model: raw };
+}
+
+function clineModelUpdateFields(provider, model) {
+  const common = {
+    planModeApiProvider: provider,
+    actModeApiProvider: provider,
+  };
+  const mask = ['planModeApiProvider', 'actModeApiProvider'];
+  const add = (planKey, actKey, value) => {
+    common[planKey] = value;
+    common[actKey] = value;
+    mask.push(planKey, actKey);
+  };
+  if (provider === 'ollama') add('planModeOllamaModelId', 'actModeOllamaModelId', model);
+  else if (provider === 'openrouter' || provider === 'cline') add('planModeOpenRouterModelId', 'actModeOpenRouterModelId', model);
+  else if (provider === 'openai') add('planModeOpenAiModelId', 'actModeOpenAiModelId', model);
+  else if (provider === 'lmstudio') add('planModeLmStudioModelId', 'actModeLmStudioModelId', model);
+  else if (provider === 'gemini') add('planModeApiModelId', 'actModeApiModelId', model);
+  else add('planModeApiModelId', 'actModeApiModelId', model);
+  return { apiConfiguration: common, updateMask: mask };
+}
+
+async function setClineModel(Runtime, modelId, sessionId) {
+  try {
+    const before = await readRooCodeConfig(Runtime).catch(() => null);
+    const parsed = parseClineModelId(modelId, before?.model_id);
+    if (!parsed.model) return { ok: false, code: 'invalid_model', detail: 'No model id supplied' };
+
+    const update = clineModelUpdateFields(parsed.provider, parsed.model);
+    const raw = await evalInRooCodeFrame(Runtime, `
+      var bridge = window.__vscode_post_message__;
+      if (typeof bridge !== 'function') {
+        return JSON.stringify({ error: 'bridge_unavailable' });
+      }
+      var requestId = 'remote-agent-chat-set-model-' + Date.now();
+      var message = {
+        type: 'grpc_request',
+        grpc_request: {
+          service: 'cline.ModelsService',
+          method: 'updateApiConfigurationPartial',
+          message: ${JSON.stringify(update)},
+          request_id: requestId,
+          is_streaming: false
+        }
+      };
+      try {
+        bridge('onmessage', message);
+        return JSON.stringify({ ok: true, request_id: requestId });
+      } catch (e) {
+        return JSON.stringify({ error: 'bridge_exception', detail: String(e && (e.message || e) || e) });
+      }
+    `);
+    const posted = raw ? JSON.parse(raw) : null;
+    if (!posted || posted.error) {
+      return { ok: false, code: posted?.error || 'bridge_failed', detail: posted?.detail || 'Cline model bridge is unavailable' };
+    }
+
+    await new Promise(r => setTimeout(r, 800));
+    const after = await readRooCodeConfig(Runtime).catch(() => null);
+    const afterModel = String(after?.model_id || '').replace(/^(anthropic|openai|openrouter|gemini|lmstudio|vscode-lm|ollama|hicap|requesty|cline):/i, '');
+    if (afterModel && afterModel !== 'unknown' && afterModel.toLowerCase() === parsed.model.toLowerCase()) {
+      console.log(`[${sessionId}] [cline-model] Selected: ${parsed.provider}:${parsed.model}`);
+      return { ok: true, selected: parsed.model };
+    }
+
+    // Cline does not currently expose a stable chat-surface dropdown. The bridge
+    // dispatch is the non-focus-stealing path; config polling will confirm the
+    // exact selected model on the next cycle if Cline accepted it.
+    console.log(`[${sessionId}] [cline-model] Dispatched model update: ${parsed.provider}:${parsed.model}`);
+    return { ok: true, selected: parsed.model, detail: 'Dispatched Cline model update' };
   } catch (e) {
     return { ok: false, code: 'exception', detail: e.message };
   }

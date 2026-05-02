@@ -161,6 +161,16 @@ export function useRelay() {
       return requestId;
     }
 
+    function setAgentEffort(sessionId, effort) {
+      const requestId = `effort-${Date.now()}-${Math.random().toString(36).slice(2, 7)}`;
+      send({ type: 'agent_set_effort', session_id: sessionId, effort, request_id: requestId });
+      setAgentConfigs(prev => {
+        const existing = prev[sessionId] || {};
+        return { ...prev, [sessionId]: { ...existing, effort } };
+      });
+      return requestId;
+    }
+
     function setAgentPermissionMode(sessionId, mode) {
       const requestId = `perm-${Date.now()}-${Math.random().toString(36).slice(2, 7)}`;
       send({ type: 'agent_set_permission_mode', session_id: sessionId, mode, request_id: requestId });
@@ -300,10 +310,18 @@ export function useRelay() {
     }
 
     // Launches a new agent session. Returns the requestId.
-    function launchSession(agentType, workspacePath) {
+    function launchSession(agentType, workspacePath, options = {}) {
       const requestId = `launch-${Date.now()}-${Math.random().toString(36).slice(2, 7)}`;
       setLaunchStates(prev => ({ ...prev, [requestId]: { status: 'launching', agentType } }));
-      send({ type: 'launch_session', agent_type: agentType, workspace_path: workspacePath || undefined, request_id: requestId });
+      send({
+        type: 'launch_session',
+        agent_type: agentType,
+        workspace_path: workspacePath || undefined,
+        model_id: options.model_id || undefined,
+        permission_mode: options.permission_mode || undefined,
+        effort: options.effort || undefined,
+        request_id: requestId,
+      });
       return requestId;
     }
 
@@ -875,7 +893,7 @@ export function useRelay() {
     // where `sessions` / `messages` would be frozen at initial render values).
     handleRelayMessageRef.current = handleRelayMessage;
 
-    return { sessions, messages, connected, unread, setUnread, thinking, thinkingContent, activities, health, deliveryStates, launchStates, justLaunched, setJustLaunched, permissionPrompts, respondToPrompt, errorPrompts, respondToErrorPrompt, interruptSession, agentConfigs, requestAgentConfig, setAgentModel, setAgentPermissionMode, setAutoApprovePermissions, setAntigravityMode, setCodexConfig, newThread, openPanel, requestChatList, switchChat, newChat, chatLists, requestThreadList, switchThread, threadLists, switchWorkspace, requestTerminalOutput, terminalOutputs, requestFileChanges, fileChanges, sendAttachment, send, sendToSession, steerMessage, discardQueuedMessage, editQueuedMessage, queuedMessages, launchSession, resumeSession, closeSession, activeSessionRef, workspaces, branchLists, requestBranchList, switchBranch, createBranch, skillLists, requestSkillList, automationViews, showCodexAutomation, controlResults, directoryListings, requestDirectoryListing, fileContents, requestFileContent, requestHistory };
+    return { sessions, messages, connected, unread, setUnread, thinking, thinkingContent, activities, health, deliveryStates, launchStates, justLaunched, setJustLaunched, permissionPrompts, respondToPrompt, errorPrompts, respondToErrorPrompt, interruptSession, agentConfigs, requestAgentConfig, setAgentModel, setAgentEffort, setAgentPermissionMode, setAutoApprovePermissions, setAntigravityMode, setCodexConfig, newThread, openPanel, requestChatList, switchChat, newChat, chatLists, requestThreadList, switchThread, threadLists, switchWorkspace, requestTerminalOutput, terminalOutputs, requestFileChanges, fileChanges, sendAttachment, send, sendToSession, steerMessage, discardQueuedMessage, editQueuedMessage, queuedMessages, launchSession, resumeSession, closeSession, activeSessionRef, workspaces, branchLists, requestBranchList, switchBranch, createBranch, skillLists, requestSkillList, automationViews, showCodexAutomation, controlResults, directoryListings, requestDirectoryListing, fileContents, requestFileContent, requestHistory };
   }
 
 // (removed window.useRelay — now an ES module export)

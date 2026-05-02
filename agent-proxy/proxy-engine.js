@@ -26,6 +26,7 @@ const selectors    = require('./selectors');
 const proto        = require('./protocol');
 const sessionStore = require('./session-store');
 const launchers    = require('./launchers');
+const claudeCli    = require('./claude-cli');
 
 function sleep(ms) { return new Promise(r => setTimeout(r, ms)); }
 
@@ -135,6 +136,8 @@ class ProxyEngine extends EventEmitter {
     this.activePermissionPrompts = new Map();
     this.activeErrorPrompts = new Map();
     this.openWorkspaces = [];
+    this._cdpPortCooldownUntil = new Map();
+    this._cdpTargetCooldownUntil = new Map();
 
     // Relay connection state
     this.relayWs = null;
@@ -299,18 +302,20 @@ class ProxyEngine extends EventEmitter {
   _buildCapabilities(agentType) {
     const isCodex   = agentType === 'codex' || agentType === 'codex-desktop';
     const isClaude  = agentType === 'claude' || agentType === 'claude-desktop';
+    const isClaudeCli = agentType === 'claude_cli';
     const isDesktop = agentType === 'codex-desktop' || agentType === 'claude-desktop';
     const isContinue = agentType === 'continue' || agentType === 'continue_yolo';
     const isRooCode = agentType === 'roo_code';
     const isClineLike = isRooCode || agentType === 'cline';
     return {
-      interrupt:              ['claude', 'codex', 'gemini', 'continue', 'continue_yolo', 'antigravity', 'antigravity_panel', 'claude-desktop', 'codex-desktop', 'roo_code', 'cline'].includes(agentType),
-      set_model:              ['claude', 'antigravity', 'antigravity_panel', 'gemini', 'continue', 'continue_yolo'].includes(agentType) || isRooCode,
+      interrupt:              ['claude', 'claude_cli', 'codex', 'gemini', 'continue', 'continue_yolo', 'antigravity', 'antigravity_panel', 'claude-desktop', 'codex-desktop', 'roo_code', 'cline'].includes(agentType),
+      set_model:              ['claude', 'claude_cli', 'antigravity', 'antigravity_panel', 'gemini', 'continue', 'continue_yolo'].includes(agentType) || isClineLike,
       set_mode:               agentType === 'antigravity' || isClineLike,
-      permission_mode_change: agentType === 'claude' || agentType === 'continue_yolo' || isRooCode,
+      permission_mode_change: agentType === 'claude' || agentType === 'claude_cli' || agentType === 'continue_yolo' || isRooCode,
       auto_approve_permissions_toggle: agentType === 'continue' || agentType === 'continue_yolo' || agentType === 'antigravity_panel',
-      permission_dialogs:     isClaude || isCodex || agentType === 'antigravity' || agentType === 'antigravity_panel' || isContinue || isClineLike,
+      permission_dialogs:     isClaude || isClaudeCli || isCodex || agentType === 'antigravity' || agentType === 'antigravity_panel' || isContinue || isClineLike,
       set_codex_config:       isCodex,
+      set_effort:             isClaudeCli,
       new_thread:             isDesktop,
       thread_list:            isDesktop,
       switch_thread:          isDesktop,
@@ -318,7 +323,7 @@ class ProxyEngine extends EventEmitter {
       open_panel:             false, // Codex side pane is already open if session exists
       chat_list:              agentType === 'codex' || agentType === 'continue' || agentType === 'antigravity_panel' || agentType === 'claude-desktop' || isClineLike,
       switch_chat:            agentType === 'codex' || agentType === 'continue' || agentType === 'antigravity_panel' || agentType === 'claude-desktop' || isClineLike,
-      new_chat:               agentType === 'codex' || agentType === 'continue_yolo' || agentType === 'antigravity_panel' || agentType === 'claude-desktop' || agentType === 'claude' || isClineLike,
+      new_chat:               agentType === 'codex' || agentType === 'continue_yolo' || agentType === 'antigravity_panel' || agentType === 'claude-desktop' || agentType === 'claude' || agentType === 'claude_cli' || isClineLike,
       terminal_output:        isCodex || agentType === 'claude-desktop',
       terminal_input:         agentType === 'codex-desktop',
       file_changes:           isCodex || agentType === 'claude-desktop',
@@ -330,6 +335,95 @@ class ProxyEngine extends EventEmitter {
       automation_view:        agentType === 'codex-desktop',
       file_browser:           true, // all session types support workspace file browsing
     };
+  }
+
+  _readJsonFileIfPresent(filePath) {
+    try {
+      if (!filePath || !fs.existsSync(filePath)) return null;
+      return JSON.parse(fs.readFileSync(filePath, 'utf8'));
+    } catch {
+      return null;
+    }
+  }
+
+  _modelOption(id, label) {
+    const value = String(id || '').trim();
+    if (!value) return null;
+    return { id: value, label: String(label || value).trim() || value };
+  }
+
+  _mergeModelOptions(...lists) {
+    const out = [];
+    const seen = new Set();
+    const add = item => {
+      const option = typeof item === 'string'
+        ? this._modelOption(item)
+        : this._modelOption(item?.id || item?.value || item?.model || item?.name, item?.label || item?.name || item?.id);
+      if (!option) return;
+      const key = option.id.toLowerCase();
+      if (seen.has(key)) return;
+      seen.add(key);
+      out.push(option);
+    };
+    for (const list of lists) {
+      if (Array.isArray(list)) list.forEach(add);
+      else if (list) add(list);
+    }
+    return out;
+  }
+
+  _readRooOllamaModelOptions() {
+    const appdata = process.env.APPDATA;
+    if (!appdata) return [];
+    const filePath = path.join(appdata, 'Antigravity', 'User', 'globalStorage', 'rooveterinaryinc.roo-cline', 'cache', 'ollama_models.json');
+    const data = this._readJsonFileIfPresent(filePath);
+    if (!data || typeof data !== 'object') return [];
+    return Object.entries(data)
+      .map(([id, info]) => this._modelOption(id, info?.name || id))
+      .filter(Boolean);
+  }
+
+  _readClineHistoryModelOptions() {
+    const appdata = process.env.APPDATA;
+    if (!appdata) return [];
+    const filePath = path.join(appdata, 'Antigravity', 'User', 'globalStorage', 'saoudrizwan.claude-dev', 'state', 'taskHistory.json');
+    const data = this._readJsonFileIfPresent(filePath);
+    const rows = Array.isArray(data) ? data : (Array.isArray(data?.tasks) ? data.tasks : []);
+    return rows
+      .map(row => row?.modelId || row?.model_id)
+      .filter(Boolean)
+      .map(id => this._modelOption(id))
+      .filter(Boolean);
+  }
+
+  _stripProviderPrefix(modelId) {
+    const raw = String(modelId || '').trim();
+    const match = raw.match(/^(anthropic|openai|openrouter|gemini|lmstudio|vscode-lm|ollama|hicap|requesty|cline):(.+)$/i);
+    return match ? match[2].trim() : raw;
+  }
+
+  _augmentClineLikeModels(agentType, domCfg) {
+    const current = this._stripProviderPrefix(domCfg?.model_id);
+    const domModels = Array.isArray(domCfg?.available_models)
+      ? domCfg.available_models.map(model => {
+          if (typeof model === 'string') return this._stripProviderPrefix(model);
+          const id = this._stripProviderPrefix(model?.id || model?.value || model?.model || model?.name);
+          return { ...model, id, label: model?.label || id };
+        })
+      : [];
+    if (agentType === 'cline') {
+      return this._mergeModelOptions(
+        current && current !== 'unknown' ? current : null,
+        domModels,
+        this._readClineHistoryModelOptions(),
+        this._readRooOllamaModelOptions()
+      );
+    }
+    return this._mergeModelOptions(
+      current && current !== 'unknown' ? current : null,
+      domModels,
+      this._readRooOllamaModelOptions()
+    );
   }
 
   _mergeAgentConfig(agentType, domCfg, workspacePath) {
@@ -346,6 +440,18 @@ class ProxyEngine extends EventEmitter {
         model_id:          modelId,
         permission_mode:   permMode,
         file_access_scope: workspacePath || 'unknown',
+        branch:            branch || 'unknown',
+      };
+    }
+    if (agentType === 'claude_cli') {
+      return {
+        model_id:          domCfg?.model_id || 'default',
+        permission_mode:   domCfg?.permission_mode || 'default',
+        effort:            domCfg?.effort || 'medium',
+        file_access_scope: workspacePath || domCfg?.file_access_scope || 'unknown',
+        available_models:  claudeCli.CLAUDE_CLI_MODELS,
+        available_efforts: claudeCli.CLAUDE_CLI_EFFORTS,
+        available_permission_modes: claudeCli.CLAUDE_CLI_PERMISSION_MODES,
         branch:            branch || 'unknown',
       };
     }
@@ -413,12 +519,14 @@ class ProxyEngine extends EventEmitter {
       };
     }
     if (agentType === 'roo_code') {
+      const availableModels = this._augmentClineLikeModels(agentType, domCfg);
+      const modelId = this._stripProviderPrefix(domCfg?.model_id) || 'unknown';
       return {
-        model_id:           domCfg?.model_id        || 'unknown',
+        model_id:           modelId,
         mode:               domCfg?.mode            || 'unknown',
         permission_mode:    domCfg?.permission_mode || 'unknown',
         file_access_scope:  workspacePath || 'unknown',
-        available_models:   domCfg?.available_models || [],
+        available_models:   availableModels,
         available_modes:    domCfg?.available_modes || [],
         available_permission_modes: domCfg?.available_permission_modes || [],
         has_model_dropdown: !!domCfg?.has_model_dropdown,
@@ -428,12 +536,14 @@ class ProxyEngine extends EventEmitter {
       };
     }
     if (agentType === 'cline') {
+      const availableModels = this._augmentClineLikeModels(agentType, domCfg);
+      const modelId = this._stripProviderPrefix(domCfg?.model_id) || 'unknown';
       return {
-        model_id:           domCfg?.model_id        || 'unknown',
+        model_id:           modelId,
         mode:               domCfg?.mode            || 'unknown',
         permission_mode:    domCfg?.permission_mode || 'unknown',
         file_access_scope:  workspacePath || 'unknown',
-        available_models:   domCfg?.available_models || [],
+        available_models:   availableModels,
         available_modes:    domCfg?.available_modes || [],
         available_permission_modes: domCfg?.available_permission_modes || [],
         has_model_dropdown: !!domCfg?.has_model_dropdown,
@@ -886,6 +996,53 @@ class ProxyEngine extends EventEmitter {
     });
   }
 
+  _isCodexSurface(agentType) {
+    return agentType === 'codex' || agentType === 'codex-desktop';
+  }
+
+  _isCdpPortCooling(port) {
+    const until = this._cdpPortCooldownUntil.get(port) || 0;
+    if (!until) return false;
+    if (Date.now() >= until) {
+      this._cdpPortCooldownUntil.delete(port);
+      return false;
+    }
+    return true;
+  }
+
+  _cooldownCdpPort(port, reason, ms = 15000) {
+    if (!port) return;
+    const until = Date.now() + ms;
+    const prev = this._cdpPortCooldownUntil.get(port) || 0;
+    this._cdpPortCooldownUntil.set(port, Math.max(prev, until));
+    if (!prev || Date.now() >= prev) {
+      this._log('warn', `[cdp] Cooling down port ${port} for ${Math.round(ms / 1000)}s (${reason})`);
+    }
+  }
+
+  _isCdpTargetCooling(targetId) {
+    if (!targetId) return false;
+    const until = this._cdpTargetCooldownUntil.get(targetId) || 0;
+    if (!until) return false;
+    if (Date.now() >= until) {
+      this._cdpTargetCooldownUntil.delete(targetId);
+      return false;
+    }
+    return true;
+  }
+
+  _cooldownCdpTarget(targetOrSession, reason, ms = 30000) {
+    const targetId = targetOrSession?.targetId || targetOrSession?.id;
+    if (!targetId) return;
+    const until = Date.now() + ms;
+    const prev = this._cdpTargetCooldownUntil.get(targetId) || 0;
+    this._cdpTargetCooldownUntil.set(targetId, Math.max(prev, until));
+    if (targetOrSession?._cdpPort) this._cooldownCdpPort(targetOrSession._cdpPort, reason, Math.min(ms, 15000));
+    if (!prev || Date.now() >= prev) {
+      this._log('warn', `[cdp] Cooling down target ${targetId.substring(0, 8)} for ${Math.round(ms / 1000)}s (${reason})`);
+    }
+  }
+
   _connectCdpTarget(target, port, label, timeoutMs = 4000) {
     const targetId = typeof target === 'string' ? target : target.id;
     return this._withTimeout(CDP({ port, target: targetId }), timeoutMs, label || `CDP connect ${targetId?.substring?.(0, 8) || targetId}`);
@@ -894,6 +1051,7 @@ class ProxyEngine extends EventEmitter {
   // ─── CDP target resolution ───────────────────────────────────────────────
 
   async _listTargetsOnPort(port) {
+    if (this._isCdpPortCooling(port)) return [];
     return this._withTimeout(CDP.List({ port }), 3000, `CDP list port ${port}`);
   }
 
@@ -914,6 +1072,9 @@ class ProxyEngine extends EventEmitter {
       } else {
         if (!r.reason?.message?.includes('ECONNREFUSED')) {
           this._log('warn', `[cdp] Port ${this.CDP_PORTS[i]} error: ${r.reason?.message}`);
+          if (String(r.reason?.message || '').includes('timed out')) {
+            this._cooldownCdpPort(this.CDP_PORTS[i], r.reason.message, 15000);
+          }
         }
       }
     }
@@ -1116,6 +1277,18 @@ class ProxyEngine extends EventEmitter {
       }
 
       this._log('info', `[ctrl] agent_interrupt for ${sid} (${sessionData.agentType})`);
+      if (sessionData.agentType === 'claude_cli') {
+        if (sessionData._claudeCliChild) {
+          try { sessionData._claudeCliChild.kill(); } catch {}
+          sessionData._claudeCliChild = null;
+        }
+        const activity = { kind: 'idle', label: 'Interrupted', updated_at: new Date().toISOString() };
+        sessionData.activity = activity;
+        sessionStore.updateSession(sid, { activity });
+        this._sendToRelay(proto.proxyStatus(sid, sessionData.status || 'healthy', activity));
+        this._sendToRelay(proto.agentControlResult(sid, msg.request_id, 'agent_interrupt', 'ok'));
+        return;
+      }
       const interruptPromise = this._isEphemeralIframeAgent(sessionData.agentType)
         ? this._withEphemeralIframeClient(sessionData, client =>
             selectors.interruptAgent(client.Runtime, sessionData.agentType, sid)
@@ -1280,6 +1453,18 @@ class ProxyEngine extends EventEmitter {
       }
       const modelId = msg.model_id;
       this._log('info', `[ctrl] agent_set_model for ${sid} model=${modelId}`);
+      if (sessionData.agentType === 'claude_cli') {
+        sessionData.model_id = modelId || 'default';
+        sessionStore.updateSession(sid, { model_id: sessionData.model_id });
+        const merged = this._decorateAgentConfig(sessionData, this._mergeAgentConfig('claude_cli', {
+          model_id: sessionData.model_id,
+          permission_mode: sessionData.permission_mode,
+          effort: sessionData.effort,
+        }, sessionData.workspace_path));
+        this._sendToRelay(proto.agentConfig(sid, { ...merged, capabilities: this._buildCapabilities('claude_cli') }));
+        this._sendToRelay(proto.agentControlResult(sid, msg.request_id, 'agent_set_model', 'ok'));
+        return;
+      }
       const setModelPromise = this._isEphemeralIframeAgent(sessionData.agentType)
         ? this._withEphemeralIframeClient(sessionData, client =>
             selectors.setAgentModel(client.Runtime, sessionData.agentType, modelId, sid, client.Input)
@@ -1399,7 +1584,7 @@ class ProxyEngine extends EventEmitter {
       const agentT = sessionData?.agentType;
 
       const isRooCodeLike = agentT === 'roo_code' || agentT === 'cline';
-      if (agentT !== 'claude' && agentT !== 'continue_yolo' && !isRooCodeLike) {
+      if (agentT !== 'claude' && agentT !== 'claude_cli' && agentT !== 'continue_yolo' && !isRooCodeLike) {
         this._sendToRelay(proto.agentControlResult(sid, msg.request_id, 'agent_set_permission_mode', 'failed', {
           code: 'not_supported', message: `Permission mode change not supported for ${agentT || 'unknown'} agent`,
         }));
@@ -1407,6 +1592,18 @@ class ProxyEngine extends EventEmitter {
       }
 
       this._log('info', `[ctrl] agent_set_permission_mode for ${sid} mode=${mode}`);
+      if (agentT === 'claude_cli') {
+        sessionData.permission_mode = mode || 'default';
+        sessionStore.updateSession(sid, { permission_mode: sessionData.permission_mode });
+        const merged = this._decorateAgentConfig(sessionData, this._mergeAgentConfig('claude_cli', {
+          model_id: sessionData.model_id,
+          permission_mode: sessionData.permission_mode,
+          effort: sessionData.effort,
+        }, sessionData.workspace_path));
+        this._sendToRelay(proto.agentConfig(sid, { ...merged, capabilities: this._buildCapabilities('claude_cli') }));
+        this._sendToRelay(proto.agentControlResult(sid, msg.request_id, 'agent_set_permission_mode', 'ok'));
+        return;
+      }
       const persisted = agentT === 'claude'
         ? this._writeAntigravitySetting('claudeCode.initialPermissionMode', mode)
         : true;
@@ -1447,6 +1644,35 @@ class ProxyEngine extends EventEmitter {
     }
 
     // ── Codex config change ─────────────────────────────────────────────
+    if (type === 'agent_set_effort') {
+      const sid = msg.session_id || msg.session;
+      const sessionData = this.sessions.get(sid);
+      const effort = msg.effort;
+      if (!sessionData || sessionData.agentType !== 'claude_cli') {
+        this._sendToRelay(proto.agentControlResult(sid, msg.request_id, 'agent_set_effort', 'failed', {
+          code: 'not_supported', message: `Effort change not supported for ${sessionData?.agentType || 'unknown'} agent`,
+        }));
+        return;
+      }
+      const allowed = new Set(claudeCli.CLAUDE_CLI_EFFORTS.map(item => item.id));
+      if (!effort || !allowed.has(effort)) {
+        this._sendToRelay(proto.agentControlResult(sid, msg.request_id, 'agent_set_effort', 'failed', {
+          code: 'invalid_effort', message: `Unsupported Claude CLI effort: ${effort || 'empty'}`,
+        }));
+        return;
+      }
+      sessionData.effort = effort;
+      sessionStore.updateSession(sid, { effort });
+      const merged = this._decorateAgentConfig(sessionData, this._mergeAgentConfig('claude_cli', {
+        model_id: sessionData.model_id,
+        permission_mode: sessionData.permission_mode,
+        effort: sessionData.effort,
+      }, sessionData.workspace_path));
+      this._sendToRelay(proto.agentConfig(sid, { ...merged, capabilities: this._buildCapabilities('claude_cli') }));
+      this._sendToRelay(proto.agentControlResult(sid, msg.request_id, 'agent_set_effort', 'ok'));
+      return;
+    }
+
     if (type === 'set_codex_config') {
       const sid = msg.session_id || msg.session;
       const sessionData = this.sessions.get(sid);
@@ -1892,10 +2118,34 @@ class ProxyEngine extends EventEmitter {
       const agentT = sessionData?.agentType;
       const requestId = msg.request_id;
 
-      if (agentT !== 'codex' && agentT !== 'codex-desktop' && agentT !== 'continue_yolo' && agentT !== 'antigravity_panel' && agentT !== 'claude-desktop' && agentT !== 'claude') {
+      if (agentT !== 'codex' && agentT !== 'codex-desktop' && agentT !== 'continue_yolo' && agentT !== 'antigravity_panel' && agentT !== 'claude-desktop' && agentT !== 'claude' && agentT !== 'claude_cli') {
         this._sendToRelay(proto.agentControlResult(sid, requestId, 'new_chat', 'failed', {
           code: 'not_supported', message: `new_chat not supported for ${agentT || 'unknown'}`,
         }));
+        return;
+      }
+
+      if (agentT === 'claude_cli') {
+        const cliSessionId = crypto.randomUUID();
+        const summary = {
+          cliSessionId,
+          filePath: null,
+          workspacePath: sessionData.workspace_path || process.cwd(),
+          workspaceName: sessionData.workspace_name || path.basename(sessionData.workspace_path || process.cwd()) || 'Claude CLI',
+          title: 'New Claude CLI session',
+          messages: [],
+          messageCount: 0,
+          updatedAt: new Date().toISOString(),
+        };
+        const newSession = this._registerClaudeCliSession(summary, { sendInitialHistory: false });
+        this._broadcastSessionSnapshot();
+        this._sendToRelay(proto.agentControlResult(
+          sid,
+          requestId,
+          'new_chat',
+          newSession ? 'ok' : 'failed',
+          newSession ? undefined : { code: 'create_failed', message: 'Could not create Claude CLI session' }
+        ));
         return;
       }
 
@@ -2413,6 +2663,49 @@ class ProxyEngine extends EventEmitter {
       const workspacePath = msg.workspace_path || null;
       this._log('info', `[ctrl] launch_session agent=${agentType} request=${requestId}`);
 
+      if (agentType === 'claude_cli') {
+        const cliSessionId = crypto.randomUUID();
+        const workspace = workspacePath || process.cwd();
+        const workspaceName = path.basename(workspace) || 'Claude CLI';
+        const modelId = msg.model_id || 'default';
+        const permissionMode = msg.permission_mode || 'default';
+        const effort = msg.effort || 'medium';
+        const summary = {
+          cliSessionId,
+          filePath: null,
+          workspacePath: workspace,
+          workspaceName,
+          title: 'New Claude CLI session',
+          messages: [],
+          messageCount: 0,
+          updatedAt: new Date().toISOString(),
+          model_id: modelId,
+          permission_mode: permissionMode,
+          effort,
+        };
+        const session = this._registerClaudeCliSession(summary, { sendInitialHistory: false });
+        if (!session) {
+          this._sendToRelay({
+            type: 'session_launch_failed',
+            protocol_version: proto.PROTOCOL_VERSION,
+            request_id: requestId,
+            agent_type: agentType,
+            reason: 'Could not create Claude CLI session',
+            error_code: 'create_failed',
+          });
+          return;
+        }
+        this._broadcastSessionSnapshot();
+        this._sendToRelay({
+          type: 'session_launch_ack',
+          protocol_version: proto.PROTOCOL_VERSION,
+          request_id: requestId,
+          session_id: session.session_id,
+          agent_type: agentType,
+        });
+        return;
+      }
+
       // Antigravity window: File > New Window via DOM menu on existing workbench
       if (agentType === 'antigravity') {
         (async () => {
@@ -2670,6 +2963,15 @@ class ProxyEngine extends EventEmitter {
 
       const agentT = sessionData.agentType;
       const isDesktopApp = agentT === 'codex-desktop' || agentT === 'claude-desktop';
+
+      if (agentT === 'claude_cli') {
+        if (sessionData._claudeCliChild) {
+          try { sessionData._claudeCliChild.kill(); } catch {}
+          sessionData._claudeCliChild = null;
+        }
+        finishClose();
+        return;
+      }
 
       if (isDesktopApp) {
         // Desktop apps are standalone windows — /json/close/ is safe here
@@ -3310,6 +3612,10 @@ class ProxyEngine extends EventEmitter {
   }
 
   async _readSessionMessages(session, sessionId) {
+    if (session.agentType === 'claude_cli') {
+      const messages = session.claudeCliFilePath ? claudeCli.parseClaudeJsonl(session.claudeCliFilePath) : [];
+      return JSON.stringify(messages);
+    }
     if (this._isEphemeralIframeAgent(session.agentType)) {
       return this._withEphemeralIframeClient(session, client =>
         selectors.readMessages(client.Runtime, session.agentType, sessionId)
@@ -3320,6 +3626,14 @@ class ProxyEngine extends EventEmitter {
 
   async _readSessionConfig(session, workspacePath, options = {}) {
     const forceRefresh = options.forceRefresh === true;
+    if (session.agentType === 'claude_cli') {
+      return {
+        model_id: session.model_id || 'default',
+        permission_mode: session.permission_mode || 'default',
+        effort: session.effort || 'medium',
+        file_access_scope: workspacePath || session.workspace_path || 'unknown',
+      };
+    }
     if (session.agentType === 'continue' || session.agentType === 'continue_yolo') {
       if (!forceRefresh && session._continueConfigCache) {
         return session._continueConfigCache;
@@ -3389,12 +3703,204 @@ class ProxyEngine extends EventEmitter {
   }
 
   async _sendSessionMessage(session, content, sessionId) {
+    if (session.agentType === 'claude_cli') {
+      return this._sendClaudeCliMessage(session, content, sessionId);
+    }
     if (this._isEphemeralIframeAgent(session.agentType)) {
       return this._withEphemeralIframeClient(session, client =>
         selectors.sendMessage(client.Runtime, session.agentType, content, sessionId)
       , 'send_message');
     }
     return selectors.sendMessage(session.client.Runtime, session.agentType, content, sessionId);
+  }
+
+  _buildClaudeCliSessionFromSummary(sessionMeta, summary) {
+    const now = new Date().toISOString();
+    return {
+      session_id:       sessionMeta.session_id,
+      display_name:     sessionMeta.display_name || 'Claude Code CLI',
+      workspace_name:   summary.workspaceName || sessionMeta.workspace_name,
+      workspace_path:   summary.workspacePath || sessionMeta.workspace_path,
+      machine_label:    sessionMeta.machine_label,
+      target_signature: sessionMeta.target_signature,
+      chat_title:       summary.title || null,
+      client:           null,
+      lastMessageCount: summary.messageCount || 0,
+      lastObservedCount: summary.messageCount || 0,
+      lastTranscriptSig: this._transcriptSignature(summary.messages || []),
+      nullPollCount:    0,
+      pendingLast:      null,
+      resyncCandidateSig: null,
+      waitingForAssistant: false,
+      thinking:         false,
+      thinkingLabel:    '',
+      autoApprovePermissions: false,
+      status:           'healthy',
+      activity:         sessionMeta.activity || { kind: 'idle', label: '', updated_at: now },
+      last_seen_at:     summary.updatedAt || now,
+      windowTitle:      sessionMeta.window_title || summary.workspaceName || 'Claude Code CLI',
+      agentType:        'claude_cli',
+      parentId:         null,
+      ext:              null,
+      targetId:         null,
+      cliSessionId:     summary.cliSessionId,
+      claudeCliFilePath: summary.filePath,
+      model_id:         sessionMeta.model_id || 'default',
+      effort:           sessionMeta.effort || 'medium',
+      permission_mode:  sessionMeta.permission_mode || 'default',
+    };
+  }
+
+  _registerClaudeCliSession(summary, { sendInitialHistory = true } = {}) {
+    if (!summary?.cliSessionId) return null;
+    const displayName = 'Claude Code CLI';
+    const sessionMeta = sessionStore.resolveVirtualSession({
+      virtualId: `claude-cli:${summary.cliSessionId}`,
+      agentType: 'claude_cli',
+      displayName,
+      workspaceName: summary.workspaceName,
+      workspacePath: summary.workspacePath,
+      windowTitle: summary.workspaceName || displayName,
+      extra: {
+        cli_session_id: summary.cliSessionId,
+        claude_cli_file_path: summary.filePath,
+        chat_title: summary.title || null,
+        model_id: summary.model_id || undefined,
+        permission_mode: summary.permission_mode || undefined,
+        effort: summary.effort || undefined,
+      },
+    });
+    const sessionId = sessionMeta.session_id;
+    const existing = this.sessions.get(sessionId);
+    if (existing) {
+      existing.workspace_name = summary.workspaceName || existing.workspace_name;
+      existing.workspace_path = summary.workspacePath || existing.workspace_path;
+      existing.chat_title = summary.title || existing.chat_title;
+      existing.last_seen_at = summary.updatedAt || existing.last_seen_at;
+      existing.claudeCliFilePath = summary.filePath || existing.claudeCliFilePath;
+      existing.cliSessionId = summary.cliSessionId;
+      if (summary.model_id) existing.model_id = summary.model_id;
+      if (summary.permission_mode) existing.permission_mode = summary.permission_mode;
+      if (summary.effort) existing.effort = summary.effort;
+      const sig = this._transcriptSignature(summary.messages || []);
+      if (sig !== existing.lastTranscriptSig) {
+        existing.lastTranscriptSig = sig;
+        existing.lastObservedCount = summary.messageCount || 0;
+        existing.lastMessageCount = summary.messageCount || 0;
+        this._sendHistorySnapshot(sessionId, summary.messages || [], 'claude cli file changed');
+      }
+      return existing;
+    }
+
+    const session = this._buildClaudeCliSessionFromSummary(sessionMeta, summary);
+    this.sessions.set(sessionId, session);
+    this._log('info', `[claude-cli] registered ${sessionId} cli=${summary.cliSessionId} (${summary.messageCount} msgs)`);
+    if (sendInitialHistory && summary.messages?.length) {
+      this._sendHistorySnapshot(sessionId, summary.messages, 'claude cli discovery');
+    }
+    const cfg = this._decorateAgentConfig(session, this._mergeAgentConfig('claude_cli', null, session.workspace_path));
+    this._sendToRelay(proto.agentConfig(sessionId, { ...cfg, capabilities: this._buildCapabilities('claude_cli') }));
+    return session;
+  }
+
+  async _discoverClaudeCliSessions() {
+    const limit = parseInt(process.env.CLAUDE_CLI_SESSION_LIMIT || '40', 10);
+    const summaries = claudeCli.discoverSessions(Number.isFinite(limit) ? limit : 40);
+    let changed = false;
+    for (const summary of summaries) {
+      const before = this.sessions.size;
+      this._registerClaudeCliSession(summary);
+      if (this.sessions.size !== before) changed = true;
+    }
+    if (changed) this._broadcastSessionSnapshot();
+  }
+
+  _findClaudeCliSummaryByCliId(cliSessionId) {
+    if (!cliSessionId) return null;
+    const summaries = claudeCli.discoverSessions(parseInt(process.env.CLAUDE_CLI_SESSION_LIMIT || '80', 10));
+    return summaries.find(s => s.cliSessionId === cliSessionId) || null;
+  }
+
+  _sendClaudeCliMessage(session, content, sessionId) {
+    if (session._claudeCliChild) {
+      return Promise.resolve({ ok: false, code: 'agent_busy', detail: 'Claude CLI process is already running' });
+    }
+    const cliSessionId = session.cliSessionId || crypto.randomUUID();
+    session.cliSessionId = cliSessionId;
+    sessionStore.updateSession(sessionId, { cli_session_id: cliSessionId });
+    const workspacePath = session.workspace_path || process.cwd();
+    const stderrChunks = [];
+
+    const child = claudeCli.startClaudePrintSession({
+      workspacePath,
+      cliSessionId,
+      resume: !!session.claudeCliFilePath,
+      content,
+      model: session.model_id,
+      effort: session.effort,
+      permissionMode: session.permission_mode,
+      onStdout: () => {},
+      onStderr: chunk => {
+        if (chunk) stderrChunks.push(chunk);
+      },
+      onExit: (code, err) => {
+        if (session._claudeCliChild === child) session._claudeCliChild = null;
+        const summary = this._findClaudeCliSummaryByCliId(cliSessionId);
+        if (summary) {
+          session.claudeCliFilePath = summary.filePath;
+          session.workspace_path = summary.workspacePath || session.workspace_path;
+          session.workspace_name = summary.workspaceName || session.workspace_name;
+          session.chat_title = summary.title || session.chat_title;
+          this._registerClaudeCliSession(summary, { sendInitialHistory: false });
+          this._sendHistorySnapshot(sessionId, summary.messages || [], 'claude cli send complete');
+          session.lastMessageCount = summary.messageCount || 0;
+          session.lastObservedCount = summary.messageCount || 0;
+          session.lastTranscriptSig = this._transcriptSignature(summary.messages || []);
+        }
+        const activity = {
+          kind: 'idle',
+          label: code === 0 ? '' : 'Claude CLI failed',
+          updated_at: new Date().toISOString(),
+        };
+        session.activity = activity;
+        session.waitingForAssistant = false;
+        sessionStore.updateSession(sessionId, {
+          activity,
+          workspace_path: session.workspace_path || null,
+          workspace_name: session.workspace_name || null,
+          cli_session_id: cliSessionId,
+          claude_cli_file_path: session.claudeCliFilePath || null,
+        });
+        this._sendToRelay(proto.proxyStatus(sessionId, session.status || 'healthy', activity));
+        if (code !== 0 || err) {
+          this._log('warn', `[claude-cli] send exited code=${code} err=${err?.message || ''} stderr=${stderrChunks.join('').slice(0, 500)}`);
+        }
+        this._broadcastSessionSnapshot();
+      },
+    });
+    session._claudeCliChild = child;
+    return Promise.resolve({ ok: true });
+  }
+
+  async _pollSessionClaudeCli(sessionId, session) {
+    if (session.claudeCliFilePath) {
+      const messages = claudeCli.parseClaudeJsonl(session.claudeCliFilePath);
+      const sig = this._transcriptSignature(messages);
+      if (sig !== session.lastTranscriptSig) {
+        session.lastTranscriptSig = sig;
+        session.lastObservedCount = messages.length;
+        session.lastMessageCount = messages.length;
+        this._sendHistorySnapshot(sessionId, messages, 'claude cli poll');
+      }
+    }
+    const kind = session._claudeCliChild ? 'generating' : 'idle';
+    const label = session._claudeCliChild ? 'Claude CLI running' : '';
+    if (session.activity?.kind !== kind || session.activity?.label !== label) {
+      const activity = { kind, label, updated_at: new Date().toISOString() };
+      session.activity = activity;
+      sessionStore.updateSession(sessionId, { activity });
+      this._sendToRelay(proto.proxyStatus(sessionId, session.status || 'healthy', activity));
+    }
   }
 
   // ─── Continue-specific poll (ephemeral CDP) ─────────────────────────
@@ -3949,6 +4455,9 @@ class ProxyEngine extends EventEmitter {
       // Continue and Roo Code use ephemeral CDP.  Claude used to but now uses persistent
       // connections (see _isEphemeralIframeAgent for rationale) because ephemeral
       // attach itself steals focus in Electron.
+      if (session.agentType === 'claude_cli') {
+        return await this._pollSessionClaudeCli(sessionId, session);
+      }
       if (session.agentType === 'continue' || session.agentType === 'continue_yolo' || session.agentType === 'roo_code' || session.agentType === 'cline') {
         return await this._pollSessionContinue(sessionId, session);
       }
@@ -3956,13 +4465,15 @@ class ProxyEngine extends EventEmitter {
       // Task list detection — runs before readMessages so it isn't skipped
       // by early returns in null-read or pending-stabilisation paths
       if (session.agentType === 'codex' || session.agentType === 'codex-desktop') {
-        const taskListPollEvery = session.agentType === 'codex-desktop' ? 10 : 5;
+        const codexAuxBusy = session.activity?.kind === 'generating' || session.activity?.kind === 'thinking';
+        const taskListPollEvery = session.agentType === 'codex-desktop' ? 30 : 15;
         if (session._taskListPollCount === undefined) {
           session._taskListPollCount = staggerOffset(sessionId, 'taskList', taskListPollEvery);
         }
         session._taskListPollCount += 1;
-        if (session._taskListPollCount >= taskListPollEvery) {
+        if (!codexAuxBusy && !session._taskListPollInProgress && session._taskListPollCount >= taskListPollEvery) {
           session._taskListPollCount = 0;
+          session._taskListPollInProgress = true;
           const usePageEval = session.agentType === 'codex-desktop';
           const handleTaskList = (taskList) => {
             const sig = taskList ? JSON.stringify(taskList) : '';
@@ -3977,17 +4488,11 @@ class ProxyEngine extends EventEmitter {
               this._sendToRelay(proto.proxyStatus(sessionId, session.status || 'healthy', session.activity));
             }
           };
-          if (session.agentType === 'codex-desktop') {
-            try {
-              handleTaskList(await selectors.readCodexTaskList(session.client.Runtime, usePageEval));
-            } catch (e) {
-              this._log('warn', `[${sessionId}] task_list error: ${e.message}`);
-            }
-          } else {
-            selectors.readCodexTaskList(session.client.Runtime, usePageEval)
-              .then(handleTaskList)
-              .catch(e => { this._log('warn', `[${sessionId}] task_list error: ${e.message}`); });
-          }
+          const taskPromise = selectors.readCodexTaskList(session.client.Runtime, usePageEval)
+            .then(handleTaskList)
+            .catch(e => { this._log('warn', `[${sessionId}] task_list error: ${e.message}`); })
+            .finally(() => { session._taskListPollInProgress = false; });
+          if (session.agentType === 'codex-desktop') await taskPromise;
         }
       }
 
@@ -4024,7 +4529,8 @@ class ProxyEngine extends EventEmitter {
 
       // Periodic agent config refresh (branch, model changes) — every 15s
       const configNow = Date.now();
-      if (!session._lastConfigPollAt || configNow - session._lastConfigPollAt > 15000) {
+      const configPollMs = this._isCodexSurface(session.agentType) ? 30000 : 15000;
+      if (!session._lastConfigPollAt || configNow - session._lastConfigPollAt > configPollMs) {
         session._lastConfigPollAt = configNow;
         try {
           const cfg = await selectors.readAgentConfig(session.client.Runtime, session.agentType, session.workspace_path);
@@ -4139,12 +4645,13 @@ class ProxyEngine extends EventEmitter {
       // with no active chat, treat that as list view and clear stale transcript state.
       if (session.agentType === 'codex') {
         const now = Date.now();
-        if (!session._lastWorkbenchPanePollAt || now - session._lastWorkbenchPanePollAt > 5000) {
+        const codexAuxBusy = session.activity?.kind === 'generating' || session.activity?.kind === 'thinking';
+        if (!codexAuxBusy && (!session._lastWorkbenchPanePollAt || now - session._lastWorkbenchPanePollAt > 15000)) {
           session._lastWorkbenchPanePollAt = now;
           const changed = await this._refreshWorkbenchPaneMeta(session);
           if (changed) this._broadcastSessionSnapshot();
         }
-        if (!session._lastCodexChatListPollAt || now - session._lastCodexChatListPollAt > 5000) {
+        if (!codexAuxBusy && (!session._lastCodexChatListPollAt || now - session._lastCodexChatListPollAt > 15000)) {
           session._lastCodexChatListPollAt = now;
           try {
             const chatList = await selectors.readCodexChatList(session.client.Runtime, false);
@@ -4539,10 +5046,11 @@ class ProxyEngine extends EventEmitter {
       // Polls every 10 cycles (~30-50s) to keep the thread list current.
       if (session.agentType === 'codex-desktop') {
         if (session._threadListPollCount === undefined) {
-          session._threadListPollCount = staggerOffset(sessionId, 'threadList', 30);
+          session._threadListPollCount = staggerOffset(sessionId, 'threadList', 60);
         }
         session._threadListPollCount += 1;
-        if (session._threadListPollCount >= 30) {
+        const codexThreadBusy = session.activity?.kind === 'generating' || session.activity?.kind === 'thinking';
+        if (!codexThreadBusy && session._threadListPollCount >= 60) {
           session._threadListPollCount = 0;
           await selectors.readCodexThreadList(session.client.Runtime, true)
             .then(threads => {
@@ -4600,11 +5108,13 @@ class ProxyEngine extends EventEmitter {
         }
 
         if (session._rateLimitPollCount === undefined) {
-          session._rateLimitPollCount = staggerOffset(sessionId, 'rateLimit', 10);
+          session._rateLimitPollCount = staggerOffset(sessionId, 'rateLimit', 30);
         }
         session._rateLimitPollCount += 1;
-        if (session._rateLimitPollCount >= 10) {
+        const codexRateBusy = session.activity?.kind === 'generating' || session.activity?.kind === 'thinking';
+        if (!codexRateBusy && !session._rateLimitPollInProgress && session._rateLimitPollCount >= 30) {
           session._rateLimitPollCount = 0;
+          session._rateLimitPollInProgress = true;
           const readFn = session.agentType === 'codex'
             ? selectors.readCodexRateLimit(session.client.Runtime)
             : selectors.readClaudeRateLimit(session.client.Runtime);
@@ -4634,19 +5144,22 @@ class ProxyEngine extends EventEmitter {
               }
               this._broadcastSessionSnapshot();
             }
-          }).catch(() => {});
+          }).catch(() => {})
+            .finally(() => { session._rateLimitPollInProgress = false; });
         }
       }
 
       // Native queue detection — Codex side-panel queue items (messages with Steer buttons)
       if (session.agentType === 'codex' || session.agentType === 'codex-desktop') {
-        const nativeQueuePollEvery = session.agentType === 'codex-desktop' ? 10 : 3;
+        const nativeQueuePollEvery = session.agentType === 'codex-desktop' ? 30 : 10;
         if (session._nativeQueuePollCount === undefined) {
           session._nativeQueuePollCount = staggerOffset(sessionId, 'nativeQueue', nativeQueuePollEvery);
         }
         session._nativeQueuePollCount += 1;
-        if (session._nativeQueuePollCount >= nativeQueuePollEvery) {
+        const codexAuxBusy = session.activity?.kind === 'generating' || session.activity?.kind === 'thinking';
+        if (!codexAuxBusy && !session._nativeQueuePollInProgress && session._nativeQueuePollCount >= nativeQueuePollEvery) {
           session._nativeQueuePollCount = 0;
+          session._nativeQueuePollInProgress = true;
           const usePageEval = session.agentType === 'codex-desktop';
           const nativeQueuePromise = selectors.readCodexNativeQueue(session.client.Runtime, usePageEval).then(items => {
             const sig = items.map(i => i.text).join('|');
@@ -4663,17 +5176,19 @@ class ProxyEngine extends EventEmitter {
               }
               this._sendToRelay(proto.nativeQueue(sessionId, items));
             }
-          }).catch((e) => { this._log('warn', `[${sessionId}] [native-queue] Error: ${e.message}`); });
+          }).catch((e) => { this._log('warn', `[${sessionId}] [native-queue] Error: ${e.message}`); })
+            .finally(() => { session._nativeQueuePollInProgress = false; });
           if (session.agentType === 'codex-desktop') await nativeQueuePromise;
         }
       }
 
       if (session.agentType === 'codex-desktop') {
         if (session._automationViewPollCount === undefined) {
-          session._automationViewPollCount = staggerOffset(sessionId, 'automationView', 5);
+          session._automationViewPollCount = staggerOffset(sessionId, 'automationView', 30);
         }
         session._automationViewPollCount += 1;
-        if (session._automationViewPollCount >= 5) {
+        const codexAuxBusy = session.activity?.kind === 'generating' || session.activity?.kind === 'thinking';
+        if (!codexAuxBusy && session._automationViewPollCount >= 30) {
           session._automationViewPollCount = 0;
           try {
             const view = await selectors.readCodexAutomationView(session.client.Runtime, true);
@@ -4701,8 +5216,14 @@ class ProxyEngine extends EventEmitter {
   async _pollSessionBounded(sessionId) {
     const session = this.sessions.get(sessionId);
     if (!session) return;
+    const now = Date.now();
+    if (this._isCdpTargetCooling(session.targetId)) return;
+    if (session._pollBackoffUntil && now < session._pollBackoffUntil) return;
+    if (session._pollBackoffUntil && now >= session._pollBackoffUntil) {
+      session._pollBackoffUntil = 0;
+    }
     const timeoutMs =
-      session.agentType === 'codex-desktop' ? 8000 :
+      this._isCodexSurface(session.agentType) ? 6000 :
       (session.agentType === 'continue' || session.agentType === 'continue_yolo') ? 10000 :
       12000;
     let timer = null;
@@ -4720,10 +5241,23 @@ class ProxyEngine extends EventEmitter {
       const dur = Date.now() - pollStartedAt;
       const slowThresh = (session.agentType === 'codex' || session.agentType === 'codex-desktop') ? 1500 : 3000;
       if (dur >= slowThresh) {
+        if (this._isCodexSurface(session.agentType)) {
+          session._slowCodexPollCount = (session._slowCodexPollCount || 0) + 1;
+          if (session._slowCodexPollCount >= 3) {
+            session._pollBackoffUntil = Date.now() + 10000;
+            session._slowCodexPollCount = 0;
+            this._log('warn', `[${sessionId}] Codex polling backed off for 10s after repeated slow polls`);
+          }
+        }
         this._log('warn', `[${sessionId}] slow poll: ${dur}ms (agent=${session.agentType})`);
+      } else if (this._isCodexSurface(session.agentType)) {
+        session._slowCodexPollCount = 0;
       }
     } catch (e) {
       this._log('warn', `[${sessionId}] ${e.message}; closing CDP client for rediscovery`);
+      if (this._isCodexSurface(session.agentType)) {
+        this._cooldownCdpTarget(session, e.message, 30000);
+      }
       sessionStore.markDisconnected(sessionId);
       try { await session.client?.close(); } catch {}
       this.sessions.delete(sessionId);
@@ -4747,6 +5281,7 @@ class ProxyEngine extends EventEmitter {
   async _pollPermissions(sessionId) {
     const session = this.sessions.get(sessionId);
     if (!session) return;
+    if (session.agentType === 'claude_cli') return;
     if (session.agentType === 'continue' || session.agentType === 'continue_yolo') {
       try {
         const promptState = await this._withEphemeralIframeClient(session, async client => {
@@ -5330,6 +5865,7 @@ class ProxyEngine extends EventEmitter {
     // ── Process iframe targets ──────────────────────────────────────────
     for (const target of iframes) {
       if (allowedTargetIds && !allowedTargetIds.has(target.id)) continue;
+      if (this._isCdpTargetCooling(target.id)) continue;
 
       const hostMatch   = target.url.match(/vscode-webview:\/\/([^/]+)/);
       const parentMatch = target.url.match(/parentId=(\w+)/);
@@ -5638,6 +6174,7 @@ class ProxyEngine extends EventEmitter {
 
       } catch (e) {
         if (client) try { await client.close(); } catch {}
+        if (String(e.message || '').includes('timed out')) this._cooldownCdpTarget(target, e.message, 30000);
         this._log('error', `[cdp] Failed to probe ${target.id.substring(0, 8)}: ${e.message}`);
       }
     }
@@ -5650,6 +6187,7 @@ class ProxyEngine extends EventEmitter {
 
     for (const target of managerPages) {
       if (allowedTargetIds && !allowedTargetIds.has(target.id)) continue;
+      if (this._isCdpTargetCooling(target.id)) continue;
       if (Array.from(this.sessions.values()).some(s => s.targetId === target.id)) continue;
 
       this._log('info', `[discover] Probing Antigravity Manager page ${target.id.substring(0, 8)} (${target.title})`);
@@ -5743,6 +6281,7 @@ class ProxyEngine extends EventEmitter {
 
       } catch (e) {
         if (client) try { await client.close(); } catch {}
+        if (String(e.message || '').includes('timed out')) this._cooldownCdpTarget(target, e.message, 30000);
         this._log('error', `[cdp] Failed to probe Antigravity Manager ${target.id.substring(0, 8)}: ${e.message}`);
       }
     }
@@ -5760,6 +6299,7 @@ class ProxyEngine extends EventEmitter {
         this._log('info', `[discover] Side-panel ${target.id.substring(0,8)} skipped: not in allowedTargetIds`);
         continue;
       }
+      if (this._isCdpTargetCooling(target.id)) continue;
       const existingSession = Array.from(this.sessions.values()).find(s => s.targetId === target.id);
       if (existingSession) {
         this._log('info', `[discover] Side-panel ${target.id.substring(0,8)} skipped: targetId owned by session ${existingSession.session_id.substring(0,8)} (${existingSession.agentType})`);
@@ -5886,6 +6426,7 @@ class ProxyEngine extends EventEmitter {
 
       } catch (e) {
         if (client) try { await client.close(); } catch {}
+        if (String(e.message || '').includes('timed out')) this._cooldownCdpTarget(target, e.message, 30000);
         this._log('error', `[cdp] Failed to probe Antigravity side-panel ${target.id.substring(0, 8)}: ${e.message}`);
       }
     }
@@ -5893,6 +6434,7 @@ class ProxyEngine extends EventEmitter {
     // ── Desktop app sessions ────────────────────────────────────────────
     for (const target of desktopPg) {
       if (allowedTargetIds && !allowedTargetIds.has(target.id)) continue;
+      if (this._isCdpTargetCooling(target.id)) continue;
       if (Array.from(this.sessions.values()).some(s => s.targetId === target.id)) continue;
 
       if (!target.url || target.url.startsWith('devtools') || target.url.startsWith('chrome-extension')) continue;
@@ -5985,6 +6527,7 @@ class ProxyEngine extends EventEmitter {
 
       } catch (e) {
         if (client) try { await client.close(); } catch {}
+        if (String(e.message || '').includes('timed out')) this._cooldownCdpTarget(target, e.message, 30000);
         this._log('error', `[cdp] Failed to probe ${agentType} target ${target.id.substring(0, 8)}: ${e.message}`);
       }
     }
@@ -6018,6 +6561,7 @@ class ProxyEngine extends EventEmitter {
     sessionStore.pruneStale(7);
 
     this.connectRelay();
+    await this._discoverClaudeCliSessions();
     await this._discoverTargets();
     await this._refreshAntigravityQuotaUsage(true);
 
@@ -6036,6 +6580,7 @@ class ProxyEngine extends EventEmitter {
       tick++;
 
       if (tick % 10 === 0) await this._discoverTargets();
+      if (tick % 30 === 0) await this._discoverClaudeCliSessions();
 
       if (tick % 30 === 0 && this.sessions.size > 0) {
         await this._refreshAntigravityQuotaUsage();
@@ -6081,17 +6626,22 @@ class ProxyEngine extends EventEmitter {
         // when actively generating.
         if (session.agentType === 'codex-desktop' || session.agentType === 'claude-desktop') {
           const isActive = session.activity?.kind === 'generating' || session.activity?.kind === 'thinking';
+          const threshold = session.agentType === 'codex-desktop'
+            ? (isActive ? 2 : 6)
+            : (isActive ? 1 : 3);
           if (!isActive) {
             session._desktopIdlePollCount = (session._desktopIdlePollCount || 0) + 1;
-            if (session._desktopIdlePollCount < 3) continue;
+            if (session._desktopIdlePollCount < threshold) continue;
             session._desktopIdlePollCount = 0;
           } else {
-            session._desktopIdlePollCount = 0;
+            session._desktopActivePollCount = (session._desktopActivePollCount || 0) + 1;
+            if (session._desktopActivePollCount < threshold) continue;
+            session._desktopActivePollCount = 0;
           }
         }
         if (session.agentType === 'codex') {
           const isActive = session.activity?.kind === 'generating' || session.activity?.kind === 'thinking';
-          const threshold = isActive ? 2 : 4;
+          const threshold = isActive ? 3 : 8;
           session._codexPollCount = (session._codexPollCount || 0) + 1;
           if (session._codexPollCount < threshold) continue;
           session._codexPollCount = 0;

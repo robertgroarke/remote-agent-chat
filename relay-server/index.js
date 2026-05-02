@@ -1047,7 +1047,7 @@ const KNOWN_CLIENT_TYPES = new Set([
   'send', 'send_message',
   'launch_session', 'resume_session', 'close_session', 'dismiss_session',
   'permission_response', 'error_prompt_action', 'agent_interrupt', 'agent_config_request',
-  'agent_set_model', 'agent_set_permission_mode', 'agent_set_auto_approve_permissions',
+  'agent_set_model', 'agent_set_effort', 'agent_set_permission_mode', 'agent_set_auto_approve_permissions',
   'set_codex_config', 'agent_set_mode',
   'new_thread', 'open_panel', 'chat_list', 'switch_chat', 'new_chat',
   'thread_list', 'switch_thread', 'switch_workspace', 'terminal_output',
@@ -2110,6 +2110,7 @@ function handleClientConnection(ws, req) {
       pendingLaunches.set(requestId, {
         agent_type:     agentType,
         workspace_path: msg.workspace_path || null,
+        model_id:       msg.model_id || null,
         launched_at:    launchedAt,
         timeout_at:     timeoutAt,
         browser_ws:     ws,
@@ -2124,6 +2125,9 @@ function handleClientConnection(ws, req) {
         agent_type:       agentType,
         ...(msg.workspace_path ? { workspace_path: msg.workspace_path } : {}),
         ...(msg.window_title   ? { window_title:   msg.window_title   } : {}),
+        ...(msg.model_id       ? { model_id:       msg.model_id       } : {}),
+        ...(msg.permission_mode ? { permission_mode: msg.permission_mode } : {}),
+        ...(msg.effort         ? { effort:         msg.effort         } : {}),
       }));
 
       // Intermediate ack to the requesting browser
@@ -2431,6 +2435,33 @@ function handleClientConnection(ws, req) {
       log('info', 'ctrl', 'Set model forwarded', { session: sessionId, model: msg.model_id, request_id: requestId });
 
     // ── Agent set permission mode ──────────────────────────────────────────
+    } else if (t === 'agent_set_effort') {
+      const sessionId = msg.session_id || msg.session;
+      const requestId = msg.request_id;
+      const proxyWs   = proxySockets.get(sessionId);
+      if (!proxyWs || proxyWs.readyState !== WebSocket.OPEN) {
+        ws.send(JSON.stringify({
+          type:             'agent_control_result',
+          protocol_version: PROTOCOL_VERSION,
+          request_id:       requestId,
+          session_id:       sessionId,
+          command:          'agent_set_effort',
+          result:           'failed',
+          error:            { code: 'no_proxy_connected', message: 'Session not connected' },
+          server_ts:        new Date().toISOString(),
+        }));
+        return;
+      }
+      if (requestId) pendingCtrlReqs.set(requestId, ws);
+      proxyWs.send(JSON.stringify({
+        type:             'agent_set_effort',
+        protocol_version: PROTOCOL_VERSION,
+        request_id:       requestId,
+        session_id:       sessionId,
+        effort:           msg.effort,
+      }));
+      log('info', 'ctrl', 'Set effort forwarded', { session: sessionId, effort: msg.effort, request_id: requestId });
+
     } else if (t === 'agent_set_permission_mode') {
       const sessionId = msg.session_id || msg.session;
       const requestId = msg.request_id;

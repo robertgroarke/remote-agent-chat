@@ -176,6 +176,63 @@ function resolveSession({ target, windowTitle, agentType, workspaceName, workspa
   return { ...session, _matched_existing: false };
 }
 
+function resolveVirtualSession({ virtualId, agentType, displayName, workspaceName, workspacePath, windowTitle, extra }) {
+  const machineLabel = os.hostname();
+  const targetSignature = crypto.createHash('sha1')
+    .update(`${agentType}|virtual|${virtualId || ''}`)
+    .digest('hex')
+    .substring(0, 16);
+
+  for (const [sid, sess] of Object.entries(_store.sessions)) {
+    if (sess.target_signature === targetSignature) {
+      sess.last_seen_at = new Date().toISOString();
+      sess.status       = 'healthy';
+      if (displayName)   sess.display_name   = displayName;
+      if (windowTitle)   sess.window_title   = windowTitle;
+      if (workspaceName) sess.workspace_name = workspaceName;
+      if (workspacePath) sess.workspace_path = workspacePath;
+      if (extra && typeof extra === 'object') Object.assign(sess, extra);
+      _saveStore();
+      console.log(`[session-store] Matched virtual ${sid} via sig=${targetSignature}`);
+      return { ...sess, _matched_existing: true };
+    }
+  }
+
+  const session_id = crypto.randomUUID();
+  const now = new Date().toISOString();
+  const displayNames = {
+    claude: 'Claude Code',
+    claude_cli: 'Claude Code CLI',
+    codex: 'Codex',
+    gemini: 'Gemini',
+    antigravity: 'Antigravity',
+    continue: 'Continue',
+  };
+
+  const session = {
+    session_id,
+    agent_type:       agentType,
+    display_name:     displayName || displayNames[agentType] || agentType,
+    window_title:     windowTitle || displayName || workspaceName || agentType,
+    workspace_name:   workspaceName || windowTitle || displayName || agentType,
+    workspace_path:   workspacePath || null,
+    machine_label:    machineLabel,
+    target_signature: targetSignature,
+    target_id:        null,
+    virtual_id:       virtualId || null,
+    created_at:       now,
+    last_seen_at:     now,
+    status:           'healthy',
+    activity:         { kind: 'idle', label: '', updated_at: now },
+    ...(extra && typeof extra === 'object' ? extra : {}),
+  };
+
+  _store.sessions[session_id] = session;
+  _saveStore();
+  console.log(`[session-store] New virtual session ${session_id} (${agentType}, sig=${targetSignature})`);
+  return { ...session, _matched_existing: false };
+}
+
 // ─── Session updates ──────────────────────────────────────────────────────────
 
 function updateSession(session_id, updates) {
@@ -257,6 +314,7 @@ function getAllSessions() {
 
 module.exports = {
   resolveSession,
+  resolveVirtualSession,
   updateSession,
   markDisconnected,
   updatePreference,

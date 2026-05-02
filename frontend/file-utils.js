@@ -22,6 +22,7 @@ function isTextFile(filename) {
 // Session display label — handles both legacy string IDs and protocol v1 metadata objects
 const AGENT_DISPLAY = {
   claude: 'Claude Code',
+  claude_cli: 'Claude Code CLI',
   codex: 'Codex',
   gemini: 'Gemini',
   continue: 'Continue',

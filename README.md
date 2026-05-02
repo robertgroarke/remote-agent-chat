@@ -322,6 +322,24 @@ Then restart the proxy.
 
 ---
 
+## Optional: Claude Code CLI With Ollama Models
+
+Claude Code CLI sessions can be launched from the WebUI as `Claude Code CLI` sessions. For Ollama-backed Claude models, enter the model id in the launch form, for example:
+
+```text
+deepseek-v4-pro:cloud
+```
+
+You can also launch an interactive Claude CLI from this repo with an Ollama-style command shim:
+
+```powershell
+.\ollama launch claude --model deepseek-v4-pro:cloud
+```
+
+The shim only handles `launch claude`; all other `ollama ...` commands are delegated to the real Ollama executable.
+
+---
+
 ## Updating
 
 ```bash

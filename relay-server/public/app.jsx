@@ -19,6 +19,7 @@ const SLASH_COMMANDS = [
 
 const AGENT_CONFIG = {
   claude:            { name: 'Claude Code',      color: '#cc785c', abbr: 'CC', logo: '/logo-claude-in-ag.svg' },
+  claude_cli:        { name: 'Claude Code CLI',  color: '#d97757', abbr: 'CLI', logo: '/logo-claude-in-ag.svg' },
   'claude-desktop':  { name: 'Claude Desktop',  color: '#cc785c', abbr: 'CD', logo: '/logo-claude-in-ag.svg' },
   codex:             { name: 'Codex',            color: '#10a37f', abbr: 'CX', logo: '/logo-codex-in-ag.svg' },
   'codex-desktop':   { name: 'Codex Desktop',   color: '#10a37f', abbr: 'CX', logo: '/logo-codex.svg' },
@@ -763,6 +764,7 @@ function NewSessionPanel({ launchStates, onLaunch, onResume, onClose, workspaces
   const [agentType,   setAgentType]   = React.useState('claude');
   const [wsMode,      setWsMode]      = React.useState('');
   const [customPath,  setCustomPath]  = React.useState('');
+  const [claudeCliModel, setClaudeCliModel] = React.useState('deepseek-v4-pro:cloud');
   const [requestId,   setRequestId]   = React.useState(null);
   const [history,     setHistory]     = React.useState([]);
   const [historyLoading, setHistoryLoading] = React.useState(false);
@@ -792,7 +794,10 @@ function NewSessionPanel({ launchStates, onLaunch, onResume, onClose, workspaces
     e.preventDefault();
     if (isLaunching) return;
     const wsPath = wsMode === 'custom' ? customPath.trim() : wsMode;
-    const rid = onLaunch(agentType, wsPath || undefined);
+    const launchOptions = agentType === 'claude_cli'
+      ? { model_id: claudeCliModel.trim() || 'default' }
+      : {};
+    const rid = onLaunch(agentType, wsPath || undefined, launchOptions);
     setRequestId(rid);
   }
 
@@ -888,6 +893,16 @@ function NewSessionPanel({ launchStates, onLaunch, onResume, onClose, workspaces
               disabled={isLaunching}
             />
           )}
+          {agentType === 'claude_cli' && (
+            <input
+              className="new-session-workspace"
+              type="text"
+              placeholder="Claude CLI model, e.g. deepseek-v4-pro:cloud"
+              value={claudeCliModel}
+              onChange={e => setClaudeCliModel(e.target.value)}
+              disabled={isLaunching}
+            />
+          )}
           {launchError && <div className="new-session-error">{launchError}</div>}
           <button className="new-session-submit" type="submit" disabled={isLaunching}>
             {isLaunching ? <span className="new-session-spinner" /> : null}
@@ -952,6 +967,14 @@ const PERMISSION_MODES = {
     { value: 'bypassPermissions', label: 'Bypass (allow all)' },
     { value: 'default',           label: 'Default (ask each time)' },
   ],
+  claude_cli: [
+    { value: 'default',           label: 'Default' },
+    { value: 'acceptEdits',       label: 'Accept edits' },
+    { value: 'auto',              label: 'Auto' },
+    { value: 'bypassPermissions', label: 'Bypass permissions' },
+    { value: 'dontAsk',           label: 'Do not ask' },
+    { value: 'plan',              label: 'Plan' },
+  ],
   continue_yolo: [
     { value: 'ask',    label: 'Ask for permissions' },
     { value: 'bypass', label: 'Bypass permissions' },
@@ -986,6 +1009,7 @@ const KNOWN_CLAUDE_MODELS = [
   { id: 'claude-3-7-sonnet',       label: 'Claude 3.7 Sonnet' },
   { id: 'claude-3-5-sonnet',       label: 'Claude 3.5 Sonnet' },
   { id: 'claude-3-5-haiku',        label: 'Claude 3.5 Haiku' },
+  { id: 'deepseek-v4-pro:cloud',   label: 'DeepSeek V4 Pro (Ollama Cloud)' },
 ];
 
 const ANTIGRAVITY_MODES = [
@@ -1031,6 +1055,7 @@ function composerModelOptionsFor(agentType, config) {
     ));
   }
   if (agentType === 'continue_yolo' || agentType === 'continue' || agentType === 'roo_code' || agentType === 'cline') return [];
+  if (agentType === 'claude_cli') return KNOWN_CLAUDE_MODELS;
   if (agentType === 'antigravity' || agentType === 'antigravity_panel') return KNOWN_ANTIGRAVITY_MODELS;
   if (agentType === 'gemini') return KNOWN_GEMINI_MODELS;
   return KNOWN_CLAUDE_MODELS;
@@ -1057,11 +1082,13 @@ function permissionModeOptionsFor(agentType, config) {
   return PERMISSION_MODES[agentType] || [];
 }
 
-function AgentSettingsPanel({ session, config, onRequestRefresh, onSetModel, onSetPermissionMode, onSetAutoApprovePermissions, onSetMode, onSetCodexConfig, onSwitchWorkspace, onClose }) {
+function AgentSettingsPanel({ session, config, onRequestRefresh, onSetModel, onSetEffort, onSetPermissionMode, onSetAutoApprovePermissions, onSetMode, onSetCodexConfig, onSwitchWorkspace, onClose }) {
   const [pendingModel, setPendingModel] = React.useState(null);
   const [modelOk, setModelOk]           = React.useState(null);
   const [pendingPerm, setPendingPerm]   = React.useState(null);
   const [permOk, setPermOk]             = React.useState(null);
+  const [pendingEffort, setPendingEffort] = React.useState(null);
+  const [effortOk, setEffortOk]           = React.useState(null);
   const [pendingAutoApprove, setPendingAutoApprove] = React.useState(null);
   const [autoApproveOk, setAutoApproveOk]           = React.useState(null);
   const [pendingMode, setPendingMode]   = React.useState(null);
@@ -1085,7 +1112,7 @@ function AgentSettingsPanel({ session, config, onRequestRefresh, onSetModel, onS
   const fileScope    = config?.file_access_scope || 'unknown';
   const permModes    = permissionModeOptionsFor(agentType, config);
   const modeOptions  = modeOptionsFor(agentType, config);
-  let modelOptions = agentType === 'claude' ? KNOWN_CLAUDE_MODELS
+  let modelOptions = (agentType === 'claude' || agentType === 'claude_cli') ? KNOWN_CLAUDE_MODELS
     : (agentType === 'antigravity' || agentType === 'antigravity_panel') ? KNOWN_ANTIGRAVITY_MODELS
     : agentType === 'gemini' ? KNOWN_GEMINI_MODELS
     : [];
@@ -1110,6 +1137,13 @@ function AgentSettingsPanel({ session, config, onRequestRefresh, onSetModel, onS
     setPermOk(null);
     setPendingPerm(mode);
     onSetPermissionMode(sessionId, mode);
+  }
+
+  function handleEffortChange(effort) {
+    if (!effort || effort === effortLevel) return;
+    setEffortOk(null);
+    setPendingEffort(effort);
+    onSetEffort && onSetEffort(sessionId, effort);
   }
 
   function handleModeChange(mode) {
@@ -1142,6 +1176,14 @@ function AgentSettingsPanel({ session, config, onRequestRefresh, onSetModel, onS
       setTimeout(() => setPermOk(null), 2000);
     }
   }, [config?.permission_mode]);
+
+  React.useEffect(() => {
+    if (pendingEffort && config?.effort && config.effort === pendingEffort) {
+      setEffortOk('Saved');
+      setPendingEffort(null);
+      setTimeout(() => setEffortOk(null), 2000);
+    }
+  }, [config?.effort]);
 
   React.useEffect(() => {
     if (pendingMode && ((config?.conversation_mode && config.conversation_mode === pendingMode) || (config?.mode && config.mode === pendingMode))) {
@@ -1285,7 +1327,7 @@ function AgentSettingsPanel({ session, config, onRequestRefresh, onSetModel, onS
           </div>
         )}
 
-        {(agentType === 'claude' || agentType === 'continue_yolo' || isClineLikeAgentType(agentType)) && (
+        {(agentType === 'claude' || agentType === 'claude_cli' || agentType === 'continue_yolo' || isClineLikeAgentType(agentType)) && (
           <div className="settings-row">
             <span className="settings-label">Permission mode</span>
             {caps.permission_mode_change && permModes.length > 0 ? (
@@ -1306,6 +1348,23 @@ function AgentSettingsPanel({ session, config, onRequestRefresh, onSetModel, onS
               <span className={`settings-value${permMode === 'unknown' ? ' dim' : ''}`}>{permMode}</span>
             )}
             {permOk && <span className="settings-inline-ok">{permOk}</span>}
+          </div>
+        )}
+
+        {agentType === 'claude_cli' && caps.set_effort && (config?.available_efforts || []).length > 0 && (
+          <div className="settings-row">
+            <span className="settings-label">Effort</span>
+            <select
+              className="settings-perm-select"
+              value={effortLevel || 'medium'}
+              disabled={!!pendingEffort}
+              onChange={e => handleEffortChange(e.target.value)}
+            >
+              {(config.available_efforts || []).map(m => (
+                <option key={m.id} value={m.id}>{m.label}</option>
+              ))}
+            </select>
+            {effortOk && <span className="settings-inline-ok">{effortOk}</span>}
           </div>
         )}
 
@@ -2459,7 +2518,7 @@ class AppErrorBoundary extends React.Component {
 }
 
 function App() {
-  const { sessions, messages, connected, unread, setUnread, thinking, thinkingContent, activities, health, deliveryStates, launchStates, justLaunched, setJustLaunched, permissionPrompts, respondToPrompt, errorPrompts, respondToErrorPrompt, interruptSession, agentConfigs, requestAgentConfig, setAgentModel, setAgentPermissionMode, setAutoApprovePermissions, setAntigravityMode, setCodexConfig, newThread, openPanel, requestChatList, switchChat, newChat, chatLists, requestThreadList, switchThread, threadLists, switchWorkspace, requestTerminalOutput, terminalOutputs, requestFileChanges, fileChanges, sendAttachment, send, sendToSession, steerMessage, discardQueuedMessage, editQueuedMessage, queuedMessages, launchSession, resumeSession, closeSession, activeSessionRef, workspaces, branchLists, requestBranchList, switchBranch, createBranch, skillLists, requestSkillList, automationViews, showCodexAutomation, controlResults, directoryListings, requestDirectoryListing, fileContents, requestFileContent, requestHistory } = useRelay();
+  const { sessions, messages, connected, unread, setUnread, thinking, thinkingContent, activities, health, deliveryStates, launchStates, justLaunched, setJustLaunched, permissionPrompts, respondToPrompt, errorPrompts, respondToErrorPrompt, interruptSession, agentConfigs, requestAgentConfig, setAgentModel, setAgentEffort, setAgentPermissionMode, setAutoApprovePermissions, setAntigravityMode, setCodexConfig, newThread, openPanel, requestChatList, switchChat, newChat, chatLists, requestThreadList, switchThread, threadLists, switchWorkspace, requestTerminalOutput, terminalOutputs, requestFileChanges, fileChanges, sendAttachment, send, sendToSession, steerMessage, discardQueuedMessage, editQueuedMessage, queuedMessages, launchSession, resumeSession, closeSession, activeSessionRef, workspaces, branchLists, requestBranchList, switchBranch, createBranch, skillLists, requestSkillList, automationViews, showCodexAutomation, controlResults, directoryListings, requestDirectoryListing, fileContents, requestFileContent, requestHistory } = useRelay();
   const [activeSession, setActiveSession] = useState(null);
   const [drafts, setDrafts]             = useState({});
   const [draftFiles, setDraftFiles]     = useState({});
@@ -3215,7 +3274,7 @@ async function uploadBinaryDraft(sessionId, base64, mimeType, filename) {
         {showNewSession && (
           <NewSessionPanel
             launchStates={launchStates}
-            onLaunch={(agentType, workspacePath) => launchSession(agentType, workspacePath)}
+            onLaunch={(agentType, workspacePath, options) => launchSession(agentType, workspacePath, options)}
             onResume={(sourceSession, agentType, workspacePath) => resumeSession(sourceSession, agentType, workspacePath)}
             onClose={() => setShowNewSession(false)}
             workspaces={workspaces}
@@ -3738,6 +3797,7 @@ async function uploadBinaryDraft(sessionId, base64, mimeType, filename) {
             config={activeConfig}
             onRequestRefresh={requestAgentConfig}
             onSetModel={(sid, modelId) => setAgentModel(sid, modelId)}
+            onSetEffort={(sid, effort) => setAgentEffort(sid, effort)}
             onSetPermissionMode={(sid, mode) => setAgentPermissionMode(sid, mode)}
             onSetAutoApprovePermissions={(sid, enabled) => setAutoApprovePermissions(sid, enabled)}
             onSetMode={(sid, mode) => setAntigravityMode && setAntigravityMode(sid, mode)}
@@ -4033,6 +4093,18 @@ async function uploadBinaryDraft(sessionId, base64, mimeType, filename) {
                     {activeConfig.permission_mode && !permissionModeOptionsFor(activeSessionMeta?.agent_type, activeConfig).some(m => m.value === activeConfig.permission_mode) && activeConfig.permission_mode !== 'unknown' && (
                       <option value={activeConfig.permission_mode}>{activeConfig.permission_mode}</option>
                     )}
+                  </select>
+                )}
+                {activeSessionMeta?.agent_type === 'claude_cli' && activeConfig?.capabilities?.set_effort && (activeConfig.available_efforts || []).length > 0 && (
+                  <select
+                    className="composer-setting-select"
+                    value={activeConfig.effort || 'medium'}
+                    onChange={e => setAgentEffort(activeSession, e.target.value)}
+                    title="Claude CLI effort"
+                  >
+                    {(activeConfig.available_efforts || []).map(m => (
+                      <option key={m.id} value={m.id}>{m.label}</option>
+                    ))}
                   </select>
                 )}
                 {activeConfig?.capabilities?.auto_approve_permissions_toggle && (
