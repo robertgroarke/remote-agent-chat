@@ -1,6 +1,6 @@
 # Remote Agent Chat
 
-Access and chat with your [Antigravity IDE](https://antigravity.dev) AI agents (Claude Code, Codex, Gemini, Continue, Continue YOLO, Roo Code, Cline) from your phone or any browser — no inbound firewall rules, no VPS required.
+Access and chat with your [Antigravity IDE](https://antigravity.dev) AI agents and CLI agents (Claude Code, Claude Code CLI, Codex, Gemini, Continue, Continue YOLO, Roo Code, Cline) from your phone or any browser - no inbound firewall rules, no VPS required.
 
 <p align="center">
   <img src="docs/architecture.png" alt="Remote Agent Chat architecture — CDP proxy, WebSocket relay, Cloudflare tunnel, mobile UI" width="100%">
@@ -16,7 +16,7 @@ Access and chat with your [Antigravity IDE](https://antigravity.dev) AI agents (
 
 ## The Problem
 
-Running autonomous AI coding agents (like Claude Code, OpenAI Codex, Gemini Code Assist, Continue, Roo Code, or Cline) often requires you to stay tethered to your desktop IDE to monitor progress, approve file changes, or unblock stuck terminal loops.
+Running autonomous AI coding agents (like Claude Code, Claude Code CLI, OpenAI Codex, Gemini Code Assist, Continue, Roo Code, or Cline) often requires you to stay tethered to your desktop IDE or terminal to monitor progress, approve file changes, or unblock stuck terminal loops.
 
 **Remote Agent Chat** solves this by bridging your local IDE with your mobile device. It uses a lightweight WebSocket relay and the Chrome DevTools Protocol (CDP) to securely expose your running IDE agents to a responsive web UI you self-host with Docker and a free Cloudflare Tunnel.
 
@@ -77,6 +77,7 @@ The agent proxy connects **outbound** to the relay — no port forwarding or inb
 | Agent | Status |
 |---|---|
 | Claude Code (Antigravity extension) | Working |
+| Claude Code CLI | Working - WebUI sessions, Ollama Cloud models, and native Windows terminal handoff |
 | OpenAI Codex (Antigravity extension) | Working |
 | Gemini Code Assist (Antigravity extension) | Working |
 | Continue (Antigravity extension) | Working — local models via Ollama, etc. |
@@ -322,21 +323,44 @@ Then restart the proxy.
 
 ---
 
-## Optional: Claude Code CLI With Ollama Models
+## Optional: Claude Code CLI With Ollama Cloud Models
 
-Claude Code CLI sessions can be launched from the WebUI as `Claude Code CLI` sessions. For Ollama-backed Claude models, enter the model id in the launch form, for example:
+Remote Agent Chat can create and drive `Claude Code CLI` sessions directly from the WebUI. These sessions are useful when you want Claude Code CLI behavior without needing an Antigravity Claude Code webview.
+
+For Ollama Cloud models, choose `Claude Code CLI` when launching a new session and select an Ollama Cloud model such as:
 
 ```text
 deepseek-v4-pro:cloud
 ```
 
+The proxy passes `:cloud` model IDs directly to Claude CLI:
+
+```powershell
+claude --model deepseek-v4-pro:cloud
+```
+
 You can also launch an interactive Claude CLI from this repo with an Ollama-style command shim:
 
 ```powershell
-.\ollama launch claude --model deepseek-v4-pro:cloud
+ollama launch claude --model deepseek-v4-pro:cloud -- <claude-cli-args>
 ```
 
-The shim only handles `launch claude`; all other `ollama ...` commands are delegated to the real Ollama executable.
+Non-Ollama Claude CLI models still launch through the normal `claude` executable.
+
+Once a Claude Code CLI session exists, you can use it from either surface:
+
+- **WebUI:** send messages from the browser like any other agent session.
+- **Native terminal:** click the `native` pill in the WebUI header, or the `cmd` button by the composer, to open the same session in a Windows command prompt.
+
+Both surfaces share the same Claude CLI session ID. If you continue from the native terminal, the proxy watches the Claude transcript file and syncs new turns back into the WebUI.
+
+This requires:
+
+- `claude` / `claude.cmd` available on `PATH`
+- `ollama` / `ollama.exe` available on `PATH` for `:cloud` models
+- access to the selected Ollama Cloud model
+
+This repository also includes small `ollama.cmd` / `ollama.ps1` shims for local testing. They only handle `launch claude`; other `ollama ...` commands are delegated to the real Ollama executable.
 
 ---
 

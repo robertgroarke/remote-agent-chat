@@ -93,6 +93,22 @@ async function mainProxyAlreadyConnected() {
   }
 }
 
+function startMainProxyWatchdog() {
+  const timer = setInterval(async () => {
+    try {
+      if (await mainProxyAlreadyConnected()) {
+        console.log(`[rescue-proxy] Main proxy is connected at ${MAIN_HEALTH_URL}; stopping rescue proxy.`);
+        try { engine.stop(); } catch {}
+        clearInterval(timer);
+        setTimeout(() => process.exit(0), 500);
+      }
+    } catch {
+      // Keep rescue alive while the main relay/proxy is unreachable.
+    }
+  }, 15000);
+  if (typeof timer.unref === 'function') timer.unref();
+}
+
 engine.on('log', (level, msg) => {
   if (level === 'error') console.error(msg);
   else if (level === 'warn') console.warn(msg);
@@ -114,6 +130,7 @@ async function main() {
   console.log('');
 
   await engine.start();
+  startMainProxyWatchdog();
 }
 
 main().catch(err => {

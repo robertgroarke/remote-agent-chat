@@ -286,6 +286,55 @@ function getSelectorFailures(sessionId) {
   return { ..._getFailures(sessionId) };
 }
 
+// ─── Codex read cache (cheap dirty-check) ─────────────────────────────────────
+// readCodexMessages runs a multi-hundred-line DOM walk on every poll. On long
+// transcripts this saturates the renderer's main thread and locks up Codex.
+// We compute a tiny signature (conversation child count + last-child shape)
+// per poll and skip the full read when unchanged.
+
+const codexReadCache = new Map(); // sessionId -> { sig, result, hits }
+
+function _getCodexReadCache(sessionId) {
+  if (!codexReadCache.has(sessionId)) {
+    codexReadCache.set(sessionId, { sig: '', result: null, hits: 0 });
+  }
+  return codexReadCache.get(sessionId);
+}
+
+function getCodexReadCacheStats(sessionId) {
+  const c = _getCodexReadCache(sessionId);
+  return { sig: c.sig, hits: c.hits, hasResult: c.result !== null };
+}
+
+// Cache the last detectThinking result keyed to the read-cache state so
+// we can skip the heavy thinking-detection DOM walk when the conversation
+// hasn't changed since the last successful detection.
+function setCodexCachedThinking(sessionId, thinking) {
+  const c = _getCodexReadCache(sessionId);
+  c.cachedThinking = thinking;
+}
+
+function getCodexCachedThinking(sessionId) {
+  const c = _getCodexReadCache(sessionId);
+  // Only valid right after a sig-match cache hit on readMessages —
+  // i.e. the conversation DOM is verifiably unchanged.
+  if (!c.cachedThinking || c.hits === 0) return null;
+  return c.cachedThinking;
+}
+
+const CODEX_DOM_SIG_EXPR = `
+  var c = d.querySelector('[data-thread-find-target="conversation"]');
+  if (!c) return '';
+  var n = c.children ? c.children.length : 0;
+  var l = c.lastElementChild;
+  var ll = '';
+  if (l) {
+    var lt = l.textContent || '';
+    ll = (l.children ? l.children.length : 0) + ':' + lt.length;
+  }
+  return n + '|' + ll;
+`;
+
 // ─── Diagnostic snapshot ──────────────────────────────────────────────────────
 // Throttled — captured at most once per 30 s per session
 
@@ -722,16 +771,19 @@ async function detectThinking(Runtime, agentType) {
         // Enabled for both Codex extension and Codex Desktop — Desktop uses
         // the same shimmer class plus an animate-spin spinner.
         if (!isThinking) {
-          var shimmers = d.querySelectorAll('span[class*="loading-shimmer"]');
+          // Scope to the conversation root so we don't walk the whole
+          // document on long sessions. Drop the getBoundingClientRect
+          // top check — offsetParent already filters out hidden residual
+          // spans and the rect read forces a synchronous layout recalc
+          // every poll, which is the main thing wedging Codex.
+          var convForShimmer = d.querySelector('[data-thread-find-target="conversation"]') || d;
+          var shimmers = convForShimmer.querySelectorAll('span[class*="loading-shimmer"]');
           for (var si = 0; si < shimmers.length; si++) {
             var st = (shimmers[si].textContent || '').trim();
             if ((st === 'Thinking' || st === 'Generating') && shimmers[si].offsetParent !== null) {
-              var rect = shimmers[si].getBoundingClientRect();
-              if (rect.top >= 0) {
-                isThinking = true;
-                hasShimmerSignal = true;
-                break;
-              }
+              isThinking = true;
+              hasShimmerSignal = true;
+              break;
             }
           }
         }
@@ -2579,11 +2631,35 @@ const CODEX_DESKTOP_READ_EXPR = `
 `;
 
 async function readCodexMessages(Runtime, sessionId, usePageEval) {
+  // Cheap dirty-check before the expensive DOM walk. If the conversation
+  // signature is unchanged from the last successful read, return the cached
+  // result. The downstream caller will see the same transcriptSig and take
+  // no action — but we avoid blocking Codex's renderer with a full parse.
+  const cache = _getCodexReadCache(sessionId);
+  const evalFn = usePageEval ? evalInPage : evalInFrame;
+  let preSig = null;
+  try {
+    preSig = await evalFn(Runtime, CODEX_DOM_SIG_EXPR);
+    if (preSig && preSig === cache.sig && cache.result !== null) {
+      cache.hits = (cache.hits || 0) + 1;
+      return cache.result;
+    }
+  } catch {
+    // Sig eval failed — fall through to the full read so we don't lose data
+  }
+
   try {
     const raw = usePageEval
       ? await evalInPage(Runtime, CODEX_DESKTOP_READ_EXPR, { awaitPromise: true })
       : await evalInFrame(Runtime, CODEX_READ_EXPR, { awaitPromise: true });
-    if (raw !== null) { resetReadFailures(sessionId); return expandCodexMessagesRaw(raw); }
+    if (raw !== null) {
+      resetReadFailures(sessionId);
+      const result = expandCodexMessagesRaw(raw);
+      cache.sig = preSig || '';
+      cache.result = result;
+      cache.hits = 0;
+      return result;
+    }
   } catch (e) {
     console.warn(`[${sessionId}] [sel] Codex read error: ${e.message}`);
   }
@@ -6542,9 +6618,23 @@ async function readCodexTaskList(Runtime, usePageEval) {
     //   "N task in progress"          (singular)
     // NOTE: use [0-9] instead of \\d — \\d gets mangled through the multiple
     // escaping layers (Node template literal → evalInFrame wrapper → CDP evaluate).
+    // Plan items first — if there are none, the task list isn't visible
+    // and we can bail without scanning the document for a header.
+    var planItems = d.querySelectorAll('div[id^="plan-item-"]');
+    if (planItems.length === 0) return null;
+
+    // Scope the header search to a small ancestor of the plan items rather
+    // than the whole document. d.querySelectorAll('span') across a long
+    // Codex transcript can return thousands of nodes, and reading
+    // .textContent on each is exactly the kind of main-thread work that
+    // wedges the Codex renderer.
+    var searchRoot = planItems[0].parentElement;
+    for (var up = 0; up < 3 && searchRoot && searchRoot.parentElement; up++) {
+      searchRoot = searchRoot.parentElement;
+    }
     var header = null;
     var headerText = '';
-    var spans = d.querySelectorAll('span');
+    var spans = (searchRoot || d).querySelectorAll('span');
     for (var i = 0; i < spans.length; i++) {
       var st = (spans[i].textContent || '').trim();
       if (/[0-9]+ out of [0-9]+ tasks/.test(st) || /[0-9]+\\s+tasks?\\s+(in progress|completed)/i.test(st)) {
@@ -6553,10 +6643,6 @@ async function readCodexTaskList(Runtime, usePageEval) {
         break;
       }
     }
-
-    var planItems = d.querySelectorAll('div[id^="plan-item-"]');
-    // Bail only if we have neither a header nor plan items
-    if (!header && planItems.length === 0) return null;
 
     // Parse header for counts
     var completedCount = 0;
@@ -6578,8 +6664,8 @@ async function readCodexTaskList(Runtime, usePageEval) {
     var tasks = [];
     for (var j = 0; j < planItems.length; j++) {
       var item = planItems[j];
-      var rect = item.getBoundingClientRect();
-      if (rect.height <= 0) continue;
+      // Skip the visibility check: getBoundingClientRect forces a synchronous
+      // layout recalc, and zero-height plan items are vanishingly rare.
       // Second child is the task description span (first child is the number+icon)
       var descSpan = item.children.length > 1 ? item.children[1] : null;
       var text = descSpan ? descSpan.textContent.trim() : item.textContent.trim().replace(/^[0-9]+\\.\\s*/, '');
@@ -10863,6 +10949,9 @@ module.exports = {
   sendMessage,
   steerCodexInput,
   getSelectorFailures,
+  getCodexReadCacheStats,
+  getCodexCachedThinking,
+  setCodexCachedThinking,
   evalInFrame,
   cacheInnerContextId,
   evalInPage,

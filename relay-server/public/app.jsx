@@ -2518,7 +2518,7 @@ class AppErrorBoundary extends React.Component {
 }
 
 function App() {
-  const { sessions, messages, connected, unread, setUnread, thinking, thinkingContent, activities, health, deliveryStates, launchStates, justLaunched, setJustLaunched, permissionPrompts, respondToPrompt, errorPrompts, respondToErrorPrompt, interruptSession, agentConfigs, requestAgentConfig, setAgentModel, setAgentEffort, setAgentPermissionMode, setAutoApprovePermissions, setAntigravityMode, setCodexConfig, newThread, openPanel, requestChatList, switchChat, newChat, chatLists, requestThreadList, switchThread, threadLists, switchWorkspace, requestTerminalOutput, terminalOutputs, requestFileChanges, fileChanges, sendAttachment, send, sendToSession, steerMessage, discardQueuedMessage, editQueuedMessage, queuedMessages, launchSession, resumeSession, closeSession, activeSessionRef, workspaces, branchLists, requestBranchList, switchBranch, createBranch, skillLists, requestSkillList, automationViews, showCodexAutomation, controlResults, directoryListings, requestDirectoryListing, fileContents, requestFileContent, requestHistory } = useRelay();
+  const { sessions, messages, connected, unread, setUnread, thinking, thinkingContent, activities, health, deliveryStates, launchStates, justLaunched, setJustLaunched, permissionPrompts, respondToPrompt, errorPrompts, respondToErrorPrompt, interruptSession, agentConfigs, requestAgentConfig, setAgentModel, setAgentEffort, setAgentPermissionMode, setAutoApprovePermissions, setAntigravityMode, setCodexConfig, newThread, openPanel, openNativeWindow, requestChatList, switchChat, newChat, chatLists, requestThreadList, switchThread, threadLists, switchWorkspace, requestTerminalOutput, terminalOutputs, requestFileChanges, fileChanges, sendAttachment, send, sendToSession, steerMessage, discardQueuedMessage, editQueuedMessage, queuedMessages, launchSession, resumeSession, closeSession, activeSessionRef, workspaces, branchLists, requestBranchList, switchBranch, createBranch, skillLists, requestSkillList, automationViews, showCodexAutomation, controlResults, directoryListings, requestDirectoryListing, fileContents, requestFileContent, requestHistory } = useRelay();
   const [activeSession, setActiveSession] = useState(null);
   const [drafts, setDrafts]             = useState({});
   const [draftFiles, setDraftFiles]     = useState({});
@@ -3505,6 +3505,15 @@ async function uploadBinaryDraft(sessionId, base64, mimeType, filename) {
                       open panel
                     </button>
                   )}
+                  {activeConfig?.capabilities?.native_window && (
+                    <button
+                      className="context-pill open-panel-btn"
+                      title="Open this Claude CLI session in a native command window"
+                      onClick={() => openNativeWindow(activeSession)}
+                    >
+                      native
+                    </button>
+                  )}
                   {isActiveThinking && activeActivity?.label && activeActivity.label !== 'Generating' && (
                     <span className="context-pill thinking" title={activeActivity.label}>
                       {activeActivity.label.length > 40 ? activeActivity.label.substring(0, 40) + '…' : activeActivity.label}
@@ -3978,6 +3987,13 @@ async function uploadBinaryDraft(sessionId, base64, mimeType, filename) {
                     onClick={() => openPanel(activeSession)}
                     title="Open panel"
                   >⊞</button>
+                )}
+                {activeConfig?.capabilities?.native_window && (
+                  <button
+                    className="composer-gear-btn mobile-hide"
+                    onClick={() => openNativeWindow(activeSession)}
+                    title="Open native command window"
+                  >cmd</button>
                 )}
                 {activeConfig?.capabilities?.new_chat && (
                   <button

@@ -3,7 +3,7 @@
 const fs = require('fs');
 const os = require('os');
 const path = require('path');
-const { spawn } = require('child_process');
+const { spawn, spawnSync } = require('child_process');
 
 const CLAUDE_CLI_MODELS = [
   { id: 'default', label: 'Default' },
@@ -198,28 +198,94 @@ function discoverSessions(limit = 40) {
     .filter(summary => summary && (includeVsCode || summary.isCliLike));
 }
 
-function buildClaudeArgs({ cliSessionId, resume = true, model, effort, permissionMode, print = false, extraArgs = [] } = {}) {
+function findSessionByCliId(cliSessionId) {
+  if (!cliSessionId || typeof cliSessionId !== 'string') return null;
+  const root = projectsDir();
+  if (!fs.existsSync(root)) return null;
+  const wanted = `${cliSessionId}.jsonl`.toLowerCase();
+  const stack = [root];
+  while (stack.length > 0) {
+    const dir = stack.pop();
+    let entries = [];
+    try { entries = fs.readdirSync(dir, { withFileTypes: true }); } catch { continue; }
+    for (const ent of entries) {
+      const full = path.join(dir, ent.name);
+      if (ent.isDirectory()) {
+        if (ent.name.toLowerCase() === 'memory') continue;
+        stack.push(full);
+      } else if (ent.isFile() && ent.name.toLowerCase() === wanted) {
+        return readSessionSummary(full);
+      }
+    }
+  }
+  return null;
+}
+
+function isOllamaLaunchModel(model) {
+  return typeof model === 'string' && /:cloud$/i.test(model);
+}
+
+function realOllamaPath() {
+  const candidates = [
+    process.env.OLLAMA_REAL_EXE,
+    process.env.LOCALAPPDATA ? path.join(process.env.LOCALAPPDATA, 'Programs', 'Ollama', 'ollama.exe') : null,
+    path.join(homeDir(), 'AppData', 'Local', 'Programs', 'Ollama', 'ollama.exe'),
+  ].filter(Boolean);
+  for (const candidate of candidates) {
+    if (candidate && fs.existsSync(candidate)) return candidate;
+  }
+
+  if (process.platform === 'win32') {
+    const found = spawnSync('where.exe', ['ollama'], { encoding: 'utf8' });
+    if (found.status === 0) {
+      const repoRoot = path.resolve(__dirname, '..').toLowerCase();
+      for (const line of found.stdout.split(/\r?\n/).map(s => s.trim()).filter(Boolean)) {
+        const normalized = line.toLowerCase();
+        if (!normalized.startsWith(repoRoot) && fs.existsSync(line)) return line;
+      }
+    }
+  }
+  return null;
+}
+
+function buildClaudeArgs({ cliSessionId, resume = true, model, effort, permissionMode, print = false, extraArgs = [], includeModel = true } = {}) {
   const args = [];
-  if (print) args.push('--print', '--output-format', 'stream-json', '--include-partial-messages');
+  if (print) args.push('--print', '--output-format', 'stream-json', '--include-partial-messages', '--verbose');
   if (cliSessionId) {
     args.push(resume ? '--resume' : '--session-id', cliSessionId);
   }
-  if (model && model !== 'default' && model !== 'unknown') args.push('--model', model);
+  if (includeModel && model && model !== 'default' && model !== 'unknown') args.push('--model', model);
   if (effort && effort !== 'unknown') args.push('--effort', effort);
   if (permissionMode && permissionMode !== 'unknown') args.push('--permission-mode', permissionMode);
   if (Array.isArray(extraArgs) && extraArgs.length > 0) args.push(...extraArgs);
   return args;
 }
 
-function buildSpawnCommand(args) {
+function buildSpawnCommand(args, { model } = {}) {
+  if (isOllamaLaunchModel(model)) {
+    const command = realOllamaPath();
+    if (!command) throw new Error('Could not find the real Ollama executable for Ollama Cloud Claude launch.');
+    return { command, spawnArgs: ['launch', 'claude', '--model', model, '--', ...args] };
+  }
   const command = process.platform === 'win32' ? 'cmd.exe' : 'claude';
   const spawnArgs = process.platform === 'win32' ? ['/d', '/s', '/c', 'claude.cmd', ...args] : args;
   return { command, spawnArgs };
 }
 
+function quoteCmdArg(value) {
+  const s = String(value ?? '');
+  if (s.length === 0) return '""';
+  return `"${s.replace(/"/g, '""')}"`;
+}
+
+function quotePowerShellString(value) {
+  return `'${String(value ?? '').replace(/'/g, "''")}'`;
+}
+
 function startClaudePrintSession({ workspacePath, cliSessionId, resume = true, content, model, effort, permissionMode, onStdout, onStderr, onExit }) {
-  const args = buildClaudeArgs({ cliSessionId, resume, model, effort, permissionMode, print: true });
-  const { command, spawnArgs } = buildSpawnCommand(args);
+  const useOllamaLaunch = isOllamaLaunchModel(model);
+  const args = buildClaudeArgs({ cliSessionId, resume, model, effort, permissionMode, print: true, includeModel: !useOllamaLaunch });
+  const { command, spawnArgs } = buildSpawnCommand(args, { model });
   const child = spawn(command, spawnArgs, {
     cwd: workspacePath || process.cwd(),
     shell: false,
@@ -237,9 +303,10 @@ function startClaudePrintSession({ workspacePath, cliSessionId, resume = true, c
   return child;
 }
 
-function startInteractiveClaude({ workspacePath, model, effort, permissionMode, extraArgs = [] } = {}) {
-  const args = buildClaudeArgs({ model, effort, permissionMode, extraArgs });
-  const { command, spawnArgs } = buildSpawnCommand(args);
+function startInteractiveClaude({ workspacePath, cliSessionId, resume = true, model, effort, permissionMode, extraArgs = [] } = {}) {
+  const useOllamaLaunch = isOllamaLaunchModel(model);
+  const args = buildClaudeArgs({ cliSessionId, resume, model, effort, permissionMode, extraArgs, includeModel: !useOllamaLaunch });
+  const { command, spawnArgs } = buildSpawnCommand(args, { model });
   return spawn(command, spawnArgs, {
     cwd: workspacePath || process.cwd(),
     shell: false,
@@ -248,13 +315,57 @@ function startInteractiveClaude({ workspacePath, model, effort, permissionMode, 
   });
 }
 
+function startNativeClaudeWindow({ workspacePath, cliSessionId, resume = true, model, effort, permissionMode, title } = {}) {
+  const cwd = workspacePath || process.cwd();
+  const useOllamaLaunch = isOllamaLaunchModel(model);
+  const args = buildClaudeArgs({ cliSessionId, resume, model, effort, permissionMode, includeModel: !useOllamaLaunch });
+  const { command, spawnArgs } = buildSpawnCommand(args, { model });
+
+  if (process.platform !== 'win32') {
+    return startInteractiveClaude({ workspacePath: cwd, cliSessionId, resume, model, effort, permissionMode });
+  }
+
+  const windowTitle = String(title || 'Claude Code CLI').replace(/["&<>|]/g, '').slice(0, 80) || 'Claude Code CLI';
+  const nativeCommand = command === 'cmd.exe' ? 'claude.cmd' : command;
+  const nativeArgs = command === 'cmd.exe' ? spawnArgs.slice(4) : spawnArgs;
+
+  const launcherPath = path.join(os.tmpdir(), `remote-agent-claude-cli-${cliSessionId || Date.now()}.cmd`);
+  const commandLine = [nativeCommand, ...nativeArgs].map(quoteCmdArg).join(' ');
+  fs.writeFileSync(launcherPath, [
+    '@echo off',
+    `title ${windowTitle}`,
+    `cd /d ${quoteCmdArg(cwd)}`,
+    commandLine,
+    '',
+  ].join('\r\n'));
+
+  const ps = [
+    'Start-Process',
+    '-FilePath', quotePowerShellString('cmd.exe'),
+    '-WorkingDirectory', quotePowerShellString(cwd),
+    '-ArgumentList', quotePowerShellString(`/k ${quoteCmdArg(launcherPath)}`),
+    '-WindowStyle', 'Normal',
+  ].join(' ');
+  const child = spawn('powershell.exe', ['-NoProfile', '-ExecutionPolicy', 'Bypass', '-Command', ps], {
+    cwd,
+    shell: false,
+    detached: true,
+    stdio: 'ignore',
+    windowsHide: true,
+  });
+  child.unref();
+  return child;
+}
+
 module.exports = {
   CLAUDE_CLI_MODELS,
   CLAUDE_CLI_EFFORTS,
   CLAUDE_CLI_PERMISSION_MODES,
   discoverSessions,
+  findSessionByCliId,
   parseClaudeJsonl,
   readSessionSummary,
   startClaudePrintSession,
   startInteractiveClaude,
+  startNativeClaudeWindow,
 };

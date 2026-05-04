@@ -29,8 +29,64 @@ ROOT       = Path(__file__).parent
 LOG_FILE   = ROOT / "proxy.log"
 ERR_FILE   = ROOT / "proxy-err.log"
 LOCK_PY    = ROOT / "proxy_restart_lock.py"
+RESTART_BAT = ROOT / "restart-proxy.bat"
 PYTHON     = sys.executable
 WEB_UI_URL = os.environ.get("PUBLIC_URL", "http://localhost:3500")
+
+
+def _stop_proxy() -> None:
+    """Kill the restart-proxy.bat wrapper and the node proxy process.
+
+    The wrapper must die first; otherwise it respawns node 5s later.
+    """
+    ps = (
+        # Kill cmd.exe instances running restart-proxy.bat
+        "Get-CimInstance Win32_Process -Filter \"Name='cmd.exe'\" | "
+        "Where-Object { $_.CommandLine -match 'restart-proxy\\.bat' } | "
+        "ForEach-Object { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue };"
+        # Kill node.exe processes running the proxy. The wrapper does
+        # `cd agent-proxy && node index.js`, so the command line is just
+        # "node index.js" — match any node.exe whose argv contains index.js.
+        "Get-CimInstance Win32_Process -Filter \"Name='node.exe'\" | "
+        "Where-Object { $_.CommandLine -match 'index\\.js' } | "
+        "ForEach-Object { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }"
+    )
+    subprocess.run(
+        ["powershell.exe", "-NoProfile", "-Command", ps],
+        timeout=20,
+        creationflags=_NO_WINDOW,
+    )
+
+
+def _is_proxy_running() -> bool:
+    """Return True if a node.exe with index.js or restart-proxy.bat wrapper is alive."""
+    ps = (
+        "$running = $false; "
+        "Get-CimInstance Win32_Process -Filter \"Name='node.exe' OR Name='cmd.exe'\" | "
+        "ForEach-Object { "
+        "  if ($_.Name -eq 'node.exe' -and $_.CommandLine -match 'index\\.js') { $running = $true } "
+        "  if ($_.Name -eq 'cmd.exe' -and $_.CommandLine -match 'restart-proxy\\.bat') { $running = $true } "
+        "}; "
+        "if ($running) { Write-Output 'YES' } else { Write-Output 'NO' }"
+    )
+    try:
+        out = subprocess.check_output(
+            ["powershell.exe", "-NoProfile", "-Command", ps],
+            timeout=8,
+            creationflags=_NO_WINDOW,
+        ).decode(errors='replace').strip()
+        return out == 'YES'
+    except Exception:
+        return False
+
+
+def _start_proxy() -> None:
+    """Launch restart-proxy.bat detached. os.startfile uses ShellExecute,
+    which is the most reliable way to spawn a .bat from a windowless
+    pythonw process — Popen with DETACHED_PROCESS can fail silently because
+    cmd.exe inherits no console handles.
+    """
+    os.startfile(str(RESTART_BAT))
 
 # ─── Log parsing ──────────────────────────────────────────────────────────────
 
@@ -115,6 +171,8 @@ ICON_PALETTE = {
     'offline':  ('#1a1a2e', '#f87171'),   # red
     'unknown':  ('#1a1a2e', '#94a3b8'),   # grey
     'restarting': ('#1a1a2e', '#60a5fa'), # blue
+    'stopped':    ('#1a1a2e', '#6b7280'), # grey ring (user-stopped)
+    'stopping':   ('#1a1a2e', '#60a5fa'), # blue
 }
 
 AGENT_INITIALS = {'claude': 'C', 'gemini': 'G', 'codex': 'X', 'antigravity': 'A'}
@@ -165,6 +223,8 @@ class ProxyTray:
         self._state      = {'status': 'unknown', 'sessions': Counter(), 'relay': 'unknown',
                             'duplicate_warning': False, 'log_age': 0}
         self._restarting = False
+        self._stopping   = False
+        self._stopped    = False  # user-initiated stop; suppresses auto-status flicker
         self._icon       = None
         self._stop_evt   = threading.Event()
 
@@ -172,6 +232,10 @@ class ProxyTray:
 
     def _status_line(self) -> str:
         s = self._state
+        if self._stopping:
+            return "⟳  Stopping proxy…"
+        if self._stopped:
+            return "■  Proxy stopped (user)"
         if self._restarting:
             return "⟳  Restarting proxy…"
         st = s['status']
@@ -195,7 +259,11 @@ class ProxyTray:
     # ── Icon / menu builders ─────────────────────────────────────────────────
 
     def _current_icon(self) -> Image.Image:
-        if self._restarting:
+        if self._stopping:
+            status = 'stopping'
+        elif self._stopped:
+            status = 'stopped'
+        elif self._restarting:
             status = 'restarting'
         else:
             status = self._state['status']
@@ -209,9 +277,17 @@ class ProxyTray:
             webbrowser.open(WEB_UI_URL)
 
         def restart_proxy(_):
-            if self._restarting:
+            if self._restarting or self._stopping:
                 return
             threading.Thread(target=self._do_restart, daemon=True).start()
+
+        def stop_proxy(_):
+            if self._stopping or self._stopped:
+                return
+            threading.Thread(target=self._do_stop, daemon=True).start()
+
+        def start_proxy(_):
+            threading.Thread(target=self._do_start, daemon=True).start()
 
         def view_log(_):
             subprocess.Popen(['notepad.exe', str(LOG_FILE)])
@@ -230,6 +306,16 @@ class ProxyTray:
             pystray.MenuItem(
                 "Restart Proxy",
                 restart_proxy,
+                enabled=not (self._restarting or self._stopping),
+            ),
+            pystray.MenuItem(
+                "Stop Proxy",
+                stop_proxy,
+                enabled=not (self._stopping or self._stopped),
+            ),
+            pystray.MenuItem(
+                "Start Proxy",
+                start_proxy,
                 enabled=not self._restarting,
             ),
             pystray.Menu.SEPARATOR,
@@ -254,6 +340,27 @@ class ProxyTray:
             print(f"[tray] Restart error: {e}")
         finally:
             self._restarting = False
+            self._refresh_icon()
+
+    def _do_stop(self):
+        self._stopping = True
+        self._refresh_icon()
+        try:
+            _stop_proxy()
+            self._stopped = True
+        except Exception as e:
+            print(f"[tray] Stop error: {e}")
+        finally:
+            self._stopping = False
+            self._refresh_icon()
+
+    def _do_start(self):
+        try:
+            _start_proxy()
+            self._stopped = False
+        except Exception as e:
+            print(f"[tray] Start error: {e}")
+        finally:
             self._refresh_icon()
 
     # ── Update loop ──────────────────────────────────────────────────────────

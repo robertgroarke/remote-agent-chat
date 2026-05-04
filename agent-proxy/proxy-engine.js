@@ -320,6 +320,7 @@ class ProxyEngine extends EventEmitter {
       thread_list:            isDesktop,
       switch_thread:          isDesktop,
       switch_workspace:       isDesktop,
+      native_window:          isClaudeCli,
       open_panel:             false, // Codex side pane is already open if session exists
       chat_list:              agentType === 'codex' || agentType === 'continue' || agentType === 'antigravity_panel' || agentType === 'claude-desktop' || isClineLike,
       switch_chat:            agentType === 'codex' || agentType === 'continue' || agentType === 'antigravity_panel' || agentType === 'claude-desktop' || isClineLike,
@@ -809,7 +810,7 @@ class ProxyEngine extends EventEmitter {
       client = await CDP({ port: cdpPort, target: workbenchTarget.id });
       await client.Runtime.enable();
       const result = await selectors.openCodexPanel(client.Runtime);
-      await client.close();
+      await this._safeClose(client);
 
       if (result.ok) {
         this._log('info', `[ctrl] open_panel OK for ${sessionId}: method=${result.method} detail=${result.detail}`);
@@ -821,7 +822,7 @@ class ProxyEngine extends EventEmitter {
         }));
       }
     } catch (e) {
-      if (client) try { await client.close(); } catch {}
+      await this._safeClose(client);
       this._log('warn', `[ctrl] open_panel error for ${sessionId}: ${e.message}`);
       this._sendToRelay(proto.agentControlResult(sessionId, requestId, 'open_panel', 'failed', {
         code: 'cdp_error', message: e.message,
@@ -994,6 +995,18 @@ class ProxyEngine extends EventEmitter {
     ]).finally(() => {
       if (timer) clearTimeout(timer);
     });
+  }
+
+  // chrome-remote-interface's client.close() awaits the WebSocket close
+  // handshake. When the underlying socket is wedged (renderer hung, network
+  // drop), that handshake never completes and the await hangs forever. We
+  // see this as the proxy poll loop "skipping" thousands of ticks because
+  // a tear-down step never returns. Always close clients via this helper.
+  async _safeClose(client, label = 'close') {
+    if (!client) return;
+    try {
+      await this._withTimeout(client.close(), 2000, label);
+    } catch {}
   }
 
   _isCodexSurface(agentType) {
@@ -2127,17 +2140,53 @@ class ProxyEngine extends EventEmitter {
 
       if (agentT === 'claude_cli') {
         const cliSessionId = crypto.randomUUID();
+        const workspacePath = sessionData.workspace_path || process.cwd();
+        const workspaceName = sessionData.workspace_name || path.basename(workspacePath) || 'Claude CLI';
         const summary = {
           cliSessionId,
           filePath: null,
-          workspacePath: sessionData.workspace_path || process.cwd(),
-          workspaceName: sessionData.workspace_name || path.basename(sessionData.workspace_path || process.cwd()) || 'Claude CLI',
+          workspacePath,
+          workspaceName,
           title: 'New Claude CLI session',
           messages: [],
           messageCount: 0,
           updatedAt: new Date().toISOString(),
+          model_id: sessionData.model_id || 'default',
+          permission_mode: sessionData.permission_mode || 'default',
+          effort: sessionData.effort || 'medium',
+          nativeCliStartedAt: new Date().toISOString(),
+          nativeCliStatus: 'native_window_opened',
+          nativeCliWindowOpened: true,
         };
         const newSession = this._registerClaudeCliSession(summary, { sendInitialHistory: false });
+        if (newSession) {
+          try {
+            const child = claudeCli.startNativeClaudeWindow({
+              workspacePath,
+              cliSessionId,
+              resume: false,
+              model: newSession.model_id,
+              effort: newSession.effort,
+              permissionMode: newSession.permission_mode,
+              title: `${workspaceName} - Claude CLI`,
+            });
+            newSession.nativeCliStartedAt = summary.nativeCliStartedAt;
+            newSession.nativeCliStatus = 'native_window_opened';
+            newSession.nativeCliWindowOpened = true;
+            sessionStore.updateSession(newSession.session_id, {
+              native_cli_started_at: newSession.nativeCliStartedAt,
+              native_cli_status: newSession.nativeCliStatus,
+              native_cli_window_opened: true,
+            });
+            this._sendHistorySnapshot(newSession.session_id, this._claudeCliPendingTranscriptMessages(newSession), 'claude cli native startup');
+            this._log('info', `[ctrl] opened native Claude CLI window for new_chat ${newSession.session_id} pid=${child?.pid || 'unknown'} model=${newSession.model_id || 'default'}`);
+          } catch (e) {
+            this._log('warn', `[ctrl] new_chat native Claude CLI window failed for ${newSession.session_id}: ${e.message}`);
+            newSession.nativeCliStatus = 'native_window_failed';
+            sessionStore.updateSession(newSession.session_id, { native_cli_status: newSession.nativeCliStatus });
+            this._sendHistorySnapshot(newSession.session_id, this._claudeCliPendingTranscriptMessages(newSession), 'claude cli native startup failed');
+          }
+        }
         this._broadcastSessionSnapshot();
         this._sendToRelay(proto.agentControlResult(
           sid,
@@ -2657,6 +2706,55 @@ class ProxyEngine extends EventEmitter {
       return;
     }
 
+    if (type === 'open_native_window') {
+      const sid = msg.session_id || msg.session;
+      const sessionData = this.sessions.get(sid);
+      const requestId = msg.request_id;
+
+      if (sessionData?.agentType !== 'claude_cli') {
+        this._sendToRelay(proto.agentControlResult(sid, requestId, 'open_native_window', 'failed', {
+          code: 'not_supported', message: `native window not supported for ${sessionData?.agentType || 'unknown'}`,
+        }));
+        return;
+      }
+
+      try {
+        const cliSessionId = sessionData.cliSessionId || crypto.randomUUID();
+        sessionData.cliSessionId = cliSessionId;
+        sessionData.nativeCliStartedAt = new Date().toISOString();
+        sessionData.nativeCliStatus = 'native_window_opened';
+        sessionData.nativeCliWindowOpened = true;
+        sessionStore.updateSession(sid, {
+          cli_session_id: cliSessionId,
+          claude_cli_archive_discovered: false,
+          native_cli_started_at: sessionData.nativeCliStartedAt,
+          native_cli_status: sessionData.nativeCliStatus,
+          native_cli_window_opened: true,
+        });
+        const child = claudeCli.startNativeClaudeWindow({
+          workspacePath: sessionData.workspace_path || process.cwd(),
+          cliSessionId,
+          resume: !!sessionData.claudeCliFilePath,
+          model: sessionData.model_id,
+          effort: sessionData.effort,
+          permissionMode: sessionData.permission_mode,
+          title: `${sessionData.workspace_name || 'Claude Code'} - Claude CLI`,
+        });
+        this._sendHistorySnapshot(sid, this._claudeCliPendingTranscriptMessages(sessionData), 'claude cli native startup');
+        this._log('info', `[ctrl] opened native Claude CLI window for ${sid} pid=${child?.pid || 'unknown'} model=${sessionData.model_id || 'default'}`);
+        this._sendToRelay(proto.agentControlResult(sid, requestId, 'open_native_window', 'ok'));
+      } catch (e) {
+        this._log('warn', `[ctrl] open_native_window failed for ${sid}: ${e.message}`);
+        sessionData.nativeCliStatus = 'native_window_failed';
+        sessionStore.updateSession(sid, { native_cli_status: sessionData.nativeCliStatus });
+        this._sendHistorySnapshot(sid, this._claudeCliPendingTranscriptMessages(sessionData), 'claude cli native startup failed');
+        this._sendToRelay(proto.agentControlResult(sid, requestId, 'open_native_window', 'failed', {
+          code: 'spawn_failed', message: e.message,
+        }));
+      }
+      return;
+    }
+
     if (type === 'launch_session') {
       const agentType    = msg.agent_type;
       const requestId    = msg.request_id;
@@ -2682,6 +2780,9 @@ class ProxyEngine extends EventEmitter {
           model_id: modelId,
           permission_mode: permissionMode,
           effort,
+          nativeCliStartedAt: new Date().toISOString(),
+          nativeCliStatus: 'native_window_opened',
+          nativeCliWindowOpened: true,
         };
         const session = this._registerClaudeCliSession(summary, { sendInitialHistory: false });
         if (!session) {
@@ -2694,6 +2795,32 @@ class ProxyEngine extends EventEmitter {
             error_code: 'create_failed',
           });
           return;
+        }
+        try {
+          const child = claudeCli.startNativeClaudeWindow({
+            workspacePath: workspace,
+            cliSessionId,
+            resume: false,
+            model: modelId,
+            effort,
+            permissionMode,
+            title: `${workspaceName} - Claude CLI`,
+          });
+          session.nativeCliStartedAt = summary.nativeCliStartedAt;
+          session.nativeCliStatus = 'native_window_opened';
+          session.nativeCliWindowOpened = true;
+          sessionStore.updateSession(session.session_id, {
+            native_cli_started_at: session.nativeCliStartedAt,
+            native_cli_status: session.nativeCliStatus,
+            native_cli_window_opened: true,
+          });
+          this._sendHistorySnapshot(session.session_id, this._claudeCliPendingTranscriptMessages(session), 'claude cli native startup');
+          this._log('info', `[ctrl] opened native Claude CLI window for launch_session ${session.session_id} pid=${child?.pid || 'unknown'} model=${modelId || 'default'}`);
+        } catch (e) {
+          this._log('warn', `[ctrl] launch_session native Claude CLI window failed for ${session.session_id}: ${e.message}`);
+          session.nativeCliStatus = 'native_window_failed';
+          sessionStore.updateSession(session.session_id, { native_cli_status: session.nativeCliStatus });
+          this._sendHistorySnapshot(session.session_id, this._claudeCliPendingTranscriptMessages(session), 'claude cli native startup failed');
         }
         this._broadcastSessionSnapshot();
         this._sendToRelay({
@@ -3404,7 +3531,7 @@ class ProxyEngine extends EventEmitter {
       return { raw, thinking, perm, errorPrompt, config, taskList, contextUsage, rateLimit };
     } finally {
       this._log('info', `[${sessionId}] [${focusTag}] poll attach:end`);
-      if (client) try { await client.close(); } catch {}
+      await this._safeClose(client);
     }
   }
 
@@ -3419,7 +3546,7 @@ class ProxyEngine extends EventEmitter {
       return await work(client);
     } finally {
       this._log('info', `[${session.session_id}] [${focusTag}] client attach:end reason=${reason}`);
-      if (client) try { await client.close(); } catch {}
+      await this._safeClose(client);
     }
   }
 
@@ -3481,13 +3608,15 @@ class ProxyEngine extends EventEmitter {
       await client.Runtime.enable();
       return await work(client);
     } finally {
-      if (client) try { await client.close(); } catch {}
+      await this._safeClose(client);
     }
   }
 
   async _withAntigravitySettingsClient(work) {
     const cdpPort = this.CDP_PORTS[0];
-    const targets = await CDP.List({ port: cdpPort });
+    const targets = await this._withTimeout(
+      CDP.List({ port: cdpPort }), 3000, 'CDP.List for settings page'
+    );
     const settingsPages = targets.filter(t =>
       t.type === 'page' &&
       t.title === 'Settings' &&
@@ -3500,11 +3629,20 @@ class ProxyEngine extends EventEmitter {
 
     let client;
     try {
-      client = await CDP({ port: cdpPort, target: settingsPages[0].id });
-      await client.Runtime.enable();
-      return await work(client);
+      client = await this._withTimeout(
+        CDP({ port: cdpPort, target: settingsPages[0].id }),
+        4000, 'CDP attach settings page'
+      );
+      await this._withTimeout(client.Runtime.enable(), 3000, 'Runtime.enable settings');
+      // Bound the work callback itself — it issues Runtime.evaluate against
+      // the settings page renderer, which can hang indefinitely if that
+      // renderer is wedged. An unbounded await here was previously enough
+      // to freeze the entire proxy poll loop for many minutes.
+      return await this._withTimeout(work(client), 8000, 'antigravity settings work');
     } finally {
-      if (client) try { await client.close(); } catch {}
+      if (client) {
+        try { await this._withTimeout(client.close(), 2000, 'close settings client'); } catch {}
+      }
     }
   }
 
@@ -3594,13 +3732,22 @@ class ProxyEngine extends EventEmitter {
     }
 
     try {
-      const snapshot = await this._withAntigravitySettingsClient(async client => {
-        const refreshResult = await selectors.refreshAntigravityModelQuota(client.Runtime);
-        if (refreshResult?.ok) {
-          await sleep(750);
-        }
-        return selectors.readAntigravityModelQuota(client.Runtime);
-      });
+      const snapshot = await this._withTimeout(
+        this._withAntigravitySettingsClient(async client => {
+          const refreshResult = await this._withTimeout(
+            selectors.refreshAntigravityModelQuota(client.Runtime), 4000, 'refresh quota'
+          );
+          if (refreshResult?.ok) {
+            await sleep(750);
+          }
+          return this._withTimeout(
+            selectors.readAntigravityModelQuota(client.Runtime), 4000, 'read quota'
+          );
+        }),
+        // Outer cap so a hung settings renderer can't wedge the main poll
+        // loop. Inner timeouts protect each step; this is the belt.
+        15000, 'antigravity quota refresh'
+      );
       if (!snapshot || !Array.isArray(snapshot.models) || snapshot.models.length === 0) {
         return false;
       }
@@ -3611,10 +3758,41 @@ class ProxyEngine extends EventEmitter {
     }
   }
 
+  _claudeCliPendingTranscriptMessages(session) {
+    const workspaceName = session.workspace_name || session.workspaceName || 'the selected workspace';
+    const model = session.model_id && session.model_id !== 'default' ? session.model_id : 'Default';
+    const permissionMode = session.permission_mode || 'default';
+    const effort = session.effort || 'medium';
+    const failedNativeWindow = session.nativeCliStatus === 'native_window_failed';
+    const hasNativeWindow = session.nativeCliWindowOpened === true || session.nativeCliStatus === 'native_window_opened';
+    const nativeText = failedNativeWindow
+      ? 'The proxy tried to open a native Claude Code CLI window, but the native launch reported a failure.'
+      : hasNativeWindow
+      ? 'A native Claude Code CLI window was opened for this session.'
+      : 'This Claude Code CLI session does not have a transcript file yet.';
+    return [{
+      role: 'assistant',
+      content: [
+        '**Claude Code CLI is waiting for a native transcript.**',
+        '',
+        nativeText,
+        `Workspace: ${workspaceName}`,
+        `Model: ${model}`,
+        `Permission mode: ${permissionMode}`,
+        `Effort: ${effort}`,
+        '',
+        'If the native cmd window is showing the Claude workspace trust prompt, choose `1. Yes, I trust this folder` and press Enter there. Claude does not write JSONL transcript messages until that startup prompt is completed.',
+        '',
+        'Once Claude creates or updates the transcript file, this placeholder will be replaced with the real CLI chat history.',
+      ].join('\n'),
+      ts: session.nativeCliStartedAt ? Math.floor(new Date(session.nativeCliStartedAt).getTime() / 1000) : undefined,
+    }];
+  }
+
   async _readSessionMessages(session, sessionId) {
     if (session.agentType === 'claude_cli') {
       const messages = session.claudeCliFilePath ? claudeCli.parseClaudeJsonl(session.claudeCliFilePath) : [];
-      return JSON.stringify(messages);
+      return JSON.stringify(messages.length > 0 ? messages : this._claudeCliPendingTranscriptMessages(session));
     }
     if (this._isEphemeralIframeAgent(session.agentType)) {
       return this._withEphemeralIframeClient(session, client =>
@@ -3745,13 +3923,17 @@ class ProxyEngine extends EventEmitter {
       targetId:         null,
       cliSessionId:     summary.cliSessionId,
       claudeCliFilePath: summary.filePath,
+      claudeCliArchiveDiscovered: sessionMeta.claude_cli_archive_discovered === true,
+      nativeCliStartedAt: sessionMeta.native_cli_started_at || summary.nativeCliStartedAt || null,
+      nativeCliStatus:    sessionMeta.native_cli_status || summary.nativeCliStatus || null,
+      nativeCliWindowOpened: sessionMeta.native_cli_window_opened === true || summary.nativeCliWindowOpened === true,
       model_id:         sessionMeta.model_id || 'default',
       effort:           sessionMeta.effort || 'medium',
       permission_mode:  sessionMeta.permission_mode || 'default',
     };
   }
 
-  _registerClaudeCliSession(summary, { sendInitialHistory = true } = {}) {
+  _registerClaudeCliSession(summary, { sendInitialHistory = true, archiveDiscovered = false } = {}) {
     if (!summary?.cliSessionId) return null;
     const displayName = 'Claude Code CLI';
     const sessionMeta = sessionStore.resolveVirtualSession({
@@ -3764,10 +3946,14 @@ class ProxyEngine extends EventEmitter {
       extra: {
         cli_session_id: summary.cliSessionId,
         claude_cli_file_path: summary.filePath,
+        claude_cli_archive_discovered: archiveDiscovered === true,
         chat_title: summary.title || null,
         model_id: summary.model_id || undefined,
         permission_mode: summary.permission_mode || undefined,
         effort: summary.effort || undefined,
+        native_cli_started_at: summary.nativeCliStartedAt || undefined,
+        native_cli_status: summary.nativeCliStatus || undefined,
+        native_cli_window_opened: summary.nativeCliWindowOpened === true || undefined,
       },
     });
     const sessionId = sessionMeta.session_id;
@@ -3778,16 +3964,22 @@ class ProxyEngine extends EventEmitter {
       existing.chat_title = summary.title || existing.chat_title;
       existing.last_seen_at = summary.updatedAt || existing.last_seen_at;
       existing.claudeCliFilePath = summary.filePath || existing.claudeCliFilePath;
+      existing.claudeCliArchiveDiscovered = archiveDiscovered === true;
       existing.cliSessionId = summary.cliSessionId;
       if (summary.model_id) existing.model_id = summary.model_id;
       if (summary.permission_mode) existing.permission_mode = summary.permission_mode;
       if (summary.effort) existing.effort = summary.effort;
-      const sig = this._transcriptSignature(summary.messages || []);
+      if (summary.nativeCliStartedAt) existing.nativeCliStartedAt = summary.nativeCliStartedAt;
+      if (summary.nativeCliStatus) existing.nativeCliStatus = summary.nativeCliStatus;
+      if (summary.nativeCliWindowOpened === true) existing.nativeCliWindowOpened = true;
+      const summaryMessages = summary.messages || [];
+      const effectiveMessages = summaryMessages.length > 0 ? summaryMessages : this._claudeCliPendingTranscriptMessages(existing);
+      const sig = this._transcriptSignature(effectiveMessages);
       if (sig !== existing.lastTranscriptSig) {
         existing.lastTranscriptSig = sig;
-        existing.lastObservedCount = summary.messageCount || 0;
-        existing.lastMessageCount = summary.messageCount || 0;
-        this._sendHistorySnapshot(sessionId, summary.messages || [], 'claude cli file changed');
+        existing.lastObservedCount = effectiveMessages.length;
+        existing.lastMessageCount = effectiveMessages.length;
+        this._sendHistorySnapshot(sessionId, effectiveMessages, 'claude cli file changed');
       }
       return existing;
     }
@@ -3795,8 +3987,12 @@ class ProxyEngine extends EventEmitter {
     const session = this._buildClaudeCliSessionFromSummary(sessionMeta, summary);
     this.sessions.set(sessionId, session);
     this._log('info', `[claude-cli] registered ${sessionId} cli=${summary.cliSessionId} (${summary.messageCount} msgs)`);
-    if (sendInitialHistory && summary.messages?.length) {
-      this._sendHistorySnapshot(sessionId, summary.messages, 'claude cli discovery');
+    if (sendInitialHistory) {
+      const initialMessages = summary.messages?.length ? summary.messages : this._claudeCliPendingTranscriptMessages(session);
+      this._sendHistorySnapshot(sessionId, initialMessages, 'claude cli discovery');
+      session.lastTranscriptSig = this._transcriptSignature(initialMessages);
+      session.lastObservedCount = initialMessages.length;
+      session.lastMessageCount = initialMessages.length;
     }
     const cfg = this._decorateAgentConfig(session, this._mergeAgentConfig('claude_cli', null, session.workspace_path));
     this._sendToRelay(proto.agentConfig(sessionId, { ...cfg, capabilities: this._buildCapabilities('claude_cli') }));
@@ -3804,12 +4000,70 @@ class ProxyEngine extends EventEmitter {
   }
 
   async _discoverClaudeCliSessions() {
+    if (process.env.CLAUDE_CLI_DISCOVER_ARCHIVES !== 'true') {
+      if (!this._claudeCliArchiveDiscoveryLogged) {
+        this._claudeCliArchiveDiscoveryLogged = true;
+        this._log('info', '[claude-cli] archive transcript discovery disabled (set CLAUDE_CLI_DISCOVER_ARCHIVES=true to enable)');
+      }
+      let changed = false;
+      const storedSessions = sessionStore.getAllSessions();
+      for (const sess of storedSessions) {
+        if (sess.agent_type !== 'claude_cli') continue;
+        if (sess.claude_cli_archive_discovered !== true) continue;
+        if (sess.status !== 'healthy') continue;
+        sessionStore.markDisconnected(sess.session_id);
+        changed = true;
+      }
+      for (const [sessionId, session] of this.sessions.entries()) {
+        if (session.agentType !== 'claude_cli') continue;
+        if (session.claudeCliArchiveDiscovered !== true) continue;
+        this.sessions.delete(sessionId);
+        changed = true;
+      }
+      for (const sess of storedSessions) {
+        if (sess.agent_type !== 'claude_cli') continue;
+        if (sess.status !== 'healthy') continue;
+        if (sess.claude_cli_archive_discovered === true) continue;
+        if (!sess.cli_session_id) continue;
+        if (this.sessions.has(sess.session_id)) continue;
+
+        let messages = [];
+        let updatedAt = sess.last_seen_at || new Date().toISOString();
+        const filePath = sess.claude_cli_file_path || null;
+        if (filePath && fs.existsSync(filePath)) {
+          try {
+            messages = claudeCli.parseClaudeJsonl(filePath);
+            updatedAt = fs.statSync(filePath).mtime.toISOString();
+          } catch (e) {
+            this._log('warn', `[claude-cli] failed to restore transcript ${filePath}: ${e.message}`);
+          }
+        }
+
+        const before = this.sessions.size;
+        this._registerClaudeCliSession({
+          cliSessionId: sess.cli_session_id,
+          filePath,
+          workspacePath: sess.workspace_path || process.cwd(),
+          workspaceName: sess.workspace_name || 'Claude CLI',
+          title: sess.chat_title || 'Claude CLI session',
+          messages,
+          messageCount: messages.length,
+          updatedAt,
+          model_id: sess.model_id,
+          permission_mode: sess.permission_mode,
+          effort: sess.effort,
+        }, { archiveDiscovered: false });
+        if (this.sessions.size !== before) changed = true;
+      }
+      if (changed) this._broadcastSessionSnapshot();
+      return;
+    }
     const limit = parseInt(process.env.CLAUDE_CLI_SESSION_LIMIT || '40', 10);
     const summaries = claudeCli.discoverSessions(Number.isFinite(limit) ? limit : 40);
     let changed = false;
     for (const summary of summaries) {
       const before = this.sessions.size;
-      this._registerClaudeCliSession(summary);
+      this._registerClaudeCliSession(summary, { archiveDiscovered: true });
       if (this.sessions.size !== before) changed = true;
     }
     if (changed) this._broadcastSessionSnapshot();
@@ -3817,6 +4071,9 @@ class ProxyEngine extends EventEmitter {
 
   _findClaudeCliSummaryByCliId(cliSessionId) {
     if (!cliSessionId) return null;
+    if (typeof claudeCli.findSessionByCliId === 'function') {
+      return claudeCli.findSessionByCliId(cliSessionId);
+    }
     const summaries = claudeCli.discoverSessions(parseInt(process.env.CLAUDE_CLI_SESSION_LIMIT || '80', 10));
     return summaries.find(s => s.cliSessionId === cliSessionId) || null;
   }
@@ -3845,37 +4102,63 @@ class ProxyEngine extends EventEmitter {
       },
       onExit: (code, err) => {
         if (session._claudeCliChild === child) session._claudeCliChild = null;
-        const summary = this._findClaudeCliSummaryByCliId(cliSessionId);
-        if (summary) {
-          session.claudeCliFilePath = summary.filePath;
-          session.workspace_path = summary.workspacePath || session.workspace_path;
-          session.workspace_name = summary.workspaceName || session.workspace_name;
-          session.chat_title = summary.title || session.chat_title;
-          this._registerClaudeCliSession(summary, { sendInitialHistory: false });
-          this._sendHistorySnapshot(sessionId, summary.messages || [], 'claude cli send complete');
-          session.lastMessageCount = summary.messageCount || 0;
-          session.lastObservedCount = summary.messageCount || 0;
-          session.lastTranscriptSig = this._transcriptSignature(summary.messages || []);
-        }
-        const activity = {
-          kind: 'idle',
-          label: code === 0 ? '' : 'Claude CLI failed',
-          updated_at: new Date().toISOString(),
-        };
-        session.activity = activity;
-        session.waitingForAssistant = false;
-        sessionStore.updateSession(sessionId, {
-          activity,
-          workspace_path: session.workspace_path || null,
-          workspace_name: session.workspace_name || null,
-          cli_session_id: cliSessionId,
-          claude_cli_file_path: session.claudeCliFilePath || null,
+        (async () => {
+          let summary = this._findClaudeCliSummaryByCliId(cliSessionId);
+          for (let attempt = 0; code === 0 && !summary && attempt < 8; attempt++) {
+            await new Promise(resolve => setTimeout(resolve, 250));
+            summary = this._findClaudeCliSummaryByCliId(cliSessionId);
+          }
+          if (summary) {
+            session.claudeCliFilePath = summary.filePath;
+            session.workspace_path = summary.workspacePath || session.workspace_path;
+            session.workspace_name = summary.workspaceName || session.workspace_name;
+            session.chat_title = summary.title || session.chat_title;
+            session.claudeCliArchiveDiscovered = false;
+            this._registerClaudeCliSession(summary, { sendInitialHistory: false });
+            const effectiveMessages = summary.messages?.length ? summary.messages : this._claudeCliPendingTranscriptMessages(session);
+            this._sendHistorySnapshot(sessionId, effectiveMessages, 'claude cli send complete');
+            session.lastMessageCount = effectiveMessages.length;
+            session.lastObservedCount = effectiveMessages.length;
+            session.lastTranscriptSig = this._transcriptSignature(effectiveMessages);
+          }
+          if (!summary && (code !== 0 || err)) {
+            const stderr = stderrChunks.join('').trim();
+            const detail = stderr || err?.message || `Claude CLI exited with code ${code}`;
+            this._sendToRelay(proto.proxyMessage(
+              sessionId,
+              'assistant',
+              `Claude CLI failed to start or complete the request.\n\n${detail}`
+            ));
+          } else if (!summary) {
+            this._sendToRelay(proto.proxyMessage(
+              sessionId,
+              'assistant',
+              'Claude CLI exited without producing a transcript file for this session.'
+            ));
+          }
+          const activity = {
+            kind: 'idle',
+            label: code === 0 && summary ? '' : 'Claude CLI failed',
+            updated_at: new Date().toISOString(),
+          };
+          session.activity = activity;
+          session.waitingForAssistant = false;
+          sessionStore.updateSession(sessionId, {
+            activity,
+            workspace_path: session.workspace_path || null,
+            workspace_name: session.workspace_name || null,
+            cli_session_id: cliSessionId,
+            claude_cli_file_path: session.claudeCliFilePath || null,
+            claude_cli_archive_discovered: false,
+          });
+          this._sendToRelay(proto.proxyStatus(sessionId, session.status || 'healthy', activity));
+          if (code !== 0 || err) {
+            this._log('warn', `[claude-cli] send exited code=${code} err=${err?.message || ''} stderr=${stderrChunks.join('').slice(0, 500)}`);
+          }
+          this._broadcastSessionSnapshot();
+        })().catch(exitErr => {
+          this._log('warn', `[claude-cli] send exit handler failed: ${exitErr.message}`);
         });
-        this._sendToRelay(proto.proxyStatus(sessionId, session.status || 'healthy', activity));
-        if (code !== 0 || err) {
-          this._log('warn', `[claude-cli] send exited code=${code} err=${err?.message || ''} stderr=${stderrChunks.join('').slice(0, 500)}`);
-        }
-        this._broadcastSessionSnapshot();
       },
     });
     session._claudeCliChild = child;
@@ -3883,15 +4166,39 @@ class ProxyEngine extends EventEmitter {
   }
 
   async _pollSessionClaudeCli(sessionId, session) {
-    if (session.claudeCliFilePath) {
-      const messages = claudeCli.parseClaudeJsonl(session.claudeCliFilePath);
-      const sig = this._transcriptSignature(messages);
-      if (sig !== session.lastTranscriptSig) {
-        session.lastTranscriptSig = sig;
-        session.lastObservedCount = messages.length;
-        session.lastMessageCount = messages.length;
-        this._sendHistorySnapshot(sessionId, messages, 'claude cli poll');
+    const now = Date.now();
+    const shouldLookupTranscript = !session._lastClaudeCliTranscriptLookupAt
+      || now - session._lastClaudeCliTranscriptLookupAt >= 10000;
+    if (!session.claudeCliFilePath && session.cliSessionId && shouldLookupTranscript) {
+      session._lastClaudeCliTranscriptLookupAt = now;
+      const summary = this._findClaudeCliSummaryByCliId(session.cliSessionId);
+      if (summary?.filePath) {
+        session.claudeCliFilePath = summary.filePath;
+        session.workspace_path = summary.workspacePath || session.workspace_path;
+        session.workspace_name = summary.workspaceName || session.workspace_name;
+        session.chat_title = summary.title || session.chat_title;
+        session.claudeCliArchiveDiscovered = false;
+        sessionStore.updateSession(sessionId, {
+          workspace_path: session.workspace_path || null,
+          workspace_name: session.workspace_name || null,
+          claude_cli_file_path: session.claudeCliFilePath,
+          claude_cli_archive_discovered: false,
+          chat_title: session.chat_title || null,
+        });
       }
+    }
+    const messages = session.claudeCliFilePath ? claudeCli.parseClaudeJsonl(session.claudeCliFilePath) : [];
+    const effectiveMessages = messages.length > 0 ? messages : this._claudeCliPendingTranscriptMessages(session);
+    const sig = this._transcriptSignature(effectiveMessages);
+    if (sig !== session.lastTranscriptSig) {
+      session.lastTranscriptSig = sig;
+      session.lastObservedCount = effectiveMessages.length;
+      session.lastMessageCount = effectiveMessages.length;
+      this._sendHistorySnapshot(
+        sessionId,
+        effectiveMessages,
+        messages.length > 0 ? 'claude cli poll' : 'claude cli pending transcript'
+      );
     }
     const kind = session._claudeCliChild ? 'generating' : 'idle';
     const label = session._claudeCliChild ? 'Claude CLI running' : '';
@@ -3919,7 +4226,7 @@ class ProxyEngine extends EventEmitter {
       if (session.nullPollCount >= 15) {
         this._log('warn', `[${sessionId}] 15 consecutive Continue poll failures — removing session for re-discovery`);
         sessionStore.markDisconnected(sessionId);
-        if (session.client) try { await session.client.close(); } catch {}
+        await this._safeClose(session.client);
         this.sessions.delete(sessionId);
         this.activePermissionPrompts.delete(sessionId);
         this.activeErrorPrompts.delete(sessionId);
@@ -3954,7 +4261,7 @@ class ProxyEngine extends EventEmitter {
       if (session.nullPollCount >= 15) {
         this._log('warn', `[${sessionId}] 15 null — removing session for re-discovery`);
         sessionStore.markDisconnected(sessionId);
-        if (session.client) try { await session.client.close(); } catch {}
+        await this._safeClose(session.client);
         this.sessions.delete(sessionId);
         this.activePermissionPrompts.delete(sessionId);
         this.activeErrorPrompts.delete(sessionId);
@@ -4236,7 +4543,7 @@ class ProxyEngine extends EventEmitter {
       if (session.nullPollCount >= 15) {
         this._log('warn', `[${sessionId}] 15 consecutive Claude poll failures - removing session for re-discovery`);
         sessionStore.markDisconnected(sessionId);
-        if (session.client) try { await session.client.close(); } catch {}
+        await this._safeClose(session.client);
         this.sessions.delete(sessionId);
         this.activePermissionPrompts.delete(sessionId);
         this.activeErrorPrompts.delete(sessionId);
@@ -4262,7 +4569,7 @@ class ProxyEngine extends EventEmitter {
       if (session.nullPollCount >= 15) {
         this._log('warn', `[${sessionId}] 15 null - removing session for re-discovery`);
         sessionStore.markDisconnected(sessionId);
-        if (session.client) try { await session.client.close(); } catch {}
+        await this._safeClose(session.client);
         this.sessions.delete(sessionId);
         this.activePermissionPrompts.delete(sessionId);
         this.activeErrorPrompts.delete(sessionId);
@@ -4466,12 +4773,18 @@ class ProxyEngine extends EventEmitter {
       // by early returns in null-read or pending-stabilisation paths
       if (session.agentType === 'codex' || session.agentType === 'codex-desktop') {
         const codexAuxBusy = session.activity?.kind === 'generating' || session.activity?.kind === 'thinking';
+        if (codexAuxBusy) session._lastBusyAt = Date.now();
+        // Task lists / native queues / automation views only meaningfully
+        // change while the agent is working. Gate aux polls to busy + a
+        // 30s grace window (catches the final state after generation ends).
+        const auxRelevant = codexAuxBusy ||
+          (session._lastBusyAt && Date.now() - session._lastBusyAt < 30000);
         const taskListPollEvery = session.agentType === 'codex-desktop' ? 30 : 15;
         if (session._taskListPollCount === undefined) {
           session._taskListPollCount = staggerOffset(sessionId, 'taskList', taskListPollEvery);
         }
         session._taskListPollCount += 1;
-        if (!codexAuxBusy && !session._taskListPollInProgress && session._taskListPollCount >= taskListPollEvery) {
+        if (auxRelevant && !session._taskListPollInProgress && session._taskListPollCount >= taskListPollEvery) {
           session._taskListPollCount = 0;
           session._taskListPollInProgress = true;
           const usePageEval = session.agentType === 'codex-desktop';
@@ -4488,11 +4801,13 @@ class ProxyEngine extends EventEmitter {
               this._sendToRelay(proto.proxyStatus(sessionId, session.status || 'healthy', session.activity));
             }
           };
-          const taskPromise = selectors.readCodexTaskList(session.client.Runtime, usePageEval)
+          // Fire-and-forget for all codex variants — previously codex-desktop
+          // serialised this with the rest of the poll, blocking readMessages
+          // behind a slow DOM walk.
+          selectors.readCodexTaskList(session.client.Runtime, usePageEval)
             .then(handleTaskList)
             .catch(e => { this._log('warn', `[${sessionId}] task_list error: ${e.message}`); })
             .finally(() => { session._taskListPollInProgress = false; });
-          if (session.agentType === 'codex-desktop') await taskPromise;
         }
       }
 
@@ -4512,7 +4827,7 @@ class ProxyEngine extends EventEmitter {
         if (session.nullPollCount >= 15) {
           this._log('warn', `[${sessionId}] 15s null — closing CDP client to force re-discovery`);
           sessionStore.markDisconnected(sessionId);
-          try { await session.client.close(); } catch {}
+          await this._safeClose(session.client);
           this.sessions.delete(sessionId);
           this._broadcastSessionSnapshot();
         }
@@ -5011,8 +5326,23 @@ class ProxyEngine extends EventEmitter {
       session.lastTranscriptSig = transcriptSig;
       session.resyncCandidateSig = null;
 
-      // Thinking / activity state
-      const ts     = await selectors.detectThinking(session.client.Runtime, session.agentType);
+      // Thinking / activity state. For Codex surfaces, reuse the cached
+      // detection when the conversation DOM signature is unchanged from
+      // the previous poll — detectThinking does a heavy DOM walk that
+      // saturates the renderer's main thread and is the largest remaining
+      // contributor to Codex wedging on idle sessions.
+      let ts;
+      if (this._isCodexSurface(session.agentType)) {
+        const cachedTs = selectors.getCodexCachedThinking(sessionId);
+        if (cachedTs) {
+          ts = cachedTs;
+        } else {
+          ts = await selectors.detectThinking(session.client.Runtime, session.agentType);
+          selectors.setCodexCachedThinking(sessionId, ts);
+        }
+      } else {
+        ts = await selectors.detectThinking(session.client.Runtime, session.agentType);
+      }
       const active = session.pendingLast !== null || session.waitingForAssistant;
       const kind   = ts.thinking ? 'thinking' : active ? 'generating' : 'idle';
       const label  = ts.label || (active ? 'Generating' : '');
@@ -5157,11 +5487,14 @@ class ProxyEngine extends EventEmitter {
         }
         session._nativeQueuePollCount += 1;
         const codexAuxBusy = session.activity?.kind === 'generating' || session.activity?.kind === 'thinking';
-        if (!codexAuxBusy && !session._nativeQueuePollInProgress && session._nativeQueuePollCount >= nativeQueuePollEvery) {
+        if (codexAuxBusy) session._lastBusyAt = Date.now();
+        const auxRelevant = codexAuxBusy ||
+          (session._lastBusyAt && Date.now() - session._lastBusyAt < 30000);
+        if (auxRelevant && !session._nativeQueuePollInProgress && session._nativeQueuePollCount >= nativeQueuePollEvery) {
           session._nativeQueuePollCount = 0;
           session._nativeQueuePollInProgress = true;
           const usePageEval = session.agentType === 'codex-desktop';
-          const nativeQueuePromise = selectors.readCodexNativeQueue(session.client.Runtime, usePageEval).then(items => {
+          selectors.readCodexNativeQueue(session.client.Runtime, usePageEval).then(items => {
             const sig = items.map(i => i.text).join('|');
             const changed = sig !== (session._nativeQueueSig || '');
             // Always re-send every ~10 polls (~30s) so new browsers pick it up
@@ -5178,7 +5511,8 @@ class ProxyEngine extends EventEmitter {
             }
           }).catch((e) => { this._log('warn', `[${sessionId}] [native-queue] Error: ${e.message}`); })
             .finally(() => { session._nativeQueuePollInProgress = false; });
-          if (session.agentType === 'codex-desktop') await nativeQueuePromise;
+          // Fire-and-forget — previously codex-desktop awaited this and the
+          // task list serially, stacking ~6s of CDP eval per poll on long sessions.
         }
       }
 
@@ -5188,7 +5522,10 @@ class ProxyEngine extends EventEmitter {
         }
         session._automationViewPollCount += 1;
         const codexAuxBusy = session.activity?.kind === 'generating' || session.activity?.kind === 'thinking';
-        if (!codexAuxBusy && session._automationViewPollCount >= 30) {
+        if (codexAuxBusy) session._lastBusyAt = Date.now();
+        const auxRelevant = codexAuxBusy ||
+          (session._lastBusyAt && Date.now() - session._lastBusyAt < 30000);
+        if (auxRelevant && session._automationViewPollCount >= 30) {
           session._automationViewPollCount = 0;
           try {
             const view = await selectors.readCodexAutomationView(session.client.Runtime, true);
@@ -5259,7 +5596,7 @@ class ProxyEngine extends EventEmitter {
         this._cooldownCdpTarget(session, e.message, 30000);
       }
       sessionStore.markDisconnected(sessionId);
-      try { await session.client?.close(); } catch {}
+      await this._safeClose(session.client, `poll close ${sessionId.substring(0,8)}`);
       this.sessions.delete(sessionId);
       this._broadcastSessionSnapshot();
     } finally {
@@ -5332,7 +5669,7 @@ class ProxyEngine extends EventEmitter {
     } catch (e) {
       this._log('warn', `[${sessionId}] [perm] ${e.message}`);
       if (!this._isEphemeralIframeAgent(session.agentType)) {
-        try { await session.client?.close(); } catch {}
+        await this._safeClose(session.client, `perm close ${sessionId.substring(0,8)}`);
         sessionStore.markDisconnected(sessionId);
         this.sessions.delete(sessionId);
         this._broadcastSessionSnapshot();
@@ -5915,7 +6252,7 @@ class ProxyEngine extends EventEmitter {
         const agentType = await this._withTimeout(selectors.detectAgentType(client.Runtime, ext), 3000, `agent detect ${target.id.substring(0, 8)}`);
         if (!agentType) {
           this._log('info', `[discover] ${target.id.substring(0, 8)}: detectAgentType=null, skipping`);
-          await client.close();
+          await this._safeClose(client);
           continue;
         }
 
@@ -5950,7 +6287,7 @@ class ProxyEngine extends EventEmitter {
 
         if (this.sessions.has(sessionId)) {
           this._log('info', `[discover] Session ${sessionId} already active, skipping duplicate target`);
-          await client.close();
+          await this._safeClose(client);
           continue;
         }
 
@@ -5961,7 +6298,7 @@ class ProxyEngine extends EventEmitter {
               !currentTargetIds.has(staleSession.targetId)) {
             this._log('info', `[discover] Evicting stale session ${staleSid} — target ${staleSession.targetId?.substring(0,8)} no longer in CDP list`);
             sessionStore.markDisconnected(staleSid);
-            try { await staleSession.client.close(); } catch {}
+            await this._safeClose(staleSession.client);
             this.sessions.delete(staleSid);
             this.activePermissionPrompts.delete(staleSid);
             this.activeErrorPrompts.delete(staleSid);
@@ -6094,7 +6431,7 @@ class ProxyEngine extends EventEmitter {
         // Claude keeps its persistent client (focus-stealing was caused by
         // active-frame access, now fixed via cached contextId + passive watcher).
         if (agentType === 'continue' || agentType === 'continue_yolo') {
-          try { await client.close(); } catch {}
+          await this._safeClose(client);
           client = null;
           const ephemeralSession = this.sessions.get(sessionId);
           if (ephemeralSession) ephemeralSession.client = null;
@@ -6173,7 +6510,7 @@ class ProxyEngine extends EventEmitter {
         this._broadcastSessionSnapshot();
 
       } catch (e) {
-        if (client) try { await client.close(); } catch {}
+        await this._safeClose(client);
         if (String(e.message || '').includes('timed out')) this._cooldownCdpTarget(target, e.message, 30000);
         this._log('error', `[cdp] Failed to probe ${target.id.substring(0, 8)}: ${e.message}`);
       }
@@ -6217,7 +6554,7 @@ class ProxyEngine extends EventEmitter {
 
         if (this.sessions.has(sessionId)) {
           this._log('info', `[discover] Antigravity session ${sessionId} already active, skipping`);
-          await client.close();
+          await this._safeClose(client);
           continue;
         }
 
@@ -6280,7 +6617,7 @@ class ProxyEngine extends EventEmitter {
         this._broadcastSessionSnapshot();
 
       } catch (e) {
-        if (client) try { await client.close(); } catch {}
+        await this._safeClose(client);
         if (String(e.message || '').includes('timed out')) this._cooldownCdpTarget(target, e.message, 30000);
         this._log('error', `[cdp] Failed to probe Antigravity Manager ${target.id.substring(0, 8)}: ${e.message}`);
       }
@@ -6356,7 +6693,7 @@ class ProxyEngine extends EventEmitter {
         const sessionId = sessionMeta.session_id;
 
         if (this.sessions.has(sessionId)) {
-          await client.close();
+          await this._safeClose(client);
           continue;
         }
 
@@ -6425,7 +6762,7 @@ class ProxyEngine extends EventEmitter {
         this._broadcastSessionSnapshot();
 
       } catch (e) {
-        if (client) try { await client.close(); } catch {}
+        await this._safeClose(client);
         if (String(e.message || '').includes('timed out')) this._cooldownCdpTarget(target, e.message, 30000);
         this._log('error', `[cdp] Failed to probe Antigravity side-panel ${target.id.substring(0, 8)}: ${e.message}`);
       }
@@ -6460,7 +6797,7 @@ class ProxyEngine extends EventEmitter {
 
         if (this.sessions.has(sessionId)) {
           this._log('info', `[discover] ${agentType} session ${sessionId} already active, skipping`);
-          await client.close();
+          await this._safeClose(client);
           continue;
         }
 
@@ -6526,7 +6863,7 @@ class ProxyEngine extends EventEmitter {
         this._broadcastSessionSnapshot();
 
       } catch (e) {
-        if (client) try { await client.close(); } catch {}
+        await this._safeClose(client);
         if (String(e.message || '').includes('timed out')) this._cooldownCdpTarget(target, e.message, 30000);
         this._log('error', `[cdp] Failed to probe ${agentType} target ${target.id.substring(0, 8)}: ${e.message}`);
       }
@@ -6579,11 +6916,24 @@ class ProxyEngine extends EventEmitter {
       try {
       tick++;
 
-      if (tick % 10 === 0) await this._discoverTargets();
-      if (tick % 30 === 0) await this._discoverClaudeCliSessions();
+      // Top-level caps on discovery and quota refresh so a single hung
+      // CDP renderer can never freeze the entire poll loop. Each function
+      // already has internal per-step timeouts; these are belt-and-braces.
+      if (tick % 10 === 0) {
+        try {
+          await this._withTimeout(this._discoverTargets(), 30000, 'tick discoverTargets');
+        } catch (e) { this._log('warn', `[poll] discoverTargets: ${e.message}`); }
+      }
+      if (tick % 30 === 0) {
+        try {
+          await this._withTimeout(this._discoverClaudeCliSessions(), 10000, 'tick discoverClaudeCli');
+        } catch (e) { this._log('warn', `[poll] discoverClaudeCli: ${e.message}`); }
+      }
 
       if (tick % 30 === 0 && this.sessions.size > 0) {
-        await this._refreshAntigravityQuotaUsage();
+        try {
+          await this._refreshAntigravityQuotaUsage();
+        } catch (e) { this._log('warn', `[poll] refreshAntigravityQuota: ${e.message}`); }
         for (const [id, s] of this.sessions.entries()) {
           this._log('info', `[status] ${id} (${s.agentType}): ${s.lastMessageCount} msgs, relay ${this.relayReady ? 'up' : 'down'}, status=${s.status}`);
         }
@@ -6626,9 +6976,18 @@ class ProxyEngine extends EventEmitter {
         // when actively generating.
         if (session.agentType === 'codex-desktop' || session.agentType === 'claude-desktop') {
           const isActive = session.activity?.kind === 'generating' || session.activity?.kind === 'thinking';
-          const threshold = session.agentType === 'codex-desktop'
+          let threshold = session.agentType === 'codex-desktop'
             ? (isActive ? 2 : 6)
             : (isActive ? 1 : 3);
+          // Adaptive idle backoff: when the cheap dirty-check on Codex
+          // messages has hit many polls in a row, the session is genuinely
+          // idle. Stretch the polling interval (3s → ~10s+) to free the
+          // renderer's main thread completely.
+          if (!isActive && session.agentType === 'codex-desktop') {
+            const cacheStats = selectors.getCodexReadCacheStats(sessionId);
+            if (cacheStats.hits > 20) threshold = Math.max(threshold, 18);
+            else if (cacheStats.hits > 5) threshold = Math.max(threshold, 12);
+          }
           if (!isActive) {
             session._desktopIdlePollCount = (session._desktopIdlePollCount || 0) + 1;
             if (session._desktopIdlePollCount < threshold) continue;
@@ -6641,7 +7000,12 @@ class ProxyEngine extends EventEmitter {
         }
         if (session.agentType === 'codex') {
           const isActive = session.activity?.kind === 'generating' || session.activity?.kind === 'thinking';
-          const threshold = isActive ? 3 : 8;
+          let threshold = isActive ? 3 : 8;
+          if (!isActive) {
+            const cacheStats = selectors.getCodexReadCacheStats(sessionId);
+            if (cacheStats.hits > 20) threshold = Math.max(threshold, 24);
+            else if (cacheStats.hits > 5) threshold = Math.max(threshold, 16);
+          }
           session._codexPollCount = (session._codexPollCount || 0) + 1;
           if (session._codexPollCount < threshold) continue;
           session._codexPollCount = 0;
