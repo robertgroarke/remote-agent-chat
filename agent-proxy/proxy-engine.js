@@ -27,6 +27,7 @@ const proto        = require('./protocol');
 const sessionStore = require('./session-store');
 const launchers    = require('./launchers');
 const claudeCli    = require('./claude-cli');
+const codexCli     = require('./codex-cli');
 
 function sleep(ms) { return new Promise(r => setTimeout(r, ms)); }
 
@@ -303,28 +304,29 @@ class ProxyEngine extends EventEmitter {
     const isCodex   = agentType === 'codex' || agentType === 'codex-desktop';
     const isClaude  = agentType === 'claude' || agentType === 'claude-desktop';
     const isClaudeCli = agentType === 'claude_cli';
+    const isCodexCli = agentType === 'codex_cli';
     const isDesktop = agentType === 'codex-desktop' || agentType === 'claude-desktop';
     const isContinue = agentType === 'continue' || agentType === 'continue_yolo';
     const isRooCode = agentType === 'roo_code';
     const isClineLike = isRooCode || agentType === 'cline';
     return {
-      interrupt:              ['claude', 'claude_cli', 'codex', 'gemini', 'continue', 'continue_yolo', 'antigravity', 'antigravity_panel', 'claude-desktop', 'codex-desktop', 'roo_code', 'cline'].includes(agentType),
-      set_model:              ['claude', 'claude_cli', 'antigravity', 'antigravity_panel', 'gemini', 'continue', 'continue_yolo'].includes(agentType) || isClineLike,
+      interrupt:              ['claude', 'claude_cli', 'codex_cli', 'codex', 'gemini', 'continue', 'continue_yolo', 'antigravity', 'antigravity_panel', 'claude-desktop', 'codex-desktop', 'roo_code', 'cline'].includes(agentType),
+      set_model:              ['claude', 'claude_cli', 'codex_cli', 'antigravity', 'antigravity_panel', 'gemini', 'continue', 'continue_yolo'].includes(agentType) || isClineLike,
       set_mode:               agentType === 'antigravity' || isClineLike,
-      permission_mode_change: agentType === 'claude' || agentType === 'claude_cli' || agentType === 'continue_yolo' || isRooCode,
+      permission_mode_change: agentType === 'claude' || isClaudeCli || isCodexCli || agentType === 'continue_yolo' || isRooCode,
       auto_approve_permissions_toggle: agentType === 'continue' || agentType === 'continue_yolo' || agentType === 'antigravity_panel',
-      permission_dialogs:     isClaude || isClaudeCli || isCodex || agentType === 'antigravity' || agentType === 'antigravity_panel' || isContinue || isClineLike,
+      permission_dialogs:     isClaude || isClaudeCli || isCodexCli || isCodex || agentType === 'antigravity' || agentType === 'antigravity_panel' || isContinue || isClineLike,
       set_codex_config:       isCodex,
-      set_effort:             isClaudeCli,
+      set_effort:             isClaudeCli || isCodexCli,
       new_thread:             isDesktop,
       thread_list:            isDesktop,
       switch_thread:          isDesktop,
       switch_workspace:       isDesktop,
-      native_window:          isClaudeCli,
+      native_window:          isClaudeCli || isCodexCli,
       open_panel:             false, // Codex side pane is already open if session exists
       chat_list:              agentType === 'codex' || agentType === 'continue' || agentType === 'antigravity_panel' || agentType === 'claude-desktop' || isClineLike,
       switch_chat:            agentType === 'codex' || agentType === 'continue' || agentType === 'antigravity_panel' || agentType === 'claude-desktop' || isClineLike,
-      new_chat:               agentType === 'codex' || agentType === 'continue_yolo' || agentType === 'antigravity_panel' || agentType === 'claude-desktop' || agentType === 'claude' || agentType === 'claude_cli' || isClineLike,
+      new_chat:               agentType === 'codex' || agentType === 'continue_yolo' || agentType === 'antigravity_panel' || agentType === 'claude-desktop' || agentType === 'claude' || isClaudeCli || isCodexCli || isClineLike,
       terminal_output:        isCodex || agentType === 'claude-desktop',
       terminal_input:         agentType === 'codex-desktop',
       file_changes:           isCodex || agentType === 'claude-desktop',
@@ -453,6 +455,18 @@ class ProxyEngine extends EventEmitter {
         available_models:  claudeCli.CLAUDE_CLI_MODELS,
         available_efforts: claudeCli.CLAUDE_CLI_EFFORTS,
         available_permission_modes: claudeCli.CLAUDE_CLI_PERMISSION_MODES,
+        branch:            branch || 'unknown',
+      };
+    }
+    if (agentType === 'codex_cli') {
+      return {
+        model_id:          domCfg?.model_id || 'gpt-5.5',
+        permission_mode:   domCfg?.permission_mode || domCfg?.access_mode || 'workspace-write',
+        effort:            domCfg?.effort || 'medium',
+        file_access_scope: workspacePath || domCfg?.file_access_scope || 'unknown',
+        available_models:  codexCli.CODEX_CLI_MODELS,
+        available_efforts: codexCli.CODEX_CLI_EFFORTS,
+        available_permission_modes: codexCli.CODEX_CLI_ACCESS_MODES,
         branch:            branch || 'unknown',
       };
     }
@@ -872,7 +886,8 @@ class ProxyEngine extends EventEmitter {
     return agentType === 'antigravity_panel'
       || agentType === 'antigravity'
       || agentType === 'claude'
-      || agentType === 'codex';
+      || agentType === 'codex'
+      || agentType === 'codex-desktop';
   }
 
   _shouldResetAccumulatorOnNoOverlap(agentType) {
@@ -887,7 +902,12 @@ class ProxyEngine extends EventEmitter {
     if (!options.force && session._lastAccumulatedPersistAt && now - session._lastAccumulatedPersistAt < minIntervalMs) {
       return;
     }
-    sessionStore.updateSession(sessionId, { accumulated_messages: session._accumulatedMessages });
+    const updates = { accumulated_messages: session._accumulatedMessages };
+    if (session.agentType === 'codex-desktop') {
+      updates.codex_desktop_active_thread_key = session._activeThreadKey || null;
+      updates.codex_desktop_active_thread_title = session._activeThreadTitle || null;
+    }
+    sessionStore.updateSession(sessionId, updates);
     session._accumulatedDirty = false;
     session._lastAccumulatedPersistAt = now;
   }
@@ -975,6 +995,42 @@ class ProxyEngine extends EventEmitter {
     session.resyncCandidateSig = null;
     session.waitingForAssistant = false;
     session._forceHistoryResync = reason || 'transcript reset';
+  }
+
+  _applyCodexDesktopThreadList(sessionId, session, threads) {
+    if (!session || session.agentType !== 'codex-desktop' || !Array.isArray(threads) || threads.length === 0) return;
+
+    const threadListSig = JSON.stringify(threads.map(t => `${t.id || ''}:${t.title || ''}:${!!t.active}:${t.age || ''}`));
+    if (threadListSig !== session._lastThreadListSig) {
+      session._lastThreadListSig = threadListSig;
+      this._sendToRelay(proto.threadList(sessionId, threads));
+    }
+
+    const activeThread = threads.find(t => t && t.active);
+    const activeThreadKey = activeThread ? `${activeThread.id || ''}:${activeThread.title || ''}` : '';
+    const previousThreadKey = session._activeThreadKey || session.codexDesktopActiveThreadKey || session.codex_desktop_active_thread_key || '';
+    if (activeThreadKey && previousThreadKey && activeThreadKey !== previousThreadKey) {
+      this._log('info', `[${sessionId}] Codex Desktop active thread changed; resetting transcript accumulator`);
+      this._resetTranscriptState(session, 'codex-desktop active thread change');
+      sessionStore.updateSession(sessionId, {
+        accumulated_messages: null,
+        codex_desktop_active_thread_key: activeThreadKey,
+        codex_desktop_active_thread_title: activeThread?.title || null,
+      });
+      session._codexDesktopArchiveMessages = null;
+      session._codexDesktopArchivePath = null;
+      session._codexDesktopArchiveUpdatedAt = null;
+      session._lastStreamedContent = null;
+    }
+    if (activeThreadKey) {
+      session._activeThreadKey = activeThreadKey;
+      session._activeThreadTitle = activeThread?.title || session._activeThreadTitle || null;
+      session.codexDesktopActiveThreadKey = activeThreadKey;
+      sessionStore.updateSession(sessionId, {
+        codex_desktop_active_thread_key: activeThreadKey,
+        codex_desktop_active_thread_title: session._activeThreadTitle || null,
+      });
+    }
   }
 
   // ─── Reconnect backoff ───────────────────────────────────────────────────
@@ -1290,10 +1346,11 @@ class ProxyEngine extends EventEmitter {
       }
 
       this._log('info', `[ctrl] agent_interrupt for ${sid} (${sessionData.agentType})`);
-      if (sessionData.agentType === 'claude_cli') {
-        if (sessionData._claudeCliChild) {
-          try { sessionData._claudeCliChild.kill(); } catch {}
-          sessionData._claudeCliChild = null;
+      if (sessionData.agentType === 'claude_cli' || sessionData.agentType === 'codex_cli') {
+        const childKey = sessionData.agentType === 'codex_cli' ? '_codexCliChild' : '_claudeCliChild';
+        if (sessionData[childKey]) {
+          try { sessionData[childKey].kill(); } catch {}
+          sessionData[childKey] = null;
         }
         const activity = { kind: 'idle', label: 'Interrupted', updated_at: new Date().toISOString() };
         sessionData.activity = activity;
@@ -1432,6 +1489,65 @@ class ProxyEngine extends EventEmitter {
         return;
       }
       this._log('info', `[ctrl] error_prompt_action for ${sid} action=${msg.action_id}`);
+      if (sessionData.agentType === 'claude_cli') {
+        if (msg.action_id === 'open_native_window') {
+          try {
+            const child = claudeCli.startNativeClaudeWindow({
+              workspacePath: sessionData.workspace_path || process.cwd(),
+              cliSessionId: sessionData.cliSessionId || crypto.randomUUID(),
+              resume: !!sessionData.claudeCliFilePath,
+              model: sessionData.model_id,
+              effort: sessionData.effort,
+              permissionMode: sessionData.permission_mode,
+              title: `${sessionData.workspace_name || 'Claude Code'} - Claude CLI`,
+            });
+            this._log('info', `[ctrl] reopened native Claude CLI window for ${sid} pid=${child?.pid || 'unknown'}`);
+            this._sendToRelay(proto.agentControlResult(sid, msg.request_id, 'error_prompt_action', 'ok'));
+          } catch (e) {
+            this._sendToRelay(proto.agentControlResult(sid, msg.request_id, 'error_prompt_action', 'failed', {
+              code: 'spawn_failed', message: e.message,
+            }));
+          }
+          return;
+        }
+        if (msg.action_id === 'trust_workspace') {
+          claudeCli.trustWorkspace({
+            workspacePath: sessionData.workspace_path || process.cwd(),
+            model: sessionData.model_id,
+            effort: sessionData.effort,
+            permissionMode: sessionData.permission_mode,
+          }).then(result => {
+            if (!result.ok) {
+              this._sendToRelay(proto.agentControlResult(sid, msg.request_id, 'error_prompt_action', 'failed', {
+                code: 'trust_failed', message: result.detail || 'Claude CLI trust helper failed',
+              }));
+              return;
+            }
+            try {
+              const child = claudeCli.startNativeClaudeWindow({
+                workspacePath: sessionData.workspace_path || process.cwd(),
+                cliSessionId: sessionData.cliSessionId || crypto.randomUUID(),
+                resume: !!sessionData.claudeCliFilePath,
+                model: sessionData.model_id,
+                effort: sessionData.effort,
+                permissionMode: sessionData.permission_mode,
+                title: `${sessionData.workspace_name || 'Claude Code'} - Claude CLI`,
+              });
+              this._log('info', `[ctrl] trusted workspace and reopened native Claude CLI window for ${sid} pid=${child?.pid || 'unknown'}`);
+              this._sendToRelay(proto.agentControlResult(sid, msg.request_id, 'error_prompt_action', 'ok'));
+            } catch (e) {
+              this._sendToRelay(proto.agentControlResult(sid, msg.request_id, 'error_prompt_action', 'failed', {
+                code: 'spawn_failed', message: e.message,
+              }));
+            }
+          }).catch(e => {
+            this._sendToRelay(proto.agentControlResult(sid, msg.request_id, 'error_prompt_action', 'failed', {
+              code: 'exception', message: e.message,
+            }));
+          });
+          return;
+        }
+      }
       const actionPromise = this._isEphemeralIframeAgent(sessionData.agentType)
         ? this._withEphemeralIframeClient(sessionData, client =>
             selectors.respondToSessionErrorPrompt(client.Runtime, sessionData.agentType, msg.action_id, sid)
@@ -1466,15 +1582,16 @@ class ProxyEngine extends EventEmitter {
       }
       const modelId = msg.model_id;
       this._log('info', `[ctrl] agent_set_model for ${sid} model=${modelId}`);
-      if (sessionData.agentType === 'claude_cli') {
+      if (sessionData.agentType === 'claude_cli' || sessionData.agentType === 'codex_cli') {
+        const cliAgentType = sessionData.agentType;
         sessionData.model_id = modelId || 'default';
         sessionStore.updateSession(sid, { model_id: sessionData.model_id });
-        const merged = this._decorateAgentConfig(sessionData, this._mergeAgentConfig('claude_cli', {
+        const merged = this._decorateAgentConfig(sessionData, this._mergeAgentConfig(cliAgentType, {
           model_id: sessionData.model_id,
           permission_mode: sessionData.permission_mode,
           effort: sessionData.effort,
         }, sessionData.workspace_path));
-        this._sendToRelay(proto.agentConfig(sid, { ...merged, capabilities: this._buildCapabilities('claude_cli') }));
+        this._sendToRelay(proto.agentConfig(sid, { ...merged, capabilities: this._buildCapabilities(cliAgentType) }));
         this._sendToRelay(proto.agentControlResult(sid, msg.request_id, 'agent_set_model', 'ok'));
         return;
       }
@@ -1597,7 +1714,7 @@ class ProxyEngine extends EventEmitter {
       const agentT = sessionData?.agentType;
 
       const isRooCodeLike = agentT === 'roo_code' || agentT === 'cline';
-      if (agentT !== 'claude' && agentT !== 'claude_cli' && agentT !== 'continue_yolo' && !isRooCodeLike) {
+      if (agentT !== 'claude' && agentT !== 'claude_cli' && agentT !== 'codex_cli' && agentT !== 'continue_yolo' && !isRooCodeLike) {
         this._sendToRelay(proto.agentControlResult(sid, msg.request_id, 'agent_set_permission_mode', 'failed', {
           code: 'not_supported', message: `Permission mode change not supported for ${agentT || 'unknown'} agent`,
         }));
@@ -1605,15 +1722,15 @@ class ProxyEngine extends EventEmitter {
       }
 
       this._log('info', `[ctrl] agent_set_permission_mode for ${sid} mode=${mode}`);
-      if (agentT === 'claude_cli') {
-        sessionData.permission_mode = mode || 'default';
+      if (agentT === 'claude_cli' || agentT === 'codex_cli') {
+        sessionData.permission_mode = mode || (agentT === 'codex_cli' ? 'workspace-write' : 'default');
         sessionStore.updateSession(sid, { permission_mode: sessionData.permission_mode });
-        const merged = this._decorateAgentConfig(sessionData, this._mergeAgentConfig('claude_cli', {
+        const merged = this._decorateAgentConfig(sessionData, this._mergeAgentConfig(agentT, {
           model_id: sessionData.model_id,
           permission_mode: sessionData.permission_mode,
           effort: sessionData.effort,
         }, sessionData.workspace_path));
-        this._sendToRelay(proto.agentConfig(sid, { ...merged, capabilities: this._buildCapabilities('claude_cli') }));
+        this._sendToRelay(proto.agentConfig(sid, { ...merged, capabilities: this._buildCapabilities(agentT) }));
         this._sendToRelay(proto.agentControlResult(sid, msg.request_id, 'agent_set_permission_mode', 'ok'));
         return;
       }
@@ -1661,27 +1778,27 @@ class ProxyEngine extends EventEmitter {
       const sid = msg.session_id || msg.session;
       const sessionData = this.sessions.get(sid);
       const effort = msg.effort;
-      if (!sessionData || sessionData.agentType !== 'claude_cli') {
+      if (!sessionData || (sessionData.agentType !== 'claude_cli' && sessionData.agentType !== 'codex_cli')) {
         this._sendToRelay(proto.agentControlResult(sid, msg.request_id, 'agent_set_effort', 'failed', {
           code: 'not_supported', message: `Effort change not supported for ${sessionData?.agentType || 'unknown'} agent`,
         }));
         return;
       }
-      const allowed = new Set(claudeCli.CLAUDE_CLI_EFFORTS.map(item => item.id));
+      const allowed = new Set((sessionData.agentType === 'codex_cli' ? codexCli.CODEX_CLI_EFFORTS : claudeCli.CLAUDE_CLI_EFFORTS).map(item => item.id));
       if (!effort || !allowed.has(effort)) {
         this._sendToRelay(proto.agentControlResult(sid, msg.request_id, 'agent_set_effort', 'failed', {
-          code: 'invalid_effort', message: `Unsupported Claude CLI effort: ${effort || 'empty'}`,
+          code: 'invalid_effort', message: `Unsupported ${sessionData.agentType === 'codex_cli' ? 'Codex' : 'Claude'} CLI effort: ${effort || 'empty'}`,
         }));
         return;
       }
       sessionData.effort = effort;
       sessionStore.updateSession(sid, { effort });
-      const merged = this._decorateAgentConfig(sessionData, this._mergeAgentConfig('claude_cli', {
+      const merged = this._decorateAgentConfig(sessionData, this._mergeAgentConfig(sessionData.agentType, {
         model_id: sessionData.model_id,
         permission_mode: sessionData.permission_mode,
         effort: sessionData.effort,
       }, sessionData.workspace_path));
-      this._sendToRelay(proto.agentConfig(sid, { ...merged, capabilities: this._buildCapabilities('claude_cli') }));
+      this._sendToRelay(proto.agentConfig(sid, { ...merged, capabilities: this._buildCapabilities(sessionData.agentType) }));
       this._sendToRelay(proto.agentControlResult(sid, msg.request_id, 'agent_set_effort', 'ok'));
       return;
     }
@@ -2131,7 +2248,7 @@ class ProxyEngine extends EventEmitter {
       const agentT = sessionData?.agentType;
       const requestId = msg.request_id;
 
-      if (agentT !== 'codex' && agentT !== 'codex-desktop' && agentT !== 'continue_yolo' && agentT !== 'antigravity_panel' && agentT !== 'claude-desktop' && agentT !== 'claude' && agentT !== 'claude_cli') {
+      if (agentT !== 'codex' && agentT !== 'codex-desktop' && agentT !== 'continue_yolo' && agentT !== 'antigravity_panel' && agentT !== 'claude-desktop' && agentT !== 'claude' && agentT !== 'claude_cli' && agentT !== 'codex_cli') {
         this._sendToRelay(proto.agentControlResult(sid, requestId, 'new_chat', 'failed', {
           code: 'not_supported', message: `new_chat not supported for ${agentT || 'unknown'}`,
         }));
@@ -2194,6 +2311,58 @@ class ProxyEngine extends EventEmitter {
           'new_chat',
           newSession ? 'ok' : 'failed',
           newSession ? undefined : { code: 'create_failed', message: 'Could not create Claude CLI session' }
+        ));
+        return;
+      }
+
+      if (agentT === 'codex_cli') {
+        const cliSessionId = crypto.randomUUID();
+        const workspacePath = sessionData.workspace_path || process.cwd();
+        const workspaceName = sessionData.workspace_name || path.basename(workspacePath) || 'Codex CLI';
+        const summary = {
+          cliSessionId,
+          filePath: null,
+          workspacePath,
+          workspaceName,
+          title: 'New Codex CLI session',
+          messages: [],
+          messageCount: 0,
+          updatedAt: new Date().toISOString(),
+          model_id: sessionData.model_id || 'gpt-5.5',
+          permission_mode: sessionData.permission_mode || 'workspace-write',
+          effort: sessionData.effort || 'medium',
+          nativeCliStartedAt: new Date().toISOString(),
+          nativeCliStatus: 'native_window_opened',
+          nativeCliWindowOpened: true,
+        };
+        const newSession = this._registerCodexCliSession(summary, { sendInitialHistory: false });
+        if (newSession) {
+          try {
+            const child = codexCli.startNativeCodexWindow({
+              workspacePath,
+              cliSessionId,
+              resume: false,
+              model: newSession.model_id,
+              effort: newSession.effort,
+              permissionMode: newSession.permission_mode,
+              title: `${workspaceName} - Codex CLI`,
+            });
+            this._sendHistorySnapshot(newSession.session_id, this._codexCliPendingTranscriptMessages(newSession), 'codex cli native startup');
+            this._log('info', `[ctrl] opened native Codex CLI window for new_chat ${newSession.session_id} pid=${child?.pid || 'unknown'} model=${newSession.model_id || 'default'}`);
+          } catch (e) {
+            this._log('warn', `[ctrl] new_chat native Codex CLI window failed for ${newSession.session_id}: ${e.message}`);
+            newSession.nativeCliStatus = 'native_window_failed';
+            sessionStore.updateSession(newSession.session_id, { native_cli_status: newSession.nativeCliStatus });
+            this._sendHistorySnapshot(newSession.session_id, this._codexCliPendingTranscriptMessages(newSession), 'codex cli native startup failed');
+          }
+        }
+        this._broadcastSessionSnapshot();
+        this._sendToRelay(proto.agentControlResult(
+          sid,
+          requestId,
+          'new_chat',
+          newSession ? 'ok' : 'failed',
+          newSession ? undefined : { code: 'create_failed', message: 'Could not create Codex CLI session' }
         ));
         return;
       }
@@ -2711,7 +2880,7 @@ class ProxyEngine extends EventEmitter {
       const sessionData = this.sessions.get(sid);
       const requestId = msg.request_id;
 
-      if (sessionData?.agentType !== 'claude_cli') {
+      if (sessionData?.agentType !== 'claude_cli' && sessionData?.agentType !== 'codex_cli') {
         this._sendToRelay(proto.agentControlResult(sid, requestId, 'open_native_window', 'failed', {
           code: 'not_supported', message: `native window not supported for ${sessionData?.agentType || 'unknown'}`,
         }));
@@ -2724,30 +2893,45 @@ class ProxyEngine extends EventEmitter {
         sessionData.nativeCliStartedAt = new Date().toISOString();
         sessionData.nativeCliStatus = 'native_window_opened';
         sessionData.nativeCliWindowOpened = true;
+        const isCodexCli = sessionData.agentType === 'codex_cli';
         sessionStore.updateSession(sid, {
           cli_session_id: cliSessionId,
-          claude_cli_archive_discovered: false,
+          ...(isCodexCli ? { codex_cli_archive_discovered: false } : { claude_cli_archive_discovered: false }),
           native_cli_started_at: sessionData.nativeCliStartedAt,
           native_cli_status: sessionData.nativeCliStatus,
           native_cli_window_opened: true,
         });
-        const child = claudeCli.startNativeClaudeWindow({
-          workspacePath: sessionData.workspace_path || process.cwd(),
-          cliSessionId,
-          resume: !!sessionData.claudeCliFilePath,
-          model: sessionData.model_id,
-          effort: sessionData.effort,
-          permissionMode: sessionData.permission_mode,
-          title: `${sessionData.workspace_name || 'Claude Code'} - Claude CLI`,
-        });
-        this._sendHistorySnapshot(sid, this._claudeCliPendingTranscriptMessages(sessionData), 'claude cli native startup');
-        this._log('info', `[ctrl] opened native Claude CLI window for ${sid} pid=${child?.pid || 'unknown'} model=${sessionData.model_id || 'default'}`);
+        const child = isCodexCli
+          ? codexCli.startNativeCodexWindow({
+              workspacePath: sessionData.workspace_path || process.cwd(),
+              cliSessionId,
+              resume: !!sessionData.codexCliFilePath,
+              model: sessionData.model_id,
+              effort: sessionData.effort,
+              permissionMode: sessionData.permission_mode,
+              title: `${sessionData.workspace_name || 'Codex'} - Codex CLI`,
+            })
+          : claudeCli.startNativeClaudeWindow({
+              workspacePath: sessionData.workspace_path || process.cwd(),
+              cliSessionId,
+              resume: !!sessionData.claudeCliFilePath,
+              model: sessionData.model_id,
+              effort: sessionData.effort,
+              permissionMode: sessionData.permission_mode,
+              title: `${sessionData.workspace_name || 'Claude Code'} - Claude CLI`,
+            });
+        this._sendHistorySnapshot(sid, isCodexCli ? this._codexCliPendingTranscriptMessages(sessionData) : this._claudeCliPendingTranscriptMessages(sessionData), `${isCodexCli ? 'codex' : 'claude'} cli native startup`);
+        this._log('info', `[ctrl] opened native ${isCodexCli ? 'Codex' : 'Claude'} CLI window for ${sid} pid=${child?.pid || 'unknown'} model=${sessionData.model_id || 'default'}`);
         this._sendToRelay(proto.agentControlResult(sid, requestId, 'open_native_window', 'ok'));
       } catch (e) {
         this._log('warn', `[ctrl] open_native_window failed for ${sid}: ${e.message}`);
         sessionData.nativeCliStatus = 'native_window_failed';
         sessionStore.updateSession(sid, { native_cli_status: sessionData.nativeCliStatus });
-        this._sendHistorySnapshot(sid, this._claudeCliPendingTranscriptMessages(sessionData), 'claude cli native startup failed');
+        this._sendHistorySnapshot(
+          sid,
+          sessionData.agentType === 'codex_cli' ? this._codexCliPendingTranscriptMessages(sessionData) : this._claudeCliPendingTranscriptMessages(sessionData),
+          `${sessionData.agentType === 'codex_cli' ? 'codex' : 'claude'} cli native startup failed`
+        );
         this._sendToRelay(proto.agentControlResult(sid, requestId, 'open_native_window', 'failed', {
           code: 'spawn_failed', message: e.message,
         }));
@@ -2821,6 +3005,78 @@ class ProxyEngine extends EventEmitter {
           session.nativeCliStatus = 'native_window_failed';
           sessionStore.updateSession(session.session_id, { native_cli_status: session.nativeCliStatus });
           this._sendHistorySnapshot(session.session_id, this._claudeCliPendingTranscriptMessages(session), 'claude cli native startup failed');
+        }
+        this._broadcastSessionSnapshot();
+        this._sendToRelay({
+          type: 'session_launch_ack',
+          protocol_version: proto.PROTOCOL_VERSION,
+          request_id: requestId,
+          session_id: session.session_id,
+          agent_type: agentType,
+        });
+        return;
+      }
+
+      if (agentType === 'codex_cli') {
+        const cliSessionId = crypto.randomUUID();
+        const workspace = workspacePath || process.cwd();
+        const workspaceName = path.basename(workspace) || 'Codex CLI';
+        const modelId = msg.model_id || 'gpt-5.5';
+        const permissionMode = msg.permission_mode || 'workspace-write';
+        const effort = msg.effort || 'medium';
+        const summary = {
+          cliSessionId,
+          filePath: null,
+          workspacePath: workspace,
+          workspaceName,
+          title: 'New Codex CLI session',
+          messages: [],
+          messageCount: 0,
+          updatedAt: new Date().toISOString(),
+          model_id: modelId,
+          permission_mode: permissionMode,
+          effort,
+          nativeCliStartedAt: new Date().toISOString(),
+          nativeCliStatus: 'native_window_opened',
+          nativeCliWindowOpened: true,
+        };
+        const session = this._registerCodexCliSession(summary, { sendInitialHistory: false });
+        if (!session) {
+          this._sendToRelay({
+            type: 'session_launch_failed',
+            protocol_version: proto.PROTOCOL_VERSION,
+            request_id: requestId,
+            agent_type: agentType,
+            reason: 'Could not create Codex CLI session',
+            error_code: 'create_failed',
+          });
+          return;
+        }
+        try {
+          const child = codexCli.startNativeCodexWindow({
+            workspacePath: workspace,
+            cliSessionId,
+            resume: false,
+            model: modelId,
+            effort,
+            permissionMode,
+            title: `${workspaceName} - Codex CLI`,
+          });
+          session.nativeCliStartedAt = summary.nativeCliStartedAt;
+          session.nativeCliStatus = 'native_window_opened';
+          session.nativeCliWindowOpened = true;
+          sessionStore.updateSession(session.session_id, {
+            native_cli_started_at: session.nativeCliStartedAt,
+            native_cli_status: session.nativeCliStatus,
+            native_cli_window_opened: true,
+          });
+          this._sendHistorySnapshot(session.session_id, this._codexCliPendingTranscriptMessages(session), 'codex cli native startup');
+          this._log('info', `[ctrl] opened native Codex CLI window for launch_session ${session.session_id} pid=${child?.pid || 'unknown'} model=${modelId || 'default'}`);
+        } catch (e) {
+          this._log('warn', `[ctrl] launch_session native Codex CLI window failed for ${session.session_id}: ${e.message}`);
+          session.nativeCliStatus = 'native_window_failed';
+          sessionStore.updateSession(session.session_id, { native_cli_status: session.nativeCliStatus });
+          this._sendHistorySnapshot(session.session_id, this._codexCliPendingTranscriptMessages(session), 'codex cli native startup failed');
         }
         this._broadcastSessionSnapshot();
         this._sendToRelay({
@@ -3260,6 +3516,104 @@ class ProxyEngine extends EventEmitter {
       || /\bWhat changed:\b/i.test(text)
       || /\bVerified:\b/i.test(text)
       || /\b\d+\s+files?\s+changed\b/i.test(text);
+  }
+
+  _titleTokenOverlap(left, right) {
+    const make = value => new Set(String(value || '')
+      .toLowerCase()
+      .replace(/[^a-z0-9]+/g, ' ')
+      .split(/\s+/)
+      .filter(t => t.length >= 4 && !/^(with|from|this|that|code|task|chat|session)$/.test(t)));
+    const a = make(left);
+    const b = make(right);
+    if (a.size === 0 || b.size === 0) return 0;
+    let overlap = 0;
+    for (const token of a) if (b.has(token)) overlap++;
+    return overlap / Math.max(1, Math.min(a.size, b.size));
+  }
+
+  _codexDesktopLooksCollapsed(messages) {
+    const list = Array.isArray(messages) ? messages : [];
+    if (list.length === 0 || list.length > 5) return false;
+    const assistantCount = list.filter(m => m && m.role === 'assistant').length;
+    const hasCompletion = list.some(m => this._isCodexCompletionSummaryMessage(m));
+    return assistantCount > 0 && hasCompletion;
+  }
+
+  _codexDesktopArchiveAnchor(archiveMessages, domMessages) {
+    const archive = Array.isArray(archiveMessages) ? archiveMessages : [];
+    const dom = Array.isArray(domMessages) ? domMessages : [];
+    if (archive.length === 0 || dom.length === 0) return -1;
+
+    const windowOffset = this._transcriptWindowOffset(archive, dom);
+    if (windowOffset >= 0) return windowOffset;
+
+    const domUsers = dom.filter(m => m && m.role === 'user');
+    for (const user of domUsers) {
+      const idx = this._findMatchingMessageIndex(archive, user);
+      if (idx >= 0) return idx;
+    }
+
+    const domCompletion = dom.find(m => this._isCodexCompletionSummaryMessage(m));
+    if (domCompletion) {
+      const idx = this._findMatchingMessageIndex(archive, domCompletion);
+      if (idx >= 0) return idx;
+    }
+
+    return -1;
+  }
+
+  _boundedCodexDesktopArchiveMessages(archiveMessages, domMessages, anchorIdx) {
+    const archive = Array.isArray(archiveMessages) ? archiveMessages : [];
+    if (archive.length <= 2000) return archive;
+
+    const dom = Array.isArray(domMessages) ? domMessages : [];
+    const hasUsefulAnchor = Number.isInteger(anchorIdx) && anchorIdx >= 0;
+    const start = hasUsefulAnchor
+      ? Math.max(0, anchorIdx - 40)
+      : Math.max(0, archive.length - 2000);
+    const end = Math.min(archive.length, Math.max(start + 2000, start + dom.length + 80));
+    return archive.slice(start, end);
+  }
+
+  _maybeUseCodexDesktopArchive(sessionId, session, domMessages) {
+    if (!session || session.agentType !== 'codex-desktop') return domMessages;
+    const dom = Array.isArray(domMessages) ? domMessages : [];
+    const now = Date.now();
+    const collapsed = this._codexDesktopLooksCollapsed(dom);
+    const accumulatedHasMore = Array.isArray(session._accumulatedMessages) && session._accumulatedMessages.length > dom.length;
+    if (!collapsed && !accumulatedHasMore) return dom;
+    if (session._lastCodexDesktopArchiveCheckAt && now - session._lastCodexDesktopArchiveCheckAt < 10000) {
+      const cached = Array.isArray(session._codexDesktopArchiveMessages) ? session._codexDesktopArchiveMessages : null;
+      if (cached && cached.length > dom.length) {
+        const cachedAnchor = this._codexDesktopArchiveAnchor(cached, dom);
+        if (cachedAnchor >= 0) return cached;
+      }
+      return dom;
+    }
+    session._lastCodexDesktopArchiveCheckAt = now;
+
+    const activeTitle = session._activeThreadTitle || session.chat_title || '';
+    const summary = codexCli.findLatestSessionForTitle({
+      workspacePath: session.workspace_path || null,
+      workspaceName: session.workspace_name || null,
+      title: activeTitle,
+      maxFiles: 20,
+    });
+    if (!summary || !Array.isArray(summary.messages) || summary.messages.length <= dom.length) return dom;
+
+    const anchorIdx = this._codexDesktopArchiveAnchor(summary.messages, dom);
+    const titleMatch = activeTitle && this._titleTokenOverlap(activeTitle, summary.title) >= 0.55;
+    if (anchorIdx < 0 && !titleMatch) return dom;
+
+    const archiveMessages = this._boundedCodexDesktopArchiveMessages(summary.messages, dom, anchorIdx);
+    if (archiveMessages.length <= dom.length) return dom;
+
+    session._codexDesktopArchiveMessages = archiveMessages;
+    session._codexDesktopArchivePath = summary.filePath;
+    session._codexDesktopArchiveUpdatedAt = summary.updatedAt;
+    this._log('info', `[${sessionId}] Using Codex Desktop JSONL transcript (${archiveMessages.length}/${summary.messages.length} msgs) to keep completed task expanded`);
+    return archiveMessages;
   }
 
   _findMatchingMessageIndex(messages, needle, startAt = 0) {
@@ -3789,10 +4143,51 @@ class ProxyEngine extends EventEmitter {
     }];
   }
 
+  _claudeCliTrustPrompt(session) {
+    if (session.claudeCliFilePath) return null;
+    const workspaceName = session.workspace_name || session.workspaceName || 'the selected workspace';
+    return {
+      title: 'Claude CLI needs workspace trust',
+      message: `Claude CLI is waiting for workspace trust before it can create a transcript for ${workspaceName}.`,
+      error_output: 'The native Claude window is showing the "Quick safety check" prompt. Choose Trust workspace here to send the trust confirmation and reopen the native window.',
+      display_mode: 'inline',
+      blocking: false,
+      actions: [
+        { action_id: 'trust_workspace', label: 'Trust workspace' },
+        { action_id: 'open_native_window', label: 'Open native window' },
+      ],
+    };
+  }
+
+  _codexCliPendingTranscriptMessages(session) {
+    const workspaceName = session.workspace_name || session.workspaceName || 'the selected workspace';
+    const model = session.model_id && session.model_id !== 'default' ? session.model_id : 'Default';
+    const permissionMode = session.permission_mode || 'workspace-write';
+    const effort = session.effort || 'medium';
+    return [{
+      role: 'assistant',
+      content: [
+        '**Codex CLI is waiting for a native transcript.**',
+        '',
+        `Workspace: ${workspaceName}`,
+        `Model: ${model}`,
+        `Access: ${permissionMode}`,
+        `Effort: ${effort}`,
+        '',
+        'Once Codex creates or updates the JSONL transcript file, this placeholder will be replaced with the real CLI chat history.',
+      ].join('\n'),
+      ts: session.nativeCliStartedAt ? Math.floor(new Date(session.nativeCliStartedAt).getTime() / 1000) : undefined,
+    }];
+  }
+
   async _readSessionMessages(session, sessionId) {
     if (session.agentType === 'claude_cli') {
       const messages = session.claudeCliFilePath ? claudeCli.parseClaudeJsonl(session.claudeCliFilePath) : [];
       return JSON.stringify(messages.length > 0 ? messages : this._claudeCliPendingTranscriptMessages(session));
+    }
+    if (session.agentType === 'codex_cli') {
+      const messages = session.codexCliFilePath ? codexCli.parseCodexJsonl(session.codexCliFilePath) : [];
+      return JSON.stringify(messages.length > 0 ? messages : this._codexCliPendingTranscriptMessages(session));
     }
     if (this._isEphemeralIframeAgent(session.agentType)) {
       return this._withEphemeralIframeClient(session, client =>
@@ -3808,6 +4203,14 @@ class ProxyEngine extends EventEmitter {
       return {
         model_id: session.model_id || 'default',
         permission_mode: session.permission_mode || 'default',
+        effort: session.effort || 'medium',
+        file_access_scope: workspacePath || session.workspace_path || 'unknown',
+      };
+    }
+    if (session.agentType === 'codex_cli') {
+      return {
+        model_id: session.model_id || 'gpt-5.5',
+        permission_mode: session.permission_mode || 'workspace-write',
         effort: session.effort || 'medium',
         file_access_scope: workspacePath || session.workspace_path || 'unknown',
       };
@@ -3883,6 +4286,9 @@ class ProxyEngine extends EventEmitter {
   async _sendSessionMessage(session, content, sessionId) {
     if (session.agentType === 'claude_cli') {
       return this._sendClaudeCliMessage(session, content, sessionId);
+    }
+    if (session.agentType === 'codex_cli') {
+      return this._sendCodexCliMessage(session, content, sessionId);
     }
     if (this._isEphemeralIframeAgent(session.agentType)) {
       return this._withEphemeralIframeClient(session, client =>
@@ -4208,9 +4614,326 @@ class ProxyEngine extends EventEmitter {
       sessionStore.updateSession(sessionId, { activity });
       this._sendToRelay(proto.proxyStatus(sessionId, session.status || 'healthy', activity));
     }
+    await this._handleSessionErrorPromptState(
+      sessionId,
+      session,
+      messages.length > 0 ? null : this._claudeCliTrustPrompt(session)
+    );
   }
 
   // ─── Continue-specific poll (ephemeral CDP) ─────────────────────────
+
+  _buildCodexCliSessionFromSummary(sessionMeta, summary) {
+    const now = new Date().toISOString();
+    return {
+      session_id: sessionMeta.session_id,
+      display_name: sessionMeta.display_name || 'Codex CLI',
+      workspace_name: summary.workspaceName || sessionMeta.workspace_name,
+      workspace_path: summary.workspacePath || sessionMeta.workspace_path,
+      machine_label: sessionMeta.machine_label,
+      target_signature: sessionMeta.target_signature,
+      chat_title: summary.title || null,
+      client: null,
+      lastMessageCount: summary.messageCount || 0,
+      lastObservedCount: summary.messageCount || 0,
+      lastTranscriptSig: this._transcriptSignature(summary.messages || []),
+      nullPollCount: 0,
+      waitingForAssistant: false,
+      thinking: false,
+      thinkingLabel: '',
+      autoApprovePermissions: false,
+      status: 'healthy',
+      activity: sessionMeta.activity || { kind: 'idle', label: '', updated_at: now },
+      last_seen_at: summary.updatedAt || now,
+      windowTitle: sessionMeta.window_title || summary.workspaceName || 'Codex CLI',
+      agentType: 'codex_cli',
+      parentId: null,
+      ext: null,
+      targetId: null,
+      cliSessionId: summary.cliSessionId,
+      codexCliFilePath: summary.filePath,
+      codexCliArchiveDiscovered: sessionMeta.codex_cli_archive_discovered === true,
+      nativeCliStartedAt: sessionMeta.native_cli_started_at || summary.nativeCliStartedAt || null,
+      nativeCliStatus: sessionMeta.native_cli_status || summary.nativeCliStatus || null,
+      nativeCliWindowOpened: sessionMeta.native_cli_window_opened === true || summary.nativeCliWindowOpened === true,
+      model_id: sessionMeta.model_id || summary.model_id || 'gpt-5.5',
+      effort: sessionMeta.effort || summary.effort || 'medium',
+      permission_mode: sessionMeta.permission_mode || summary.permission_mode || 'workspace-write',
+    };
+  }
+
+  _registerCodexCliSession(summary, { sendInitialHistory = true, archiveDiscovered = false } = {}) {
+    if (!summary?.cliSessionId) return null;
+    const displayName = 'Codex CLI';
+    const norm = p => String(p || '').replace(/\\/g, '/').replace(/\/+$/, '').toLowerCase();
+    const pendingEntry = Array.from(this.sessions.entries()).find(([, s]) =>
+      s.agentType === 'codex_cli'
+      && !s.codexCliFilePath
+      && norm(s.workspace_path) === norm(summary.workspacePath)
+      && (s.cliSessionId === summary.cliSessionId || s.nativeCliWindowOpened === true || s._codexCliChild)
+    );
+    if (pendingEntry) {
+      const [sessionId, existing] = pendingEntry;
+      existing.workspace_name = summary.workspaceName || existing.workspace_name;
+      existing.workspace_path = summary.workspacePath || existing.workspace_path;
+      existing.chat_title = summary.title || existing.chat_title;
+      existing.last_seen_at = summary.updatedAt || existing.last_seen_at;
+      existing.codexCliFilePath = summary.filePath || existing.codexCliFilePath;
+      existing.codexCliArchiveDiscovered = archiveDiscovered === true;
+      existing.cliSessionId = summary.cliSessionId;
+      if (summary.model_id) existing.model_id = summary.model_id;
+      sessionStore.updateSession(sessionId, {
+        cli_session_id: existing.cliSessionId,
+        codex_cli_file_path: existing.codexCliFilePath || null,
+        codex_cli_archive_discovered: archiveDiscovered === true,
+        chat_title: existing.chat_title || null,
+        workspace_path: existing.workspace_path || null,
+        workspace_name: existing.workspace_name || null,
+      });
+      const effectiveMessages = (summary.messages || []).length > 0 ? summary.messages : this._codexCliPendingTranscriptMessages(existing);
+      const sig = this._transcriptSignature(effectiveMessages);
+      if (sig !== existing.lastTranscriptSig) {
+        existing.lastTranscriptSig = sig;
+        existing.lastObservedCount = effectiveMessages.length;
+        existing.lastMessageCount = effectiveMessages.length;
+        this._sendHistorySnapshot(sessionId, effectiveMessages, 'codex cli file attached');
+      }
+      return existing;
+    }
+    const sessionMeta = sessionStore.resolveVirtualSession({
+      virtualId: `codex-cli:${summary.cliSessionId}`,
+      agentType: 'codex_cli',
+      displayName,
+      workspaceName: summary.workspaceName,
+      workspacePath: summary.workspacePath,
+      windowTitle: summary.workspaceName || displayName,
+      extra: {
+        cli_session_id: summary.cliSessionId,
+        codex_cli_file_path: summary.filePath,
+        codex_cli_archive_discovered: archiveDiscovered === true,
+        chat_title: summary.title || null,
+        model_id: summary.model_id || undefined,
+        permission_mode: summary.permission_mode || undefined,
+        effort: summary.effort || undefined,
+        native_cli_started_at: summary.nativeCliStartedAt || undefined,
+        native_cli_status: summary.nativeCliStatus || undefined,
+        native_cli_window_opened: summary.nativeCliWindowOpened === true || undefined,
+      },
+    });
+    const sessionId = sessionMeta.session_id;
+    const existing = this.sessions.get(sessionId);
+    if (existing) {
+      existing.workspace_name = summary.workspaceName || existing.workspace_name;
+      existing.workspace_path = summary.workspacePath || existing.workspace_path;
+      existing.chat_title = summary.title || existing.chat_title;
+      existing.last_seen_at = summary.updatedAt || existing.last_seen_at;
+      existing.codexCliFilePath = summary.filePath || existing.codexCliFilePath;
+      existing.codexCliArchiveDiscovered = archiveDiscovered === true;
+      existing.cliSessionId = summary.cliSessionId;
+      if (summary.model_id) existing.model_id = summary.model_id;
+      if (summary.permission_mode) existing.permission_mode = summary.permission_mode;
+      if (summary.effort) existing.effort = summary.effort;
+      const summaryMessages = summary.messages || [];
+      const effectiveMessages = summaryMessages.length > 0 ? summaryMessages : this._codexCliPendingTranscriptMessages(existing);
+      const sig = this._transcriptSignature(effectiveMessages);
+      if (sig !== existing.lastTranscriptSig) {
+        existing.lastTranscriptSig = sig;
+        existing.lastObservedCount = effectiveMessages.length;
+        existing.lastMessageCount = effectiveMessages.length;
+        this._sendHistorySnapshot(sessionId, effectiveMessages, 'codex cli file changed');
+      }
+      return existing;
+    }
+    const session = this._buildCodexCliSessionFromSummary(sessionMeta, summary);
+    this.sessions.set(sessionId, session);
+    this._log('info', `[codex-cli] registered ${sessionId} cli=${summary.cliSessionId} (${summary.messageCount} msgs)`);
+    if (sendInitialHistory) {
+      const initialMessages = summary.messages?.length ? summary.messages : this._codexCliPendingTranscriptMessages(session);
+      this._sendHistorySnapshot(sessionId, initialMessages, 'codex cli discovery');
+      session.lastTranscriptSig = this._transcriptSignature(initialMessages);
+      session.lastObservedCount = initialMessages.length;
+      session.lastMessageCount = initialMessages.length;
+    }
+    const cfg = this._decorateAgentConfig(session, this._mergeAgentConfig('codex_cli', {
+      model_id: session.model_id,
+      permission_mode: session.permission_mode,
+      effort: session.effort,
+    }, session.workspace_path));
+    this._sendToRelay(proto.agentConfig(sessionId, { ...cfg, capabilities: this._buildCapabilities('codex_cli') }));
+    return session;
+  }
+
+  async _discoverCodexCliSessions() {
+    if (process.env.CODEX_CLI_DISCOVER_ARCHIVES !== 'true') {
+      let changed = false;
+      const storedSessions = sessionStore.getAllSessions();
+      for (const sess of storedSessions) {
+        if (sess.agent_type !== 'codex_cli') continue;
+        if (sess.codex_cli_archive_discovered === true) continue;
+        if (sess.status !== 'healthy') continue;
+        if (!sess.cli_session_id) continue;
+        if (this.sessions.has(sess.session_id)) continue;
+        let messages = [];
+        let updatedAt = sess.last_seen_at || new Date().toISOString();
+        const filePath = sess.codex_cli_file_path || null;
+        if (filePath && fs.existsSync(filePath)) {
+          try {
+            messages = codexCli.parseCodexJsonl(filePath);
+            updatedAt = fs.statSync(filePath).mtime.toISOString();
+          } catch (e) {
+            this._log('warn', `[codex-cli] failed to restore transcript ${filePath}: ${e.message}`);
+          }
+        }
+        const before = this.sessions.size;
+        this._registerCodexCliSession({
+          cliSessionId: sess.cli_session_id,
+          filePath,
+          workspacePath: sess.workspace_path || process.cwd(),
+          workspaceName: sess.workspace_name || 'Codex CLI',
+          title: sess.chat_title || 'Codex CLI session',
+          messages,
+          messageCount: messages.length,
+          updatedAt,
+          model_id: sess.model_id,
+          permission_mode: sess.permission_mode,
+          effort: sess.effort,
+        }, { archiveDiscovered: false });
+        if (this.sessions.size !== before) changed = true;
+      }
+      if (changed) this._broadcastSessionSnapshot();
+      return;
+    }
+    const limit = parseInt(process.env.CODEX_CLI_SESSION_LIMIT || '40', 10);
+    const summaries = codexCli.discoverSessions(Number.isFinite(limit) ? limit : 40);
+    let changed = false;
+    for (const summary of summaries) {
+      const before = this.sessions.size;
+      this._registerCodexCliSession(summary, { archiveDiscovered: true });
+      if (this.sessions.size !== before) changed = true;
+    }
+    if (changed) this._broadcastSessionSnapshot();
+  }
+
+  _findCodexCliSummaryByCliId(cliSessionId) {
+    if (!cliSessionId) return null;
+    return codexCli.findSessionByCliId(cliSessionId);
+  }
+
+  _sendCodexCliMessage(session, content, sessionId) {
+    if (session._codexCliChild) {
+      return Promise.resolve({ ok: false, code: 'agent_busy', detail: 'Codex CLI process is already running' });
+    }
+    const cliSessionId = session.cliSessionId || crypto.randomUUID();
+    session.cliSessionId = cliSessionId;
+    sessionStore.updateSession(sessionId, { cli_session_id: cliSessionId });
+    const workspacePath = session.workspace_path || process.cwd();
+    const startedAtMs = Date.now();
+    const stderrChunks = [];
+    const child = codexCli.startCodexExecSession({
+      workspacePath,
+      cliSessionId,
+      resume: !!session.codexCliFilePath,
+      content,
+      model: session.model_id,
+      effort: session.effort,
+      permissionMode: session.permission_mode,
+      onStdout: () => {},
+      onStderr: chunk => { if (chunk) stderrChunks.push(chunk); },
+      onExit: (code, err) => {
+        if (session._codexCliChild === child) session._codexCliChild = null;
+        (async () => {
+          let summary = this._findCodexCliSummaryByCliId(cliSessionId)
+            || codexCli.findLatestSessionForWorkspace(workspacePath, startedAtMs - 5000);
+          for (let attempt = 0; code === 0 && !summary && attempt < 8; attempt++) {
+            await sleep(250);
+            summary = this._findCodexCliSummaryByCliId(cliSessionId)
+              || codexCli.findLatestSessionForWorkspace(workspacePath, startedAtMs - 5000);
+          }
+          if (summary) {
+            session.codexCliFilePath = summary.filePath;
+            session.workspace_path = summary.workspacePath || session.workspace_path;
+            session.workspace_name = summary.workspaceName || session.workspace_name;
+            session.chat_title = summary.title || session.chat_title;
+            session.codexCliArchiveDiscovered = false;
+            this._registerCodexCliSession(summary, { sendInitialHistory: false });
+            const effectiveMessages = summary.messages?.length ? summary.messages : this._codexCliPendingTranscriptMessages(session);
+            this._sendHistorySnapshot(sessionId, effectiveMessages, 'codex cli send complete');
+            session.lastMessageCount = effectiveMessages.length;
+            session.lastObservedCount = effectiveMessages.length;
+            session.lastTranscriptSig = this._transcriptSignature(effectiveMessages);
+          } else {
+            const stderr = stderrChunks.join('').trim();
+            this._sendToRelay(proto.proxyMessage(
+              sessionId,
+              'assistant',
+              code === 0 && !err
+                ? 'Codex CLI exited without producing a transcript file for this session.'
+                : `Codex CLI failed to start or complete the request.\n\n${stderr || err?.message || `Codex CLI exited with code ${code}`}`
+            ));
+          }
+          const activity = { kind: 'idle', label: summary ? '' : 'Codex CLI failed', updated_at: new Date().toISOString() };
+          session.activity = activity;
+          session.waitingForAssistant = false;
+          sessionStore.updateSession(sessionId, {
+            activity,
+            workspace_path: session.workspace_path || null,
+            workspace_name: session.workspace_name || null,
+            cli_session_id: cliSessionId,
+            codex_cli_file_path: session.codexCliFilePath || null,
+            codex_cli_archive_discovered: false,
+          });
+          this._sendToRelay(proto.proxyStatus(sessionId, session.status || 'healthy', activity));
+          this._broadcastSessionSnapshot();
+        })().catch(exitErr => {
+          this._log('warn', `[codex-cli] send exit handler failed: ${exitErr.message}`);
+        });
+      },
+    });
+    session._codexCliChild = child;
+    return Promise.resolve({ ok: true });
+  }
+
+  async _pollSessionCodexCli(sessionId, session) {
+    const now = Date.now();
+    const shouldLookupTranscript = !session._lastCodexCliTranscriptLookupAt
+      || now - session._lastCodexCliTranscriptLookupAt >= 10000;
+    if (!session.codexCliFilePath && session.cliSessionId && shouldLookupTranscript) {
+      session._lastCodexCliTranscriptLookupAt = now;
+      const nativeStartMs = session.nativeCliStartedAt ? new Date(session.nativeCliStartedAt).getTime() : 0;
+      const summary = this._findCodexCliSummaryByCliId(session.cliSessionId)
+        || codexCli.findLatestSessionForWorkspace(session.workspace_path || process.cwd(), nativeStartMs ? nativeStartMs - 5000 : 0);
+      if (summary?.filePath) {
+        session.codexCliFilePath = summary.filePath;
+        session.workspace_path = summary.workspacePath || session.workspace_path;
+        session.workspace_name = summary.workspaceName || session.workspace_name;
+        session.chat_title = summary.title || session.chat_title;
+        sessionStore.updateSession(sessionId, {
+          workspace_path: session.workspace_path || null,
+          workspace_name: session.workspace_name || null,
+          codex_cli_file_path: session.codexCliFilePath,
+          codex_cli_archive_discovered: false,
+          chat_title: session.chat_title || null,
+        });
+      }
+    }
+    const messages = session.codexCliFilePath ? codexCli.parseCodexJsonl(session.codexCliFilePath) : [];
+    const effectiveMessages = messages.length > 0 ? messages : this._codexCliPendingTranscriptMessages(session);
+    const sig = this._transcriptSignature(effectiveMessages);
+    if (sig !== session.lastTranscriptSig) {
+      session.lastTranscriptSig = sig;
+      session.lastObservedCount = effectiveMessages.length;
+      session.lastMessageCount = effectiveMessages.length;
+      this._sendHistorySnapshot(sessionId, effectiveMessages, messages.length > 0 ? 'codex cli poll' : 'codex cli pending transcript');
+    }
+    const kind = session._codexCliChild ? 'generating' : 'idle';
+    const label = session._codexCliChild ? 'Codex CLI running' : '';
+    if (session.activity?.kind !== kind || session.activity?.label !== label) {
+      const activity = { kind, label, updated_at: new Date().toISOString() };
+      session.activity = activity;
+      sessionStore.updateSession(sessionId, { activity });
+      this._sendToRelay(proto.proxyStatus(sessionId, session.status || 'healthy', activity));
+    }
+  }
 
   async _pollSessionContinue(sessionId, session) {
     const configNow = Date.now();
@@ -4765,6 +5488,9 @@ class ProxyEngine extends EventEmitter {
       if (session.agentType === 'claude_cli') {
         return await this._pollSessionClaudeCli(sessionId, session);
       }
+      if (session.agentType === 'codex_cli') {
+        return await this._pollSessionCodexCli(sessionId, session);
+      }
       if (session.agentType === 'continue' || session.agentType === 'continue_yolo' || session.agentType === 'roo_code' || session.agentType === 'cline') {
         return await this._pollSessionContinue(sessionId, session);
       }
@@ -4808,6 +5534,27 @@ class ProxyEngine extends EventEmitter {
             .then(handleTaskList)
             .catch(e => { this._log('warn', `[${sessionId}] task_list error: ${e.message}`); })
             .finally(() => { session._taskListPollInProgress = false; });
+        }
+      }
+
+      // Codex Desktop thread switches are native app state, not transcript
+      // state. Refresh the active-thread marker even while busy so the WebUI
+      // does not keep showing the previous thread's accumulated history after
+      // the user switches chats or Codex focuses a different thread.
+      if (session.agentType === 'codex-desktop') {
+        const now = Date.now();
+        if (!session._lastCodexDesktopThreadPollAt || now - session._lastCodexDesktopThreadPollAt > 5000) {
+          session._lastCodexDesktopThreadPollAt = now;
+          try {
+            const threads = await this._withTimeout(
+              selectors.readCodexThreadList(session.client.Runtime, true),
+              2000,
+              `codex desktop thread list ${sessionId.substring(0, 8)}`
+            );
+            this._applyCodexDesktopThreadList(sessionId, session, threads);
+          } catch (e) {
+            this._log('warn', `[${sessionId}] codex desktop thread list poll failed: ${e.message}`);
+          }
         }
       }
 
@@ -5021,7 +5768,10 @@ class ProxyEngine extends EventEmitter {
       // Skip stale message processing when the visible surface is in empty/list-view mode
       if (session._panelEmpty || session._listView) return;
 
-      const messages = JSON.parse(raw);
+      let messages = JSON.parse(raw);
+      if (session.agentType === 'codex-desktop') {
+        messages = this._maybeUseCodexDesktopArchive(sessionId, session, messages);
+      }
 
       // ── Antigravity accumulation layer ──────────────────────────────
       // The Antigravity side panel virtualizes older turns — they disappear
@@ -5061,6 +5811,7 @@ class ProxyEngine extends EventEmitter {
           if (dom.length > 0 && !completionCollapseMatched) {
             // Find the longest suffix of `acc` that is a prefix of `dom`
             // (i.e. how many of the last accumulated messages are still visible)
+            let expandedHistoricalMessage = false;
             let overlapLen = 0;
             for (let tryLen = Math.min(acc.length, dom.length); tryLen >= 1; tryLen--) {
               let match = true;
@@ -5106,7 +5857,11 @@ class ProxyEngine extends EventEmitter {
                 if (this._messageContentText(dom[domIdx]).length > this._messageContentText(acc[accIdx]).length) {
                   acc[accIdx] = dom[domIdx];
                   session._accumulatedDirty = true;
+                  if (accIdx < acc.length - 1) expandedHistoricalMessage = true;
                 }
+              }
+              if (expandedHistoricalMessage) {
+                session._forceHistoryResync = `${session.agentType} expanded historical transcript content`;
               }
               // Append truly new messages
               for (let k = overlapLen; !skipUnstableNoOverlap && !session._forceHistoryResync && k < dom.length; k++) {
@@ -5156,6 +5911,16 @@ class ProxyEngine extends EventEmitter {
       const transcriptSig = this._transcriptSignature(effectiveMessages);
       const prevObservedCount = session.lastObservedCount ?? session.lastMessageCount;
 
+      // Keep _lastFirstMessageContent in sync with the last KNOWN-STABLE
+      // state (when sig matches lastTranscriptSig, nothing changed since
+      // the last successful sync). When sig changes and we enter the
+      // "in-place mutation" branch below, _lastFirstMessageContent still
+      // reflects the prior chat's first message, so we can compare and
+      // detect a chat switch on the very first observation.
+      if (transcriptSig === session.lastTranscriptSig && effectiveMessages.length > 0) {
+        session._lastFirstMessageContent = (effectiveMessages[0]?.content || '').substring(0, 200);
+      }
+
       if (skipUnstableNoOverlap) {
         session.lastObservedCount = effectiveMessages.length;
         session.lastTranscriptSig = transcriptSig;
@@ -5171,6 +5936,7 @@ class ProxyEngine extends EventEmitter {
         session.lastMessageCount = effectiveMessages.length;
         session.lastObservedCount = effectiveMessages.length;
         session.lastTranscriptSig = transcriptSig;
+        session._lastFirstMessageContent = (effectiveMessages[0]?.content || '').substring(0, 200);
         session.pendingLast = null;
         session.resyncCandidateSig = null;
         session.waitingForAssistant = effectiveMessages.length > 0 && effectiveMessages[effectiveMessages.length - 1].role === 'user';
@@ -5196,6 +5962,7 @@ class ProxyEngine extends EventEmitter {
         session.lastMessageCount = effectiveMessages.length;
         session.lastObservedCount = effectiveMessages.length;
         session.lastTranscriptSig = transcriptSig;
+        session._lastFirstMessageContent = (effectiveMessages[0]?.content || '').substring(0, 200);
         session.pendingLast = null;
         session.resyncCandidateSig = null;
         session.waitingForAssistant = effectiveMessages.length > 0 && effectiveMessages[effectiveMessages.length - 1].role === 'user';
@@ -5207,13 +5974,25 @@ class ProxyEngine extends EventEmitter {
         transcriptSig !== session.lastTranscriptSig &&
         effectiveMessages.length === prevObservedCount
       ) {
-        if (session.resyncCandidateSig === transcriptSig) {
-          this._log('warn', `[${sessionId}] Transcript mutated in place, forcing history snapshot`);
-          this._sendHistorySnapshot(sessionId, effectiveMessages, 'transcript mutation');
+        // Chat switch detection: if the FIRST message content differs from
+        // what we last sent, this isn't a streaming mutation — the user
+        // navigated to a different conversation. Fire the snapshot on the
+        // first observation instead of waiting for a stable repeat (which
+        // added 2-3s of WebUI lag on every chat switch).
+        const firstChanged = (() => {
+          if (!session._lastFirstMessageContent) return false;
+          const newFirst = effectiveMessages[0]?.content || '';
+          return newFirst.substring(0, 200) !== session._lastFirstMessageContent;
+        })();
+        if (firstChanged || session.resyncCandidateSig === transcriptSig) {
+          const reason = firstChanged ? 'chat switch' : 'transcript mutation';
+          this._log('warn', `[${sessionId}] ${reason} detected, forcing history snapshot`);
+          this._sendHistorySnapshot(sessionId, effectiveMessages, reason);
           this._maybePersistAccumulatedMessages(sessionId, session, { force: true });
           session.lastMessageCount = effectiveMessages.length;
           session.lastObservedCount = effectiveMessages.length;
           session.lastTranscriptSig = transcriptSig;
+          session._lastFirstMessageContent = (effectiveMessages[0]?.content || '').substring(0, 200);
           session.pendingLast = null;
           session.resyncCandidateSig = null;
           session.waitingForAssistant = effectiveMessages.length > 0 && effectiveMessages[effectiveMessages.length - 1].role === 'user';
@@ -5384,17 +6163,7 @@ class ProxyEngine extends EventEmitter {
           session._threadListPollCount = 0;
           await selectors.readCodexThreadList(session.client.Runtime, true)
             .then(threads => {
-              if (threads.length > 0) {
-                this._sendToRelay(proto.threadList(sessionId, threads));
-                const activeThread = threads.find(t => t && t.active);
-                const activeThreadKey = activeThread ? `${activeThread.id || ''}:${activeThread.title || ''}` : '';
-                if (activeThreadKey && session._activeThreadKey && activeThreadKey !== session._activeThreadKey) {
-                  this._log('info', `[${sessionId}] Codex Desktop active thread changed; resetting transcript accumulator`);
-                  this._resetTranscriptState(session, 'codex-desktop active thread change');
-                  sessionStore.updateSession(sessionId, { accumulated_messages: null });
-                }
-                if (activeThreadKey) session._activeThreadKey = activeThreadKey;
-              }
+              this._applyCodexDesktopThreadList(sessionId, session, threads);
             })
             .catch(() => {});
         }
@@ -5573,27 +6342,50 @@ class ProxyEngine extends EventEmitter {
         }),
       ]);
       // Surface unusually slow polls — these correspond to long-blocking
-      // CDP evals on the agent's renderer, which the user perceives as the
-      // Codex / Codex Desktop UI being locked up.
+      // CDP evals on the agent's renderer. Legitimate streaming polls take
+      // 1-2s while the renderer's main thread is busy producing content,
+      // so 4s is the threshold that distinguishes "busy" from "stuck".
       const dur = Date.now() - pollStartedAt;
-      const slowThresh = (session.agentType === 'codex' || session.agentType === 'codex-desktop') ? 1500 : 3000;
+      const slowThresh = (session.agentType === 'codex' || session.agentType === 'codex-desktop') ? 4000 : 3000;
       if (dur >= slowThresh) {
         if (this._isCodexSurface(session.agentType)) {
           session._slowCodexPollCount = (session._slowCodexPollCount || 0) + 1;
-          if (session._slowCodexPollCount >= 3) {
-            session._pollBackoffUntil = Date.now() + 10000;
+          if (session._slowCodexPollCount >= 5) {
+            session._pollBackoffUntil = Date.now() + 3000;
             session._slowCodexPollCount = 0;
-            this._log('warn', `[${sessionId}] Codex polling backed off for 10s after repeated slow polls`);
+            this._log('warn', `[${sessionId}] Codex polling backed off for 3s after repeated slow polls`);
           }
         }
         this._log('warn', `[${sessionId}] slow poll: ${dur}ms (agent=${session.agentType})`);
       } else if (this._isCodexSurface(session.agentType)) {
         session._slowCodexPollCount = 0;
       }
+      // Reset timeout counter on successful poll. Tracked on `this` keyed
+      // by targetId so the count persists across the session deletion that
+      // happens on timeout (a rediscovered session gets a fresh object).
+      if (!this._consecutiveTimeoutsByTarget) this._consecutiveTimeoutsByTarget = new Map();
+      if (session.targetId) this._consecutiveTimeoutsByTarget.delete(session.targetId);
     } catch (e) {
       this._log('warn', `[${sessionId}] ${e.message}; closing CDP client for rediscovery`);
       if (this._isCodexSurface(session.agentType)) {
-        this._cooldownCdpTarget(session, e.message, 30000);
+        // Escalating cooldown: a single timeout is often transient (renderer
+        // briefly busy), but consecutive timeouts mean Codex is genuinely
+        // wedged — and continued CDP polling makes recovery slower. Back off
+        // hard so the renderer has breathing room to unwedge itself.
+        if (!this._consecutiveTimeoutsByTarget) this._consecutiveTimeoutsByTarget = new Map();
+        const tid = session.targetId;
+        const prev = this._consecutiveTimeoutsByTarget.get(tid) || 0;
+        const next = prev + 1;
+        this._consecutiveTimeoutsByTarget.set(tid, next);
+        // Escalating: 0s → 10s → 30s → 60s
+        let cooldown = 0;
+        if (next >= 4) cooldown = 60000;
+        else if (next === 3) cooldown = 30000;
+        else if (next === 2) cooldown = 10000;
+        if (cooldown > 0) {
+          this._cooldownCdpTarget(session, e.message, cooldown);
+          this._log('warn', `[${sessionId}] Codex target cooled ${cooldown/1000}s after ${next} consecutive timeouts`);
+        }
       }
       sessionStore.markDisconnected(sessionId);
       await this._safeClose(session.client, `poll close ${sessionId.substring(0,8)}`);
@@ -5618,7 +6410,7 @@ class ProxyEngine extends EventEmitter {
   async _pollPermissions(sessionId) {
     const session = this.sessions.get(sessionId);
     if (!session) return;
-    if (session.agentType === 'claude_cli') return;
+    if (session.agentType === 'claude_cli' || session.agentType === 'codex_cli') return;
     if (session.agentType === 'continue' || session.agentType === 'continue_yolo') {
       try {
         const promptState = await this._withEphemeralIframeClient(session, async client => {
@@ -6324,7 +7116,43 @@ class ProxyEngine extends EventEmitter {
             this._log('warn', `[discover] initial readCodexChatList failed for ${sessionId}: ${e.message}`);
           }
         }
+        let initialThreadList = null;
+        let initialActiveThread = null;
+        let initialActiveThreadKey = '';
+        if (agentType === 'codex-desktop') {
+          try {
+            initialThreadList = await this._withTimeout(
+              selectors.readCodexThreadList(client.Runtime, true),
+              3000,
+              `initial codex desktop thread list ${sessionId.substring(0, 8)}`
+            );
+            initialActiveThread = Array.isArray(initialThreadList) ? initialThreadList.find(t => t && t.active) : null;
+            initialActiveThreadKey = initialActiveThread ? `${initialActiveThread.id || ''}:${initialActiveThread.title || ''}` : '';
+            if (Array.isArray(initialThreadList) && initialThreadList.length > 0) {
+              this._sendToRelay(proto.threadList(sessionId, initialThreadList));
+            }
+          } catch (e) {
+            this._log('warn', `[discover] initial codex desktop thread list failed for ${sessionId}: ${e.message}`);
+          }
+        }
         let storedAccumulated = Array.isArray(sessionMeta.accumulated_messages) ? sessionMeta.accumulated_messages : null;
+        if (agentType === 'codex-desktop') {
+          const storedThreadKey = sessionMeta.codex_desktop_active_thread_key || '';
+          if (storedAccumulated && storedThreadKey && initialActiveThreadKey && storedThreadKey !== initialActiveThreadKey) {
+            this._log('info', `[discover] Codex Desktop active thread changed since last persist; dropping stale accumulated history for ${sessionId}`);
+            storedAccumulated = null;
+            sessionStore.updateSession(sessionId, {
+              accumulated_messages: null,
+              codex_desktop_active_thread_key: initialActiveThreadKey,
+              codex_desktop_active_thread_title: initialActiveThread?.title || null,
+            });
+          } else if (initialActiveThreadKey) {
+            sessionStore.updateSession(sessionId, {
+              codex_desktop_active_thread_key: initialActiveThreadKey,
+              codex_desktop_active_thread_title: initialActiveThread?.title || null,
+            });
+          }
+        }
         let useStoredAccumulated = false;
         if (isAccumAccum && storedAccumulated && domMsgs.length > 0) {
           const windowOffset = this._transcriptWindowOffset(storedAccumulated, domMsgs);
@@ -6392,7 +7220,11 @@ class ProxyEngine extends EventEmitter {
           _continueInnerContextId: (agentType === 'continue' || agentType === 'continue_yolo') ? (client.Runtime?._innerContextId || null) : null,
           _listView:        initialListView,
           _lastChatListSig: initialChatList ? JSON.stringify(initialChatList.map(c => `${c.id || ''}:${c.title || ''}:${!!c.active}`)) : '',
+          _lastThreadListSig: initialThreadList ? JSON.stringify(initialThreadList.map(t => `${t.id || ''}:${t.title || ''}:${!!t.active}:${t.age || ''}`)) : '',
           _activeChatKey:   initialActiveChatKey,
+          _activeThreadTitle: initialActiveThread?.title || null,
+          _activeThreadKey:   initialActiveThreadKey,
+          codexDesktopActiveThreadKey: initialActiveThreadKey,
         });
 
         if (agentType === 'codex') {
@@ -6442,7 +7274,10 @@ class ProxyEngine extends EventEmitter {
         const shouldSendInitialHistory = raw && initialCount > 0 && (
           !isAccumAccum ||
           useStoredAccumulated ||
-          sessionMeta._matched_existing === false
+          sessionMeta._matched_existing === false ||
+          agentType === 'claude' ||
+          agentType === 'codex' ||
+          agentType === 'codex-desktop'
         );
         if (shouldSendInitialHistory) {
           this._sendHistorySnapshot(sessionId, initialMsgs, 'initial discovery');
@@ -6899,6 +7734,7 @@ class ProxyEngine extends EventEmitter {
 
     this.connectRelay();
     await this._discoverClaudeCliSessions();
+    await this._discoverCodexCliSessions();
     await this._discoverTargets();
     await this._refreshAntigravityQuotaUsage(true);
 
@@ -6928,6 +7764,9 @@ class ProxyEngine extends EventEmitter {
         try {
           await this._withTimeout(this._discoverClaudeCliSessions(), 10000, 'tick discoverClaudeCli');
         } catch (e) { this._log('warn', `[poll] discoverClaudeCli: ${e.message}`); }
+        try {
+          await this._withTimeout(this._discoverCodexCliSessions(), 10000, 'tick discoverCodexCli');
+        } catch (e) { this._log('warn', `[poll] discoverCodexCli: ${e.message}`); }
       }
 
       if (tick % 30 === 0 && this.sessions.size > 0) {
@@ -6976,17 +7815,21 @@ class ProxyEngine extends EventEmitter {
         // when actively generating.
         if (session.agentType === 'codex-desktop' || session.agentType === 'claude-desktop') {
           const isActive = session.activity?.kind === 'generating' || session.activity?.kind === 'thinking';
-          let threshold = session.agentType === 'codex-desktop'
-            ? (isActive ? 2 : 6)
-            : (isActive ? 1 : 3);
-          // Adaptive idle backoff: when the cheap dirty-check on Codex
-          // messages has hit many polls in a row, the session is genuinely
-          // idle. Stretch the polling interval (3s → ~10s+) to free the
-          // renderer's main thread completely.
-          if (!isActive && session.agentType === 'codex-desktop') {
-            const cacheStats = selectors.getCodexReadCacheStats(sessionId);
-            if (cacheStats.hits > 20) threshold = Math.max(threshold, 18);
-            else if (cacheStats.hits > 5) threshold = Math.max(threshold, 12);
+          // codex-desktop: 2 ticks active (responsive streaming), 4 ticks
+          // idle (cuts CDP pressure in half during long idle stretches
+          // without making chat-switch detection feel slow). claude-desktop
+          // keeps the prior idle/active distinction.
+          let threshold;
+          if (session.agentType === 'codex-desktop') {
+            threshold = isActive ? 2 : 4;
+            // Wedge backoff: when Codex Desktop has been timing out
+            // repeatedly, the renderer is pegged and any extra CDP pressure
+            // makes recovery slower. Back off to 15 ticks (~15s) until the
+            // health counter clears via a successful poll.
+            const timeoutCount = (this._consecutiveTimeoutsByTarget || new Map()).get(session.targetId) || 0;
+            if (timeoutCount >= 2) threshold = Math.max(threshold, 15);
+          } else {
+            threshold = isActive ? 1 : 3;
           }
           if (!isActive) {
             session._desktopIdlePollCount = (session._desktopIdlePollCount || 0) + 1;
@@ -6999,13 +7842,11 @@ class ProxyEngine extends EventEmitter {
           }
         }
         if (session.agentType === 'codex') {
+          // 3 ticks active, 5 ticks idle. The dirty-check is cheap so we
+          // don't need the old adaptive backoff that stretched to 16/24
+          // ticks (which made chat switches feel broken).
           const isActive = session.activity?.kind === 'generating' || session.activity?.kind === 'thinking';
-          let threshold = isActive ? 3 : 8;
-          if (!isActive) {
-            const cacheStats = selectors.getCodexReadCacheStats(sessionId);
-            if (cacheStats.hits > 20) threshold = Math.max(threshold, 24);
-            else if (cacheStats.hits > 5) threshold = Math.max(threshold, 16);
-          }
+          const threshold = isActive ? 3 : 5;
           session._codexPollCount = (session._codexPollCount || 0) + 1;
           if (session._codexPollCount < threshold) continue;
           session._codexPollCount = 0;

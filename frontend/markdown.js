@@ -894,14 +894,14 @@ function renderIOBlock(io, index) {
 }
 
 function parseFileChangesBlock(content) {
-  const text = String(content || '').replace(/\r\n/g, '\n').trim();
-  if (!text) return null;
-  const lines = text.split('\n').map(line => line.trim()).filter(Boolean);
-  const headerIndex = lines.findIndex(line => /^\d+\s+file(?:\(s\)|s?)\s+changed/i.test(line));
-  if (headerIndex === -1) return null;
-
-  const header = lines[headerIndex];
-  const countMatch = header.match(/^(\d+)\s+file(?:\(s\)|s?)\s+changed(?:\s+in\s+this\s+conversation)?/i);
+  const text = String(content || '').replace(/\r\n/g, '\n');
+  if (!text.trim()) return null;
+  const rawLines = text.split('\n');
+  const headerRe = /^\s*(\d+)\s+file(?:\(s\)|s?)\s+changed(?:\s+in\s+this\s+conversation)?/i;
+  const headerLineIdx = rawLines.findIndex(line => headerRe.test(line));
+  if (headerLineIdx === -1) return null;
+  const header = rawLines[headerLineIdx].trim();
+  const countMatch = header.match(headerRe);
   if (!countMatch) return null;
 
   const totalsFromLine = (line) => {
@@ -913,17 +913,28 @@ function parseFileChangesBlock(content) {
   let pendingAdds = null;
   const entries = [];
   let pendingPath = '';
-  for (const line of lines.slice(headerIndex + 1)) {
-    if (!totals) totals = totalsFromLine(line);
+  // Walk forward; record the last raw-line index that contributed to the
+  // block so we can keep surrounding prose intact (callers can render the
+  // text before/after as normal markdown).
+  let lastConsumedIdx = headerLineIdx;
+  for (let ri = headerLineIdx + 1; ri < rawLines.length; ri++) {
+    const line = rawLines[ri].trim();
+    if (!line) continue; // blank lines don't break the block
+    if (!totals) {
+      const t = totalsFromLine(line);
+      if (t) { totals = t; lastConsumedIdx = ri; continue; }
+    }
     const addsOnly = line.match(/^\+(\d+)$/);
     if (addsOnly) {
       pendingAdds = Number(addsOnly[1]) || 0;
+      lastConsumedIdx = ri;
       continue;
     }
     const delsOnly = line.match(/^-(\d+)$/);
     if (delsOnly && pendingAdds != null && !totals) {
       totals = { adds: pendingAdds, dels: Number(delsOnly[1]) || 0 };
       pendingAdds = null;
+      lastConsumedIdx = ri;
       continue;
     }
     const statsOnly = line.match(/^\+(\d+)\s+(?:Â·|·|-|\s)\s*-?(\d+)$/);
@@ -934,37 +945,53 @@ function parseFileChangesBlock(content) {
         dels: Number(statsOnly[2]) || 0,
       });
       pendingPath = '';
+      lastConsumedIdx = ri;
       continue;
     }
     const entry = line.match(/^(.+?)\s+\+(\d+)\s+(?:Â·|·|-|\s)\s*-?(\d+)(?:\s+.*)?$/);
     if (!entry) {
-      if (looksLikePath(line)) pendingPath = line;
-      continue;
+      if (looksLikePath(line)) {
+        pendingPath = line;
+        lastConsumedIdx = ri;
+        continue;
+      }
+      // Non-matching, non-path line ends the block.
+      break;
     }
     const filepath = entry[1].trim();
-    if (!filepath || /^\+?\d+$/.test(filepath)) continue;
+    if (!filepath || /^\+?\d+$/.test(filepath)) {
+      break;
+    }
     entries.push({
       filepath,
       adds: Number(entry[2]) || 0,
       dels: Number(entry[3]) || 0,
     });
     pendingPath = '';
+    lastConsumedIdx = ri;
   }
+
+  // Require at least one parsed entry — otherwise treat as ordinary prose.
+  // (A bare "9 files changed" mention inside a paragraph should not collapse
+  // the whole assistant message into an empty card.)
+  if (entries.length === 0) return null;
 
   const adds = totals?.adds ?? entries.reduce((sum, entry) => sum + entry.adds, 0);
   const dels = totals?.dels ?? entries.reduce((sum, entry) => sum + entry.dels, 0);
+  const beforeText = rawLines.slice(0, headerLineIdx).join('\n').replace(/\s+$/g, '');
+  const afterText = rawLines.slice(lastConsumedIdx + 1).join('\n').replace(/^\s+/g, '');
   return {
     count: Number(countMatch[1]) || entries.length,
     title: header.replace(/\s+\+\d+.*$/, '').trim(),
     adds,
     dels,
     entries,
+    beforeText,
+    afterText,
   };
 }
 
-function renderFileChangesBlock(content, index) {
-  const parsed = parseFileChangesBlock(content);
-  if (!parsed) return null;
+function renderFileChangesBlockFromParsed(parsed, index) {
   const entryHtml = parsed.entries.map(entry => {
     const path = escapeHtml(entry.filepath);
     return `<div class="file-changes-item">
@@ -1061,8 +1088,18 @@ function renderStructuredContent(content) {
       // Detect compact IN/OUT block before falling through to full markdown rendering
       const io = parseIOBlock(chunk.content);
       if (io) return renderIOBlock(io, index);
-      const fileChanges = renderFileChangesBlock(chunk.content, index);
-      if (fileChanges) return fileChanges;
+      // File-changes summary may be embedded in surrounding prose (Codex Desktop
+      // emits "Implemented X.\n\nVerified: ...\n\n3 files changed +A -D\npath/a +A -D\n...\n\nWorked for 5m").
+      // Split the chunk so the prose either side renders as normal markdown and
+      // the summary card sits between them — otherwise the whole assistant turn
+      // would collapse to just the file list.
+      const fileChangesParsed = parseFileChangesBlock(chunk.content);
+      if (fileChangesParsed) {
+        const cardHtml = renderFileChangesBlockFromParsed(fileChangesParsed, index);
+        const beforeHtml = (fileChangesParsed.beforeText || '').trim() ? marked.parse(fileChangesParsed.beforeText) : '';
+        const afterHtml = (fileChangesParsed.afterText || '').trim() ? marked.parse(fileChangesParsed.afterText) : '';
+        return beforeHtml + cardHtml + afterHtml;
+      }
       // Skip empty/whitespace-only markdown chunks
       if (!(chunk.content || '').trim()) return '';
       return marked.parse(chunk.content || '');

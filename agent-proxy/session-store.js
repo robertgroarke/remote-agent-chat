@@ -152,7 +152,7 @@ function resolveSession({ target, windowTitle, agentType, workspaceName, workspa
   // Create a new durable session
   const session_id = crypto.randomUUID();
   const now = new Date().toISOString();
-  const displayNames = { claude: 'Claude Code', codex: 'Codex', gemini: 'Gemini', antigravity: 'Antigravity', continue: 'Continue' };
+  const displayNames = { claude: 'Claude Code', claude_cli: 'Claude Code CLI', codex: 'Codex', codex_cli: 'Codex CLI', gemini: 'Gemini', antigravity: 'Antigravity', continue: 'Continue' };
 
   const session = {
     session_id,
@@ -204,6 +204,7 @@ function resolveVirtualSession({ virtualId, agentType, displayName, workspaceNam
     claude: 'Claude Code',
     claude_cli: 'Claude Code CLI',
     codex: 'Codex',
+    codex_cli: 'Codex CLI',
     gemini: 'Gemini',
     antigravity: 'Antigravity',
     continue: 'Continue',

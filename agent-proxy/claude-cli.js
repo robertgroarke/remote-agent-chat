@@ -357,6 +357,56 @@ function startNativeClaudeWindow({ workspacePath, cliSessionId, resume = true, m
   return child;
 }
 
+function trustWorkspace({ workspacePath, model, effort, permissionMode, timeoutMs = 8000 } = {}) {
+  return new Promise((resolve) => {
+    const cwd = workspacePath || process.cwd();
+    let child;
+    let settled = false;
+    const chunks = [];
+    const finish = (ok, detail) => {
+      if (settled) return;
+      settled = true;
+      if (timer) clearTimeout(timer);
+      try { if (child && !child.killed) child.kill(); } catch {}
+      resolve({ ok, detail: detail || chunks.join('').slice(-1000) });
+    };
+    let timer = null;
+    try {
+      const useOllamaLaunch = isOllamaLaunchModel(model);
+      const args = buildClaudeArgs({
+        model,
+        effort,
+        permissionMode,
+        includeModel: !useOllamaLaunch,
+      });
+      const { command, spawnArgs } = buildSpawnCommand(args, { model });
+      child = spawn(command, spawnArgs, {
+        cwd,
+        shell: false,
+        stdio: ['pipe', 'pipe', 'pipe'],
+        windowsHide: true,
+      });
+      const onData = chunk => {
+        const text = chunk.toString('utf8');
+        chunks.push(text);
+        if (/Yes,\s*I trust this folder|Enter to confirm|Quick safety check/i.test(text)) {
+          try { child.stdin.write('1\r\n'); } catch {}
+        }
+        if (/Type a message|Welcome back|bypass permissions|What's new/i.test(chunks.join(''))) {
+          setTimeout(() => finish(true, 'workspace trusted'), 500);
+        }
+      };
+      child.stdout.on('data', onData);
+      child.stderr.on('data', onData);
+      child.on('close', code => finish(code === 0, `Claude CLI exited with code ${code}`));
+      child.on('error', err => finish(false, err.message));
+      timer = setTimeout(() => finish(true, 'trust action sent; timed out waiting for Claude prompt to settle'), timeoutMs);
+    } catch (e) {
+      finish(false, e.message);
+    }
+  });
+}
+
 module.exports = {
   CLAUDE_CLI_MODELS,
   CLAUDE_CLI_EFFORTS,
@@ -368,4 +418,5 @@ module.exports = {
   startClaudePrintSession,
   startInteractiveClaude,
   startNativeClaudeWindow,
+  trustWorkspace,
 };

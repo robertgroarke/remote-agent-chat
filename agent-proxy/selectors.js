@@ -137,8 +137,46 @@ function _expandCodexCompactFileLines(text) {
   return out.join('\n');
 }
 
+function _dedupeCodexMalformedShellLines(lines) {
+  const out = [];
+  const seen = new Set();
+  for (const rawLine of lines) {
+    const line = String(rawLine || '').trim();
+    if (!line) continue;
+    if (/^Shell$/i.test(line)) continue;
+    if (/^Running command(?:\s+for\s+[\dsmh ]+)?$/i.test(line)) continue;
+    const key = line;
+    if (seen.has(key)) continue;
+    seen.add(key);
+    out.push(line);
+  }
+  return out;
+}
+
+function _repairCodexMalformedShellBlocks(content) {
+  return String(content || '').replace(/\[Bash\s+(?:command|shell)\]\nShell\n([\s\S]*?)\n?\[end\]/gi, (match, body) => {
+    const lines = String(body || '').split('\n').map(line => String(line || '').trim()).filter(Boolean);
+    const blocks = [];
+    for (let i = 0; i < lines.length; i++) {
+      if (/^Shell$/i.test(lines[i]) || /^Running command(?:\s+for\s+[\dsmh ]+)?$/i.test(lines[i])) continue;
+      if (!/^\$\s+/.test(lines[i])) continue;
+      const command = lines[i].replace(/^\$\s+/, '').trim();
+      if (!command) continue;
+      const bodyLines = [];
+      for (i = i + 1; i < lines.length; i++) {
+        const line = lines[i];
+        if (/^Shell$/i.test(line) && i + 1 < lines.length && /^\$\s+/.test(lines[i + 1])) break;
+        if (/^\$\s+/.test(line)) { i--; break; }
+        bodyLines.push(line);
+      }
+      blocks.push(_codexToolBlock(`Bash ${command}`, _dedupeCodexMalformedShellLines(bodyLines).join('\n')));
+    }
+    return blocks.length > 0 ? blocks.join('\n\n') : match;
+  });
+}
+
 function _expandCodexCompactActivities(content) {
-  let text = String(content || '');
+  let text = _repairCodexMalformedShellBlocks(content);
   text = text.replace(/\[Bash\s+\d+\s+commands?\]\n([\s\S]*?)\n?\[end\]/gi, (match, body) => {
     return _expandCodexCommandGroup(body) || match;
   });
@@ -152,7 +190,7 @@ function _expandCodexCompactActivities(content) {
     last = re.lastIndex;
   }
   out += _expandCodexCompactFileLines(text.slice(last));
-  return out;
+  return _repairCodexMalformedShellBlocks(out);
 }
 
 function expandCodexMessagesRaw(raw) {
@@ -325,14 +363,48 @@ function getCodexCachedThinking(sessionId) {
 const CODEX_DOM_SIG_EXPR = `
   var c = d.querySelector('[data-thread-find-target="conversation"]');
   if (!c) return '';
-  var n = c.children ? c.children.length : 0;
-  var l = c.lastElementChild;
-  var ll = '';
-  if (l) {
-    var lt = l.textContent || '';
-    ll = (l.children ? l.children.length : 0) + ':' + lt.length;
+  function _codexActivitySig() {
+    function visible(el) {
+      return !!(el && el.offsetParent !== null);
+    }
+    var stopBtn = Array.from(d.querySelectorAll('button[aria-label*="Stop" i], button[aria-label*="stop" i]'))
+      .find(function(btn) { return visible(btn) && !btn.closest('nav'); });
+    var shimmerCount = 0;
+    var shimmers = c.querySelectorAll('span[class*="loading-shimmer"]');
+    for (var si = 0; si < shimmers.length; si++) {
+      var st = (shimmers[si].textContent || '').trim();
+      if ((st === 'Thinking' || st === 'Generating') && visible(shimmers[si])) shimmerCount++;
+    }
+    return '|a:' + (stopBtn ? '1' : '0') + ':' + shimmerCount;
   }
-  return n + '|' + ll;
+  var activitySig = _codexActivitySig();
+  // Prefer [data-content-search-unit-key] — newer Codex Desktop builds
+  // dropped the turn-key wrapper attribute but kept unit-keys. Unit keys
+  // follow {turnId}:{index}:{role} so first/last cover chat-switch and
+  // structural changes; last unit's textContent length captures streaming.
+  var units = c.querySelectorAll('[data-content-search-unit-key]');
+  if (units.length > 0) {
+    var firstUnit = units[0];
+    var lastUnit = units[units.length - 1];
+    var firstKey = firstUnit.getAttribute('data-content-search-unit-key') || '';
+    var lastKey = lastUnit.getAttribute('data-content-search-unit-key') || '';
+    return 'u|' + units.length + '|' + firstKey + '|' + lastKey + '|' + (lastUnit.textContent || '').length + activitySig;
+  }
+  // Older turn-key-based DOMs (sidepane often, older desktop)
+  var turns = c.querySelectorAll('[data-content-search-turn-key]');
+  if (turns.length > 0) {
+    var firstTurnKey = turns[0].getAttribute('data-content-search-turn-key') || '';
+    var lastTurn = turns[turns.length - 1];
+    var lastTurnKey = lastTurn.getAttribute('data-content-search-turn-key') || '';
+    return 't|' + turns.length + '|' + firstTurnKey + '|' + lastTurnKey + '|' + (lastTurn.textContent || '').length + activitySig;
+  }
+  // Sidepane structural fallback
+  var gap3 = c.querySelector('.flex.flex-col.gap-3');
+  if (gap3 && gap3.lastElementChild) {
+    var last = gap3.lastElementChild;
+    return 'g|' + gap3.children.length + '|' + last.children.length + '|' + (last.textContent || '').length + activitySig;
+  }
+  return 'r|' + c.children.length + '|' + (c.textContent || '').length + activitySig;
 `;
 
 // ─── Diagnostic snapshot ──────────────────────────────────────────────────────
@@ -757,8 +829,9 @@ async function detectThinking(Runtime, agentType) {
         var isThinking = false;
         var hasStopSignal = false;
         var hasShimmerSignal = false;
-        var stopBtn = d.querySelector('button[aria-label*="Stop" i], button[aria-label*="stop" i]');
-        if (stopBtn && stopBtn.offsetParent !== null) {
+        var stopBtn = Array.from(d.querySelectorAll('button[aria-label*="Stop" i], button[aria-label*="stop" i]'))
+          .find(function(btn) { return btn.offsetParent !== null && !btn.closest('nav'); });
+        if (stopBtn) {
           isThinking = true;
           hasStopSignal = true;
         }
@@ -787,11 +860,18 @@ async function detectThinking(Runtime, agentType) {
             }
           }
         }
-        // Codex Desktop: also check for animate-spin spinner (strong thinking signal)
+        // Codex Desktop: also check for animate-spin spinner, but never from
+        // the sidebar. Codex keeps per-thread sidebar spinners for other
+        // chats, and treating those as document-level activity marks every
+        // WebUI Codex Desktop session as thinking.
         var hasSpinnerSignal = false;
         if (isDesktopApp && !isThinking) {
-          var spinner = d.querySelector('[class*="animate-spin"]');
-          if (spinner && spinner.offsetParent !== null) {
+          var spinnerRoot = d.querySelector('[data-thread-find-target="conversation"]') ||
+            d.querySelector('main') ||
+            d.body;
+          var spinner = Array.from(spinnerRoot.querySelectorAll('[class*="animate-spin"]'))
+            .find(function(el) { return el.offsetParent !== null && !el.closest('nav'); });
+          if (spinner) {
             isThinking = true;
             hasSpinnerSignal = true;
           }
@@ -1184,21 +1264,35 @@ function buildClaudeReadExpr(userClass, userText, userTextAlt) {
       var text = (bodyText || '').replace(/\\r\\n/g, '\\n').trim();
       if (!text) return '';
       var lowerHeader = String(header || '').toLowerCase();
-      var lines = text.split('\\n').map(function(line) { return line.trim(); }).filter(Boolean);
+      var lines = text.split('\\n').map(function(line) { return String(line || '').replace(/\\s+$/g, ''); });
       var filtered = [];
-      var seen = {};
-      lines.forEach(function(line) {
-        var lower = line.toLowerCase();
-        if (!line) return;
+      lines.forEach(function(rawLine) {
+        var line = String(rawLine || '');
+        var trimmed = line.trim();
+        var lower = trimmed.toLowerCase();
+        if (!trimmed) {
+          if (filtered.length > 0 && filtered[filtered.length - 1] !== '') filtered.push('');
+          return;
+        }
         if (lower === lowerHeader) return;
-        if (seen[lower]) return;
-        seen[lower] = true;
         filtered.push(line);
       });
+      while (filtered.length > 0 && filtered[0] === '') filtered.shift();
+      while (filtered.length > 0 && filtered[filtered.length - 1] === '') filtered.pop();
       if (filtered.length === 0) return '';
-      if (/^read\b/i.test(lowerHeader)) return '';
-      var limit = (/^(glob|grep|search|find)\b/i.test(lowerHeader)) ? 2 : 3;
-      return filtered.slice(0, limit).join('\\n').substring(0, 600).trim();
+      // Fidelity matters more than tiny cards: preserve real tool output and
+      // only bound extreme cases so a single tool cannot wedge the relay/UI.
+      var maxLines = (/^(glob|grep|search|find)\b/i.test(lowerHeader)) ? 400 : 1200;
+      var maxChars = 60000;
+      var visible = filtered.slice(0, maxLines);
+      var result = visible.join('\\n').trim();
+      if (filtered.length > maxLines) {
+        result += '\\n...[truncated: ' + (filtered.length - maxLines) + ' more lines]';
+      }
+      if (result.length > maxChars) {
+        result = result.substring(0, maxChars).replace(/\\s+$/g, '') + '\\n...[truncated by scraper]';
+      }
+      return result;
     }
 
     function nodeToText(node) {
@@ -1438,6 +1532,141 @@ const CODEX_READ_EXPR = `
   // or as direct children (for simple responses like "Received.").
   var gap3 = conv ? conv.querySelector('.flex.flex-col.gap-3') : null;
   if (gap3 && gap3.children.length > 0) {
+    function _codexWorkedCache() {
+      try {
+        var w = d.defaultView || window;
+        w.__remoteAgentCodexWorkedCache = w.__remoteAgentCodexWorkedCache || {};
+        return w.__remoteAgentCodexWorkedCache;
+      } catch (_) {
+        return {};
+      }
+    }
+
+    function _codexWorkedTurnKey(btn) {
+      var turn = btn.closest && btn.closest('[data-turn-key], [data-content-search-turn-key]');
+      if (turn) {
+        return turn.getAttribute('data-turn-key') || turn.getAttribute('data-content-search-turn-key') || '';
+      }
+      var unit = btn.closest && btn.closest('[data-content-search-unit-key]');
+      if (unit) {
+        var unitKey = unit.getAttribute('data-content-search-unit-key') || '';
+        if (unitKey) return unitKey.split(':')[0];
+      }
+      var label = String((btn.innerText || btn.textContent || '')).trim().substring(0, 80);
+      var idx = -1;
+      var root = btn.closest && btn.closest('.flex.flex-col.gap-3');
+      if (root) {
+        var worked = Array.from(root.querySelectorAll('button[aria-expanded]')).filter(function(b) {
+          var t = (b.innerText || b.textContent || '').trim();
+          return /^Worked for /i.test(t) || /^Working for /i.test(t);
+        });
+        idx = worked.indexOf(btn);
+      }
+      return label + '|' + idx;
+    }
+
+    function _codexWorkedExpandedContainer(btn) {
+      var btnText = String(btn.innerText || btn.textContent || '');
+      var parent = btn.parentElement;
+      var best = null;
+      var bestLen = 0;
+      for (var depth = 0; parent && depth < 5; depth++, parent = parent.parentElement) {
+        if (parent.matches && parent.matches('[data-thread-find-target="conversation"], main, body')) break;
+        var children = Array.from(parent.children || []);
+        for (var i = 0; i < children.length; i++) {
+          var child = children[i];
+          if (child.contains && child.contains(btn)) continue;
+          var text = String(child.innerText || child.textContent || '');
+          var len = text.length;
+          if (len > btnText.length + 40 && len < 90000 && len > bestLen) {
+            best = child;
+            bestLen = len;
+          }
+        }
+      }
+      if (best) return best;
+      var fallback = btn.parentElement;
+      for (var fdepth = 0; fallback && fdepth < 4; fdepth++, fallback = fallback.parentElement) {
+        if (fallback.matches && fallback.matches('[data-thread-find-target="conversation"], main, body')) break;
+        var raw = String(fallback.innerText || fallback.textContent || '');
+        if (raw.length > btnText.length + 40 && raw.length < 90000) return fallback;
+      }
+      return null;
+    }
+
+    function _codexWorkedBodyText(btn) {
+      var container = _codexWorkedExpandedContainer(btn);
+      if (!container) return '';
+      var clone = container.cloneNode(true);
+      Array.from(clone.querySelectorAll('button, svg, path')).forEach(function(node) {
+        if (node && node.parentNode) node.parentNode.removeChild(node);
+      });
+      var text = (clone.innerText || clone.textContent || '').replace(/\\r\\n/g, '\\n');
+      var status = String(btn.innerText || btn.textContent || '').replace(/\\s+/g, ' ').trim();
+      var lines = text.split('\\n').map(function(line) { return line.replace(/\\s+$/g, ''); });
+      var kept = [];
+      for (var i = 0; i < lines.length; i++) {
+        var line = String(lines[i] || '').trim();
+        if (!line) {
+          if (kept.length > 0 && kept[kept.length - 1] !== '') kept.push('');
+          continue;
+        }
+        if (status && line.replace(/\\s+/g, ' ').trim() === status) continue;
+        if (/^(Copy|Copy message|Fork|Undo|Review)$/i.test(line)) continue;
+        kept.push(lines[i]);
+      }
+      while (kept.length > 0 && kept[0] === '') kept.shift();
+      while (kept.length > 0 && kept[kept.length - 1] === '') kept.pop();
+      var cleaned = kept.join('\\n').replace(/\\n{3,}/g, '\\n\\n').trim();
+      if (cleaned.length > 70000) {
+        return cleaned.substring(0, 70000).replace(/\\s+$/g, '') + '\\n...[truncated by scraper]';
+      }
+      return cleaned;
+    }
+
+    function _cachedCodexWorkedBodyFor(btn) {
+      var cache = _codexWorkedCache();
+      var key = _codexWorkedTurnKey(btn);
+      if (key && cache[key]) return String(cache[key]);
+      return '';
+    }
+
+    async function _primeCodexWorkedForTurns(root) {
+      var cache = _codexWorkedCache();
+      var buttons = Array.from(root.querySelectorAll('button[aria-expanded]')).filter(function(b) {
+        var t = (b.innerText || b.textContent || '').trim();
+        return /^Worked for /i.test(t) || /^Working for /i.test(t);
+      });
+      var clicked = 0;
+      var budget = 8;
+      for (var i = buttons.length - 1; i >= 0 && clicked < budget; i--) {
+        var btn = buttons[i];
+        var key = _codexWorkedTurnKey(btn);
+        if (key && cache[key]) continue;
+        if (btn.getAttribute('aria-expanded') === 'true') continue;
+        try {
+          btn.click();
+          clicked++;
+        } catch (_) {}
+      }
+      if (clicked > 0) {
+        await new Promise(function(resolve) { setTimeout(resolve, 80); });
+      }
+      var expanded = Array.from(root.querySelectorAll('button[aria-expanded="true"]')).filter(function(b) {
+        var t = (b.innerText || b.textContent || '').trim();
+        return /^Worked for /i.test(t) || /^Working for /i.test(t);
+      });
+      for (var ei = 0; ei < expanded.length; ei++) {
+        var expandedBtn = expanded[ei];
+        var expandedKey = _codexWorkedTurnKey(expandedBtn);
+        if (!expandedKey) continue;
+        var body = _codexWorkedBodyText(expandedBtn);
+        if (body) cache[expandedKey] = body;
+      }
+    }
+
+    await _primeCodexWorkedForTurns(gap3);
+
     var allItems = [];
     for (var gi = 0; gi < gap3.children.length; gi++) {
       var turn = gap3.children[gi];
@@ -1578,25 +1807,22 @@ const CODEX_READ_EXPR = `
       pendingAssistant = [];
     }
 
-    // Bounded ephemeral prime. textContent serializes the entire subtree
-    // synchronously on the renderer thread; the previous version walked up
-    // to 80 rows per poll and read textContent of large parent containers,
-    // which froze the Codex side pane on long sessions. Now: at most 4 rows
-    // per poll, no multi-level container climb, and a negative-cache sentinel
-    // so unreadable rows aren't re-attempted on every subsequent poll.
+    // Bounded ephemeral prime: shallow read only, no expansion clicks. This
+    // preserves already-mounted details without climbing into the full chat.
     var _CODEX_PRIME_NULL = '\\x00';
-    var _CODEX_PRIME_BUDGET = 4;
+    var _CODEX_PRIME_BUDGET = 16;
 
     function _readCodexCollapsedRowBody(row) {
       var rowText = String(row.innerText || '');
       var firstLine = rowText.split('\\n')[0] || '';
       // Row already has its body inline (user expanded it manually).
       if (rowText.length > firstLine.length + 30) return rowText;
-      // Otherwise check the row's immediate parent only.
       var parent = row.parentElement;
-      if (!parent) return '';
-      var raw = String(parent.textContent || '');
-      if (raw.length > rowText.length + 30) return raw;
+      for (var depth = 0; parent && depth < 4; depth++, parent = parent.parentElement) {
+        if (parent.matches && parent.matches('[data-thread-find-target="conversation"], main, body')) break;
+        var raw = String(parent.innerText || parent.textContent || '');
+        if (raw.length > rowText.length + 30 && raw.length < 50000) return raw;
+      }
       return '';
     }
 
@@ -1638,7 +1864,7 @@ const CODEX_READ_EXPR = `
       if (!contentCol) return '';
       var diffLines = [];
       var children = contentCol.children;
-      for (var li = 0; li < children.length && diffLines.length < 200; li++) {
+      for (var li = 0; li < children.length && diffLines.length < 1000; li++) {
         var line = children[li];
         var lineType = line.getAttribute('data-line-type') || '';
         var lineText = (line.innerText || line.textContent || '');
@@ -1774,7 +2000,10 @@ const CODEX_READ_EXPR = `
       while (kept.length > 0 && kept[0] === '') kept.shift();
       while (kept.length > 0 && kept[kept.length - 1] === '') kept.pop();
       var cleaned = kept.join('\\n').trim();
-      if (!cleaned || cleaned.length > 8000) return '';
+      if (!cleaned) return '';
+      if (cleaned.length > 60000) {
+        return cleaned.substring(0, 60000).replace(/\\s+$/g, '') + '\\n...[truncated by scraper]';
+      }
       return cleaned;
     }
 
@@ -1845,6 +2074,8 @@ const CODEX_READ_EXPR = `
       if (statusBtn && /Worked for/i.test(statusBtn.textContent)) {
         var workedText = (statusBtn.textContent || '').trim();
         pendingAssistant.push(workedText);
+        var workedBody = _cachedCodexWorkedBodyFor(statusBtn);
+        if (workedBody) pendingAssistant.push(workedBody);
         var completedText = _extractCompletedTaskText(el, workedText);
         if (completedText) pendingAssistant.push(completedText);
         var completedFileSummaries = _extractFileChangeSummaryCards(el);
@@ -2104,15 +2335,17 @@ const CODEX_DESKTOP_READ_EXPR = `
   // The previous version did a 6-level textContent climb per button which
   // froze the renderer for seconds on long sessions.
   var _DESKTOP_PRIME_NULL = '\\x00';
-  var _DESKTOP_PRIME_BUDGET = 4;
+  var _DESKTOP_PRIME_BUDGET = 16;
 
   function _desktopCaptureExpandedBox(btn) {
-    var btnText = String(btn.textContent || '');
+    var btnText = String(btn.innerText || btn.textContent || '');
     if (btnText.length > 80) return btnText.trim();
     var parent = btn.parentElement;
-    if (!parent) return '';
-    var pt = String(parent.textContent || '');
-    if (pt.length > btnText.length + 50) return pt.trim();
+    for (var depth = 0; parent && depth < 4; depth++, parent = parent.parentElement) {
+      if (parent.matches && parent.matches('[data-thread-find-target="conversation"], main, body')) break;
+      var pt = String(parent.innerText || parent.textContent || '');
+      if (pt.length > btnText.length + 50 && pt.length < 50000) return pt.trim();
+    }
     return '';
   }
 
@@ -2385,6 +2618,47 @@ const CODEX_DESKTOP_READ_EXPR = `
     if (!text) return [];
     var lines = text.split('\\n').map(function(line) { return String(line || '').trim(); }).filter(Boolean);
     if (lines.length === 0) return [];
+    function dedupeAdjacentOutputLines(rawLines) {
+      var out = [];
+      for (var di = 0; di < rawLines.length; di++) {
+        var line = String(rawLines[di] || '').trim();
+        if (!line) continue;
+        if (out.length > 0 && out[out.length - 1] === line) continue;
+        out.push(line);
+      }
+      var half = Math.floor(out.length / 2);
+      if (half > 0 && out.length % 2 === 0) {
+        var firstHalf = out.slice(0, half).join('\\n');
+        var secondHalf = out.slice(half).join('\\n');
+        if (firstHalf === secondHalf) return out.slice(0, half);
+      }
+      return out;
+    }
+    function parseCollapsedShellLines(rawLines) {
+      var shellIdx = -1;
+      for (var si = 0; si < rawLines.length; si++) {
+        if (/^Shell$/i.test(rawLines[si])) { shellIdx = si; break; }
+      }
+      var searchFrom = shellIdx >= 0 ? shellIdx + 1 : 0;
+      var cmdIdx = -1;
+      for (var ci = searchFrom; ci < rawLines.length; ci++) {
+        if (/^\\$\\s+/.test(rawLines[ci])) { cmdIdx = ci; break; }
+      }
+      if (cmdIdx < 0) return null;
+      var cmd = rawLines[cmdIdx].replace(/^\\$\\s+/, '').trim();
+      if (!cmd) return null;
+      var bodyLines = [];
+      for (var bi = cmdIdx + 1; bi < rawLines.length; bi++) {
+        var bodyLine = String(rawLines[bi] || '').trim();
+        if (!bodyLine || /^Shell$/i.test(bodyLine)) continue;
+        if (/^Running command(?:\\s+for\\s+[\\dsmh ]+)?$/i.test(bodyLine)) continue;
+        if (/^\\$\\s+/.test(bodyLine)) break;
+        if (bodyLine === cmd) continue;
+        bodyLines.push(bodyLine);
+      }
+      bodyLines = dedupeAdjacentOutputLines(bodyLines);
+      return { command: cmd, body: squashNewlines(bodyLines.join('\\n')) };
+    }
     function toolBlock(name, body) {
       var safeBody = typeof body === 'string' ? body.trim() : '';
       // Don't synthesise "Command completed" / "Edited file" placeholder
@@ -2394,6 +2668,10 @@ const CODEX_DESKTOP_READ_EXPR = `
     }
     var summary = lines[0];
     var bodyText = squashNewlines(lines.slice(1).join('\\n'));
+    var shell = parseCollapsedShellLines(lines);
+    if (shell) {
+      return [toolBlock('Bash ' + shell.command, shell.body)];
+    }
     if (/^Ran(?:\\s+\\d+\\s+commands?)?$/i.test(summary)) {
       return [toolBlock('Bash ' + summary.replace(/^Ran\\s*/i, '').trim(), bodyText)];
     }
@@ -2404,6 +2682,8 @@ const CODEX_DESKTOP_READ_EXPR = `
       var ranMatch = lines[i].match(/^Ran\\s+(.+)$/i);
       if (ranMatch) {
         var remaining = lines.slice(i + 1).join('\\n');
+        var remainingShell = parseCollapsedShellLines(lines.slice(i + 1));
+        if (remainingShell) return [toolBlock('Bash ' + remainingShell.command, remainingShell.body)];
         return [toolBlock('Bash ' + ranMatch[1].trim(), remaining)];
       }
       if (/^Edited$/i.test(lines[i])) {
@@ -2419,16 +2699,46 @@ const CODEX_DESKTOP_READ_EXPR = `
     if (!block) return '';
     var text = cleanText(block.innerText || block.textContent || '', 'assistant');
     if (!text) return '';
+    function outputForBlock() {
+      var commandText = cleanText(block.innerText || block.textContent || '', 'assistant');
+      var parent = block.parentElement;
+      for (var depth = 0; parent && depth < 6; depth++, parent = parent.parentElement) {
+        if (parent.matches && parent.matches('[data-thread-find-target="conversation"], main, body')) break;
+        var commands = Array.from(parent.querySelectorAll('[class*="group/command"]'));
+        if (commands.length !== 1 || commands[0] !== block) continue;
+        var outputs = Array.from(parent.querySelectorAll('[class*="group/output"]'));
+        for (var oi = 0; oi < outputs.length; oi++) {
+          if (outputs[oi].contains && outputs[oi].contains(block)) continue;
+          var out = cleanText(outputs[oi].innerText || outputs[oi].textContent || '', 'assistant');
+          if (out) return out;
+        }
+        var raw = cleanText(parent.innerText || parent.textContent || '', 'assistant');
+        if (raw.length <= commandText.length + 20) continue;
+        var rawLines = raw.split('\\n').map(function(line) { return String(line || '').trim(); });
+        var kept = [];
+        for (var ri = 0; ri < rawLines.length; ri++) {
+          var rawLine = rawLines[ri];
+          if (!rawLine || /^Shell$/i.test(rawLine)) continue;
+          if (rawLine === commandText || rawLine.indexOf(commandText) === 0) continue;
+          kept.push(rawLine);
+        }
+        var fallback = squashNewlines(kept.join('\\n'));
+        if (fallback) return fallback;
+      }
+      return '';
+    }
     var lines = text.split('\\n').map(function(line) { return String(line || '').trim(); });
     var commandLine = lines.find(function(line) { return /^\\$\\s+/.test(line); }) || '';
     var bodyStart = commandLine ? lines.indexOf(commandLine) + 1 : 0;
     var body = squashNewlines(lines.slice(bodyStart).join('\\n'));
+    var siblingOutput = outputForBlock();
+    if (!body && siblingOutput) body = siblingOutput;
     if (commandLine) {
       return '[Bash ' + commandLine.replace(/^\\$\\s+/, '').trim() + ']\\n' + (body ? body + '\\n' : '') + '[end]';
     }
     var first = lines.find(function(line) { return !!line; }) || '';
     if (/^Ran\\s+/i.test(first)) {
-      return '[Bash ' + first.replace(/^Ran\\s+/i, '').trim() + ']\\n[end]';
+      return '[Bash ' + first.replace(/^Ran\\s+/i, '').trim() + ']\\n' + (body ? body + '\\n' : '') + '[end]';
     }
     return '';
   }
@@ -2525,20 +2835,212 @@ const CODEX_DESKTOP_READ_EXPR = `
     return '';
   }
 
+  // ─── Desktop "Worked for X" expansion cache ──────────────────────────
+  // Codex Desktop collapses the per-turn reasoning + tool-call trace behind a
+  // "Worked for X" toggle as soon as a turn completes. The intermediate work
+  // (tool output, reasoning, "Working…" stream) only lives in the DOM while
+  // that toggle is expanded. We click each collapsed toggle once per page,
+  // snapshot the expanded body keyed by the parent's data-turn-key, then
+  // leave it expanded so subsequent polls keep seeing the live content. The
+  // cache survives even if Codex later re-collapses or virtualises the row.
+  function _desktopWorkedCache() {
+    try {
+      var w = d.defaultView || window;
+      w.__remoteAgentCodexDesktopWorkedCache = w.__remoteAgentCodexDesktopWorkedCache || {};
+      return w.__remoteAgentCodexDesktopWorkedCache;
+    } catch (_) {
+      return {};
+    }
+  }
+
+  function _desktopWorkedTurnKey(btn) {
+    var turn = btn.closest && btn.closest('[data-turn-key]');
+    if (turn) return turn.getAttribute('data-turn-key') || '';
+    var unit = btn.closest && btn.closest('[data-content-search-unit-key]');
+    if (unit) {
+      var k = unit.getAttribute('data-content-search-unit-key') || '';
+      return k.split(':')[0];
+    }
+    // Fallback: button text is per-duration (e.g. "Worked for 7m 25s") and
+    // unique enough within a single conversation to use as a key.
+    return (btn.innerText || btn.textContent || '').trim().substring(0, 80);
+  }
+
+  function _desktopWorkedExpandedContainer(btn) {
+    // Structure: <div.flex.flex-col>{button-wrapper}{spacer}{expanded-content}</div>
+    var grandparent = btn.parentElement && btn.parentElement.parentElement;
+    if (!grandparent) return null;
+    // The expanded body is the longest sibling that isn't the button wrapper.
+    var siblings = Array.from(grandparent.children || []);
+    var best = null;
+    var bestLen = 0;
+    for (var i = 0; i < siblings.length; i++) {
+      var sib = siblings[i];
+      if (sib.contains(btn)) continue;
+      var len = (sib.innerText || '').length;
+      if (len > bestLen) { bestLen = len; best = sib; }
+    }
+    return bestLen > 0 ? best : null;
+  }
+
+  function _desktopWorkedBodyText(btn) {
+    var container = _desktopWorkedExpandedContainer(btn);
+    if (!container) return '';
+    var clone = container.cloneNode(true);
+    // Strip buttons (copy/fork/etc.) and SVGs so the text is clean.
+    Array.from(clone.querySelectorAll('button, svg, path')).forEach(function(node) {
+      if (node && node.parentNode) node.parentNode.removeChild(node);
+    });
+    var text = (clone.innerText || clone.textContent || '').replace(/\\r\\n/g, '\\n');
+    // Squash 3+ blank lines, trim trailing whitespace per line.
+    text = text.split('\\n').map(function(l) { return l.replace(/\\s+$/g, ''); }).join('\\n');
+    text = text.replace(/\\n{3,}/g, '\\n\\n').trim();
+    return text;
+  }
+
+  function _DESKTOP_WORKED_PRIME_BUDGET() { return 12; }
+
+  async function _primeDesktopWorkedForTurns() {
+    var cache = _desktopWorkedCache();
+    var convoEl = d.querySelector('[data-thread-find-target="conversation"]');
+    if (!convoEl) return;
+    var btns = Array.from(convoEl.querySelectorAll('button[aria-expanded]')).filter(function(b) {
+      var t = (b.innerText || '').trim();
+      return /^Worked for /i.test(t) || /^Working for /i.test(t);
+    });
+    var clicked = 0;
+    for (var i = btns.length - 1; i >= 0 && clicked < _DESKTOP_WORKED_PRIME_BUDGET(); i--) {
+      var btn = btns[i];
+      if (btn.getAttribute('aria-expanded') === 'true') continue;
+      try { btn.click(); clicked++; } catch (_) {}
+    }
+    if (clicked > 0) {
+      // Let React commit the expanded subtree before we read it.
+      await new Promise(function(r) { setTimeout(r, 80); });
+    }
+    // Snapshot every expanded "Worked for" body into the cache.
+    var expanded = Array.from(convoEl.querySelectorAll('button[aria-expanded="true"]')).filter(function(b) {
+      var t = (b.innerText || '').trim();
+      return /^Worked for /i.test(t) || /^Working for /i.test(t);
+    });
+    for (var ei = 0; ei < expanded.length; ei++) {
+      var ebtn = expanded[ei];
+      var key = _desktopWorkedTurnKey(ebtn);
+      if (!key) continue;
+      var body = _desktopWorkedBodyText(ebtn);
+      if (body) cache[key] = body;
+    }
+  }
+
+  function _cachedDesktopWorkedBodyForTurn(turn) {
+    var cache = _desktopWorkedCache();
+    var keys = [];
+    if (turn.getAttribute) {
+      var dk = turn.getAttribute('data-turn-key') || turn.getAttribute('data-content-search-turn-key');
+      if (dk) keys.push(dk);
+    }
+    var inner = turn.querySelector && turn.querySelector('[data-turn-key]');
+    if (inner) {
+      var ik = inner.getAttribute('data-turn-key');
+      if (ik && keys.indexOf(ik) === -1) keys.push(ik);
+    }
+    var firstUnit = turn.querySelector && turn.querySelector('[data-content-search-unit-key]');
+    if (firstUnit) {
+      var uk = (firstUnit.getAttribute('data-content-search-unit-key') || '').split(':')[0];
+      if (uk && keys.indexOf(uk) === -1) keys.push(uk);
+    }
+    var workedBtn = null;
+    var allBtns = turn.querySelectorAll ? turn.querySelectorAll('button[aria-expanded]') : [];
+    for (var bi = 0; bi < allBtns.length; bi++) {
+      var t = (allBtns[bi].innerText || '').trim();
+      if (/^Worked for /i.test(t) || /^Working for /i.test(t)) { workedBtn = allBtns[bi]; break; }
+    }
+    if (workedBtn) {
+      var bk = _desktopWorkedTurnKey(workedBtn);
+      if (bk && keys.indexOf(bk) === -1) keys.push(bk);
+    }
+    for (var ki = 0; ki < keys.length; ki++) {
+      if (cache[keys[ki]]) return cache[keys[ki]];
+    }
+    return '';
+  }
+
   var convo = d.querySelector('[data-thread-find-target="conversation"]');
   if (!convo) return JSON.stringify([]);
 
-  // Prime the cache for collapsed multi-command runs before walking turns.
+  // Prime caches for collapsed multi-command runs AND the per-turn
+  // "Worked for X" reasoning trace before walking turns.
   await _primeDesktopCollapsedRuns();
+  await _primeDesktopWorkedForTurns();
 
-  var turns = Array.from(convo.querySelectorAll('[data-content-search-turn-key]'));
+  // Prefer the current build's data-turn-key attribute. Older builds used
+  // data-content-search-turn-key; if neither is present we fall back below
+  // to synthesizing turns by LCA of units with a shared turn UUID.
+  var turns = Array.from(convo.querySelectorAll('[data-turn-key], [data-content-search-turn-key]'));
+
+  // Fallback for newer Codex Desktop builds that dropped the turn-key
+  // wrapper attribute. Synthesize "turn" elements by grouping units with
+  // the same turnId (the part before the first ':' in their unit-key)
+  // and finding their lowest common ancestor in the DOM. The rest of the
+  // per-turn extraction logic below works against those synthesized
+  // elements unchanged.
+  if (turns.length === 0) {
+    var units = Array.from(convo.querySelectorAll('[data-content-search-unit-key]'));
+    var groups = {};
+    var groupOrder = [];
+    for (var ui = 0; ui < units.length; ui++) {
+      var ukey = units[ui].getAttribute('data-content-search-unit-key') || '';
+      var tid = ukey.split(':')[0];
+      if (!tid) continue;
+      if (!groups[tid]) { groups[tid] = []; groupOrder.push(tid); }
+      groups[tid].push(units[ui]);
+    }
+    function lca(nodes) {
+      if (!nodes || nodes.length === 0) return null;
+      if (nodes.length === 1) return nodes[0].parentElement || nodes[0];
+      var a = nodes[0];
+      for (var i = 1; i < nodes.length; i++) {
+        var b = nodes[i];
+        var aAncestors = [];
+        for (var p = a; p; p = p.parentElement) aAncestors.push(p);
+        for (var q = b; q; q = q.parentElement) {
+          if (aAncestors.indexOf(q) !== -1) { a = q; break; }
+        }
+      }
+      return a;
+    }
+    for (var gi = 0; gi < groupOrder.length; gi++) {
+      var groupUnits = groups[groupOrder[gi]];
+      var turnEl = lca(groupUnits);
+      if (turnEl) turns.push(turnEl);
+    }
+  }
+
   var msgs = [];
+
+  // UUIDv7 has 48 bits of millisecond timestamp in the first 12 hex chars.
+  // Codex Desktop unit-keys are UUIDv7 turnIds, so we can extract a real
+  // creation timestamp per turn without scraping the DOM. Returns seconds
+  // since epoch (the WebUI expects ts in seconds), or null if the key
+  // doesn't match the expected format.
+  function _turnTsFromKey(key) {
+    if (!key) return null;
+    var uuid = String(key).split(':')[0];
+    if (!/^[0-9a-f]{8}-[0-9a-f]{4}-7/.test(uuid)) return null;
+    var hex = uuid.replace(/-/g, '').substring(0, 12);
+    var ms = parseInt(hex, 16);
+    if (!ms || ms < 1000000000000 || ms > 4000000000000) return null;
+    return Math.floor(ms / 1000);
+  }
 
   for (var ti = 0; ti < turns.length; ti++) {
     var turn = turns[ti];
     var userParts = [];
     var assistantParts = [];
     var units = Array.from(turn.querySelectorAll('[data-content-search-unit-key]'));
+    var turnTs = units.length > 0
+      ? _turnTsFromKey(units[0].getAttribute('data-content-search-unit-key'))
+      : null;
 
     for (var ui = 0; ui < units.length; ui++) {
       var unit = units[ui];
@@ -2611,6 +3113,21 @@ const CODEX_DESKTOP_READ_EXPR = `
     var summaryBlocks = _extractDesktopFileChangeSummaryCards(turn);
     summaryBlocks.forEach(function(block) { uniquePushAny(assistantParts, block); });
 
+    // Prepend the "Worked for X" expanded body (reasoning + tool-call trace)
+    // before the assistant's final answer so the WebUI shows the intermediate
+    // work Codex Desktop hides behind the toggle. Cached per turn-key so it
+    // survives later collapses or virtualization.
+    var workedBody = _cachedDesktopWorkedBodyForTurn(turn);
+    if (workedBody) {
+      var hasWorkedBody = assistantParts.some(function(p) {
+        return p && p.length >= 80 && workedBody.indexOf(p.substring(0, 80)) !== -1;
+      });
+      if (!hasWorkedBody) {
+        // Insert at the front so reasoning/tools appear above the final answer.
+        assistantParts.unshift(workedBody);
+      }
+    }
+
     // Append the "Worked for X" header (if present and not already in
     // assistantParts) so the turn boundary is visible and the accumulator
     // merge logic can detect completion.
@@ -2620,10 +3137,14 @@ const CODEX_DESKTOP_READ_EXPR = `
     }
 
     if (userParts.length > 0) {
-      msgs.push({ role: 'user', content: userParts.join('\\n\\n') });
+      var userMsg = { role: 'user', content: userParts.join('\\n\\n') };
+      if (turnTs) userMsg.ts = turnTs;
+      msgs.push(userMsg);
     }
     if (assistantParts.length > 0) {
-      msgs.push({ role: 'assistant', content: assistantParts.join('\\n\\n') });
+      var asstMsg = { role: 'assistant', content: assistantParts.join('\\n\\n') };
+      if (turnTs) asstMsg.ts = turnTs;
+      msgs.push(asstMsg);
     }
   }
 
@@ -2642,6 +3163,8 @@ async function readCodexMessages(Runtime, sessionId, usePageEval) {
     preSig = await evalFn(Runtime, CODEX_DOM_SIG_EXPR);
     if (preSig && preSig === cache.sig && cache.result !== null) {
       cache.hits = (cache.hits || 0) + 1;
+      const repaired = expandCodexMessagesRaw(cache.result);
+      if (repaired !== cache.result) cache.result = repaired;
       return cache.result;
     }
   } catch {

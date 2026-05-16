@@ -22,6 +22,7 @@ const AGENT_CONFIG = {
   claude_cli:        { name: 'Claude Code CLI',  color: '#d97757', abbr: 'CLI', logo: '/logo-claude-in-ag.svg' },
   'claude-desktop':  { name: 'Claude Desktop',  color: '#cc785c', abbr: 'CD', logo: '/logo-claude-in-ag.svg' },
   codex:             { name: 'Codex',            color: '#10a37f', abbr: 'CX', logo: '/logo-codex-in-ag.svg' },
+  codex_cli:         { name: 'Codex CLI',        color: '#10a37f', abbr: 'CLI', logo: '/logo-codex.svg' },
   'codex-desktop':   { name: 'Codex Desktop',   color: '#10a37f', abbr: 'CX', logo: '/logo-codex.svg' },
   gemini:            { name: 'Gemini',           color: '#4285f4', abbr: 'GC', logo: '/logo-gemini-in-ag.svg' },
   continue:          { name: 'Continue',         color: '#d29922', abbr: 'CN', logo: '/logo-continue.png' },
@@ -136,6 +137,7 @@ function normalizeAgentTypeHint(value) {
   if (raw.includes('cline') || raw.includes('claude-dev')) return 'cline';
   if (raw.includes('continue yolo') || raw.includes('continue_yolo')) return 'continue_yolo';
   if (raw.includes('continue')) return 'continue';
+  if (raw.includes('codex cli') || raw.includes('codex_cli')) return 'codex_cli';
   if (raw.includes('codex desktop')) return 'codex-desktop';
   if (raw.includes('codex')) return 'codex';
   if (raw.includes('claude code') || raw.includes('claude')) return 'claude';
@@ -765,6 +767,7 @@ function NewSessionPanel({ launchStates, onLaunch, onResume, onClose, workspaces
   const [wsMode,      setWsMode]      = React.useState('');
   const [customPath,  setCustomPath]  = React.useState('');
   const [claudeCliModel, setClaudeCliModel] = React.useState('deepseek-v4-pro:cloud');
+  const [codexCliModel, setCodexCliModel] = React.useState('gpt-5.5');
   const [requestId,   setRequestId]   = React.useState(null);
   const [history,     setHistory]     = React.useState([]);
   const [historyLoading, setHistoryLoading] = React.useState(false);
@@ -796,6 +799,8 @@ function NewSessionPanel({ launchStates, onLaunch, onResume, onClose, workspaces
     const wsPath = wsMode === 'custom' ? customPath.trim() : wsMode;
     const launchOptions = agentType === 'claude_cli'
       ? { model_id: claudeCliModel.trim() || 'default' }
+      : agentType === 'codex_cli'
+      ? { model_id: codexCliModel.trim() || 'gpt-5.5', permission_mode: 'workspace-write', effort: 'medium' }
       : {};
     const rid = onLaunch(agentType, wsPath || undefined, launchOptions);
     setRequestId(rid);
@@ -903,6 +908,18 @@ function NewSessionPanel({ launchStates, onLaunch, onResume, onClose, workspaces
               disabled={isLaunching}
             />
           )}
+          {agentType === 'codex_cli' && (
+            <select
+              className="new-session-workspace"
+              value={codexCliModel}
+              onChange={e => setCodexCliModel(e.target.value)}
+              disabled={isLaunching}
+            >
+              {KNOWN_CODEX_CLI_MODELS.map(model => (
+                <option key={model.id} value={model.id}>{model.label}</option>
+              ))}
+            </select>
+          )}
           {launchError && <div className="new-session-error">{launchError}</div>}
           <button className="new-session-submit" type="submit" disabled={isLaunching}>
             {isLaunching ? <span className="new-session-spinner" /> : null}
@@ -988,11 +1005,17 @@ const PERMISSION_MODES = {
   cline: [
     { value: 'YOLO', label: 'YOLO' },
   ],
+  codex_cli: [
+    { value: 'read-only',          label: 'Read only' },
+    { value: 'workspace-write',    label: 'Workspace write' },
+    { value: 'danger-full-access', label: 'Full access' },
+  ],
   codex:  [],  // Codex permission mode not configurable via settings
   gemini: [],  // Gemini permission mode not configurable via settings
 };
 
 function defaultPermissionModeFor(agentType) {
+  if (agentType === 'codex_cli') return 'workspace-write';
   if (agentType === 'continue_yolo' || agentType === 'roo_code' || agentType === 'cline') return 'ask';
   return 'default';
 }
@@ -1010,6 +1033,20 @@ const KNOWN_CLAUDE_MODELS = [
   { id: 'claude-3-5-sonnet',       label: 'Claude 3.5 Sonnet' },
   { id: 'claude-3-5-haiku',        label: 'Claude 3.5 Haiku' },
   { id: 'deepseek-v4-pro:cloud',   label: 'DeepSeek V4 Pro (Ollama Cloud)' },
+];
+
+const KNOWN_CODEX_CLI_MODELS = [
+  { id: 'gpt-5.5',                     label: 'GPT-5.5' },
+  { id: 'gpt-5.4',                     label: 'GPT-5.4' },
+  { id: 'gpt-5.4-mini',                label: 'GPT-5.4 Mini' },
+  { id: 'gpt-5.3-codex',               label: 'GPT-5.3 Codex' },
+  { id: 'gpt-5.2-codex',               label: 'GPT-5.2 Codex' },
+  { id: 'gpt-5.2',                     label: 'GPT-5.2' },
+  { id: 'gpt-5.1-codex',               label: 'GPT-5.1 Codex' },
+  { id: 'gpt-5.1',                     label: 'GPT-5.1' },
+  { id: 'gpt-5',                       label: 'GPT-5' },
+  { id: 'ollama:deepseek-v4-pro:cloud', label: 'DeepSeek V4 Pro (Ollama Cloud)' },
+  { id: 'ollama:kimi-k2.6:cloud',       label: 'Kimi K2.6 (Ollama Cloud)' },
 ];
 
 const ANTIGRAVITY_MODES = [
@@ -1056,6 +1093,7 @@ function composerModelOptionsFor(agentType, config) {
   }
   if (agentType === 'continue_yolo' || agentType === 'continue' || agentType === 'roo_code' || agentType === 'cline') return [];
   if (agentType === 'claude_cli') return KNOWN_CLAUDE_MODELS;
+  if (agentType === 'codex_cli') return KNOWN_CODEX_CLI_MODELS;
   if (agentType === 'antigravity' || agentType === 'antigravity_panel') return KNOWN_ANTIGRAVITY_MODELS;
   if (agentType === 'gemini') return KNOWN_GEMINI_MODELS;
   return KNOWN_CLAUDE_MODELS;
@@ -1113,6 +1151,7 @@ function AgentSettingsPanel({ session, config, onRequestRefresh, onSetModel, onS
   const permModes    = permissionModeOptionsFor(agentType, config);
   const modeOptions  = modeOptionsFor(agentType, config);
   let modelOptions = (agentType === 'claude' || agentType === 'claude_cli') ? KNOWN_CLAUDE_MODELS
+    : agentType === 'codex_cli' ? KNOWN_CODEX_CLI_MODELS
     : (agentType === 'antigravity' || agentType === 'antigravity_panel') ? KNOWN_ANTIGRAVITY_MODELS
     : agentType === 'gemini' ? KNOWN_GEMINI_MODELS
     : [];
@@ -1327,7 +1366,7 @@ function AgentSettingsPanel({ session, config, onRequestRefresh, onSetModel, onS
           </div>
         )}
 
-        {(agentType === 'claude' || agentType === 'claude_cli' || agentType === 'continue_yolo' || isClineLikeAgentType(agentType)) && (
+        {(agentType === 'claude' || agentType === 'claude_cli' || agentType === 'codex_cli' || agentType === 'continue_yolo' || isClineLikeAgentType(agentType)) && (
           <div className="settings-row">
             <span className="settings-label">Permission mode</span>
             {caps.permission_mode_change && permModes.length > 0 ? (
@@ -1351,7 +1390,7 @@ function AgentSettingsPanel({ session, config, onRequestRefresh, onSetModel, onS
           </div>
         )}
 
-        {agentType === 'claude_cli' && caps.set_effort && (config?.available_efforts || []).length > 0 && (
+        {(agentType === 'claude_cli' || agentType === 'codex_cli') && caps.set_effort && (config?.available_efforts || []).length > 0 && (
           <div className="settings-row">
             <span className="settings-label">Effort</span>
             <select
@@ -3094,7 +3133,7 @@ async function uploadBinaryDraft(sessionId, base64, mimeType, filename) {
     && lastUserText
     && !((activeSessionMeta?.agent_type === 'cline' || activeSessionMeta?.agent_type === 'roo_code') && activeContextCard)
   );
-  const assistantMonospace = activeSessionMeta?.agent_type === 'codex';
+  const assistantMonospace = activeSessionMeta?.agent_type === 'codex' || activeSessionMeta?.agent_type === 'codex_cli';
   const lastAssistantMsg = [...currentMessages].reverse().find(m => m.role === 'assistant');
   const liveThinkingText = activeSession ? (thinkingContent[activeSession] || '').trim() : '';
   const lastAssistantText = lastAssistantMsg ? normalizeMessageContent(lastAssistantMsg.content).trim() : '';
@@ -4111,12 +4150,12 @@ async function uploadBinaryDraft(sessionId, base64, mimeType, filename) {
                     )}
                   </select>
                 )}
-                {activeSessionMeta?.agent_type === 'claude_cli' && activeConfig?.capabilities?.set_effort && (activeConfig.available_efforts || []).length > 0 && (
+                {(activeSessionMeta?.agent_type === 'claude_cli' || activeSessionMeta?.agent_type === 'codex_cli') && activeConfig?.capabilities?.set_effort && (activeConfig.available_efforts || []).length > 0 && (
                   <select
                     className="composer-setting-select"
                     value={activeConfig.effort || 'medium'}
                     onChange={e => setAgentEffort(activeSession, e.target.value)}
-                    title="Claude CLI effort"
+                    title={`${activeSessionMeta?.agent_type === 'codex_cli' ? 'Codex' : 'Claude'} CLI effort`}
                   >
                     {(activeConfig.available_efforts || []).map(m => (
                       <option key={m.id} value={m.id}>{m.label}</option>

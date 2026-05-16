@@ -105,7 +105,7 @@ export function useRelay() {
 
     function shouldPreserveTranscriptInListView(session) {
       if (!session || typeof session !== 'object') return false;
-      return ['codex', 'codex-desktop', 'roo_code', 'cline'].includes(session.agent_type);
+      return ['codex', 'codex-desktop', 'codex_cli', 'roo_code', 'cline'].includes(session.agent_type);
     }
 
     function clearSessionTranscript(sessionId) {

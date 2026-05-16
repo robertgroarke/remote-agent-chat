@@ -221,6 +221,13 @@ function historiesMatch(existingRows, incomingRows) {
     if (existing.role !== incoming.role || existing.content !== incoming.content) {
       return false;
     }
+    // Trigger resync when the proxy supplies a timestamp that materially
+    // differs from what's stored. Tolerate small drift (e.g. 1s rounding)
+    // so we don't churn on every poll. Only checks when incoming.ts is
+    // present — otherwise stored ts stands.
+    if (incoming.ts && Number.isFinite(incoming.ts) && existing.ts) {
+      if (Math.abs(existing.ts - incoming.ts) > 2) return false;
+    }
   }
   return true;
 }
@@ -261,10 +268,34 @@ const stmtInsert = db.prepare(
   `INSERT INTO messages (session, role, content, client_msg_id, status, sequence)
    VALUES (?, ?, ?, ?, ?, ?)`
 );
+const stmtInsertWithTs = db.prepare(
+  `INSERT INTO messages (session, role, content, client_msg_id, status, sequence, ts)
+   VALUES (?, ?, ?, ?, ?, ?, ?)`
+);
 const stmtInsertIdempotent = db.prepare(
   `INSERT OR IGNORE INTO messages (session, role, content, client_msg_id, status, sequence)
    VALUES (?, ?, ?, ?, ?, ?)`
 );
+const stmtInsertIdempotentWithTs = db.prepare(
+  `INSERT OR IGNORE INTO messages (session, role, content, client_msg_id, status, sequence, ts)
+   VALUES (?, ?, ?, ?, ?, ?, ?)`
+);
+
+// Helper: insert a message, honoring proxy-supplied ts when available so
+// historical messages render with their original timestamps (otherwise the
+// table default unixepoch() makes every imported message look "now").
+function insertMessage(session, role, content, clientMsgId, status, sequence, ts) {
+  if (ts && Number.isFinite(ts) && ts > 0) {
+    return stmtInsertWithTs.run(session, role, content, clientMsgId, status, sequence, ts);
+  }
+  return stmtInsert.run(session, role, content, clientMsgId, status, sequence);
+}
+function insertMessageIdempotent(session, role, content, clientMsgId, status, sequence, ts) {
+  if (ts && Number.isFinite(ts) && ts > 0) {
+    return stmtInsertIdempotentWithTs.run(session, role, content, clientMsgId, status, sequence, ts);
+  }
+  return stmtInsertIdempotent.run(session, role, content, clientMsgId, status, sequence);
+}
 const stmtDeleteSession  = db.prepare('DELETE FROM messages WHERE session = ?');
 
 // ── Session history queries ─────────────────────────────────────────────────
@@ -1717,7 +1748,7 @@ function handleProxyConnection(ws, req) {
         const resync = db.transaction((msgs) => {
           stmtDeleteSession.run(id);
           sessionSeq.delete(id);
-          msgs.forEach(m => stmtInsert.run(id, m.role, m.content, null, 'delivered', nextSeq(id)));
+          msgs.forEach(m => insertMessage(id, m.role, m.content, null, 'delivered', nextSeq(id), m.ts));
         });
         resync(messages);
         log('info', 'history', `Resynced ${existing.length}→${messages.length}`, { session: id });
@@ -1731,7 +1762,7 @@ function handleProxyConnection(ws, req) {
         }
       } else if (existing.length === 0 && messages.length > 0) {
         db.transaction((msgs) => {
-          msgs.forEach(m => stmtInsert.run(id, m.role, m.content, null, 'delivered', nextSeq(id)));
+          msgs.forEach(m => insertMessage(id, m.role, m.content, null, 'delivered', nextSeq(id), m.ts));
         })(messages);
         log('info', 'history', `Stored ${messages.length} msgs`, { session: id });
         broadcastToBrowsers({ type: 'history', session: id, messages: stmtGetHistory.all(id) });
