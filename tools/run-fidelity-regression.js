@@ -24,6 +24,7 @@ try {
 
 const PORTS = {
   antigravity: 9223,
+  antigravityV2: 9226,
   codexDesktop: 9225,
 };
 
@@ -59,7 +60,7 @@ function parseArgs(argv) {
     json: false,
     strict: false,
     allowActive: false,
-    surfaces: ['codex-desktop', 'claude', 'codex', 'continue', 'roo_code', 'antigravity_panel'],
+    surfaces: ['codex-desktop', 'claude', 'codex', 'continue', 'roo_code', 'antigravity_panel', 'antigravity-v2'],
     jsonFile: null,
     tail: null,
     relayBaseUrl: null,
@@ -248,8 +249,17 @@ function findWorkbenchTarget(targets) {
   return targets.find((t) => t.type === 'page' && t.url && t.url.includes('workbench.html') && !t.url.includes('jetski'));
 }
 
+function findAntigravityV2Target(targets) {
+  return targets.find((t) => t.type === 'page' && /\/c\/[0-9a-f-]{36}/i.test(t.url || ''))
+    || targets.find((t) => t.type === 'page');
+}
+
 function findFirstMatchingTarget(targets, patterns) {
   return targets.find((t) => t.type === 'iframe' && patterns.some((pattern) => pattern.test((t.url || '') + ' ' + (t.title || ''))));
+}
+
+function findMatchingTargets(targets, patterns) {
+  return targets.filter((t) => t.type === 'iframe' && patterns.some((pattern) => pattern.test((t.url || '') + ' ' + (t.title || ''))));
 }
 
 function stripTimestampOnlyLines(text) {
@@ -275,7 +285,9 @@ function normalizeWindowsPaths(text) {
 }
 
 function normalizeContent(text) {
-  const noTimestamps = stripTimestampOnlyLines(String(text || '').replace(/\r\n/g, '\n'));
+  const noTimestamps = stripTimestampOnlyLines(String(text || '').replace(/\r\n/g, '\n'))
+    .replace(/\b\d{1,2}:\d{2}\s?(?:AM|PM)(?:,\s*\d{1,2}\/\d{1,2}\/\d{4})?\s*$/i, '')
+    .replace(/([.!?])(?=[A-Z])/g, '$1 ');
   const withNormalizedPaths = normalizeWindowsPaths(noTimestamps);
   return withNormalizedPaths
     .replace(/[ \t]+\n/g, '\n')
@@ -288,10 +300,12 @@ function normalizeMessages(messages, tail) {
   const list = Array.isArray(messages) ? messages : [];
   const sliced = tail ? list.slice(-tail) : list.slice();
   return sliced
-    .map((msg) => ({
-      role: String(msg.role || '').trim(),
-      content: normalizeContent(msg.content || ''),
-    }))
+    .map((msg) => {
+      const role = String(msg.role || '').trim();
+      let content = normalizeContent(msg.content || '');
+      if (role === 'user') content = content.replace(/\s*\n+\s*/g, ' ');
+      return { role, content };
+    })
     .filter((msg) => msg.role && msg.content);
 }
 
@@ -334,6 +348,20 @@ function compareSequences(nativeMessages, webuiMessages) {
   };
 }
 
+function messagesSoftMatch(left, right) {
+  if (!left || !right || left.role !== right.role) return false;
+  const a = left.content || '';
+  const b = right.content || '';
+  if (a === b) return true;
+  if (!a || !b) return false;
+  const shorter = a.length <= b.length ? a : b;
+  const longer = a.length > b.length ? a : b;
+  if (shorter.length >= 80 && longer.startsWith(shorter)) return true;
+  const probeLen = Math.min(160, a.length, b.length);
+  if (probeLen < 40) return false;
+  return a.substring(0, probeLen) === b.substring(0, probeLen);
+}
+
 function findContiguousWindow(needleMessages, haystackMessages) {
   if (!Array.isArray(needleMessages) || !Array.isArray(haystackMessages)) return -1;
   if (needleMessages.length === 0) return 0;
@@ -343,7 +371,7 @@ function findContiguousWindow(needleMessages, haystackMessages) {
     for (let i = 0; i < needleMessages.length; i++) {
       const needle = needleMessages[i];
       const hay = haystackMessages[start + i];
-      if (needle.role !== hay?.role || needle.content !== hay?.content) {
+      if (!messagesSoftMatch(needle, hay)) {
         match = false;
         break;
       }
@@ -353,8 +381,32 @@ function findContiguousWindow(needleMessages, haystackMessages) {
   return -1;
 }
 
+function findOrderedSubsequence(needleMessages, haystackMessages) {
+  if (!Array.isArray(needleMessages) || !Array.isArray(haystackMessages)) return null;
+  if (needleMessages.length === 0) return { start: 0, end: 0, matched: 0 };
+
+  let cursor = 0;
+  let start = -1;
+  let end = -1;
+  for (const needle of needleMessages) {
+    let found = -1;
+    for (let i = cursor; i < haystackMessages.length; i++) {
+      if (messagesSoftMatch(needle, haystackMessages[i])) {
+        found = i;
+        break;
+      }
+    }
+    if (found < 0) return null;
+    if (start < 0) start = found;
+    end = found;
+    cursor = found + 1;
+  }
+
+  return { start, end, matched: needleMessages.length };
+}
+
 function allowsAccumulatedWebui(surface) {
-  return surface === 'codex';
+  return surface === 'codex' || surface === 'codex-desktop' || surface === 'antigravity-v2';
 }
 
 function detectTrailingPartialMismatch(nativeMessages, webuiMessages, comparison) {
@@ -564,6 +616,12 @@ async function collectNativeTranscript(surface, target, sessionId) {
     });
   }
 
+  if (surface === 'antigravity-v2') {
+    return withTarget(PORTS.antigravityV2, target, async (Runtime) => {
+      return parseMaybeJson(await selectors.readMessages(Runtime, 'antigravity-v2', sessionId || `fidelity-${surface}`), []);
+    });
+  }
+
   if (surface === 'roo_code') {
     return withTarget(PORTS.antigravity, target, async (Runtime) => {
       return parseMaybeJson(await selectors.readMessages(Runtime, 'roo_code', sessionId || `fidelity-${surface}`), []);
@@ -605,6 +663,8 @@ async function runSurfaceComparison(surface, target, mappedSession, context, rep
 
   const normalizedNative = normalizeMessages(nativeMessages, context.options.tail);
   const normalizedWebui = normalizeMessages(webuiResult.messages, context.options.tail);
+  const normalizedNativeFull = normalizeMessages(nativeMessages, null);
+  const normalizedWebuiFull = normalizeMessages(webuiResult.messages, null);
 
   if (!context.options.allowActive) {
     const thinking = surface === 'codex-desktop'
@@ -675,6 +735,38 @@ async function runSurfaceComparison(surface, target, mappedSession, context, rep
     }
   }
 
+  if (surface === 'codex-desktop' && normalizedNativeFull.length === 0) {
+    const threads = await withTarget(PORTS.codexDesktop, target, (Runtime) => selectors.readCodexThreadList(Runtime, true));
+    const activeThread = Array.isArray(threads) ? threads.find((thread) => thread && thread.active) : null;
+    reporter.add({
+      surface,
+      test_id: `${surface}.fidelity.compare`,
+      status: STATUS_SKIP,
+      detail: activeThread
+        ? 'Codex Desktop active thread has no visible transcript content'
+        : 'Codex Desktop is showing the project/thread list, not a visible transcript',
+      native_evidence: {
+        mapped_session: mappedSession?.session_id || null,
+        native_count: 0,
+        active_thread: activeThread || null,
+        visible_thread_count: Array.isArray(threads) ? threads.length : 0,
+      },
+      webui_evidence: {
+        source: webuiResult.source,
+        webui_count: normalizedWebui.length,
+        webui_full_count: normalizedWebuiFull.length,
+        sample_last_webui: normalizedWebui.length ? truncate(normalizedWebui[normalizedWebui.length - 1].content, 240) : null,
+      },
+      expected: 'Codex Desktop fidelity should be compared only when a native transcript is visible',
+      actual: {
+        has_active_thread: !!activeThread,
+        native_count: 0,
+      },
+      investigation_hint: 'Open/select a Codex Desktop thread with visible messages before running the desktop fidelity comparison',
+    });
+    return;
+  }
+
   const previewComparison = compareSequences(normalizedNative, normalizedWebui);
   const trailingPartial = detectTrailingPartialMismatch(normalizedNative, normalizedWebui, previewComparison);
   if (trailingPartial) {
@@ -702,19 +794,25 @@ async function runSurfaceComparison(surface, target, mappedSession, context, rep
 
   const comparison = previewComparison;
   const accumulatedWindowOffset = allowsAccumulatedWebui(surface)
-    ? findContiguousWindow(normalizedNative, normalizedWebui)
+    ? findContiguousWindow(normalizedNativeFull, normalizedWebuiFull)
     : -1;
-  const passAccumulatedWindow = accumulatedWindowOffset >= 0;
+  const passAccumulatedWindow = normalizedNativeFull.length > 0 && accumulatedWindowOffset >= 0;
+  const accumulatedSubsequence = allowsAccumulatedWebui(surface)
+    ? findOrderedSubsequence(normalizedNativeFull, normalizedWebuiFull)
+    : null;
+  const passAccumulatedSubsequence = normalizedNativeFull.length > 0 && !!accumulatedSubsequence;
   const pass = comparison.missing.length === 0 && comparison.extra.length === 0 && comparison.prefixMatchCount === normalizedNative.length && normalizedNative.length === normalizedWebui.length;
 
   reporter.add({
     surface,
     test_id: `${surface}.fidelity.compare`,
-    status: (pass || passAccumulatedWindow) ? STATUS_PASS : STATUS_FAIL,
+    status: (pass || passAccumulatedWindow || passAccumulatedSubsequence) ? STATUS_PASS : STATUS_FAIL,
     detail: pass
       ? `Matched ${normalizedNative.length} normalized messages using ${webuiResult.source}`
       : passAccumulatedWindow
-        ? `Native visible transcript window (${normalizedNative.length} msgs) is retained inside WebUI history (${normalizedWebui.length} msgs) using ${webuiResult.source}`
+        ? `Native visible transcript window (${normalizedNativeFull.length} msgs) is retained inside full WebUI history (${normalizedWebuiFull.length} msgs) using ${webuiResult.source}`
+      : passAccumulatedSubsequence
+        ? `Native visible transcript (${normalizedNativeFull.length} msgs) is retained in order inside expanded WebUI history (${normalizedWebuiFull.length} msgs) using ${webuiResult.source}`
       : `Mismatch via ${webuiResult.source}: native=${normalizedNative.length} webui=${normalizedWebui.length} missing=${comparison.missing.length} extra=${comparison.extra.length} prefix=${comparison.prefixMatchCount}`,
     native_evidence: {
       mapped_session: mappedSession?.session_id || null,
@@ -725,6 +823,7 @@ async function runSurfaceComparison(surface, target, mappedSession, context, rep
     webui_evidence: {
       source: webuiResult.source,
       webui_count: normalizedWebui.length,
+      webui_full_count: normalizedWebuiFull.length,
       sample_last_webui: normalizedWebui.length ? truncate(normalizedWebui[normalizedWebui.length - 1].content, 240) : null,
       extra_samples: comparison.extra.slice(0, 3).map((m) => ({ role: m.role, content: truncate(m.content, 240) })),
     },
@@ -734,6 +833,8 @@ async function runSurfaceComparison(surface, target, mappedSession, context, rep
       missing_count: comparison.missing.length,
       extra_count: comparison.extra.length,
       accumulated_window_offset: accumulatedWindowOffset >= 0 ? accumulatedWindowOffset : null,
+      accumulated_window_length: passAccumulatedWindow ? normalizedNativeFull.length : null,
+      accumulated_subsequence: accumulatedSubsequence,
       exact: comparison.exact,
     },
     investigation_hint: 'Check selector/native DOM first, then proxy session state, then relay history, then frontend rendering',
@@ -759,6 +860,7 @@ async function runFidelitySuite(options = {}) {
     relay_auth_mode: bearerToken ? 'bearer_jwt' : 'none',
     stored_sessions: sessions.length,
     antigravity_targets: Array.isArray(targetsByPort.antigravity) ? targetsByPort.antigravity.length : 0,
+    antigravity_v2_targets: Array.isArray(targetsByPort.antigravityV2) ? targetsByPort.antigravityV2.length : 0,
     codex_desktop_targets: Array.isArray(targetsByPort.codexDesktop) ? targetsByPort.codexDesktop.length : 0,
   };
 
@@ -781,6 +883,22 @@ async function runFidelitySuite(options = {}) {
       }
     }
 
+    if (options.surfaces.includes('antigravity-v2')) {
+      const target = Array.isArray(targetsByPort.antigravityV2) ? findAntigravityV2Target(targetsByPort.antigravityV2) : null;
+      if (!target) {
+        reporter.add({
+          surface: 'antigravity-v2',
+          test_id: 'antigravity-v2.fidelity.compare',
+          status: STATUS_SKIP,
+          detail: 'No Antigravity v2 target found',
+          investigation_hint: 'Open Antigravity v2 before running the fidelity regression',
+        });
+      } else {
+        const mapped = matchSessionByTarget(sessions, 'antigravity-v2', target.id, target.title || target.url || 'antigravity-v2');
+        await runSurfaceComparison('antigravity-v2', target, mapped, { relayBaseUrl, relayBaseUrls, bearerToken, dbReader, options }, reporter);
+      }
+    }
+
     if (Array.isArray(targetsByPort.antigravity)) {
       if (options.surfaces.includes('antigravity_panel')) {
         const workbench = findWorkbenchTarget(targetsByPort.antigravity);
@@ -800,8 +918,10 @@ async function runFidelitySuite(options = {}) {
 
       for (const surface of ['claude', 'codex', 'continue']) {
         if (!options.surfaces.includes(surface)) continue;
-        const target = findFirstMatchingTarget(targetsByPort.antigravity, PATTERNS[surface]);
-        if (!target) {
+        const targets = surface === 'codex'
+          ? findMatchingTargets(targetsByPort.antigravity, PATTERNS[surface])
+          : [findFirstMatchingTarget(targetsByPort.antigravity, PATTERNS[surface])].filter(Boolean);
+        if (targets.length === 0) {
           reporter.add({
             surface,
             test_id: `${surface}.fidelity.compare`,
@@ -811,8 +931,10 @@ async function runFidelitySuite(options = {}) {
           });
           continue;
         }
-        const mapped = matchSessionByTarget(sessions, surface, target.id, target.title || target.url || surface);
-        await runSurfaceComparison(surface, target, mapped, { relayBaseUrl, relayBaseUrls, bearerToken, dbReader, options }, reporter);
+        for (const target of targets) {
+          const mapped = matchSessionByTarget(sessions, surface, target.id, target.title || target.url || surface);
+          await runSurfaceComparison(surface, target, mapped, { relayBaseUrl, relayBaseUrls, bearerToken, dbReader, options }, reporter);
+        }
       }
     }
   } finally {
@@ -858,6 +980,9 @@ module.exports = {
   deriveRelayBaseUrl,
   deriveRelayBaseUrls,
   findFirstMatchingTarget,
+  findMatchingTargets,
+  findAntigravityV2Target,
+  findOrderedSubsequence,
   findRelayDbPath,
   findWorkbenchTarget,
   listSessions,

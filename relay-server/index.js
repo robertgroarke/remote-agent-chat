@@ -71,7 +71,8 @@ db.exec(`
     ts            INTEGER NOT NULL DEFAULT (unixepoch()),
     client_msg_id TEXT,
     status        TEXT    NOT NULL DEFAULT 'delivered',
-    sequence      INTEGER NOT NULL DEFAULT 0
+    sequence      INTEGER NOT NULL DEFAULT 0,
+    content_blocks TEXT
   );
   CREATE INDEX IF NOT EXISTS idx_session ON messages(session, id);
 `);
@@ -134,6 +135,8 @@ if (!existingCols.has('status'))
   db.exec(`ALTER TABLE messages ADD COLUMN status TEXT NOT NULL DEFAULT 'delivered'`);
 if (!existingCols.has('sequence'))
   db.exec(`ALTER TABLE messages ADD COLUMN sequence INTEGER NOT NULL DEFAULT 0`);
+if (!existingCols.has('content_blocks'))
+  db.exec(`ALTER TABLE messages ADD COLUMN content_blocks TEXT`);
 
 // Indexes that reference migrated columns — safe to create now
 try { db.exec(`CREATE INDEX IF NOT EXISTS idx_sequence ON messages(session, sequence)`); } catch {}
@@ -221,6 +224,9 @@ function historiesMatch(existingRows, incomingRows) {
     if (existing.role !== incoming.role || existing.content !== incoming.content) {
       return false;
     }
+    const existingBlocks = JSON.stringify(existing.content_blocks || null);
+    const incomingBlocks = JSON.stringify(Array.isArray(incoming.content_blocks) ? incoming.content_blocks : null);
+    if (existingBlocks !== incomingBlocks) return false;
     // Trigger resync when the proxy supplies a timestamp that materially
     // differs from what's stored. Tolerate small drift (e.g. 1s rounding)
     // so we don't churn on every poll. Only checks when incoming.ts is
@@ -230,6 +236,24 @@ function historiesMatch(existingRows, incomingRows) {
     }
   }
   return true;
+}
+
+function normalizeBrowserEchoContent(content) {
+  return String(content || '')
+    .replace(/\b\d{1,2}:\d{2}\s?(?:AM|PM)\s*$/i, '')
+    .replace(/\s+/g, '')
+    .trim();
+}
+
+function isRecentBrowserUserEcho(sessionId, content) {
+  const normalized = normalizeBrowserEchoContent(content);
+  if (!normalized) return false;
+  const nowSec = Math.floor(Date.now() / 1000);
+  const rows = stmtRecentBrowserUserMessages.all(sessionId);
+  return rows.some((row) => (
+    nowSec - Number(row.ts || 0) <= BROWSER_ECHO_DEDUP_WINDOW_SEC &&
+    normalizeBrowserEchoContent(row.content) === normalized
+  ));
 }
 
 // Per-session throttle for large history broadcasts. The transcript is always
@@ -264,37 +288,64 @@ function scheduleHistoryBroadcast(sessionId, payloadFactory) {
 
 // ── Prepared statements ───────────────────────────────────────────────────────
 
+function serializeContentBlocks(blocks) {
+  if (!Array.isArray(blocks) || blocks.length === 0) return null;
+  try {
+    return JSON.stringify(blocks);
+  } catch {
+    return null;
+  }
+}
+
+function hydrateMessageRow(row) {
+  if (!row) return row;
+  const hydrated = { ...row };
+  if (typeof hydrated.content_blocks === 'string' && hydrated.content_blocks.trim()) {
+    try {
+      hydrated.content_blocks = JSON.parse(hydrated.content_blocks);
+    } catch {
+      hydrated.content_blocks = null;
+    }
+  } else {
+    hydrated.content_blocks = null;
+  }
+  if (!hydrated.content_blocks) delete hydrated.content_blocks;
+  return hydrated;
+}
+
 const stmtInsert = db.prepare(
-  `INSERT INTO messages (session, role, content, client_msg_id, status, sequence)
-   VALUES (?, ?, ?, ?, ?, ?)`
+  `INSERT INTO messages (session, role, content, client_msg_id, status, sequence, content_blocks)
+   VALUES (?, ?, ?, ?, ?, ?, ?)`
 );
 const stmtInsertWithTs = db.prepare(
-  `INSERT INTO messages (session, role, content, client_msg_id, status, sequence, ts)
-   VALUES (?, ?, ?, ?, ?, ?, ?)`
+  `INSERT INTO messages (session, role, content, client_msg_id, status, sequence, ts, content_blocks)
+   VALUES (?, ?, ?, ?, ?, ?, ?, ?)`
 );
 const stmtInsertIdempotent = db.prepare(
-  `INSERT OR IGNORE INTO messages (session, role, content, client_msg_id, status, sequence)
-   VALUES (?, ?, ?, ?, ?, ?)`
+  `INSERT OR IGNORE INTO messages (session, role, content, client_msg_id, status, sequence, content_blocks)
+   VALUES (?, ?, ?, ?, ?, ?, ?)`
 );
 const stmtInsertIdempotentWithTs = db.prepare(
-  `INSERT OR IGNORE INTO messages (session, role, content, client_msg_id, status, sequence, ts)
-   VALUES (?, ?, ?, ?, ?, ?, ?)`
+  `INSERT OR IGNORE INTO messages (session, role, content, client_msg_id, status, sequence, ts, content_blocks)
+   VALUES (?, ?, ?, ?, ?, ?, ?, ?)`
 );
 
 // Helper: insert a message, honoring proxy-supplied ts when available so
 // historical messages render with their original timestamps (otherwise the
 // table default unixepoch() makes every imported message look "now").
-function insertMessage(session, role, content, clientMsgId, status, sequence, ts) {
+function insertMessage(session, role, content, clientMsgId, status, sequence, ts, contentBlocks) {
+  const blocksJson = serializeContentBlocks(contentBlocks);
   if (ts && Number.isFinite(ts) && ts > 0) {
-    return stmtInsertWithTs.run(session, role, content, clientMsgId, status, sequence, ts);
+    return stmtInsertWithTs.run(session, role, content, clientMsgId, status, sequence, ts, blocksJson);
   }
-  return stmtInsert.run(session, role, content, clientMsgId, status, sequence);
+  return stmtInsert.run(session, role, content, clientMsgId, status, sequence, blocksJson);
 }
-function insertMessageIdempotent(session, role, content, clientMsgId, status, sequence, ts) {
+function insertMessageIdempotent(session, role, content, clientMsgId, status, sequence, ts, contentBlocks) {
+  const blocksJson = serializeContentBlocks(contentBlocks);
   if (ts && Number.isFinite(ts) && ts > 0) {
-    return stmtInsertIdempotentWithTs.run(session, role, content, clientMsgId, status, sequence, ts);
+    return stmtInsertIdempotentWithTs.run(session, role, content, clientMsgId, status, sequence, ts, blocksJson);
   }
-  return stmtInsertIdempotent.run(session, role, content, clientMsgId, status, sequence);
+  return stmtInsertIdempotent.run(session, role, content, clientMsgId, status, sequence, blocksJson);
 }
 const stmtDeleteSession  = db.prepare('DELETE FROM messages WHERE session = ?');
 
@@ -331,12 +382,20 @@ const stmtGetSessionMeta = db.prepare(
    FROM session_meta WHERE session_id = ?`
 );
 const stmtGetHistory     = db.prepare(
-  'SELECT id, role, content, status, sequence, ts FROM messages WHERE session = ? ORDER BY id ASC'
+  'SELECT id, role, content, content_blocks, status, sequence, ts FROM messages WHERE session = ? ORDER BY id ASC'
 );
 const stmtGetHistoryFrom = db.prepare(
-  `SELECT id, role, content, status, sequence, ts
+  `SELECT id, role, content, content_blocks, status, sequence, ts
    FROM messages WHERE session = ? AND sequence > ? ORDER BY id ASC`
 );
+
+function getHistoryRows(sessionId) {
+  return stmtGetHistory.all(sessionId).map(hydrateMessageRow);
+}
+
+function getHistoryRowsFrom(sessionId, sinceSeq) {
+  return stmtGetHistoryFrom.all(sessionId, sinceSeq).map(hydrateMessageRow);
+}
 const stmtFindRelatedHistoryByPath = db.prepare(`
   SELECT sm.session_id, sm.agent_type, MAX(m.ts) AS last_active_at
   FROM session_meta sm
@@ -365,6 +424,11 @@ const stmtFindRelatedHistoryByName = db.prepare(`
 `);
 const stmtGetByClientId = db.prepare(
   'SELECT id, sequence, ts FROM messages WHERE client_msg_id = ?'
+);
+const stmtRecentBrowserUserMessages = db.prepare(
+  `SELECT id, content, ts FROM messages
+   WHERE session = ? AND role = 'user' AND client_msg_id IS NOT NULL
+   ORDER BY id DESC LIMIT 10`
 );
 
 // ── Auth ──────────────────────────────────────────────────────────────────────
@@ -839,9 +903,12 @@ const sessionHealth   = new Map();  // sessionId → 'healthy'|'degraded'|'disco
 const sessionLastSeen = new Map();  // sessionId → Date.now() of last activity
 const sessionActivity = new Map();  // sessionId → last known activity kind (A12-02)
 
+const cachedChatLists = new Map();  // sessionId -> latest chat_list payload
+
 // Duplicate suppression maps
 const recentBrowserSends = new Map();  // "session:content" → timestamp
 const recentFileSends    = new Map();  // "session:filename" → timestamp
+const BROWSER_ECHO_DEDUP_WINDOW_SEC = 5 * 60;
 
 // Workspace list from proxy snapshot (for "Launch New Session" dropdown)
 let cachedWorkspaces = [];
@@ -892,7 +959,7 @@ function getSessionList() {
 }
 
 function getEffectiveHistory(sessionId) {
-  const direct = stmtGetHistory.all(sessionId);
+  const direct = getHistoryRows(sessionId);
   if (direct.length > 0) return direct;
 
   const liveMeta = sessionMeta.get(sessionId);
@@ -922,7 +989,7 @@ function getEffectiveHistory(sessionId) {
   }
   if (!candidate?.session_id) return direct;
 
-  const fallback = stmtGetHistory.all(candidate.session_id);
+  const fallback = getHistoryRows(candidate.session_id);
   if (fallback.length > 0) {
     log('info', 'history', 'Using related Codex Desktop history fallback', {
       requested_session: sessionId,
@@ -1271,6 +1338,7 @@ function handleProxyConnection(ws, req) {
           sessionLastSeen.delete(sid);
           sessionSeq.delete(sid);
           sessionActivity.delete(sid);
+          cachedChatLists.delete(sid);
           log('info', 'proxy-ws', `Evicted stale session ${sid} (not in new snapshot)`);
           // Check if this was a recently resumed session whose messages need migration
           if (recentResumeSessions.has(sid)) {
@@ -1302,13 +1370,13 @@ function handleProxyConnection(ws, req) {
           if (replacementId) {
             // Migrate messages from evicted session to replacement
             try {
-              const messages = stmtGetHistory.all(evictedSid);
+              const messages = getHistoryRows(evictedSid);
               if (messages.length > 0) {
                 let migrated = 0;
                 for (const m of messages) {
                   if (m.role === 'user' || m.role === 'assistant') {
                     const seq = nextSeq(replacementId);
-                    stmtInsertIdempotent.run(replacementId, m.role, m.content, null, 'delivered', seq);
+                    insertMessageIdempotent(replacementId, m.role, m.content, null, 'delivered', seq, null, m.content_blocks);
                     migrated++;
                   }
                 }
@@ -1409,12 +1477,19 @@ function handleProxyConnection(ws, req) {
       const id      = msg.session || msg.session_id;
       const role    = msg.role    || msg.message?.role;
       const content = msg.content || msg.message?.content;
+      const contentBlocks = Array.isArray(msg.content_blocks)
+        ? msg.content_blocks
+        : (Array.isArray(msg.message?.content_blocks) ? msg.message.content_blocks : null);
       if (!id || !role || !content) return;
 
       // Dedup: suppress echoed user messages that came from the browser
       if (role === 'user') {
         const key = `${id}:${content}`;
         if (recentBrowserSends.has(key)) { recentBrowserSends.delete(key); return; }
+        if (isRecentBrowserUserEcho(id, content)) {
+          log('info', 'dedup', 'Skipping browser-originated user echo', { session: id });
+          return;
+        }
         for (const [fk] of recentFileSends.entries()) {
           const [fs, fn] = fk.split(':');
           if (fs === id && content.includes(fn)) { recentFileSends.delete(fk); return; }
@@ -1436,7 +1511,7 @@ function handleProxyConnection(ws, req) {
       let messageTs = Math.floor(Date.now() / 1000);
       let rowId;
       try {
-        const info = stmtInsert.run(id, role, content, null, 'delivered', seq);
+        const info = insertMessage(id, role, content, null, 'delivered', seq, null, contentBlocks);
         rowId = info.lastInsertRowid;
       } catch (e) {
         log('error', 'db', 'Insert failed', { session: id, err: e.message });
@@ -1449,6 +1524,7 @@ function handleProxyConnection(ws, req) {
         session:           id,
         role,
         content,
+        ...(contentBlocks ? { content_blocks: contentBlocks } : {}),
         sequence:          seq,
         server_message_id: rowId,
         ts:                messageTs,
@@ -1484,7 +1560,7 @@ function handleProxyConnection(ws, req) {
           for (const m of oldMessages) {
             if (m.role === 'user' || m.role === 'assistant') {
               const seq = nextSeq(newSessionId);
-              stmtInsert.run(newSessionId, m.role, m.content, null, 'delivered', seq);
+              insertMessage(newSessionId, m.role, m.content, null, 'delivered', seq, null, m.content_blocks);
               copied++;
             }
           }
@@ -1493,7 +1569,7 @@ function handleProxyConnection(ws, req) {
             source: pending.resume_source, messages_copied: copied,
           });
           // Send the copied history to the browser so it appears immediately
-          const newHistory = stmtGetHistory.all(newSessionId);
+          const newHistory = getHistoryRows(newSessionId);
           if (pending.browser_ws?.readyState === WebSocket.OPEN) {
             pending.browser_ws.send(JSON.stringify({ type: 'history', session: newSessionId, messages: newHistory }));
           }
@@ -1530,6 +1606,7 @@ function handleProxyConnection(ws, req) {
         sessionLastSeen.delete(id);
         sessionSeq.delete(id);
         sessionActivity.delete(id);
+        cachedChatLists.delete(id);
         for (const key of Array.from(pendingErrorPrompts.keys())) {
           if (key.startsWith(`${id}:`)) pendingErrorPrompts.delete(key);
         }
@@ -1614,7 +1691,10 @@ function handleProxyConnection(ws, req) {
     // ── Chat list (Epic 9) ──────────────────────────────────────────────
     } else if (t === 'chat_list') {
       const sessionId = msg.session_id || msg.session;
-      if (sessionId) touchSession(sessionId);
+      if (sessionId) {
+        touchSession(sessionId);
+        cachedChatLists.set(sessionId, { ...msg, session_id: sessionId });
+      }
       broadcastToBrowsers(msg);
       log('info', 'ctrl', 'Chat list received', { session: sessionId, count: (msg.chats || []).length });
 
@@ -1743,16 +1823,16 @@ function handleProxyConnection(ws, req) {
       const messages = msg.messages || [];
       if (!id || !Array.isArray(messages)) return;
 
-      const existing = stmtGetHistory.all(id);
+      const existing = getHistoryRows(id);
       if (messages.length > 0 && !historiesMatch(existing, messages)) {
         const resync = db.transaction((msgs) => {
           stmtDeleteSession.run(id);
           sessionSeq.delete(id);
-          msgs.forEach(m => insertMessage(id, m.role, m.content, null, 'delivered', nextSeq(id), m.ts));
+          msgs.forEach(m => insertMessage(id, m.role, m.content, null, 'delivered', nextSeq(id), m.ts, m.content_blocks));
         });
         resync(messages);
         log('info', 'history', `Resynced ${existing.length}→${messages.length}`, { session: id });
-        const buildPayload = () => ({ type: 'history', session: id, messages: stmtGetHistory.all(id) });
+        const buildPayload = () => ({ type: 'history', session: id, messages: getHistoryRows(id) });
         if (messages.length <= LARGE_HISTORY_BROADCAST_LIMIT) {
           broadcastToBrowsers(buildPayload());
         } else {
@@ -1762,10 +1842,10 @@ function handleProxyConnection(ws, req) {
         }
       } else if (existing.length === 0 && messages.length > 0) {
         db.transaction((msgs) => {
-          msgs.forEach(m => insertMessage(id, m.role, m.content, null, 'delivered', nextSeq(id), m.ts));
+          msgs.forEach(m => insertMessage(id, m.role, m.content, null, 'delivered', nextSeq(id), m.ts, m.content_blocks));
         })(messages);
         log('info', 'history', `Stored ${messages.length} msgs`, { session: id });
-        broadcastToBrowsers({ type: 'history', session: id, messages: stmtGetHistory.all(id) });
+        broadcastToBrowsers({ type: 'history', session: id, messages: getHistoryRows(id) });
       }
 
     // ── Rate limit events (A12-02, proxy side added in A12-03) ────────────
@@ -1807,7 +1887,7 @@ function handleProxyConnection(ws, req) {
       log('info', 'rate-limit', 'Rate limit cleared', { session: id });
 
     // ── Steer / queue messages (proxy → browser) ─────────────────────────
-    } else if (t === 'message_queued' || t === 'queue_delivered' || t === 'steer_result') {
+    } else if (t === 'message_queued' || t === 'queue_delivered' || t === 'steer_result' || t === 'proxy_send_result') {
       broadcastToBrowsers(msg);
       log('info', 'send', `${t}`, { session: msg.session_id, cid: msg.client_message_id });
 
@@ -1827,6 +1907,7 @@ function handleProxyConnection(ws, req) {
         sessionProxyId.delete(s);
         sessionMeta.delete(s);
         sessionActivity.delete(s);
+        cachedChatLists.delete(s);
         setHealth(s, 'disconnected');
       }
     });
@@ -1904,6 +1985,9 @@ function handleClientConnection(ws, req) {
     ...(cachedWorkspaces.length > 0 ? { workspaces: cachedWorkspaces } : {}),
     ts:                   Date.now(),
   }));
+  for (const [sessionId, chatList] of cachedChatLists) {
+    if (proxySockets.has(sessionId)) ws.send(JSON.stringify(chatList));
+  }
 
   ws.on('message', (data) => {
     let msg;
@@ -1946,7 +2030,7 @@ function handleClientConnection(ws, req) {
       const id       = msg.session || msg.session_id;
       const sinceSeq = msg.since_sequence ?? msg.after_sequence ?? null;
       if (sinceSeq != null && sinceSeq > 0) {
-        const messages = stmtGetHistoryFrom.all(id, sinceSeq);
+        const messages = getHistoryRowsFrom(id, sinceSeq);
         ws.send(JSON.stringify({ type: 'history_delta', session: id, since_sequence: sinceSeq, messages }));
       } else {
         const messages = getEffectiveHistory(id);
@@ -2045,7 +2129,7 @@ function handleClientConnection(ws, req) {
       let serverId, finalSeq = seq;
       try {
         if (clientMsgId) {
-          stmtInsertIdempotent.run(id, 'user', content, clientMsgId, 'delivered', seq);
+          insertMessageIdempotent(id, 'user', content, clientMsgId, 'delivered', seq);
           const row = stmtGetByClientId.get(clientMsgId);
           if (row) {
             serverId = row.id;
@@ -2053,7 +2137,7 @@ function handleClientConnection(ws, req) {
             if (row.ts) messageTs = row.ts;
           }
         } else {
-          const info = stmtInsert.run(id, 'user', content, null, 'delivered', seq);
+          const info = insertMessage(id, 'user', content, null, 'delivered', seq);
           serverId = info.lastInsertRowid;
         }
       } catch (e) {
@@ -2063,7 +2147,7 @@ function handleClientConnection(ws, req) {
       // Register for dedup suppression (proxy will scrape this back)
       const key = `${id}:${content}`;
       recentBrowserSends.set(key, Date.now());
-      setTimeout(() => recentBrowserSends.delete(key), 10_000);
+      setTimeout(() => recentBrowserSends.delete(key), BROWSER_ECHO_DEDUP_WINDOW_SEC * 1000);
 
       // Ack to the sending browser
       ws.send(JSON.stringify({
@@ -2188,7 +2272,7 @@ function handleClientConnection(ws, req) {
       }
 
       // Verify source session has messages
-      const oldMessages = stmtGetHistory.all(sourceSession);
+      const oldMessages = getHistoryRows(sourceSession);
       if (oldMessages.length === 0) {
         ws.send(JSON.stringify({
           type: 'session_launch_failed', protocol_version: PROTOCOL_VERSION,
@@ -2736,7 +2820,7 @@ function executeAutomation(automation) {
   const content = automation.prompt;
 
   try {
-    stmtInsertIdempotent.run(targetSession, 'user', content, clientMsgId, 'delivered', seq);
+    insertMessageIdempotent(targetSession, 'user', content, clientMsgId, 'delivered', seq);
   } catch (e) {
     log('error', 'automations', 'DB insert failed', { err: e.message });
   }

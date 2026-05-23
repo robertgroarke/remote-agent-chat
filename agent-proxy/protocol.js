@@ -59,8 +59,9 @@ function sessionSnapshot(sessions, workspaces, proxyId) {
 // Proxy observed a transcript message (replaces legacy 'message').
 // Includes legacy fields so an un-upgraded relay that checks `type === 'message'`
 // still works — but 'proxy_message' is the canonical v1 type.
-function proxyMessage(sessionId, role, content) {
-  return {
+function proxyMessage(sessionId, role, content, extra = null) {
+  const contentBlocks = Array.isArray(extra?.content_blocks) ? extra.content_blocks : null;
+  const msg = {
     type: 'proxy_message',
     protocol_version: PROTOCOL_VERSION,
     session_id: sessionId,
@@ -74,6 +75,11 @@ function proxyMessage(sessionId, role, content) {
     role,
     content,
   };
+  if (contentBlocks) {
+    msg.message.content_blocks = contentBlocks;
+    msg.content_blocks = contentBlocks;
+  }
+  return msg;
 }
 
 // ─── Status events ────────────────────────────────────────────────────────────

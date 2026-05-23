@@ -127,6 +127,7 @@ Every `session_up`, `session_snapshot`, and session-bearing history event should
     "machine_label": "Robert-Windows",
     "target_signature": "sha-like-or-derived-string",
     "target_id": "transient-target-id",
+    "is_list_view": false,
     "last_seen_at": "2026-03-19T10:15:30.000Z",
     "status": "healthy|degraded|disconnected|scraping_failed|agent_ui_changed",
     "activity": {
@@ -151,6 +152,9 @@ Recommended fields:
 - `workspace_name`
 - `workspace_path`
 - `last_seen_at`
+- `is_list_view`: true when the native surface is on a conversation picker,
+  history, scheduled-task, or new-conversation view rather than an active
+  transcript.
 
 ## Connection Lifecycle
 
@@ -523,6 +527,7 @@ Sent by relay when returning the full known transcript for a session.
       "message_id": "msg_srv_111",
       "role": "user",
       "content": "hello",
+      "content_blocks": null,
       "created_at": "2026-03-19T10:00:00.000Z"
     }
   ]
@@ -550,6 +555,9 @@ Sent by relay when returning only events after a known sequence.
         "message_id": "msg_srv_456",
         "role": "assistant",
         "content": "I updated the file.",
+        "content_blocks": [
+          { "type": "markdown", "content": "I updated the file." }
+        ],
         "created_at": "2026-03-19T10:17:10.000Z"
       }
     }
@@ -597,10 +605,38 @@ Sent by proxy to relay when the proxy observes transcript content.
   "message": {
     "role": "assistant",
     "content": "Done.",
+    "content_blocks": [
+      { "type": "markdown", "content": "Done." }
+    ],
     "created_at": "2026-03-19T10:17:10.000Z"
   }
 }
 ```
+
+`content_blocks` is optional. When present it is an ordered array of structured
+rendering blocks such as `markdown`, `thinking`, `tool_call`, `terminal`,
+`file_changes`, `artifact`, `prompt`, or `error`. Receivers must preserve it
+through persistence and replay while continuing to treat `content` as the plain
+text fallback for older clients.
+
+Canonical block fields:
+
+```json
+[
+  { "type": "markdown", "content": "Rendered Markdown including tables and fenced code." },
+  { "type": "thinking", "label": "Worked for 5m", "content": "Reasoning/work summary text", "collapsed": true },
+  { "type": "tool_call", "label": "Run command", "status": "running|done|error", "content": "Visible tool body" },
+  { "type": "terminal", "command": "npm test", "stdout": "...", "stderr": "", "exit_code": 0 },
+  { "type": "file_changes", "summary": "2 files changed", "files": [{ "path": "x.js", "added": 52, "removed": 5 }] },
+  { "type": "artifact", "label": "Walkthrough", "artifact_type": "walkthrough", "content": "Visible artifact text" },
+  { "type": "prompt", "label": "Permission required", "content": "Prompt text", "actions": [{ "id": "allow", "label": "Allow" }] },
+  { "type": "error", "label": "Failed", "content": "Error text", "actions": [{ "id": "retry", "label": "Retry" }] }
+]
+```
+
+Senders must not emit off-spec block types. If a reader sees legacy `code`, it
+should normalize it to a `markdown` block containing a fenced code block. Legacy
+`file_change` should normalize to `file_changes`.
 
 ### `proxy_send_result`
 
@@ -651,6 +687,34 @@ Sent by proxy when session health or activity changes.
   }
 }
 ```
+
+### `chat_list`
+
+Sent by proxy to relay when an agent surface exposes conversation navigation.
+Relay broadcasts the event to browser clients and may cache the latest list for
+reconnect.
+
+```json
+{
+  "type": "chat_list",
+  "protocol_version": 1,
+  "session_id": "sess_123",
+  "chats": [
+    { "id": "__agv2:new_conversation", "kind": "nav", "action": "new_conversation", "title": "New Conversation" },
+    { "id": "__agv2:project:0", "kind": "project", "title": "Remote Agent Chat", "project": "Remote Agent Chat", "project_index": 0 },
+    { "id": "4fe356d9-7107-4fab-90c2-ee9d0c1fd534", "kind": "chat", "title": "Fixing Catalyst Events API", "project": "Remote Agent Chat", "active": true },
+    { "id": "__agv2:see_all:0", "kind": "see_all", "action": "see_all", "title": "See all (9)", "project": "Remote Agent Chat" }
+  ],
+  "read_at": "2026-03-19T10:18:00.000Z"
+}
+```
+
+`kind` taxonomy:
+
+- `nav`: top-level native navigation such as new conversation, conversation history, or scheduled tasks.
+- `project`: a project/group row.
+- `chat`: an addressable conversation. For Antigravity v2 the `id` is the route UUID from `/c/<uuid>`.
+- `see_all`: explicit user-triggered expansion for a project. Passive polling must not click these controls.
 
 ## Session Management
 

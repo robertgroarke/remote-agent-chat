@@ -804,6 +804,7 @@ function isRooCodeAgentType(agentType) {
 async function detectThinking(Runtime, agentType) {
   if (isRooCodeAgentType(agentType)) return detectRooCodeThinking(Runtime);
   if (isContinueAgentType(agentType)) return detectContinueThinking(Runtime);
+  if (agentType === 'antigravity-v2') return detectAntigravityV2Thinking(Runtime);
   if (agentType === 'antigravity_panel') return detectAntigravityPanelThinking(Runtime);
   if (agentType === 'antigravity') return detectAntigravityThinking(Runtime);
   if (agentType === 'gemini') {
@@ -2368,6 +2369,31 @@ const CODEX_DESKTOP_READ_EXPR = `
     }
   }
 
+  // Format a Codex Desktop tool-disclosure button ("Ran 5 commands",
+  // "Edited 3 files", …) into a [Bash …] / [Edit …] block. Body comes from
+  // the live expanded box when the row is open, else the per-poll cache.
+  // With no body it emits just the header — the WebUI collapses an empty
+  // tool block to its title, which is the desired "command + tool only" view.
+  function _formatDesktopToolButton(btn) {
+    var header = String(btn.innerText || btn.textContent || '').trim().split('\\n')[0].trim();
+    if (!header) return '';
+    var isEdit = /^(Edited|Created|Deleted)\\b/i.test(header);
+    var body = '';
+    if (btn.getAttribute('aria-expanded') === 'true') {
+      body = _desktopCaptureExpandedBox(btn);
+    }
+    if (!body) body = _desktopCachedRunBody(btn);
+    if (body) {
+      var lines = body.split('\\n');
+      while (lines.length && (lines[0].trim() === header || !lines[0].trim())) lines.shift();
+      body = lines.join('\\n').trim();
+    }
+    var name = isEdit
+      ? 'Edit ' + header.replace(/^(Edited|Created|Deleted)\\s*/i, '').trim()
+      : 'Bash ' + header.replace(/^(Ran|Read|Searched|Search)\\s*/i, '').trim();
+    return '[' + name + ']\\n' + (body ? body + '\\n' : '') + '[end]';
+  }
+
   function _desktopCachedRunBody(btn) {
     var cache = _desktopCmdCache();
     var key = _desktopRanButtonKey(btn);
@@ -2442,6 +2468,18 @@ const CODEX_DESKTOP_READ_EXPR = `
     return clone;
   }
 
+  function _desktopIsInlineCodeNode(node) {
+    // Codex Desktop renders inline code as a styled <span> instead of a
+    // <code> tag. The class always contains "inline-markdown" (or the
+    // CSS-module variant "_inlineMarkdown_*"). Treat any such span as
+    // inline code so the WebUI renders it monospace.
+    if (!node || node.nodeType !== 1) return false;
+    if (node.nodeName.toUpperCase() !== 'SPAN') return false;
+    var cls = typeof node.className === 'string' ? node.className : '';
+    if (!cls) return false;
+    return /\\b_?inline-?[Mm]arkdown\\b/.test(cls);
+  }
+
   function inlineText(node) {
     if (!node) return '';
     if (node.nodeType === 3) return node.textContent || '';
@@ -2452,6 +2490,34 @@ const CODEX_DESKTOP_READ_EXPR = `
     if (tag === 'CODE') {
       var codeText = squashNewlines(node.textContent || '');
       return codeText ? bt + codeText + bt : '';
+    }
+    // Codex's custom inline-code span — render as backtick-wrapped text.
+    if (_desktopIsInlineCodeNode(node)) {
+      var spanText = squashNewlines(node.textContent || '');
+      return spanText ? bt + spanText + bt : '';
+    }
+    if (tag === 'STRONG' || tag === 'B') {
+      var boldText = Array.from(node.childNodes).map(inlineText).join('');
+      var trimmed = boldText.replace(/^\\s+|\\s+$/g, '');
+      if (!trimmed) return boldText;
+      // Preserve leading/trailing whitespace outside the markers.
+      var lead = boldText.slice(0, boldText.length - boldText.replace(/^\\s+/, '').length);
+      var tail = boldText.slice(boldText.replace(/\\s+$/, '').length);
+      return lead + '**' + trimmed + '**' + tail;
+    }
+    if (tag === 'EM' || tag === 'I') {
+      var itText = Array.from(node.childNodes).map(inlineText).join('');
+      var itTrim = itText.replace(/^\\s+|\\s+$/g, '');
+      if (!itTrim) return itText;
+      var lead2 = itText.slice(0, itText.length - itText.replace(/^\\s+/, '').length);
+      var tail2 = itText.slice(itText.replace(/\\s+$/, '').length);
+      return lead2 + '*' + itTrim + '*' + tail2;
+    }
+    if (tag === 'A') {
+      var linkText = Array.from(node.childNodes).map(inlineText).join('');
+      var href = node.getAttribute('href') || '';
+      if (href && linkText && linkText !== href) return '[' + linkText + '](' + href + ')';
+      return linkText || href;
     }
     if (tag === 'BUTTON' || tag === 'SVG' || tag === 'PATH') return '';
     var inner = Array.from(node.childNodes).map(inlineText).join('');
@@ -2973,46 +3039,49 @@ const CODEX_DESKTOP_READ_EXPR = `
   await _primeDesktopCollapsedRuns();
   await _primeDesktopWorkedForTurns();
 
-  // Prefer the current build's data-turn-key attribute. Older builds used
-  // data-content-search-turn-key; if neither is present we fall back below
-  // to synthesizing turns by LCA of units with a shared turn UUID.
-  var turns = Array.from(convo.querySelectorAll('[data-turn-key], [data-content-search-turn-key]'));
-
-  // Fallback for newer Codex Desktop builds that dropped the turn-key
-  // wrapper attribute. Synthesize "turn" elements by grouping units with
-  // the same turnId (the part before the first ':' in their unit-key)
-  // and finding their lowest common ancestor in the DOM. The rest of the
-  // per-turn extraction logic below works against those synthesized
-  // elements unchanged.
-  if (turns.length === 0) {
-    var units = Array.from(convo.querySelectorAll('[data-content-search-unit-key]'));
-    var groups = {};
-    var groupOrder = [];
-    for (var ui = 0; ui < units.length; ui++) {
-      var ukey = units[ui].getAttribute('data-content-search-unit-key') || '';
-      var tid = ukey.split(':')[0];
-      if (!tid) continue;
-      if (!groups[tid]) { groups[tid] = []; groupOrder.push(tid); }
-      groups[tid].push(units[ui]);
-    }
-    function lca(nodes) {
-      if (!nodes || nodes.length === 0) return null;
-      if (nodes.length === 1) return nodes[0].parentElement || nodes[0];
-      var a = nodes[0];
-      for (var i = 1; i < nodes.length; i++) {
-        var b = nodes[i];
-        var aAncestors = [];
-        for (var p = a; p; p = p.parentElement) aAncestors.push(p);
-        for (var q = b; q; q = q.parentElement) {
-          if (aAncestors.indexOf(q) !== -1) { a = q; break; }
-        }
+  // Group ALL units by their turnId (the part before the first ':' in their
+  // unit-key). Codex Desktop sometimes wraps turns in [data-turn-key] /
+  // [data-content-search-turn-key] elements, but in virtualized chats only
+  // the most-recently mounted turns get those wrappers — older turns have
+  // units but no wrapper. Iterating wrapper elements alone misses every
+  // unwrapped turn, which is what made the WebUI go blank.
+  // For each unique turnId: prefer an actual turn-wrapper attribute when one
+  // contains the whole group; otherwise fall back to the lowest common
+  // ancestor of the group's units in the DOM. The rest of the per-turn
+  // extraction below works against either kind of element unchanged.
+  function _desktopTurnLca(nodes) {
+    if (!nodes || nodes.length === 0) return null;
+    if (nodes.length === 1) return nodes[0].parentElement || nodes[0];
+    var a = nodes[0];
+    for (var i = 1; i < nodes.length; i++) {
+      var b = nodes[i];
+      var aAncestors = [];
+      for (var p = a; p; p = p.parentElement) aAncestors.push(p);
+      for (var q = b; q; q = q.parentElement) {
+        if (aAncestors.indexOf(q) !== -1) { a = q; break; }
       }
-      return a;
     }
-    for (var gi = 0; gi < groupOrder.length; gi++) {
-      var groupUnits = groups[groupOrder[gi]];
-      var turnEl = lca(groupUnits);
-      if (turnEl) turns.push(turnEl);
+    return a;
+  }
+  var allUnits = Array.from(convo.querySelectorAll('[data-content-search-unit-key]'));
+  var _turnGroups = {};
+  var _turnGroupOrder = [];
+  for (var _ui = 0; _ui < allUnits.length; _ui++) {
+    var _ukey = allUnits[_ui].getAttribute('data-content-search-unit-key') || '';
+    var _tid = _ukey.split(':')[0];
+    if (!_tid) continue;
+    if (!_turnGroups[_tid]) { _turnGroups[_tid] = []; _turnGroupOrder.push(_tid); }
+    _turnGroups[_tid].push(allUnits[_ui]);
+  }
+  var turns = [];
+  for (var _gi = 0; _gi < _turnGroupOrder.length; _gi++) {
+    var _groupUnits = _turnGroups[_turnGroupOrder[_gi]];
+    var _firstWrapper = _groupUnits[0].closest('[data-turn-key], [data-content-search-turn-key]');
+    if (_firstWrapper && _groupUnits.every(function(u) { return _firstWrapper.contains(u); })) {
+      turns.push(_firstWrapper);
+    } else {
+      var _turnEl = _desktopTurnLca(_groupUnits);
+      if (_turnEl) turns.push(_turnEl);
     }
   }
 
@@ -3042,18 +3111,60 @@ const CODEX_DESKTOP_READ_EXPR = `
       ? _turnTsFromKey(units[0].getAttribute('data-content-search-unit-key'))
       : null;
 
+    // Build an ordered content list: assistant/tool units + tool disclosure
+    // buttons ("Ran N commands", "Edited 3 files", …). Codex Desktop renders
+    // the tool-activity rows as <button> disclosures sitting BETWEEN the
+    // assistant narrative units (they are not unit-key elements), so a
+    // unit-only walk drops every tool block and a turn-end harvest loses the
+    // interleaving. Walk both kinds in DOM document order instead.
+    function _isDesktopToolHeader(text) {
+      return /^(Ran |Edited |Created |Deleted |Read |Searched |Search )/i.test(String(text || '').trim());
+    }
+    var contentEls = [];
     for (var ui = 0; ui < units.length; ui++) {
-      var unit = units[ui];
-      var role = roleFromUnit(unit);
-      if (!role) continue;
-
-      var text = extractUnitText(unit, role);
-      if (!text) continue;
-
+      var role = roleFromUnit(units[ui]);
       if (role === 'user') {
-        uniquePush(userParts, text);
+        contentEls.push({ el: units[ui], kind: 'user' });
       } else if (role === 'assistant' || role === 'tool') {
-        uniquePush(assistantParts, text);
+        contentEls.push({ el: units[ui], kind: 'unit', role: role });
+      }
+    }
+    var toolBtnCandidates = Array.from(turn.querySelectorAll('button'));
+    var acceptedToolBtns = [];
+    for (var tb = 0; tb < toolBtnCandidates.length; tb++) {
+      var tbtn = toolBtnCandidates[tb];
+      var tbHeader = (tbtn.innerText || '').trim().split('\\n')[0];
+      if (!_isDesktopToolHeader(tbHeader)) continue;
+      // "Worked for X" is the turn-level container toggle, not a tool row.
+      if (/^Worked for |^Working for /i.test(tbHeader)) continue;
+      if (tbtn.closest('[data-content-search-unit-key]')) continue;
+      // Skip a tool button nested inside another already-accepted tool button
+      // (a "Ran N commands" disclosure contains per-command child buttons).
+      var nestedInTool = acceptedToolBtns.some(function(p) { return p !== tbtn && p.contains(tbtn); });
+      if (nestedInTool) continue;
+      acceptedToolBtns.push(tbtn);
+      contentEls.push({ el: tbtn, kind: 'tool' });
+    }
+    // Order by DOM document position so tool blocks land between the
+    // narrative paragraphs exactly where Codex Desktop shows them.
+    contentEls.sort(function(a, b) {
+      if (a.el === b.el) return 0;
+      var pos = a.el.compareDocumentPosition(b.el);
+      if (pos & 4) return -1;   // b follows a
+      if (pos & 2) return 1;    // b precedes a
+      return 0;
+    });
+    for (var ce = 0; ce < contentEls.length; ce++) {
+      var item = contentEls[ce];
+      if (item.kind === 'user') {
+        var utext = extractUnitText(item.el, 'user');
+        if (utext) uniquePush(userParts, utext);
+      } else if (item.kind === 'unit') {
+        var atext = extractUnitText(item.el, item.role);
+        if (atext) uniquePush(assistantParts, atext);
+      } else if (item.kind === 'tool') {
+        var tblock = _formatDesktopToolButton(item.el);
+        if (tblock) uniquePushAny(assistantParts, tblock);
       }
     }
 
@@ -3069,43 +3180,6 @@ const CODEX_DESKTOP_READ_EXPR = `
       if (parsedCommand) uniquePushAny(assistantParts, parsedCommand);
     }
 
-    // Harvest "Ran ..." rows in this turn. Codex Desktop renders multi-command
-    // turns as a button (collapsed "Ran N commands" or single "Ran <cmd>"),
-    // and the actual body sits in a sibling/parent box that's only mounted
-    // when the row is expanded. We use whichever source is available:
-    //   1. Live expanded box text (when the row is currently expanded)
-    //   2. Cached body captured on a prior poll (filled by the prime step)
-    // The rows live OUTSIDE [data-content-search-unit-key] elements while the
-    // assistant is mid-flight, so we have to scan at the turn level here.
-    // Skip when an assistant unit already exists in this turn — the unit
-    // text covers the same content and we'd double-emit.
-    var hasAssistantUnit = units.some(function(u) { return roleFromUnit(u) === 'assistant'; });
-    var ranBtnsInTurn = hasAssistantUnit
-      ? []
-      : Array.from(turn.querySelectorAll('button'))
-          .filter(function(b) { return /^Ran\\s+/i.test((b.innerText || '').trim()); });
-    for (var rbi = 0; rbi < ranBtnsInTurn.length; rbi++) {
-      var rbtn = ranBtnsInTurn[rbi];
-      var hdr = (rbtn.innerText || '').trim().split('\\n')[0];
-      var body = '';
-      if (rbtn.getAttribute('aria-expanded') === 'true') {
-        body = _desktopCaptureExpandedBox(rbtn);
-      }
-      if (!body) body = _desktopCachedRunBody(rbtn);
-      if (!body) continue;
-      // Strip the leading header line(s) from the captured body so we don't
-      // double-print "Ran N commands" inside the [Bash ...] block.
-      var bodyLines = body.split('\\n');
-      while (bodyLines.length && (bodyLines[0].trim() === hdr.trim() || !bodyLines[0].trim())) {
-        bodyLines.shift();
-      }
-      var bodyText = bodyLines.join('\\n').trim();
-      if (!bodyText) continue;
-      var headerLabel = hdr.replace(/^Ran\\s+/i, '').trim() || 'commands';
-      var block = '[Bash ' + headerLabel + ']\\n' + bodyText + '\\n[end]';
-      uniquePushAny(assistantParts, block);
-    }
-
     // File-change summary cards ("N files changed +A -D" with per-file rows).
     // These show up after a "Worked for" header on completed turns and were
     // previously dropped on Codex Desktop, so collapsed turns lost the file
@@ -3113,19 +3187,13 @@ const CODEX_DESKTOP_READ_EXPR = `
     var summaryBlocks = _extractDesktopFileChangeSummaryCards(turn);
     summaryBlocks.forEach(function(block) { uniquePushAny(assistantParts, block); });
 
-    // Prepend the "Worked for X" expanded body (reasoning + tool-call trace)
-    // before the assistant's final answer so the WebUI shows the intermediate
-    // work Codex Desktop hides behind the toggle. Cached per turn-key so it
-    // survives later collapses or virtualization.
-    var workedBody = _cachedDesktopWorkedBodyForTurn(turn);
-    if (workedBody) {
-      var hasWorkedBody = assistantParts.some(function(p) {
-        return p && p.length >= 80 && workedBody.indexOf(p.substring(0, 80)) !== -1;
-      });
-      if (!hasWorkedBody) {
-        // Insert at the front so reasoning/tools appear above the final answer.
-        assistantParts.unshift(workedBody);
-      }
+    // Fallback only: if the interleaved unit/tool walk produced nothing for
+    // this turn (turn fully collapsed and not yet expanded by the prime
+    // step), fall back to the cached "Worked for X" expanded body so the
+    // WebUI still shows something rather than an empty turn.
+    if (assistantParts.length === 0) {
+      var workedBody = _cachedDesktopWorkedBodyForTurn(turn);
+      if (workedBody) assistantParts.push(workedBody);
     }
 
     // Append the "Worked for X" header (if present and not already in
@@ -5751,12 +5819,730 @@ async function readAntigravityConfig(Runtime, workspacePath) {
 
 // ─── Message reading (dispatch) ───────────────────────────────────────────────
 
+// Antigravity v2 Agent Manager is a standalone React/Vite page target on CDP
+// port 9226. It is not a VS Code webview, so all selectors use evalInPage.
+const ANTIGRAVITY_V2_READ_EXPR = `
+  function norm(t) {
+    return String(t || '').replace(/\\u00a0/g, ' ').replace(/[ \\t]+\\n/g, '\\n').replace(/\\n{3,}/g, '\\n\\n').trim();
+  }
+  function visibleText(el) {
+    return norm(el ? (el.innerText || el.textContent || '') : '');
+  }
+  function tableToMarkdown(table) {
+    var rows = Array.from(table.querySelectorAll('tr')).map(function(row) {
+      return Array.from(row.querySelectorAll('th,td')).map(function(cell) {
+        return visibleText(cell).replace(/\\|/g, '\\\\|');
+      });
+    }).filter(function(row) { return row.length > 0; });
+    if (!rows.length) return '';
+    var out = ['| ' + rows[0].join(' | ') + ' |'];
+    out.push('| ' + rows[0].map(function() { return '---'; }).join(' | ') + ' |');
+    for (var i = 1; i < rows.length; i++) out.push('| ' + rows[i].join(' | ') + ' |');
+    return out.join('\\n');
+  }
+  function isControlText(text) {
+    return /^(Copy|Good response|Bad response|Retry|Dismiss|Open|Close)$/i.test(norm(text));
+  }
+  function languageForPre(pre) {
+    var cls = String(pre.className || '');
+    var code = pre.querySelector('code');
+    var codeCls = code ? String(code.className || '') : '';
+    var m = (cls + ' ' + codeCls).match(/language-([a-z0-9_+-]+)/i);
+    return m ? m[1] : (pre.getAttribute('data-language') || '');
+  }
+  function pushMarkdown(blocks, content) {
+    content = norm(content);
+    if (!content) return;
+    var last = blocks[blocks.length - 1];
+    if (last && last.type === 'markdown') last.content = norm(last.content + '\\n\\n' + content);
+    else blocks.push({ type: 'markdown', content: content });
+  }
+  function markdownForElement(el) {
+    var text = visibleText(el);
+    if (!text || isControlText(text)) return '';
+    var tag = el.tagName;
+    if (tag === 'H1') return '# ' + text;
+    if (tag === 'H2') return '## ' + text;
+    if (tag === 'H3' || tag === 'H4') return '### ' + text;
+    if (tag === 'LI') return '- ' + text;
+    if (tag === 'BLOCKQUOTE') return '> ' + text.replace(/\\n/g, '\\n> ');
+    return text;
+  }
+  function parseFileChangesFromText(text) {
+    text = norm(text);
+    var countMatch = text.match(/(\\d+)\\s+files?\\s+changed/i);
+    if (!countMatch && !/\\+\\d+/.test(text) && !/-\\d+/.test(text)) return null;
+    var added = (text.match(/\\+(\\d+)/) || [])[1];
+    var removed = (text.match(/-(\\d+)/) || [])[1];
+    var files = [];
+    text.split('\\n').forEach(function(line) {
+      var trimmed = norm(line);
+      if (!trimmed || /files? changed/i.test(trimmed)) return;
+      var stats = trimmed.match(/(.+?)\\s+\\+(\\d+)(?:\\s+-(\\d+))?$/);
+      if (!stats) stats = trimmed.match(/(.+?)\\s+-(\\d+)(?:\\s+\\+(\\d+))?$/);
+      if (stats) {
+        files.push({
+          path: norm(stats[1]),
+          added: trimmed.match(/\\+(\\d+)/) ? Number((trimmed.match(/\\+(\\d+)/) || [])[1]) : 0,
+          removed: trimmed.match(/-(\\d+)/) ? Number((trimmed.match(/-(\\d+)/) || [])[1]) : 0
+        });
+      }
+    });
+    return {
+      type: 'file_changes',
+      summary: countMatch ? countMatch[0] : 'File changes',
+      content: [countMatch ? countMatch[0] : 'File changes', added ? '+' + added : null, removed ? '-' + removed : null].filter(Boolean).join(' '),
+      files_changed: countMatch ? Number(countMatch[1]) : (files.length || null),
+      additions: added ? Number(added) : null,
+      deletions: removed ? Number(removed) : null,
+      files: files
+    };
+  }
+  function buttonLabel(el) {
+    return norm((el.getAttribute('aria-label') || '') + ' ' + (el.innerText || el.textContent || ''));
+  }
+  function classifyButton(el) {
+    var text = buttonLabel(el);
+    if (!text || isControlText(text)) return null;
+    if (/^Worked for\\s+|^Working|^Thinking/i.test(text)) return {
+      type: 'thinking',
+      label: text.split('\\n')[0],
+      content: text,
+      collapsed: true
+    };
+    if (/files?\\s+changed|\\bReview\\b|\\bDiff\\b/i.test(text)) {
+      var change = parseFileChangesFromText(text);
+      if (change) return change;
+      return { type: 'file_changes', summary: text, content: text, files: [] };
+    }
+    if (/\\b(error|failed|retry)\\b/i.test(text)) return { type: 'error', label: text.split('\\n')[0], content: text };
+    if (/\\b(allow|deny|approve|permission|confirm)\\b/i.test(text)) return { type: 'prompt', label: text.split('\\n')[0], content: text };
+    if (/^(Task|Walkthrough|Verify Fix|Artifact)/i.test(text)) return {
+      type: 'artifact',
+      label: text.split('\\n')[0],
+      content: text,
+      artifact_type: /^Task/i.test(text) ? 'task' : /^Walkthrough/i.test(text) ? 'walkthrough' : 'artifact'
+    };
+    if (/\\b(running|ran|tool|command)\\b/i.test(text)) return { type: 'tool_call', label: text.split('\\n')[0], status: /running/i.test(text) ? 'running' : 'done', content: text };
+    return null;
+  }
+  function preBlock(pre) {
+    var text = visibleText(pre);
+    if (!text) return null;
+    var lang = languageForPre(pre);
+    if (/^\\s*(\\$|>|PS>|powershell|cmd|bash)\\b/i.test(text) || /\\b(exit code|stdout|stderr)\\b/i.test(text)) {
+      return { type: 'terminal', command: '', stdout: text, stderr: '', content: text, exit_code: null };
+    }
+    return { type: 'markdown', content: '~~~' + (lang || '') + '\\n' + text + '\\n~~~' };
+  }
+  function walkContent(node, blocks) {
+    if (!node || node.nodeType !== 1) return;
+    if (node.closest && node.closest('[data-testid="response-footer"]')) return;
+    var tag = node.tagName;
+    if (tag === 'BUTTON' || tag === 'A' || node.getAttribute('role') === 'button') {
+      var buttonBlock = classifyButton(node);
+      if (buttonBlock) blocks.push(buttonBlock);
+      return;
+    }
+    if (tag === 'TABLE') {
+      var md = tableToMarkdown(node);
+      if (md) pushMarkdown(blocks, md);
+      return;
+    }
+    if (tag === 'PRE') {
+      var pb = preBlock(node);
+      if (pb) {
+        if (pb.type === 'markdown') pushMarkdown(blocks, pb.content);
+        else blocks.push(pb);
+      }
+      return;
+    }
+    if (/^(H1|H2|H3|H4|P|LI|BLOCKQUOTE)$/.test(tag)) {
+      pushMarkdown(blocks, markdownForElement(node));
+      return;
+    }
+    var text = visibleText(node);
+    if (/files?\\s+changed/i.test(text) && node.querySelector && node.querySelector('button,[role="button"]')) {
+      var change = parseFileChangesFromText(text);
+      if (change) {
+        blocks.push(change);
+        return;
+      }
+    }
+    Array.from(node.children || []).forEach(function(child) { walkContent(child, blocks); });
+  }
+  function assistantBlocks(article) {
+    var blocks = [];
+    Array.from(article.children || []).forEach(function(child) { walkContent(child, blocks); });
+    var fullText = visibleText(article);
+    if (!blocks.length && fullText) blocks.push({ type: 'markdown', content: fullText });
+    return blocks.filter(function(block) {
+      if (!block || !block.type) return false;
+      if (block.type === 'thinking' && !norm(block.content || block.label)) return false;
+      if (block.type === 'markdown' && !norm(block.content)) return false;
+      return true;
+    });
+  }
+  function blockText(block) {
+    return norm(block.content || block.text || block.markdown || block.title || block.label || '');
+  }
+  function fallbackContent(blocks) {
+    return blocks.map(blockText).filter(Boolean).join('\\n\\n').trim();
+  }
+  function readUser(node) {
+    var clone = node.cloneNode(true);
+    Array.from(clone.querySelectorAll('button')).forEach(function(btn) { btn.remove(); });
+    return visibleText(clone).split('\\n').map(norm).filter(function(line) {
+      return line && !/^Revert$/i.test(line);
+    }).join('\\n');
+  }
+  var nodes = Array.from(d.querySelectorAll('[data-testid="user-input-step"], [role="article"][aria-label="Agent response"]'));
+  nodes.sort(function(a, b) {
+    if (a === b) return 0;
+    return a.compareDocumentPosition(b) & Node.DOCUMENT_POSITION_FOLLOWING ? -1 : 1;
+  });
+  var msgs = [];
+  for (var i = 0; i < nodes.length; i++) {
+    var node = nodes[i];
+    if (node.matches('[data-testid="user-input-step"]')) {
+      var userText = readUser(node);
+      if (userText) msgs.push({ role: 'user', content: userText });
+      continue;
+    }
+    var blocks = assistantBlocks(node);
+    var content = fallbackContent(blocks);
+    if (content) msgs.push({ role: 'assistant', content: content, content_blocks: blocks });
+  }
+  return JSON.stringify(msgs);
+`;
+
+async function readAntigravityV2Messages(Runtime, sessionId) {
+  try {
+    const raw = await evalInPage(Runtime, ANTIGRAVITY_V2_READ_EXPR);
+    if (raw !== null) { resetReadFailures(sessionId); return raw; }
+  } catch (e) {
+    console.warn(`[${sessionId}] [sel] Antigravity v2 read error: ${e.message}`);
+  }
+  const f = recordReadFailure(sessionId);
+  if (f.readFails === 1 || f.readFails % 5 === 0) {
+    console.warn(`[${sessionId}] [sel] Antigravity v2 read null x${f.readFails}`);
+  }
+  return JSON.stringify([]);
+}
+
+async function readAntigravityV2ActiveConversation(Runtime) {
+  try {
+    const raw = await evalInPage(Runtime, `
+      function norm(t) { return String(t || '').replace(/\\s+/g, ' ').trim(); }
+      function uuidFrom(value) {
+        var m = String(value || '').match(/[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}/i);
+        return m ? m[0] : null;
+      }
+      var conversationId = uuidFrom(location.pathname);
+      var pill = conversationId ? d.querySelector('[data-testid="convo-pill-' + conversationId + '"]') : null;
+      var title = pill ? norm(pill.innerText || pill.textContent) : norm(d.title);
+      var path = String(location.pathname || '');
+      var view = conversationId ? 'conversation' : (path === '/' || path === '' ? 'new_conversation' : 'agent_manager');
+      return JSON.stringify({
+        conversation_id: conversationId,
+        section_id: new URLSearchParams(location.search).get('section') || null,
+        title: title || norm(d.title) || 'Antigravity v2',
+        view: view,
+        is_list_view: !conversationId,
+        url: location.href,
+        page_title: d.title || 'Antigravity'
+      });
+    `);
+    return raw ? JSON.parse(raw) : null;
+  } catch {
+    return null;
+  }
+}
+
+async function readAntigravityV2ChatList(Runtime) {
+  try {
+    const raw = await evalInPage(Runtime, `
+      function norm(t) { return String(t || '').replace(/\\s+/g, ' ').trim(); }
+      function labelText(el) { return norm((el && (el.innerText || el.textContent)) || ''); }
+      function compact(t) { return norm(t).toLowerCase().replace(/[^a-z0-9]+/g, ' ').trim(); }
+      function uuidFrom(value) {
+        var m = String(value || '').match(/[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}/i);
+        return m ? m[0] : null;
+      }
+      function buttonLike() {
+        return Array.from(d.querySelectorAll('button,[role="button"],a')).filter(function(el) {
+          var r = el.getBoundingClientRect();
+          return r.width > 0 && r.height > 0;
+        });
+      }
+      var activeId = uuidFrom(location.pathname);
+      var projectCards = Array.from(d.querySelectorAll('[data-project-card]')).map(function(card, index) {
+        var rect = card.getBoundingClientRect();
+        var title = labelText(card).split(/\\n/).map(norm).filter(Boolean)[0] || 'Project ' + (index + 1);
+        return {
+          el: card,
+          index: index,
+          title: title,
+          top: rect.top,
+          order: rect.top
+        };
+      }).sort(function(a, b) { return a.top - b.top; });
+      function projectFor(el) {
+        var best = null;
+        var rect = el.getBoundingClientRect();
+        for (var i = 0; i < projectCards.length; i++) {
+          if (projectCards[i].top <= rect.top + 1) best = projectCards[i];
+        }
+        return best ? { project: best.title, project_index: best.index } : { project: '', project_index: null };
+      }
+      var nav = [
+        { id: '__agv2:new_conversation', kind: 'nav', action: 'new_conversation', title: 'New Conversation' },
+        { id: '__agv2:conversation_history', kind: 'nav', action: 'conversation_history', title: 'Conversation History' },
+        { id: '__agv2:scheduled_tasks', kind: 'nav', action: 'scheduled_tasks', title: 'Scheduled Tasks' }
+      ];
+      var body = [];
+      projectCards.forEach(function(project) {
+        body.push({
+          id: '__agv2:project:' + project.index,
+          kind: 'project',
+          title: project.title,
+          project: project.title,
+          project_index: project.index,
+          order: project.order
+        });
+      });
+      Array.from(d.querySelectorAll('[data-testid^="convo-pill-"]')).forEach(function(pill, index) {
+        var testid = pill.getAttribute('data-testid') || '';
+        var id = testid.replace(/^convo-pill-/, '') || uuidFrom(testid);
+        var button = pill.closest('[role="button"]') || pill;
+        var lines = norm(button.innerText || button.textContent).split(/\\n/).map(norm).filter(Boolean);
+        var title = norm(pill.innerText || pill.textContent) || lines[0] || 'Untitled';
+        var active = id && id === activeId;
+        var p = projectFor(pill);
+        var rect = button.getBoundingClientRect();
+        body.push({
+          id: id || 'ag-v2-chat-' + index,
+          kind: 'chat',
+          title: title,
+          project: p.project,
+          project_index: p.project_index,
+          age: lines.length > 1 ? lines[lines.length - 1] : '',
+          active: !!active,
+          order: rect.top + 0.1
+        });
+      });
+      buttonLike().forEach(function(el, index) {
+        var text = labelText(el);
+        if (!/^see all\\s*\\(/i.test(text)) return;
+        var p = projectFor(el);
+        var rect = el.getBoundingClientRect();
+        body.push({
+          id: '__agv2:see_all:' + index,
+          kind: 'see_all',
+          action: 'see_all',
+          title: text,
+          project: p.project,
+          project_index: p.project_index,
+          order: rect.top + 0.2
+        });
+      });
+      body.sort(function(a, b) { return (a.order || 0) - (b.order || 0); });
+      return JSON.stringify(nav.concat(body));
+    `, { awaitPromise: true });
+    return raw ? JSON.parse(raw) : [];
+  } catch {
+    return [];
+  }
+}
+
+async function switchAntigravityV2Chat(Runtime, chatId) {
+  try {
+    const raw = await evalInPage(Runtime, `
+      const chatId = ${JSON.stringify(chatId)};
+      function norm(t) { return String(t || '').replace(/\\s+/g, ' ').trim(); }
+      function labelText(el) { return norm((el && (el.innerText || el.textContent)) || ''); }
+      function compact(t) { return norm(t).toLowerCase().replace(/[^a-z0-9]+/g, ' ').trim(); }
+      function uuidFrom(value) {
+        var m = String(value || '').match(/[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}/i);
+        return m ? m[0] : null;
+      }
+      function buttonLike() {
+        return Array.from(d.querySelectorAll('button,[role="button"],a')).filter(function(el) {
+          var r = el.getBoundingClientRect();
+          return r.width > 0 && r.height > 0;
+        });
+      }
+      async function clickControl(action) {
+        var buttons = buttonLike();
+        var target = null;
+        if (action === 'new_conversation') {
+          target = buttons.find(function(el) {
+            var text = compact(labelText(el) + ' ' + (el.getAttribute('aria-label') || ''));
+            return /new.*conver/.test(text);
+          });
+        } else if (action === 'conversation_history') {
+          target = buttons.find(function(el) {
+            var text = compact(labelText(el) + ' ' + (el.getAttribute('aria-label') || ''));
+            return /conver.*hi.*tory/.test(text);
+          });
+        } else if (action === 'scheduled_tasks') {
+          target = buttons.find(function(el) {
+            var text = compact(labelText(el) + ' ' + (el.getAttribute('aria-label') || ''));
+            return /scheduled.*ta/.test(text);
+          });
+        }
+        if (!target) return { ok: false, code: 'control_not_found', detail: action };
+        var before = uuidFrom(location.pathname);
+        target.click();
+        await new Promise(function(resolve) { setTimeout(resolve, 800); });
+        return {
+          ok: true,
+          action: action,
+          view: action,
+          title: action === 'new_conversation' ? 'New Conversation' : (action === 'conversation_history' ? 'Conversation History' : 'Scheduled Tasks'),
+          before: before,
+          after: uuidFrom(location.pathname),
+          url: location.href
+        };
+      }
+      if (String(chatId || '').indexOf('__agv2:') === 0) {
+        if (chatId === '__agv2:new_conversation') return JSON.stringify(await clickControl('new_conversation'));
+        if (chatId === '__agv2:conversation_history') return JSON.stringify(await clickControl('conversation_history'));
+        if (chatId === '__agv2:scheduled_tasks') return JSON.stringify(await clickControl('scheduled_tasks'));
+        if (chatId.indexOf('__agv2:see_all:') === 0) {
+          var seeIndex = Number(chatId.split(':')[2] || 0);
+          var seeButtons = buttonLike().filter(function(el) { return /^see all\\s*\\(/i.test(labelText(el)); });
+          var seeBtn = seeButtons[seeIndex] || seeButtons[0];
+          if (!seeBtn) return JSON.stringify({ ok: false, code: 'see_all_not_found', detail: chatId });
+          seeBtn.click();
+          await new Promise(function(resolve) { setTimeout(resolve, 500); });
+          return JSON.stringify({ ok: true, action: 'see_all', view: 'navigation', url: location.href });
+        }
+        if (chatId.indexOf('__agv2:project:') === 0) {
+          var projectIndex = Number(chatId.split(':')[2] || 0);
+          var cards = Array.from(d.querySelectorAll('[data-project-card]'));
+          var card = cards[projectIndex];
+          if (!card) return JSON.stringify({ ok: false, code: 'project_not_found', detail: chatId });
+          (card.closest('[role="button"]') || card).click();
+          await new Promise(function(resolve) { setTimeout(resolve, 300); });
+          return JSON.stringify({ ok: true, action: 'project', view: 'navigation', url: location.href });
+        }
+      }
+      var before = uuidFrom(location.pathname);
+      var pill = d.querySelector('[data-testid="convo-pill-' + chatId + '"]');
+      if (!pill) return JSON.stringify({ ok: false, code: 'chat_not_found', detail: chatId });
+      var button = pill.closest('[role="button"]') || pill;
+      button.click();
+      await new Promise(function(resolve) { setTimeout(resolve, 800); });
+      var after = uuidFrom(location.pathname);
+      return JSON.stringify({ ok: after === chatId || before !== after, action: 'switch_chat', view: 'conversation', before: before, after: after, url: location.href });
+    `, { awaitPromise: true });
+    return raw ? JSON.parse(raw) : { ok: false, code: 'eval_failed' };
+  } catch (e) {
+    return { ok: false, code: 'cdp_error', detail: e.message };
+  }
+}
+
+async function newAntigravityV2Conversation(Runtime) {
+  return switchAntigravityV2Chat(Runtime, '__agv2:new_conversation');
+}
+
+async function readAntigravityV2Config(Runtime, workspacePath) {
+  try {
+    const raw = await evalInPage(Runtime, `
+      function norm(t) { return String(t || '').replace(/\\s+/g, ' ').trim(); }
+      var modelBtn = d.querySelector('button[aria-label^="Select model, current:"]');
+      var model = 'unknown';
+      if (modelBtn) {
+        var aria = modelBtn.getAttribute('aria-label') || '';
+        model = aria.replace(/^Select model, current:\\s*/i, '').trim() || norm(modelBtn.innerText || modelBtn.textContent) || 'unknown';
+      }
+      return JSON.stringify({
+        model_id: model,
+        conversation_mode: 'unknown',
+        permission_mode: 'unknown',
+        file_access_scope: ${JSON.stringify(workspacePath || 'unknown')}
+      });
+    `);
+    return raw ? JSON.parse(raw) : { model_id: 'unknown', conversation_mode: 'unknown', permission_mode: 'unknown', file_access_scope: workspacePath || 'unknown' };
+  } catch {
+    return { model_id: 'unknown', conversation_mode: 'unknown', permission_mode: 'unknown', file_access_scope: workspacePath || 'unknown' };
+  }
+}
+
+async function sendAntigravityV2WithStrategies(Runtime, text, strategies) {
+  let result;
+  try {
+    result = await evalInPage(Runtime, `
+    const text = ${JSON.stringify(text)};
+    const strategies = ${JSON.stringify(strategies)};
+    function norm(t) { return String(t || '').replace(/\\s+/g, ' ').trim(); }
+    function sleep(ms) { return new Promise(function(resolve) { setTimeout(resolve, ms); }); }
+    const editor = d.querySelector('[role="combobox"][aria-label="Message input"][data-lexical-editor]') || d.querySelector('[data-lexical-editor]');
+    if (!editor) return JSON.stringify({ ok: false, code: 'input_not_found', detail: 'no lexical editor' });
+    const wanted = norm(text);
+    function visibleText() { return norm(editor.innerText || editor.textContent || ''); }
+    function focusAndClear() {
+      editor.focus();
+      try {
+        const selection = (d.defaultView || window).getSelection();
+        const range = d.createRange();
+        range.selectNodeContents(editor);
+        selection.removeAllRanges();
+        selection.addRange(range);
+      } catch (_) {}
+      try { d.execCommand('selectAll', false, null); } catch (_) {}
+      try { d.execCommand('delete', false, null); } catch (_) {}
+      editor.dispatchEvent(new InputEvent('input', { bubbles: true, inputType: 'deleteContentBackward', data: null }));
+    }
+    async function tryExecCommand() {
+      focusAndClear();
+      try { d.execCommand('insertText', false, text); } catch (_) {}
+      editor.dispatchEvent(new InputEvent('input', { bubbles: true, inputType: 'insertText', data: text }));
+      await sleep(120);
+      return visibleText() === wanted;
+    }
+    async function tryBeforeInput() {
+      focusAndClear();
+      try {
+        editor.dispatchEvent(new InputEvent('beforeinput', { bubbles: true, cancelable: true, inputType: 'insertText', data: text }));
+        editor.dispatchEvent(new InputEvent('input', { bubbles: true, inputType: 'insertText', data: text }));
+      } catch (_) {}
+      await sleep(160);
+      return visibleText() === wanted;
+    }
+    async function tryPaste() {
+      focusAndClear();
+      try {
+        const dt = new DataTransfer();
+        dt.setData('text/plain', text);
+        editor.dispatchEvent(new ClipboardEvent('paste', { bubbles: true, cancelable: true, clipboardData: dt }));
+      } catch (_) {}
+      await sleep(220);
+      return visibleText() === wanted;
+    }
+    async function tryLexicalApi() {
+      const lexical = editor.__lexicalEditor;
+      if (!lexical || typeof lexical.parseEditorState !== 'function' || typeof lexical.setEditorState !== 'function') return false;
+      editor.focus();
+      const paragraphs = String(text || '').split(/\\r?\\n/).map(function(line) {
+        return {
+          children: line
+            ? [{ detail: 0, format: 0, mode: 'normal', style: '', text: line, type: 'text', version: 1 }]
+            : [],
+          direction: null,
+          format: '',
+          indent: 0,
+          type: 'paragraph',
+          version: 1
+        };
+      });
+      const state = {
+        root: {
+          children: paragraphs.length ? paragraphs : [{
+            children: [],
+            direction: null,
+            format: '',
+            indent: 0,
+            type: 'paragraph',
+            version: 1
+          }],
+          direction: null,
+          format: '',
+          indent: 0,
+          type: 'root',
+          version: 1
+        }
+      };
+      try {
+        lexical.setEditorState(lexical.parseEditorState(JSON.stringify(state)));
+        editor.dispatchEvent(new InputEvent('input', { bubbles: true, inputType: 'insertText', data: text }));
+      } catch (_) {
+        return false;
+      }
+      await sleep(180);
+      return visibleText() === wanted;
+    }
+    const attempts = [];
+    for (const strategy of strategies) {
+      let ok = false;
+      if (strategy === 'execCommand') ok = await tryExecCommand();
+      else if (strategy === 'beforeinput') ok = await tryBeforeInput();
+      else if (strategy === 'paste') ok = await tryPaste();
+      else if (strategy === 'lexicalApi') ok = await tryLexicalApi();
+      attempts.push(strategy + ':' + (ok ? 'ok' : 'no'));
+      if (ok) break;
+    }
+    const visible = visibleText();
+    if (visible !== wanted) return JSON.stringify({ ok: false, code: 'input_verify_failed', detail: visible.substring(0, 200), attempts: attempts });
+    async function waitSendButton() {
+      const deadline = Date.now() + 3200;
+      while (Date.now() < deadline) {
+        const btn = d.querySelector('[data-testid="send-button"]');
+        if (btn) {
+          const label = (btn.getAttribute('aria-label') || btn.textContent || '').toLowerCase();
+          const disabled = btn.disabled || btn.getAttribute('aria-disabled') === 'true';
+          if (!disabled && label.includes('send')) return btn;
+        }
+        await sleep(200);
+      }
+      return null;
+    }
+    const btn = await waitSendButton();
+    if (!btn) {
+      const lastBtn = d.querySelector('[data-testid="send-button"]');
+      const label = lastBtn ? (lastBtn.getAttribute('aria-label') || lastBtn.textContent || '') : 'missing';
+      return JSON.stringify({ ok: false, code: 'send_button_failed', detail: 'button not ready: ' + label, attempts: attempts });
+    }
+    btn.click();
+    const deadline = Date.now() + 4000;
+    while (Date.now() < deadline) {
+      await sleep(200);
+      const turns = Array.from(d.querySelectorAll('[data-testid="user-input-step"]'));
+      if (turns.some(function(turn) { return norm(turn.innerText || turn.textContent).includes(norm(text)); })) return JSON.stringify({ ok: true });
+    }
+    return JSON.stringify({ ok: false, code: 'native_user_turn_not_observed', detail: 'click did not produce a native user turn', attempts: attempts });
+  `, { awaitPromise: true });
+  } catch (error) {
+    return { ok: false, code: 'exception', detail: error.message };
+  }
+  try {
+    return result ? JSON.parse(result) : { ok: false, code: 'send_button_failed', detail: 'empty result' };
+  } catch {
+    return { ok: false, code: 'send_button_failed', detail: String(result || '') };
+  }
+}
+
+async function sendAntigravityV2TrustedInput(client, Runtime, text) {
+  const Input = client && client.Input;
+  if (!Input || typeof Input.insertText !== 'function' || typeof Input.dispatchKeyEvent !== 'function') {
+    return { ok: false, code: 'not_supported', detail: 'CDP Input domain unavailable' };
+  }
+  function sleep(ms) { return new Promise(resolve => setTimeout(resolve, ms)); }
+  async function key(type, event) {
+    await Input.dispatchKeyEvent(Object.assign({ type }, event));
+  }
+  async function focusEditor() {
+    const raw = await evalInPage(Runtime, `
+      const editor = d.querySelector('[role="combobox"][aria-label="Message input"][data-lexical-editor]') || d.querySelector('[data-lexical-editor]');
+      if (!editor) return JSON.stringify({ ok: false, code: 'input_not_found', detail: 'no lexical editor' });
+      editor.focus();
+      return JSON.stringify({ ok: true });
+    `);
+    return raw ? JSON.parse(raw) : { ok: false, code: 'input_not_found', detail: 'empty focus result' };
+  }
+  async function clearEditor() {
+    await key('keyDown', { key: 'Control', code: 'ControlLeft', windowsVirtualKeyCode: 17, nativeVirtualKeyCode: 17, modifiers: 2 });
+    await key('keyDown', { key: 'a', code: 'KeyA', windowsVirtualKeyCode: 65, nativeVirtualKeyCode: 65, modifiers: 2 });
+    await key('keyUp', { key: 'a', code: 'KeyA', windowsVirtualKeyCode: 65, nativeVirtualKeyCode: 65, modifiers: 2 });
+    await key('keyUp', { key: 'Control', code: 'ControlLeft', windowsVirtualKeyCode: 17, nativeVirtualKeyCode: 17, modifiers: 0 });
+    await key('keyDown', { key: 'Backspace', code: 'Backspace', windowsVirtualKeyCode: 8, nativeVirtualKeyCode: 8, modifiers: 0 });
+    await key('keyUp', { key: 'Backspace', code: 'Backspace', windowsVirtualKeyCode: 8, nativeVirtualKeyCode: 8, modifiers: 0 });
+    await sleep(120);
+  }
+  async function readEditorText() {
+    return await evalInPage(Runtime, `
+      function norm(t) { return String(t || '').replace(/\\s+/g, ' ').trim(); }
+      const editor = d.querySelector('[role="combobox"][aria-label="Message input"][data-lexical-editor]') || d.querySelector('[data-lexical-editor]');
+      return editor ? norm(editor.innerText || editor.textContent || '') : '';
+    `);
+  }
+  async function waitSendButtonRect() {
+    const deadline = Date.now() + 3200;
+    while (Date.now() < deadline) {
+      const raw = await evalInPage(Runtime, `
+        const btn = d.querySelector('[data-testid="send-button"]');
+        if (!btn) return JSON.stringify({ ok: false, code: 'missing' });
+        const label = (btn.getAttribute('aria-label') || btn.textContent || '').toLowerCase();
+        const disabled = btn.disabled || btn.getAttribute('aria-disabled') === 'true';
+        const rect = btn.getBoundingClientRect();
+        return JSON.stringify({
+          ok: !disabled && label.indexOf('send') >= 0 && rect.width > 0 && rect.height > 0,
+          label,
+          disabled,
+          x: rect.left + rect.width / 2,
+          y: rect.top + rect.height / 2
+        });
+      `);
+      const info = raw ? JSON.parse(raw) : null;
+      if (info && info.ok) return info;
+      await sleep(200);
+    }
+    return null;
+  }
+  try {
+    const focus = await focusEditor();
+    if (!focus.ok) return focus;
+    await clearEditor();
+    await Input.insertText({ text });
+    await sleep(250);
+    const wanted = String(text || '').replace(/\s+/g, ' ').trim();
+    const visible = await readEditorText();
+    if (visible !== wanted) {
+      return { ok: false, code: 'input_verify_failed', detail: visible.substring(0, 200) };
+    }
+    const btn = await waitSendButtonRect();
+    if (!btn) return { ok: false, code: 'send_button_failed', detail: 'button not ready' };
+    await focusEditor();
+    await key('keyDown', { key: 'Enter', code: 'Enter', windowsVirtualKeyCode: 13, nativeVirtualKeyCode: 13, modifiers: 0 });
+    await key('keyUp', { key: 'Enter', code: 'Enter', windowsVirtualKeyCode: 13, nativeVirtualKeyCode: 13, modifiers: 0 });
+    const deadline = Date.now() + 5000;
+    while (Date.now() < deadline) {
+      await sleep(250);
+      const observed = await evalInPage(Runtime, `
+        function norm(t) { return String(t || '').replace(/\\s+/g, ' ').trim(); }
+        const wanted = ${JSON.stringify(String(text || '').replace(/\s+/g, ' ').trim())};
+        const turns = Array.from(d.querySelectorAll('[data-testid="user-input-step"]'));
+        return turns.some(function(turn) { return norm(turn.innerText || turn.textContent).indexOf(wanted) >= 0; });
+      `);
+      if (observed) return { ok: true, method: 'cdp_input' };
+    }
+    return { ok: false, code: 'native_user_turn_not_observed', detail: 'send key accepted but native user turn did not appear' };
+  } catch (error) {
+    return { ok: false, code: 'exception', detail: error.message };
+  }
+}
+
+async function sendAntigravityV2Primary(Runtime, text) {
+  return sendAntigravityV2WithStrategies(Runtime, text, ['execCommand', 'beforeinput', 'paste', 'lexicalApi']);
+}
+
+async function sendAntigravityV2Fallback(Runtime, text) {
+  return sendAntigravityV2WithStrategies(Runtime, text, ['paste', 'beforeinput', 'execCommand', 'lexicalApi']);
+}
+
+async function detectAntigravityV2Thinking(Runtime) {
+  try {
+    const raw = await evalInPage(Runtime, `
+      function norm(t) { return String(t || '').replace(/\\s+/g, ' ').trim(); }
+      var roots = Array.from(d.querySelectorAll('[data-testid="conversation-view"], [role="article"][aria-label="Agent response"]'));
+      var btns = [];
+      roots.forEach(function(root) { btns = btns.concat(Array.from(root.querySelectorAll('button'))); });
+      var sendBtn = d.querySelector('[data-testid="send-button"]');
+      if (sendBtn) btns.push(sendBtn);
+      var stopBtn = btns.find(function(btn) {
+        var label = norm(btn.getAttribute('aria-label') || btn.textContent || '').toLowerCase();
+        return label.includes('stop') && btn.offsetParent !== null;
+      });
+      var working = Array.from(d.querySelectorAll('[role="article"][aria-label="Agent response"] button')).find(function(btn) {
+        return /^Working|^Thinking/i.test(norm(btn.innerText || btn.textContent));
+      });
+      var isThinking = !!stopBtn || !!working;
+      return JSON.stringify({ thinking: isThinking, label: isThinking ? 'Working' : '', thinkingContent: working ? norm(working.innerText || working.textContent) : '' });
+    `);
+    return raw ? JSON.parse(raw) : { thinking: false, label: '' };
+  } catch {
+    return { thinking: false, label: '' };
+  }
+}
+
 async function readMessages(Runtime, agentType, sessionId) {
   if (agentType === 'codex-desktop')      return readCodexMessages(Runtime, sessionId, true);
   if (agentType === 'codex')              return readCodexMessages(Runtime, sessionId, false);
   if (agentType === 'gemini')             return readGeminiMessages(Runtime, sessionId);
   if (isRooCodeAgentType(agentType))      return readRooCodeMessages(Runtime, sessionId);
   if (isContinueAgentType(agentType))     return readContinueMessages(Runtime, sessionId);
+  if (agentType === 'antigravity-v2')     return readAntigravityV2Messages(Runtime, sessionId);
   if (agentType === 'antigravity')        return readAntigravityMessages(Runtime, sessionId);
   if (agentType === 'antigravity_panel')  return readAntigravityPanelMessages(Runtime, sessionId);
   // 'claude' and 'claude-desktop' both use Claude message selectors
@@ -6114,6 +6900,26 @@ const _ESCAPE_EXPR = `
 // Returns { ok: true } on success, { ok: false, code, detail } on failure.
 // 'agent_not_active' means no stop button was found (agent is idle).
 async function interruptAgent(Runtime, agentType, sessionId) {
+  if (agentType === 'antigravity-v2') {
+    try {
+      const r = await evalInPage(Runtime, `
+        var btns = Array.from(d.querySelectorAll('button'));
+        var btn = btns.find(function(b) {
+          var label = String(b.getAttribute('aria-label') || b.textContent || '').toLowerCase();
+          return (label.includes('stop') || label.includes('cancel')) && b.offsetParent !== null;
+        });
+        if (!btn) return 'no-btn';
+        if (btn.disabled || btn.getAttribute('aria-disabled') === 'true') return 'disabled';
+        btn.click();
+        return 'clicked';
+      `);
+      if (r === 'clicked') return { ok: true };
+      if (r === 'disabled') return { ok: false, code: 'agent_not_active', detail: 'Stop button disabled' };
+    } catch (e) {
+      console.warn(`[${sessionId}] [interrupt] Antigravity v2 stop error: ${e.message}`);
+    }
+    return { ok: false, code: 'agent_not_active', detail: 'No stop button visible' };
+  }
   // antigravity/antigravity_panel host the Claude Code webview — use claude stop selectors
   // claude-desktop uses claude selectors; codex-desktop uses codex selectors
   const normalised = (agentType === 'antigravity' || agentType === 'antigravity_panel') ? 'claude'
@@ -7280,6 +8086,7 @@ const READ_AGENT_CONFIG_EXPR = `
 // Returns { model_id, permission_mode, file_access_scope, [effort] } or null on error.
 // Fields are 'unknown' when not detected.
 async function readAgentConfig(Runtime, agentType, workspacePath) {
+  if (agentType === 'antigravity-v2') return readAntigravityV2Config(Runtime, workspacePath);
   if (agentType === 'antigravity' || agentType === 'antigravity_panel') return readAntigravityConfig(Runtime, workspacePath);
   if (isContinueAgentType(agentType)) {
     try {
@@ -7994,7 +8801,9 @@ async function setAgentModel(Runtime, agentType, modelId, sessionId, InputDomain
   if (agentType === 'antigravity_panel') {
     return setAntigravityPanelModel(Runtime, modelId, sessionId);
   }
-  if (agentType === 'antigravity') {
+  if (agentType === 'antigravity-v2') {
+    return { ok: false, code: 'not_supported', detail: 'Antigravity v2 model changes are not advertised until live-safe selection is verified' };
+  } else if (agentType === 'antigravity') {
     if (!InputDomain) return { ok: false, code: 'no_input_domain', detail: 'InputDomain required for antigravity model selection' };
     return setAntigravityModel(Runtime, InputDomain, modelId, sessionId);
   }
@@ -9459,7 +10268,7 @@ async function respondToPermissionDialog(Runtime, agentType, choiceId, sessionId
 
 // ─── Send dispatch (with fallback) ────────────────────────────────────────────
 
-async function sendMessage(Runtime, agentType, text, sessionId) {
+async function sendMessage(Runtime, agentType, text, sessionId, cdpClient = null) {
   let result;
 
   if (agentType === 'antigravity') {
@@ -9470,6 +10279,16 @@ async function sendMessage(Runtime, agentType, text, sessionId) {
     }
   } else if (agentType === 'antigravity_panel') {
     result = await sendAntigravityPanelPrimary(Runtime, text);
+  } else if (agentType === 'antigravity-v2') {
+    result = await sendAntigravityV2TrustedInput(cdpClient, Runtime, text);
+    if (!result.ok && result.code !== 'not_supported') {
+      console.warn(`[${sessionId}] [sel] Antigravity v2 CDP input send failed (${result.code}:${result.detail}), trying DOM strategies`);
+    }
+    if (!result.ok) result = await sendAntigravityV2Primary(Runtime, text);
+    if (!result.ok) {
+      console.warn(`[${sessionId}] [sel] Antigravity v2 primary send failed (${result.code}:${result.detail}), trying fallback`);
+      result = await sendAntigravityV2Fallback(Runtime, text);
+    }
   } else if (agentType === 'codex' || agentType === 'codex-desktop') {
     const usePageEval = agentType === 'codex-desktop';
     result = await sendCodexPrimary(Runtime, text, usePageEval);
@@ -11496,6 +12315,10 @@ module.exports = {
   readAntigravityPanelTitle,
   readAntigravityPanelSummary,
   detectAntigravityPanelHasContent,
+  readAntigravityV2ActiveConversation,
+  readAntigravityV2ChatList,
+  switchAntigravityV2Chat,
+  newAntigravityV2Conversation,
   readCodexRateLimit,
   readClaudeRateLimit,
   readRateLimit,

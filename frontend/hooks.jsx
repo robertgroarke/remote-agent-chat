@@ -65,18 +65,38 @@ export function useRelay() {
 
     function mergeSessionMetadataActivity(sessionList) {
       const next = {};
+      const nextThinkingContent = {};
+      const nextThinking = {};
       (sessionList || []).forEach(session => {
         if (!session || typeof session !== 'object' || !session.session_id || !session.activity) return;
+        const kind = session.activity.kind || 'working';
+        const label = session.activity.label || (kind === 'idle' ? '' : 'Working');
         next[session.session_id] = {
-          kind:      session.activity.kind || 'working',
-          label:     session.activity.label || 'Working',
+          kind,
+          label,
           updatedAt: session.activity.updated_at || null,
+          startedAt: session.activity.started_at || null,
+          interruptHint: session.activity.interrupt_hint || '',
+          goal: session.activity.goal || null,
           task_list: session.activity.task_list || null,
           context_card: session.activity.context_card || null,
+          thinkingContent: session.activity.thinkingContent || '',
         };
+        if (session.activity.thinkingContent != null) {
+          nextThinkingContent[session.session_id] = session.activity.thinkingContent || '';
+        }
+        if (['thinking', 'generating', 'running_command', 'applying_patch', 'reading_files', 'working'].includes(kind)) {
+          nextThinking[session.session_id] = label;
+        }
       });
       if (Object.keys(next).length > 0) {
         setActivities(prev => ({ ...prev, ...next }));
+      }
+      if (Object.keys(nextThinkingContent).length > 0) {
+        setThinkingContent(prev => ({ ...prev, ...nextThinkingContent }));
+      }
+      if (Object.keys(nextThinking).length > 0) {
+        setThinking(prev => ({ ...prev, ...nextThinking }));
       }
     }
 
@@ -95,6 +115,17 @@ export function useRelay() {
           });
           return merged;
         });
+      }
+    }
+
+    function mergeSessionChatLists(sessionList) {
+      const next = {};
+      (sessionList || []).forEach(session => {
+        if (!session || typeof session !== 'object' || !session.session_id) return;
+        if (Array.isArray(session.chat_list)) next[session.session_id] = session.chat_list;
+      });
+      if (Object.keys(next).length > 0) {
+        setChatLists(prev => ({ ...prev, ...next }));
       }
     }
 
@@ -411,6 +442,7 @@ export function useRelay() {
         setSessions(msg.sessions || []);
         mergeSessionMetadataActivity(msg.sessions || []);
         mergeSessionConfigHints(msg.sessions || []);
+        mergeSessionChatLists(msg.sessions || []);
         (msg.sessions || []).forEach(s => {
           const id = s && typeof s === 'object' ? s.session_id : s;
           const preserveListViewHistory = shouldPreserveTranscriptInListView(s);
@@ -430,6 +462,7 @@ export function useRelay() {
         setSessions(msg.sessions || []);
         mergeSessionMetadataActivity(msg.sessions || []);
         mergeSessionConfigHints(msg.sessions || []);
+        mergeSessionChatLists(msg.sessions || []);
         (msg.sessions || []).forEach(s => {
           const id = s && typeof s === 'object' ? s.session_id : s;
           const preserveListViewHistory = shouldPreserveTranscriptInListView(s);
@@ -450,6 +483,7 @@ export function useRelay() {
           setSessions(msg.sessions);
           mergeSessionMetadataActivity(msg.sessions);
           mergeSessionConfigHints(msg.sessions);
+          mergeSessionChatLists(msg.sessions);
           msg.sessions.forEach(s => {
             const preserveListViewHistory = shouldPreserveTranscriptInListView(s);
             if (s && typeof s === 'object' && s.is_list_view && !preserveListViewHistory) {
@@ -524,17 +558,21 @@ export function useRelay() {
       if (t === 'status' || t === 'proxy_status' || t === 'session_status') {
         const id = msg.session || msg.session_id;
         if (!id) return;
+        const activityKind = msg.activity?.kind || '';
         const isThinking = msg.thinking
-          || msg.activity?.kind === 'thinking'
-          || msg.activity?.kind === 'generating';
-        const label = msg.label || msg.activity?.label || 'Thinking';
+          || ['thinking', 'generating', 'running_command', 'applying_patch', 'reading_files', 'working'].includes(activityKind);
+        const label = msg.label || msg.activity?.label || (activityKind === 'idle' ? '' : 'Thinking');
         const activity = isThinking || msg.activity
           ? {
               kind:      msg.activity?.kind || (isThinking ? 'thinking' : 'working'),
               label,
               updatedAt: msg.activity?.updated_at || null,
+              startedAt: msg.activity?.started_at || null,
+              interruptHint: msg.activity?.interrupt_hint || '',
+              goal: msg.activity?.goal || null,
               task_list: msg.activity?.task_list || null,
               context_card: msg.activity?.context_card || null,
+              thinkingContent: msg.activity?.thinkingContent || '',
             }
           : false;
         if (isThinking) {
@@ -542,9 +580,14 @@ export function useRelay() {
           setThinking(prev => ({ ...prev, [id]: label }));
           setActivities(prev => ({ ...prev, [id]: activity }));
           // Store Claude Code thinking content text
-          if (msg.thinking_content != null) {
-            setThinkingContent(prev => ({ ...prev, [id]: msg.thinking_content }));
+          const nextThinkingContent = msg.thinking_content ?? msg.activity?.thinkingContent;
+          if (nextThinkingContent != null) {
+            setThinkingContent(prev => ({ ...prev, [id]: nextThinkingContent }));
           }
+        } else if (msg.activity?.goal || msg.activity?.task_list) {
+          clearTimeout(thinkingTimers.current[id]);
+          setThinking(prev => ({ ...prev, [id]: false }));
+          setActivities(prev => ({ ...prev, [id]: activity }));
         } else {
           clearTimeout(thinkingTimers.current[id]);
           thinkingTimers.current[id] = setTimeout(() => {
@@ -857,6 +900,9 @@ export function useRelay() {
         const id      = msg.session || msg.session_id || msg.message?.session_id;
         const role    = msg.role    || msg.message?.role;
         const content = msg.content || msg.message?.content;
+        const contentBlocks = Array.isArray(msg.content_blocks)
+          ? msg.content_blocks
+          : (Array.isArray(msg.message?.content_blocks) ? msg.message.content_blocks : null);
         if (!id || !role || !content) return;
 
         setMessages(prev => {
@@ -872,6 +918,7 @@ export function useRelay() {
               updated[idx] = {
                 role,
                 content,
+                ...(contentBlocks ? { content_blocks: contentBlocks } : {}),
                 ts: msg.ts || prev_msg.ts || Date.now(),
                 _delivered: true,
                 _cid: prev_msg._cid,
@@ -884,7 +931,7 @@ export function useRelay() {
           if (existing.some(m => m.role === role && m.content === content)) {
             return prev;
           }
-          return { ...prev, [id]: [...existing, { role, content, ts: msg.ts || Date.now(), _delivered: role === 'user' }] };
+          return { ...prev, [id]: [...existing, { role, content, ...(contentBlocks ? { content_blocks: contentBlocks } : {}), ts: msg.ts || Date.now(), _delivered: role === 'user' }] };
         });
 
         if (role === 'assistant' && id !== activeSessionRef.current) {

@@ -26,7 +26,7 @@ const FIXTURES = {
   TEXT_SHORT: {
     id: 'TEXT_SHORT',
     kind: 'message',
-    surfaces: ['claude', 'codex', 'continue', 'antigravity_panel', 'codex-desktop'],
+    surfaces: ['claude', 'codex', 'continue', 'antigravity_panel', 'antigravity-v2', 'codex-desktop'],
     description: 'Short deterministic round-trip prompt.',
     prompt({ runId }) {
       return [
@@ -44,7 +44,7 @@ const FIXTURES = {
   TEXT_LONG: {
     id: 'TEXT_LONG',
     kind: 'message',
-    surfaces: ['claude', 'codex', 'continue', 'antigravity_panel', 'codex-desktop'],
+    surfaces: ['claude', 'codex', 'continue', 'antigravity_panel', 'antigravity-v2', 'codex-desktop'],
     description: 'Large deterministic pasted prompt over 20 KB.',
     prompt({ runId }) {
       return [
@@ -65,7 +65,7 @@ const FIXTURES = {
   TOOL_HEAVY: {
     id: 'TOOL_HEAVY',
     kind: 'message',
-    surfaces: ['claude', 'codex', 'continue', 'antigravity_panel', 'codex-desktop'],
+    surfaces: ['claude', 'codex', 'continue', 'antigravity_panel', 'antigravity-v2', 'codex-desktop'],
     description: 'Safe tool-heavy prompt that should emit shell/read activity and deterministic headings.',
     prompt({ runId }) {
       return [
@@ -121,7 +121,7 @@ const FIXTURES = {
   THREAD_SWITCH: {
     id: 'THREAD_SWITCH',
     kind: 'manual',
-    surfaces: ['codex', 'antigravity_panel', 'codex-desktop'],
+    surfaces: ['codex', 'antigravity_panel', 'antigravity-v2', 'codex-desktop'],
     description: 'Manual thread/chat switch procedure with deterministic message text.',
     operatorSteps({ runId }) {
       return [
@@ -148,7 +148,7 @@ const FIXTURES = {
   IMAGE_PASTE: {
     id: 'IMAGE_PASTE',
     kind: 'manual',
-    surfaces: ['claude', 'codex', 'continue', 'antigravity_panel', 'codex-desktop'],
+    surfaces: ['claude', 'codex', 'continue', 'antigravity_panel', 'antigravity-v2', 'codex-desktop'],
     description: 'Manual screenshot/image attachment check.',
     operatorSteps({ runId }) {
       return [
@@ -175,6 +175,98 @@ const FIXTURES = {
     },
   },
 };
+
+const ANTIGRAVITY_V2_STRUCTURAL_FIXTURES = [
+  {
+    id: 'agv2_finished_markdown',
+    description: 'Finished assistant transcript with markdown, table, and fenced code.',
+    messages: [{
+      role: 'assistant',
+      content_blocks: [
+        { type: 'markdown', content: '# Done\n\n| Check | Result |\n| --- | --- |\n| v2 | pass |\n\n```js\nconsole.log("agv2");\n```' },
+      ],
+    }],
+  },
+  {
+    id: 'agv2_thinking',
+    description: 'Collapsed thinking/work block.',
+    messages: [{ role: 'assistant', content_blocks: [{ type: 'thinking', label: 'Worked for 2m', content: 'Inspected the page and selected a plan.', collapsed: true }] }],
+  },
+  {
+    id: 'agv2_tool_running',
+    description: 'Running tool call block.',
+    messages: [{ role: 'assistant', content_blocks: [{ type: 'tool_call', label: 'Task', status: 'running', content: 'Checking workspace state...' }] }],
+  },
+  {
+    id: 'agv2_tool_done',
+    description: 'Completed tool call block.',
+    messages: [{ role: 'assistant', content_blocks: [{ type: 'tool_call', label: 'Walkthrough', status: 'done', content: 'Opened the walkthrough artifact.' }] }],
+  },
+  {
+    id: 'agv2_terminal',
+    description: 'Terminal command output.',
+    messages: [{ role: 'assistant', content_blocks: [{ type: 'terminal', command: 'node --version', stdout: 'v24.11.1', stderr: '', exit_code: 0 }] }],
+  },
+  {
+    id: 'agv2_file_changes',
+    description: 'Multi-file change summary.',
+    messages: [{ role: 'assistant', content_blocks: [{ type: 'file_changes', summary: '2 files changed', files_changed: 2, additions: 52, deletions: 5, files: [{ path: 'agent-proxy/selectors.js', added: 40, removed: 2 }, { path: 'frontend/app.jsx', added: 12, removed: 3 }] }] }],
+  },
+  {
+    id: 'agv2_artifact',
+    description: 'Named artifact chip.',
+    messages: [{ role: 'assistant', content_blocks: [{ type: 'artifact', label: 'Verify Fix', artifact_type: 'task', content: 'Verification artifact opened.' }] }],
+  },
+  {
+    id: 'agv2_error',
+    description: 'Failed turn/error block.',
+    messages: [{ role: 'assistant', content_blocks: [{ type: 'error', label: 'Failed', content: 'The request failed.', actions: [{ id: 'retry', label: 'Retry' }] }] }],
+  },
+  {
+    id: 'agv2_prompt',
+    description: 'Permission or approval prompt block.',
+    messages: [{ role: 'assistant', content_blocks: [{ type: 'prompt', label: 'Approval required', content: 'Allow this safe action?', actions: [{ id: 'allow', label: 'Allow' }, { id: 'deny', label: 'Deny' }] }] }],
+  },
+];
+
+const CANONICAL_BLOCK_TYPES = new Set(['markdown', 'thinking', 'tool_call', 'terminal', 'file_changes', 'artifact', 'prompt', 'error']);
+
+function blockPlainText(block) {
+  if (!block || typeof block !== 'object') return '';
+  return [
+    block.label,
+    block.summary,
+    block.content,
+    block.command,
+    block.stdout,
+    block.stderr,
+    Array.isArray(block.files) ? block.files.map(file => `${file.path || ''} +${file.added || 0} -${file.removed || 0}`).join('\n') : '',
+  ].filter(Boolean).join('\n');
+}
+
+function evaluateAntigravityV2StructuralFixtures() {
+  const results = [];
+  for (const fixture of ANTIGRAVITY_V2_STRUCTURAL_FIXTURES) {
+    const failures = [];
+    for (const message of fixture.messages || []) {
+      const blocks = Array.isArray(message.content_blocks) ? message.content_blocks : [];
+      if (!blocks.length) failures.push('missing content_blocks');
+      for (const block of blocks) {
+        if (!CANONICAL_BLOCK_TYPES.has(block.type)) failures.push(`off-spec block type ${block.type}`);
+        if (!blockPlainText(block).trim()) failures.push(`empty ${block.type} block`);
+      }
+      const fallback = blocks.map(blockPlainText).filter(Boolean).join('\n\n').trim();
+      if (!fallback) failures.push('empty plain-text fallback');
+    }
+    results.push({
+      fixture_id: fixture.id,
+      description: fixture.description,
+      status: failures.length ? 'fail' : 'pass',
+      failures,
+    });
+  }
+  return results;
+}
 
 function listFixtures() {
   return Object.values(FIXTURES).map((fixture) => ({
@@ -254,7 +346,9 @@ module.exports = {
   DISPOSABLE_EDIT_FILE,
   PREVIEW_SOURCE_FILE,
   FIXTURES,
+  ANTIGRAVITY_V2_STRUCTURAL_FIXTURES,
   evaluateFixtureMessages,
+  evaluateAntigravityV2StructuralFixtures,
   getFixture,
   listFixtures,
   normalizeRunId,

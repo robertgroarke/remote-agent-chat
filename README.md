@@ -1,6 +1,6 @@
 # Remote Agent Chat
 
-Access and chat with your [Antigravity IDE](https://antigravity.dev) AI agents and CLI agents (Claude Code, Claude Code CLI, Codex, Gemini, Continue, Continue YOLO, Roo Code, Cline) from your phone or any browser - no inbound firewall rules, no VPS required.
+Access and chat with your [Antigravity IDE](https://antigravity.dev) AI agents and CLI agents (Claude Code, Claude Code CLI, Codex, Codex CLI, Gemini, Continue, Continue YOLO, Roo Code, Cline) from your phone or any browser - no inbound firewall rules, no VPS required.
 
 <p align="center">
   <img src="docs/architecture.png" alt="Remote Agent Chat architecture — CDP proxy, WebSocket relay, Cloudflare tunnel, mobile UI" width="100%">
@@ -16,7 +16,7 @@ Access and chat with your [Antigravity IDE](https://antigravity.dev) AI agents a
 
 ## The Problem
 
-Running autonomous AI coding agents (like Claude Code, Claude Code CLI, OpenAI Codex, Gemini Code Assist, Continue, Roo Code, or Cline) often requires you to stay tethered to your desktop IDE or terminal to monitor progress, approve file changes, or unblock stuck terminal loops.
+Running autonomous AI coding agents (like Claude Code, Claude Code CLI, OpenAI Codex, Codex CLI, Gemini Code Assist, Continue, Roo Code, or Cline) often requires you to stay tethered to your desktop IDE or terminal to monitor progress, approve file changes, or unblock stuck terminal loops.
 
 **Remote Agent Chat** solves this by bridging your local IDE with your mobile device. It uses a lightweight WebSocket relay and the Chrome DevTools Protocol (CDP) to securely expose your running IDE agents to a responsive web UI you self-host with Docker and a free Cloudflare Tunnel.
 
@@ -79,12 +79,14 @@ The agent proxy connects **outbound** to the relay — no port forwarding or inb
 | Claude Code (Antigravity extension) | Working |
 | Claude Code CLI | Working - WebUI sessions, Ollama Cloud models, and native Windows terminal handoff |
 | OpenAI Codex (Antigravity extension) | Working |
+| OpenAI Codex CLI | Working - WebUI sessions, native terminal handoff, active transcript discovery, tool output, and live goal/working status |
 | Gemini Code Assist (Antigravity extension) | Working |
 | Continue (Antigravity extension) | Working — local models via Ollama, etc. |
 | Continue YOLO (Antigravity extension) | Working — editor-tab sessions with bypass-permissions support |
 | Roo Code (Antigravity extension) | Working — side-pane sessions with permission dialog support |
 | Cline (Antigravity extension) | Working — side-pane sessions with Plan/Act mode, context usage, and permission dialog support |
 | Antigravity Chat (built-in agent) | Working |
+| Antigravity v2 Agent Manager (standalone app) | Working (separate CDP port) |
 | Codex Desktop (MSIX) | Working (separate CDP port) |
 | Claude Desktop (MSIX) | Blocked — Anthropic requires a signed `CLAUDE_CDP_AUTH` token to allow CDP |
 
@@ -92,8 +94,8 @@ The agent proxy connects **outbound** to the relay — no port forwarding or inb
 
 ## How it works
 
-1. **Antigravity** is launched with `--remote-debugging-port=9223`, exposing each agent webview via Chrome DevTools Protocol (CDP).
-2. **agent-proxy** connects to those webviews via CDP, polls for new messages, and relays them to the relay server over a persistent WebSocket.
+1. **Antigravity IDE** is launched with `--remote-debugging-port=9223`, exposing each agent webview via Chrome DevTools Protocol (CDP). Optional standalone apps use separate ports: Codex Desktop on `9225`, Antigravity v2 Agent Manager on `9226`.
+2. **agent-proxy** connects to those webviews via CDP, polls for new messages, follows local CLI transcript files for Claude Code CLI and Codex CLI sessions, and relays them to the relay server over a persistent WebSocket.
 3. **relay-server** brokers messages between the proxy and browser clients, persists history in SQLite, and gates access via Google OAuth.
 4. **Cloudflare Tunnel** (running as a Docker sidecar) punches a secure HTTPS tunnel to your relay so it's reachable from anywhere — no domain, no VPS, no port forwarding needed.
 5. You open the web UI on your phone, pick a session, and chat.
@@ -243,8 +245,8 @@ RELAY_URL=wss://agents.yourdomain.com/proxy-ws
 # Must match PROXY_SECRET in your relay .env
 PROXY_SECRET=<same value as relay>
 
-# CDP ports to scan (9223 = Antigravity)
-CDP_PORTS=9223
+# CDP ports to scan (9223 = Antigravity IDE, 9225 = Codex Desktop, 9226 = Antigravity v2)
+CDP_PORTS=9223,9225,9226
 ```
 
 ---
@@ -263,7 +265,7 @@ Install the proxy as an Antigravity/VS Code extension. No separate process, no s
 4. Open **Settings** (Ctrl+,) and search for `remoteAgentProxy`, then configure:
    - **Relay URL**: `wss://agents.yourdomain.com/proxy-ws`
    - **Proxy Secret**: same value as your relay's `PROXY_SECRET`
-    - **CDP Ports**: `9223` (add `,9225` if using Codex Desktop)
+    - **CDP Ports**: `9223` (add `,9225` for Codex Desktop and `,9226` for Antigravity v2)
 5. The proxy starts automatically. Look for `$(broadcast) Proxy (N)` in the status bar.
 
 Click the status bar item for a quick menu (Stop, Restart, Show Logs).
@@ -272,7 +274,7 @@ Click the status bar item for a quick menu (Stop, Restart, Show Logs).
 
 > **When to use the VSIX:** You only use agent extensions inside Antigravity. Simpler setup, no background process to manage.
 
-#### Option B: Standalone process — for Codex Desktop or always-on operation
+#### Option B: Standalone process — for Codex Desktop, CLI agents, or always-on operation
 
 The proxy runs as a standalone Node.js process managed by a Windows Scheduled Task (`agent-proxy-task`) that runs `restart-proxy.bat` in an infinite loop, so it always restarts automatically.
 
@@ -291,7 +293,7 @@ node index.js
 
 > **Warning:** Never run `node index.js` manually while the Scheduled Task is also running — two proxy processes will fight over the same sessions, causing them to flicker in the UI.
 >
-> **When to use standalone:** You use Codex Desktop (separate app, not an Antigravity extension), or you want the proxy running even when Antigravity is closed.
+> **When to use standalone:** You use Codex Desktop (separate app, not an Antigravity extension), Codex CLI / Claude Code CLI sessions, or you want the proxy running even when Antigravity is closed.
 
 **Do not run both modes at once.** If switching from standalone to VSIX, disable the `agent-proxy-task` Scheduled Task first. If switching from VSIX to standalone, uninstall the extension.
 
@@ -320,6 +322,73 @@ CDP_PORTS=9223,9225
 Then restart the proxy.
 
 > **Note:** Claude Desktop (MSIX) is **not supported** — Anthropic requires a signed `CLAUDE_CDP_AUTH` token to allow CDP access, which third parties cannot generate.
+
+## Optional: Antigravity v2 Agent Manager
+
+Antigravity v2 is the standalone Agent Manager app, installed separately from
+the v1 IDE:
+
+```bat
+launch-antigravity-v2-cdp.bat     # port 9226
+```
+
+The v2 executable is normally:
+
+```text
+%LOCALAPPDATA%\Programs\Antigravity\Antigravity.exe
+```
+
+The v1 IDE executable is normally:
+
+```text
+%LOCALAPPDATA%\Programs\Antigravity IDE\Antigravity.exe
+```
+
+Keep both `9223` and `9226` in `CDP_PORTS` when you want Antigravity IDE and
+Antigravity v2 sessions to appear together.
+
+---
+
+## Optional: OpenAI Codex CLI
+
+Remote Agent Chat can create and drive `Codex CLI` sessions directly from the
+WebUI, and can also discover active native Codex CLI sessions by following the
+local Codex transcript store.
+
+Once a Codex CLI session exists, you can use it from either surface:
+
+- **WebUI:** send messages from the browser like any other agent session.
+- **Native terminal:** click the `native` pill in the WebUI header, or the `cmd`
+  button by the composer, to open or resume the same session in a terminal.
+
+The WebUI preserves Codex CLI tool calls, terminal output, patch/file-change
+summaries, task plans, and live status such as `Pursuing goal (...)` and
+`Working (... esc to interrupt)`.
+
+This requires:
+
+- `codex` available on `PATH`, or `CODEX_CLI_PATH` set to a `codex` executable,
+  `.cmd`, `.bat`, or `.js` launcher
+- read access to the Codex CLI transcript directory under the current user
+  profile
+- the standalone proxy mode when you want sessions tracked while the IDE is not
+  running
+
+Useful optional environment variables:
+
+```env
+# Override Codex executable discovery
+CODEX_CLI_PATH=
+
+# Raise if large historical sessions should fully hydrate in the WebUI
+CODEX_CLI_HYDRATE_MAX_MB=75
+
+# Number of active native Codex CLI sessions to surface automatically
+CODEX_CLI_ACTIVE_SESSION_LIMIT=2
+
+# Opt in to archive discovery beyond currently active/recent sessions
+CODEX_CLI_DISCOVER_ARCHIVES=false
+```
 
 ---
 
@@ -400,6 +469,7 @@ root/
 ├── agent-proxy/              # Runs on Windows — CDP bridge + relay WebSocket client
 │   ├── proxy-engine.js       # Core proxy engine (shared by standalone + VSIX)
 │   ├── index.js              # Standalone entry point (loads .env, starts engine)
+│   ├── codex-cli.js          # Codex CLI transcript discovery + launch helpers
 │   ├── selectors.js          # DOM selector strategies per agent type
 │   ├── protocol.js           # Protocol v1 message builders
 │   ├── session-store.js      # Durable session IDs (survive restarts)
@@ -420,6 +490,7 @@ root/
 ├── .env.example              # Copy to .env and fill in
 ├── SELF_HOSTING.md           # Detailed self-hosting guide
 ├── launch-antigravity-cdp.bat
+├── launch-antigravity-v2-cdp.bat
 ├── launch-codex-desktop-cdp.bat
 ├── restart-proxy.bat         # Infinite-loop runner for Scheduled Task
 ├── proxy_restart_lock.py     # Safe proxy restart with mutex
@@ -444,6 +515,16 @@ The `PUBLIC_URL` in `.env` and the Authorized Redirect URI in Google Console mus
 - Check `http://localhost:9223/json/list` — you should see iframe targets with agent extension IDs
 - Check `proxy.log` for connection errors
 - Make sure `PROXY_SECRET` matches in both `.env` files
+
+**Antigravity v2 sessions do not appear**
+- Start v2 with `launch-antigravity-v2-cdp.bat`
+- Check `http://localhost:9226/json/list` for an `Antigravity` page target
+- Make sure `CDP_PORTS` includes `9226`
+
+**Codex CLI sessions do not appear**
+- Make sure the standalone proxy is running
+- Confirm `codex` is available on `PATH`, or set `CODEX_CLI_PATH`
+- If you expect old archived sessions, opt in with `CODEX_CLI_DISCOVER_ARCHIVES=true`
 
 **Sessions flicker or disappear**
 Two proxy processes are running simultaneously. This happens when both the VSIX extension and the standalone proxy are active, or when two standalone processes are running. Fix:

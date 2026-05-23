@@ -17,6 +17,7 @@ const CDP = requireCdp();
 
 const PORTS = {
   antigravity: 9223,
+  antigravityV2: 9226,
   codexDesktop: 9225,
 };
 
@@ -32,6 +33,7 @@ const SURFACE_SET = new Set([
   'roo_code',
   'cline',
   'antigravity_panel',
+  'antigravity-v2',
   'workbench',
 ]);
 
@@ -169,6 +171,10 @@ function findWorkbenchTarget(targets) {
 
 function findFirstMatchingTarget(targets, patterns) {
   return targets.find((t) => t.type === 'iframe' && patterns.some((pattern) => pattern.test((t.url || '') + ' ' + (t.title || ''))));
+}
+
+function findMatchingTargets(targets, patterns) {
+  return targets.filter((t) => t.type === 'iframe' && patterns.some((pattern) => pattern.test((t.url || '') + ' ' + (t.title || ''))));
 }
 
 async function findBestRooCodeTarget(targets) {
@@ -391,19 +397,104 @@ async function runWorkbenchSuite(targets, reporter) {
   });
 }
 
-async function runIframeSurfaceSuite(targets, reporter, surface) {
+async function runAntigravityV2Suite(targets, reporter) {
+  const surface = 'antigravity-v2';
+  const target = Array.isArray(targets) ? targets.find((t) => t.type === 'page' && /\/c\/[0-9a-f-]{36}/i.test(t.url || '')) || targets.find((t) => t.type === 'page') : null;
+  if (!target) {
+    reporter.add({
+      surface,
+      test_id: 'antigravity-v2.target.detect',
+      status: STATUS_SKIP,
+      detail: 'No Antigravity v2 page target found on port 9226',
+      investigation_hint: 'Open Antigravity v2 Agent Manager with remote debugging enabled on port 9226',
+    });
+    return;
+  }
+
+  reporter.add({
+    surface,
+    test_id: 'antigravity-v2.target.detect',
+    status: STATUS_PASS,
+    detail: 'Found Antigravity v2 page "' + truncate(target.title || target.id) + '"',
+    native_evidence: { target_id: target.id, url: truncate(target.url, 240), title: truncate(target.title || '') },
+  });
+
+  await withTarget(PORTS.antigravityV2, target, async (Runtime) => {
+    const active = await selectors.readAntigravityV2ActiveConversation(Runtime);
+    const activeOk = !!(active && (active.conversation_id || active.is_list_view));
+    reporter.add({
+      surface,
+      test_id: 'antigravity-v2.active-conversation.read',
+      status: activeOk ? STATUS_PASS : STATUS_FAIL,
+      detail: active?.conversation_id
+        ? 'Read active conversation UUID'
+        : active?.is_list_view
+          ? 'Read v2 list-view route (no active conversation)'
+          : 'Could not read active conversation UUID or list-view route',
+      native_evidence: active,
+      investigation_hint: 'Check readAntigravityV2ActiveConversation in selectors.js',
+    });
+
+    const chats = await selectors.readAntigravityV2ChatList(Runtime);
+    reporter.add({
+      surface,
+      test_id: 'antigravity-v2.chat-list.read',
+      status: Array.isArray(chats) ? STATUS_PASS : STATUS_FAIL,
+      detail: 'Read ' + (Array.isArray(chats) ? chats.length : 0) + ' v2 conversation entries',
+      native_evidence: Array.isArray(chats) ? chats.slice(0, 5) : null,
+      investigation_hint: 'Check readAntigravityV2ChatList in selectors.js',
+    });
+
+    const config = await selectors.readAgentConfig(Runtime, 'antigravity-v2');
+    reporter.add({
+      surface,
+      test_id: 'antigravity-v2.config.read',
+      status: config?.model_id && config.model_id !== 'unknown' ? STATUS_PASS : STATUS_FAIL,
+      detail: config?.model_id ? 'Read v2 model/config' : 'Could not read v2 model/config',
+      native_evidence: config,
+      investigation_hint: 'Check readAntigravityV2Config in selectors.js',
+    });
+
+    const messagesRaw = await selectors.readMessages(Runtime, 'antigravity-v2', 'smoke-antigravity-v2');
+    const messages = parseMaybeJson(messagesRaw, []);
+    const hasBlocks = Array.isArray(messages) && messages.some(m => Array.isArray(m.content_blocks) && m.content_blocks.length > 0);
+    reporter.add({
+      surface,
+      test_id: 'antigravity-v2.messages.read',
+      status: Array.isArray(messages) ? STATUS_PASS : STATUS_FAIL,
+      detail: 'Read ' + (Array.isArray(messages) ? messages.length : 0) + ' v2 transcript messages',
+      native_evidence: Array.isArray(messages) && messages.length > 0 ? { last_message: truncate(messages[messages.length - 1].content || '', 220), has_content_blocks: hasBlocks } : null,
+      investigation_hint: 'Check readAntigravityV2Messages and content_blocks extraction',
+    });
+
+    const thinking = await selectors.detectThinking(Runtime, 'antigravity-v2');
+    reporter.add({
+      surface,
+      test_id: 'antigravity-v2.thinking.detect',
+      status: STATUS_PASS,
+      detail: 'Thinking=' + !!thinking.thinking + ' label="' + truncate(thinking.label || '') + '"',
+      native_evidence: thinking,
+      investigation_hint: 'Check detectAntigravityV2Thinking in selectors.js',
+    });
+  });
+}
+
+async function runIframeSurfaceSuite(targets, reporter, surface, targetOverride = null, targetIndex = null) {
   const patterns = PATTERNS[surface];
   if (!patterns) return;
   let target;
-  if (surface === 'roo_code') {
+  if (targetOverride) {
+    target = targetOverride;
+  } else if (surface === 'roo_code') {
     target = Array.isArray(targets) ? await findBestRooCodeTarget(targets) : null;
   } else {
     target = Array.isArray(targets) ? findFirstMatchingTarget(targets, patterns) : null;
   }
+  const testPrefix = targetIndex == null ? surface : `${surface}.${targetIndex}`;
   if (!target) {
     reporter.add({
       surface,
-      test_id: surface + '.target.detect',
+      test_id: testPrefix + '.target.detect',
       status: STATUS_SKIP,
       detail: 'No live ' + surface + ' iframe target found on port 9223',
       investigation_hint: 'Open the ' + surface + ' surface in Antigravity before running the smoke suite',
@@ -413,7 +504,7 @@ async function runIframeSurfaceSuite(targets, reporter, surface) {
 
   reporter.add({
     surface,
-    test_id: surface + '.target.detect',
+    test_id: testPrefix + '.target.detect',
     status: STATUS_PASS,
     detail: 'Found ' + surface + ' iframe target',
     native_evidence: { target_id: target.id, url: truncate(target.url, 240), title: truncate(target.title || '') },
@@ -424,7 +515,7 @@ async function runIframeSurfaceSuite(targets, reporter, surface) {
     const expectedType = surface === 'codex' ? 'codex' : surface;
     reporter.add({
       surface,
-      test_id: surface + '.type.detect',
+      test_id: testPrefix + '.type.detect',
       status: detectedType === expectedType ? STATUS_PASS : STATUS_FAIL,
       detail: 'Detected type "' + detectedType + '"',
       expected: expectedType,
@@ -446,7 +537,7 @@ async function runIframeSurfaceSuite(targets, reporter, surface) {
     );
     reporter.add({
       surface,
-      test_id: surface + '.config.read',
+      test_id: testPrefix + '.config.read',
       status: configOk ? STATUS_PASS : STATUS_FAIL,
       detail: configOk ? 'Read ' + surface + ' config' : 'Could not read ' + surface + ' config',
       native_evidence: config,
@@ -457,7 +548,7 @@ async function runIframeSurfaceSuite(targets, reporter, surface) {
     const messages = parseMaybeJson(messagesRaw, []);
     reporter.add({
       surface,
-      test_id: surface + '.messages.read',
+      test_id: testPrefix + '.messages.read',
       status: Array.isArray(messages) ? STATUS_PASS : STATUS_FAIL,
       detail: 'Read ' + (Array.isArray(messages) ? messages.length : 0) + ' transcript messages',
       native_evidence: Array.isArray(messages) && messages.length > 0 ? { last_message: truncate(messages[messages.length - 1].content || '', 220) } : null,
@@ -469,7 +560,7 @@ async function runIframeSurfaceSuite(targets, reporter, surface) {
     const thinking = await selectors.detectThinking(Runtime, expectedType);
     reporter.add({
       surface,
-      test_id: surface + '.thinking.detect',
+      test_id: testPrefix + '.thinking.detect',
       status: STATUS_PASS,
       detail: 'Thinking=' + !!thinking.thinking + ' label="' + truncate(thinking.label || '') + '"',
       native_evidence: thinking,
@@ -480,7 +571,7 @@ async function runIframeSurfaceSuite(targets, reporter, surface) {
       const chats = await selectors.readCodexChatList(Runtime, false);
       reporter.add({
         surface,
-        test_id: 'codex.chat-list.read',
+        test_id: testPrefix + '.chat-list.read',
         status: Array.isArray(chats) ? STATUS_PASS : STATUS_FAIL,
         detail: 'Read ' + (Array.isArray(chats) ? chats.length : 0) + ' Codex side pane chats',
         native_evidence: Array.isArray(chats) ? chats.slice(0, 3) : null,
@@ -574,8 +665,10 @@ async function runSmokeSuite(options = {}) {
 
   const meta = {
     antigravity_targets: Array.isArray(targetsByPort.antigravity) ? targetsByPort.antigravity.length : 0,
+    antigravity_v2_targets: Array.isArray(targetsByPort.antigravityV2) ? targetsByPort.antigravityV2.length : 0,
     codex_desktop_targets: Array.isArray(targetsByPort.codexDesktop) ? targetsByPort.codexDesktop.length : 0,
     antigravity_error: Array.isArray(targetsByPort.antigravity) ? null : targetsByPort.antigravity.error,
+    antigravity_v2_error: Array.isArray(targetsByPort.antigravityV2) ? null : targetsByPort.antigravityV2.error,
     codex_desktop_error: Array.isArray(targetsByPort.codexDesktop) ? null : targetsByPort.codexDesktop.error,
   };
 
@@ -589,6 +682,7 @@ async function runSmokeSuite(options = {}) {
     surface === 'cline'
   );
   const needsCodexDesktopPort = options.surfaces.includes('codex-desktop');
+  const needsAntigravityV2Port = options.surfaces.includes('antigravity-v2');
 
   if (needsAntigravityPort && !Array.isArray(targetsByPort.antigravity)) {
     reporter.add({
@@ -610,6 +704,16 @@ async function runSmokeSuite(options = {}) {
     });
   }
 
+  if (needsAntigravityV2Port && !Array.isArray(targetsByPort.antigravityV2)) {
+    reporter.add({
+      surface: 'antigravity-v2',
+      test_id: 'antigravity-v2.port.connect',
+      status: STATUS_FAIL,
+      detail: 'Could not list Antigravity v2 CDP targets: ' + targetsByPort.antigravityV2.error,
+      investigation_hint: 'Check port 9226 and whether Antigravity v2 was launched with remote debugging',
+    });
+  }
+
   if (options.surfaces.includes('workbench') || options.surfaces.includes('antigravity_panel')) {
     await runWorkbenchSuite(Array.isArray(targetsByPort.antigravity) ? targetsByPort.antigravity : [], reporter);
   }
@@ -618,9 +722,25 @@ async function runSmokeSuite(options = {}) {
     await runCodexDesktopSuite(Array.isArray(targetsByPort.codexDesktop) ? targetsByPort.codexDesktop : [], reporter);
   }
 
+  if (options.surfaces.includes('antigravity-v2')) {
+    await runAntigravityV2Suite(Array.isArray(targetsByPort.antigravityV2) ? targetsByPort.antigravityV2 : [], reporter);
+  }
+
   for (const surface of ['claude', 'codex', 'continue', 'roo_code', 'cline']) {
     if (!options.surfaces.includes(surface)) continue;
-    await runIframeSurfaceSuite(Array.isArray(targetsByPort.antigravity) ? targetsByPort.antigravity : [], reporter, surface);
+    const antigravityTargets = Array.isArray(targetsByPort.antigravity) ? targetsByPort.antigravity : [];
+    if (surface === 'codex') {
+      const codexTargets = findMatchingTargets(antigravityTargets, PATTERNS.codex);
+      if (codexTargets.length === 0) {
+        await runIframeSurfaceSuite(antigravityTargets, reporter, surface);
+      } else {
+        for (let i = 0; i < codexTargets.length; i++) {
+          await runIframeSurfaceSuite(antigravityTargets, reporter, surface, codexTargets[i], i);
+        }
+      }
+      continue;
+    }
+    await runIframeSurfaceSuite(antigravityTargets, reporter, surface);
   }
 
   return reporter.buildReport(meta);

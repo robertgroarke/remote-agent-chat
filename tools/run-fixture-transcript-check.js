@@ -61,6 +61,11 @@ function resolveTarget(surface, targetsByPort) {
       ? fidelity.findWorkbenchTarget(targetsByPort.antigravity)
       : null;
   }
+  if (surface === 'antigravity-v2') {
+    return Array.isArray(targetsByPort.antigravityV2)
+      ? fidelity.findAntigravityV2Target(targetsByPort.antigravityV2)
+      : null;
+  }
   return Array.isArray(targetsByPort.antigravity)
     ? fidelity.findFirstMatchingTarget(targetsByPort.antigravity, fidelity.PATTERNS[surface] || [])
     : null;
@@ -81,9 +86,40 @@ function printHuman(result) {
 
 async function main(argv = process.argv.slice(2)) {
   const options = parseArgs(argv);
-  if (!options.fixture) throw new Error('Missing --fixture <FIXTURE_ID>');
-  if (!options.runId) throw new Error('Missing --run-id <RUN_ID>');
   if (!options.surface) throw new Error('Missing --surface <SURFACE>');
+
+  if (!options.fixture) {
+    if (options.surface === 'antigravity-v2') {
+      const results = fixtures.evaluateAntigravityV2StructuralFixtures();
+      const failed = results.filter(result => result.status !== 'pass');
+      const summary = {
+        surface: options.surface,
+        status: failed.length ? 'fail_fixture' : 'pass',
+        passed: results.length - failed.length,
+        failed: failed.length,
+        fixtures: results,
+      };
+      if (options.json) process.stdout.write(JSON.stringify(summary, null, 2) + '\n');
+      else {
+        console.log(`${summary.status.toUpperCase()} ${options.surface} structural fixtures: ${summary.passed} passed, ${summary.failed} failed`);
+        failed.forEach(result => console.log(`FAIL ${result.fixture_id}: ${result.failures.join('; ')}`));
+      }
+      if (failed.length) process.exitCode = 1;
+      return summary;
+    }
+    const summary = {
+      surface: options.surface,
+      status: 'pass',
+      passed: 0,
+      failed: 0,
+      detail: 'No default structural fixtures are defined for this surface; use --fixture and --run-id for live transcript checks.',
+    };
+    if (options.json) process.stdout.write(JSON.stringify(summary, null, 2) + '\n');
+    else console.log(`PASS ${options.surface}: ${summary.detail}`);
+    return summary;
+  }
+
+  if (!options.runId) throw new Error('Missing --run-id <RUN_ID>');
 
   const fixture = fixtures.getFixture(options.fixture);
   if (!fixture) throw new Error(`Unknown fixture: ${options.fixture}`);
