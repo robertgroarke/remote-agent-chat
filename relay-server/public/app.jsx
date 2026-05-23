@@ -31,6 +31,7 @@ const AGENT_CONFIG = {
   cline:             { name: 'Cline',            color: '#6366f1', abbr: 'CL', logo: '/logo-cline.svg' },
   antigravity:       { name: 'Antigravity',      color: '#a855f7', abbr: 'AG', logo: '/logo-antigravity.svg' },
   antigravity_panel: { name: 'Antigravity Chat', color: '#a855f7', abbr: 'AC', logo: '/logo-antigravity.svg' },
+  'antigravity-v2':  { name: 'Antigravity v2',   color: '#7c3aed', abbr: 'A2', logo: null },
 };
 const DEFAULT_AGENT = { name: 'Agent', color: '#8b949e', abbr: 'AG' };
 
@@ -95,6 +96,164 @@ function hasVisibleMessageContent(content) {
   return normalizeMessageContent(content).trim().length > 0;
 }
 
+function normalizeContentBlocks(blocks) {
+  if (!Array.isArray(blocks)) return [];
+  return blocks
+    .filter(block => block && typeof block === 'object')
+    .map(block => {
+      const type = safeString(block.type || 'markdown').toLowerCase();
+      if (type === 'code') {
+        const lang = safeString(block.language || block.lang || '').trim();
+        const content = normalizeMessageContent(block.content || block.text || block.markdown || '');
+        return { ...block, type: 'markdown', content: `\`\`\`${lang}\n${content}\n\`\`\`` };
+      }
+      if (type === 'file_change') return { ...block, type: 'file_changes' };
+      if (type === 'tool') return { ...block, type: 'tool_call' };
+      if (type === 'thought') return { ...block, type: 'thinking' };
+      return block;
+    });
+}
+
+function hasVisibleMessage(msg) {
+  if (!msg) return false;
+  if (hasVisibleMessageContent(msg.content)) return true;
+  return normalizeContentBlocks(msg.content_blocks).some(block =>
+    normalizeMessageContent(block.content || block.text || block.markdown || block.title || block.label).trim().length > 0
+  );
+}
+
+function contentBlocksFallback(blocks) {
+  return normalizeContentBlocks(blocks)
+    .map(block => normalizeMessageContent(block.content || block.text || block.markdown || block.title || block.label))
+    .filter(Boolean)
+    .join('\n\n');
+}
+
+function ContentBlocks({ blocks, monospace, autoExpandLongCodeBlocks, onOpenPath, agentType }) {
+  const normalized = normalizeContentBlocks(blocks);
+  if (normalized.length === 0) return null;
+  const isCodexCli = safeString(agentType).toLowerCase() === 'codex_cli';
+  function blockBody(block) {
+    const terminalParts = [
+      block.workdir ? `cwd: ${block.workdir}` : null,
+      block.command ? `$ ${block.command}` : null,
+      block.stdout || null,
+      block.stderr ? `stderr:\n${block.stderr}` : null,
+      block.exit_code != null ? `exit code: ${block.exit_code}` : null,
+    ].filter(Boolean);
+    if (terminalParts.length) return terminalParts.join('\n\n');
+    return normalizeMessageContent(block.content || block.text || block.markdown || '');
+  }
+  function explicitOpen(block) {
+    if (block.collapsed === false || block.default_open === true || block.open === true) return true;
+    if (block.collapsed === true) return false;
+    return null;
+  }
+  function isCodexCliExpandedToolBlock(block, title) {
+    if (!isCodexCli) return false;
+    if (block.command) return true;
+    const normalizedTitle = safeString(title).toLowerCase();
+    if (safeString(block.type).toLowerCase() === 'tool_call') return true;
+    return normalizedTitle.startsWith('tool:')
+      || normalizedTitle.includes('shell_command')
+      || normalizedTitle.includes('local_shell')
+      || normalizedTitle.includes('custom_tool');
+  }
+  return (
+    <div className="content-blocks">
+      {normalized.map((block, index) => {
+        const type = safeString(block.type || 'markdown').toLowerCase();
+        const title = safeString(block.title || block.label || block.summary || type);
+        const body = blockBody(block);
+        if (type === 'thinking') {
+          return (
+            <details key={index} className="content-block content-block-thinking" open={block.collapsed === false}>
+              <summary>{title || 'Thinking'}</summary>
+              {body && <MarkdownContent content={body} monospace={monospace} autoExpandLongCodeBlocks={autoExpandLongCodeBlocks} onOpenPath={onOpenPath} />}
+            </details>
+          );
+        }
+        if (type === 'tool_call') {
+          const open = explicitOpen(block);
+          return (
+            <details key={index} className="content-block content-block-tool" open={open ?? (block.status === 'running' || isCodexCliExpandedToolBlock(block, title))}>
+              <summary>
+                <span>{title || 'Tool'}</span>
+                {block.status && <span className={`content-block-status ${safeString(block.status).toLowerCase()}`}>{block.status}</span>}
+              </summary>
+              {body && <pre className="content-block-pre">{body}</pre>}
+            </details>
+          );
+        }
+        if (type === 'terminal') {
+          const open = explicitOpen(block);
+          return (
+            <details key={index} className="content-block content-block-terminal" open={open ?? isCodexCli}>
+              <summary>
+                <span>{title || 'Terminal'}</span>
+                {block.exit_code != null && <span className="content-block-status">exit {block.exit_code}</span>}
+              </summary>
+              {body && <pre className="content-block-pre">{body}</pre>}
+            </details>
+          );
+        }
+        if (type === 'file_changes') {
+          const stats = [
+            block.files_changed != null ? `${block.files_changed} files` : null,
+            block.additions != null ? `+${block.additions}` : null,
+            block.deletions != null ? `-${block.deletions}` : null,
+          ].filter(Boolean).join(' ');
+          return (
+            <details key={index} className="content-block content-block-file-change">
+              <summary>{title || 'File changes'}{stats ? ` ${stats}` : ''}</summary>
+              {Array.isArray(block.files) && block.files.length > 0 && (
+                <div className="content-block-file-list">
+                  {block.files.map((file, fileIndex) => (
+                    <div className="content-block-file-row" key={file.path || fileIndex}>
+                      <span className="content-block-file-path">{file.path || 'file'}</span>
+                      {file.added != null && <span className="content-block-add">+{file.added}</span>}
+                      {file.removed != null && <span className="content-block-del">-{file.removed}</span>}
+                    </div>
+                  ))}
+                </div>
+              )}
+              {body && <MarkdownContent content={body} monospace={monospace} autoExpandLongCodeBlocks={autoExpandLongCodeBlocks} onOpenPath={onOpenPath} />}
+            </details>
+          );
+        }
+        if (type === 'artifact') {
+          return (
+            <div key={index} className="content-block content-block-artifact">
+              <div className="content-block-title">{title || 'Artifact'}</div>
+              {body && <MarkdownContent content={body} monospace={monospace} autoExpandLongCodeBlocks={autoExpandLongCodeBlocks} onOpenPath={onOpenPath} />}
+            </div>
+          );
+        }
+        if (type === 'prompt' || type === 'error') {
+          return (
+            <div key={index} className={`content-block content-block-${type}`}>
+              <div className="content-block-title">{title || type}</div>
+              {body && <MarkdownContent content={body} monospace={monospace} autoExpandLongCodeBlocks={autoExpandLongCodeBlocks} onOpenPath={onOpenPath} />}
+              {Array.isArray(block.actions) && block.actions.length > 0 && (
+                <div className="content-block-actions">
+                  {block.actions.map((action, actionIndex) => (
+                    <span key={action.id || actionIndex} className="content-block-action-label">{action.label || action.id || 'Action'}</span>
+                  ))}
+                </div>
+              )}
+            </div>
+          );
+        }
+        return (
+          <div key={index} className="content-block content-block-markdown">
+            <MarkdownContent content={body || title} monospace={monospace} autoExpandLongCodeBlocks={autoExpandLongCodeBlocks} onOpenPath={onOpenPath} />
+          </div>
+        );
+      })}
+    </div>
+  );
+}
+
 function hasSubstantiveLiveText(content) {
   const text = normalizeMessageContent(content).trim();
   if (!text) return false;
@@ -142,6 +301,7 @@ function normalizeAgentTypeHint(value) {
   if (raw.includes('codex')) return 'codex';
   if (raw.includes('claude code') || raw.includes('claude')) return 'claude';
   if (raw.includes('antigravity chat') || raw.includes('antigravity_panel')) return 'antigravity_panel';
+  if (raw.includes('antigravity-v2') || raw.includes('antigravity v2')) return 'antigravity-v2';
   return null;
 }
 
@@ -481,14 +641,56 @@ function ClaudeSpinner() {
   return <span className="claude-spinner-icon">{SPINNER_SYMBOLS[frame]}</span>;
 }
 
+function formatActivityElapsed(updatedAt, nowMs) {
+  const started = updatedAt ? new Date(updatedAt).getTime() : 0;
+  if (!Number.isFinite(started) || started <= 0) return '';
+  const totalSeconds = Math.max(0, Math.floor((nowMs - started) / 1000));
+  return formatClockDuration(totalSeconds, { includeSeconds: true });
+}
+
+function formatClockDuration(totalSeconds, { includeSeconds = false } = {}) {
+  totalSeconds = Math.max(0, Math.floor(Number(totalSeconds) || 0));
+  if (totalSeconds < 60) return `${totalSeconds}s`;
+  const minutes = Math.floor(totalSeconds / 60);
+  const seconds = totalSeconds % 60;
+  if (minutes < 60) return includeSeconds ? `${minutes}m ${String(seconds).padStart(2, '0')}s` : `${minutes}m`;
+  const hours = Math.floor(minutes / 60);
+  const remMinutes = minutes % 60;
+  return `${hours}h ${String(remMinutes).padStart(2, '0')}m`;
+}
+
+function formatGoalElapsed(goal, nowMs) {
+  if (!goal) return '';
+  const base = Number(goal.time_used_seconds ?? goal.timeUsedSeconds ?? 0) || 0;
+  const updated = goal.updated_at ? new Date(goal.updated_at).getTime() : 0;
+  const liveDelta = goal.status === 'active' && Number.isFinite(updated) && updated > 0
+    ? Math.max(0, Math.floor((nowMs - updated) / 1000))
+    : 0;
+  return formatClockDuration(base + liveDelta);
+}
+
 function ActivityRow({ activity, thinkingText, isClaude, pinned = false }) {
   const kind = activity?.kind || 'working';
   const meta = ACTIVITY_META[kind] || ACTIVITY_META.working;
+  const goal = activity?.goal || null;
   const isActive = meta.tone === 'thinking' || meta.tone === 'info';
-  const label = activity?.label || kind.replaceAll('_', ' ');
+  const goalActive = goal?.status === 'active';
+  const [nowMs, setNowMs] = React.useState(Date.now());
+  React.useEffect(() => {
+    if ((!isActive || !(activity?.startedAt || activity?.updatedAt)) && !goalActive) return undefined;
+    const id = setInterval(() => setNowMs(Date.now()), 1000);
+    return () => clearInterval(id);
+  }, [isActive, activity?.startedAt, activity?.updatedAt, goalActive, goal?.updated_at]);
+  const rawLabel = activity?.label ?? '';
+  const baseLabel = rawLabel || (kind === 'idle' && goal ? '' : kind.replaceAll('_', ' '));
+  const elapsed = isActive ? formatActivityElapsed(activity?.startedAt || activity?.updatedAt, nowMs) : '';
+  const hint = activity?.interruptHint || activity?.interrupt_hint || '';
+  const labelDetail = [elapsed, hint].filter(Boolean).join(' • ');
+  const label = baseLabel && labelDetail ? `${baseLabel} (${labelDetail})` : baseLabel;
+  const goalElapsed = goal ? formatGoalElapsed(goal, nowMs) : '';
   const isThinkingKind = kind === 'thinking' || kind === 'generating';
   const showBlob = isClaude && isThinkingKind;
-  const visibleThinkingText = showBlob ? '' : (thinkingText || '').trim();
+  const visibleThinkingText = showBlob ? '' : (thinkingText || activity?.thinkingContent || '').trim();
 
   return (
     <div className={`activity-row ${meta.tone}${isActive ? ' active' : ''}${showBlob ? ' claude-thinking' : ''}${pinned ? ' pinned' : ''}`}>
@@ -500,10 +702,18 @@ function ActivityRow({ activity, thinkingText, isClaude, pinned = false }) {
         </div>
       )}
       <div className="activity-copy">
-        <div className={`activity-label${showBlob ? ' inline-blob' : ''}`}>
-          {showBlob && <ClaudeSpinner />}
-          <span>{label}</span>
-        </div>
+        {goal && (
+          <div className="activity-goal" title={goal.objective || ''}>
+            <span>{goal.label || 'Pursuing goal'}</span>
+            {goalElapsed && <span className="activity-goal-time">({goalElapsed})</span>}
+          </div>
+        )}
+        {(label || showBlob) && (
+          <div className={`activity-label${showBlob ? ' inline-blob' : ''}`}>
+            {showBlob && <ClaudeSpinner />}
+            {label && <span>{label}</span>}
+          </div>
+        )}
         {isActive && visibleThinkingText && (
           showBlob ? (
             <div className="thinking-inline-text">
@@ -1599,6 +1809,148 @@ function ChatListPanel({ chats, sessionId, onSwitch, onNew, onClose }) {
 // ─── Thread history panel (Epic 2) ────────────────────────────────────────────
 // Collapsible panel showing Codex Desktop threads with switch/new actions.
 // Reuses the same visual style as ChatListPanel.
+function AntigravityV2NavPanel({ items, onNavigate, onNew, onClose, embedded = false, loading = false }) {
+  const normalized = Array.isArray(items) ? items : [];
+  const navItems = normalized.filter(item => item?.kind === 'nav');
+  const projects = normalized.filter(item => item?.kind === 'project');
+  const chats = normalized.filter(item => !item?.kind || item.kind === 'chat');
+  const seeAllItems = normalized.filter(item => item?.kind === 'see_all');
+  const projectKeys = [];
+  const projectLabels = new Map();
+  projects.forEach(project => {
+    const key = project.project_index != null ? `idx:${project.project_index}` : `name:${project.project || project.title || 'Project'}`;
+    if (!projectLabels.has(key)) {
+      projectKeys.push(key);
+      projectLabels.set(key, project.title || project.project || 'Project');
+    }
+  });
+  chats.forEach(chat => {
+    const key = chat.project_index != null ? `idx:${chat.project_index}` : `name:${chat.project || 'Other'}`;
+    if (!projectLabels.has(key)) {
+      projectKeys.push(key);
+      projectLabels.set(key, chat.project || 'Other');
+    }
+  });
+  const ungrouped = chats.filter(chat => chat.project_index == null && !chat.project);
+
+  function navTitle(action) {
+    if (action === 'new_conversation') return 'New Conversation';
+    if (action === 'conversation_history') return 'Conversation History';
+    if (action === 'scheduled_tasks') return 'Scheduled Tasks';
+    return 'Agent Manager';
+  }
+
+  function renderChat(chat, i) {
+    return (
+      <button
+        key={chat.id || i}
+        className={`agv2-chat-item${chat.active ? ' active' : ''}`}
+        type="button"
+        onClick={() => onNavigate(chat.id)}
+        title={chat.title || 'Untitled'}
+      >
+        <span className="agv2-chat-title">{chat.title || 'Untitled'}</span>
+        {chat.age && <span className="agv2-chat-age">{chat.age}</span>}
+        {chat.active && <span className="agv2-chat-active">●</span>}
+      </button>
+    );
+  }
+
+  const body = (
+    <>
+      <div className="agv2-nav-actions">
+        {(navItems.length ? navItems : [
+          { id: '__agv2:new_conversation', action: 'new_conversation' },
+          { id: '__agv2:conversation_history', action: 'conversation_history' },
+          { id: '__agv2:scheduled_tasks', action: 'scheduled_tasks' },
+        ]).map(item => (
+          <button
+            key={item.id || item.action}
+            className={`agv2-nav-action ${item.action || ''}`}
+            type="button"
+            onClick={() => item.action === 'new_conversation' ? onNew() : onNavigate(item.id)}
+          >
+            <span className="agv2-nav-action-icon">{item.action === 'new_conversation' ? '+' : item.action === 'scheduled_tasks' ? '◷' : '↺'}</span>
+            <span>{item.title || navTitle(item.action)}</span>
+          </button>
+        ))}
+      </div>
+      <div className="agv2-project-list">
+        {projectKeys.length === 0 && ungrouped.length === 0 ? (
+          <div className="chat-list-empty">{loading ? 'Loading conversations...' : 'No projects or conversations found'}</div>
+        ) : (
+          <>
+            {projectKeys.map(projectKey => {
+              const label = projectLabels.get(projectKey) || 'Project';
+              const projectChats = chats.filter(chat => {
+                const key = chat.project_index != null ? `idx:${chat.project_index}` : `name:${chat.project || 'Other'}`;
+                return key === projectKey;
+              });
+              const projectSeeAll = seeAllItems.filter(item => {
+                const key = item.project_index != null ? `idx:${item.project_index}` : `name:${item.project || 'Other'}`;
+                return key === projectKey;
+              });
+              return (
+                <section className="agv2-project-section" key={projectKey}>
+                  <div className="agv2-project-header">
+                    <span className="agv2-project-icon">⌂</span>
+                    <span className="agv2-project-title">{label}</span>
+                  </div>
+                  <div className="agv2-project-chats">
+                    {projectChats.length === 0 ? (
+                      <div className="agv2-project-empty">No visible conversations</div>
+                    ) : (
+                      projectChats.map(renderChat)
+                    )}
+                    {projectSeeAll.map(item => (
+                      <button
+                        key={item.id}
+                        className="agv2-see-all"
+                        type="button"
+                        onClick={() => onNavigate(item.id)}
+                      >
+                        {item.title || 'See all'}
+                      </button>
+                    ))}
+                  </div>
+                </section>
+              );
+            })}
+            {ungrouped.length > 0 && (
+              <section className="agv2-project-section">
+                <div className="agv2-project-header">
+                  <span className="agv2-project-icon">⌂</span>
+                  <span className="agv2-project-title">Other</span>
+                </div>
+                <div className="agv2-project-chats">
+                  {ungrouped.map(renderChat)}
+                </div>
+              </section>
+            )}
+          </>
+        )}
+      </div>
+    </>
+  );
+
+  if (embedded) {
+    return <div className="agv2-nav-embedded">{body}</div>;
+  }
+
+  return (
+    <div className="chat-list-panel agv2-nav-panel">
+      <div className="chat-list-header">
+        <span className="chat-list-title">Antigravity Agent Manager</span>
+        <button className="chat-list-new-btn" onClick={onNew} title="New conversation">+</button>
+        <button className="chat-list-close-btn" onClick={onClose} title="Close">✕</button>
+      </div>
+      <div className="chat-list-body agv2-nav-body">
+        {body}
+      </div>
+    </div>
+  );
+}
+
 function ThreadHistoryPanel({ threads, sessionId, onSwitch, onNew, onClose, newLabel = 'New thread' }) {
   return (
     <div className="chat-list-panel">
@@ -2571,6 +2923,8 @@ function App() {
   const [stopPending, setStopPending]       = useState({});
   const [showJumpButton, setShowJumpButton] = useState(false);
   const [showChatList, setShowChatList]     = useState(false);
+  const [agv2NavigatorOpen, setAgv2NavigatorOpen] = useState(true);
+  const [optimisticV2ChatFocus, setOptimisticV2ChatFocus] = useState({});
   const [showThreadList, setShowThreadList] = useState(false);
   const [pendingDraftThreads, setPendingDraftThreads] = useState({});
   const [optimisticThreadFocus, setOptimisticThreadFocus] = useState({});
@@ -3013,7 +3367,24 @@ async function uploadBinaryDraft(sessionId, base64, mimeType, filename) {
   const activeSessionMeta = orderedSessions.find(s =>
     sessionIdOf(s) === activeSession
   );
-  const autoExpandLongCodeBlocks = activeSessionMeta?.agent_type === 'antigravity' || activeSessionMeta?.agent_type === 'antigravity_panel';
+  const isAntigravityV2 = activeSessionMeta?.agent_type === 'antigravity-v2';
+  const rawActiveChatList = activeSession ? (chatLists[activeSession] || []) : [];
+  const optimisticV2Focus = activeSession ? optimisticV2ChatFocus[activeSession] : null;
+  const activeChatList = React.useMemo(() => {
+    if (!(isAntigravityV2 && optimisticV2Focus?.id)) return rawActiveChatList;
+    return rawActiveChatList.map(item => (
+      (!item?.kind || item.kind === 'chat')
+        ? { ...item, active: item.id === optimisticV2Focus.id }
+        : item
+    ));
+  }, [rawActiveChatList, isAntigravityV2, optimisticV2Focus?.id]);
+  const activeChatListLoaded = !!(
+    activeSession
+    && Object.prototype.hasOwnProperty.call(chatLists, activeSession)
+  );
+  const activeV2ConversationCount = activeChatList.filter(item => !item?.kind || item.kind === 'chat').length;
+  const showAntigravityV2Navigator = !!(activeSession && isAntigravityV2 && !showFileBrowser);
+  const autoExpandLongCodeBlocks = activeSessionMeta?.agent_type === 'antigravity' || activeSessionMeta?.agent_type === 'antigravity_panel' || activeSessionMeta?.agent_type === 'antigravity-v2';
   const visiblePaneSession = activeSessionMeta ? findVisiblePaneSession(orderedSessions, activeSessionMeta) : null;
   const codexWorkbenchPaneSummary = activeSessionMeta?.agent_type === 'codex' && activeSessionMeta?.visible_pane_visible
     ? {
@@ -3066,7 +3437,11 @@ async function uploadBinaryDraft(sessionId, base64, mimeType, filename) {
       )
     )
   );
-  const activeWindowLabel = activeSession ? sessionSubLabel(activeSessionMeta, activeSession) : '';
+  let activeWindowLabel = activeSession ? sessionSubLabel(activeSessionMeta, activeSession) : '';
+  if (isAntigravityV2 && optimisticV2Focus?.title) {
+    const workspaceLabel = activeSessionMeta?.workspace_name || activeWorkspaceBasename || 'Antigravity v2';
+    activeWindowLabel = `${workspaceLabel} / ${optimisticV2Focus.title}`;
+  }
   const activeWorkspacePath = activeSessionMeta && typeof activeSessionMeta === 'object'
     ? activeSessionMeta.workspace_path
     : '';
@@ -3150,6 +3525,7 @@ async function uploadBinaryDraft(sessionId, base64, mimeType, filename) {
     && hasSubstantiveLiveText(liveThinkingText)
     && (
       activeSessionMeta?.agent_type === 'codex'
+      || activeSessionMeta?.agent_type === 'codex_cli'
       || activeSessionMeta?.agent_type === 'codex-desktop'
       || activeSessionMeta?.agent_type === 'antigravity_panel'
     )
@@ -3160,6 +3536,19 @@ async function uploadBinaryDraft(sessionId, base64, mimeType, filename) {
     activeActivity
     && !activeActivity?.task_list
     && activeSessionMeta?.agent_type === 'claude'
+  );
+  const isActiveCodexCli = activeSessionMeta?.agent_type === 'codex_cli';
+  const showLiveStatusStrip = !!(
+    activeActivity
+    && !showInlineClaudeActivity
+    && (
+      activeActivity?.goal
+      || activeActivity?.task_list
+      || (
+        isActiveCodexCli
+        && (activeActivity.kind !== 'idle' || hasSubstantiveLiveText(liveThinkingText || activeActivity.thinkingContent || ''))
+      )
+    )
   );
   const shouldBottomAlignMessages = !!(
     activeSession
@@ -3192,6 +3581,45 @@ async function uploadBinaryDraft(sessionId, base64, mimeType, filename) {
       requestThreadList(activeSession);
     }
   }, [activeSession, hasThreadCap, noMessages]);
+  React.useEffect(() => {
+    if (!(activeSession && isAntigravityV2 && connected)) return undefined;
+    requestChatList(activeSession);
+    const retryTimers = [600, 1800, 4200].map(delay => setTimeout(() => {
+      if (typeof document !== 'undefined' && document.hidden) return;
+      requestChatList(activeSession);
+    }, delay));
+    const refreshIfVisible = () => {
+      if (typeof document !== 'undefined' && document.hidden) return;
+      requestChatList(activeSession);
+    };
+    const intervalId = setInterval(refreshIfVisible, 30000);
+    const onVisibility = () => refreshIfVisible();
+    if (typeof document !== 'undefined') document.addEventListener('visibilitychange', onVisibility);
+    return () => {
+      retryTimers.forEach(timer => clearTimeout(timer));
+      clearInterval(intervalId);
+      if (typeof document !== 'undefined') document.removeEventListener('visibilitychange', onVisibility);
+    };
+  }, [activeSession, isAntigravityV2, connected]);
+  React.useEffect(() => {
+    if (activeSession && isAntigravityV2) {
+      setAgv2NavigatorOpen(true);
+      setShowChatList(false);
+    }
+  }, [activeSession, isAntigravityV2]);
+  React.useEffect(() => {
+    if (!(activeSession && isAntigravityV2)) return;
+    const activeChat = rawActiveChatList.find(item => (!item?.kind || item.kind === 'chat') && item.active);
+    if (!activeChat) return;
+    setOptimisticV2ChatFocus(prev => {
+      const current = prev[activeSession];
+      if (!current) return prev;
+      if (current.id !== activeChat.id && Date.now() - (current.at || 0) < 15000) return prev;
+      const next = { ...prev };
+      delete next[activeSession];
+      return next;
+    });
+  }, [activeSession, isAntigravityV2, rawActiveChatList]);
   React.useEffect(() => {
     if (!(activeSession && activeSessionMeta?.agent_type === 'codex-desktop' && noMessages)) return undefined;
     requestHistory(activeSession);
@@ -3271,6 +3699,51 @@ async function uploadBinaryDraft(sessionId, base64, mimeType, filename) {
     setTimeout(() => requestHistory(sessionId), 550);
     setTimeout(() => requestThreadList(sessionId), 300);
     setTimeout(() => requestThreadList(sessionId), 1200);
+  }
+
+  function handleAntigravityV2New(sessionId = activeSession) {
+    if (!sessionId) return;
+    setAgv2NavigatorOpen(true);
+    setShowChatList(false);
+    setOptimisticV2ChatFocus(prev => ({
+      ...prev,
+      [sessionId]: { id: '__agv2:new_conversation', title: 'New Conversation', kind: 'nav', at: Date.now() },
+    }));
+    newChat(sessionId);
+    setTimeout(() => requestHistory(sessionId), 150);
+    setTimeout(() => requestChatList(sessionId), 500);
+    setTimeout(() => requestChatList(sessionId), 1400);
+  }
+
+  function handleAntigravityV2Navigate(itemId, sessionId = activeSession) {
+    if (!(sessionId && itemId)) return;
+    setAgv2NavigatorOpen(true);
+    setShowChatList(false);
+    const item = (chatLists[sessionId] || []).find(entry => entry?.id === itemId);
+    const fallbackTitle = itemId === '__agv2:new_conversation'
+      ? 'New Conversation'
+      : itemId === '__agv2:conversation_history'
+        ? 'Conversation History'
+        : itemId === '__agv2:scheduled_tasks'
+          ? 'Scheduled Tasks'
+          : 'Antigravity v2';
+    setOptimisticV2ChatFocus(prev => ({
+      ...prev,
+      [sessionId]: {
+        id: itemId,
+        title: item?.title || fallbackTitle,
+        kind: item?.kind || 'chat',
+        at: Date.now(),
+      },
+    }));
+    if (itemId === '__agv2:new_conversation') {
+      handleAntigravityV2New(sessionId);
+      return;
+    }
+    switchChat(sessionId, itemId);
+    setTimeout(() => requestHistory(sessionId), 180);
+    setTimeout(() => requestChatList(sessionId), 450);
+    setTimeout(() => requestChatList(sessionId), 1200);
   }
 
   function updateInput(value) {
@@ -3461,17 +3934,23 @@ async function uploadBinaryDraft(sessionId, base64, mimeType, filename) {
                       {currentMessages.length} msg{currentMessages.length !== 1 ? 's' : ''}
                     </span>
                   )}
-                  {activeConfig?.capabilities?.chat_list && (
+                  {(activeConfig?.capabilities?.chat_list || isAntigravityV2) && (
                     <button
-                      className={`context-pill chat-list-toggle${showChatList ? ' active' : ''}`}
-                      title="View conversations"
+                      className={`context-pill chat-list-toggle${(isAntigravityV2 ? agv2NavigatorOpen : showChatList) ? ' active' : ''}`}
+                      title={isAntigravityV2 ? `${agv2NavigatorOpen ? 'Hide' : 'Show'} Agent Manager projects and conversations` : 'View conversations'}
                       onClick={() => {
+                        if (isAntigravityV2) {
+                          setAgv2NavigatorOpen(open => !open);
+                          setShowChatList(false);
+                          requestChatList(activeSession);
+                          return;
+                        }
                         const next = !showChatList;
                         setShowChatList(next);
                         if (next) requestChatList(activeSession);
                       }}
                     >
-                      chats
+                      {isAntigravityV2 ? 'projects' : 'chats'}
                     </button>
                   )}
                   {activeConfig?.capabilities?.thread_list && (
@@ -3575,6 +4054,17 @@ async function uploadBinaryDraft(sessionId, base64, mimeType, filename) {
           </div>
         )}
 
+        {showLiveStatusStrip && (
+          <div className="session-live-status-strip">
+            <ActivityRow
+              activity={activeActivity}
+              thinkingText={activeSession ? (thinkingContent[activeSession] || '') : ''}
+              isClaude={activeSessionMeta?.agent_type === 'claude'}
+              pinned
+            />
+          </div>
+        )}
+
         {(activeSessionMeta?.agent_type === 'cline' || activeSessionMeta?.agent_type === 'roo_code') && activeContextCard && (
           <div className={`cline-context-strip ${activeSessionMeta?.agent_type === 'roo_code' ? 'roo-context-strip' : ''}`}>
             <ClineContextCard
@@ -3660,6 +4150,46 @@ async function uploadBinaryDraft(sessionId, base64, mimeType, filename) {
             </button>
           </div>
         )}
+        {showAntigravityV2Navigator && (
+          <div className={`agv2-session-nav${agv2NavigatorOpen ? '' : ' collapsed'}`}>
+            <div className="agv2-session-nav-header">
+              <div className="agv2-session-nav-copy">
+                <span className="agv2-session-nav-title">Agent Manager</span>
+                <span className="agv2-session-nav-meta">
+                  {activeV2ConversationCount} conversation{activeV2ConversationCount === 1 ? '' : 's'}
+                </span>
+              </div>
+              <button
+                className="agv2-session-nav-btn"
+                type="button"
+                onClick={() => requestChatList(activeSession)}
+                title="Refresh Agent Manager conversations"
+              >
+                Refresh
+              </button>
+              <button
+                className="agv2-session-nav-btn"
+                type="button"
+                onClick={() => {
+                  setAgv2NavigatorOpen(open => !open);
+                  requestChatList(activeSession);
+                }}
+                title={agv2NavigatorOpen ? 'Hide Agent Manager conversations' : 'Show Agent Manager conversations'}
+              >
+                {agv2NavigatorOpen ? 'Hide' : 'Show'}
+              </button>
+            </div>
+            {agv2NavigatorOpen && (
+              <AntigravityV2NavPanel
+                items={activeChatList}
+                embedded
+                loading={!activeChatListLoaded}
+                onNavigate={(itemId) => handleAntigravityV2Navigate(itemId)}
+                onNew={() => handleAntigravityV2New(activeSession)}
+              />
+            )}
+          </div>
+        )}
         {showJumpButton && (
           <button
             className="jump-to-newest"
@@ -3720,6 +4250,32 @@ async function uploadBinaryDraft(sessionId, base64, mimeType, filename) {
                 onClick={() => handleNewThread(activeSession)}
               >+ New Thread</button>
             </div>
+          ) : currentMessages.length === 0 && isAntigravityV2 && activeSessionMeta?.is_list_view ? (
+            <div className="thread-picker-empty agv2-picker-empty">
+              <div className="thread-picker-header">Choose a conversation or start a new one</div>
+              {agv2NavigatorOpen ? null : (chatLists[activeSession]?.length > 0) ? (
+                <AntigravityV2NavPanel
+                  items={chatLists[activeSession] || []}
+                  embedded
+                  loading={!activeChatListLoaded}
+                  onNavigate={(itemId) => handleAntigravityV2Navigate(itemId)}
+                  onNew={() => handleAntigravityV2New(activeSession)}
+                />
+              ) : (
+                <button className="thread-picker-new" onClick={() => handleAntigravityV2New(activeSession)}>+ New Conversation</button>
+              )}
+            </div>
+          ) : currentMessages.length === 0 && isAntigravityV2 && chatLists[activeSession]?.length > 0 ? (
+            <div className="thread-picker-empty agv2-picker-empty">
+              <div className="thread-picker-header">Select an Antigravity project or conversation</div>
+              {!agv2NavigatorOpen && <AntigravityV2NavPanel
+                items={chatLists[activeSession] || []}
+                embedded
+                loading={!activeChatListLoaded}
+                onNavigate={(itemId) => handleAntigravityV2Navigate(itemId)}
+                onNew={() => handleAntigravityV2New(activeSession)}
+              />}
+            </div>
           ) : currentMessages.length === 0 && activeSessionMeta?.is_list_view && chatLists[activeSession]?.length > 0 ? (
             <div className="thread-picker-empty">
               <div className="thread-picker-header">Select a conversation or type a new message</div>
@@ -3739,12 +4295,13 @@ async function uploadBinaryDraft(sessionId, base64, mimeType, filename) {
           ) : currentMessages.length === 0 ? (
             <div className="empty-state"><div className="icon">💬</div><div>No messages yet</div></div>
           ) : (
-            currentMessages.filter(msg => hasVisibleMessageContent(msg.content)).map((msg, i) => {
+            currentMessages.filter(msg => hasVisibleMessage(msg)).map((msg, i) => {
               const messageKey = msg._cid || `msg-${i}`;
-              const normalizedContent = normalizeMessageContent(msg.content);
+              const normalizedContent = normalizeMessageContent(msg.content) || contentBlocksFallback(msg.content_blocks);
               const renderableUserContent = recoverUploadedImageMarkdown(msg.content);
               const timestampLabel = formatMessageTimestamp(msg.ts);
               const hasInlineScreenshot = /!\[[^\]]*\]\((?:data:|\/uploads\/)/.test(normalizedContent);
+              const hasStructuredBlocks = msg.role !== 'user' && normalizeContentBlocks(msg.content_blocks).length > 0;
               return (
               msg.role === 'user' ? (
                 <div key={msg._cid || i} className={`message user${msg._optimistic && deliveryStates[msg._cid] === 'failed' ? ' failed' : ''}`}>
@@ -3781,7 +4338,17 @@ async function uploadBinaryDraft(sessionId, base64, mimeType, filename) {
                       <span>{activeAgent.name}</span>
                       {timestampLabel && <span className="message-timestamp">{timestampLabel}</span>}
                     </div>
-                    <MarkdownContent content={normalizeMessageContent(msg.content)} monospace={assistantMonospace} autoExpandLongCodeBlocks={autoExpandLongCodeBlocks} onOpenPath={(path) => openTranscriptPreview(messageKey, path)} />
+                    {hasStructuredBlocks ? (
+                      <ContentBlocks
+                        blocks={msg.content_blocks}
+                        monospace={assistantMonospace}
+                        autoExpandLongCodeBlocks={autoExpandLongCodeBlocks}
+                        onOpenPath={(path) => openTranscriptPreview(messageKey, path)}
+                        agentType={activeSessionMeta?.agent_type}
+                      />
+                    ) : (
+                      <MarkdownContent content={normalizeMessageContent(msg.content)} monospace={assistantMonospace} autoExpandLongCodeBlocks={autoExpandLongCodeBlocks} onOpenPath={(path) => openTranscriptPreview(messageKey, path)} />
+                    )}
                     {transcriptPreview?.sessionId === activeSession && transcriptPreview?.messageKey === messageKey && (
                       <TranscriptInlineFilePreview
                         sessionId={transcriptPreview.sessionId}
@@ -3827,7 +4394,7 @@ async function uploadBinaryDraft(sessionId, base64, mimeType, filename) {
           )}
           <div ref={messagesEndRef} />
         </div>
-        {activeActivity && !activeActivity?.task_list && !showInlineClaudeActivity && <ActivityRow
+        {!showLiveStatusStrip && activeActivity && !showInlineClaudeActivity && (activeActivity.kind !== 'idle' || hasSubstantiveLiveText(thinkingContent[activeSession] || activeActivity.thinkingContent || '')) && <ActivityRow
           activity={activeActivity}
           thinkingText={activeSession ? (thinkingContent[activeSession] || '') : ''}
           isClaude={activeSessionMeta?.agent_type === 'claude'}
@@ -3864,20 +4431,20 @@ async function uploadBinaryDraft(sessionId, base64, mimeType, filename) {
           />
         )}
 
-        {showChatList && activeSession && activeConfig?.capabilities?.chat_list && (
-          <ChatListPanel
-            chats={chatLists[activeSession] || []}
-            sessionId={activeSession}
-            onSwitch={(chatId) => {
-              switchChat(activeSession, chatId);
-              setShowChatList(false);
-            }}
-            onNew={() => {
-              newChat(activeSession);
-              setShowChatList(false);
-            }}
-            onClose={() => setShowChatList(false)}
-          />
+        {showChatList && activeSession && activeConfig?.capabilities?.chat_list && !isAntigravityV2 && (
+            <ChatListPanel
+              chats={chatLists[activeSession] || []}
+              sessionId={activeSession}
+              onSwitch={(chatId) => {
+                switchChat(activeSession, chatId);
+                setShowChatList(false);
+              }}
+              onNew={() => {
+                newChat(activeSession);
+                setShowChatList(false);
+              }}
+              onClose={() => setShowChatList(false)}
+            />
         )}
 
         {showThreadList && activeSession && activeConfig?.capabilities?.thread_list && (
@@ -3998,15 +4565,21 @@ async function uploadBinaryDraft(sessionId, base64, mimeType, filename) {
                     title={newThreadLabel}
                   >✎</button>
                 )}
-                {activeConfig?.capabilities?.chat_list && (
+                {(activeConfig?.capabilities?.chat_list || isAntigravityV2) && (
                   <button
-                    className={`composer-gear-btn mobile-hide${showChatList ? ' active' : ''}`}
+                    className={`composer-gear-btn mobile-hide${(isAntigravityV2 ? agv2NavigatorOpen : showChatList) ? ' active' : ''}`}
                     onClick={() => {
+                      if (isAntigravityV2) {
+                        setAgv2NavigatorOpen(open => !open);
+                        setShowChatList(false);
+                        requestChatList(activeSession);
+                        return;
+                      }
                       const willShow = !showChatList;
                       setShowChatList(willShow);
                       if (willShow) requestChatList(activeSession);
                     }}
-                    title="Chat history"
+                    title={isAntigravityV2 ? 'Agent Manager conversations' : 'Chat history'}
                   >☰</button>
                 )}
                 {activeConfig?.capabilities?.thread_list && (
@@ -4037,8 +4610,8 @@ async function uploadBinaryDraft(sessionId, base64, mimeType, filename) {
                 {activeConfig?.capabilities?.new_chat && (
                   <button
                     className="composer-gear-btn mobile-hide"
-                    onClick={() => newChat(activeSession)}
-                    title="New chat"
+                    onClick={() => isAntigravityV2 ? handleAntigravityV2New(activeSession) : newChat(activeSession)}
+                    title={isAntigravityV2 ? 'New Antigravity conversation' : 'New chat'}
                   >+</button>
                 )}
                 {isActiveThinking ? (
@@ -4066,6 +4639,9 @@ async function uploadBinaryDraft(sessionId, base64, mimeType, filename) {
               )}
               {(isContinueLikeAgentType(activeSessionMeta?.agent_type) || isClineLikeAgentType(activeSessionMeta?.agent_type)) && activeConfig?.model_id && activeConfig.model_id !== 'unknown' && (
                 <span className="composer-hint" style={{ color: '#d29922' }}>{activeConfig.model_id}</span>
+              )}
+              {activeSessionMeta?.agent_type === 'antigravity-v2' && activeConfig?.model_id && activeConfig.model_id !== 'unknown' && (
+                <span className="composer-hint" style={{ color: '#8b949e' }}>{activeConfig.model_id}</span>
               )}
               {(activeSessionMeta?.agent_type === 'antigravity' || activeSessionMeta?.agent_type === 'antigravity_panel') && (
                 Array.isArray(activeSessionMeta?.antigravity_quota_models) && activeSessionMeta.antigravity_quota_models.length > 0 ? (
@@ -4250,8 +4826,17 @@ async function uploadBinaryDraft(sessionId, base64, mimeType, filename) {
                   {canLaunchNewThread && (
                     <button className="composer-mobile-action" onClick={() => newThread(activeSession)}>✎ New thread</button>
                   )}
-                  {activeConfig?.capabilities?.chat_list && (
-                    <button className="composer-mobile-action" onClick={() => { requestChatList(activeSession); setShowChatList(true); setShowComposerSettings(false); }}>☰ Chat history</button>
+                  {(activeConfig?.capabilities?.chat_list || isAntigravityV2) && (
+                    <button className="composer-mobile-action" onClick={() => {
+                      requestChatList(activeSession);
+                      if (isAntigravityV2) {
+                        setAgv2NavigatorOpen(true);
+                        setShowChatList(false);
+                      } else {
+                        setShowChatList(true);
+                      }
+                      setShowComposerSettings(false);
+                    }}>☰ {isAntigravityV2 ? 'Projects' : 'Chat history'}</button>
                   )}
                   {activeConfig?.capabilities?.thread_list && (
                     <button className="composer-mobile-action" onClick={() => { requestThreadList(activeSession); setShowThreadList(true); setShowComposerSettings(false); }}>⊟ Threads</button>
@@ -4260,7 +4845,7 @@ async function uploadBinaryDraft(sessionId, base64, mimeType, filename) {
                     <button className="composer-mobile-action" onClick={() => openPanel(activeSession)}>⊞ Open panel</button>
                   )}
                   {activeConfig?.capabilities?.new_chat && (
-                    <button className="composer-mobile-action" onClick={() => newChat(activeSession)}>+ New chat</button>
+                    <button className="composer-mobile-action" onClick={() => isAntigravityV2 ? handleAntigravityV2New(activeSession) : newChat(activeSession)}>+ New chat</button>
                   )}
                 </div>
               </div>

@@ -685,7 +685,7 @@ function ActivityRow({ activity, thinkingText, isClaude, pinned = false }) {
   const baseLabel = rawLabel || (kind === 'idle' && goal ? '' : kind.replaceAll('_', ' '));
   const elapsed = isActive ? formatActivityElapsed(activity?.startedAt || activity?.updatedAt, nowMs) : '';
   const hint = activity?.interruptHint || activity?.interrupt_hint || '';
-  const labelDetail = [elapsed, hint].filter(Boolean).join(' ');
+  const labelDetail = [elapsed, hint].filter(Boolean).join(' • ');
   const label = baseLabel && labelDetail ? `${baseLabel} (${labelDetail})` : baseLabel;
   const goalElapsed = goal ? formatGoalElapsed(goal, nowMs) : '';
   const isThinkingKind = kind === 'thinking' || kind === 'generating';
@@ -3537,10 +3537,18 @@ async function uploadBinaryDraft(sessionId, base64, mimeType, filename) {
     && !activeActivity?.task_list
     && activeSessionMeta?.agent_type === 'claude'
   );
+  const isActiveCodexCli = activeSessionMeta?.agent_type === 'codex_cli';
   const showLiveStatusStrip = !!(
     activeActivity
     && !showInlineClaudeActivity
-    && (activeActivity?.goal || activeActivity?.task_list)
+    && (
+      activeActivity?.goal
+      || activeActivity?.task_list
+      || (
+        isActiveCodexCli
+        && (activeActivity.kind !== 'idle' || hasSubstantiveLiveText(liveThinkingText || activeActivity.thinkingContent || ''))
+      )
+    )
   );
   const shouldBottomAlignMessages = !!(
     activeSession

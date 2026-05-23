@@ -12,9 +12,34 @@
 'use strict';
 
 const esbuild = require('esbuild');
+const fs = require('fs');
 const path = require('path');
 
 const isWatch = process.argv.includes('--watch');
+const publicDir = path.join(__dirname, '..', 'relay-server', 'public');
+
+function copyFile(source, destination) {
+  fs.mkdirSync(path.dirname(destination), { recursive: true });
+  fs.copyFileSync(source, destination);
+}
+
+function syncPublicAssets() {
+  const assets = ['index.html', 'styles.css', 'app.jsx', 'hooks.jsx', 'sw.js'];
+  for (const asset of assets) {
+    copyFile(path.join(__dirname, asset), path.join(publicDir, asset));
+  }
+  copyFile(path.join(__dirname, 'dist', 'bundle.js'), path.join(publicDir, 'dist', 'bundle.js'));
+  console.log('[build] Synced relay-server/public assets');
+}
+
+const syncPublicAssetsPlugin = {
+  name: 'sync-public-assets',
+  setup(build) {
+    build.onEnd(result => {
+      if (result.errors.length === 0) syncPublicAssets();
+    });
+  },
+};
 
 const buildOptions = {
   entryPoints: [path.join(__dirname, 'entry.jsx')],
@@ -33,6 +58,7 @@ const buildOptions = {
   logLevel: 'info',
   // Treat CDN globals as externals that esbuild won't try to resolve
   define: {},
+  plugins: [syncPublicAssetsPlugin],
 };
 
 async function main() {

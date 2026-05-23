@@ -86,9 +86,13 @@ The agent proxy connects **outbound** to the relay — no port forwarding or inb
 | Roo Code (Antigravity extension) | Working — side-pane sessions with permission dialog support |
 | Cline (Antigravity extension) | Working — side-pane sessions with Plan/Act mode, context usage, and permission dialog support |
 | Antigravity Chat (built-in agent) | Working |
-| Antigravity v2 Agent Manager (standalone app) | Working (separate CDP port) |
+| Antigravity v2 Agent Manager (standalone app) | Working - separate CDP port, project/conversation history, new conversation, chat switching, rich transcript blocks |
 | Codex Desktop (MSIX) | Working (separate CDP port) |
 | Claude Desktop (MSIX) | Blocked — Anthropic requires a signed `CLAUDE_CDP_AUTH` token to allow CDP |
+
+Antigravity v2 is treated as a separate standalone Agent Manager surface, not as the Antigravity IDE side pane. The WebUI can expose its project/conversation list, switch between v2 chats, start new v2 conversations, and render rich assistant output such as markdown, thinking, tool calls, terminal output, file-change summaries, artifacts, prompts, and errors.
+
+Codex CLI support covers both WebUI-launched sessions and active native terminal sessions. The proxy follows recent Codex CLI transcript files, surfaces multiple active sessions, preserves full tool-call/result output, and renders live task-plan status including `Pursuing goal (...)` and `Working (... esc to interrupt)`.
 
 ---
 
