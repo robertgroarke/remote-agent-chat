@@ -151,6 +151,43 @@ function historySnapshot(sessionId, messages) {
   };
 }
 
+function historyChunk(sessionId, options = {}) {
+  const {
+    requestId = null,
+    messages = [],
+    mode = 'tail',
+    startOffset = 0,
+    endOffset = 0,
+    nextBeforeOffset = null,
+    totalBytes = 0,
+    partial = false,
+    complete = !partial,
+    source = 'native',
+    error = null,
+  } = options;
+  const cursor = {
+    start_offset: Math.max(0, Number(startOffset) || 0),
+    end_offset: Math.max(0, Number(endOffset) || 0),
+    next_before_offset: nextBeforeOffset == null ? null : Math.max(0, Number(nextBeforeOffset) || 0),
+    total_bytes: Math.max(0, Number(totalBytes) || 0),
+  };
+  const msg = {
+    type: 'history_chunk',
+    protocol_version: PROTOCOL_VERSION,
+    session_id: sessionId,
+    session: sessionId,
+    request_id: requestId || null,
+    mode,
+    source,
+    messages: Array.isArray(messages) ? messages : [],
+    partial: !!partial,
+    complete: !!complete,
+    cursor,
+  };
+  if (error) msg.error = error;
+  return msg;
+}
+
 // ─── Agent control results ────────────────────────────────────────────────────
 
 // Sent by proxy to relay in response to a control command.
@@ -416,6 +453,7 @@ module.exports = {
   proxyStatus,
   proxySendResult,
   historySnapshot,
+  historyChunk,
   agentControlResult,
   agentConfig,
   sessionErrorPrompt,

@@ -3241,7 +3241,7 @@ class AppErrorBoundary extends React.Component {
 }
 
 function App() {
-  const { sessions, messages, historyMeta, historyLoading, connected, unread, setUnread, thinking, thinkingContent, activities, health, deliveryStates, launchStates, justLaunched, setJustLaunched, permissionPrompts, respondToPrompt, errorPrompts, respondToErrorPrompt, interruptSession, agentConfigs, requestAgentConfig, setAgentModel, setAgentEffort, setAgentPermissionMode, setAutoApprovePermissions, setAntigravityMode, setCodexConfig, newThread, openPanel, openNativeWindow, requestChatList, switchChat, newChat, chatLists, requestThreadList, switchThread, threadLists, switchWorkspace, requestTerminalOutput, terminalOutputs, requestFileChanges, fileChanges, sendAttachment, send, sendToSession, steerMessage, discardQueuedMessage, editQueuedMessage, queuedMessages, launchSession, resumeSession, closeSession, activeSessionRef, workspaces, branchLists, requestBranchList, switchBranch, createBranch, skillLists, requestSkillList, automationViews, showCodexAutomation, controlResults, directoryListings, requestDirectoryListing, fileContents, requestFileContent, requestHistory } = useRelay();
+  const { sessions, messages, historyMeta, historyLoading, connected, unread, setUnread, thinking, thinkingContent, activities, health, deliveryStates, launchStates, justLaunched, setJustLaunched, permissionPrompts, respondToPrompt, errorPrompts, respondToErrorPrompt, interruptSession, agentConfigs, requestAgentConfig, setAgentModel, setAgentEffort, setAgentPermissionMode, setAutoApprovePermissions, setAntigravityMode, setCodexConfig, newThread, openPanel, openNativeWindow, requestChatList, switchChat, newChat, chatLists, requestThreadList, switchThread, threadLists, switchWorkspace, requestTerminalOutput, terminalOutputs, requestFileChanges, fileChanges, sendAttachment, send, sendToSession, steerMessage, discardQueuedMessage, editQueuedMessage, queuedMessages, launchSession, resumeSession, closeSession, activeSessionRef, workspaces, branchLists, requestBranchList, switchBranch, createBranch, skillLists, requestSkillList, automationViews, showCodexAutomation, controlResults, directoryListings, requestDirectoryListing, fileContents, requestFileContent, requestHistory, requestHistoryChunk } = useRelay();
   const [activeSession, setActiveSession] = useState(null);
   const [drafts, setDrafts]             = useState({});
   const [draftFiles, setDraftFiles]     = useState({});
@@ -3706,12 +3706,14 @@ async function uploadBinaryDraft(sessionId, base64, mimeType, filename) {
   const activeHistoryMeta = activeSession ? (historyMeta[activeSession] || null) : null;
   const activeHistoryLoading = activeSession ? (historyLoading[activeSession] || null) : null;
 
-  // Full transcript history is loaded lazily for the selected session only.
-  // Codex CLI transcripts can be thousands of turns, so hydrate a recent tail
-  // first and let the user explicitly load the full archive when needed.
+  // Transcript history is loaded newest-first for the selected session only.
+  // Relay-backed sessions page through SQLite chunks; Codex CLI pages through
+  // the native JSONL archive so refresh never has to hydrate a full transcript.
   useEffect(() => {
     if (!activeSession || !connected) return;
-    requestHistory(activeSession, historyRequestOptionsFor(activeSessionMeta));
+    const tailOptions = historyRequestOptionsFor(activeSessionMeta);
+    const chunkSource = activeSessionMeta?.agent_type === 'codex_cli' ? 'native' : 'relay_sqlite';
+    requestHistoryChunk(activeSession, { ...tailOptions, mode: 'tail', source: chunkSource });
   }, [activeSession, connected, activeSessionMeta?.agent_type]);
   const isAntigravityV2 = activeSessionMeta?.agent_type === 'antigravity-v2';
   const rawActiveChatList = activeSession ? (chatLists[activeSession] || []) : [];
@@ -3922,7 +3924,15 @@ async function uploadBinaryDraft(sessionId, base64, mimeType, filename) {
   const partialHistoryLoaded = Number(activeHistoryMeta?.loaded || currentMessages.length || 0);
   const partialHistoryTotal = Number(activeHistoryMeta?.total || partialHistoryLoaded || 0);
   function loadFullActiveHistory() {
-    if (activeSession) requestHistory(activeSession, { full: true });
+    if (!activeSession) return;
+    const chunkSource = activeSessionMeta?.agent_type === 'codex_cli' ? 'native' : 'relay_sqlite';
+    requestHistoryChunk(activeSession, {
+      mode: activeHistoryMeta?.cursor ? 'older' : 'tail',
+      source: chunkSource,
+      beforeOffset: activeHistoryMeta?.cursor?.next_before_offset,
+      beforeId: activeHistoryMeta?.cursor?.next_before_id,
+      ...historyRequestOptionsFor(activeSessionMeta),
+    });
   }
   const shouldBottomAlignMessages = !!(
     activeSession

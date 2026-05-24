@@ -518,6 +518,9 @@ Rules:
   older messages are available
 - include `full: true` to force a complete snapshot even if the browser usually
   asks for a bounded tail for very large transcript surfaces such as Codex CLI
+- for large transcripts, the browser may send `history_chunk_request` for
+  newest-first hydration. Relay-backed sessions use SQLite chunks; Codex CLI can
+  ask the owning proxy for native JSONL byte chunks.
 
 ### `history_snapshot`
 
@@ -579,6 +582,70 @@ Rules:
 
 - `sequence` must be monotonic per session
 - `history_delta` may contain lifecycle events and transcript events if the frontend needs both to recover state
+
+### `history_chunk_request`
+
+Sent by browser to relay when transcript history should be read incrementally
+instead of as one full snapshot.
+
+```json
+{
+  "type": "history_chunk_request",
+  "protocol_version": 1,
+  "session_id": "sess_123",
+  "request_id": "histchunk-1",
+  "mode": "tail",
+  "source": "relay_sqlite",
+  "limit": 120,
+  "chunk_bytes": 2097152
+}
+```
+
+Rules:
+
+- use `source: "relay_sqlite"` for normal persisted histories across agent
+  types
+- use `source: "native"` for native archive readers such as Codex CLI JSONL
+- for older relay chunks, send `mode: "older"` plus `before_id`
+- for older native byte chunks, send `mode: "older"` plus `before_offset`
+
+### `history_chunk`
+
+Sent by relay, or by proxy through relay, to the browser. `messages` are in
+chronological order within the chunk. `mode: "tail"` replaces the visible
+transcript tail; `mode: "older"` prepends older unique messages.
+
+```json
+{
+  "type": "history_chunk",
+  "protocol_version": 1,
+  "session_id": "sess_123",
+  "request_id": "histchunk-1",
+  "mode": "tail",
+  "source": "relay_sqlite",
+  "partial": true,
+  "complete": false,
+  "total_messages": 500,
+  "loaded_messages": 120,
+  "cursor": {
+    "next_before_id": 12345,
+    "start_offset": 10485760,
+    "end_offset": 12582912,
+    "next_before_offset": 10485760,
+    "total_bytes": 12582912
+  },
+  "messages": []
+}
+```
+
+Rules:
+
+- `cursor.next_before_id` is null when no older relay SQLite rows remain
+- `cursor.next_before_offset` is null when no older native bytes remain
+- chunks are not authoritative SQLite snapshots and must not delete relay
+  history
+- browsers should stop auto-requesting older chunks when the session is no
+  longer selected
 
 ## Proxy-Originated Events
 

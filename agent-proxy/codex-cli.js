@@ -48,11 +48,11 @@ function envMb(name, fallback, min = 1) {
 
 const JSONL_MAX_LINE_BYTES = envMb('CODEX_CLI_MAX_JSONL_LINE_MB', 8);
 const DEFAULT_HYDRATE_MAX_BYTES = envMb('CODEX_CLI_HYDRATE_MAX_MB', 75);
-const DEFAULT_HYDRATE_TAIL_BYTES = envMb('CODEX_CLI_HYDRATE_TAIL_MB', 10);
+const DEFAULT_HYDRATE_TAIL_BYTES = envMb('CODEX_CLI_HYDRATE_TAIL_MB', 4);
 const DEFAULT_ACTIVE_HYDRATE_MAX_BYTES = envMb(
   'CODEX_CLI_ACTIVE_HYDRATE_MAX_MB',
-  Math.max(75, Math.ceil(DEFAULT_HYDRATE_MAX_BYTES / (1024 * 1024))),
-  10
+  16,
+  4
 );
 const DEFAULT_INTERACTIVE_HISTORY_HOURS = Math.max(1, parseInt(process.env.CODEX_CLI_INTERACTIVE_HISTORY_HOURS || '24', 10) || 24);
 const CODEX_CLI_ACTIVITY_STALE_MS = Math.max(60 * 1000, parseInt(process.env.CODEX_CLI_ACTIVITY_STALE_MS || '14400000', 10) || 14400000);
@@ -166,7 +166,7 @@ function formatBytes(bytes) {
   return mb >= 1024 ? `${(mb / 1024).toFixed(1)} GB` : `${mb.toFixed(1)} MB`;
 }
 
-function scanJsonlLines(filePath, onLine, { startOffset = 0, processFinalLine = true, maxLines = 0, maxLineBytes = JSONL_MAX_LINE_BYTES } = {}) {
+function scanJsonlLines(filePath, onLine, { startOffset = 0, endOffset = Infinity, processFinalLine = true, maxLines = 0, maxLineBytes = JSONL_MAX_LINE_BYTES } = {}) {
   let fd = null;
   let stat = null;
   let position = Math.max(0, Number(startOffset) || 0);
@@ -179,9 +179,13 @@ function scanJsonlLines(filePath, onLine, { startOffset = 0, processFinalLine = 
     fd = fs.openSync(filePath, 'r');
     stat = fs.fstatSync(fd);
     if (position > stat.size) position = 0;
+    const requestedEnd = Number(endOffset);
+    const stopOffset = Number.isFinite(requestedEnd)
+      ? Math.max(position, Math.min(stat.size, requestedEnd))
+      : stat.size;
     const chunk = Buffer.allocUnsafe(JSONL_CHUNK_BYTES);
-    while (position < stat.size) {
-      const wanted = Math.min(JSONL_CHUNK_BYTES, stat.size - position);
+    while (position < stopOffset) {
+      const wanted = Math.min(JSONL_CHUNK_BYTES, stopOffset - position);
       const bytesRead = fs.readSync(fd, chunk, 0, wanted, position);
       if (!bytesRead) break;
       let segmentStart = 0;
@@ -234,10 +238,10 @@ function scanJsonlLines(filePath, onLine, { startOffset = 0, processFinalLine = 
       if (line.trim()) {
         emitted++;
         const keepGoing = onLine(line);
-        if (keepGoing !== JSONL_PARSE_ERROR) lastCompleteOffset = stat.size;
+        if (keepGoing !== JSONL_PARSE_ERROR) lastCompleteOffset = stopOffset;
         if (keepGoing === false) return { stat, offset: lastCompleteOffset, emitted };
       } else {
-        lastCompleteOffset = stat.size;
+        lastCompleteOffset = stopOffset;
       }
     }
     return { stat, offset: lastCompleteOffset, emitted };
@@ -1020,6 +1024,40 @@ function parseCodexJsonlTail(filePath, tailBytes = DEFAULT_HYDRATE_TAIL_BYTES) {
   return { state, stat, startOffset };
 }
 
+function createChunkParseState(filePath) {
+  const meta = readSessionMeta(filePath);
+  const state = createParseState(filePath);
+  state.meta = { ...meta };
+  if (meta.id) state.cliSessionId = meta.id;
+  if (meta.model || meta.model_slug) state.model_id = meta.model || meta.model_slug;
+  return state;
+}
+
+function parseCodexJsonlChunk(filePath, { beforeOffset = null, chunkBytes = DEFAULT_HYDRATE_TAIL_BYTES } = {}) {
+  const stat = safeStat(filePath);
+  if (!stat) return null;
+  const rawBefore = Number(beforeOffset);
+  const endOffset = Number.isFinite(rawBefore) && rawBefore > 0
+    ? Math.max(0, Math.min(stat.size, rawBefore))
+    : stat.size;
+  const bytes = Math.max(256 * 1024, Math.min(16 * 1024 * 1024, Number(chunkBytes) || DEFAULT_HYDRATE_TAIL_BYTES));
+  const wantedStart = Math.max(0, endOffset - bytes);
+  const startOffset = scanStartAlignedToLine(filePath, wantedStart);
+  const state = createChunkParseState(filePath);
+  scanJsonlEntries(filePath, entry => applyEntryToState(state, entry), {
+    startOffset,
+    endOffset,
+    processFinalLine: endOffset >= stat.size,
+  });
+  return {
+    state,
+    stat,
+    startOffset,
+    endOffset,
+    nextBeforeOffset: startOffset > 0 ? startOffset : null,
+  };
+}
+
 function readSessionSummary(filePath, { includeMessages = true, maxHydrateBytes = DEFAULT_HYDRATE_MAX_BYTES } = {}) {
   const stat = safeStat(filePath);
   if (!stat) return null;
@@ -1340,6 +1378,7 @@ module.exports = {
   findLatestSessionForWorkspace,
   findLatestSessionForTitle,
   parseCodexJsonl,
+  parseCodexJsonlChunk,
   readSessionIndex,
   readCliHistory,
   recentInteractiveSessionIds,

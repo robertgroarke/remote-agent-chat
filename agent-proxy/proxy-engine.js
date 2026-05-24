@@ -31,6 +31,12 @@ const codexCli     = require('./codex-cli');
 
 function sleep(ms) { return new Promise(r => setTimeout(r, ms)); }
 
+function envMbBytes(name, fallbackMb, minMb = 1, maxMb = 96) {
+  const parsed = Number(process.env[name] || '');
+  const mb = Number.isFinite(parsed) && parsed > 0 ? parsed : fallbackMb;
+  return Math.max(minMb, Math.min(maxMb, mb)) * 1024 * 1024;
+}
+
 // Deterministic per-session stagger offset so different periodic reads
 // (task_list, rate_limit, native_queue, automation_view…) don't fire on the
 // same poll tick. Without this, every counter starts at 0 and they all hit
@@ -106,6 +112,11 @@ const RELAY_MESSAGE_MAX_BYTES = 96 * 1024 * 1024;
 // after the session list arrives, so do not block/kill the socket by flushing
 // multi-megabyte archives ahead of the sidebar.
 const DEFERRED_HISTORY_FLUSH_MAX_BYTES = 512 * 1024;
+// Automatic history snapshots run from poll/reconnect paths. Large transcripts
+// should be loaded through explicit tail requests or incremental messages, not
+// repeatedly serialized and pushed through the relay during page refresh.
+const AUTOMATIC_HISTORY_SNAPSHOT_MAX_BYTES = envMbBytes('RAC_HISTORY_SNAPSHOT_AUTO_MAX_MB', 4, 1, 64);
+const CODEX_CLI_HISTORY_CHUNK_BYTES = envMbBytes('CODEX_CLI_HISTORY_CHUNK_MB', 2, 1, 16);
 
 // ─── ProxyEngine class ─────────────────────────────────────────────────────
 
@@ -1362,6 +1373,11 @@ class ProxyEngine extends EventEmitter {
     }
 
     // ── Agent control commands ──────────────────────────────────────────
+    if (type === 'history_chunk_request') {
+      this._handleHistoryChunkRequest(msg);
+      return;
+    }
+
     if (type === 'agent_interrupt') {
       const sid = msg.session_id || msg.session;
       const sessionData = this.sessions.get(sid);
@@ -3581,6 +3597,59 @@ class ProxyEngine extends EventEmitter {
     }
   }
 
+  _handleHistoryChunkRequest(msg) {
+    const sessionId = msg.session_id || msg.session;
+    const requestId = msg.request_id || null;
+    const fail = (code, message) => {
+      if (!sessionId) return;
+      this._sendToRelay(proto.historyChunk(sessionId, {
+        requestId,
+        messages: [],
+        mode: msg.mode || 'tail',
+        partial: false,
+        complete: true,
+        source: 'codex_cli_jsonl',
+        error: { code, message },
+      }));
+    };
+    if (!sessionId) return;
+    const session = this.sessions.get(sessionId);
+    if (!session) return fail('session_not_found', 'Session not found');
+    if (session.agentType !== 'codex_cli') {
+      return fail('unsupported_agent_type', 'Chunked native history is only available for Codex CLI sessions');
+    }
+    const filePath = session.codexCliFilePath || session.codex_cli_file_path;
+    if (!filePath) return fail('archive_not_found', 'Codex CLI archive path is unavailable');
+
+    const requestedBytes = Number(msg.chunk_bytes || msg.chunkBytes || 0);
+    const chunkBytes = Number.isFinite(requestedBytes) && requestedBytes > 0
+      ? Math.max(256 * 1024, Math.min(16 * 1024 * 1024, Math.floor(requestedBytes)))
+      : CODEX_CLI_HISTORY_CHUNK_BYTES;
+    const beforeOffset = msg.mode === 'older'
+      ? (msg.before_offset ?? msg.beforeOffset ?? msg.cursor?.next_before_offset ?? null)
+      : null;
+    try {
+      const chunk = codexCli.parseCodexJsonlChunk(filePath, { beforeOffset, chunkBytes });
+      if (!chunk) return fail('archive_unreadable', 'Codex CLI archive could not be read');
+      const messages = Array.isArray(chunk.state?.messages) ? chunk.state.messages : [];
+      this._sendToRelay(proto.historyChunk(sessionId, {
+        requestId,
+        messages,
+        mode: msg.mode === 'older' ? 'older' : 'tail',
+        startOffset: chunk.startOffset,
+        endOffset: chunk.endOffset,
+        nextBeforeOffset: chunk.nextBeforeOffset,
+        totalBytes: chunk.stat?.size || 0,
+        partial: !!chunk.nextBeforeOffset,
+        complete: !chunk.nextBeforeOffset,
+        source: 'codex_cli_jsonl',
+      }));
+      this._log('info', `[${sessionId}] Sent Codex CLI history chunk (${messages.length} msgs, ${chunk.startOffset}-${chunk.endOffset}/${chunk.stat?.size || 0})`);
+    } catch (e) {
+      fail('chunk_read_failed', e.message || 'Codex CLI archive chunk read failed');
+    }
+  }
+
   _sendToRelay(msg) {
     const encoded = JSON.stringify(msg);
     const byteLen = Buffer.byteLength(encoded, 'utf8');
@@ -3602,6 +3671,10 @@ class ProxyEngine extends EventEmitter {
     if (type === 'history' || type === 'history_snapshot') {
       const sid = msg.session_id || msg.session;
       if (sid) {
+        if (byteLen > DEFERRED_HISTORY_FLUSH_MAX_BYTES) {
+          this._log('info', `[relay] Skipped pre-ready history snapshot for ${sid} (${Math.round(byteLen / 1024)} KB); browser will request transcript tail on selection`);
+          return;
+        }
         if (!this._pendingPreReadyHistory) this._pendingPreReadyHistory = new Map();
         // Keep only the most recent snapshot per session — older queued ones
         // are obsolete the moment a newer one arrives.
@@ -3630,6 +3703,41 @@ class ProxyEngine extends EventEmitter {
     q.clear();
   }
 
+  _historySnapshotLimitBytes(reason = 'history') {
+    if (!(this.relayReady && this.relayWs && this.relayWs.readyState === WebSocket.OPEN)) {
+      return DEFERRED_HISTORY_FLUSH_MAX_BYTES;
+    }
+    const r = String(reason || '').toLowerCase();
+    // User-directed navigation snapshots are allowed to be larger because they
+    // are infrequent and make the selected native conversation appear.
+    if (/\b(switch|new_thread|new conversation)\b/.test(r)) {
+      return RELAY_MESSAGE_MAX_BYTES;
+    }
+    return AUTOMATIC_HISTORY_SNAPSHOT_MAX_BYTES;
+  }
+
+  _historySnapshotSizeInfo(sessionId, messages, maxBytes) {
+    const emptySnapshot = proto.historySnapshot(sessionId, []);
+    // Start from the empty shape and replace the [] messages payload below.
+    let bytes = Math.max(0, Buffer.byteLength(JSON.stringify(emptySnapshot), 'utf8') - 2);
+    for (let i = 0; i < messages.length; i++) {
+      let encoded = '';
+      try {
+        encoded = JSON.stringify(messages[i]);
+      } catch {
+        encoded = JSON.stringify({
+          role: messages[i]?.role || '',
+          content: this._messageContentText(messages[i]),
+        });
+      }
+      bytes += Buffer.byteLength(encoded || 'null', 'utf8') + (i > 0 ? 1 : 0);
+      if (bytes > maxBytes) {
+        return { fits: false, bytes, counted: i + 1 };
+      }
+    }
+    return { fits: bytes <= maxBytes, bytes, counted: messages.length };
+  }
+
   _sessionSnapshotSignature(metas) {
     const stableMetas = metas.map(meta => ({
       ...meta,
@@ -3653,25 +3761,26 @@ class ProxyEngine extends EventEmitter {
   _sendHistorySnapshot(sessionId, messages, reason = 'history') {
     const fullMessages = Array.isArray(messages) ? messages : [];
     const buildSnapshot = (msgs) => proto.historySnapshot(sessionId, msgs);
-    const fitsRelayCap = (msgs) => {
-      const encoded = JSON.stringify(buildSnapshot(msgs));
-      return Buffer.byteLength(encoded, 'utf8') <= RELAY_MESSAGE_MAX_BYTES;
-    };
-
-    if (fitsRelayCap(fullMessages)) {
-      this._sendToRelay(buildSnapshot(fullMessages));
-      return;
-    }
 
     if (fullMessages.length === 0) {
       this._sendToRelay(buildSnapshot([]));
       return;
     }
 
+    const maxBytes = this._historySnapshotLimitBytes(reason);
+    const sizeInfo = this._historySnapshotSizeInfo(sessionId, fullMessages, maxBytes);
+    if (sizeInfo.fits) {
+      this._sendToRelay(buildSnapshot(fullMessages));
+      return;
+    }
+
     // Do not send a clipped history snapshot. The relay treats snapshots as
     // authoritative and replaces persisted history; sending only the tail would
     // erase older messages from the WebUI.
-    this._log('warn', `[${sessionId}] Not sending oversized history snapshot (${fullMessages.length} msgs, ${reason})`);
+    this._log(
+      'warn',
+      `[${sessionId}] Skipping large history snapshot (${fullMessages.length} msgs, >${Math.round(maxBytes / 1024)} KB after ${sizeInfo.counted} msgs, ${reason}); browser will request transcript tail on selection`
+    );
     return;
 
   }

@@ -11,8 +11,8 @@ delete process.env.CODEX_CLI_ACTIVE_HYDRATE_MAX_MB;
 const codexCli = require('../agent-proxy/codex-cli');
 
 assert(
-  codexCli.CODEX_CLI_ACTIVE_HYDRATE_MAX_BYTES >= 75 * 1024 * 1024,
-  'active Codex CLI hydration should stay high even when archive hydration is capped low'
+  codexCli.CODEX_CLI_ACTIVE_HYDRATE_MAX_BYTES >= 16 * 1024 * 1024,
+  'active Codex CLI hydration should remain separately tunable when archive hydration is capped low'
 );
 
 const fixture = path.join(__dirname, 'fixtures', 'codex-cli-session-sample.jsonl');
@@ -170,5 +170,35 @@ assert.strictEqual(tailSummary.messagesPartial, true);
 assert(tailSummary.messagesHydrated, 'expected oversized transcript to hydrate from tail');
 assert(!tailSummary.messages.some(msg => /too large to hydrate automatically/i.test(msg.content || '')));
 assert(tailSummary.messages.some(msg => msg.role === 'assistant' && msg.content.includes('Parser smoke complete.')));
+
+const chunkFixture = path.join(os.tmpdir(), `codex-cli-history-chunk-${Date.now()}.jsonl`);
+const chunkEntries = [
+  { timestamp: iso(-800000), type: 'session_meta', payload: { id: '00000000-0000-4000-8000-000000000103', cwd: process.cwd(), model: 'gpt-5.5' } },
+];
+for (let i = 0; i < 700; i++) {
+  chunkEntries.push({
+    timestamp: iso(-700000 + i),
+    type: 'response_item',
+    payload: {
+      type: 'message',
+      role: i % 2 === 0 ? 'user' : 'assistant',
+      content: [{ type: i % 2 === 0 ? 'input_text' : 'output_text', text: `Chunk message ${i} ${'x'.repeat(900)}` }],
+    },
+  });
+}
+fs.writeFileSync(chunkFixture, chunkEntries.map(entry => JSON.stringify(entry)).join('\n') + '\n');
+const tailChunk = codexCli.parseCodexJsonlChunk(chunkFixture, { chunkBytes: 256 * 1024 });
+assert(tailChunk, 'expected tail chunk');
+assert(tailChunk.nextBeforeOffset, 'expected tail chunk to expose an older cursor');
+assert(tailChunk.state.messages.some(msg => msg.content.includes('Chunk message 699')), 'tail chunk should contain the newest message');
+const olderChunk = codexCli.parseCodexJsonlChunk(chunkFixture, {
+  beforeOffset: tailChunk.nextBeforeOffset,
+  chunkBytes: 256 * 1024,
+});
+assert(olderChunk, 'expected older chunk');
+assert.strictEqual(olderChunk.endOffset, tailChunk.nextBeforeOffset, 'older chunk should end at the prior cursor');
+assert(olderChunk.state.messages.length > 0, 'older chunk should contain messages');
+assert(!olderChunk.state.messages.some(msg => msg.content.includes('Chunk message 699')), 'older chunk should not overlap the newest tail');
+try { fs.unlinkSync(chunkFixture); } catch {}
 
 console.log(`Codex CLI parser smoke passed (${summary.messages.length} messages, tail=${tailSummary.messages.length})`);

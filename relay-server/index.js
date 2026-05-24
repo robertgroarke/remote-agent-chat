@@ -43,6 +43,8 @@ const HEARTBEAT_TIMEOUT_MS    = 10_000;
 const HEALTH_DEGRADE_AFTER_MS = 120_000;  // inactivity threshold → degraded
 const LAUNCH_TIMEOUT_MS       = 30_000;   // max wait for proxy to confirm a new session
 const LARGE_HISTORY_BROADCAST_LIMIT = 250;
+const DEFAULT_HISTORY_CHUNK_LIMIT = 120;
+const MAX_HISTORY_CHUNK_LIMIT = 500;
 
 // ── Structured logger ─────────────────────────────────────────────────────────
 
@@ -238,6 +240,18 @@ function historiesMatch(existingRows, incomingRows) {
   return true;
 }
 
+function historiesTailLikelyMatch(sessionId, incomingRows, tailLimit = 50) {
+  const existingCount = getHistoryCount(sessionId);
+  if (existingCount !== incomingRows.length) {
+    return { match: false, existingCount };
+  }
+  const limit = Math.min(Math.max(1, tailLimit), incomingRows.length);
+  if (limit <= 0) return { match: true, existingCount };
+  const existingTail = getHistoryRowsTail(sessionId, limit);
+  const incomingTail = incomingRows.slice(-limit);
+  return { match: historiesMatch(existingTail, incomingTail), existingCount };
+}
+
 function normalizeBrowserEchoContent(content) {
   return String(content || '')
     .replace(/\b\d{1,2}:\d{2}\s?(?:AM|PM)\s*$/i, '')
@@ -398,6 +412,20 @@ const stmtGetHistoryTail = db.prepare(
    )
    ORDER BY id ASC`
 );
+const stmtGetHistoryBeforeId = db.prepare(
+  `SELECT id, role, content, content_blocks, status, sequence, ts
+   FROM (
+     SELECT id, role, content, content_blocks, status, sequence, ts
+     FROM messages
+     WHERE session = ? AND id < ?
+     ORDER BY id DESC
+     LIMIT ?
+   )
+   ORDER BY id ASC`
+);
+const stmtGetHistoryCountBeforeId = db.prepare(
+  'SELECT COUNT(*) AS count FROM messages WHERE session = ? AND id < ?'
+);
 const stmtGetHistoryFrom = db.prepare(
   `SELECT id, role, content, content_blocks, status, sequence, ts
    FROM messages WHERE session = ? AND sequence > ? ORDER BY id ASC`
@@ -414,6 +442,23 @@ function getHistoryCount(sessionId) {
 function getHistoryRowsTail(sessionId, limit) {
   const safeLimit = Math.max(1, Math.min(1000, Math.floor(Number(limit) || 0)));
   return stmtGetHistoryTail.all(sessionId, safeLimit).map(hydrateMessageRow);
+}
+
+function historyChunkLimit(limit) {
+  return Math.max(1, Math.min(MAX_HISTORY_CHUNK_LIMIT, Math.floor(Number(limit) || DEFAULT_HISTORY_CHUNK_LIMIT)));
+}
+
+function getHistoryRowsBeforeId(sessionId, beforeId, limit) {
+  const safeLimit = historyChunkLimit(limit);
+  const safeBeforeId = Math.max(0, Math.floor(Number(beforeId) || 0));
+  if (!safeBeforeId) return getHistoryRowsTail(sessionId, safeLimit);
+  return stmtGetHistoryBeforeId.all(sessionId, safeBeforeId, safeLimit).map(hydrateMessageRow);
+}
+
+function getHistoryCountBeforeId(sessionId, beforeId) {
+  const safeBeforeId = Math.max(0, Math.floor(Number(beforeId) || 0));
+  if (!safeBeforeId) return 0;
+  return Number(stmtGetHistoryCountBeforeId.get(sessionId, safeBeforeId)?.count || 0);
 }
 
 function getHistoryRowsFrom(sessionId, sinceSeq) {
@@ -1140,6 +1185,55 @@ function getEffectiveHistoryTail(sessionId, limit) {
   };
 }
 
+function resolveEffectiveHistorySource(sessionId) {
+  const directTotal = getHistoryCount(sessionId);
+  if (directTotal > 0) return { sourceSession: sessionId, total: directTotal };
+
+  const candidate = findRelatedHistorySession(sessionId);
+  if (!candidate?.session_id) return { sourceSession: sessionId, total: 0 };
+
+  const total = getHistoryCount(candidate.session_id);
+  if (total > 0) {
+    log('info', 'history', 'Using related history chunk fallback', {
+      requested_session: sessionId,
+      fallback_session: candidate.session_id,
+      fallback_agent_type: candidate.agent_type,
+      total_messages: total,
+    });
+  }
+  return { sourceSession: candidate.session_id, total };
+}
+
+function getEffectiveHistoryChunk(sessionId, { beforeId = null, limit = DEFAULT_HISTORY_CHUNK_LIMIT } = {}) {
+  const safeLimit = historyChunkLimit(limit);
+  const { sourceSession, total } = resolveEffectiveHistorySource(sessionId);
+  if (!total) {
+    return {
+      messages: [],
+      total: 0,
+      source_session: sourceSession,
+      next_before_id: null,
+      partial: false,
+      limit: safeLimit,
+    };
+  }
+
+  const safeBeforeId = Math.max(0, Math.floor(Number(beforeId) || 0));
+  const messages = safeBeforeId
+    ? getHistoryRowsBeforeId(sourceSession, safeBeforeId, safeLimit)
+    : getHistoryRowsTail(sourceSession, safeLimit);
+  const firstId = messages[0]?.id || null;
+  const remainingBefore = firstId ? getHistoryCountBeforeId(sourceSession, firstId) : 0;
+  return {
+    messages,
+    total,
+    source_session: sourceSession,
+    next_before_id: remainingBefore > 0 ? firstId : null,
+    partial: remainingBefore > 0,
+    limit: safeLimit,
+  };
+}
+
 // Returns any active proxy WebSocket, regardless of session registration.
 // Used for launch_session which may target a proxy before any session is registered.
 function getProxySocket() {
@@ -1269,7 +1363,7 @@ const KNOWN_PROXY_TYPES = new Set([
   'message', 'proxy_message',
   'session_launch_ack', 'session_launch_failed', 'session_closed', 'session_meta_backfill',
   'permission_prompt', 'permission_prompt_expired', 'session_error_prompt', 'session_error_prompt_cleared', 'agent_config', 'agent_control_result',
-  'history', 'history_snapshot',
+  'history', 'history_snapshot', 'history_chunk',
   'rate_limit_active', 'rate_limit_cleared',
   'chat_list', 'thread_list', 'terminal_output', 'file_changes',
   'branch_list', 'skill_list', 'codex_automation_view',
@@ -1280,7 +1374,7 @@ const KNOWN_PROXY_TYPES = new Set([
 
 const KNOWN_CLIENT_TYPES = new Set([
   'connection_hello', 'hello', 'heartbeat',
-  'get_history', 'history_request',
+  'get_history', 'history_request', 'history_chunk_request',
   'send', 'send_message',
   'launch_session', 'resume_session', 'close_session', 'dismiss_session',
   'permission_response', 'error_prompt_action', 'agent_interrupt', 'agent_config_request',
@@ -1965,29 +2059,72 @@ function handleProxyConnection(ws, req) {
       log('info', 'ctrl', `Control result: ${msg.result}`, { request_id: requestId, command: msg.command });
 
     // ── Full history resync from proxy (legacy: 'history', v1: 'history_snapshot') ─
+    } else if (t === 'history_chunk') {
+      const requestId = msg.request_id || null;
+      const targetWs = requestId ? pendingCtrlReqs.get(requestId) : null;
+      if (requestId) pendingCtrlReqs.delete(requestId);
+      if (targetWs && targetWs.readyState === WebSocket.OPEN) {
+        targetWs.send(JSON.stringify(msg));
+      } else {
+        broadcastToBrowsers(msg);
+      }
+      log('info', 'history', 'Forwarded native history chunk', {
+        session: msg.session_id || msg.session,
+        messages: Array.isArray(msg.messages) ? msg.messages.length : 0,
+        partial: !!msg.partial,
+      });
+
     } else if (t === 'history' || t === 'history_snapshot') {
       const id       = msg.session || msg.session_id;
       const messages = msg.messages || [];
       if (!id || !Array.isArray(messages)) return;
 
-      const existing = getHistoryRows(id);
-      if (messages.length > 0 && !historiesMatch(existing, messages)) {
+      const isLargeHistory = messages.length > LARGE_HISTORY_BROADCAST_LIMIT;
+      let existing = null;
+      let existingLength = 0;
+      let alreadyMatches = false;
+      if (messages.length > 0 && isLargeHistory) {
+        const quick = historiesTailLikelyMatch(id, messages);
+        existingLength = quick.existingCount;
+        alreadyMatches = quick.match;
+      } else {
+        existing = getHistoryRows(id);
+        existingLength = existing.length;
+        alreadyMatches = historiesMatch(existing, messages);
+      }
+
+      if (messages.length > 0 && !alreadyMatches) {
+        if (!existing) existing = getHistoryRows(id);
         const resync = db.transaction((msgs) => {
           stmtDeleteSession.run(id);
           sessionSeq.delete(id);
           msgs.forEach(m => insertMessage(id, m.role, m.content, null, 'delivered', nextSeq(id), m.ts, m.content_blocks));
         });
         resync(messages);
-        log('info', 'history', `Resynced ${existing.length}→${messages.length}`, { session: id });
+        log('info', 'history', `Resynced ${existingLength}→${messages.length}`, { session: id });
         const buildPayload = () => ({ type: 'history', session: id, messages: getHistoryRows(id) });
+        const buildTailPayload = () => {
+          const total = getHistoryCount(id);
+          const tail = getHistoryRowsTail(id, LARGE_HISTORY_BROADCAST_LIMIT);
+          return {
+            type: 'history',
+            session: id,
+            messages: tail,
+            partial: total > tail.length,
+            total_messages: total,
+            loaded_messages: tail.length,
+            limit: LARGE_HISTORY_BROADCAST_LIMIT,
+            mode: 'tail',
+          };
+        };
         if (messages.length <= LARGE_HISTORY_BROADCAST_LIMIT) {
           broadcastToBrowsers(buildPayload());
         } else {
-          // Throttle but always deliver the latest — large transcripts must
-          // still appear live in the WebUI, just not on every single poll.
-          scheduleHistoryBroadcast(id, buildPayload);
+          // Throttle and broadcast only the tail; full history stays available
+          // through explicit history requests.
+          scheduleHistoryBroadcast(id, buildTailPayload);
         }
-      } else if (existing.length === 0 && messages.length > 0) {
+      } else if (!isLargeHistory && existing && existing.length === 0 && messages.length > 0) {
         db.transaction((msgs) => {
           msgs.forEach(m => insertMessage(id, m.role, m.content, null, 'delivered', nextSeq(id), m.ts, m.content_blocks));
         })(messages);
@@ -2173,6 +2310,76 @@ function handleClientConnection(ws, req) {
     // ── History request (A2-04) ────────────────────────────────────────────
     // Supports both old (get_history) and new (history_request) names,
     // and both old and new field names for delta mode.
+    } else if (t === 'history_chunk_request') {
+      const id = msg.session || msg.session_id;
+      const requestId = msg.request_id || `histchunk-${Date.now()}-${Math.random().toString(36).slice(2, 7)}`;
+      if (!id) return;
+      const requestedSource = msg.source || msg.history_source || 'native';
+      if (requestedSource === 'relay_sqlite') {
+        const beforeId = msg.mode === 'older'
+          ? (msg.before_id ?? msg.beforeId ?? msg.cursor?.next_before_id ?? null)
+          : null;
+        const result = getEffectiveHistoryChunk(id, {
+          beforeId,
+          limit: msg.limit || msg.tail_limit || msg.history_limit || DEFAULT_HISTORY_CHUNK_LIMIT,
+        });
+        ws.send(JSON.stringify({
+          type: 'history_chunk',
+          protocol_version: PROTOCOL_VERSION,
+          session: id,
+          session_id: id,
+          request_id: requestId,
+          mode: msg.mode === 'older' ? 'older' : 'tail',
+          source: 'relay_sqlite',
+          source_session: result.source_session,
+          messages: result.messages,
+          partial: !!result.partial,
+          complete: !result.partial,
+          total_messages: result.total,
+          loaded_messages: result.messages.length,
+          limit: result.limit,
+          cursor: {
+            next_before_id: result.next_before_id,
+            source_session: result.source_session,
+            total_messages: result.total,
+            limit: result.limit,
+          },
+        }));
+        log('info', 'history', 'Served relay history chunk', {
+          session: id,
+          source_session: result.source_session,
+          mode: msg.mode === 'older' ? 'older' : 'tail',
+          messages: result.messages.length,
+          partial: !!result.partial,
+        });
+        return;
+      }
+      const proxyWs = proxySockets.get(id);
+      if (!proxyWs || proxyWs.readyState !== WebSocket.OPEN) {
+        ws.send(JSON.stringify({
+          type: 'history_chunk',
+          session: id,
+          session_id: id,
+          request_id: requestId,
+          mode: msg.mode || 'tail',
+          messages: [],
+          partial: false,
+          complete: true,
+          error: { code: 'session_not_connected', message: `Session ${id} not connected` },
+          cursor: { start_offset: 0, end_offset: 0, next_before_offset: null, total_bytes: 0 },
+        }));
+        return;
+      }
+      pendingCtrlReqs.set(requestId, ws);
+      proxyWs.send(JSON.stringify({
+        ...msg,
+        type: 'history_chunk_request',
+        session: id,
+        session_id: id,
+        request_id: requestId,
+      }));
+      log('info', 'history', 'Forwarded native history chunk request', { session: id, mode: msg.mode || 'tail' });
+
     } else if (t === 'get_history' || t === 'history_request') {
       const id       = msg.session || msg.session_id;
       const sinceSeq = msg.since_sequence ?? msg.after_sequence ?? null;

@@ -8,6 +8,7 @@
 const { useState, useEffect, useRef, useCallback } = React;
 
 const DEFAULT_HISTORY_TAIL_LIMIT = 120;
+const CODEX_CLI_HISTORY_CHUNK_BYTES = 2 * 1024 * 1024;
 
 export function useRelay() {
     const [sessions,        setSessions]        = useState([]);   // string IDs (legacy) or metadata objects (v1)
@@ -45,6 +46,10 @@ export function useRelay() {
     const handleRelayMessageRef = useRef(null);
     const historyRequestSerial = useRef(0);
     const latestHistoryRequest = useRef({});
+    const historyChunkSerial = useRef(0);
+    const latestHistoryChunkRequest = useRef({});
+    const historyChunkTimers = useRef({});
+    const historyChunkState = useRef({});
 
     const send = useCallback((msg) => {
       if (wsRef.current?.readyState === WebSocket.OPEN) {
@@ -166,6 +171,89 @@ export function useRelay() {
       }
       if (options.full) payload.full = true;
       send(payload);
+    }
+
+    function requestHistoryChunk(sessionOrId, options = {}) {
+      const id = typeof sessionOrId === 'string' ? sessionOrId : sessionOrId?.session_id;
+      if (!id) return;
+      if (wsRef.current?.readyState !== WebSocket.OPEN) return;
+      const mode = options.mode === 'older' ? 'older' : 'tail';
+      const source = options.source || 'relay_sqlite';
+      const requestId = `histchunk-${Date.now()}-${++historyChunkSerial.current}`;
+      const chunkBytes = Math.max(256 * 1024, Math.min(16 * 1024 * 1024, Number(options.chunkBytes || options.chunk_bytes || CODEX_CLI_HISTORY_CHUNK_BYTES) || CODEX_CLI_HISTORY_CHUNK_BYTES));
+      if (mode === 'tail') {
+        clearTimeout(historyChunkTimers.current[id]);
+        historyChunkState.current[id] = { source, chunkBytes, limit: options.limit || null, inFlight: true };
+      } else {
+        historyChunkState.current[id] = { ...(historyChunkState.current[id] || {}), source, chunkBytes, limit: options.limit || historyChunkState.current[id]?.limit || null, inFlight: true };
+      }
+      latestHistoryChunkRequest.current[id] = requestId;
+      setHistoryLoading(prev => ({
+        ...prev,
+        [id]: { mode: 'chunked', requestedAt: Date.now(), requestId },
+      }));
+      const payload = {
+        type: 'history_chunk_request',
+        session: id,
+        session_id: id,
+        request_id: requestId,
+        mode,
+        source,
+        chunk_bytes: chunkBytes,
+      };
+      const limit = Number(options.limit || options.tailLimit || 0);
+      if (Number.isFinite(limit) && limit > 0) payload.limit = Math.floor(limit);
+      const beforeOffset = options.beforeOffset ?? options.before_offset ?? null;
+      const beforeId = options.beforeId ?? options.before_id ?? null;
+      if (mode === 'older' && beforeOffset != null) payload.before_offset = beforeOffset;
+      if (mode === 'older' && beforeId != null) payload.before_id = beforeId;
+      send(payload);
+    }
+
+    function messageDedupeKey(msg) {
+      if (!msg) return '';
+      const blocks = Array.isArray(msg.content_blocks) ? JSON.stringify(msg.content_blocks) : '';
+      return `${msg.role || ''}\u0001${msg.content || ''}\u0001${blocks}`;
+    }
+
+    function mergeHistoryChunk(existing, incoming, mode) {
+      const current = Array.isArray(existing) ? existing : [];
+      const nextIncoming = Array.isArray(incoming) ? incoming : [];
+      if (mode === 'older') {
+        const seen = new Set(current.map(messageDedupeKey));
+        const older = [];
+        nextIncoming.forEach(msg => {
+          const key = messageDedupeKey(msg);
+          if (seen.has(key)) return;
+          seen.add(key);
+          older.push(msg);
+        });
+        return older.length ? [...older, ...current] : current;
+      }
+      const seen = new Set();
+      const merged = [];
+      const incomingIds = nextIncoming.map(msg => Number(msg?.id || 0)).filter(n => Number.isFinite(n) && n > 0);
+      const incomingTs = nextIncoming.map(msg => Number(msg?.ts || 0)).filter(n => Number.isFinite(n) && n > 0);
+      const lastIncomingId = incomingIds.length ? Math.max(...incomingIds) : 0;
+      const lastIncomingTs = incomingTs.length ? Math.max(...incomingTs) : 0;
+      nextIncoming.forEach(msg => {
+        const key = messageDedupeKey(msg);
+        if (seen.has(key)) return;
+        seen.add(key);
+        merged.push(msg);
+      });
+      current.forEach(msg => {
+        const msgId = Number(msg?.id || 0);
+        const msgTs = Number(msg?.ts || 0);
+        const isNewerThanTail = (lastIncomingId > 0 && msgId > lastIncomingId)
+          || (!lastIncomingId && lastIncomingTs > 0 && msgTs > lastIncomingTs);
+        if (!(msg?._optimistic || msg?._cid || isNewerThanTail)) return;
+        const key = messageDedupeKey(msg);
+        if (seen.has(key)) return;
+        seen.add(key);
+        merged.push(msg);
+      });
+      return merged;
     }
 
     function shouldPreserveTranscriptInListView(session) {
@@ -623,6 +711,71 @@ export function useRelay() {
       }
 
       // ── History delta (v1) ──────────────────────────────────────────────────
+      if (t === 'history_chunk') {
+        const id = msg.session || msg.session_id;
+        if (!id) return;
+        if (
+          msg.request_id
+          && latestHistoryChunkRequest.current[id]
+          && latestHistoryChunkRequest.current[id] !== msg.request_id
+        ) {
+          return;
+        }
+        const mode = msg.mode === 'older' ? 'older' : 'tail';
+        const cursor = msg.cursor || {};
+        const nextBeforeOffset = cursor.next_before_offset ?? null;
+        const nextBeforeId = cursor.next_before_id ?? null;
+        const hasMore = !!(msg.partial && (nextBeforeOffset != null || nextBeforeId != null));
+        const estimatedMessages = mergeHistoryChunk(messages[id], msg.messages || [], mode);
+        setMessages(prev => {
+          const merged = mergeHistoryChunk(prev[id], msg.messages || [], mode);
+          return { ...prev, [id]: merged };
+        });
+        setHistoryMeta(prev => ({
+          ...prev,
+          [id]: {
+            ...(prev[id] || {}),
+            partial: hasMore,
+            loaded: estimatedMessages.length,
+            total: Number(msg.total_messages || prev[id]?.total || estimatedMessages.length) || estimatedMessages.length,
+            limit: null,
+            mode: 'chunked',
+            source: msg.source || 'native',
+            cursor,
+            bytes_total: cursor.total_bytes || 0,
+          },
+        }));
+        setHistoryLoading(prev => {
+          if (!prev[id]) return prev;
+          const next = { ...prev };
+          delete next[id];
+          return next;
+        });
+        historyChunkState.current[id] = {
+          ...(historyChunkState.current[id] || {}),
+          inFlight: false,
+          nextBeforeOffset,
+          nextBeforeId,
+        };
+        clearTimeout(historyChunkTimers.current[id]);
+        if (!msg.error && hasMore) {
+          const chunkState = historyChunkState.current[id] || {};
+          const requestSource = chunkState.source || (msg.source === 'codex_cli_jsonl' ? 'native' : 'relay_sqlite');
+          historyChunkTimers.current[id] = setTimeout(() => {
+            if (activeSessionRef.current !== id) return;
+            requestHistoryChunk(id, {
+              mode: 'older',
+              source: requestSource,
+              beforeOffset: nextBeforeOffset,
+              beforeId: nextBeforeId,
+              limit: chunkState.limit || undefined,
+              chunkBytes: historyChunkState.current[id]?.chunkBytes || CODEX_CLI_HISTORY_CHUNK_BYTES,
+            });
+          }, 250);
+        }
+        return;
+      }
+
       if (t === 'history_delta') {
         const id      = msg.session || msg.session_id;
         const newMsgs = msg.messages || msg.events || [];
@@ -1023,7 +1176,7 @@ export function useRelay() {
     // where `sessions` / `messages` would be frozen at initial render values).
     handleRelayMessageRef.current = handleRelayMessage;
 
-    return { sessions, messages, historyMeta, historyLoading, connected, unread, setUnread, thinking, thinkingContent, activities, health, deliveryStates, launchStates, justLaunched, setJustLaunched, permissionPrompts, respondToPrompt, errorPrompts, respondToErrorPrompt, interruptSession, agentConfigs, requestAgentConfig, setAgentModel, setAgentEffort, setAgentPermissionMode, setAutoApprovePermissions, setAntigravityMode, setCodexConfig, newThread, openPanel, openNativeWindow, requestChatList, switchChat, newChat, chatLists, requestThreadList, switchThread, threadLists, switchWorkspace, requestTerminalOutput, terminalOutputs, requestFileChanges, fileChanges, sendAttachment, send, sendToSession, steerMessage, discardQueuedMessage, editQueuedMessage, queuedMessages, launchSession, resumeSession, closeSession, activeSessionRef, workspaces, branchLists, requestBranchList, switchBranch, createBranch, skillLists, requestSkillList, automationViews, showCodexAutomation, controlResults, directoryListings, requestDirectoryListing, fileContents, requestFileContent, requestHistory };
+    return { sessions, messages, historyMeta, historyLoading, connected, unread, setUnread, thinking, thinkingContent, activities, health, deliveryStates, launchStates, justLaunched, setJustLaunched, permissionPrompts, respondToPrompt, errorPrompts, respondToErrorPrompt, interruptSession, agentConfigs, requestAgentConfig, setAgentModel, setAgentEffort, setAgentPermissionMode, setAutoApprovePermissions, setAntigravityMode, setCodexConfig, newThread, openPanel, openNativeWindow, requestChatList, switchChat, newChat, chatLists, requestThreadList, switchThread, threadLists, switchWorkspace, requestTerminalOutput, terminalOutputs, requestFileChanges, fileChanges, sendAttachment, send, sendToSession, steerMessage, discardQueuedMessage, editQueuedMessage, queuedMessages, launchSession, resumeSession, closeSession, activeSessionRef, workspaces, branchLists, requestBranchList, switchBranch, createBranch, skillLists, requestSkillList, automationViews, showCodexAutomation, controlResults, directoryListings, requestDirectoryListing, fileContents, requestFileContent, requestHistory, requestHistoryChunk };
   }
 
 // (removed window.useRelay — now an ES module export)
