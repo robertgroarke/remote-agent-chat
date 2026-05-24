@@ -8,7 +8,7 @@
 const { useState, useEffect, useRef, useCallback } = React;
 
 const DEFAULT_HISTORY_TAIL_LIMIT = 120;
-const CODEX_CLI_HISTORY_CHUNK_BYTES = 256 * 1024;
+const CODEX_CLI_HISTORY_CHUNK_BYTES = 1024 * 1024;
 
 function shallowMapMerge(prev, next) {
   const entries = Object.entries(next || {});

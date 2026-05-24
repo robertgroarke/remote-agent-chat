@@ -1124,6 +1124,29 @@ function discoverSessions(limit = 0, options = {}) {
     .filter(Boolean);
 }
 
+function recentActiveSessionSummaries({
+  limit = 4,
+  maxAgeMs = 30 * 60 * 1000,
+  maxFiles = 80,
+  summaryOptions = {},
+} = {}) {
+  const root = sessionsDir();
+  if (!fs.existsSync(root)) return [];
+  const now = Date.now();
+  const ageMs = Math.max(0, Number(maxAgeMs) || 0);
+  const seen = new Set();
+  const out = [];
+  for (const item of walkJsonlFiles(root, maxFiles)) {
+    if (ageMs > 0 && now - item.stat.mtimeMs > ageMs) continue;
+    const summary = readSessionSummary(item.filePath, summaryOptions);
+    if (!summary?.cliSessionId || seen.has(summary.cliSessionId)) continue;
+    seen.add(summary.cliSessionId);
+    out.push(summary);
+    if (Number.isFinite(limit) && limit > 0 && out.length >= limit) break;
+  }
+  return out;
+}
+
 function findSessionByCliId(cliSessionId, options = {}) {
   if (!cliSessionId) return null;
   const root = sessionsDir();
@@ -1391,6 +1414,7 @@ module.exports = {
   readSessionIndex,
   readCliHistory,
   recentInteractiveSessionIds,
+  recentActiveSessionSummaries,
   runningCodexCliProcessCount,
   readSessionSummary,
   resolveCodexCommand,

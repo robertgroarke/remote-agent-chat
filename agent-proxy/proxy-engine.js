@@ -120,6 +120,10 @@ const CODEX_CLI_HISTORY_CHUNK_BYTES = envMbBytes('CODEX_CLI_HISTORY_CHUNK_MB', 1
 const CODEX_CLI_HISTORY_TAIL_MIN_INTERVAL_MS = 1_500;
 const CODEX_CLI_HISTORY_OLDER_MIN_INTERVAL_MS = 5_000;
 const CODEX_CLI_HISTORY_REPEAT_CURSOR_MS = 60_000;
+const CODEX_CLI_ACTIVE_FILE_MAX_AGE_MS = Math.max(
+  60_000,
+  parseInt(process.env.CODEX_CLI_ACTIVE_FILE_MAX_AGE_MS || '1800000', 10) || 1_800_000
+);
 
 // ─── ProxyEngine class ─────────────────────────────────────────────────────
 
@@ -3727,6 +3731,38 @@ class ProxyEngine extends EventEmitter {
     }
   }
 
+  _sendCodexCliLiveTailChunk(sessionId, session, reason = 'codex cli live tail') {
+    const filePath = session?.codexCliFilePath || session?.codex_cli_file_path;
+    if (!filePath) return false;
+    try {
+      const chunk = codexCli.parseCodexJsonlChunk(filePath, { chunkBytes: CODEX_CLI_HISTORY_CHUNK_BYTES });
+      const messages = Array.isArray(chunk?.state?.messages) ? chunk.state.messages : [];
+      if (!chunk || messages.length === 0) return false;
+      const tailSig = `${chunk.startOffset}:${chunk.endOffset}:${this._transcriptSignature(messages.slice(-64))}`;
+      if (session._lastCodexCliLiveChunkSig === tailSig) return false;
+      session._lastCodexCliLiveChunkSig = tailSig;
+      this._sendToRelay(proto.historyChunk(sessionId, {
+        messages,
+        mode: 'tail',
+        startOffset: chunk.startOffset,
+        endOffset: chunk.endOffset,
+        nextBeforeOffset: chunk.nextBeforeOffset,
+        totalBytes: chunk.stat?.size || 0,
+        partial: !!chunk.nextBeforeOffset,
+        complete: !chunk.nextBeforeOffset,
+        source: 'codex_cli_live_tail',
+      }));
+      this._log('info', `[${sessionId}] Sent Codex CLI live tail (${messages.length} msgs, ${reason})`);
+      return true;
+    } catch (e) {
+      if (session._lastCodexCliLiveTailError !== e.message) {
+        session._lastCodexCliLiveTailError = e.message;
+        this._log('warn', `[${sessionId}] Codex CLI live tail failed: ${e.message}`);
+      }
+      return false;
+    }
+  }
+
   _sendToRelay(msg) {
     const encoded = JSON.stringify(msg);
     const byteLen = Buffer.byteLength(encoded, 'utf8');
@@ -5243,6 +5279,9 @@ class ProxyEngine extends EventEmitter {
         existing.lastObservedCount = effectiveMessages.length;
         existing.lastMessageCount = effectiveMessages.length;
         this._sendHistorySnapshot(sessionId, effectiveMessages, 'codex cli file attached');
+        if (summary.messagesPartial === true) {
+          this._sendCodexCliLiveTailChunk(sessionId, existing, 'codex cli file attached');
+        }
       }
       return existing;
     }
@@ -5290,6 +5329,9 @@ class ProxyEngine extends EventEmitter {
         existing.lastObservedCount = effectiveMessages.length;
         existing.lastMessageCount = effectiveMessages.length;
         this._sendHistorySnapshot(sessionId, effectiveMessages, 'codex cli file changed');
+        if (summary.messagesPartial === true) {
+          this._sendCodexCliLiveTailChunk(sessionId, existing, 'codex cli file changed');
+        }
       }
       return existing;
     }
@@ -5299,6 +5341,9 @@ class ProxyEngine extends EventEmitter {
     if (sendInitialHistory) {
       const initialMessages = summary.messages?.length ? summary.messages : this._codexCliPendingTranscriptMessages(session);
       this._sendHistorySnapshot(sessionId, initialMessages, 'codex cli discovery');
+      if (summary.messagesPartial === true) {
+        this._sendCodexCliLiveTailChunk(sessionId, session, 'codex cli discovery');
+      }
       session.lastTranscriptSig = this._transcriptSignature(initialMessages);
       session.lastObservedCount = initialMessages.length;
       session.lastMessageCount = initialMessages.length;
@@ -5323,7 +5368,7 @@ class ProxyEngine extends EventEmitter {
     };
   }
 
-  _codexCliExternalActiveIds() {
+  _codexCliExternalActiveSummaries() {
     const configuredLimit = parseInt(process.env.CODEX_CLI_ACTIVE_SESSION_LIMIT || '', 10);
     const runningProcessCount = codexCli.runningCodexCliProcessCount();
     const detectedLimit = runningProcessCount > 0 ? Math.min(runningProcessCount, 10) : 1;
@@ -5334,20 +5379,42 @@ class ProxyEngine extends EventEmitter {
       this._lastCodexCliProcessCountSig = processCountSig;
       this._log('info', `[codex-cli] detected ${runningProcessCount} running Codex CLI process(es); active history limit=${limit}`);
     }
-    return new Set(codexCli.recentInteractiveSessionIds({
+    const activeSummaryOptions = this._codexCliActiveSummaryOptions();
+    const byId = new Map();
+    if (runningProcessCount > 0) {
+      for (const summary of codexCli.recentActiveSessionSummaries({
+        limit,
+        maxAgeMs: CODEX_CLI_ACTIVE_FILE_MAX_AGE_MS,
+        summaryOptions: activeSummaryOptions,
+      })) {
+        byId.set(summary.cliSessionId, summary);
+        if (byId.size >= limit) break;
+      }
+    }
+    const historyIds = codexCli.recentInteractiveSessionIds({
       limit,
       maxAgeMs: (Number.isFinite(hours) && hours > 0 ? hours : 24) * 60 * 60 * 1000,
-    }));
+    });
+    for (const cliSessionId of historyIds) {
+      if (byId.has(cliSessionId)) continue;
+      const summary = this._findCodexCliSummaryByCliId(cliSessionId);
+      if (summary) byId.set(cliSessionId, summary);
+      if (byId.size >= limit) break;
+    }
+    return Array.from(byId.values());
+  }
+
+  _codexCliExternalActiveIds() {
+    return new Set(this._codexCliExternalActiveSummaries().map(summary => summary.cliSessionId));
   }
 
   async _discoverCodexCliSessions() {
     if (!this._codexCliArchiveDiscoveryEnabled()) {
       let changed = false;
-      const externalActiveIds = this._codexCliExternalActiveIds();
+      const externalActiveSummaries = this._codexCliExternalActiveSummaries();
+      const externalActiveIds = new Set(externalActiveSummaries.map(summary => summary.cliSessionId));
       const activeSummaryOptions = this._codexCliActiveSummaryOptions();
-      for (const cliSessionId of externalActiveIds) {
-        const summary = this._findCodexCliSummaryByCliId(cliSessionId);
-        if (!summary) continue;
+      for (const summary of externalActiveSummaries) {
         const before = this.sessions.size;
         this._registerCodexCliSession(summary, { archiveDiscovered: false, externalActive: true });
         if (this.sessions.size !== before) changed = true;
@@ -5653,6 +5720,7 @@ class ProxyEngine extends EventEmitter {
     }
     let messages = [];
     let summaryActivity = null;
+    let summaryPartial = false;
     let transcriptMaybeChanged = !session.codexCliFilePath;
     if (session.codexCliFilePath) {
       const stat = (() => { try { return fs.statSync(session.codexCliFilePath); } catch { return null; } })();
@@ -5660,14 +5728,17 @@ class ProxyEngine extends EventEmitter {
       if (fileSig && fileSig === session._lastCodexCliFileSig && Array.isArray(session._lastCodexCliMessages)) {
         messages = session._lastCodexCliMessages;
         summaryActivity = session._lastCodexCliActivity || null;
+        summaryPartial = session._lastCodexCliMessagesPartial === true;
       } else {
         transcriptMaybeChanged = true;
         const summary = codexCli.readSessionSummary(session.codexCliFilePath, this._codexCliActiveSummaryOptions());
         messages = summary?.messages || [];
         summaryActivity = summary?.activity || null;
+        summaryPartial = summary?.messagesPartial === true;
         session._lastCodexCliFileSig = fileSig;
         session._lastCodexCliMessages = messages;
         session._lastCodexCliActivity = summaryActivity;
+        session._lastCodexCliMessagesPartial = summaryPartial;
         if (summary) {
           if (this._applyCodexCliSummaryMetadata(sessionId, session, summary)) {
             this._broadcastSessionSnapshot();
@@ -5686,6 +5757,9 @@ class ProxyEngine extends EventEmitter {
         session.lastObservedCount = effectiveMessages.length;
         session.lastMessageCount = effectiveMessages.length;
         this._sendHistorySnapshot(sessionId, effectiveMessages, messages.length > 0 ? 'codex cli poll' : 'codex cli pending transcript');
+        if (messages.length > 0 && summaryPartial) {
+          this._sendCodexCliLiveTailChunk(sessionId, session, 'codex cli poll');
+        }
       }
     }
     const fallbackActivity = session._codexCliChild

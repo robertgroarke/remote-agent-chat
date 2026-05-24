@@ -81,20 +81,20 @@ The WebUI groups active sessions by workspace directory in the sidebar and shows
 | Claude Code (Antigravity extension) | Working |
 | Claude Code CLI | Working - WebUI sessions, Ollama Cloud models, and native Windows terminal handoff |
 | OpenAI Codex (Antigravity extension) | Working - side-pane chat, task/completion summaries, tool output, files/changes panels, and retained transcript history |
-| OpenAI Codex CLI | Working - WebUI sessions, elevated native terminal handoff, active multi-session discovery, full tool output, bottom live goal/working status, stable scroll anchoring, and newest-first chunked transcript hydration |
+| OpenAI Codex CLI | Working - WebUI sessions, elevated native terminal handoff, active multi-session discovery, live JSONL tail streaming, full tool output, bottom live goal/working status, stable scroll anchoring, and newest-first chunked transcript hydration |
 | Gemini Code Assist (Antigravity extension) | Working |
 | Continue (Antigravity extension) | Working — local models via Ollama, etc. |
 | Continue YOLO (Antigravity extension) | Working — editor-tab sessions with bypass-permissions support |
 | Roo Code (Antigravity extension) | Working — side-pane sessions with permission dialog support |
 | Cline (Antigravity extension) | Working — side-pane sessions with Plan/Act mode, context usage, and permission dialog support |
 | Antigravity Chat (built-in agent) | Working |
-| Antigravity v2 Agent Manager (standalone app) | Working - standalone CDP port, project/conversation navigator, history/scheduled-task entry points, new conversation, chat switching, rich transcript blocks |
+| Antigravity v2 Agent Manager (standalone app) | Working - standalone CDP port 9226, project/conversation navigator, history/scheduled-task entry points, new conversation, chat switching, rich transcript blocks |
 | Codex Desktop (MSIX) | Working (separate CDP port) |
 | Claude Desktop (MSIX) | Blocked — Anthropic requires a signed `CLAUDE_CDP_AUTH` token to allow CDP |
 
 Antigravity v2 is treated as a separate standalone Agent Manager surface, not as the Antigravity IDE side pane. The WebUI exposes its project/conversation controls where available, including conversation history, scheduled-task entry points, project/sub-chat switching, and new conversation launch. v2 transcripts preserve rich assistant output such as markdown, thinking, tool calls, terminal output, file-change summaries, artifacts, prompts, and errors.
 
-Codex CLI support covers both WebUI-launched sessions and active native terminal sessions. The proxy follows recent Codex CLI transcript files, surfaces multiple active sessions, preserves full tool-call/result output, opens native sessions elevated on Windows, and renders live task-plan status near the composer, including `Pursuing goal (...)` and `Working (... esc to interrupt)`. Large archived transcripts are kept selectable without blocking initial sidebar hydration, and active sessions stay pinned to the newest output while older history backfills.
+Codex CLI support covers both WebUI-launched sessions and active native terminal sessions. The proxy follows recent Codex CLI transcript files, streams the live JSONL tail for active sessions, surfaces multiple active sessions, preserves full tool-call/result output, opens native sessions elevated on Windows, and renders live task-plan status near the composer, including `Pursuing goal (...)` and `Working (... esc to interrupt)`. Large archived transcripts are kept selectable without blocking initial sidebar hydration, and active sessions stay pinned to the newest output while older history backfills.
 
 Transcript history hydrates newest-first across agent types. The WebUI shows the most recent messages first, then incrementally backfills older history in chunks. Backfilled chunks preserve the reader's scroll position, while chats already pinned to the bottom stay pinned to the newest messages. Codex CLI uses the same UX while reading its native JSONL transcript archive in bounded byte ranges.
 
@@ -378,8 +378,10 @@ On Windows, Codex CLI native windows opened by the WebUI are launched with
 UAC elevation (`RunAs`), so newly-created Codex CLI sessions run elevated.
 
 The WebUI preserves Codex CLI tool calls, terminal output, patch/file-change
-summaries, task plans, and live status. When a Codex CLI session is active, the
-goal timer and working timer are shown together just above the message composer.
+summaries, task plans, and live status. Active native sessions stream tool calls
+and results from the Codex JSONL tail instead of waiting for full archive
+hydration. When a Codex CLI session is active, the goal timer and working timer
+are shown together just above the message composer.
 Large Codex CLI archives hydrate newest-first, then continue loading older
 messages in bounded chunks so refresh stays responsive even for long sessions.
 During backfill, the transcript keeps a stable scroll position; if the chat is
