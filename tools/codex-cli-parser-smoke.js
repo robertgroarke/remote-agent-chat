@@ -87,6 +87,48 @@ assert(!liveLikeSummary.messages.some(msg =>
 ), 'empty reasoning summaries should not create placeholder messages');
 try { fs.unlinkSync(liveLikeFixture); } catch {}
 
+const workspaceInferRoot = fs.mkdtempSync(path.join(os.tmpdir(), `codex-cli-workspace-infer-${Date.now()}-`));
+const inferredParentRepo = path.join(workspaceInferRoot, 'Parent Repo');
+const inferredTargetRepo = path.join(workspaceInferRoot, 'Target Repo');
+fs.mkdirSync(path.join(inferredParentRepo, '.git'), { recursive: true });
+fs.mkdirSync(path.join(inferredTargetRepo, '.git'), { recursive: true });
+fs.writeFileSync(path.join(inferredParentRepo, 'AGENTS.md'), 'registry rules\n');
+const workspaceInferFixture = path.join(os.tmpdir(), `codex-cli-workspace-infer-${Date.now()}.jsonl`);
+fs.writeFileSync(workspaceInferFixture, [
+  {
+    timestamp: iso(-10000),
+    type: 'session_meta',
+    payload: {
+      id: '00000000-0000-4000-8000-000000000102',
+      cwd: os.homedir(),
+      model: 'gpt-5.5',
+    },
+  },
+  {
+    timestamp: iso(-9000),
+    type: 'response_item',
+    payload: {
+      type: 'message',
+      role: 'user',
+      content: [{
+        type: 'input_text',
+        text: [
+          `/goal Improve tooling targeting ${inferredTargetRepo}.`,
+          'Read first:',
+          `- ${path.join(inferredParentRepo, 'AGENTS.md')} (registry rules)`,
+          `Constraints: Work in the parent repo only (${inferredParentRepo}).`,
+          `Do NOT modify ${path.join(inferredTargetRepo, '.git', 'hooks', 'pre-commit')} except by installing a hook.`,
+        ].join('\n'),
+      }],
+    },
+  },
+].map(entry => JSON.stringify(entry)).join('\n') + '\n');
+const workspaceInferSummary = codexCli.readSessionSummary(workspaceInferFixture);
+assert.strictEqual(workspaceInferSummary.workspacePath, inferredParentRepo);
+assert.strictEqual(workspaceInferSummary.workspaceName, path.basename(inferredParentRepo));
+try { fs.unlinkSync(workspaceInferFixture); } catch {}
+try { fs.rmSync(workspaceInferRoot, { recursive: true, force: true }); } catch {}
+
 const sameSecondFixture = path.join(os.tmpdir(), `codex-cli-same-second-task-${Date.now()}.jsonl`);
 const sameSecondBase = Math.floor((now - 600000) / 1000) * 1000;
 const sameSecondUnix = Math.floor(sameSecondBase / 1000);

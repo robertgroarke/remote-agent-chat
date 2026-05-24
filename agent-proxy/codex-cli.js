@@ -781,6 +781,124 @@ function readSessionMeta(filePath) {
   return {};
 }
 
+function trimPathCandidate(raw) {
+  let text = String(raw || '').trim();
+  if (!text) return '';
+  const variants = [
+    text.replace(/\s+\(.+$/s, ''),
+    text.replace(/\s+\[.+$/s, ''),
+    text.replace(/\.\s+.+$/s, ''),
+    text.replace(/;\s+.+$/s, ''),
+    text.replace(/,\s+.+$/s, ''),
+    text,
+  ];
+  for (const variant of variants) {
+    const cleaned = variant.replace(/[)\].,;:]+$/g, '').trim();
+    if (cleaned) return cleaned;
+  }
+  return '';
+}
+
+function existingPathPrefix(rawPath) {
+  let candidate = trimPathCandidate(rawPath);
+  if (!candidate) return '';
+  if (fs.existsSync(candidate)) return candidate;
+  const parts = candidate.split(/[\\/]+/).filter(Boolean);
+  if (!/^[A-Za-z]:/.test(candidate) || parts.length < 2) return '';
+  const drive = parts[0];
+  for (let end = parts.length; end >= 2; end--) {
+    const prefix = `${drive}\\${parts.slice(1, end).join('\\')}`;
+    if (fs.existsSync(prefix)) return prefix;
+  }
+  return '';
+}
+
+function directoryForWorkspaceCandidate(rawPath) {
+  const existing = existingPathPrefix(rawPath);
+  if (!existing) return '';
+  try {
+    const stat = fs.statSync(existing);
+    return stat.isFile() ? path.dirname(existing) : existing;
+  } catch {
+    return '';
+  }
+}
+
+function findGitRoot(startPath) {
+  let cur = directoryForWorkspaceCandidate(startPath) || startPath;
+  if (!cur) return '';
+  try { cur = path.resolve(cur); } catch { return ''; }
+  for (;;) {
+    if (fs.existsSync(path.join(cur, '.git'))) return cur;
+    const parent = path.dirname(cur);
+    if (!parent || parent === cur) return '';
+    cur = parent;
+  }
+}
+
+function isHomeWorkspace(workspacePath) {
+  if (!workspacePath) return true;
+  try {
+    return path.resolve(workspacePath).toLowerCase() === path.resolve(homeDir()).toLowerCase();
+  } catch {
+    return false;
+  }
+}
+
+function workspaceCandidatesFromText(text) {
+  const source = String(text || '');
+  if (!source) return [];
+  const byRoot = new Map();
+  const re = /[A-Za-z]:\\[^\r\n"'<>|]+/g;
+  let match;
+  while ((match = re.exec(source))) {
+    const fragments = match[0]
+      .split(/(?=\s*[A-Za-z]:\\)/g)
+      .map(part => part.trim())
+      .filter(Boolean);
+    for (const raw of fragments) {
+      const dir = directoryForWorkspaceCandidate(raw);
+      const root = findGitRoot(dir || raw) || dir;
+      if (!root) continue;
+      const key = root.toLowerCase();
+      const rawIndex = Math.max(0, source.indexOf(raw, match.index));
+      const context = source.slice(Math.max(0, rawIndex - 120), Math.min(source.length, rawIndex + raw.length + 160)).toLowerCase();
+      let score = 1;
+      if (/agents\.md|claude\.md|readme\.md|package\.json|\.sln|\.csproj/i.test(raw)) score += 16;
+      if (/\b(work in|working in|all your work happens|parent repo|repo root|cwd|cd\s+)/i.test(context)) score += 16;
+      if (/\bread first\b|\bmandatory\b|\bsource of truth\b/i.test(context)) score += 4;
+      if (/\btargeting\b|\bdo not touch\b|\bnon-goals?\b|\bexcept by\b/i.test(context)) score -= 14;
+      if (/\.git[\\/]hooks|install(?:ing)? a hook/i.test(raw) || /\.git[\\/]hooks|install(?:ing)? a hook/i.test(context)) score -= 12;
+      if (fs.existsSync(path.join(root, '.git'))) score += 4;
+      const existing = byRoot.get(key);
+      if (!existing || score > existing.score) {
+        byRoot.set(key, { workspacePath: root, workspaceName: path.basename(root) || root, score });
+      }
+    }
+  }
+  const out = Array.from(byRoot.values());
+  out.sort((a, b) => b.score - a.score || a.workspacePath.length - b.workspacePath.length);
+  return out;
+}
+
+function resolveCodexWorkspace(metaCwd, ...texts) {
+  const cwd = metaCwd || null;
+  const cwdWorkspace = cwd ? (findGitRoot(cwd) || directoryForWorkspaceCandidate(cwd) || cwd) : null;
+  if (cwdWorkspace && !isHomeWorkspace(cwdWorkspace)) {
+    return {
+      workspacePath: cwdWorkspace,
+      workspaceName: path.basename(cwdWorkspace) || cwdWorkspace,
+    };
+  }
+
+  const inferred = workspaceCandidatesFromText(texts.filter(Boolean).join('\n\n'))[0] || null;
+  const workspacePath = inferred?.workspacePath || cwdWorkspace || cwd || null;
+  return {
+    workspacePath,
+    workspaceName: workspacePath ? path.basename(workspacePath) : 'Codex CLI',
+  };
+}
+
 function readSessionCandidate(filePath, stat) {
   const lines = readJsonlHead(filePath);
   let meta = {};
@@ -802,13 +920,14 @@ function readSessionCandidate(filePath, stat) {
       if (!isCodexContextNoise(text)) firstUserText = text;
     }
   }
-  const workspacePath = meta.cwd || null;
+  const workspace = resolveCodexWorkspace(meta.cwd || null, firstUserText);
+  const workspacePath = workspace.workspacePath || null;
   const fileIdMatch = path.basename(filePath, '.jsonl').match(/([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})$/i);
   return {
     cliSessionId: meta.id || fileIdMatch?.[1] || path.basename(filePath, '.jsonl').replace(/^rollout-/, ''),
     filePath,
     workspacePath,
-    workspaceName: workspacePath ? path.basename(workspacePath) : 'Codex CLI',
+    workspaceName: workspace.workspaceName,
     title: firstUserText.replace(/\s+/g, ' ').trim().substring(0, 80) || 'Codex CLI session',
     updatedAt: stat.mtime.toISOString(),
     hasUser: !!firstUserText,
@@ -820,13 +939,17 @@ function readLightweightSessionSummary(filePath, stat) {
   const candidate = readSessionCandidate(filePath, stat);
   const cliSessionId = meta.id || candidate.cliSessionId;
   const index = readSessionIndex().get(cliSessionId) || null;
-  const workspacePath = meta.cwd || candidate.workspacePath || null;
+  const workspace = resolveCodexWorkspace(meta.cwd || null, candidate.title);
+  const candidateWorkspacePath = candidate.workspacePath && !isHomeWorkspace(candidate.workspacePath)
+    ? candidate.workspacePath
+    : null;
+  const workspacePath = candidateWorkspacePath || workspace.workspacePath || candidate.workspacePath || null;
   const titleSource = index?.thread_name || candidate.title || '';
   return {
     cliSessionId,
     filePath,
     workspacePath,
-    workspaceName: workspacePath ? path.basename(workspacePath) : 'Codex CLI',
+    workspaceName: workspacePath ? path.basename(workspacePath) : workspace.workspaceName,
     title: titleSource.replace(/\s+/g, ' ').trim().substring(0, 80) || 'Codex CLI session',
     messages: [],
     messageCount: 0,
@@ -925,12 +1048,14 @@ function readSessionSummary(filePath, { includeMessages = true, maxHydrateBytes 
   const firstUser = state.messages.find(m => m.role === 'user');
   const titleSource = index?.thread_name || state.firstUserText || firstUser?.content || '';
   const title = titleSource.replace(/\s+/g, ' ').trim().substring(0, 80) || 'Codex CLI session';
-  const workspacePath = meta.cwd || null;
+  const goalObjective = state.activeGoal?.objective || '';
+  const workspace = resolveCodexWorkspace(meta.cwd || null, state.firstUserText, firstUser?.content, goalObjective);
+  const workspacePath = workspace.workspacePath || null;
   const summary = {
     cliSessionId: state.cliSessionId,
     filePath,
     workspacePath,
-    workspaceName: workspacePath ? path.basename(workspacePath) : 'Codex CLI',
+    workspaceName: workspacePath ? path.basename(workspacePath) : workspace.workspaceName,
     title,
     messages: state.messages,
     messageCount: state.messages.length,

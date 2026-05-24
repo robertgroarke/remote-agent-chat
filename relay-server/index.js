@@ -874,8 +874,30 @@ app.get('/api/sessions/history', requireAnyAuth, (req, res) => {
 
 app.get('/api/sessions/:sessionId/messages', requireAnyAuth, (req, res) => {
   try {
+    const requestedLimit = req.query.full === 'true'
+      ? 0
+      : Number(req.query.limit || req.query.tail_limit || req.query.history_limit || 0);
+    if (Number.isFinite(requestedLimit) && requestedLimit > 0) {
+      const limit = Math.max(1, Math.min(1000, Math.floor(requestedLimit)));
+      const result = getEffectiveHistoryTail(req.params.sessionId, limit);
+      res.json({
+        messages: result.messages,
+        partial: result.total > result.loaded,
+        total_messages: result.total,
+        loaded_messages: result.loaded,
+        limit,
+        mode: 'tail',
+      });
+      return;
+    }
     const messages = getEffectiveHistory(req.params.sessionId);
-    res.json({ messages });
+    res.json({
+      messages,
+      partial: false,
+      total_messages: messages.length,
+      loaded_messages: messages.length,
+      mode: 'full',
+    });
   } catch (e) {
     log('error', 'session-history', 'Failed to fetch session messages', { err: e.message });
     res.status(500).json({ error: 'Failed to fetch session messages' });
@@ -981,15 +1003,12 @@ function getSessionList() {
   });
 }
 
-function getEffectiveHistory(sessionId) {
-  const direct = getHistoryRows(sessionId);
-  if (direct.length > 0) return direct;
-
+function findRelatedHistorySession(sessionId) {
   const liveMeta = sessionMeta.get(sessionId);
   const persistedMeta = stmtGetSessionMeta.get(sessionId);
   const meta = liveMeta || persistedMeta;
-  if (!meta || meta.agent_type !== 'codex-desktop') return direct;
-  if (liveMeta) return direct;
+  if (!meta || meta.agent_type !== 'codex-desktop') return null;
+  if (liveMeta) return null;
 
   let candidate = null;
   if (meta.workspace_path) {
@@ -1010,6 +1029,15 @@ function getEffectiveHistory(sessionId) {
       'codex-desktop'
     );
   }
+  if (!candidate?.session_id) return null;
+  return candidate;
+}
+
+function getEffectiveHistory(sessionId) {
+  const direct = getHistoryRows(sessionId);
+  if (direct.length > 0) return direct;
+
+  const candidate = findRelatedHistorySession(sessionId);
   if (!candidate?.session_id) return direct;
 
   const fallback = getHistoryRows(candidate.session_id);
@@ -1022,6 +1050,42 @@ function getEffectiveHistory(sessionId) {
     });
   }
   return fallback;
+}
+
+function getEffectiveHistoryTail(sessionId, limit) {
+  const directTotal = getHistoryCount(sessionId);
+  if (directTotal > 0) {
+    const messages = getHistoryRowsTail(sessionId, limit);
+    return {
+      messages,
+      total: directTotal,
+      loaded: messages.length,
+      source_session: sessionId,
+    };
+  }
+
+  const candidate = findRelatedHistorySession(sessionId);
+  if (!candidate?.session_id) {
+    return { messages: [], total: 0, loaded: 0, source_session: sessionId };
+  }
+
+  const total = getHistoryCount(candidate.session_id);
+  const messages = total > 0 ? getHistoryRowsTail(candidate.session_id, limit) : [];
+  if (messages.length > 0) {
+    log('info', 'history', 'Using related Codex Desktop history tail fallback', {
+      requested_session: sessionId,
+      fallback_session: candidate.session_id,
+      fallback_agent_type: candidate.agent_type,
+      message_count: messages.length,
+      total_messages: total,
+    });
+  }
+  return {
+    messages,
+    total,
+    loaded: messages.length,
+    source_session: candidate.session_id,
+  };
 }
 
 // Returns any active proxy WebSocket, regardless of session registration.
@@ -2055,20 +2119,20 @@ function handleClientConnection(ws, req) {
       if (!id) return;
       if (sinceSeq != null && sinceSeq > 0) {
         const messages = getHistoryRowsFrom(id, sinceSeq);
-        ws.send(JSON.stringify({ type: 'history_delta', session: id, since_sequence: sinceSeq, messages }));
+        ws.send(JSON.stringify({ type: 'history_delta', session: id, request_id: msg.request_id || null, since_sequence: sinceSeq, messages }));
       } else {
         const requestedLimit = msg.full ? 0 : Number(msg.limit || msg.tail_limit || msg.history_limit || 0);
         if (Number.isFinite(requestedLimit) && requestedLimit > 0) {
           const limit = Math.max(1, Math.min(1000, Math.floor(requestedLimit)));
-          const total = getHistoryCount(id);
-          const messages = getHistoryRowsTail(id, limit);
+          const result = getEffectiveHistoryTail(id, limit);
           ws.send(JSON.stringify({
             type: 'history',
             session: id,
-            messages,
-            partial: total > messages.length,
-            total_messages: total,
-            loaded_messages: messages.length,
+            request_id: msg.request_id || null,
+            messages: result.messages,
+            partial: result.total > result.loaded,
+            total_messages: result.total,
+            loaded_messages: result.loaded,
             limit,
             mode: 'tail',
           }));
@@ -2078,10 +2142,12 @@ function handleClientConnection(ws, req) {
         ws.send(JSON.stringify({
           type: 'history',
           session: id,
+          request_id: msg.request_id || null,
           messages,
           partial: false,
           total_messages: messages.length,
           loaded_messages: messages.length,
+          mode: 'full',
         }));
       }
 

@@ -4909,6 +4909,44 @@ class ProxyEngine extends EventEmitter {
     };
   }
 
+  _applyCodexCliSummaryMetadata(sessionId, session, summary) {
+    if (!session || !summary) return false;
+    let changed = false;
+    const nextWorkspaceName = summary.workspaceName || session.workspace_name;
+    const nextWorkspacePath = summary.workspacePath || session.workspace_path;
+    const nextChatTitle = summary.title || session.chat_title;
+    if (nextWorkspaceName && nextWorkspaceName !== session.workspace_name) {
+      session.workspace_name = nextWorkspaceName;
+      changed = true;
+    }
+    if (nextWorkspacePath && nextWorkspacePath !== session.workspace_path) {
+      session.workspace_path = nextWorkspacePath;
+      changed = true;
+    }
+    if (nextChatTitle && nextChatTitle !== session.chat_title) {
+      session.chat_title = nextChatTitle;
+      changed = true;
+    }
+    if (summary.updatedAt && summary.updatedAt !== session.last_seen_at) {
+      session.last_seen_at = summary.updatedAt;
+    }
+    if (summary.filePath && summary.filePath !== session.codexCliFilePath) {
+      session.codexCliFilePath = summary.filePath;
+      changed = true;
+    }
+    if (changed) {
+      session.windowTitle = session.workspace_name || session.windowTitle || 'Codex CLI';
+      sessionStore.updateSession(sessionId, {
+        workspace_path: session.workspace_path || null,
+        workspace_name: session.workspace_name || null,
+        window_title: session.windowTitle || null,
+        chat_title: session.chat_title || null,
+        codex_cli_file_path: session.codexCliFilePath || null,
+      });
+    }
+    return changed;
+  }
+
   _registerCodexCliSession(summary, { sendInitialHistory = true, archiveDiscovered = false, externalActive = null } = {}) {
     if (!summary?.cliSessionId) return null;
     const displayName = 'Codex CLI';
@@ -4924,11 +4962,7 @@ class ProxyEngine extends EventEmitter {
       const externalActiveFlag = externalActive == null
         ? existing.codexCliExternalActive === true
         : externalActive === true;
-      existing.workspace_name = summary.workspaceName || existing.workspace_name;
-      existing.workspace_path = summary.workspacePath || existing.workspace_path;
-      existing.chat_title = summary.title || existing.chat_title;
-      existing.last_seen_at = summary.updatedAt || existing.last_seen_at;
-      existing.codexCliFilePath = summary.filePath || existing.codexCliFilePath;
+      const metaChanged = this._applyCodexCliSummaryMetadata(sessionId, existing, summary);
       existing.codexCliArchiveDiscovered = archiveDiscovered === true;
       existing.codexCliExternalActive = externalActiveFlag;
       existing.cliSessionId = summary.cliSessionId;
@@ -4943,6 +4977,7 @@ class ProxyEngine extends EventEmitter {
         workspace_path: existing.workspace_path || null,
         workspace_name: existing.workspace_name || null,
       });
+      if (metaChanged) this._broadcastSessionSnapshot();
       const effectiveMessages = (summary.messages || []).length > 0 ? summary.messages : this._codexCliPendingTranscriptMessages(existing);
       const sig = this._transcriptSignature(effectiveMessages);
       if (sig !== existing.lastTranscriptSig) {
@@ -4980,11 +5015,7 @@ class ProxyEngine extends EventEmitter {
       const externalActiveFlag = externalActive == null
         ? existing.codexCliExternalActive === true
         : externalActive === true;
-      existing.workspace_name = summary.workspaceName || existing.workspace_name;
-      existing.workspace_path = summary.workspacePath || existing.workspace_path;
-      existing.chat_title = summary.title || existing.chat_title;
-      existing.last_seen_at = summary.updatedAt || existing.last_seen_at;
-      existing.codexCliFilePath = summary.filePath || existing.codexCliFilePath;
+      const metaChanged = this._applyCodexCliSummaryMetadata(sessionId, existing, summary);
       existing.codexCliArchiveDiscovered = archiveDiscovered === true;
       existing.codexCliExternalActive = externalActiveFlag;
       existing.cliSessionId = summary.cliSessionId;
@@ -4992,6 +5023,7 @@ class ProxyEngine extends EventEmitter {
       if (summary.permission_mode) existing.permission_mode = summary.permission_mode;
       if (summary.effort) existing.effort = summary.effort;
       this._setCodexCliActivity(sessionId, existing, summary.activity || existing.activity);
+      if (metaChanged) this._broadcastSessionSnapshot();
       const summaryMessages = summary.messages || [];
       const effectiveMessages = summaryMessages.length > 0 ? summaryMessages : this._codexCliPendingTranscriptMessages(existing);
       const sig = this._transcriptSignature(effectiveMessages);
@@ -5376,8 +5408,9 @@ class ProxyEngine extends EventEmitter {
         session._lastCodexCliMessages = messages;
         session._lastCodexCliActivity = summaryActivity;
         if (summary) {
-          session.last_seen_at = summary.updatedAt || session.last_seen_at;
-          session.chat_title = summary.title || session.chat_title;
+          if (this._applyCodexCliSummaryMetadata(sessionId, session, summary)) {
+            this._broadcastSessionSnapshot();
+          }
           if (summary.model_id) session.model_id = summary.model_id;
           if (summary.permission_mode) session.permission_mode = summary.permission_mode;
           if (summary.effort) session.effort = summary.effort;

@@ -7,10 +7,13 @@
 
 const { useState, useEffect, useRef, useCallback } = React;
 
+const DEFAULT_HISTORY_TAIL_LIMIT = 120;
+
 export function useRelay() {
     const [sessions,        setSessions]        = useState([]);   // string IDs (legacy) or metadata objects (v1)
     const [messages,        setMessages]        = useState({});   // sessionId -> [{role, content, _cid?, _optimistic?, _delivered?}]
     const [historyMeta,     setHistoryMeta]     = useState({});   // sessionId -> { partial, loaded, total, limit, mode }
+    const [historyLoading,  setHistoryLoading]  = useState({});   // sessionId -> { mode, requestedAt, requestId }
     const [connected,       setConnected]       = useState(false);
     const [unread,          setUnread]          = useState({});   // sessionId -> count
     const [thinking,        setThinking]        = useState({});   // sessionId -> label string | false
@@ -40,6 +43,8 @@ export function useRelay() {
     const wsRef            = useRef(null);
     const activeSessionRef = useRef(null);
     const handleRelayMessageRef = useRef(null);
+    const historyRequestSerial = useRef(0);
+    const latestHistoryRequest = useRef({});
 
     const send = useCallback((msg) => {
       if (wsRef.current?.readyState === WebSocket.OPEN) {
@@ -145,7 +150,15 @@ export function useRelay() {
     function requestHistory(sessionOrId, options = {}) {
       const id = typeof sessionOrId === 'string' ? sessionOrId : sessionOrId?.session_id;
       if (!id) return;
-      const payload = { type: 'get_history', session: id };
+      if (wsRef.current?.readyState !== WebSocket.OPEN) return;
+      const requestId = `hist-${Date.now()}-${++historyRequestSerial.current}`;
+      latestHistoryRequest.current[id] = requestId;
+      const mode = options.full ? 'full' : 'tail';
+      setHistoryLoading(prev => ({
+        ...prev,
+        [id]: { mode, requestedAt: Date.now(), requestId },
+      }));
+      const payload = { type: 'get_history', session: id, request_id: requestId };
       const limit = Number(options.limit || options.tailLimit || 0);
       if (Number.isFinite(limit) && limit > 0 && !options.full) {
         payload.limit = Math.floor(limit);
@@ -167,6 +180,13 @@ export function useRelay() {
       setThinking(prev => ({ ...prev, [sessionId]: false }));
       setThinkingContent(prev => ({ ...prev, [sessionId]: '' }));
       setActivities(prev => ({ ...prev, [sessionId]: false }));
+      setHistoryMeta(prev => ({ ...prev, [sessionId]: null }));
+      setHistoryLoading(prev => {
+        if (!prev[sessionId]) return prev;
+        const next = { ...prev };
+        delete next[sessionId];
+        return next;
+      });
     }
 
     // Responds to a permission prompt.
@@ -562,10 +582,25 @@ export function useRelay() {
       if (t === 'history' || t === 'history_snapshot') {
         const id = msg.session || msg.session_id;
         if (!id) return;
+        if (
+          msg.request_id
+          && latestHistoryRequest.current[id]
+          && latestHistoryRequest.current[id] !== msg.request_id
+        ) {
+          return;
+        }
         // Don't overwrite cleared messages for sessions in list-view mode
         const sessionObj = sessions.find(s => (typeof s === 'object' ? s.session_id : s) === id);
         const preserveListViewHistory = shouldPreserveTranscriptInListView(sessionObj);
-        if (sessionObj && typeof sessionObj === 'object' && sessionObj.is_list_view && msg.messages?.length > 0 && !preserveListViewHistory) return;
+        if (sessionObj && typeof sessionObj === 'object' && sessionObj.is_list_view && msg.messages?.length > 0 && !preserveListViewHistory) {
+          setHistoryLoading(prev => {
+            if (!prev[id]) return prev;
+            const next = { ...prev };
+            delete next[id];
+            return next;
+          });
+          return;
+        }
         const nextMessages = msg.messages || [];
         setMessages(prev => ({ ...prev, [id]: nextMessages }));
         setHistoryMeta(prev => ({
@@ -578,6 +613,12 @@ export function useRelay() {
             mode: msg.mode || (msg.partial ? 'tail' : 'full'),
           },
         }));
+        setHistoryLoading(prev => {
+          if (!prev[id]) return prev;
+          const next = { ...prev };
+          delete next[id];
+          return next;
+        });
         return;
       }
 
@@ -746,9 +787,10 @@ export function useRelay() {
         }
         if (sid && msg.result === 'ok' && (msg.command === 'new_thread' || msg.command === 'switch_thread')) {
           clearSessionTranscript(sid);
-          requestHistory(sid);
-          setTimeout(() => requestHistory(sid), 300);
-          setTimeout(() => requestHistory(sid), 900);
+          const tailOptions = { limit: DEFAULT_HISTORY_TAIL_LIMIT };
+          requestHistory(sid, tailOptions);
+          setTimeout(() => requestHistory(sid, tailOptions), 300);
+          setTimeout(() => requestHistory(sid, tailOptions), 900);
         }
         if (msg.command === 'permission_response' && sid) {
           if (msg.result === 'ok') {
@@ -981,7 +1023,7 @@ export function useRelay() {
     // where `sessions` / `messages` would be frozen at initial render values).
     handleRelayMessageRef.current = handleRelayMessage;
 
-    return { sessions, messages, historyMeta, connected, unread, setUnread, thinking, thinkingContent, activities, health, deliveryStates, launchStates, justLaunched, setJustLaunched, permissionPrompts, respondToPrompt, errorPrompts, respondToErrorPrompt, interruptSession, agentConfigs, requestAgentConfig, setAgentModel, setAgentEffort, setAgentPermissionMode, setAutoApprovePermissions, setAntigravityMode, setCodexConfig, newThread, openPanel, openNativeWindow, requestChatList, switchChat, newChat, chatLists, requestThreadList, switchThread, threadLists, switchWorkspace, requestTerminalOutput, terminalOutputs, requestFileChanges, fileChanges, sendAttachment, send, sendToSession, steerMessage, discardQueuedMessage, editQueuedMessage, queuedMessages, launchSession, resumeSession, closeSession, activeSessionRef, workspaces, branchLists, requestBranchList, switchBranch, createBranch, skillLists, requestSkillList, automationViews, showCodexAutomation, controlResults, directoryListings, requestDirectoryListing, fileContents, requestFileContent, requestHistory };
+    return { sessions, messages, historyMeta, historyLoading, connected, unread, setUnread, thinking, thinkingContent, activities, health, deliveryStates, launchStates, justLaunched, setJustLaunched, permissionPrompts, respondToPrompt, errorPrompts, respondToErrorPrompt, interruptSession, agentConfigs, requestAgentConfig, setAgentModel, setAgentEffort, setAgentPermissionMode, setAutoApprovePermissions, setAntigravityMode, setCodexConfig, newThread, openPanel, openNativeWindow, requestChatList, switchChat, newChat, chatLists, requestThreadList, switchThread, threadLists, switchWorkspace, requestTerminalOutput, terminalOutputs, requestFileChanges, fileChanges, sendAttachment, send, sendToSession, steerMessage, discardQueuedMessage, editQueuedMessage, queuedMessages, launchSession, resumeSession, closeSession, activeSessionRef, workspaces, branchLists, requestBranchList, switchBranch, createBranch, skillLists, requestSkillList, automationViews, showCodexAutomation, controlResults, directoryListings, requestDirectoryListing, fileContents, requestFileContent, requestHistory };
   }
 
 // (removed window.useRelay — now an ES module export)

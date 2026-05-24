@@ -8,7 +8,8 @@ import { useRelay } from './hooks.jsx';
 const { useState, useRef, useEffect } = React;
 
 const DRAFT_STORAGE_KEY = 'remote-agent-chat:drafts:v1';
-const CODEX_CLI_INITIAL_HISTORY_LIMIT = 250;
+const DEFAULT_INITIAL_HISTORY_LIMIT = 120;
+const CODEX_CLI_INITIAL_HISTORY_LIMIT = 160;
 const SLASH_COMMANDS = [
   { command: '/plan', detail: 'Outline the implementation approach and major steps.' },
   { command: '/review', detail: 'Review the current changes for bugs, regressions, and missing tests.' },
@@ -340,15 +341,14 @@ function sessionAgent(sessionOrId, agentConfig) {
 
 function sessionSubLabel(sessionOrId, fallbackId, agentConfig) {
   if (sessionOrId && typeof sessionOrId === 'object') {
-    // workspace_name is the clean basename resolved by the proxy (preferred over window_title
-    // which is "window-1" for Claude/Codex/Gemini because the Electron parent lookup fails).
+    const workspaceCandidate = workspaceCandidateFromSession(sessionOrId, agentConfig);
     const scopeBasename = agentConfig?.file_access_scope
       ? agentConfig.file_access_scope.replace(/\\/g, '/').split('/').filter(Boolean).pop()
       : null;
     const panelSuffix = sessionOrId.agent_type === 'antigravity_panel' && sessionOrId.panel_title
       ? ` / ${sessionOrId.panel_title}`
       : '';
-    const workspacePart = (sessionOrId.workspace_name || scopeBasename || sessionOrId.window_title || sessionOrId.workspace_path || fallbackId || 'Session') + panelSuffix;
+    const workspacePart = (workspaceCandidate?.label || sessionOrId.workspace_name || scopeBasename || sessionOrId.window_title || sessionOrId.workspace_path || fallbackId || 'Session') + panelSuffix;
     // Append chat_title (first user message preview) when available and workspace name isn't already a full conversation title
     if (sessionOrId.chat_title && !workspacePart.includes('/')) {
       return `${workspacePart} / ${sessionOrId.chat_title}`;
@@ -366,6 +366,24 @@ function basenameFromPath(value) {
   const text = safeString(value).replace(/\\/g, '/').replace(/\/+$/, '').trim();
   if (!text) return '';
   return text.split('/').filter(Boolean).pop() || text;
+}
+
+function normalizePathForDisplay(value) {
+  return safeString(value).replace(/\\/g, '/').replace(/\/+$/, '').trim();
+}
+
+function looksLikeAbsolutePath(value) {
+  const text = normalizePathForDisplay(value);
+  return /^[A-Za-z]:\//.test(text) || text.startsWith('//') || text.startsWith('/');
+}
+
+function isUserHomeOrDocumentsPath(value) {
+  const text = normalizePathForDisplay(value).toLowerCase();
+  return /^[a-z]:\/users\/[^/]+$/.test(text)
+    || /^[a-z]:\/users\/[^/]+\/documents$/.test(text)
+    || /^\/users\/[^/]+$/.test(text)
+    || /^\/users\/[^/]+\/documents$/.test(text)
+    || /^\/home\/[^/]+$/.test(text);
 }
 
 function stripWorkspaceDecorations(value) {
@@ -386,34 +404,192 @@ function parseVSCodeWindowParts(value) {
   return parts;
 }
 
-function sidebarWorkspaceLabel(sessionOrId, agentConfig) {
-  if (!sessionOrId || typeof sessionOrId !== 'object') return 'Other';
-  const scopeBasename = basenameFromPath(agentConfig?.file_access_scope);
-  const pathBasename = basenameFromPath(sessionOrId.workspace_path);
-  if (pathBasename) return pathBasename;
-  if (scopeBasename && scopeBasename !== 'unknown') return scopeBasename;
+function isLowSignalChatTitle(value) {
+  const text = safeString(value).trim();
+  if (!text) return false;
+  if (/^!\[[^\]]*\]\(\s*data:image\//i.test(text)) return true;
+  if (/^\[File:\s*[^\\\]]+\.(png|jpe?g|gif|webp|bmp|svg)(?:\b|[0-9x×])/i.test(text)) return true;
+  if (/^(image|screenshot)[\w .-]*\.(png|jpe?g|gif|webp|bmp|svg)(?:\b|[0-9x×])/i.test(text)) return true;
+  if (/^(?:[A-Za-z]:\\|\/|\\\\).+\.(png|jpe?g|gif|webp|bmp|svg|md|js|jsx|ts|tsx|json|log|txt)\b/i.test(text)) return true;
+  return false;
+}
 
-  const workspaceName = safeString(sessionOrId.workspace_name).trim();
-  if (workspaceName) {
-    const workspaceParts = parseVSCodeWindowParts(workspaceName);
-    if (workspaceParts.length >= 2) return stripWorkspaceDecorations(workspaceParts[workspaceParts.length - 1]);
-    return stripWorkspaceDecorations(workspaceName);
+const LOW_SIGNAL_WORKSPACE_LABELS = new Set([
+  'agent',
+  'agent manager',
+  'agent session',
+  'antigravity',
+  'antigravity chat',
+  'antigravity v2',
+  'claude',
+  'claude code',
+  'codex',
+  'codex cli',
+  'codex desktop',
+  'connected session',
+  'other',
+  'session',
+  'unknown',
+]);
+
+function humanizeWorkspaceLabel(value) {
+  const stripped = stripWorkspaceDecorations(value);
+  if (!stripped) return '';
+  const base = basenameFromPath(stripped);
+  const hadWordSeparators = /[-_]/.test(base);
+  let label = base.replace(/[-_]+/g, ' ');
+  if (hadWordSeparators || !/\s/.test(base)) {
+    label = label.replace(/([a-z])([A-Z])/g, '$1 $2');
+  }
+  return label
+    .replace(/\s+/g, ' ')
+    .trim();
+}
+
+function isLowSignalWorkspaceLabel(value) {
+  const label = humanizeWorkspaceLabel(value).toLowerCase();
+  if (!label) return true;
+  if (/^window\s+\d+$/.test(label)) return true;
+  return LOW_SIGNAL_WORKSPACE_LABELS.has(label);
+}
+
+function makeWorkspaceCandidate(label, key) {
+  const display = humanizeWorkspaceLabel(label);
+  if (isLowSignalWorkspaceLabel(display)) return null;
+  return {
+    label: display,
+    key: safeString(key || display).replace(/\\/g, '/').replace(/\/+$/, '').toLowerCase(),
+  };
+}
+
+function pathWorkspaceCandidate(pathValue) {
+  const pathText = normalizePathForDisplay(pathValue);
+  if (!pathText || !looksLikeAbsolutePath(pathText) || isUserHomeOrDocumentsPath(pathText)) return null;
+  return makeWorkspaceCandidate(basenameFromPath(pathText), pathText);
+}
+
+function vscodeWorkspaceCandidate(titleValue) {
+  const parts = parseVSCodeWindowParts(titleValue);
+  if (parts.length < 2) return null;
+  return makeWorkspaceCandidate(parts[parts.length - 1], parts[parts.length - 1]);
+}
+
+function namedWorkspaceCandidate(value) {
+  const text = stripWorkspaceDecorations(value);
+  if (!text || looksLikeAbsolutePath(text)) return null;
+  if (parseVSCodeWindowParts(text).length >= 2) return null;
+  return makeWorkspaceCandidate(text, text);
+}
+
+function workspaceCandidateFromSession(sessionOrId, agentConfig, knownWorkspaces = []) {
+  if (!sessionOrId || typeof sessionOrId !== 'object') return null;
+
+  const directCandidates = [
+    pathWorkspaceCandidate(sessionOrId.workspace_path),
+    pathWorkspaceCandidate(agentConfig?.file_access_scope),
+    vscodeWorkspaceCandidate(sessionOrId.workspace_name),
+    vscodeWorkspaceCandidate(sessionOrId.window_title),
+    namedWorkspaceCandidate(sessionOrId.workspace_name),
+  ].filter(Boolean);
+  if (directCandidates.length > 0) {
+    const candidate = directCandidates[0];
+    return knownWorkspaces.find(known => known.label.toLowerCase() === candidate.label.toLowerCase()) || candidate;
   }
 
-  const windowParts = parseVSCodeWindowParts(sessionOrId.window_title);
-  if (windowParts.length >= 2) return stripWorkspaceDecorations(windowParts[windowParts.length - 1]);
-  return 'Other';
+  const textFields = [
+    sessionOrId.chat_title,
+    sessionOrId.session_title,
+    sessionOrId.title,
+    sessionOrId.display_title,
+    sessionOrId.window_title,
+    sessionOrId.workspace_name,
+  ].map(value => safeString(value).toLowerCase()).filter(Boolean);
+  const sortedKnown = [...knownWorkspaces].sort((a, b) => b.label.length - a.label.length);
+  for (const known of sortedKnown) {
+    const variants = [
+      known.label.toLowerCase(),
+      known.label.toLowerCase().replace(/\s+/g, '-'),
+      known.label.toLowerCase().replace(/\s+/g, ''),
+    ];
+    if (textFields.some(text => variants.some(variant => variant && text.includes(variant)))) {
+      return known;
+    }
+  }
+
+  return null;
 }
 
-function sidebarWorkspaceKey(sessionOrId, agentConfig) {
-  const label = sidebarWorkspaceLabel(sessionOrId, agentConfig);
-  const path = sessionOrId && typeof sessionOrId === 'object'
-    ? safeString(sessionOrId.workspace_path || agentConfig?.file_access_scope).replace(/\\/g, '/').replace(/\/+$/, '')
-    : '';
-  return (path || label).toLowerCase();
+function collectKnownWorkspaceCandidates(sessionList, agentConfigs = {}) {
+  const byLabel = new Map();
+  function remember(candidate) {
+    if (!candidate) return;
+    const labelKey = candidate.label.toLowerCase();
+    const existing = byLabel.get(labelKey);
+    if (!existing || (looksLikeAbsolutePath(candidate.key) && !looksLikeAbsolutePath(existing.key))) {
+      byLabel.set(labelKey, candidate);
+    }
+  }
+  for (const session of sessionList || []) {
+    const id = sessionIdOf(session);
+    const config = id ? agentConfigs[id] : null;
+    if (!session || typeof session !== 'object') continue;
+    [
+      pathWorkspaceCandidate(session.workspace_path),
+      pathWorkspaceCandidate(config?.file_access_scope),
+      vscodeWorkspaceCandidate(session.workspace_name),
+      vscodeWorkspaceCandidate(session.window_title),
+      namedWorkspaceCandidate(session.workspace_name),
+    ].forEach(remember);
+  }
+  return Array.from(byLabel.values());
 }
 
-function sidebarChatTitle(sessionOrId, fallbackId, agentConfig) {
+function sidebarWorkspaceLabel(sessionOrId, agentConfig, knownWorkspaces = []) {
+  return workspaceCandidateFromSession(sessionOrId, agentConfig, knownWorkspaces)?.label || 'Unscoped Sessions';
+}
+
+function sidebarWorkspaceKey(sessionOrId, agentConfig, knownWorkspaces = []) {
+  const candidate = workspaceCandidateFromSession(sessionOrId, agentConfig, knownWorkspaces);
+  return candidate?.key || 'unscoped-sessions';
+}
+
+function compactSessionId(value) {
+  const id = safeString(value).trim();
+  if (!id) return '';
+  if (id.length <= 10) return id;
+  return `${id.slice(0, 6)}...${id.slice(-4)}`;
+}
+
+function stripTitleNoise(content) {
+  return normalizeMessageContent(content)
+    .replace(/!\[[^\]]*\]\((?:data:image\/[^)]+|\/uploads\/[^)]+|[^)]*\.(?:png|jpe?g|gif|webp|bmp|svg))\)/gi, ' ')
+    .replace(/\[File:\s*[^\]]+\]/gi, ' ')
+    .replace(/<goal_context>[\s\S]*?<\/goal_context>/gi, ' ')
+    .replace(/<[^>\n]{1,80}>/g, ' ')
+    .replace(/```[\s\S]*?```/g, ' ')
+    .replace(/`([^`]+)`/g, '$1')
+    .replace(/^\s*(?:user|assistant|codex|claude|tool result)\s*[:\-]\s*/i, '')
+    .replace(/\s+/g, ' ')
+    .trim();
+}
+
+function titleFromMessageContent(content) {
+  const text = stripTitleNoise(content);
+  if (!text || isLowSignalChatTitle(text)) return '';
+  if (/^(thinking|working|tool result|tool:|exit code|wall time)\b/i.test(text)) return '';
+  if (/^[^A-Za-z0-9]+$/.test(text)) return '';
+  return text.slice(0, 80).trim();
+}
+
+function titleFromSessionMessages(sessionMessages) {
+  const list = Array.isArray(sessionMessages) ? sessionMessages : [];
+  const user = list.find(msg => msg?.role === 'user' && titleFromMessageContent(msg.content));
+  if (user) return titleFromMessageContent(user.content);
+  const any = list.find(msg => titleFromMessageContent(msg?.content || contentBlocksFallback(msg?.content_blocks)));
+  return any ? titleFromMessageContent(any.content || contentBlocksFallback(any.content_blocks)) : '';
+}
+
+function sidebarChatTitle(sessionOrId, fallbackId, agentConfig, sessionMessages = []) {
   const agent = sessionAgent(sessionOrId, agentConfig);
   if (sessionOrId && typeof sessionOrId === 'object') {
     const explicit = safeString(
@@ -422,24 +598,28 @@ function sidebarChatTitle(sessionOrId, fallbackId, agentConfig) {
       || sessionOrId.title
       || sessionOrId.display_title
     ).trim();
-    if (explicit) return explicit;
+    if (explicit && !isLowSignalChatTitle(explicit)) return explicit;
 
-    const windowParts = parseVSCodeWindowParts(sessionOrId.window_title || sessionOrId.workspace_name);
-    if (windowParts.length >= 2 && windowParts[0]) return windowParts[0];
+    const messageTitle = titleFromSessionMessages(sessionMessages);
+    if (messageTitle) return messageTitle;
+    if (explicit) return explicit;
   }
   const id = fallbackId || sessionIdOf(sessionOrId);
-  if (typeof id === 'string' && id && !isUuidLike(id)) return id;
+  if (typeof id === 'string' && id && !isUuidLike(id) && !/[\\/:]/.test(id) && id.length <= 48) return id;
+  const shortId = compactSessionId(id);
+  if (shortId) return `${agent.name || 'Session'} ${shortId}`;
   return agent.name || 'Session';
 }
 
 function groupSessionsByWorkspace(sessionList, agentConfigs = {}) {
   const groups = [];
   const byKey = new Map();
+  const knownWorkspaces = collectKnownWorkspaceCandidates(sessionList, agentConfigs);
   for (const session of sessionList || []) {
     const id = sessionIdOf(session);
     const config = id ? agentConfigs[id] : null;
-    const label = sidebarWorkspaceLabel(session, config);
-    const key = sidebarWorkspaceKey(session, config) || label.toLowerCase();
+    const label = sidebarWorkspaceLabel(session, config, knownWorkspaces);
+    const key = sidebarWorkspaceKey(session, config, knownWorkspaces) || label.toLowerCase();
     let group = byKey.get(key);
     if (!group) {
       group = { key, label, sessions: [] };
@@ -648,11 +828,11 @@ function QueuedItem({ qm, onSteer, onDiscard, onEdit }) {
 // Each card shows: colored agent badge, agent name, window label, health dot,
 // and either a thinking spinner or an unread count badge.
 
-function SessionCard({ session, health, unread, isThinking, isActive, agentConfig, activity, hasBlockingPrompt, blockingPromptLabel, onSelect, onClose, onAutomations, showAutomationsActive, onSkills, showSkillsActive }) {
+function SessionCard({ session, health, unread, isThinking, isActive, agentConfig, activity, sessionMessages, hasBlockingPrompt, blockingPromptLabel, onSelect, onClose, onAutomations, showAutomationsActive, onSkills, showSkillsActive }) {
   const sessionId = sessionIdOf(session);
   const agent    = sessionAgent(session, agentConfig);
   const winLabel = sessionSubLabel(session, sessionId, agentConfig);
-  const chatTitle = sidebarChatTitle(session, sessionId, agentConfig);
+  const chatTitle = sidebarChatTitle(session, sessionId, agentConfig, sessionMessages);
   const cardTitle = [chatTitle, winLabel || agent.name].filter(Boolean).join(' - ');
   const dotColor = HEALTH_COLOR[health] || '#444c56';
   const rateLimitedUntil = session?.rate_limited_until || null;
@@ -3001,7 +3181,7 @@ class AppErrorBoundary extends React.Component {
 }
 
 function App() {
-  const { sessions, messages, historyMeta, connected, unread, setUnread, thinking, thinkingContent, activities, health, deliveryStates, launchStates, justLaunched, setJustLaunched, permissionPrompts, respondToPrompt, errorPrompts, respondToErrorPrompt, interruptSession, agentConfigs, requestAgentConfig, setAgentModel, setAgentEffort, setAgentPermissionMode, setAutoApprovePermissions, setAntigravityMode, setCodexConfig, newThread, openPanel, openNativeWindow, requestChatList, switchChat, newChat, chatLists, requestThreadList, switchThread, threadLists, switchWorkspace, requestTerminalOutput, terminalOutputs, requestFileChanges, fileChanges, sendAttachment, send, sendToSession, steerMessage, discardQueuedMessage, editQueuedMessage, queuedMessages, launchSession, resumeSession, closeSession, activeSessionRef, workspaces, branchLists, requestBranchList, switchBranch, createBranch, skillLists, requestSkillList, automationViews, showCodexAutomation, controlResults, directoryListings, requestDirectoryListing, fileContents, requestFileContent, requestHistory } = useRelay();
+  const { sessions, messages, historyMeta, historyLoading, connected, unread, setUnread, thinking, thinkingContent, activities, health, deliveryStates, launchStates, justLaunched, setJustLaunched, permissionPrompts, respondToPrompt, errorPrompts, respondToErrorPrompt, interruptSession, agentConfigs, requestAgentConfig, setAgentModel, setAgentEffort, setAgentPermissionMode, setAutoApprovePermissions, setAntigravityMode, setCodexConfig, newThread, openPanel, openNativeWindow, requestChatList, switchChat, newChat, chatLists, requestThreadList, switchThread, threadLists, switchWorkspace, requestTerminalOutput, terminalOutputs, requestFileChanges, fileChanges, sendAttachment, send, sendToSession, steerMessage, discardQueuedMessage, editQueuedMessage, queuedMessages, launchSession, resumeSession, closeSession, activeSessionRef, workspaces, branchLists, requestBranchList, switchBranch, createBranch, skillLists, requestSkillList, automationViews, showCodexAutomation, controlResults, directoryListings, requestDirectoryListing, fileContents, requestFileContent, requestHistory } = useRelay();
   const [activeSession, setActiveSession] = useState(null);
   const [drafts, setDrafts]             = useState({});
   const [draftFiles, setDraftFiles]     = useState({});
@@ -3261,9 +3441,10 @@ async function uploadBinaryDraft(sessionId, base64, mimeType, filename) {
   }, [controlResults]);
 
   function historyRequestOptionsFor(sessionMeta) {
-    return sessionMeta?.agent_type === 'codex_cli'
-      ? { limit: CODEX_CLI_INITIAL_HISTORY_LIMIT }
-      : {};
+    const limit = sessionMeta?.agent_type === 'codex_cli'
+      ? CODEX_CLI_INITIAL_HISTORY_LIMIT
+      : DEFAULT_INITIAL_HISTORY_LIMIT;
+    return { limit };
   }
 
   function selectSession(id, sessionMeta) {
@@ -3458,6 +3639,7 @@ async function uploadBinaryDraft(sessionId, base64, mimeType, filename) {
     sessionIdOf(s) === activeSession
   );
   const activeHistoryMeta = activeSession ? (historyMeta[activeSession] || null) : null;
+  const activeHistoryLoading = activeSession ? (historyLoading[activeSession] || null) : null;
 
   // Full transcript history is loaded lazily for the selected session only.
   // Codex CLI transcripts can be thousands of turns, so hydrate a recent tail
@@ -3519,8 +3701,16 @@ async function uploadBinaryDraft(sessionId, base64, mimeType, filename) {
     && activeSessionMeta.visible_pane_agent
     && activeSessionMeta.visible_pane_agent !== 'codex'
   );
-  const activeLabel = activeSession ? sessionLabel(activeSessionMeta, activeSession) : 'Agent Chat';
   const activeAgent = sessionAgent(activeSessionMeta || activeSession, activeConfig);
+  const activeSessionGroup = activeSession
+    ? sessionGroups.find(group => group.sessions.some(session => sessionIdOf(session) === activeSession))
+    : null;
+  const activeGroupLabel = activeSessionGroup?.label && activeSessionGroup.label !== 'Unscoped Sessions'
+    ? activeSessionGroup.label
+    : '';
+  const activeLabel = activeSession
+    ? `${activeAgent.name}${activeGroupLabel ? ` — ${activeGroupLabel}` : ''}`
+    : 'Agent Chat';
   const activeAutomationView = activeSession ? automationViews[activeSession] : null;
   const activeLooksLikeCodex = activeAgent?.name === 'Codex' || /^Codex\b/.test(activeLabel || '');
   const showVisiblePaneBanner = !!(
@@ -3933,6 +4123,7 @@ async function uploadBinaryDraft(sessionId, base64, mimeType, filename) {
                     isActive={id === activeSession}
                     agentConfig={agentConfigs[id] || null}
                     activity={activities[id] || null}
+                    sessionMessages={messages[id] || []}
                     hasBlockingPrompt={!!permissionPrompts[id] || !!isBlockingErrorPrompt(errorPrompts[id])}
                     blockingPromptLabel={permissionPrompts[id] ? 'Permission required' : (errorPrompts[id]?.title || 'Action required')}
                     onSelect={() => selectSession(id, s)}
@@ -4357,7 +4548,9 @@ async function uploadBinaryDraft(sessionId, base64, mimeType, filename) {
           {showPartialHistoryBanner && (
             <div className="history-tail-banner">
               <span>Showing latest {partialHistoryLoaded.toLocaleString()} of {partialHistoryTotal.toLocaleString()} messages</span>
-              <button type="button" onClick={loadFullActiveHistory}>Load full history</button>
+              <button type="button" onClick={loadFullActiveHistory} disabled={activeHistoryLoading?.mode === 'full'}>
+                {activeHistoryLoading?.mode === 'full' ? 'Loading full history...' : 'Load full history'}
+              </button>
             </div>
           )}
           {!activeSession ? (
@@ -4426,6 +4619,11 @@ async function uploadBinaryDraft(sessionId, base64, mimeType, filename) {
                   </button>
                 ))}
               </div>
+            </div>
+          ) : currentMessages.length === 0 && activeHistoryLoading ? (
+            <div className="empty-state history-loading-state">
+              <span className="new-session-spinner" />
+              <div>{activeHistoryLoading.mode === 'full' ? 'Loading full history...' : 'Loading latest messages...'}</div>
             </div>
           ) : currentMessages.length === 0 ? (
             <div className="empty-state"><div className="icon">💬</div><div>No messages yet</div></div>
