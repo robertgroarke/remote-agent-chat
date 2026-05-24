@@ -116,7 +116,10 @@ const DEFERRED_HISTORY_FLUSH_MAX_BYTES = 512 * 1024;
 // should be loaded through explicit tail requests or incremental messages, not
 // repeatedly serialized and pushed through the relay during page refresh.
 const AUTOMATIC_HISTORY_SNAPSHOT_MAX_BYTES = envMbBytes('RAC_HISTORY_SNAPSHOT_AUTO_MAX_MB', 4, 1, 64);
-const CODEX_CLI_HISTORY_CHUNK_BYTES = envMbBytes('CODEX_CLI_HISTORY_CHUNK_MB', 2, 1, 16);
+const CODEX_CLI_HISTORY_CHUNK_BYTES = envMbBytes('CODEX_CLI_HISTORY_CHUNK_MB', 1, 1, 16);
+const CODEX_CLI_HISTORY_TAIL_MIN_INTERVAL_MS = 1_500;
+const CODEX_CLI_HISTORY_OLDER_MIN_INTERVAL_MS = 5_000;
+const CODEX_CLI_HISTORY_REPEAT_CURSOR_MS = 60_000;
 
 // ─── ProxyEngine class ─────────────────────────────────────────────────────
 
@@ -167,6 +170,8 @@ class ProxyEngine extends EventEmitter {
 
     // Snapshot debounce timer
     this._snapshotTimer = null;
+    this._largeHistorySkipLogAt = new Map();
+    this._codexCliHistoryChunkRequests = new Map();
 
     // Main poll interval handle
     this._pollTimer = null;
@@ -876,6 +881,35 @@ class ProxyEngine extends EventEmitter {
   }
 
   // ─── Workspace discovery helpers ─────────────────────────────────────────
+
+  _stripEditorWindowTitleDecorations(value) {
+    return String(value || '')
+      .replace(/\s+\(Workspace\)$/i, '')
+      .replace(/\s+-\s+(?:Visual Studio Code|Code|Cursor|Antigravity)(?:\s*\[[^\]]+\]|\s+(?:Administrator|Admin))?$/i, '')
+      .trim();
+  }
+
+  _isEditorAppChromeLabel(value) {
+    return /^(?:Visual Studio Code|Code|Cursor|Antigravity)(?:\s*\[[^\]]+\]|\s+(?:Administrator|Admin))?$/i.test(String(value || '').trim());
+  }
+
+  _parseEditorWindowTitleParts(value) {
+    const raw = String(value || '').trim();
+    if (!raw) return [];
+    const parts = raw.split(/\s+-\s+/)
+      .map(part => this._stripEditorWindowTitleDecorations(part))
+      .filter(Boolean);
+    while (parts.length && this._isEditorAppChromeLabel(parts[parts.length - 1])) {
+      parts.pop();
+    }
+    return parts;
+  }
+
+  _workspaceTitleFromEditorWindowTitle(value) {
+    const parts = this._parseEditorWindowTitleParts(value);
+    if (parts.length >= 2) return parts[parts.length - 1];
+    return null;
+  }
 
   _readAntigravityWindowPaths() {
     try {
@@ -3597,6 +3631,47 @@ class ProxyEngine extends EventEmitter {
     }
   }
 
+  _codexCliHistoryCursorSig(msg) {
+    if (!msg || msg.mode !== 'older') return '';
+    const beforeOffset = msg.before_offset ?? msg.beforeOffset ?? msg.cursor?.next_before_offset ?? '';
+    const beforeId = msg.before_id ?? msg.beforeId ?? msg.cursor?.next_before_id ?? '';
+    return `${beforeOffset}\u0001${beforeId}`;
+  }
+
+  _codexCliHistoryChunkThrottle(sessionId, msg) {
+    const mode = msg.mode === 'older' ? 'older' : 'tail';
+    if (mode === 'older' && !msg.user_initiated) {
+      return {
+        code: 'history_older_requires_user_action',
+        message: 'Older Codex CLI history chunks require a current manual WebUI request.',
+      };
+    }
+    const now = Date.now();
+    const key = `${sessionId}:${mode}`;
+    const cursorSig = this._codexCliHistoryCursorSig(msg);
+    const minInterval = mode === 'older'
+      ? CODEX_CLI_HISTORY_OLDER_MIN_INTERVAL_MS
+      : CODEX_CLI_HISTORY_TAIL_MIN_INTERVAL_MS;
+    const previous = this._codexCliHistoryChunkRequests.get(key);
+    if (previous) {
+      const elapsed = now - previous.at;
+      if (elapsed < minInterval) {
+        return {
+          code: 'history_chunk_throttled',
+          message: 'Codex CLI history chunk request throttled to protect the browser and proxy.',
+        };
+      }
+      if (mode === 'older' && cursorSig && previous.cursorSig === cursorSig && elapsed < CODEX_CLI_HISTORY_REPEAT_CURSOR_MS) {
+        return {
+          code: 'history_chunk_duplicate_cursor',
+          message: 'Duplicate older Codex CLI history cursor ignored.',
+        };
+      }
+    }
+    this._codexCliHistoryChunkRequests.set(key, { at: now, cursorSig });
+    return null;
+  }
+
   _handleHistoryChunkRequest(msg) {
     const sessionId = msg.session_id || msg.session;
     const requestId = msg.request_id || null;
@@ -3620,6 +3695,8 @@ class ProxyEngine extends EventEmitter {
     }
     const filePath = session.codexCliFilePath || session.codex_cli_file_path;
     if (!filePath) return fail('archive_not_found', 'Codex CLI archive path is unavailable');
+    const throttle = this._codexCliHistoryChunkThrottle(sessionId, msg);
+    if (throttle) return fail(throttle.code, throttle.message);
 
     const requestedBytes = Number(msg.chunk_bytes || msg.chunkBytes || 0);
     const chunkBytes = Number.isFinite(requestedBytes) && requestedBytes > 0
@@ -3738,6 +3815,15 @@ class ProxyEngine extends EventEmitter {
     return { fits: bytes <= maxBytes, bytes, counted: messages.length };
   }
 
+  _shouldLogLargeHistorySkip(sessionId, reason) {
+    const key = `${sessionId}:${String(reason || 'history').toLowerCase()}`;
+    const now = Date.now();
+    const last = this._largeHistorySkipLogAt.get(key) || 0;
+    if (now - last < 30000) return false;
+    this._largeHistorySkipLogAt.set(key, now);
+    return true;
+  }
+
   _sessionSnapshotSignature(metas) {
     const stableMetas = metas.map(meta => ({
       ...meta,
@@ -3777,10 +3863,12 @@ class ProxyEngine extends EventEmitter {
     // Do not send a clipped history snapshot. The relay treats snapshots as
     // authoritative and replaces persisted history; sending only the tail would
     // erase older messages from the WebUI.
-    this._log(
-      'warn',
-      `[${sessionId}] Skipping large history snapshot (${fullMessages.length} msgs, >${Math.round(maxBytes / 1024)} KB after ${sizeInfo.counted} msgs, ${reason}); browser will request transcript tail on selection`
-    );
+    if (this._shouldLogLargeHistorySkip(sessionId, reason)) {
+      this._log(
+        'warn',
+        `[${sessionId}] Skipping large history snapshot (${fullMessages.length} msgs, >${Math.round(maxBytes / 1024)} KB after ${sizeInfo.counted} msgs, ${reason}); browser will request transcript tail on selection`
+      );
+    }
     return;
 
   }
@@ -5013,10 +5101,23 @@ class ProxyEngine extends EventEmitter {
 
   // ─── Continue-specific poll (ephemeral CDP) ─────────────────────────
 
+  _activitySemanticSignature(activity) {
+    if (!activity) return '';
+    const goal = activity.goal && typeof activity.goal === 'object'
+      ? { ...activity.goal, updated_at: undefined }
+      : activity.goal || null;
+    return JSON.stringify({
+      ...activity,
+      updated_at: undefined,
+      started_at: activity.started_at || null,
+      goal,
+    });
+  }
+
   _setCodexCliActivity(sessionId, session, activity) {
     const nextActivity = activity || { kind: 'idle', label: '', updated_at: new Date().toISOString() };
-    const prevSig = JSON.stringify(session.activity || null);
-    const nextSig = JSON.stringify(nextActivity);
+    const prevSig = this._activitySemanticSignature(session.activity || null);
+    const nextSig = this._activitySemanticSignature(nextActivity);
     if (prevSig === nextSig) return false;
     session.activity = nextActivity;
     if (nextActivity.thinkingContent) session.thinkingContent = nextActivity.thinkingContent;
@@ -5218,6 +5319,7 @@ class ProxyEngine extends EventEmitter {
   _codexCliActiveSummaryOptions() {
     return {
       maxHydrateBytes: codexCli.CODEX_CLI_ACTIVE_HYDRATE_MAX_BYTES,
+      preferTailBytes: codexCli.CODEX_CLI_ACTIVE_HYDRATE_TAIL_BYTES,
     };
   }
 
@@ -5551,6 +5653,7 @@ class ProxyEngine extends EventEmitter {
     }
     let messages = [];
     let summaryActivity = null;
+    let transcriptMaybeChanged = !session.codexCliFilePath;
     if (session.codexCliFilePath) {
       const stat = (() => { try { return fs.statSync(session.codexCliFilePath); } catch { return null; } })();
       const fileSig = stat ? `${stat.mtimeMs}:${stat.size}` : '';
@@ -5558,6 +5661,7 @@ class ProxyEngine extends EventEmitter {
         messages = session._lastCodexCliMessages;
         summaryActivity = session._lastCodexCliActivity || null;
       } else {
+        transcriptMaybeChanged = true;
         const summary = codexCli.readSessionSummary(session.codexCliFilePath, this._codexCliActiveSummaryOptions());
         messages = summary?.messages || [];
         summaryActivity = summary?.activity || null;
@@ -5575,12 +5679,14 @@ class ProxyEngine extends EventEmitter {
       }
     }
     const effectiveMessages = messages.length > 0 ? messages : this._codexCliPendingTranscriptMessages(session);
-    const sig = this._transcriptSignature(effectiveMessages);
-    if (sig !== session.lastTranscriptSig) {
-      session.lastTranscriptSig = sig;
-      session.lastObservedCount = effectiveMessages.length;
-      session.lastMessageCount = effectiveMessages.length;
-      this._sendHistorySnapshot(sessionId, effectiveMessages, messages.length > 0 ? 'codex cli poll' : 'codex cli pending transcript');
+    if (transcriptMaybeChanged || !session.lastTranscriptSig) {
+      const sig = this._transcriptSignature(effectiveMessages);
+      if (sig !== session.lastTranscriptSig) {
+        session.lastTranscriptSig = sig;
+        session.lastObservedCount = effectiveMessages.length;
+        session.lastMessageCount = effectiveMessages.length;
+        this._sendHistorySnapshot(sessionId, effectiveMessages, messages.length > 0 ? 'codex cli poll' : 'codex cli pending transcript');
+      }
     }
     const fallbackActivity = session._codexCliChild
       ? { kind: 'generating', label: 'Codex CLI running', thinkingContent: session._codexCliLiveText || '', updated_at: new Date().toISOString() }
@@ -6590,9 +6696,17 @@ class ProxyEngine extends EventEmitter {
                   acc[accIdx] = dom[domIdx];
                   session._accumulatedDirty = true;
                   if (accIdx < acc.length - 1) expandedHistoricalMessage = true;
+                  if (
+                    !session._forceHistoryResync &&
+                    accIdx === acc.length - 1 &&
+                    (session.agentType === 'codex' || session.agentType === 'codex-desktop') &&
+                    this._isCodexCompletionSummaryMessage(dom[domIdx])
+                  ) {
+                    session._forceHistoryResync = `${session.agentType} completion tail update`;
+                  }
                 }
               }
-              if (expandedHistoricalMessage) {
+              if (expandedHistoricalMessage && !session._forceHistoryResync) {
                 session._forceHistoryResync = `${session.agentType} expanded historical transcript content`;
               }
               // Append truly new messages
@@ -7668,7 +7782,8 @@ class ProxyEngine extends EventEmitter {
     if (!allowedTargetIds) {
       this.openWorkspaces = antigravityPg
         .map(p => {
-          const title = p.title.replace(/ - Antigravity.*/, '').trim();
+          const title = this._workspaceTitleFromEditorWindowTitle(p.title)
+            || this._stripEditorWindowTitleDecorations(p.title.replace(/ - Antigravity.*/, '').trim());
           if (!title || title.toLowerCase() === 'antigravity') return null;
           const match = storagePaths.find(w => w.title.toLowerCase() === title.toLowerCase());
           return { title, path: match ? match.path : null };
@@ -7678,12 +7793,15 @@ class ProxyEngine extends EventEmitter {
       let sessionMetaChanged = false;
       const openWithPaths = this.openWorkspaces.filter(w => w.path);
       for (const [sid, session] of this.sessions.entries()) {
-        const nameBad = !session.workspace_name || /^window-\d+$/.test(session.workspace_name);
+        const nameBad = !session.workspace_name
+          || /^window-\d+$/.test(session.workspace_name)
+          || !!this._workspaceTitleFromEditorWindowTitle(session.workspace_name);
 
         // Use windowIdToPage to resolve the correct workspace from parentId
         const parentPageForSession = session.parentId ? windowIdToPage.get(session.parentId) : null;
         if (parentPageForSession) {
-          const resolvedTitle = parentPageForSession.title.replace(/ - Antigravity.*/, '').trim();
+          const resolvedTitle = this._workspaceTitleFromEditorWindowTitle(parentPageForSession.title)
+            || this._stripEditorWindowTitleDecorations(parentPageForSession.title.replace(/ - Antigravity.*/, '').trim());
           const wsMatch = this.openWorkspaces.find(w => w.path && w.title.toLowerCase() === resolvedTitle.toLowerCase());
           if (wsMatch) {
             // Correct workspace if it differs from what's stored
@@ -7720,8 +7838,9 @@ class ProxyEngine extends EventEmitter {
 
         // No parentId match and no workspace_path — try title-based resolution
         const resolvedTitle = parentPageForSession
-          ? parentPageForSession.title.replace(/ - Antigravity.*/, '').trim()
-          : session.windowTitle;
+          ? (this._workspaceTitleFromEditorWindowTitle(parentPageForSession.title)
+              || this._stripEditorWindowTitleDecorations(parentPageForSession.title.replace(/ - Antigravity.*/, '').trim()))
+          : (this._workspaceTitleFromEditorWindowTitle(session.windowTitle) || session.windowTitle);
         const wsMatch = this.openWorkspaces.find(w => w.path && w.title.toLowerCase() === resolvedTitle?.toLowerCase())
           || (openWithPaths.length === 1 ? openWithPaths[0] : null);
         if (nameBad && resolvedTitle && resolvedTitle !== session.windowTitle) {
@@ -7915,16 +8034,18 @@ class ProxyEngine extends EventEmitter {
         }
 
         const parentPage   = windowIdToPage.get(parentId);
-        const windowTitle  = parentPage
-          ? parentPage.title.replace(/ - Antigravity.*/, '').trim()
-          : `window-${parentId}`;
+        const rawWindowTitle = parentPage ? parentPage.title : `window-${parentId}`;
+        const workspaceTitle = this._workspaceTitleFromEditorWindowTitle(rawWindowTitle)
+          || this._stripEditorWindowTitleDecorations(rawWindowTitle.replace(/ - Antigravity.*/, '').trim());
+        const windowTitle = rawWindowTitle;
 
         // Match workspace by title; only use single-workspace fallback when
         // parentId couldn't be resolved (window-N placeholder), to avoid
         // mis-attributing sessions from other Antigravity windows.
         const hasParentPage = !!parentPage;
         const openWithPaths  = this.openWorkspaces.filter(w => w.path);
-        const workspaceMatch = storagePaths.find(w => w.title.toLowerCase() === windowTitle.toLowerCase())
+        const workspaceMatch = storagePaths.find(w => w.title.toLowerCase() === workspaceTitle.toLowerCase())
+          || storagePaths.find(w => w.title.toLowerCase() === windowTitle.toLowerCase())
           || (!hasParentPage && openWithPaths.length === 1 ? openWithPaths[0] : null)
           || (!hasParentPage && storagePaths.length === 1 ? storagePaths[0] : null);
         const workspacePath  = workspaceMatch ? workspaceMatch.path : null;
@@ -7933,12 +8054,12 @@ class ProxyEngine extends EventEmitter {
           target,
           windowTitle,
           agentType,
-          workspaceName: workspaceMatch?.title || windowTitle,
+          workspaceName: workspaceMatch?.title || workspaceTitle || windowTitle,
           workspacePath,
         });
         const { enabled: autoApprovePermissions, preferenceKey } = this._resolveAutoApproveState(agentType, sessionMeta, {
           workspacePath,
-          workspaceName: workspaceMatch?.title || windowTitle,
+          workspaceName: workspaceMatch?.title || workspaceTitle || windowTitle,
           windowTitle,
         });
         const sessionId = sessionMeta.session_id;
@@ -8359,7 +8480,9 @@ class ProxyEngine extends EventEmitter {
         // Register the panel even when empty so it shows in the web UI immediately.
         // The user can start typing and the session will persist.
 
-        const workspaceName = (target.title || '').replace(/ - Antigravity.*/, '').trim() || target.title;
+        const workspaceName = this._workspaceTitleFromEditorWindowTitle(target.title)
+          || this._stripEditorWindowTitleDecorations((target.title || '').replace(/ - Antigravity.*/, '').trim())
+          || target.title;
         const panelSummary  = await this._withTimeout(
           selectors.readAntigravityPanelSummary(client.Runtime),
           3000,

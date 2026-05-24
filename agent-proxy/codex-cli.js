@@ -54,6 +54,7 @@ const DEFAULT_ACTIVE_HYDRATE_MAX_BYTES = envMb(
   16,
   4
 );
+const DEFAULT_ACTIVE_HYDRATE_TAIL_BYTES = envMb('CODEX_CLI_ACTIVE_HYDRATE_TAIL_MB', 4);
 const DEFAULT_INTERACTIVE_HISTORY_HOURS = Math.max(1, parseInt(process.env.CODEX_CLI_INTERACTIVE_HISTORY_HOURS || '24', 10) || 24);
 const CODEX_CLI_ACTIVITY_STALE_MS = Math.max(60 * 1000, parseInt(process.env.CODEX_CLI_ACTIVITY_STALE_MS || '14400000', 10) || 14400000);
 
@@ -1058,25 +1059,32 @@ function parseCodexJsonlChunk(filePath, { beforeOffset = null, chunkBytes = DEFA
   };
 }
 
-function readSessionSummary(filePath, { includeMessages = true, maxHydrateBytes = DEFAULT_HYDRATE_MAX_BYTES } = {}) {
+function tailSessionSummary(filePath, stat, maxHydrateBytes, tailBytes, hydrateSkippedReason) {
+  const summary = readLightweightSessionSummary(filePath, stat);
+  const tail = parseCodexJsonlTail(filePath, tailBytes);
+  const fallbackMessages = oversizedTranscriptMessage(summary, maxHydrateBytes);
+  const messages = tail?.state?.messages?.length ? tail.state.messages : fallbackMessages;
+  const tailHydrated = messages !== fallbackMessages;
+  return {
+    ...summary,
+    messages,
+    messageCount: messages.length,
+    messagesHydrated: tailHydrated,
+    messagesPartial: true,
+    hydrateSkippedReason: tailHydrated ? hydrateSkippedReason : 'file_too_large',
+    activity: tail?.state ? buildCodexCliActivity(tail.state) : null,
+  };
+}
+
+function readSessionSummary(filePath, { includeMessages = true, maxHydrateBytes = DEFAULT_HYDRATE_MAX_BYTES, preferTailBytes = 0 } = {}) {
   const stat = safeStat(filePath);
   if (!stat) return null;
   if (!includeMessages) return readLightweightSessionSummary(filePath, stat);
+  if (Number(preferTailBytes) > 0 && stat.size > Number(preferTailBytes)) {
+    return tailSessionSummary(filePath, stat, maxHydrateBytes, preferTailBytes, 'active_tail');
+  }
   if (stat.size > maxHydrateBytes) {
-    const summary = readLightweightSessionSummary(filePath, stat);
-    const tail = parseCodexJsonlTail(filePath);
-    const fallbackMessages = oversizedTranscriptMessage(summary, maxHydrateBytes);
-    const messages = tail?.state?.messages?.length ? tail.state.messages : fallbackMessages;
-    const tailHydrated = messages !== fallbackMessages;
-    return {
-      ...summary,
-      messages,
-      messageCount: messages.length,
-      messagesHydrated: tailHydrated,
-      messagesPartial: true,
-      hydrateSkippedReason: tailHydrated ? 'file_too_large_tail' : 'file_too_large',
-      activity: tail?.state ? buildCodexCliActivity(tail.state) : null,
-    };
+    return tailSessionSummary(filePath, stat, maxHydrateBytes, DEFAULT_HYDRATE_TAIL_BYTES, 'file_too_large_tail');
   }
   const detailed = parseCodexJsonlDetailed(filePath);
   if (!detailed) return null;
@@ -1373,6 +1381,7 @@ module.exports = {
   CODEX_CLI_EFFORTS,
   CODEX_CLI_ACCESS_MODES,
   CODEX_CLI_ACTIVE_HYDRATE_MAX_BYTES: DEFAULT_ACTIVE_HYDRATE_MAX_BYTES,
+  CODEX_CLI_ACTIVE_HYDRATE_TAIL_BYTES: DEFAULT_ACTIVE_HYDRATE_TAIL_BYTES,
   discoverSessions,
   findSessionByCliId,
   findLatestSessionForWorkspace,

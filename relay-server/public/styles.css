@@ -878,7 +878,7 @@ body {
   display: flex;
   flex-direction: column;
   gap: 0;
-  scroll-behavior: smooth;
+  scroll-behavior: auto;
   scroll-padding-bottom: 88px;
   position: relative;
   -webkit-overflow-scrolling: touch;
@@ -1248,6 +1248,7 @@ body {
   align-items: start;
   padding: 3px 0;
   max-width: 100%;
+  contain: layout paint;
 }
 
 .message-role {

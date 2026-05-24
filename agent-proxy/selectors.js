@@ -363,6 +363,26 @@ function getCodexCachedThinking(sessionId) {
 const CODEX_DOM_SIG_EXPR = `
   var c = d.querySelector('[data-thread-find-target="conversation"]');
   if (!c) return '';
+  function _tinyHash(text) {
+    var h = 2166136261;
+    text = String(text || '');
+    for (var i = 0; i < text.length; i++) {
+      h ^= text.charCodeAt(i);
+      h = Math.imul(h, 16777619);
+    }
+    return (h >>> 0).toString(36);
+  }
+  function _recentUnitTextSig(units) {
+    var parts = [];
+    var start = Math.max(0, units.length - 24);
+    for (var i = start; i < units.length; i++) {
+      var u = units[i];
+      var key = u.getAttribute('data-content-search-unit-key') || '';
+      var text = String(u.textContent || u.innerText || '');
+      parts.push(key + ':' + text.length + ':' + _tinyHash(text.slice(-3000)));
+    }
+    return parts.join('|');
+  }
   function _codexActivitySig() {
     function visible(el) {
       return !!(el && el.offsetParent !== null);
@@ -388,7 +408,7 @@ const CODEX_DOM_SIG_EXPR = `
     var lastUnit = units[units.length - 1];
     var firstKey = firstUnit.getAttribute('data-content-search-unit-key') || '';
     var lastKey = lastUnit.getAttribute('data-content-search-unit-key') || '';
-    return 'u|' + units.length + '|' + firstKey + '|' + lastKey + '|' + (lastUnit.textContent || '').length + activitySig;
+    return 'u|' + units.length + '|' + firstKey + '|' + lastKey + '|' + _recentUnitTextSig(units) + activitySig;
   }
   // Older turn-key-based DOMs (sidepane often, older desktop)
   var turns = c.querySelectorAll('[data-content-search-turn-key]');
@@ -1628,7 +1648,11 @@ const CODEX_READ_EXPR = `
     function _cachedCodexWorkedBodyFor(btn) {
       var cache = _codexWorkedCache();
       var key = _codexWorkedTurnKey(btn);
-      if (key && cache[key]) return String(cache[key]);
+      if (key && cache[key]) {
+        var entry = cache[key];
+        if (entry && typeof entry === 'object') return String(entry.body || '');
+        return String(entry);
+      }
       return '';
     }
 
@@ -1643,7 +1667,11 @@ const CODEX_READ_EXPR = `
       for (var i = buttons.length - 1; i >= 0 && clicked < budget; i--) {
         var btn = buttons[i];
         var key = _codexWorkedTurnKey(btn);
-        if (key && cache[key]) continue;
+        var newestRank = buttons.length - 1 - i;
+        var entry = key ? cache[key] : null;
+        var capturedAt = entry && typeof entry === 'object' ? Number(entry.capturedAt || 0) : 0;
+        var refreshRecent = !!(entry && newestRank < 3 && Date.now() - capturedAt > 1500);
+        if (key && entry && !refreshRecent) continue;
         if (btn.getAttribute('aria-expanded') === 'true') continue;
         try {
           btn.click();
@@ -1662,7 +1690,7 @@ const CODEX_READ_EXPR = `
         var expandedKey = _codexWorkedTurnKey(expandedBtn);
         if (!expandedKey) continue;
         var body = _codexWorkedBodyText(expandedBtn);
-        if (body) cache[expandedKey] = body;
+        if (body) cache[expandedKey] = { body: body, capturedAt: Date.now() };
       }
     }
 
@@ -2043,7 +2071,12 @@ const CODEX_READ_EXPR = `
         continue;
       }
       // Detect user unit key
-      var userUnit = el.querySelector('[data-content-search-unit-key$=":user"]');
+      var userUnit = null;
+      if (el.matches && el.matches('[data-content-search-unit-key$=":user"]')) {
+        userUnit = el;
+      } else {
+        userUnit = el.querySelector('[data-content-search-unit-key$=":user"]');
+      }
       if (userUnit) {
         flushAssistant();
         var wpw2 = userUnit.querySelector('.whitespace-pre-wrap');
@@ -2051,6 +2084,23 @@ const CODEX_READ_EXPR = `
         var uimgs2 = _extractImages(userUnit);
         var ucontent2 = (uimgs2.length > 0 ? uimgs2.join('\\n') + '\\n' : '') + (ut2 || '');
         if (ucontent2.trim()) msgs.push({ role: 'user', content: ucontent2.trim() });
+        continue;
+      }
+
+      // Codex side pane now gives stable assistant narrative its own unit key.
+      // Read it directly so finished-task summaries after "Worked for ..." are
+      // not swallowed by coarser turn wrappers or adjacent tool/card rows.
+      var assistantUnit = null;
+      if (el.matches && el.matches('[data-content-search-unit-key$=":assistant"]')) {
+        assistantUnit = el;
+      }
+      if (assistantUnit) {
+        var assistantUnitText = _extractCompletedTaskText(assistantUnit, '') || (assistantUnit.innerText || assistantUnit.textContent || '').trim();
+        var assistantUnitFiles = _extractFileChangeSummaryCards(assistantUnit);
+        if (assistantUnitText && !/^Final message$/i.test(assistantUnitText)) {
+          pendingAssistant.push(assistantUnitText);
+        }
+        assistantUnitFiles.forEach(function(block) { pendingAssistant.push(block); });
         continue;
       }
 

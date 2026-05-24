@@ -1318,6 +1318,8 @@ function _extractLastOpenBlock(text) {
 function MarkdownContent({ content, monospace = false, onOpenPath = null, autoExpandLongCodeBlocks = false }) {
   const ref          = React.useRef(null);
   const lastContent  = React.useRef(null);  // A11-11: skip re-render when content is identical
+  const onOpenPathRef = React.useRef(onOpenPath);
+  onOpenPathRef.current = onOpenPath;
 
   React.useEffect(() => {
     if (!ref.current) return;
@@ -1534,9 +1536,10 @@ function MarkdownContent({ content, monospace = false, onOpenPath = null, autoEx
       btn.onclick = (e) => {
         e.stopPropagation();
         const path = btn.dataset.openPath || btn.dataset.copyPath;
-        if (path && typeof onOpenPath === 'function') {
+        const openPath = onOpenPathRef.current;
+        if (path && typeof openPath === 'function') {
           e.preventDefault();
-          onOpenPath(path);
+          openPath(path);
           return;
         }
         if (!btn.dataset.copyPath) return;
@@ -1720,7 +1723,7 @@ function MarkdownContent({ content, monospace = false, onOpenPath = null, autoEx
       }
     }
     return () => { if (cleanupObserver) cleanupObserver(); };
-  }, [content, onOpenPath, autoExpandLongCodeBlocks]);
+  }, [content, autoExpandLongCodeBlocks]);
   return <div className={`message-body${monospace ? ' monospace-body' : ''}`} ref={ref} />;
 }
 

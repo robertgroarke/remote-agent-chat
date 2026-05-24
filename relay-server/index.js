@@ -45,6 +45,10 @@ const LAUNCH_TIMEOUT_MS       = 30_000;   // max wait for proxy to confirm a new
 const LARGE_HISTORY_BROADCAST_LIMIT = 250;
 const DEFAULT_HISTORY_CHUNK_LIMIT = 120;
 const MAX_HISTORY_CHUNK_LIMIT = 500;
+const NATIVE_HISTORY_TAIL_MIN_INTERVAL_MS = 1_500;
+const NATIVE_HISTORY_OLDER_MIN_INTERVAL_MS = 5_000;
+const NATIVE_HISTORY_REPEAT_CURSOR_MS = 60_000;
+const STATUS_BROADCAST_REFRESH_MS = 30_000;
 
 // ── Structured logger ─────────────────────────────────────────────────────────
 
@@ -1025,6 +1029,8 @@ const agentConfigs    = new Map();
 const pendingCtrlReqs = new Map();
 const pendingPromptResponses = new Map();
 const pendingErrorPromptResponses = new Map();
+const nativeHistoryChunkRequests = new Map();
+const statusBroadcastState = new Map();
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
 
@@ -1040,6 +1046,116 @@ function broadcastToBrowsersExcept(msg, excludedWs) {
   for (const ws of browserClients) {
     if (ws !== excludedWs && ws.readyState === WebSocket.OPEN) ws.send(data);
   }
+}
+
+function sendHistoryChunkError(ws, { sessionId, requestId, mode = 'tail', source = 'native', code, message, retryAfterMs = 0 }) {
+  if (!ws || ws.readyState !== WebSocket.OPEN || !sessionId) return;
+  ws.send(JSON.stringify({
+    type: 'history_chunk',
+    protocol_version: PROTOCOL_VERSION,
+    session: sessionId,
+    session_id: sessionId,
+    request_id: requestId || null,
+    mode,
+    source,
+    messages: [],
+    partial: true,
+    complete: false,
+    error: {
+      code,
+      message,
+      ...(retryAfterMs > 0 ? { retry_after_ms: retryAfterMs } : {}),
+    },
+    cursor: {
+      start_offset: 0,
+      end_offset: 0,
+      next_before_offset: null,
+      total_bytes: 0,
+    },
+  }));
+}
+
+function nativeHistoryCursorSig(msg) {
+  if (!msg || msg.mode !== 'older') return '';
+  const beforeOffset = msg.before_offset ?? msg.beforeOffset ?? msg.cursor?.next_before_offset ?? '';
+  const beforeId = msg.before_id ?? msg.beforeId ?? msg.cursor?.next_before_id ?? '';
+  return `${beforeOffset}\u0001${beforeId}`;
+}
+
+function throttleNativeHistoryChunkRequest(sessionId, msg) {
+  const mode = msg.mode === 'older' ? 'older' : 'tail';
+  if (mode === 'older' && !msg.user_initiated) {
+    return {
+      code: 'history_older_requires_user_action',
+      message: 'Older native history chunks require a current manual WebUI request.',
+      retryAfterMs: NATIVE_HISTORY_OLDER_MIN_INTERVAL_MS,
+    };
+  }
+  const now = Date.now();
+  const key = `${sessionId}:${mode}`;
+  const cursorSig = nativeHistoryCursorSig(msg);
+  const minInterval = mode === 'older'
+    ? NATIVE_HISTORY_OLDER_MIN_INTERVAL_MS
+    : NATIVE_HISTORY_TAIL_MIN_INTERVAL_MS;
+  const previous = nativeHistoryChunkRequests.get(key);
+  if (previous) {
+    const elapsed = now - previous.at;
+    if (elapsed < minInterval) {
+      return {
+        code: 'history_chunk_throttled',
+        message: 'Native history chunk request throttled to protect the browser and proxy.',
+        retryAfterMs: minInterval - elapsed,
+      };
+    }
+    if (mode === 'older' && cursorSig && previous.cursorSig === cursorSig && elapsed < NATIVE_HISTORY_REPEAT_CURSOR_MS) {
+      return {
+        code: 'history_chunk_duplicate_cursor',
+        message: 'Duplicate older native history cursor ignored.',
+        retryAfterMs: NATIVE_HISTORY_REPEAT_CURSOR_MS - elapsed,
+      };
+    }
+  }
+  nativeHistoryChunkRequests.set(key, { at: now, cursorSig });
+  return null;
+}
+
+function statusBroadcastSignature(msg) {
+  const activity = msg?.activity && typeof msg.activity === 'object' ? msg.activity : null;
+  const goal = activity?.goal && typeof activity.goal === 'object'
+    ? {
+        label: activity.goal.label || '',
+        objective: activity.goal.objective || '',
+        status: activity.goal.status || '',
+        tokens_used: activity.goal.tokens_used ?? activity.goal.tokensUsed ?? null,
+      }
+    : null;
+  return JSON.stringify({
+    thinking: !!msg?.thinking,
+    label: msg?.label || '',
+    thinking_content: msg?.thinking_content || '',
+    activity: activity ? {
+      kind: activity.kind || '',
+      label: activity.label || '',
+      started_at: activity.started_at || null,
+      interrupt_hint: activity.interrupt_hint || '',
+      thinkingContent: activity.thinkingContent || '',
+      task_list: activity.task_list || null,
+      context_card: activity.context_card || null,
+      goal,
+    } : null,
+  });
+}
+
+function shouldBroadcastStatus(sessionId, statusMsg) {
+  if (!sessionId) return true;
+  const now = Date.now();
+  const sig = statusBroadcastSignature(statusMsg);
+  const previous = statusBroadcastState.get(sessionId);
+  if (!previous || previous.sig !== sig || now - previous.at >= STATUS_BROADCAST_REFRESH_MS) {
+    statusBroadcastState.set(sessionId, { sig, at: now });
+    return true;
+  }
+  return false;
 }
 
 function getSessionList() {
@@ -1703,7 +1819,7 @@ function handleProxyConnection(ws, req) {
       // Normalise to old shape so existing frontend still works
       const statusMsg = { type: 'status', session: id || msg.session, thinking: msg.thinking, label: msg.label, activity: msg.activity };
       if (msg.thinking_content) statusMsg.thinking_content = msg.thinking_content;
-      broadcastToBrowsers(statusMsg);
+      if (shouldBroadcastStatus(id, statusMsg)) broadcastToBrowsers(statusMsg);
 
     // ── Incoming agent message ─────────────────────────────────────────────
     } else if (t === 'message' || t === 'proxy_message') {
@@ -2315,6 +2431,26 @@ function handleClientConnection(ws, req) {
       const requestId = msg.request_id || `histchunk-${Date.now()}-${Math.random().toString(36).slice(2, 7)}`;
       if (!id) return;
       const requestedSource = msg.source || msg.history_source || 'native';
+      if (requestedSource !== 'relay_sqlite') {
+        const throttle = throttleNativeHistoryChunkRequest(id, msg);
+        if (throttle) {
+          sendHistoryChunkError(ws, {
+            sessionId: id,
+            requestId,
+            mode: msg.mode || 'tail',
+            source: requestedSource,
+            code: throttle.code,
+            message: throttle.message,
+            retryAfterMs: throttle.retryAfterMs,
+          });
+          log('warn', 'history', 'Rejected native history chunk request', {
+            session: id,
+            mode: msg.mode || 'tail',
+            code: throttle.code,
+          });
+          return;
+        }
+      }
       if (requestedSource === 'relay_sqlite') {
         const beforeId = msg.mode === 'older'
           ? (msg.before_id ?? msg.beforeId ?? msg.cursor?.next_before_id ?? null)

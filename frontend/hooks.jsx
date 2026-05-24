@@ -8,7 +8,31 @@
 const { useState, useEffect, useRef, useCallback } = React;
 
 const DEFAULT_HISTORY_TAIL_LIMIT = 120;
-const CODEX_CLI_HISTORY_CHUNK_BYTES = 2 * 1024 * 1024;
+const CODEX_CLI_HISTORY_CHUNK_BYTES = 256 * 1024;
+
+function shallowMapMerge(prev, next) {
+  const entries = Object.entries(next || {});
+  if (!entries.length) return prev;
+  let changed = false;
+  const merged = { ...prev };
+  entries.forEach(([key, value]) => {
+    if (Object.is(prev[key], value)) return;
+    if (JSON.stringify(prev[key] ?? null) === JSON.stringify(value ?? null)) return;
+    merged[key] = value;
+    changed = true;
+  });
+  return changed ? merged : prev;
+}
+
+function sameSessionList(a, b) {
+  const left = Array.isArray(a) ? a : [];
+  const right = Array.isArray(b) ? b : [];
+  if (left.length !== right.length) return false;
+  for (let i = 0; i < left.length; i++) {
+    if (JSON.stringify(left[i] ?? null) !== JSON.stringify(right[i] ?? null)) return false;
+  }
+  return true;
+}
 
 export function useRelay() {
     const [sessions,        setSessions]        = useState([]);   // string IDs (legacy) or metadata objects (v1)
@@ -100,15 +124,9 @@ export function useRelay() {
           nextThinking[session.session_id] = label;
         }
       });
-      if (Object.keys(next).length > 0) {
-        setActivities(prev => ({ ...prev, ...next }));
-      }
-      if (Object.keys(nextThinkingContent).length > 0) {
-        setThinkingContent(prev => ({ ...prev, ...nextThinkingContent }));
-      }
-      if (Object.keys(nextThinking).length > 0) {
-        setThinking(prev => ({ ...prev, ...nextThinking }));
-      }
+      setActivities(prev => shallowMapMerge(prev, next));
+      setThinkingContent(prev => shallowMapMerge(prev, nextThinkingContent));
+      setThinking(prev => shallowMapMerge(prev, nextThinking));
     }
 
     function mergeSessionConfigHints(sessionList) {
@@ -120,11 +138,15 @@ export function useRelay() {
       });
       if (Object.keys(next).length > 0) {
         setAgentConfigs(prev => {
+          let changed = false;
           const merged = { ...prev };
           Object.entries(next).forEach(([sid, hints]) => {
-            merged[sid] = { ...(merged[sid] || {}), ...hints };
+            const nextCfg = { ...(merged[sid] || {}), ...hints };
+            if (JSON.stringify(merged[sid] || {}) === JSON.stringify(nextCfg)) return;
+            merged[sid] = nextCfg;
+            changed = true;
           });
-          return merged;
+          return changed ? merged : prev;
         });
       }
     }
@@ -135,9 +157,7 @@ export function useRelay() {
         if (!session || typeof session !== 'object' || !session.session_id) return;
         if (Array.isArray(session.chat_list)) next[session.session_id] = session.chat_list;
       });
-      if (Object.keys(next).length > 0) {
-        setChatLists(prev => ({ ...prev, ...next }));
-      }
+      setChatLists(prev => shallowMapMerge(prev, next));
     }
 
     function mergeSessionHealth(sessionList) {
@@ -147,9 +167,7 @@ export function useRelay() {
         if (!session.status) return;
         next[session.session_id] = session.status;
       });
-      if (Object.keys(next).length > 0) {
-        setHealth(prev => ({ ...prev, ...next }));
-      }
+      setHealth(prev => shallowMapMerge(prev, next));
     }
 
     function requestHistory(sessionOrId, options = {}) {
@@ -179,18 +197,31 @@ export function useRelay() {
       if (wsRef.current?.readyState !== WebSocket.OPEN) return;
       const mode = options.mode === 'older' ? 'older' : 'tail';
       const source = options.source || 'relay_sqlite';
+      const beforeOffset = options.beforeOffset ?? options.before_offset ?? null;
+      const beforeId = options.beforeId ?? options.before_id ?? null;
+      const requestCursorSig = `${mode}\u0001${source}\u0001${beforeOffset ?? ''}\u0001${beforeId ?? ''}`;
+      const currentChunkState = historyChunkState.current[id] || {};
+      const nowMs = Date.now();
+      if (currentChunkState.inFlight) return;
+      if (
+        mode === 'older'
+        && currentChunkState.lastRequestSig === requestCursorSig
+        && nowMs - Number(currentChunkState.lastRequestAt || 0) < 1500
+      ) {
+        return;
+      }
       const requestId = `histchunk-${Date.now()}-${++historyChunkSerial.current}`;
       const chunkBytes = Math.max(256 * 1024, Math.min(16 * 1024 * 1024, Number(options.chunkBytes || options.chunk_bytes || CODEX_CLI_HISTORY_CHUNK_BYTES) || CODEX_CLI_HISTORY_CHUNK_BYTES));
       if (mode === 'tail') {
         clearTimeout(historyChunkTimers.current[id]);
-        historyChunkState.current[id] = { source, chunkBytes, limit: options.limit || null, inFlight: true };
+        historyChunkState.current[id] = { source, chunkBytes, limit: options.limit || null, inFlight: true, mode, lastRequestSig: requestCursorSig, lastRequestAt: nowMs };
       } else {
-        historyChunkState.current[id] = { ...(historyChunkState.current[id] || {}), source, chunkBytes, limit: options.limit || historyChunkState.current[id]?.limit || null, inFlight: true };
+        historyChunkState.current[id] = { ...(historyChunkState.current[id] || {}), source, chunkBytes, limit: options.limit || historyChunkState.current[id]?.limit || null, inFlight: true, mode, lastRequestSig: requestCursorSig, lastRequestAt: nowMs };
       }
       latestHistoryChunkRequest.current[id] = requestId;
       setHistoryLoading(prev => ({
         ...prev,
-        [id]: { mode: 'chunked', requestedAt: Date.now(), requestId },
+        [id]: { mode, kind: 'chunked', requestedAt: Date.now(), requestId },
       }));
       const payload = {
         type: 'history_chunk_request',
@@ -203,8 +234,7 @@ export function useRelay() {
       };
       const limit = Number(options.limit || options.tailLimit || 0);
       if (Number.isFinite(limit) && limit > 0) payload.limit = Math.floor(limit);
-      const beforeOffset = options.beforeOffset ?? options.before_offset ?? null;
-      const beforeId = options.beforeId ?? options.before_id ?? null;
+      if (options.userInitiated || options.user_initiated) payload.user_initiated = true;
       if (mode === 'older' && beforeOffset != null) payload.before_offset = beforeOffset;
       if (mode === 'older' && beforeId != null) payload.before_id = beforeId;
       send(payload);
@@ -212,6 +242,10 @@ export function useRelay() {
 
     function messageDedupeKey(msg) {
       if (!msg) return '';
+      if (msg.id != null) return `id\u0001${msg.id}`;
+      if (msg.server_message_id != null) return `server\u0001${msg.server_message_id}`;
+      if (msg.sequence != null && msg.ts != null) return `seq\u0001${msg.sequence}\u0001${msg.ts}\u0001${msg.role || ''}`;
+      if (msg.client_msg_id) return `client\u0001${msg.client_msg_id}`;
       const blocks = Array.isArray(msg.content_blocks) ? JSON.stringify(msg.content_blocks) : '';
       return `${msg.role || ''}\u0001${msg.content || ''}\u0001${blocks}`;
     }
@@ -230,30 +264,35 @@ export function useRelay() {
         });
         return older.length ? [...older, ...current] : current;
       }
-      const seen = new Set();
-      const merged = [];
-      const incomingIds = nextIncoming.map(msg => Number(msg?.id || 0)).filter(n => Number.isFinite(n) && n > 0);
-      const incomingTs = nextIncoming.map(msg => Number(msg?.ts || 0)).filter(n => Number.isFinite(n) && n > 0);
-      const lastIncomingId = incomingIds.length ? Math.max(...incomingIds) : 0;
-      const lastIncomingTs = incomingTs.length ? Math.max(...incomingTs) : 0;
+      const seen = new Set(current.map(messageDedupeKey));
+      const merged = [...current];
+      let added = 0;
       nextIncoming.forEach(msg => {
         const key = messageDedupeKey(msg);
         if (seen.has(key)) return;
         seen.add(key);
         merged.push(msg);
+        added++;
       });
-      current.forEach(msg => {
-        const msgId = Number(msg?.id || 0);
-        const msgTs = Number(msg?.ts || 0);
-        const isNewerThanTail = (lastIncomingId > 0 && msgId > lastIncomingId)
-          || (!lastIncomingId && lastIncomingTs > 0 && msgTs > lastIncomingTs);
-        if (!(msg?._optimistic || msg?._cid || isNewerThanTail)) return;
+      return added ? merged : current;
+    }
+
+    function mergeHistoryTailSnapshot(existing, incoming) {
+      const current = Array.isArray(existing) ? existing : [];
+      const nextIncoming = Array.isArray(incoming) ? incoming : [];
+      if (!current.length) return nextIncoming;
+      if (!nextIncoming.length) return current;
+      const seen = new Set(current.map(messageDedupeKey));
+      const merged = [...current];
+      let added = 0;
+      nextIncoming.forEach(msg => {
         const key = messageDedupeKey(msg);
         if (seen.has(key)) return;
         seen.add(key);
         merged.push(msg);
+        added++;
       });
-      return merged;
+      return added ? merged : current;
     }
 
     function shouldPreserveTranscriptInListView(session) {
@@ -568,7 +607,7 @@ export function useRelay() {
 
       // ── Session list (legacy) ───────────────────────────────────────────────
       if (t === 'session_list') {
-        setSessions(msg.sessions || []);
+        setSessions(prev => sameSessionList(prev, msg.sessions || []) ? prev : (msg.sessions || []));
         mergeSessionMetadataActivity(msg.sessions || []);
         mergeSessionConfigHints(msg.sessions || []);
         mergeSessionChatLists(msg.sessions || []);
@@ -583,13 +622,13 @@ export function useRelay() {
             });
           }
         });
-        if (Array.isArray(msg.workspaces)) setWorkspaces(msg.workspaces);
+        if (Array.isArray(msg.workspaces)) setWorkspaces(prev => sameSessionList(prev, msg.workspaces) ? prev : msg.workspaces);
         return;
       }
 
       // ── Session snapshot (v1) ───────────────────────────────────────────────
       if (t === 'session_snapshot' || t === 'proxy_session_snapshot') {
-        setSessions(msg.sessions || []);
+        setSessions(prev => sameSessionList(prev, msg.sessions || []) ? prev : (msg.sessions || []));
         mergeSessionMetadataActivity(msg.sessions || []);
         mergeSessionConfigHints(msg.sessions || []);
         mergeSessionChatLists(msg.sessions || []);
@@ -611,7 +650,7 @@ export function useRelay() {
       // ── connection_ack may include initial session list + health snapshot ────
       if (t === 'connection_ack') {
         if (msg.sessions && msg.sessions.length > 0) {
-          setSessions(msg.sessions);
+          setSessions(prev => sameSessionList(prev, msg.sessions) ? prev : msg.sessions);
           mergeSessionMetadataActivity(msg.sessions);
           mergeSessionConfigHints(msg.sessions);
           mergeSessionChatLists(msg.sessions);
@@ -627,13 +666,13 @@ export function useRelay() {
             }
           });
         }
-        if (Array.isArray(msg.workspaces)) setWorkspaces(msg.workspaces);
+        if (Array.isArray(msg.workspaces)) setWorkspaces(prev => sameSessionList(prev, msg.workspaces) ? prev : msg.workspaces);
         if (msg.session_health) {
           const h = {};
           Object.entries(msg.session_health).forEach(([id, v]) => {
             h[id] = typeof v === 'object' ? v.health : v;
           });
-          setHealth(h);
+          setHealth(prev => shallowMapMerge(prev, h));
         }
         // Restore cached agent configs on (re)connect
         if (msg.agent_configs && typeof msg.agent_configs === 'object') {
@@ -690,17 +729,38 @@ export function useRelay() {
           return;
         }
         const nextMessages = msg.messages || [];
-        setMessages(prev => ({ ...prev, [id]: nextMessages }));
-        setHistoryMeta(prev => ({
-          ...prev,
-          [id]: {
-            partial: !!msg.partial,
-            loaded: Number(msg.loaded_messages ?? nextMessages.length) || nextMessages.length,
-            total: Number(msg.total_messages ?? nextMessages.length) || nextMessages.length,
+        const priorHistoryMeta = historyMeta[id] || null;
+        const shouldMergeTailSnapshot = !!(
+          msg.partial
+          || msg.mode === 'tail'
+          || priorHistoryMeta?.mode === 'chunked'
+          || priorHistoryMeta?.partial
+        );
+        setMessages(prev => {
+          const merged = shouldMergeTailSnapshot
+            ? mergeHistoryTailSnapshot(prev[id], nextMessages)
+            : nextMessages;
+          if (merged === prev[id]) return prev;
+          return { ...prev, [id]: merged };
+        });
+        setHistoryMeta(prev => {
+          const nextMeta = {
+            ...(shouldMergeTailSnapshot ? (prev[id] || {}) : {}),
+            partial: !!msg.partial || !!(shouldMergeTailSnapshot && prev[id]?.partial),
+            loaded: shouldMergeTailSnapshot
+              ? Math.max(
+                  Number(prev[id]?.loaded || 0),
+                  Number(msg.loaded_messages ?? nextMessages.length) || nextMessages.length,
+                  (messages[id] || []).length
+                )
+              : (Number(msg.loaded_messages ?? nextMessages.length) || nextMessages.length),
+            total: Number(msg.total_messages ?? prev[id]?.total ?? nextMessages.length) || nextMessages.length,
             limit: msg.limit || null,
-            mode: msg.mode || (msg.partial ? 'tail' : 'full'),
-          },
-        }));
+            mode: shouldMergeTailSnapshot ? (prev[id]?.mode || 'chunked') : (msg.mode || (msg.partial ? 'tail' : 'full')),
+          };
+          if (JSON.stringify(prev[id] || null) === JSON.stringify(nextMeta)) return prev;
+          return { ...prev, [id]: nextMeta };
+        });
         setHistoryLoading(prev => {
           if (!prev[id]) return prev;
           const next = { ...prev };
@@ -721,30 +781,47 @@ export function useRelay() {
         ) {
           return;
         }
+        if (msg.error && (!Array.isArray(msg.messages) || msg.messages.length === 0)) {
+          setHistoryLoading(prev => {
+            if (!prev[id]) return prev;
+            const next = { ...prev };
+            delete next[id];
+            return next;
+          });
+          historyChunkState.current[id] = {
+            ...(historyChunkState.current[id] || {}),
+            inFlight: false,
+          };
+          clearTimeout(historyChunkTimers.current[id]);
+          return;
+        }
         const mode = msg.mode === 'older' ? 'older' : 'tail';
         const cursor = msg.cursor || {};
         const nextBeforeOffset = cursor.next_before_offset ?? null;
         const nextBeforeId = cursor.next_before_id ?? null;
         const hasMore = !!(msg.partial && (nextBeforeOffset != null || nextBeforeId != null));
         const estimatedMessages = mergeHistoryChunk(messages[id], msg.messages || [], mode);
+        const estimatedLength = estimatedMessages.length;
         setMessages(prev => {
           const merged = mergeHistoryChunk(prev[id], msg.messages || [], mode);
+          if (merged === prev[id]) return prev;
           return { ...prev, [id]: merged };
         });
-        setHistoryMeta(prev => ({
-          ...prev,
-          [id]: {
+        setHistoryMeta(prev => {
+          const nextMeta = {
             ...(prev[id] || {}),
             partial: hasMore,
-            loaded: estimatedMessages.length,
-            total: Number(msg.total_messages || prev[id]?.total || estimatedMessages.length) || estimatedMessages.length,
+            loaded: Math.max(Number(prev[id]?.loaded || 0), Number(msg.loaded_messages || 0), estimatedLength),
+            total: Number(msg.total_messages || prev[id]?.total || estimatedLength) || estimatedLength,
             limit: null,
             mode: 'chunked',
             source: msg.source || 'native',
             cursor,
             bytes_total: cursor.total_bytes || 0,
-          },
-        }));
+          };
+          if (JSON.stringify(prev[id] || null) === JSON.stringify(nextMeta)) return prev;
+          return { ...prev, [id]: nextMeta };
+        });
         setHistoryLoading(prev => {
           if (!prev[id]) return prev;
           const next = { ...prev };
@@ -758,21 +835,6 @@ export function useRelay() {
           nextBeforeId,
         };
         clearTimeout(historyChunkTimers.current[id]);
-        if (!msg.error && hasMore) {
-          const chunkState = historyChunkState.current[id] || {};
-          const requestSource = chunkState.source || (msg.source === 'codex_cli_jsonl' ? 'native' : 'relay_sqlite');
-          historyChunkTimers.current[id] = setTimeout(() => {
-            if (activeSessionRef.current !== id) return;
-            requestHistoryChunk(id, {
-              mode: 'older',
-              source: requestSource,
-              beforeOffset: nextBeforeOffset,
-              beforeId: nextBeforeId,
-              limit: chunkState.limit || undefined,
-              chunkBytes: historyChunkState.current[id]?.chunkBytes || CODEX_CLI_HISTORY_CHUNK_BYTES,
-            });
-          }, 250);
-        }
         return;
       }
 
@@ -806,23 +868,23 @@ export function useRelay() {
           : false;
         if (isThinking) {
           clearTimeout(thinkingTimers.current[id]);
-          setThinking(prev => ({ ...prev, [id]: label }));
-          setActivities(prev => ({ ...prev, [id]: activity }));
+          setThinking(prev => Object.is(prev[id], label) ? prev : ({ ...prev, [id]: label }));
+          setActivities(prev => shallowMapMerge(prev, { [id]: activity }));
           // Store Claude Code thinking content text
           const nextThinkingContent = msg.thinking_content ?? msg.activity?.thinkingContent;
           if (nextThinkingContent != null) {
-            setThinkingContent(prev => ({ ...prev, [id]: nextThinkingContent }));
+            setThinkingContent(prev => Object.is(prev[id], nextThinkingContent) ? prev : ({ ...prev, [id]: nextThinkingContent }));
           }
         } else if (msg.activity?.goal || msg.activity?.task_list) {
           clearTimeout(thinkingTimers.current[id]);
-          setThinking(prev => ({ ...prev, [id]: false }));
-          setActivities(prev => ({ ...prev, [id]: activity }));
+          setThinking(prev => prev[id] === false ? prev : ({ ...prev, [id]: false }));
+          setActivities(prev => shallowMapMerge(prev, { [id]: activity }));
         } else {
           clearTimeout(thinkingTimers.current[id]);
           thinkingTimers.current[id] = setTimeout(() => {
-            setThinking(prev => ({ ...prev, [id]: false }));
-            setActivities(prev => ({ ...prev, [id]: false }));
-            setThinkingContent(prev => ({ ...prev, [id]: '' }));
+            setThinking(prev => prev[id] === false ? prev : ({ ...prev, [id]: false }));
+            setActivities(prev => prev[id] === false ? prev : ({ ...prev, [id]: false }));
+            setThinkingContent(prev => prev[id] === '' ? prev : ({ ...prev, [id]: '' }));
           }, 4000);
         }
         return;

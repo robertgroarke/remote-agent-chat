@@ -10,6 +10,8 @@ const { useState, useRef, useEffect, useLayoutEffect } = React;
 const DRAFT_STORAGE_KEY = 'remote-agent-chat:drafts:v1';
 const DEFAULT_INITIAL_HISTORY_LIMIT = 120;
 const CODEX_CLI_INITIAL_HISTORY_LIMIT = 160;
+const TRANSCRIPT_RENDER_TAIL_LIMIT = 96;
+const EMPTY_MESSAGES = Object.freeze([]);
 const SLASH_COMMANDS = [
   { command: '/plan', detail: 'Outline the implementation approach and major steps.' },
   { command: '/review', detail: 'Review the current changes for bugs, regressions, and missing tests.' },
@@ -110,6 +112,15 @@ function messageIdentityKey(msg, fallbackIndex = 0) {
     msg.ts || '',
     stableContentHash(`${content}\n${blocks}`),
   ].join(':');
+}
+
+function scrollIdentityKeysForMessages(messages, renderAll = false) {
+  const list = Array.isArray(messages) ? messages : [];
+  const keySource = (!renderAll && list.length > TRANSCRIPT_RENDER_TAIL_LIMIT)
+    ? list.slice(-TRANSCRIPT_RENDER_TAIL_LIMIT)
+    : list;
+  const offset = list.length - keySource.length;
+  return keySource.map((msg, i) => messageIdentityKey(msg, offset + i));
 }
 
 function setScrollTopInstant(element, value) {
@@ -441,16 +452,24 @@ function isUserHomeWorkspaceName(nameValue, pathValue) {
 function stripWorkspaceDecorations(value) {
   return safeString(value)
     .replace(/\s+\(Workspace\)$/i, '')
-    .replace(/\s+-\s+Visual Studio Code$/i, '')
-    .replace(/\s+-\s+Code$/i, '')
+    .replace(/\s+-\s+(?:Visual Studio Code|Code|Cursor|Antigravity)(?:\s*\[[^\]]+\]|\s+(?:Administrator|Admin))?$/i, '')
     .trim();
+}
+
+function isEditorAppChromeLabel(value) {
+  const text = safeString(value).trim();
+  return /^(?:Visual Studio Code|Code|Cursor|Antigravity)(?:\s*\[[^\]]+\]|\s+(?:Administrator|Admin))?$/i.test(text);
+}
+
+function hasEditorAppChromeSuffix(value) {
+  return /\s+-\s+(?:Visual Studio Code|Code|Cursor|Antigravity)(?:\s*\[[^\]]+\]|\s+(?:Administrator|Admin))?\s*$/i.test(safeString(value));
 }
 
 function parseVSCodeWindowParts(value) {
   const raw = safeString(value).trim();
   if (!raw) return [];
-  const parts = raw.split(/\s+-\s+/).map(part => part.trim()).filter(Boolean);
-  while (parts.length && /^(Visual Studio Code|Code|Cursor|Antigravity)$/i.test(parts[parts.length - 1])) {
+  const parts = raw.split(/\s+-\s+/).map(part => stripWorkspaceDecorations(part)).filter(Boolean);
+  while (parts.length && isEditorAppChromeLabel(parts[parts.length - 1])) {
     parts.pop();
   }
   return parts;
@@ -531,6 +550,7 @@ function isLowSignalWorkspaceLabel(value) {
   const label = humanizeWorkspaceLabel(value).toLowerCase();
   if (!label) return true;
   if (/^window\s+\d+$/.test(label)) return true;
+  if (isEditorAppChromeLabel(label)) return true;
   if (LOW_SIGNAL_WORKSPACE_LABELS.has(label)) return true;
   const compact = label.replace(/[^a-z0-9]+/g, '');
   return LOW_SIGNAL_WORKSPACE_KEYS.has(compact);
@@ -562,21 +582,52 @@ function vscodeWorkspaceCandidate(titleValue) {
 }
 
 function namedWorkspaceCandidate(value) {
+  const raw = safeString(value);
+  if (hasEditorAppChromeSuffix(raw)) return null;
   const text = stripWorkspaceDecorations(value);
   if (!text || looksLikeAbsolutePath(text)) return null;
   if (parseVSCodeWindowParts(text).length >= 2) return null;
   return makeWorkspaceCandidate(text, text);
 }
 
+function workspaceTextVariants(label) {
+  const base = safeString(label).toLowerCase().trim();
+  return [
+    base,
+    base.replace(/\s+/g, '-'),
+    base.replace(/\s+/g, ''),
+  ].filter(Boolean);
+}
+
+function knownWorkspaceCandidateFromText(values, knownWorkspaces = []) {
+  const textFields = values.map(value => safeString(value).toLowerCase()).filter(Boolean);
+  const sortedKnown = [...knownWorkspaces].sort((a, b) => b.label.length - a.label.length);
+  for (const known of sortedKnown) {
+    const variants = workspaceTextVariants(known.label);
+    if (textFields.some(text => variants.some(variant => variant && text.includes(variant)))) {
+      return known;
+    }
+  }
+  return null;
+}
+
 function workspaceCandidateFromSession(sessionOrId, agentConfig, knownWorkspaces = []) {
   if (!sessionOrId || typeof sessionOrId !== 'object') return null;
 
+  const knownMatch = knownWorkspaceCandidateFromText([
+    sessionOrId.window_title,
+    sessionOrId.workspace_name,
+    sessionOrId.chat_title,
+    sessionOrId.session_title,
+  ], knownWorkspaces);
+
   const directCandidates = [
     pathWorkspaceCandidate(sessionOrId.workspace_path),
+    pathWorkspaceCandidate(agentConfig?.file_access_scope),
+    knownMatch,
     vscodeWorkspaceCandidate(sessionOrId.window_title),
     vscodeWorkspaceCandidate(sessionOrId.workspace_name),
     isUserHomeWorkspaceName(sessionOrId.workspace_name, sessionOrId.workspace_path) ? null : namedWorkspaceCandidate(sessionOrId.workspace_name),
-    pathWorkspaceCandidate(agentConfig?.file_access_scope),
   ].filter(Boolean);
   if (directCandidates.length > 0) {
     const candidate = directCandidates[0];
@@ -591,17 +642,8 @@ function workspaceCandidateFromSession(sessionOrId, agentConfig, knownWorkspaces
     sessionOrId.window_title,
     sessionOrId.workspace_name,
   ].map(value => safeString(value).toLowerCase()).filter(Boolean);
-  const sortedKnown = [...knownWorkspaces].sort((a, b) => b.label.length - a.label.length);
-  for (const known of sortedKnown) {
-    const variants = [
-      known.label.toLowerCase(),
-      known.label.toLowerCase().replace(/\s+/g, '-'),
-      known.label.toLowerCase().replace(/\s+/g, ''),
-    ];
-    if (textFields.some(text => variants.some(variant => variant && text.includes(variant)))) {
-      return known;
-    }
-  }
+  const textMatch = knownWorkspaceCandidateFromText(textFields, knownWorkspaces);
+  if (textMatch) return textMatch;
 
   return null;
 }
@@ -681,9 +723,12 @@ function titleFromMessageContent(content) {
 
 function titleFromSessionMessages(sessionMessages) {
   const list = Array.isArray(sessionMessages) ? sessionMessages : [];
-  const user = list.find(msg => msg?.role === 'user' && titleFromMessageContent(msg.content));
+  const sample = list.length > 80
+    ? [...list.slice(0, 40), ...list.slice(-40)]
+    : list;
+  const user = sample.find(msg => msg?.role === 'user' && titleFromMessageContent(msg.content));
   if (user) return titleFromMessageContent(user.content);
-  const any = list.find(msg => titleFromMessageContent(msg?.content || contentBlocksFallback(msg?.content_blocks)));
+  const any = sample.find(msg => titleFromMessageContent(msg?.content || contentBlocksFallback(msg?.content_blocks)));
   return any ? titleFromMessageContent(any.content || contentBlocksFallback(any.content_blocks)) : '';
 }
 
@@ -859,6 +904,115 @@ function DeliveryStatus({ msg, deliveryStates, onSteer }) {
   return <span className="delivery delivered" title="Sent">✓</span>;
 }
 
+// Memoized transcript rows keep live status ticks from repainting Markdown/code blocks.
+function TranscriptMessage({
+  msg,
+  messageKey,
+  activeAgent,
+  assistantMonospace,
+  autoExpandLongCodeBlocks,
+  onOpenPath,
+  agentType,
+  preview,
+  fileContents,
+  onClosePreview,
+  deliveryState,
+  onSteer,
+}) {
+  const normalizedContent = normalizeMessageContent(msg.content) || contentBlocksFallback(msg.content_blocks);
+  const renderableUserContent = recoverUploadedImageMarkdown(msg.content);
+  const timestampLabel = formatMessageTimestamp(msg.ts);
+  const hasStructuredBlocks = msg.role !== 'user' && normalizeContentBlocks(msg.content_blocks).length > 0;
+  if (msg.role === 'user') {
+    const deliveryStatesForMessage = msg._cid ? { [msg._cid]: deliveryState } : {};
+    return (
+      <div className={`message user${msg._optimistic && deliveryState === 'failed' ? ' failed' : ''}`}>
+        <div className="user-gutter">
+          <div className="user-glyph" />
+        </div>
+        <div className="user-content">
+          <div className="message-role">
+            <span>You</span>
+            {timestampLabel && <span className="message-timestamp">{timestampLabel}</span>}
+            <DeliveryStatus msg={msg} deliveryStates={deliveryStatesForMessage} onSteer={onSteer} />
+          </div>
+          {/!\[[^\]]*\]\((?:data:|\/uploads\/)/.test(renderableUserContent) ? (
+            <div className="user-text"><MarkdownContent content={renderableUserContent} /></div>
+          ) : (
+            <div className="user-text">{normalizedContent}</div>
+          )}
+        </div>
+      </div>
+    );
+  }
+  return (
+    <div className={`message assistant${assistantMonospace ? ' monospace' : ''}`}>
+      <div className="assistant-gutter">
+        <div
+          className="agent-badge transcript-agent-badge"
+          style={{ color: activeAgent.color, borderColor: activeAgent.color + '55', background: activeAgent.color + '18' }}
+        >
+          {activeAgent.logo
+            ? <img src={activeAgent.logo} alt={activeAgent.abbr} className="agent-badge-logo" />
+            : activeAgent.abbr}
+        </div>
+      </div>
+      <div className="assistant-content">
+        <div className="message-role">
+          <span>{activeAgent.name}</span>
+          {timestampLabel && <span className="message-timestamp">{timestampLabel}</span>}
+        </div>
+        {hasStructuredBlocks ? (
+          <ContentBlocks
+            blocks={msg.content_blocks}
+            monospace={assistantMonospace}
+            autoExpandLongCodeBlocks={autoExpandLongCodeBlocks}
+            onOpenPath={(path) => onOpenPath(messageKey, path)}
+            agentType={agentType}
+          />
+        ) : (
+          <MarkdownContent
+            content={normalizeMessageContent(msg.content)}
+            monospace={assistantMonospace}
+            autoExpandLongCodeBlocks={autoExpandLongCodeBlocks}
+            onOpenPath={(path) => onOpenPath(messageKey, path)}
+          />
+        )}
+        {preview && (
+          <TranscriptInlineFilePreview
+            sessionId={preview.sessionId}
+            filePath={preview.path}
+            fileContents={fileContents}
+            onClose={onClosePreview}
+          />
+        )}
+      </div>
+    </div>
+  );
+}
+
+function transcriptPreviewKey(preview) {
+  return preview ? `${preview.sessionId}\u0001${preview.messageKey}\u0001${preview.path}` : '';
+}
+
+function activeAgentKey(agent) {
+  return [agent?.name, agent?.color, agent?.abbr, agent?.logo || ''].join('\u0001');
+}
+
+function areTranscriptMessagePropsEqual(prev, next) {
+  return prev.msg === next.msg
+    && prev.messageKey === next.messageKey
+    && prev.assistantMonospace === next.assistantMonospace
+    && prev.autoExpandLongCodeBlocks === next.autoExpandLongCodeBlocks
+    && prev.agentType === next.agentType
+    && activeAgentKey(prev.activeAgent) === activeAgentKey(next.activeAgent)
+    && transcriptPreviewKey(prev.preview) === transcriptPreviewKey(next.preview)
+    && prev.fileContents === next.fileContents
+    && prev.deliveryState === next.deliveryState;
+}
+
+const MemoTranscriptMessage = React.memo(TranscriptMessage, areTranscriptMessagePropsEqual);
+
 // ─── QueuedItem — queued message with Steer, trash, and ... menu ─────────────
 function QueuedItem({ qm, onSteer, onDiscard, onEdit }) {
   const [menuOpen, setMenuOpen] = React.useState(false);
@@ -997,6 +1151,57 @@ function SessionCard({ session, health, unread, isThinking, isActive, agentConfi
     </div>
   );
 }
+
+function sessionCardMessagesKey(messages) {
+  const list = Array.isArray(messages) ? messages : [];
+  if (!list.length) return '0';
+  const first = list[0];
+  const last = list[list.length - 1];
+  return [
+    list.length,
+    first?.role || '',
+    safeString(first?.content).slice(0, 120),
+    last?.role || '',
+    safeString(last?.content).slice(0, 120),
+  ].join('\u0001');
+}
+
+function sessionCardAgentConfigKey(config) {
+  if (!config) return '';
+  return [
+    config.model_id || '',
+    config.effort || '',
+    config.permission_mode || '',
+    config.file_access_scope || '',
+  ].join('\u0001');
+}
+
+function sessionCardActivityKey(activity) {
+  if (!activity) return '';
+  return [
+    activity.kind || '',
+    activity.label || '',
+    activity.goal?.status || '',
+    activity.goal?.label || '',
+  ].join('\u0001');
+}
+
+function areSessionCardPropsEqual(prev, next) {
+  return prev.session === next.session
+    && prev.health === next.health
+    && prev.unread === next.unread
+    && prev.isThinking === next.isThinking
+    && prev.isActive === next.isActive
+    && prev.hasBlockingPrompt === next.hasBlockingPrompt
+    && prev.blockingPromptLabel === next.blockingPromptLabel
+    && prev.showAutomationsActive === next.showAutomationsActive
+    && prev.showSkillsActive === next.showSkillsActive
+    && sessionCardAgentConfigKey(prev.agentConfig) === sessionCardAgentConfigKey(next.agentConfig)
+    && sessionCardActivityKey(prev.activity) === sessionCardActivityKey(next.activity)
+    && sessionCardMessagesKey(prev.sessionMessages) === sessionCardMessagesKey(next.sessionMessages);
+}
+
+const MemoSessionCard = React.memo(SessionCard, areSessionCardPropsEqual);
 
 // ─── ClaudeSpinner — replicates the Claude Code extension's thinking spinner ──
 // Cycles through Unicode symbols at 120ms per frame, matching the extension exactly.
@@ -3293,6 +3498,7 @@ function App() {
   const [showComposerSettings, setShowComposerSettings] = useState(false);
   const [stopPending, setStopPending]       = useState({});
   const [showJumpButton, setShowJumpButton] = useState(false);
+  const [expandedTranscriptSessions, setExpandedTranscriptSessions] = useState({});
   const [showChatList, setShowChatList]     = useState(false);
   const [agv2NavigatorOpen, setAgv2NavigatorOpen] = useState(true);
   const [optimisticV2ChatFocus, setOptimisticV2ChatFocus] = useState({});
@@ -3312,11 +3518,66 @@ function App() {
   const [theme, setTheme]                           = useState(() => {
     try { return localStorage.getItem('remote-agent-chat-theme') || 'dark'; } catch { return 'dark'; }
   });
-  const orderedSessions = sortSessionsForDisplay(sessions);
-  const sessionGroups = groupSessionsByWorkspace(orderedSessions, agentConfigs);
+  const steerMessageRef = useRef(steerMessage);
+  useEffect(() => { steerMessageRef.current = steerMessage; }, [steerMessage]);
+  const handleTranscriptSteer = React.useCallback((cid, content) => {
+    if (!activeSession) return;
+    steerMessageRef.current(activeSession, cid, content);
+  }, [activeSession]);
+  const requestFileContentRef = useRef(requestFileContent);
+  useEffect(() => { requestFileContentRef.current = requestFileContent; }, [requestFileContent]);
+  const orderedSessions = React.useMemo(() => sortSessionsForDisplay(sessions), [sessions]);
+  const sessionGroups = React.useMemo(
+    () => groupSessionsByWorkspace(orderedSessions, agentConfigs),
+    [orderedSessions, agentConfigs],
+  );
+  const activeMessagesForScroll = activeSession && messages[activeSession]
+    ? messages[activeSession]
+    : EMPTY_MESSAGES;
+  const activeTranscriptExpandedForScroll = !!(activeSession && expandedTranscriptSessions[activeSession]);
+  const activeActivityForScroll = activeSession ? activities[activeSession] : null;
+  const activeThinkingForScroll = activeSession ? (thinkingContent[activeSession] || '') : '';
+  const activePermissionPromptForScroll = activeSession ? permissionPrompts[activeSession] || null : null;
+  const activeErrorPromptForScroll = activeSession ? errorPrompts[activeSession] || null : null;
+  const activeLiveScrollVersion = React.useMemo(() => {
+    const activity = activeActivityForScroll && typeof activeActivityForScroll === 'object'
+      ? activeActivityForScroll
+      : null;
+    const goal = activity?.goal || null;
+    const tasks = Array.isArray(activity?.task_list?.tasks)
+      ? activity.task_list.tasks.map(task => `${task.state || ''}:${task.text || task.title || task.label || ''}`).join('|')
+      : '';
+    return [
+      activeThinkingForScroll,
+      activity?.kind || '',
+      activity?.label || '',
+      activity?.updatedAt || '',
+      activity?.startedAt || '',
+      activity?.interruptHint || '',
+      activity?.thinkingContent || '',
+      goal?.status || '',
+      goal?.label || '',
+      goal?.objective || '',
+      goal?.time_used_seconds ?? goal?.timeUsedSeconds ?? '',
+      goal?.updated_at || '',
+      tasks,
+      activePermissionPromptForScroll?.id || activePermissionPromptForScroll?.request_id || '',
+      activeErrorPromptForScroll?.id || activeErrorPromptForScroll?.request_id || '',
+    ].join('\u0001');
+  }, [
+    activeActivityForScroll,
+    activeThinkingForScroll,
+    activePermissionPromptForScroll,
+    activeErrorPromptForScroll,
+  ]);
   const messagesEndRef  = useRef(null);
   const messagesListRef = useRef(null);
   const isAtBottom      = useRef(true);   // updated by scroll listener before DOM changes
+  const stickyToNewestRef = useRef(true); // false only after an intentional user scroll away from newest
+  const userScrollIntentUntilRef = useRef(0);
+  const programmaticScrollUntilRef = useRef(0);
+  const pinnedToNewestUntilRef = useRef(0);
+  const selectedSessionRef = useRef(activeSession);
   const scrollSnapshotRef = useRef({
     sessionId: null,
     keys: [],
@@ -3330,6 +3591,10 @@ function App() {
   const prevConnected   = useRef(connected);
   const pendingAttachmentReqs = useRef({});
   const seenAttachmentResults = useRef({});
+
+  useLayoutEffect(() => {
+    selectedSessionRef.current = activeSession;
+  }, [activeSession]);
 
   useEffect(() => {
     const onError = (event) => {
@@ -3409,21 +3674,101 @@ function App() {
   useEffect(() => {
     const list = messagesListRef.current;
     if (!list) return;
+    let touchStartY = null;
+    const markUserScrollAwayIntent = () => {
+      userScrollIntentUntilRef.current = Date.now() + 1200;
+    };
+    const onWheel = (event) => {
+      if (event.deltaY < -1) markUserScrollAwayIntent();
+    };
+    const onPointerDown = (event) => {
+      const rect = list.getBoundingClientRect();
+      if (event.clientX >= rect.right - 16) markUserScrollAwayIntent();
+    };
+    const onTouchStart = (event) => {
+      touchStartY = event.touches?.[0]?.clientY ?? null;
+    };
+    const onTouchMove = (event) => {
+      const y = event.touches?.[0]?.clientY ?? null;
+      if (touchStartY != null && y != null && y - touchStartY > 4) markUserScrollAwayIntent();
+    };
+    const onKeyDown = (event) => {
+      if (['ArrowUp', 'PageUp', 'Home'].includes(event.key)) markUserScrollAwayIntent();
+    };
     const onScroll = () => {
       const atBottom = list.scrollHeight - list.scrollTop - list.clientHeight < 80;
+      const now = Date.now();
+      const userInitiated = now < userScrollIntentUntilRef.current;
+      const programmatic = now < programmaticScrollUntilRef.current;
       isAtBottom.current = atBottom;
-      setShowJumpButton(!atBottom);
+      if (atBottom) {
+        stickyToNewestRef.current = true;
+      } else if (userInitiated && !programmatic) {
+        stickyToNewestRef.current = false;
+        pinnedToNewestUntilRef.current = 0;
+      }
+      setShowJumpButton(!atBottom && !stickyToNewestRef.current);
       scrollSnapshotRef.current = {
         ...scrollSnapshotRef.current,
         scrollTop: list.scrollTop,
         scrollHeight: list.scrollHeight,
         clientHeight: list.clientHeight,
-        atBottom,
+        atBottom: atBottom || stickyToNewestRef.current,
       };
     };
     list.addEventListener('scroll', onScroll, { passive: true });
-    return () => list.removeEventListener('scroll', onScroll);
+    list.addEventListener('wheel', onWheel, { passive: true });
+    list.addEventListener('touchstart', onTouchStart, { passive: true });
+    list.addEventListener('touchmove', onTouchMove, { passive: true });
+    list.addEventListener('pointerdown', onPointerDown, { passive: true });
+    window.addEventListener('keydown', onKeyDown);
+    return () => {
+      list.removeEventListener('scroll', onScroll);
+      list.removeEventListener('wheel', onWheel);
+      list.removeEventListener('touchstart', onTouchStart);
+      list.removeEventListener('touchmove', onTouchMove);
+      list.removeEventListener('pointerdown', onPointerDown);
+      window.removeEventListener('keydown', onKeyDown);
+    };
   }, []);  // mount only — list ref is stable
+
+  function stickTranscriptToNewest(keys, frameCount = 2) {
+    const sessionAtStart = activeSession;
+    const apply = () => {
+      const list = messagesListRef.current;
+      if (!list || selectedSessionRef.current !== sessionAtStart) return false;
+      programmaticScrollUntilRef.current = Date.now() + 800;
+      stickyToNewestRef.current = true;
+      setScrollTopInstant(list, list.scrollHeight);
+      isAtBottom.current = true;
+      setShowJumpButton(false);
+      scrollSnapshotRef.current = {
+        sessionId: sessionAtStart,
+        keys,
+        scrollTop: list.scrollTop,
+        scrollHeight: list.scrollHeight,
+        clientHeight: list.clientHeight,
+        atBottom: true,
+      };
+      return true;
+    };
+    apply();
+    let remaining = Math.max(0, frameCount);
+    const tick = () => {
+      if (remaining <= 0) return;
+      remaining -= 1;
+      if (apply()) requestAnimationFrame(tick);
+    };
+    if (remaining > 0) requestAnimationFrame(tick);
+  }
+
+  function pinTranscriptToNewest() {
+    const list = messagesListRef.current;
+    if (!list) return;
+    const keys = scrollIdentityKeysForMessages(activeMessagesForScroll, activeTranscriptExpandedForScroll);
+    pinnedToNewestUntilRef.current = Date.now() + 5000;
+    stickTranscriptToNewest(keys, 4);
+  }
 
   // Keep transcript hydration visually stable. Tail chunks should land at the
   // bottom, but older backfill chunks are prepended above the viewport; preserve
@@ -3431,8 +3776,7 @@ function App() {
   useLayoutEffect(() => {
     const list = messagesListRef.current;
     if (!list) return;
-    const activeMessages = activeSession ? (messages[activeSession] || []) : [];
-    const keys = activeMessages.map((msg, i) => messageIdentityKey(msg, i));
+    const keys = scrollIdentityKeysForMessages(activeMessagesForScroll, activeTranscriptExpandedForScroll);
     const prev = scrollSnapshotRef.current || {};
     const sameSession = prev.sessionId === activeSession;
     const prevKeys = Array.isArray(prev.keys) ? prev.keys : [];
@@ -3440,10 +3784,19 @@ function App() {
     const prevLast = prevKeys[prevKeys.length - 1] || null;
     const prevFirstIndex = prevFirst ? keys.indexOf(prevFirst) : -1;
     const prevLastIndex = prevLast ? keys.indexOf(prevLast) : -1;
+    const sameRenderedKeys = !!(
+      sameSession
+      && keys.length === prevKeys.length
+      && keys.every((key, index) => key === prevKeys[index])
+    );
     const previousBottomGap = (Number(prev.scrollHeight) || 0)
       - (Number(prev.scrollTop) || 0)
       - (Number(prev.clientHeight) || 0);
-    const wasAtBottom = prev.atBottom !== false || previousBottomGap < 120;
+    const forcePinnedToNewest = Date.now() < pinnedToNewestUntilRef.current;
+    const wasAtBottom = forcePinnedToNewest
+      || stickyToNewestRef.current
+      || prev.atBottom !== false
+      || previousBottomGap < 120;
     const olderPrepended = !!(
       sameSession
       && prevKeys.length
@@ -3451,29 +3804,33 @@ function App() {
       && prevLastIndex >= prevFirstIndex
     );
 
-    if (!sameSession) {
+    if (sameRenderedKeys && !forcePinnedToNewest && !wasAtBottom) {
+      // Older hydration chunks often change the backing array without changing
+      // the rendered tail window. Leave scrollTop alone so the browser does not
+      // visibly bounce while history backfills in the background.
+    } else if (!sameSession) {
       setTranscriptPreview(null);
-      isAtBottom.current = true;
-      setScrollTopInstant(list, list.scrollHeight);
+      stickTranscriptToNewest(keys, 3);
     } else if (wasAtBottom) {
-      setScrollTopInstant(list, list.scrollHeight);
+      stickTranscriptToNewest(keys, 3);
     } else if (olderPrepended) {
       const heightDelta = list.scrollHeight - (Number(prev.scrollHeight) || 0);
+      programmaticScrollUntilRef.current = Date.now() + 500;
       setScrollTopInstant(list, Math.max(0, (Number(prev.scrollTop) || 0) + heightDelta));
     }
 
     const atBottom = list.scrollHeight - list.scrollTop - list.clientHeight < 80;
     isAtBottom.current = atBottom;
-    setShowJumpButton(!atBottom);
+    setShowJumpButton(!atBottom && !stickyToNewestRef.current);
     scrollSnapshotRef.current = {
       sessionId: activeSession,
       keys,
       scrollTop: list.scrollTop,
       scrollHeight: list.scrollHeight,
       clientHeight: list.clientHeight,
-      atBottom,
+      atBottom: atBottom || stickyToNewestRef.current,
     };
-  }, [activeSession, messages]);
+  }, [activeSession, activeMessagesForScroll, activeTranscriptExpandedForScroll, activeLiveScrollVersion]);
 
   // Fetch agent config whenever the active session changes
   useEffect(() => {
@@ -3760,11 +4117,27 @@ async function uploadBinaryDraft(sessionId, base64, mimeType, filename) {
   const isStopPending    = activeSession ? !!stopPending[activeSession] : false;
   const currentInput    = activeSession ? (drafts[activeSession] || '') : '';
   const attachedFiles   = activeSession ? (draftFiles[activeSession] || []) : [];
-  const rawCurrentMessages = messages[activeSession] || [];
+  const rawCurrentMessages = activeMessagesForScroll;
   const draftBaseline = activeSession && pendingDraftThreads[activeSession]
     ? (draftMessageBaselines[activeSession] || 0)
     : 0;
-  const currentMessages = rawCurrentMessages.slice(Math.min(draftBaseline, rawCurrentMessages.length));
+  const currentMessages = React.useMemo(() => {
+    const baseline = Math.min(draftBaseline, rawCurrentMessages.length);
+    if (baseline <= 0) return rawCurrentMessages;
+    if (baseline >= rawCurrentMessages.length) return EMPTY_MESSAGES;
+    return rawCurrentMessages.slice(baseline);
+  }, [rawCurrentMessages, draftBaseline]);
+  const renderAllLoadedTranscript = !!(activeSession && expandedTranscriptSessions[activeSession]);
+  const renderedMessages = React.useMemo(() => {
+    if (renderAllLoadedTranscript || currentMessages.length <= TRANSCRIPT_RENDER_TAIL_LIMIT) {
+      return currentMessages.filter(msg => hasVisibleMessage(msg));
+    }
+    const tailWindow = currentMessages.slice(-TRANSCRIPT_RENDER_TAIL_LIMIT * 2);
+    return tailWindow.filter(msg => hasVisibleMessage(msg)).slice(-TRANSCRIPT_RENDER_TAIL_LIMIT);
+  }, [currentMessages, renderAllLoadedTranscript]);
+  const hiddenLoadedMessageCount = renderAllLoadedTranscript
+    ? 0
+    : Math.max(0, currentMessages.length - renderedMessages.length);
   const activePrompt    = activeSession ? permissionPrompts[activeSession] || null : null;
   const activeErrorPrompt = activeSession ? errorPrompts[activeSession] || null : null;
   const activeBlockingErrorPrompt = isBlockingErrorPrompt(activeErrorPrompt) ? activeErrorPrompt : null;
@@ -3784,8 +4157,9 @@ async function uploadBinaryDraft(sessionId, base64, mimeType, filename) {
 
   // Resolve display label for the active session
   const activeConfig = activeSession ? (agentConfigs[activeSession] || null) : null;
-  const activeSessionMeta = orderedSessions.find(s =>
-    sessionIdOf(s) === activeSession
+  const activeSessionMeta = React.useMemo(
+    () => orderedSessions.find(s => sessionIdOf(s) === activeSession),
+    [orderedSessions, activeSession],
   );
   const activeHistoryMeta = activeSession ? (historyMeta[activeSession] || null) : null;
   const activeHistoryLoading = activeSession ? (historyLoading[activeSession] || null) : null;
@@ -3853,9 +4227,11 @@ async function uploadBinaryDraft(sessionId, base64, mimeType, filename) {
     && activeSessionMeta.visible_pane_agent !== 'codex'
   );
   const activeAgent = sessionAgent(activeSessionMeta || activeSession, activeConfig);
-  const activeSessionGroup = activeSession
-    ? sessionGroups.find(group => group.sessions.some(session => sessionIdOf(session) === activeSession))
-    : null;
+  const activeSessionGroup = React.useMemo(() => (
+    activeSession
+      ? sessionGroups.find(group => group.sessions.some(session => sessionIdOf(session) === activeSession))
+      : null
+  ), [activeSession, sessionGroups]);
   const activeGroupLabel = activeSessionGroup?.label && activeSessionGroup.label !== 'Unscoped Sessions'
     ? activeSessionGroup.label
     : '';
@@ -3895,7 +4271,12 @@ async function uploadBinaryDraft(sessionId, base64, mimeType, filename) {
     ? activeSessionMeta.machine_label
     : '';
   // Last user message — shown as sticky context banner at top of chat
-  const lastUserMsg = [...currentMessages].reverse().find(m => m.role === 'user');
+  const lastUserMsg = React.useMemo(() => {
+    for (let i = currentMessages.length - 1; i >= 0; i--) {
+      if (currentMessages[i]?.role === 'user') return currentMessages[i];
+    }
+    return null;
+  }, [currentMessages]);
   const lastUserText = lastUserMsg
     ? normalizeMessageContent(lastUserMsg.content)
       .replace(/\s+/g, ' ').trim()
@@ -3931,8 +4312,9 @@ async function uploadBinaryDraft(sessionId, base64, mimeType, filename) {
         ? null
         : { sessionId: activeSession, messageKey, path: relativePath }
     ));
-    requestFileContent(activeSession, relativePath);
-  }, [activeSession, normalizeTranscriptPreviewPath, requestFileContent]);
+    requestFileContentRef.current(activeSession, relativePath);
+  }, [activeSession, normalizeTranscriptPreviewPath]);
+  const closeTranscriptPreview = React.useCallback(() => setTranscriptPreview(null), []);
   // Use real-time activity when present. Fall back to session-metadata activity ONLY
   // when no status event has arrived yet for this session (undefined), not when it
   // was explicitly cleared to false by the idle timeout — that would resurrect a
@@ -3949,7 +4331,12 @@ async function uploadBinaryDraft(sessionId, base64, mimeType, filename) {
     && !((activeSessionMeta?.agent_type === 'cline' || activeSessionMeta?.agent_type === 'roo_code') && activeContextCard)
   );
   const assistantMonospace = activeSessionMeta?.agent_type === 'codex' || activeSessionMeta?.agent_type === 'codex_cli';
-  const lastAssistantMsg = [...currentMessages].reverse().find(m => m.role === 'assistant');
+  const lastAssistantMsg = React.useMemo(() => {
+    for (let i = currentMessages.length - 1; i >= 0; i--) {
+      if (currentMessages[i]?.role === 'assistant') return currentMessages[i];
+    }
+    return null;
+  }, [currentMessages]);
   const liveThinkingText = activeSession ? (thinkingContent[activeSession] || '').trim() : '';
   const lastAssistantText = lastAssistantMsg ? normalizeMessageContent(lastAssistantMsg.content).trim() : '';
   const showPinnedThinkingRow = !!(
@@ -4007,12 +4394,13 @@ async function uploadBinaryDraft(sessionId, base64, mimeType, filename) {
   );
   const partialHistoryLoaded = Number(activeHistoryMeta?.loaded || currentMessages.length || 0);
   const partialHistoryTotal = Number(activeHistoryMeta?.total || partialHistoryLoaded || 0);
-  function loadFullActiveHistory() {
+  function loadOlderActiveHistory() {
     if (!activeSession) return;
     const chunkSource = activeSessionMeta?.agent_type === 'codex_cli' ? 'native' : 'relay_sqlite';
     requestHistoryChunk(activeSession, {
       mode: activeHistoryMeta?.cursor ? 'older' : 'tail',
       source: chunkSource,
+      userInitiated: true,
       beforeOffset: activeHistoryMeta?.cursor?.next_before_offset,
       beforeId: activeHistoryMeta?.cursor?.next_before_id,
       ...historyRequestOptionsFor(activeSessionMeta),
@@ -4022,6 +4410,46 @@ async function uploadBinaryDraft(sessionId, base64, mimeType, filename) {
     activeSession
     && (currentMessages.length > 0 || showLiveAssistantDraft || showInlineClaudeActivity)
   );
+  const activeAgentMemoKey = activeAgentKey(activeAgent);
+  const renderedMessageNodes = React.useMemo(() => (
+    renderedMessages.map((msg, i) => {
+      const messageKey = messageIdentityKey(msg, hiddenLoadedMessageCount + i);
+      const preview = transcriptPreview?.sessionId === activeSession && transcriptPreview?.messageKey === messageKey
+        ? transcriptPreview
+        : null;
+      return (
+        <MemoTranscriptMessage
+          key={messageKey}
+          msg={msg}
+          messageKey={messageKey}
+          activeAgent={activeAgent}
+          assistantMonospace={assistantMonospace}
+          autoExpandLongCodeBlocks={autoExpandLongCodeBlocks}
+          onOpenPath={openTranscriptPreview}
+          agentType={activeSessionMeta?.agent_type}
+          preview={preview}
+          fileContents={fileContents}
+          onClosePreview={closeTranscriptPreview}
+          deliveryState={msg._cid ? deliveryStates[msg._cid] : null}
+          onSteer={handleTranscriptSteer}
+        />
+      );
+    })
+  ), [
+    renderedMessages,
+    hiddenLoadedMessageCount,
+    activeSession,
+    activeAgentMemoKey,
+    assistantMonospace,
+    autoExpandLongCodeBlocks,
+    openTranscriptPreview,
+    activeSessionMeta?.agent_type,
+    transcriptPreview,
+    fileContents,
+    closeTranscriptPreview,
+    deliveryStates,
+    handleTranscriptSteer,
+  ]);
   // Auto-fetch thread list for desktop sessions with no messages (e.g. Codex Desktop showing chat picker)
   const hasThreadCap = activeConfig?.capabilities?.thread_list;
   const showDesktopThreadTabs = !!(
@@ -4276,7 +4704,7 @@ async function uploadBinaryDraft(sessionId, base64, mimeType, filename) {
               {group.sessions.map(s => {
                 const id = typeof s === 'string' ? s : s?.session_id;
                 return (
-                  <SessionCard
+                  <MemoSessionCard
                     key={id}
                     session={s}
                     health={health[id]}
@@ -4675,9 +5103,7 @@ async function uploadBinaryDraft(sessionId, base64, mimeType, filename) {
         {showJumpButton && (
           <button
             className="jump-to-newest"
-            onClick={() => {
-              messagesEndRef.current?.scrollIntoView({ behavior: 'smooth' });
-            }}
+            onClick={pinTranscriptToNewest}
           >↓ Jump to Newest</button>
         )}
         <div className={`messages${showInlineClaudeActivity ? ' compact-footer-gap' : ''}`} ref={messagesListRef}>
@@ -4710,8 +5136,8 @@ async function uploadBinaryDraft(sessionId, base64, mimeType, filename) {
           {showPartialHistoryBanner && (
             <div className="history-tail-banner">
               <span>Showing latest {partialHistoryLoaded.toLocaleString()} of {partialHistoryTotal.toLocaleString()} messages</span>
-              <button type="button" onClick={loadFullActiveHistory} disabled={activeHistoryLoading?.mode === 'full'}>
-                {activeHistoryLoading?.mode === 'full' ? 'Loading full history...' : 'Load full history'}
+              <button type="button" onClick={loadOlderActiveHistory} disabled={!!activeHistoryLoading}>
+                {activeHistoryLoading ? 'Loading older messages...' : 'Load older messages'}
               </button>
             </div>
           )}
@@ -4785,77 +5211,32 @@ async function uploadBinaryDraft(sessionId, base64, mimeType, filename) {
           ) : currentMessages.length === 0 && activeHistoryLoading ? (
             <div className="empty-state history-loading-state">
               <span className="new-session-spinner" />
-              <div>{activeHistoryLoading.mode === 'full' ? 'Loading full history...' : 'Loading latest messages...'}</div>
+              <div>{activeHistoryLoading.mode === 'older' ? 'Loading older messages...' : 'Loading latest messages...'}</div>
             </div>
           ) : currentMessages.length === 0 ? (
             <div className="empty-state"><div className="icon">💬</div><div>No messages yet</div></div>
           ) : (
-            currentMessages.filter(msg => hasVisibleMessage(msg)).map((msg, i) => {
-              const messageKey = messageIdentityKey(msg, i);
-              const normalizedContent = normalizeMessageContent(msg.content) || contentBlocksFallback(msg.content_blocks);
-              const renderableUserContent = recoverUploadedImageMarkdown(msg.content);
-              const timestampLabel = formatMessageTimestamp(msg.ts);
-              const hasInlineScreenshot = /!\[[^\]]*\]\((?:data:|\/uploads\/)/.test(normalizedContent);
-              const hasStructuredBlocks = msg.role !== 'user' && normalizeContentBlocks(msg.content_blocks).length > 0;
-              return (
-              msg.role === 'user' ? (
-                <div key={messageKey} className={`message user${msg._optimistic && deliveryStates[msg._cid] === 'failed' ? ' failed' : ''}`}>
-                  <div className="user-gutter">
-                    <div className="user-glyph" />
-                  </div>
-                  <div className="user-content">
-                    <div className="message-role">
-                      <span>You</span>
-                      {timestampLabel && <span className="message-timestamp">{timestampLabel}</span>}
-                      <DeliveryStatus msg={msg} deliveryStates={deliveryStates} onSteer={(cid, content) => steerMessage(activeSession, cid, content)} />
-                    </div>
-                    {/!\[[^\]]*\]\((?:data:|\/uploads\/)/.test(renderableUserContent) ? (
-                      <div className="user-text"><MarkdownContent content={renderableUserContent} /></div>
-                    ) : (
-                      <div className="user-text">{normalizedContent}</div>
-                    )}
-                  </div>
+            <>
+              {hiddenLoadedMessageCount > 0 && (
+                <div className="history-tail-banner transcript-render-window-banner">
+                  <span>Rendering latest {renderedMessages.length.toLocaleString()} of {currentMessages.length.toLocaleString()} loaded messages</span>
+                  <button
+                    type="button"
+                    onClick={() => setExpandedTranscriptSessions(prev => ({ ...prev, [activeSession]: true }))}
+                  >Render all loaded</button>
                 </div>
-              ) : (
-                <div key={messageKey} className={`message assistant${assistantMonospace ? ' monospace' : ''}`}>
-                  <div className="assistant-gutter">
-                    <div
-                      className="agent-badge transcript-agent-badge"
-                      style={{ color: activeAgent.color, borderColor: activeAgent.color + '55', background: activeAgent.color + '18' }}
-                    >
-                      {activeAgent.logo
-                        ? <img src={activeAgent.logo} alt={activeAgent.abbr} className="agent-badge-logo" />
-                        : activeAgent.abbr}
-                    </div>
-                  </div>
-                  <div className="assistant-content">
-                    <div className="message-role">
-                      <span>{activeAgent.name}</span>
-                      {timestampLabel && <span className="message-timestamp">{timestampLabel}</span>}
-                    </div>
-                    {hasStructuredBlocks ? (
-                      <ContentBlocks
-                        blocks={msg.content_blocks}
-                        monospace={assistantMonospace}
-                        autoExpandLongCodeBlocks={autoExpandLongCodeBlocks}
-                        onOpenPath={(path) => openTranscriptPreview(messageKey, path)}
-                        agentType={activeSessionMeta?.agent_type}
-                      />
-                    ) : (
-                      <MarkdownContent content={normalizeMessageContent(msg.content)} monospace={assistantMonospace} autoExpandLongCodeBlocks={autoExpandLongCodeBlocks} onOpenPath={(path) => openTranscriptPreview(messageKey, path)} />
-                    )}
-                    {transcriptPreview?.sessionId === activeSession && transcriptPreview?.messageKey === messageKey && (
-                      <TranscriptInlineFilePreview
-                        sessionId={transcriptPreview.sessionId}
-                        filePath={transcriptPreview.path}
-                        fileContents={fileContents}
-                        onClose={() => setTranscriptPreview(null)}
-                      />
-                    )}
-                  </div>
+              )}
+              {renderAllLoadedTranscript && currentMessages.length > TRANSCRIPT_RENDER_TAIL_LIMIT && (
+                <div className="history-tail-banner transcript-render-window-banner">
+                  <span>Rendering all {currentMessages.length.toLocaleString()} loaded messages</span>
+                  <button
+                    type="button"
+                    onClick={() => setExpandedTranscriptSessions(prev => ({ ...prev, [activeSession]: false }))}
+                  >Return to latest only</button>
                 </div>
-              )
-            )})
+              )}
+              {renderedMessageNodes}
+            </>
           )}
           {showLiveAssistantDraft && (
             <div className={`message assistant live-draft${assistantMonospace ? ' monospace' : ''}`}>
