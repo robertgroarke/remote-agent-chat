@@ -384,6 +384,20 @@ const stmtGetSessionMeta = db.prepare(
 const stmtGetHistory     = db.prepare(
   'SELECT id, role, content, content_blocks, status, sequence, ts FROM messages WHERE session = ? ORDER BY id ASC'
 );
+const stmtGetHistoryCount = db.prepare(
+  'SELECT COUNT(*) AS count FROM messages WHERE session = ?'
+);
+const stmtGetHistoryTail = db.prepare(
+  `SELECT id, role, content, content_blocks, status, sequence, ts
+   FROM (
+     SELECT id, role, content, content_blocks, status, sequence, ts
+     FROM messages
+     WHERE session = ?
+     ORDER BY id DESC
+     LIMIT ?
+   )
+   ORDER BY id ASC`
+);
 const stmtGetHistoryFrom = db.prepare(
   `SELECT id, role, content, content_blocks, status, sequence, ts
    FROM messages WHERE session = ? AND sequence > ? ORDER BY id ASC`
@@ -391,6 +405,15 @@ const stmtGetHistoryFrom = db.prepare(
 
 function getHistoryRows(sessionId) {
   return stmtGetHistory.all(sessionId).map(hydrateMessageRow);
+}
+
+function getHistoryCount(sessionId) {
+  return Number(stmtGetHistoryCount.get(sessionId)?.count || 0);
+}
+
+function getHistoryRowsTail(sessionId, limit) {
+  const safeLimit = Math.max(1, Math.min(1000, Math.floor(Number(limit) || 0)));
+  return stmtGetHistoryTail.all(sessionId, safeLimit).map(hydrateMessageRow);
 }
 
 function getHistoryRowsFrom(sessionId, sinceSeq) {
@@ -2029,12 +2052,37 @@ function handleClientConnection(ws, req) {
     } else if (t === 'get_history' || t === 'history_request') {
       const id       = msg.session || msg.session_id;
       const sinceSeq = msg.since_sequence ?? msg.after_sequence ?? null;
+      if (!id) return;
       if (sinceSeq != null && sinceSeq > 0) {
         const messages = getHistoryRowsFrom(id, sinceSeq);
         ws.send(JSON.stringify({ type: 'history_delta', session: id, since_sequence: sinceSeq, messages }));
       } else {
+        const requestedLimit = msg.full ? 0 : Number(msg.limit || msg.tail_limit || msg.history_limit || 0);
+        if (Number.isFinite(requestedLimit) && requestedLimit > 0) {
+          const limit = Math.max(1, Math.min(1000, Math.floor(requestedLimit)));
+          const total = getHistoryCount(id);
+          const messages = getHistoryRowsTail(id, limit);
+          ws.send(JSON.stringify({
+            type: 'history',
+            session: id,
+            messages,
+            partial: total > messages.length,
+            total_messages: total,
+            loaded_messages: messages.length,
+            limit,
+            mode: 'tail',
+          }));
+          return;
+        }
         const messages = getEffectiveHistory(id);
-        ws.send(JSON.stringify({ type: 'history', session: id, messages }));
+        ws.send(JSON.stringify({
+          type: 'history',
+          session: id,
+          messages,
+          partial: false,
+          total_messages: messages.length,
+          loaded_messages: messages.length,
+        }));
       }
 
     // ── Send message (A2-01, A2-03) ────────────────────────────────────────

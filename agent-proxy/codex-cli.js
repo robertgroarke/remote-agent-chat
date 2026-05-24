@@ -1128,7 +1128,19 @@ function startCodexExecSession({ workspacePath, cliSessionId, resume = true, con
   return child;
 }
 
-function startNativeCodexWindow({ workspacePath, cliSessionId, resume = true, model, effort, permissionMode, title } = {}) {
+function buildNativeCodexWindowPowerShell({ cwd, launcherPath, elevated = true } = {}) {
+  const ps = [
+    'Start-Process',
+    '-FilePath', quotePowerShellString('cmd.exe'),
+    '-WorkingDirectory', quotePowerShellString(cwd || process.cwd()),
+    '-ArgumentList', quotePowerShellString(`/k ${quoteCmdArg(launcherPath)}`),
+  ];
+  if (elevated) ps.push('-Verb', quotePowerShellString('RunAs'));
+  ps.push('-WindowStyle', 'Normal');
+  return ps.join(' ');
+}
+
+function startNativeCodexWindow({ workspacePath, cliSessionId, resume = true, model, effort, permissionMode, title, elevated = true } = {}) {
   const cwd = workspacePath || process.cwd();
   if (process.platform !== 'win32') {
     const args = buildCodexArgs({ cliSessionId, resume, model, effort, permissionMode, workspacePath: cwd });
@@ -1145,13 +1157,7 @@ function startNativeCodexWindow({ workspacePath, cliSessionId, resume = true, mo
     commandLine,
     '',
   ].join('\r\n'));
-  const ps = [
-    'Start-Process',
-    '-FilePath', quotePowerShellString('cmd.exe'),
-    '-WorkingDirectory', quotePowerShellString(cwd),
-    '-ArgumentList', quotePowerShellString(`/k ${quoteCmdArg(launcherPath)}`),
-    '-WindowStyle', 'Normal',
-  ].join(' ');
+  const ps = buildNativeCodexWindowPowerShell({ cwd, launcherPath, elevated });
   const child = spawn('powershell.exe', ['-NoProfile', '-ExecutionPolicy', 'Bypass', '-Command', ps], {
     cwd,
     shell: false,
@@ -1159,6 +1165,7 @@ function startNativeCodexWindow({ workspacePath, cliSessionId, resume = true, mo
     stdio: 'ignore',
     windowsHide: true,
   });
+  child.remoteAgentElevated = !!elevated;
   child.unref();
   return child;
 }
@@ -1215,6 +1222,7 @@ module.exports = {
   readSessionSummary,
   resolveCodexCommand,
   startCodexExecSession,
+  buildNativeCodexWindowPowerShell,
   startNativeCodexWindow,
   watchSessions,
 };

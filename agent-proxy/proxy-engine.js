@@ -2432,9 +2432,10 @@ class ProxyEngine extends EventEmitter {
               effort: newSession.effort,
               permissionMode: newSession.permission_mode,
               title: `${workspaceName} - Codex CLI`,
+              elevated: true,
             });
             this._sendHistorySnapshot(newSession.session_id, this._codexCliPendingTranscriptMessages(newSession), 'codex cli native startup');
-            this._log('info', `[ctrl] opened native Codex CLI window for new_chat ${newSession.session_id} pid=${child?.pid || 'unknown'} model=${newSession.model_id || 'default'}`);
+            this._log('info', `[ctrl] opened native Codex CLI window for new_chat ${newSession.session_id} pid=${child?.pid || 'unknown'} model=${newSession.model_id || 'default'} elevated=${child?.remoteAgentElevated === true}`);
           } catch (e) {
             this._log('warn', `[ctrl] new_chat native Codex CLI window failed for ${newSession.session_id}: ${e.message}`);
             newSession.nativeCliStatus = 'native_window_failed';
@@ -3030,6 +3031,7 @@ class ProxyEngine extends EventEmitter {
               effort: sessionData.effort,
               permissionMode: sessionData.permission_mode,
               title: `${sessionData.workspace_name || 'Codex'} - Codex CLI`,
+              elevated: true,
             })
           : claudeCli.startNativeClaudeWindow({
               workspacePath: sessionData.workspace_path || process.cwd(),
@@ -3041,7 +3043,7 @@ class ProxyEngine extends EventEmitter {
               title: `${sessionData.workspace_name || 'Claude Code'} - Claude CLI`,
             });
         this._sendHistorySnapshot(sid, isCodexCli ? this._codexCliPendingTranscriptMessages(sessionData) : this._claudeCliPendingTranscriptMessages(sessionData), `${isCodexCli ? 'codex' : 'claude'} cli native startup`);
-        this._log('info', `[ctrl] opened native ${isCodexCli ? 'Codex' : 'Claude'} CLI window for ${sid} pid=${child?.pid || 'unknown'} model=${sessionData.model_id || 'default'}`);
+        this._log('info', `[ctrl] opened native ${isCodexCli ? 'Codex' : 'Claude'} CLI window for ${sid} pid=${child?.pid || 'unknown'} model=${sessionData.model_id || 'default'}${isCodexCli ? ` elevated=${child?.remoteAgentElevated === true}` : ''}`);
         this._sendToRelay(proto.agentControlResult(sid, requestId, 'open_native_window', 'ok'));
       } catch (e) {
         this._log('warn', `[ctrl] open_native_window failed for ${sid}: ${e.message}`);
@@ -3181,6 +3183,7 @@ class ProxyEngine extends EventEmitter {
             effort,
             permissionMode,
             title: `${workspaceName} - Codex CLI`,
+            elevated: true,
           });
           session.nativeCliStartedAt = summary.nativeCliStartedAt;
           session.nativeCliStatus = 'native_window_opened';
@@ -3191,7 +3194,7 @@ class ProxyEngine extends EventEmitter {
             native_cli_window_opened: true,
           });
           this._sendHistorySnapshot(session.session_id, this._codexCliPendingTranscriptMessages(session), 'codex cli native startup');
-          this._log('info', `[ctrl] opened native Codex CLI window for launch_session ${session.session_id} pid=${child?.pid || 'unknown'} model=${modelId || 'default'}`);
+          this._log('info', `[ctrl] opened native Codex CLI window for launch_session ${session.session_id} pid=${child?.pid || 'unknown'} model=${modelId || 'default'} elevated=${child?.remoteAgentElevated === true}`);
         } catch (e) {
           this._log('warn', `[ctrl] launch_session native Codex CLI window failed for ${session.session_id}: ${e.message}`);
           session.nativeCliStatus = 'native_window_failed';

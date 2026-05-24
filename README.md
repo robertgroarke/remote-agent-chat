@@ -1,6 +1,6 @@
 # Remote Agent Chat
 
-Access and chat with your [Antigravity IDE](https://antigravity.dev) AI agents and CLI agents (Claude Code, Claude Code CLI, Codex, Codex CLI, Gemini, Continue, Continue YOLO, Roo Code, Cline) from your phone or any browser - no inbound firewall rules, no VPS required.
+Access and chat with your [Antigravity IDE](https://antigravity.dev), Antigravity v2 Agent Manager, desktop agents, and CLI agents (Claude Code, Claude Code CLI, Codex, Codex CLI, Gemini, Continue, Continue YOLO, Roo Code, Cline) from your phone or any browser - no inbound firewall rules, no VPS required.
 
 <p align="center">
   <img src="docs/architecture.png" alt="Remote Agent Chat architecture — CDP proxy, WebSocket relay, Cloudflare tunnel, mobile UI" width="100%">
@@ -26,8 +26,8 @@ Whether you are using Antigravity, VS Code, or standalone desktop apps, you can 
 
 | | Remote Agent Chat | Claude RC (`claude --remote`) | CursorRemote |
 |---|---|---|---|
-| **IDE support** | Any IDE with CDP (Antigravity, VS Code, Electron apps) | Claude Code CLI only | Cursor only |
-| **Multi-agent** | Claude + Codex + Gemini + Continue + Roo Code + Cline in one UI | Claude only | Cursor's built-in agent only |
+| **IDE support** | Any IDE with CDP (Antigravity IDE, Antigravity v2, VS Code, Electron apps) plus CLI transcripts | Claude Code CLI only | Cursor only |
+| **Multi-agent** | Claude + Codex + Codex CLI + Gemini + Continue + Roo Code + Cline + Antigravity v2 in one UI | Claude only | Cursor's built-in agent only |
 | **Infrastructure** | Self-hosted (Docker + Cloudflare Tunnel, free) | Anthropic's servers | Cursor's servers |
 | **Data privacy** | Your code never leaves your network | Routed through Anthropic | Routed through Cursor |
 | **Open source** | Yes (MIT) | No | No |
@@ -70,6 +70,8 @@ Whether you are using Antigravity, VS Code, or standalone desktop apps, you can 
 
 The agent proxy connects **outbound** to the relay — no port forwarding or inbound firewall rules needed on your Windows machine.
 
+The WebUI groups active sessions by workspace in the sidebar and shows each chat/thread title as the session label, so multiple agents working in the same repo stay organized.
+
 ---
 
 ## What's supported
@@ -79,20 +81,20 @@ The agent proxy connects **outbound** to the relay — no port forwarding or inb
 | Claude Code (Antigravity extension) | Working |
 | Claude Code CLI | Working - WebUI sessions, Ollama Cloud models, and native Windows terminal handoff |
 | OpenAI Codex (Antigravity extension) | Working |
-| OpenAI Codex CLI | Working - WebUI sessions, native terminal handoff, active transcript discovery, tool output, and live goal/working status |
+| OpenAI Codex CLI | Working - WebUI sessions, elevated native terminal handoff, active multi-session discovery, full tool output, and bottom live goal/working status |
 | Gemini Code Assist (Antigravity extension) | Working |
 | Continue (Antigravity extension) | Working — local models via Ollama, etc. |
 | Continue YOLO (Antigravity extension) | Working — editor-tab sessions with bypass-permissions support |
 | Roo Code (Antigravity extension) | Working — side-pane sessions with permission dialog support |
 | Cline (Antigravity extension) | Working — side-pane sessions with Plan/Act mode, context usage, and permission dialog support |
 | Antigravity Chat (built-in agent) | Working |
-| Antigravity v2 Agent Manager (standalone app) | Working - separate CDP port, project/conversation history, new conversation, chat switching, rich transcript blocks |
+| Antigravity v2 Agent Manager (standalone app) | Working - separate CDP port, project/conversation navigator, new conversation, chat switching, rich transcript blocks |
 | Codex Desktop (MSIX) | Working (separate CDP port) |
 | Claude Desktop (MSIX) | Blocked — Anthropic requires a signed `CLAUDE_CDP_AUTH` token to allow CDP |
 
-Antigravity v2 is treated as a separate standalone Agent Manager surface, not as the Antigravity IDE side pane. The WebUI can expose its project/conversation list, switch between v2 chats, start new v2 conversations, and render rich assistant output such as markdown, thinking, tool calls, terminal output, file-change summaries, artifacts, prompts, and errors.
+Antigravity v2 is treated as a separate standalone Agent Manager surface, not as the Antigravity IDE side pane. The WebUI can expose its project/conversation list, scheduled-task/history entry points where available, switch between v2 chats, start new v2 conversations, and render rich assistant output such as markdown, thinking, tool calls, terminal output, file-change summaries, artifacts, prompts, and errors.
 
-Codex CLI support covers both WebUI-launched sessions and active native terminal sessions. The proxy follows recent Codex CLI transcript files, surfaces multiple active sessions, preserves full tool-call/result output, and renders live task-plan status including `Pursuing goal (...)` and `Working (... esc to interrupt)`.
+Codex CLI support covers both WebUI-launched sessions and active native terminal sessions. The proxy follows recent Codex CLI transcript files, surfaces multiple active sessions, preserves full tool-call/result output, and renders live task-plan status near the composer, including `Pursuing goal (...)` and `Working (... esc to interrupt)`.
 
 ---
 
@@ -305,7 +307,7 @@ node index.js
 
 ### Step 9 — Open the web UI
 
-Navigate to `https://agents.yourdomain.com` on your phone or browser. After logging in with Google you'll see a sidebar listing all active agent sessions. Click any session to open the chat.
+Navigate to `https://agents.yourdomain.com` on your phone or browser. After logging in with Google you'll see a sidebar grouped by workspace. Each session card shows the chat or thread title first, with the agent type and live status underneath. Click any session to open the chat.
 
 ---
 
@@ -351,6 +353,11 @@ The v1 IDE executable is normally:
 Keep both `9223` and `9226` in `CDP_PORTS` when you want Antigravity IDE and
 Antigravity v2 sessions to appear together.
 
+In the WebUI, Antigravity v2 exposes a conversation navigator for the standalone
+Agent Manager. Use it to switch projects/conversations, open history/scheduled
+task entry points when the native app exposes them, and start a new v2
+conversation without leaving the browser.
+
 ---
 
 ## Optional: OpenAI Codex CLI
@@ -365,9 +372,12 @@ Once a Codex CLI session exists, you can use it from either surface:
 - **Native terminal:** click the `native` pill in the WebUI header, or the `cmd`
   button by the composer, to open or resume the same session in a terminal.
 
+On Windows, Codex CLI native windows opened by the WebUI are launched with
+UAC elevation (`RunAs`), so newly-created Codex CLI sessions run elevated.
+
 The WebUI preserves Codex CLI tool calls, terminal output, patch/file-change
-summaries, task plans, and live status such as `Pursuing goal (...)` and
-`Working (... esc to interrupt)`.
+summaries, task plans, and live status. When a Codex CLI session is active, the
+goal timer and working timer are shown together just above the message composer.
 
 This requires:
 

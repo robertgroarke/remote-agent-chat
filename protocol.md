@@ -503,7 +503,9 @@ Sent by browser to relay when it needs snapshot or replay data.
   "type": "history_request",
   "protocol_version": 1,
   "session_id": "sess_123",
-  "after_sequence": 42
+  "after_sequence": 42,
+  "limit": 250,
+  "full": false
 }
 ```
 
@@ -511,6 +513,11 @@ Rules:
 
 - omit `after_sequence` to request a full snapshot
 - include `after_sequence` to request deltas after reconnect
+- include `limit` without `after_sequence` to request the latest N messages
+  as an ascending tail snapshot; the relay responds with `partial: true` when
+  older messages are available
+- include `full: true` to force a complete snapshot even if the browser usually
+  asks for a bounded tail for very large transcript surfaces such as Codex CLI
 
 ### `history_snapshot`
 
@@ -522,6 +529,9 @@ Sent by relay when returning the full known transcript for a session.
   "protocol_version": 1,
   "session_id": "sess_123",
   "last_sequence": 49,
+  "partial": false,
+  "total_messages": 1,
+  "loaded_messages": 1,
   "messages": [
     {
       "message_id": "msg_srv_111",

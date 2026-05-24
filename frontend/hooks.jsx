@@ -10,6 +10,7 @@ const { useState, useEffect, useRef, useCallback } = React;
 export function useRelay() {
     const [sessions,        setSessions]        = useState([]);   // string IDs (legacy) or metadata objects (v1)
     const [messages,        setMessages]        = useState({});   // sessionId -> [{role, content, _cid?, _optimistic?, _delivered?}]
+    const [historyMeta,     setHistoryMeta]     = useState({});   // sessionId -> { partial, loaded, total, limit, mode }
     const [connected,       setConnected]       = useState(false);
     const [unread,          setUnread]          = useState({});   // sessionId -> count
     const [thinking,        setThinking]        = useState({});   // sessionId -> label string | false
@@ -129,9 +130,29 @@ export function useRelay() {
       }
     }
 
-    function requestHistory(sessionOrId) {
+    function mergeSessionHealth(sessionList) {
+      const next = {};
+      (sessionList || []).forEach(session => {
+        if (!session || typeof session !== 'object' || !session.session_id) return;
+        if (!session.status) return;
+        next[session.session_id] = session.status;
+      });
+      if (Object.keys(next).length > 0) {
+        setHealth(prev => ({ ...prev, ...next }));
+      }
+    }
+
+    function requestHistory(sessionOrId, options = {}) {
       const id = typeof sessionOrId === 'string' ? sessionOrId : sessionOrId?.session_id;
-      if (id) send({ type: 'get_history', session: id });
+      if (!id) return;
+      const payload = { type: 'get_history', session: id };
+      const limit = Number(options.limit || options.tailLimit || 0);
+      if (Number.isFinite(limit) && limit > 0 && !options.full) {
+        payload.limit = Math.floor(limit);
+        payload.tail = true;
+      }
+      if (options.full) payload.full = true;
+      send(payload);
     }
 
     function shouldPreserveTranscriptInListView(session) {
@@ -443,6 +464,7 @@ export function useRelay() {
         mergeSessionMetadataActivity(msg.sessions || []);
         mergeSessionConfigHints(msg.sessions || []);
         mergeSessionChatLists(msg.sessions || []);
+        mergeSessionHealth(msg.sessions || []);
         (msg.sessions || []).forEach(s => {
           const id = s && typeof s === 'object' ? s.session_id : s;
           const preserveListViewHistory = shouldPreserveTranscriptInListView(s);
@@ -463,6 +485,7 @@ export function useRelay() {
         mergeSessionMetadataActivity(msg.sessions || []);
         mergeSessionConfigHints(msg.sessions || []);
         mergeSessionChatLists(msg.sessions || []);
+        mergeSessionHealth(msg.sessions || []);
         (msg.sessions || []).forEach(s => {
           const id = s && typeof s === 'object' ? s.session_id : s;
           const preserveListViewHistory = shouldPreserveTranscriptInListView(s);
@@ -484,6 +507,7 @@ export function useRelay() {
           mergeSessionMetadataActivity(msg.sessions);
           mergeSessionConfigHints(msg.sessions);
           mergeSessionChatLists(msg.sessions);
+          mergeSessionHealth(msg.sessions);
           msg.sessions.forEach(s => {
             const preserveListViewHistory = shouldPreserveTranscriptInListView(s);
             if (s && typeof s === 'object' && s.is_list_view && !preserveListViewHistory) {
@@ -542,7 +566,18 @@ export function useRelay() {
         const sessionObj = sessions.find(s => (typeof s === 'object' ? s.session_id : s) === id);
         const preserveListViewHistory = shouldPreserveTranscriptInListView(sessionObj);
         if (sessionObj && typeof sessionObj === 'object' && sessionObj.is_list_view && msg.messages?.length > 0 && !preserveListViewHistory) return;
-        setMessages(prev => ({ ...prev, [id]: msg.messages || [] }));
+        const nextMessages = msg.messages || [];
+        setMessages(prev => ({ ...prev, [id]: nextMessages }));
+        setHistoryMeta(prev => ({
+          ...prev,
+          [id]: {
+            partial: !!msg.partial,
+            loaded: Number(msg.loaded_messages ?? nextMessages.length) || nextMessages.length,
+            total: Number(msg.total_messages ?? nextMessages.length) || nextMessages.length,
+            limit: msg.limit || null,
+            mode: msg.mode || (msg.partial ? 'tail' : 'full'),
+          },
+        }));
         return;
       }
 
@@ -946,7 +981,7 @@ export function useRelay() {
     // where `sessions` / `messages` would be frozen at initial render values).
     handleRelayMessageRef.current = handleRelayMessage;
 
-    return { sessions, messages, connected, unread, setUnread, thinking, thinkingContent, activities, health, deliveryStates, launchStates, justLaunched, setJustLaunched, permissionPrompts, respondToPrompt, errorPrompts, respondToErrorPrompt, interruptSession, agentConfigs, requestAgentConfig, setAgentModel, setAgentEffort, setAgentPermissionMode, setAutoApprovePermissions, setAntigravityMode, setCodexConfig, newThread, openPanel, openNativeWindow, requestChatList, switchChat, newChat, chatLists, requestThreadList, switchThread, threadLists, switchWorkspace, requestTerminalOutput, terminalOutputs, requestFileChanges, fileChanges, sendAttachment, send, sendToSession, steerMessage, discardQueuedMessage, editQueuedMessage, queuedMessages, launchSession, resumeSession, closeSession, activeSessionRef, workspaces, branchLists, requestBranchList, switchBranch, createBranch, skillLists, requestSkillList, automationViews, showCodexAutomation, controlResults, directoryListings, requestDirectoryListing, fileContents, requestFileContent, requestHistory };
+    return { sessions, messages, historyMeta, connected, unread, setUnread, thinking, thinkingContent, activities, health, deliveryStates, launchStates, justLaunched, setJustLaunched, permissionPrompts, respondToPrompt, errorPrompts, respondToErrorPrompt, interruptSession, agentConfigs, requestAgentConfig, setAgentModel, setAgentEffort, setAgentPermissionMode, setAutoApprovePermissions, setAntigravityMode, setCodexConfig, newThread, openPanel, openNativeWindow, requestChatList, switchChat, newChat, chatLists, requestThreadList, switchThread, threadLists, switchWorkspace, requestTerminalOutput, terminalOutputs, requestFileChanges, fileChanges, sendAttachment, send, sendToSession, steerMessage, discardQueuedMessage, editQueuedMessage, queuedMessages, launchSession, resumeSession, closeSession, activeSessionRef, workspaces, branchLists, requestBranchList, switchBranch, createBranch, skillLists, requestSkillList, automationViews, showCodexAutomation, controlResults, directoryListings, requestDirectoryListing, fileContents, requestFileContent, requestHistory };
   }
 
 // (removed window.useRelay — now an ES module export)
