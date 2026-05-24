@@ -96,7 +96,7 @@ Antigravity v2 is treated as a separate standalone Agent Manager surface, not as
 
 Codex CLI support covers both WebUI-launched sessions and active native terminal sessions. The proxy follows recent Codex CLI transcript files, surfaces multiple active sessions, preserves full tool-call/result output, opens native sessions elevated on Windows, and renders live task-plan status near the composer, including `Pursuing goal (...)` and `Working (... esc to interrupt)`. Large archived transcripts are kept selectable without blocking initial sidebar hydration.
 
-Transcript history hydrates newest-first across agent types. The WebUI shows the most recent messages first, then incrementally backfills older history in chunks. Codex CLI uses the same UX while reading its native JSONL transcript archive in bounded byte ranges.
+Transcript history hydrates newest-first across agent types. The WebUI shows the most recent messages first, then incrementally backfills older history in chunks. Backfilled chunks preserve the reader's scroll position, while chats already pinned to the bottom stay pinned to the newest messages. Codex CLI uses the same UX while reading its native JSONL transcript archive in bounded byte ranges.
 
 ---
 
@@ -382,6 +382,8 @@ summaries, task plans, and live status. When a Codex CLI session is active, the
 goal timer and working timer are shown together just above the message composer.
 Large Codex CLI archives hydrate newest-first, then continue loading older
 messages in bounded chunks so refresh stays responsive even for long sessions.
+During backfill, the transcript keeps a stable scroll position; if the chat is
+already at the bottom, it remains pinned to the newest output.
 
 This requires:
 

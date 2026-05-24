@@ -5,7 +5,7 @@ import { getLang, isTextFile, sessionLabel } from './file-utils.js';
 import { MarkdownContent } from './markdown.js';
 import { useRelay } from './hooks.jsx';
 
-const { useState, useRef, useEffect } = React;
+const { useState, useRef, useEffect, useLayoutEffect } = React;
 
 const DRAFT_STORAGE_KEY = 'remote-agent-chat:drafts:v1';
 const DEFAULT_INITIAL_HISTORY_LIMIT = 120;
@@ -83,6 +83,45 @@ function normalizeMessageContent(content) {
     }
   }
   return '';
+}
+
+function stableContentHash(value) {
+  const text = typeof value === 'string' ? value : safeString(value);
+  let hash = 2166136261;
+  for (let i = 0; i < text.length; i++) {
+    hash ^= text.charCodeAt(i);
+    hash = Math.imul(hash, 16777619);
+  }
+  return (hash >>> 0).toString(36);
+}
+
+function messageIdentityKey(msg, fallbackIndex = 0) {
+  if (!msg || typeof msg !== 'object') return `empty:${fallbackIndex}`;
+  if (msg._cid) return `cid:${msg._cid}`;
+  if (msg.id != null) return `id:${msg.id}`;
+  if (msg.server_message_id != null) return `server:${msg.server_message_id}`;
+  if (msg.client_msg_id) return `client:${msg.client_msg_id}`;
+  if (msg.sequence != null) return `seq:${msg.sequence}`;
+  const content = normalizeMessageContent(msg.content) || contentBlocksFallback(msg.content_blocks);
+  const blocks = Array.isArray(msg.content_blocks) ? JSON.stringify(msg.content_blocks) : '';
+  return [
+    'body',
+    msg.role || '',
+    msg.ts || '',
+    stableContentHash(`${content}\n${blocks}`),
+  ].join(':');
+}
+
+function setScrollTopInstant(element, value) {
+  if (!element) return;
+  const previous = element.style.scrollBehavior;
+  element.style.scrollBehavior = 'auto';
+  element.scrollTop = value;
+  requestAnimationFrame(() => {
+    if (element.style.scrollBehavior === 'auto') {
+      element.style.scrollBehavior = previous;
+    }
+  });
 }
 
 function recoverUploadedImageMarkdown(content) {
@@ -3278,6 +3317,14 @@ function App() {
   const messagesEndRef  = useRef(null);
   const messagesListRef = useRef(null);
   const isAtBottom      = useRef(true);   // updated by scroll listener before DOM changes
+  const scrollSnapshotRef = useRef({
+    sessionId: null,
+    keys: [],
+    scrollTop: 0,
+    scrollHeight: 0,
+    clientHeight: 0,
+    atBottom: true,
+  });
   const textareaRef     = useRef(null);
   const fileInputRef    = useRef(null);
   const prevConnected   = useRef(connected);
@@ -3366,30 +3413,67 @@ function App() {
       const atBottom = list.scrollHeight - list.scrollTop - list.clientHeight < 80;
       isAtBottom.current = atBottom;
       setShowJumpButton(!atBottom);
+      scrollSnapshotRef.current = {
+        ...scrollSnapshotRef.current,
+        scrollTop: list.scrollTop,
+        scrollHeight: list.scrollHeight,
+        clientHeight: list.clientHeight,
+        atBottom,
+      };
     };
     list.addEventListener('scroll', onScroll, { passive: true });
     return () => list.removeEventListener('scroll', onScroll);
   }, []);  // mount only — list ref is stable
 
-  // On session switch: jump to bottom instantly, hide jump button, reset msg count.
-  const prevMsgCount = useRef(0);
-  useEffect(() => {
-    isAtBottom.current = true;
-    setShowJumpButton(false);
-    setTranscriptPreview(null);
-    prevMsgCount.current = (messages[activeSession] || []).length;
-    messagesEndRef.current?.scrollIntoView({ behavior: 'instant' });
-  }, [activeSession]);
+  // Keep transcript hydration visually stable. Tail chunks should land at the
+  // bottom, but older backfill chunks are prepended above the viewport; preserve
+  // the current anchor by adding the rendered height delta to scrollTop.
+  useLayoutEffect(() => {
+    const list = messagesListRef.current;
+    if (!list) return;
+    const activeMessages = activeSession ? (messages[activeSession] || []) : [];
+    const keys = activeMessages.map((msg, i) => messageIdentityKey(msg, i));
+    const prev = scrollSnapshotRef.current || {};
+    const sameSession = prev.sessionId === activeSession;
+    const prevKeys = Array.isArray(prev.keys) ? prev.keys : [];
+    const prevFirst = prevKeys[0] || null;
+    const prevLast = prevKeys[prevKeys.length - 1] || null;
+    const prevFirstIndex = prevFirst ? keys.indexOf(prevFirst) : -1;
+    const prevLastIndex = prevLast ? keys.indexOf(prevLast) : -1;
+    const previousBottomGap = (Number(prev.scrollHeight) || 0)
+      - (Number(prev.scrollTop) || 0)
+      - (Number(prev.clientHeight) || 0);
+    const wasAtBottom = prev.atBottom !== false || previousBottomGap < 120;
+    const olderPrepended = !!(
+      sameSession
+      && prevKeys.length
+      && prevFirstIndex > 0
+      && prevLastIndex >= prevFirstIndex
+    );
 
-  // Auto-scroll on new messages — but ONLY when already at the bottom.
-  // If the user has scrolled up to review history, never yank them down.
-  useEffect(() => {
-    const count = (messages[activeSession] || []).length;
-    if (count > prevMsgCount.current && isAtBottom.current) {
-      messagesEndRef.current?.scrollIntoView({ behavior: 'smooth' });
+    if (!sameSession) {
+      setTranscriptPreview(null);
+      isAtBottom.current = true;
+      setScrollTopInstant(list, list.scrollHeight);
+    } else if (wasAtBottom) {
+      setScrollTopInstant(list, list.scrollHeight);
+    } else if (olderPrepended) {
+      const heightDelta = list.scrollHeight - (Number(prev.scrollHeight) || 0);
+      setScrollTopInstant(list, Math.max(0, (Number(prev.scrollTop) || 0) + heightDelta));
     }
-    prevMsgCount.current = count;
-  }, [messages, activeSession]);
+
+    const atBottom = list.scrollHeight - list.scrollTop - list.clientHeight < 80;
+    isAtBottom.current = atBottom;
+    setShowJumpButton(!atBottom);
+    scrollSnapshotRef.current = {
+      sessionId: activeSession,
+      keys,
+      scrollTop: list.scrollTop,
+      scrollHeight: list.scrollHeight,
+      clientHeight: list.clientHeight,
+      atBottom,
+    };
+  }, [activeSession, messages]);
 
   // Fetch agent config whenever the active session changes
   useEffect(() => {
@@ -4707,7 +4791,7 @@ async function uploadBinaryDraft(sessionId, base64, mimeType, filename) {
             <div className="empty-state"><div className="icon">💬</div><div>No messages yet</div></div>
           ) : (
             currentMessages.filter(msg => hasVisibleMessage(msg)).map((msg, i) => {
-              const messageKey = msg._cid || `msg-${i}`;
+              const messageKey = messageIdentityKey(msg, i);
               const normalizedContent = normalizeMessageContent(msg.content) || contentBlocksFallback(msg.content_blocks);
               const renderableUserContent = recoverUploadedImageMarkdown(msg.content);
               const timestampLabel = formatMessageTimestamp(msg.ts);
@@ -4715,7 +4799,7 @@ async function uploadBinaryDraft(sessionId, base64, mimeType, filename) {
               const hasStructuredBlocks = msg.role !== 'user' && normalizeContentBlocks(msg.content_blocks).length > 0;
               return (
               msg.role === 'user' ? (
-                <div key={msg._cid || i} className={`message user${msg._optimistic && deliveryStates[msg._cid] === 'failed' ? ' failed' : ''}`}>
+                <div key={messageKey} className={`message user${msg._optimistic && deliveryStates[msg._cid] === 'failed' ? ' failed' : ''}`}>
                   <div className="user-gutter">
                     <div className="user-glyph" />
                   </div>
@@ -4733,7 +4817,7 @@ async function uploadBinaryDraft(sessionId, base64, mimeType, filename) {
                   </div>
                 </div>
               ) : (
-                <div key={i} className={`message assistant${assistantMonospace ? ' monospace' : ''}`}>
+                <div key={messageKey} className={`message assistant${assistantMonospace ? ' monospace' : ''}`}>
                   <div className="assistant-gutter">
                     <div
                       className="agent-badge transcript-agent-badge"
