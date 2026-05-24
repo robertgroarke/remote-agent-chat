@@ -101,6 +101,11 @@ const SEND_RETRY_DELAY_MS = 3000;
 // virtualized Codex transcripts that must be resynced as one authoritative
 // history snapshot.
 const RELAY_MESSAGE_MAX_BYTES = 96 * 1024 * 1024;
+// On reconnect, session discovery can queue large history snapshots before the
+// relay handshake completes. The WebUI asks for the selected transcript tail
+// after the session list arrives, so do not block/kill the socket by flushing
+// multi-megabyte archives ahead of the sidebar.
+const DEFERRED_HISTORY_FLUSH_MAX_BYTES = 512 * 1024;
 
 // ─── ProxyEngine class ─────────────────────────────────────────────────────
 
@@ -339,6 +344,19 @@ class ProxyEngine extends EventEmitter {
       skill_list:             agentType === 'codex-desktop',
       automation_view:        agentType === 'codex-desktop',
       file_browser:           !isAntigravityV2, // v2 exposes only a worktree label until a real path is verified
+    };
+  }
+
+  _configLogSummary(config, capabilities = null) {
+    const cfg = config && typeof config === 'object' ? config : {};
+    const caps = capabilities && typeof capabilities === 'object' ? capabilities : cfg.capabilities;
+    return {
+      model_id: cfg.model_id || 'unknown',
+      mode: cfg.mode || cfg.conversation_mode || undefined,
+      permission_mode: cfg.permission_mode || undefined,
+      file_access_scope: cfg.file_access_scope || undefined,
+      branch: cfg.branch || undefined,
+      capabilities: caps ? Object.keys(caps).filter(key => caps[key] === true).sort() : undefined,
     };
   }
 
@@ -1210,8 +1228,9 @@ class ProxyEngine extends EventEmitter {
       // still false (the discovery path runs in parallel with this handshake
       // on startup, so its initial-snapshot _sendToRelay calls hit before
       // we're allowed to send and would otherwise be lost).
+      this._lastSessionSnapshotSig = null;
+      this._sendSessionSnapshotNow('connection_ack');
       this._flushPendingPreReadyHistory();
-      this._broadcastSessionSnapshot();
       // Send all known sessions from session-store for relay backfill
       this._sendSessionMetaBackfill();
       // Re-emit agent config for all active sessions
@@ -1221,12 +1240,12 @@ class ProxyEngine extends EventEmitter {
         this._readSessionConfig(session, resolvedPath)
           .then(cfg => {
             const merged = this._decorateAgentConfig(session, this._mergeAgentConfig(session.agentType, cfg, resolvedPath));
-            this._log('info', `[startup-cfg] ${sessionId} (${session.agentType}): ${JSON.stringify({ ...merged, capabilities: agentCaps })}`);
+            this._log('info', `[startup-cfg] ${sessionId} (${session.agentType}): ${JSON.stringify(this._configLogSummary(merged, agentCaps))}`);
             this._sendToRelay(proto.agentConfig(sessionId, { ...merged, capabilities: agentCaps }));
           })
           .catch(err => {
             const merged = this._decorateAgentConfig(session, this._mergeAgentConfig(session.agentType, null, resolvedPath));
-            this._log('info', `[startup-cfg] ${sessionId} (${session.agentType}) fallback (err: ${err?.message}): ${JSON.stringify({ ...merged, capabilities: agentCaps })}`);
+            this._log('info', `[startup-cfg] ${sessionId} (${session.agentType}) fallback (err: ${err?.message}): ${JSON.stringify(this._configLogSummary(merged, agentCaps))}`);
             this._sendToRelay(proto.agentConfig(sessionId, { ...merged, capabilities: agentCaps }));
           });
       }
@@ -1691,7 +1710,7 @@ class ProxyEngine extends EventEmitter {
 
       if (!sessionData) {
         this._sendToRelay(proto.agentConfig(sid, {
-          model_id: 'unknown', permission_mode: 'unknown', file_access_scope: 'unknown', auto_approve_permissions: false, capabilities,
+          model_id: 'unknown', permission_mode: 'unknown', file_access_scope: 'unknown', auto_approve_permissions: false, capabilities, request_id: msg.request_id || null,
         }));
         return;
       }
@@ -1704,13 +1723,13 @@ class ProxyEngine extends EventEmitter {
       )
         .then(cfg => {
           const merged = this._decorateAgentConfig(sessionData, this._mergeAgentConfig(agentT, cfg, sessionData.workspace_path));
-          this._log('info', `[ctrl] agent_config sending for ${sid}: ${JSON.stringify({ ...merged, capabilities })}`);
-          this._sendToRelay(proto.agentConfig(sid, { ...merged, capabilities }));
+          this._log('info', `[ctrl] agent_config sending for ${sid}: ${JSON.stringify(this._configLogSummary(merged, capabilities))}`);
+          this._sendToRelay(proto.agentConfig(sid, { ...merged, capabilities, request_id: msg.request_id || null }));
         })
         .catch(() => {
           const merged = this._decorateAgentConfig(sessionData, this._mergeAgentConfig(agentT, null, sessionData.workspace_path));
-          this._log('info', `[ctrl] agent_config sending (fallback) for ${sid}: ${JSON.stringify({ ...merged, capabilities })}`);
-          this._sendToRelay(proto.agentConfig(sid, { ...merged, capabilities }));
+          this._log('info', `[ctrl] agent_config sending (fallback) for ${sid}: ${JSON.stringify(this._configLogSummary(merged, capabilities))}`);
+          this._sendToRelay(proto.agentConfig(sid, { ...merged, capabilities, request_id: msg.request_id || null }));
         });
       return;
     }
@@ -3556,8 +3575,9 @@ class ProxyEngine extends EventEmitter {
       this._log('info', `[relay] Received '${type}' before ack — assuming legacy relay, marking ready`);
       this.reconnectAttempt = 0;
       this.relayReady = true;
+      this._lastSessionSnapshotSig = null;
+      this._sendSessionSnapshotNow('connection_ack');
       this._flushPendingPreReadyHistory();
-      this._broadcastSessionSnapshot();
     }
   }
 
@@ -3596,6 +3616,11 @@ class ProxyEngine extends EventEmitter {
     if (!(this.relayReady && this.relayWs && this.relayWs.readyState === WebSocket.OPEN)) return;
     for (const [sid, encoded] of q.entries()) {
       try {
+        const byteLen = Buffer.byteLength(encoded, 'utf8');
+        if (byteLen > DEFERRED_HISTORY_FLUSH_MAX_BYTES) {
+          this._log('info', `[relay] Skipped deferred history snapshot for ${sid} (${Math.round(byteLen / 1024)} KB); browser will request transcript tail on selection`);
+          continue;
+        }
         this.relayWs.send(encoded);
         this._log('info', `[relay] Flushed deferred history snapshot for ${sid}`);
       } catch (e) {
@@ -3603,6 +3628,26 @@ class ProxyEngine extends EventEmitter {
       }
     }
     q.clear();
+  }
+
+  _sessionSnapshotSignature(metas) {
+    const stableMetas = metas.map(meta => ({
+      ...meta,
+      last_seen_at: undefined,
+      // Activity and live timers are broadcast through proxy_status; including
+      // them here turns every status tick into a full session-list update.
+      activity: undefined,
+    }));
+    return JSON.stringify({ sessions: stableMetas, workspaces: this.openWorkspaces || [] });
+  }
+
+  _sendSessionSnapshotNow(reason = 'snapshot') {
+    const metas = this._buildSessionMetas();
+    const snapshotSig = this._sessionSnapshotSignature(metas);
+    if (snapshotSig === this._lastSessionSnapshotSig) return;
+    this._lastSessionSnapshotSig = snapshotSig;
+    this._log('info', `[snapshot] Broadcasting ${metas.length} sessions${reason ? ` (${reason})` : ''}: ${metas.map(m => m.session_id.substring(0,8) + '(' + m.agent_type + ')').join(', ')}`);
+    this._sendToRelay(proto.sessionSnapshot(metas, this.openWorkspaces, this.PROXY_ID));
   }
 
   _sendHistorySnapshot(sessionId, messages, reason = 'history') {
@@ -4050,6 +4095,9 @@ class ProxyEngine extends EventEmitter {
     this._snapshotTimer = setTimeout(() => {
       this._snapshotTimer = null;
       const metas = this._buildSessionMetas();
+      const snapshotSig = this._sessionSnapshotSignature(metas);
+      if (snapshotSig === this._lastSessionSnapshotSig) return;
+      this._lastSessionSnapshotSig = snapshotSig;
       this._log('info', `[snapshot] Broadcasting ${metas.length} sessions: ${metas.map(m => m.session_id.substring(0,8) + '(' + m.agent_type + ')').join(', ')}`);
       this._sendToRelay(proto.sessionSnapshot(metas, this.openWorkspaces, this.PROXY_ID));
     }, 250);
@@ -8019,7 +8067,7 @@ class ProxyEngine extends EventEmitter {
           const session = this.sessions.get(sessionId);
           const merged = this._decorateAgentConfig(session, this._mergeAgentConfig(agentType, cfg, resolvedPath));
           if (session) session._currentModelId = merged.model_id || null;
-          this._log('info', `[init-cfg] ${sessionId} (${agentType}): ${JSON.stringify({ ...merged, capabilities: agentCaps })}`);
+          this._log('info', `[init-cfg] ${sessionId} (${agentType}): ${JSON.stringify(this._configLogSummary(merged, agentCaps))}`);
           this._sendToRelay(proto.agentConfig(sessionId, { ...merged, capabilities: agentCaps }));
           if (session && merged.file_access_scope && merged.file_access_scope !== 'unknown') {
             const scopePath = merged.file_access_scope;
@@ -8037,7 +8085,7 @@ class ProxyEngine extends EventEmitter {
           const session = this.sessions.get(sessionId);
           const merged = this._decorateAgentConfig(session, this._mergeAgentConfig(agentType, null, resolvedPath));
           if (session) session._currentModelId = merged.model_id || null;
-          this._log('info', `[init-cfg] ${sessionId} (${agentType}) fallback (${err?.message}): ${JSON.stringify({ ...merged, capabilities: agentCaps })}`);
+          this._log('info', `[init-cfg] ${sessionId} (${agentType}) fallback (${err?.message}): ${JSON.stringify(this._configLogSummary(merged, agentCaps))}`);
           this._sendToRelay(proto.agentConfig(sessionId, { ...merged, capabilities: agentCaps }));
         });
 
@@ -8148,7 +8196,7 @@ class ProxyEngine extends EventEmitter {
           const session = this.sessions.get(sessionId);
           const merged = this._decorateAgentConfig(session, this._mergeAgentConfig('antigravity', cfg, null));
           if (session) session._currentModelId = merged.model_id || null;
-          this._log('info', `[init-cfg] ${sessionId} (antigravity): ${JSON.stringify({ ...merged, capabilities: agentCaps })}`);
+          this._log('info', `[init-cfg] ${sessionId} (antigravity): ${JSON.stringify(this._configLogSummary(merged, agentCaps))}`);
           this._sendToRelay(proto.agentConfig(sessionId, { ...merged, capabilities: agentCaps }));
         }).catch(() => {});
 

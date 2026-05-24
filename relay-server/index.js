@@ -990,6 +990,13 @@ function broadcastToBrowsers(msg) {
   }
 }
 
+function broadcastToBrowsersExcept(msg, excludedWs) {
+  const data = JSON.stringify(msg);
+  for (const ws of browserClients) {
+    if (ws !== excludedWs && ws.readyState === WebSocket.OPEN) ws.send(data);
+  }
+}
+
 function getSessionList() {
   return Array.from(proxySockets.keys()).map((id) => {
     const meta = sessionMeta.get(id);
@@ -1001,6 +1008,51 @@ function getSessionList() {
       last_seen_at: meta.last_seen_at || (sessionLastSeen.has(id) ? new Date(sessionLastSeen.get(id)).toISOString() : null),
     };
   });
+}
+
+function compactAgentConfigForAck(config) {
+  if (!config || typeof config !== 'object') return null;
+  const compact = {};
+  [
+    'session_id',
+    'session',
+    'agent_type',
+    'model_id',
+    'mode',
+    'conversation_mode',
+    'permission_mode',
+    'file_access_scope',
+    'branch',
+    'effort',
+    'speed',
+    'sandbox_status',
+    'auto_approve_permissions',
+    'capabilities',
+  ].forEach(key => {
+    if (config[key] !== undefined) compact[key] = config[key];
+  });
+  return compact;
+}
+
+function compactAgentConfigMessage(msg) {
+  const sessionId = msg.session_id || msg.session;
+  return {
+    type:             'agent_config',
+    protocol_version: msg.protocol_version || PROTOCOL_VERSION,
+    session_id:       sessionId,
+    ...compactAgentConfigForAck(msg),
+    read_at:          msg.read_at || new Date().toISOString(),
+  };
+}
+
+function getCompactAgentConfigsForAck() {
+  const entries = [];
+  for (const [sessionId, config] of agentConfigs) {
+    if (!proxySockets.has(sessionId)) continue;
+    const compact = compactAgentConfigForAck(config);
+    if (compact) entries.push([sessionId, compact]);
+  }
+  return Object.fromEntries(entries);
 }
 
 function findRelatedHistorySession(sessionId) {
@@ -1772,7 +1824,15 @@ function handleProxyConnection(ws, req) {
     } else if (t === 'agent_config') {
       const sessionId = msg.session_id || msg.session;
       if (sessionId) { agentConfigs.set(sessionId, msg); touchSession(sessionId); }
-      broadcastToBrowsers(msg);
+      const requestId = msg.request_id || null;
+      const targetWs = requestId ? pendingCtrlReqs.get(requestId) : null;
+      if (requestId) pendingCtrlReqs.delete(requestId);
+      if (targetWs && targetWs.readyState === WebSocket.OPEN) {
+        targetWs.send(JSON.stringify(msg));
+        broadcastToBrowsersExcept(compactAgentConfigMessage(msg), targetWs);
+      } else {
+        broadcastToBrowsers(compactAgentConfigMessage(msg));
+      }
       log('info', 'config', 'Agent config updated', { session: sessionId });
 
     // ── Chat list (Epic 9) ──────────────────────────────────────────────
@@ -2057,7 +2117,7 @@ function handleClientConnection(ws, req) {
   }));
   const openPromptList = Array.from(pendingPrompts.values()).map(e => e.prompt);
   const openErrorPromptList = Array.from(pendingErrorPrompts.values()).map(e => e.prompt);
-  const agentConfigMap = Object.fromEntries(agentConfigs);
+  const agentConfigMap = getCompactAgentConfigsForAck();
   ws.send(JSON.stringify({
     type:                 'connection_ack',
     protocol_version:     PROTOCOL_VERSION,
@@ -2627,6 +2687,7 @@ function handleClientConnection(ws, req) {
       // Also forward to proxy for a fresh read
       const proxyWs = proxySockets.get(sessionId);
       if (proxyWs && proxyWs.readyState === WebSocket.OPEN) {
+        if (requestId) pendingCtrlReqs.set(requestId, ws);
         proxyWs.send(JSON.stringify({
           type:             'agent_config_request',
           protocol_version: PROTOCOL_VERSION,

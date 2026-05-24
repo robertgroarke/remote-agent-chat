@@ -386,6 +386,19 @@ function isUserHomeOrDocumentsPath(value) {
     || /^\/home\/[^/]+$/.test(text);
 }
 
+function userProfileNameFromPath(value) {
+  const text = normalizePathForDisplay(value);
+  const windowsMatch = text.match(/^[A-Za-z]:\/Users\/([^/]+)(?:\/|$)/i);
+  if (windowsMatch) return windowsMatch[1];
+  const unixMatch = text.match(/^\/(?:Users|home)\/([^/]+)(?:\/|$)/i);
+  return unixMatch ? unixMatch[1] : '';
+}
+
+function isUserHomeWorkspaceName(nameValue, pathValue) {
+  const profileName = userProfileNameFromPath(pathValue);
+  return Boolean(profileName) && safeString(nameValue).trim().toLowerCase() === profileName.toLowerCase();
+}
+
 function stripWorkspaceDecorations(value) {
   return safeString(value)
     .replace(/\s+\(Workspace\)$/i, '')
@@ -404,9 +417,34 @@ function parseVSCodeWindowParts(value) {
   return parts;
 }
 
+const IMAGE_TITLE_RE = /\b(?:image|screenshot|screen\s*shot|capture)[\w .()[\]-]*\.(?:png|jpe?g|gif|webp|bmp|svg)(?:\b|[\s._-]*\d{2,}(?:\s*[x\u00d7]\s*\d{2,})?|[\s._-]*[a-z0-9]{3,})/i;
+const ABSOLUTE_PATH_TITLE_RE = /(?:[A-Za-z]:[\\/]|\\\\[^\\/\s]+[\\/]|\/(?:Users|home|mnt|var|tmp|etc|opt|workspace|workspaces)\/)[^\s"'`<>)]{2,}/i;
+const FILE_ACTION_TITLE_RE = /^(?:read|open|view|inspect|check|review|show|load|attach|attached|upload|uploaded|cat|get-content|select-string)\b/i;
+
+function stripTitleAttachmentNoise(value) {
+  return safeString(value)
+    .replace(/!\[[^\]]*\]\(\s*(?:data:image\/[^)]+|\/uploads\/[^)]+|[^)]*\.(?:png|jpe?g|gif|webp|bmp|svg)[^)]*)\)/gi, ' ')
+    .replace(/\[File:\s*[^\]]+\]/gi, ' ')
+    .replace(ABSOLUTE_PATH_TITLE_RE, ' ')
+    .replace(IMAGE_TITLE_RE, ' ')
+    .replace(/\b(?:image|screenshot|screen\s*shot|capture)[\w .()[\]-]*(?:\d{2,}\s*[x\u00d7]\s*\d{2,})\b/gi, ' ')
+    .replace(/\b(?:file|image|screenshot|attached|uploaded|read|open|view|inspect|check|review|show|load|get-content|select-string)\b/gi, ' ')
+    .replace(/[\s:;,.()[\]{}'"`/\\|-]+/g, ' ')
+    .trim();
+}
+
 function isLowSignalChatTitle(value) {
   const text = safeString(value).trim();
   if (!text) return false;
+  if (/^!\[[^\]]*\]\(\s*(?:data:image\/|\/uploads\/|[^)]*\.(?:png|jpe?g|gif|webp|bmp|svg))/i.test(text)) return true;
+  if (/^\[File:\s*[^\]]+\]/i.test(text)) return true;
+  if (/^(?:[A-Za-z]:[\\/]|\\\\|\/(?:Users|home|mnt|var|tmp|etc|opt|workspace|workspaces)\/)/i.test(text)) return true;
+
+  const hasImageName = IMAGE_TITLE_RE.test(text);
+  const hasPath = ABSOLUTE_PATH_TITLE_RE.test(text);
+  if (hasImageName && stripTitleAttachmentNoise(text).length < 12) return true;
+  if (hasPath && (FILE_ACTION_TITLE_RE.test(text) || stripTitleAttachmentNoise(text).length < 16)) return true;
+  if (/^(?:image|screenshot|screen\s*shot|capture)\b/i.test(text) && stripTitleAttachmentNoise(text).length < 16) return true;
   if (/^!\[[^\]]*\]\(\s*data:image\//i.test(text)) return true;
   if (/^\[File:\s*[^\\\]]+\.(png|jpe?g|gif|webp|bmp|svg)(?:\b|[0-9x×])/i.test(text)) return true;
   if (/^(image|screenshot)[\w .-]*\.(png|jpe?g|gif|webp|bmp|svg)(?:\b|[0-9x×])/i.test(text)) return true;
@@ -432,6 +470,10 @@ const LOW_SIGNAL_WORKSPACE_LABELS = new Set([
   'unknown',
 ]);
 
+const LOW_SIGNAL_WORKSPACE_KEYS = new Set(
+  Array.from(LOW_SIGNAL_WORKSPACE_LABELS, label => label.replace(/[^a-z0-9]+/g, ''))
+);
+
 function humanizeWorkspaceLabel(value) {
   const stripped = stripWorkspaceDecorations(value);
   if (!stripped) return '';
@@ -450,7 +492,13 @@ function isLowSignalWorkspaceLabel(value) {
   const label = humanizeWorkspaceLabel(value).toLowerCase();
   if (!label) return true;
   if (/^window\s+\d+$/.test(label)) return true;
-  return LOW_SIGNAL_WORKSPACE_LABELS.has(label);
+  if (LOW_SIGNAL_WORKSPACE_LABELS.has(label)) return true;
+  const compact = label.replace(/[^a-z0-9]+/g, '');
+  return LOW_SIGNAL_WORKSPACE_KEYS.has(compact);
+}
+
+function workspaceLabelsEqual(left, right) {
+  return safeString(left).toLowerCase() === safeString(right).toLowerCase();
 }
 
 function makeWorkspaceCandidate(label, key) {
@@ -486,14 +534,14 @@ function workspaceCandidateFromSession(sessionOrId, agentConfig, knownWorkspaces
 
   const directCandidates = [
     pathWorkspaceCandidate(sessionOrId.workspace_path),
-    pathWorkspaceCandidate(agentConfig?.file_access_scope),
-    vscodeWorkspaceCandidate(sessionOrId.workspace_name),
     vscodeWorkspaceCandidate(sessionOrId.window_title),
-    namedWorkspaceCandidate(sessionOrId.workspace_name),
+    vscodeWorkspaceCandidate(sessionOrId.workspace_name),
+    isUserHomeWorkspaceName(sessionOrId.workspace_name, sessionOrId.workspace_path) ? null : namedWorkspaceCandidate(sessionOrId.workspace_name),
+    pathWorkspaceCandidate(agentConfig?.file_access_scope),
   ].filter(Boolean);
   if (directCandidates.length > 0) {
     const candidate = directCandidates[0];
-    return knownWorkspaces.find(known => known.label.toLowerCase() === candidate.label.toLowerCase()) || candidate;
+    return knownWorkspaces.find(known => workspaceLabelsEqual(known.label, candidate.label)) || candidate;
   }
 
   const textFields = [
@@ -535,21 +583,27 @@ function collectKnownWorkspaceCandidates(sessionList, agentConfigs = {}) {
     if (!session || typeof session !== 'object') continue;
     [
       pathWorkspaceCandidate(session.workspace_path),
-      pathWorkspaceCandidate(config?.file_access_scope),
-      vscodeWorkspaceCandidate(session.workspace_name),
       vscodeWorkspaceCandidate(session.window_title),
-      namedWorkspaceCandidate(session.workspace_name),
+      vscodeWorkspaceCandidate(session.workspace_name),
+      isUserHomeWorkspaceName(session.workspace_name, session.workspace_path) ? null : namedWorkspaceCandidate(session.workspace_name),
+      pathWorkspaceCandidate(config?.file_access_scope),
     ].forEach(remember);
   }
   return Array.from(byLabel.values());
 }
 
+function workspaceGroupCandidate(sessionOrId, agentConfig, knownWorkspaces = []) {
+  const candidate = workspaceCandidateFromSession(sessionOrId, agentConfig, knownWorkspaces);
+  if (candidate && !isLowSignalWorkspaceLabel(candidate.label)) return candidate;
+  return null;
+}
+
 function sidebarWorkspaceLabel(sessionOrId, agentConfig, knownWorkspaces = []) {
-  return workspaceCandidateFromSession(sessionOrId, agentConfig, knownWorkspaces)?.label || 'Unscoped Sessions';
+  return workspaceGroupCandidate(sessionOrId, agentConfig, knownWorkspaces)?.label || 'Unscoped Sessions';
 }
 
 function sidebarWorkspaceKey(sessionOrId, agentConfig, knownWorkspaces = []) {
-  const candidate = workspaceCandidateFromSession(sessionOrId, agentConfig, knownWorkspaces);
+  const candidate = workspaceGroupCandidate(sessionOrId, agentConfig, knownWorkspaces);
   return candidate?.key || 'unscoped-sessions';
 }
 
@@ -564,6 +618,8 @@ function stripTitleNoise(content) {
   return normalizeMessageContent(content)
     .replace(/!\[[^\]]*\]\((?:data:image\/[^)]+|\/uploads\/[^)]+|[^)]*\.(?:png|jpe?g|gif|webp|bmp|svg))\)/gi, ' ')
     .replace(/\[File:\s*[^\]]+\]/gi, ' ')
+    .replace(ABSOLUTE_PATH_TITLE_RE, ' ')
+    .replace(IMAGE_TITLE_RE, ' ')
     .replace(/<goal_context>[\s\S]*?<\/goal_context>/gi, ' ')
     .replace(/<[^>\n]{1,80}>/g, ' ')
     .replace(/```[\s\S]*?```/g, ' ')
@@ -574,9 +630,12 @@ function stripTitleNoise(content) {
 }
 
 function titleFromMessageContent(content) {
+  const originalText = normalizeMessageContent(content);
+  if (isLowSignalChatTitle(originalText)) return '';
   const text = stripTitleNoise(content);
   if (!text || isLowSignalChatTitle(text)) return '';
   if (/^(thinking|working|tool result|tool:|exit code|wall time)\b/i.test(text)) return '';
+  if (/^(?:read|open|view|inspect|check|review|show|load|attach|attached|uploaded|cat|get-content|select-string|file|image|screenshot|cli)$/i.test(text)) return '';
   if (/^[^A-Za-z0-9]+$/.test(text)) return '';
   return text.slice(0, 80).trim();
 }
@@ -618,8 +677,9 @@ function groupSessionsByWorkspace(sessionList, agentConfigs = {}) {
   for (const session of sessionList || []) {
     const id = sessionIdOf(session);
     const config = id ? agentConfigs[id] : null;
-    const label = sidebarWorkspaceLabel(session, config, knownWorkspaces);
-    const key = sidebarWorkspaceKey(session, config, knownWorkspaces) || label.toLowerCase();
+    const candidate = workspaceGroupCandidate(session, config, knownWorkspaces);
+    const label = candidate?.label || 'Unscoped Sessions';
+    const key = candidate?.key || 'unscoped-sessions';
     let group = byKey.get(key);
     if (!group) {
       group = { key, label, sessions: [] };
@@ -3447,6 +3507,11 @@ async function uploadBinaryDraft(sessionId, base64, mimeType, filename) {
     return { limit };
   }
 
+  function historyRequestOptionsForSessionId(sessionId) {
+    const meta = orderedSessions.find(session => sessionIdOf(session) === sessionId);
+    return historyRequestOptionsFor(meta);
+  }
+
   function selectSession(id, sessionMeta) {
     setActiveSession(id);
     activeSessionRef.current = id;
@@ -3931,8 +3996,9 @@ async function uploadBinaryDraft(sessionId, base64, mimeType, filename) {
   }, [activeSession, isAntigravityV2, rawActiveChatList]);
   React.useEffect(() => {
     if (!(activeSession && activeSessionMeta?.agent_type === 'codex-desktop' && noMessages)) return undefined;
-    requestHistory(activeSession);
-    const intervalId = setInterval(() => requestHistory(activeSession), 3000);
+    const tailOptions = historyRequestOptionsFor(activeSessionMeta);
+    requestHistory(activeSession, tailOptions);
+    const intervalId = setInterval(() => requestHistory(activeSession, tailOptions), 3000);
     return () => clearInterval(intervalId);
   }, [activeSession, activeSessionMeta?.agent_type, noMessages]);
   React.useEffect(() => {
@@ -3991,8 +4057,9 @@ async function uploadBinaryDraft(sessionId, base64, mimeType, filename) {
     setShowThreadList(false);
     newThread(sessionId);
     if (agentConfigs[sessionId]?.capabilities?.thread_list) {
-      setTimeout(() => requestHistory(sessionId), 150);
-      setTimeout(() => requestHistory(sessionId), 650);
+      const tailOptions = historyRequestOptionsForSessionId(sessionId);
+      setTimeout(() => requestHistory(sessionId, tailOptions), 150);
+      setTimeout(() => requestHistory(sessionId, tailOptions), 650);
       setTimeout(() => requestThreadList(sessionId), 400);
       setTimeout(() => requestThreadList(sessionId), 1400);
     }
@@ -4004,8 +4071,9 @@ async function uploadBinaryDraft(sessionId, base64, mimeType, filename) {
     setOptimisticThreadFocus(prev => ({ ...prev, [sessionId]: threadId }));
     setDraftMessageBaselines(prev => ({ ...prev, [sessionId]: 0 }));
     switchThread(sessionId, threadId);
-    setTimeout(() => requestHistory(sessionId), 120);
-    setTimeout(() => requestHistory(sessionId), 550);
+    const tailOptions = historyRequestOptionsForSessionId(sessionId);
+    setTimeout(() => requestHistory(sessionId, tailOptions), 120);
+    setTimeout(() => requestHistory(sessionId, tailOptions), 550);
     setTimeout(() => requestThreadList(sessionId), 300);
     setTimeout(() => requestThreadList(sessionId), 1200);
   }
@@ -4019,7 +4087,7 @@ async function uploadBinaryDraft(sessionId, base64, mimeType, filename) {
       [sessionId]: { id: '__agv2:new_conversation', title: 'New Conversation', kind: 'nav', at: Date.now() },
     }));
     newChat(sessionId);
-    setTimeout(() => requestHistory(sessionId), 150);
+    setTimeout(() => requestHistory(sessionId, historyRequestOptionsForSessionId(sessionId)), 150);
     setTimeout(() => requestChatList(sessionId), 500);
     setTimeout(() => requestChatList(sessionId), 1400);
   }
@@ -4050,7 +4118,7 @@ async function uploadBinaryDraft(sessionId, base64, mimeType, filename) {
       return;
     }
     switchChat(sessionId, itemId);
-    setTimeout(() => requestHistory(sessionId), 180);
+    setTimeout(() => requestHistory(sessionId, historyRequestOptionsForSessionId(sessionId)), 180);
     setTimeout(() => requestChatList(sessionId), 450);
     setTimeout(() => requestChatList(sessionId), 1200);
   }

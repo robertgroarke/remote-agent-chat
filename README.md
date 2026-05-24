@@ -70,7 +70,7 @@ Whether you are using Antigravity, VS Code, or standalone desktop apps, you can 
 
 The agent proxy connects **outbound** to the relay — no port forwarding or inbound firewall rules needed on your Windows machine.
 
-The WebUI groups active sessions by workspace directory in the sidebar and shows each chat/thread title as the session label, so multiple agents working in the same repo stay organized without confusing the active IDE window title for a chat title.
+The WebUI groups active sessions by workspace directory in the sidebar and shows each chat/thread title as the session label. File paths, screenshot attachment names, and native window titles are filtered out as low-signal titles, so multiple agents working in the same repo stay organized without turning implementation details into chat names.
 
 ---
 
@@ -92,9 +92,9 @@ The WebUI groups active sessions by workspace directory in the sidebar and shows
 | Codex Desktop (MSIX) | Working (separate CDP port) |
 | Claude Desktop (MSIX) | Blocked — Anthropic requires a signed `CLAUDE_CDP_AUTH` token to allow CDP |
 
-Antigravity v2 is treated as a separate standalone Agent Manager surface, not as the Antigravity IDE side pane. The WebUI can expose its project/conversation list, history and scheduled-task entry points where available, switch between v2 chats, start new v2 conversations, and render rich assistant output such as markdown, thinking, tool calls, terminal output, file-change summaries, artifacts, prompts, and errors.
+Antigravity v2 is treated as a separate standalone Agent Manager surface, not as the Antigravity IDE side pane. The WebUI exposes its project/conversation controls where available, including conversation history, scheduled-task entry points, project/sub-chat switching, and new conversation launch. v2 transcripts preserve rich assistant output such as markdown, thinking, tool calls, terminal output, file-change summaries, artifacts, prompts, and errors.
 
-Codex CLI support covers both WebUI-launched sessions and active native terminal sessions. The proxy follows recent Codex CLI transcript files, surfaces multiple active sessions, preserves full tool-call/result output, opens native sessions elevated on Windows, and renders live task-plan status near the composer, including `Pursuing goal (...)` and `Working (... esc to interrupt)`.
+Codex CLI support covers both WebUI-launched sessions and active native terminal sessions. The proxy follows recent Codex CLI transcript files, surfaces multiple active sessions, preserves full tool-call/result output, opens native sessions elevated on Windows, and renders live task-plan status near the composer, including `Pursuing goal (...)` and `Working (... esc to interrupt)`. Large archived transcripts are kept selectable without blocking initial sidebar hydration.
 
 ---
 
