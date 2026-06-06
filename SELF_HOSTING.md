@@ -120,7 +120,7 @@ Edit `agent-proxy/.env`:
 ```env
 RELAY_URL=wss://your-tunnel-hostname/proxy-ws
 PROXY_SECRET=<same value as in relay .env>
-CDP_PORTS=9223
+CDP_PORTS=9223,9225,9226,9227
 ```
 
 Start the proxy (via Windows Scheduled Task, or manually for testing):

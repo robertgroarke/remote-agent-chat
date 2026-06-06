@@ -195,6 +195,7 @@ export default function SessionListScreen({ navigation }) {
     claude:            { abbr: 'CC', color: '#cc785c', label: 'Claude Code' },
     codex:             { abbr: 'CX', color: '#10a37f', label: 'Codex' },
     'codex-desktop':   { abbr: 'CX', color: '#10a37f', label: 'Codex Desktop' },
+    cursor:            { abbr: 'CR', color: '#7AA2F7', label: 'Cursor' },
     gemini:            { abbr: 'GC', color: '#4285f4', label: 'Gemini' },
     antigravity:       { abbr: 'AG', color: '#a855f7', label: 'Antigravity' },
     antigravity_panel: { abbr: 'AC', color: '#a855f7', label: 'Antigravity' },

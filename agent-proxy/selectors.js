@@ -8,6 +8,8 @@
 
 'use strict';
 
+const cursorSel = require('./cursor-selectors');
+
 // ─── Claude selector sets ─────────────────────────────────────────────────────
 
 const CLAUDE_PRIMARY = {
@@ -193,7 +195,194 @@ function _expandCodexCompactActivities(content) {
   return _repairCodexMalformedShellBlocks(out);
 }
 
-function expandCodexMessagesRaw(raw) {
+function _parseCodexStructuredFileChanges(text, unsupportedActions) {
+  const rawLines = String(text || '').split('\n');
+  const firstLine = String(rawLines[0] || '').replace(/\s+/g, ' ').trim();
+  const header = firstLine.match(/^(\d+)\s+files?\s+changed(?:\s+\+(\d+))?(?:\s+-(\d+))?/i);
+  if (!header) return null;
+  const files = [];
+  for (let i = 1; i < rawLines.length; i++) {
+    const line = String(rawLines[i] || '').trim();
+    if (!line) continue;
+    if (/^(Undo|Review)$/i.test(line)) continue;
+    let match = line.match(/^(.+?)\s+\+(\d+)\s+-(\d+)$/);
+    if (!match) match = line.match(/^(.+?)\s+-(\d+)\s+\+(\d+)$/);
+    if (!match) continue;
+    const plusFirst = /\+\d+\s+-\d+$/.test(line);
+    files.push({
+      path: match[1].trim(),
+      added: plusFirst ? Number(match[2]) : Number(match[3]),
+      removed: plusFirst ? Number(match[3]) : Number(match[2]),
+    });
+  }
+  const block = {
+    type: 'file_changes',
+    summary: `${header[1]} ${Number(header[1]) === 1 ? 'file' : 'files'} changed`,
+    files_changed: Number(header[1]),
+    additions: header[2] != null ? Number(header[2]) : null,
+    deletions: header[3] != null ? Number(header[3]) : null,
+    files,
+    content: String(text || '').trim(),
+  };
+  if (unsupportedActions) {
+    block.actions = [
+      { id: 'codex-undo-unsupported', label: 'Undo unsupported in web UI', unsupported: true },
+      { id: 'codex-review-unsupported', label: 'Review unsupported in web UI', unsupported: true },
+    ];
+  }
+  return block;
+}
+
+function _codexToolStatusFromHeader(header, body) {
+  const text = `${header || ''}\n${body || ''}`;
+  if (/running|working|in progress/i.test(text)) return 'running';
+  if (/failed|error|denied|cancelled|canceled/i.test(text)) return 'error';
+  return 'completed';
+}
+
+function _codexUnsupportedFileActions(options = {}) {
+  if (!options.unsupportedFileActions) return null;
+  return [
+    { id: 'codex-undo-unsupported', label: 'Undo unsupported in web UI', unsupported: true },
+    { id: 'codex-review-unsupported', label: 'Review unsupported in web UI', unsupported: true },
+  ];
+}
+
+function _codexStructuredBlockFromTool(header, body, options = {}) {
+  const rawHeader = String(header || '').trim();
+  const rawBody = String(body || '').trim();
+  const terminal = rawHeader.match(/^Bash\s+(.+)$/i);
+  if (terminal) {
+    const aggregate = terminal[1].trim().match(/^(\d+)\s+commands?$/i);
+    if (aggregate && !rawBody) {
+      return {
+        type: 'tool_call',
+        label: `Ran ${aggregate[1]} ${Number(aggregate[1]) === 1 ? 'command' : 'commands'}`,
+        content: 'Command details are collapsed in Codex.',
+        status: options.forceStatus || 'completed',
+        collapsed: true,
+      };
+    }
+    return {
+      type: 'terminal',
+      label: 'Shell command',
+      command: terminal[1].trim(),
+      stdout: rawBody,
+      exit_code: null,
+      status: options.forceStatus || _codexToolStatusFromHeader(rawHeader, rawBody),
+      collapsed: false,
+    };
+  }
+  const edit = rawHeader.match(/^Edit\s+(.+)$/i);
+  if (edit) {
+    const target = edit[1].trim();
+    const aggregate = target.match(/^(\d+)\s+files?$/i);
+    if (aggregate) {
+      const block = {
+        type: 'file_changes',
+        summary: `Edited ${aggregate[1]} ${Number(aggregate[1]) === 1 ? 'file' : 'files'}`,
+        content: rawBody,
+        files: [],
+        files_changed: Number(aggregate[1]),
+        additions: null,
+        deletions: null,
+      };
+      const actions = _codexUnsupportedFileActions(options);
+      if (actions) block.actions = actions;
+      return block;
+    }
+    const block = {
+      type: 'file_changes',
+      summary: `Edit ${target}`,
+      content: rawBody,
+      files: [{ path: target }],
+      files_changed: 1,
+      additions: null,
+      deletions: null,
+    };
+    const actions = _codexUnsupportedFileActions(options);
+    if (actions) block.actions = actions;
+    return block;
+  }
+  const createdDeleted = rawHeader.match(/^(Created|Deleted)\s+(.+)$/i);
+  if (createdDeleted) {
+    const target = createdDeleted[2].trim();
+    const aggregate = target.match(/^(\d+)\s+files?$/i);
+    const block = {
+      type: 'file_changes',
+      summary: `${createdDeleted[1][0].toUpperCase()}${createdDeleted[1].slice(1).toLowerCase()} ${target}`,
+      content: rawBody,
+      files: aggregate ? [] : [{ path: target }],
+      files_changed: aggregate ? Number(aggregate[1]) : 1,
+      additions: null,
+      deletions: null,
+    };
+    const actions = _codexUnsupportedFileActions(options);
+    if (actions) block.actions = actions;
+    return block;
+  }
+  return {
+    type: 'tool_call',
+    label: rawHeader || 'Tool',
+    content: rawBody,
+    status: options.forceStatus || _codexToolStatusFromHeader(rawHeader, rawBody),
+    collapsed: false,
+  };
+}
+
+function _codexStructuredBlocksFromText(content, options = {}) {
+  const text = String(content || '');
+  const re = /\[((?!end\b)[^\]\n]+)\]\n([\s\S]*?)\n?\[end\]/gi;
+  const blocks = [];
+  let last = 0;
+  function pushMarkdown(value) {
+    const pieces = String(value || '').split(/\n{2,}/);
+    for (const piece of pieces) {
+      const trimmed = piece.trim();
+      if (!trimmed) continue;
+      const fileChanges = _parseCodexStructuredFileChanges(trimmed, options.unsupportedFileActions);
+      if (fileChanges) {
+        blocks.push(fileChanges);
+      } else if (/^Worked for\s+|^Working for\s+/i.test(trimmed)) {
+        blocks.push({ type: 'thinking', label: trimmed.split('\n')[0], content: trimmed, collapsed: true });
+      } else if (/^---\s*Context automatically compacted\s*---$/i.test(trimmed) || /^Context automatically compacted$/i.test(trimmed)) {
+        blocks.push({ type: 'prompt', label: 'Context compacted', content: trimmed });
+      } else {
+        const lastBlock = blocks[blocks.length - 1];
+        if (lastBlock && lastBlock.type === 'markdown') {
+          lastBlock.content = `${lastBlock.content}\n\n${trimmed}`;
+        } else {
+          blocks.push({ type: 'markdown', content: trimmed });
+        }
+      }
+    }
+  }
+  let match;
+  while ((match = re.exec(text)) !== null) {
+    pushMarkdown(text.slice(last, match.index));
+    blocks.push(_codexStructuredBlockFromTool(match[1], match[2], options));
+    last = re.lastIndex;
+  }
+  const tail = text.slice(last);
+  const openTool = tail.match(/^\s*\[((?!end\b)[^\]\n]+)\]\n([\s\S]*)$/i);
+  if (openTool) {
+    blocks.push(_codexStructuredBlockFromTool(openTool[1], openTool[2], {
+      ...options,
+      forceStatus: 'running',
+    }));
+  } else {
+    pushMarkdown(tail);
+  }
+  return blocks.filter(block => {
+    if (!block || !block.type) return false;
+    if (block.type === 'markdown') return String(block.content || '').trim().length > 0;
+    if (block.type === 'terminal') return String(block.command || block.stdout || block.stderr || block.content || '').trim().length > 0;
+    return String(block.content || block.summary || block.label || block.title || '').trim().length > 0
+      || (Array.isArray(block.files) && block.files.length > 0);
+  });
+}
+
+function expandCodexMessagesRaw(raw, options = {}) {
   if (typeof raw !== 'string' || !raw.trim()) return raw;
   try {
     const messages = JSON.parse(raw);
@@ -205,6 +394,15 @@ function expandCodexMessagesRaw(raw) {
       if (next !== msg.content) {
         msg.content = next;
         changed = true;
+      }
+      if (options.structuredBlocks) {
+        const blocks = _codexStructuredBlocksFromText(msg.content, {
+          unsupportedFileActions: !!options.unsupportedFileActions,
+        });
+        if (blocks.length > 0) {
+          msg.content_blocks = blocks;
+          changed = true;
+        }
       }
     }
     return changed ? JSON.stringify(messages) : raw;
@@ -822,6 +1020,7 @@ function isRooCodeAgentType(agentType) {
 // ─── Thinking detection ───────────────────────────────────────────────────────
 
 async function detectThinking(Runtime, agentType) {
+  if (agentType === 'cursor') return cursorSel.detectCursorThinking(Runtime);
   if (isRooCodeAgentType(agentType)) return detectRooCodeThinking(Runtime);
   if (isContinueAgentType(agentType)) return detectContinueThinking(Runtime);
   if (agentType === 'antigravity-v2') return detectAntigravityV2Thinking(Runtime);
@@ -1738,8 +1937,8 @@ const CODEX_READ_EXPR = `
     function _codexCommandCache() {
       try {
         var w = d.defaultView || window;
-        w.__remoteAgentCodexCommandOutputCache = w.__remoteAgentCodexCommandOutputCache || {};
-        return w.__remoteAgentCodexCommandOutputCache;
+        w.__remoteAgentCodexCommandOutputCacheV2 = w.__remoteAgentCodexCommandOutputCacheV2 || {};
+        return w.__remoteAgentCodexCommandOutputCacheV2;
       } catch (_) {
         return {};
       }
@@ -1814,7 +2013,7 @@ const CODEX_READ_EXPR = `
         }
         if (!insideTool) {
           var ran = trimmed.match(/^Ran\\s+(.+)$/i);
-          if (ran && ran[1] && !/^\\d+\\s+commands?$/i.test(ran[1].trim())) {
+          if (ran && ran[1]) {
             var command = ran[1].trim();
             var output = _readCodexCachedCommandOutput(command);
             out.push('[Bash ' + command + ']');
@@ -1836,8 +2035,9 @@ const CODEX_READ_EXPR = `
       pendingAssistant = [];
     }
 
-    // Bounded ephemeral prime: shallow read only, no expansion clicks. This
-    // preserves already-mounted details without climbing into the full chat.
+    // Bounded ephemeral prime: briefly expand collapsed rows, snapshot only
+    // their mounted disclosure body, then restore the previous collapse state.
+    // This keeps WebUI fidelity high without broad parent scraping.
     var _CODEX_PRIME_NULL = '\\x00';
     var _CODEX_PRIME_BUDGET = 16;
 
@@ -1846,8 +2046,9 @@ const CODEX_READ_EXPR = `
       var firstLine = rowText.split('\\n')[0] || '';
       // Row already has its body inline (user expanded it manually).
       if (rowText.length > firstLine.length + 30) return rowText;
+      if (row.getAttribute && row.getAttribute('aria-expanded') !== 'true') return '';
       var parent = row.parentElement;
-      for (var depth = 0; parent && depth < 4; depth++, parent = parent.parentElement) {
+      for (var depth = 0; parent && depth < 2; depth++, parent = parent.parentElement) {
         if (parent.matches && parent.matches('[data-thread-find-target="conversation"], main, body')) break;
         var raw = String(parent.innerText || parent.textContent || '');
         if (raw.length > rowText.length + 30 && raw.length < 50000) return raw;
@@ -1855,32 +2056,80 @@ const CODEX_READ_EXPR = `
       return '';
     }
 
-    function _primeCodexCollapsedCommandOutputCache(root) {
+    function _codexSnapshotScrollPositions(nodes) {
+      var seen = [];
+      function add(el) {
+        if (!el || seen.indexOf(el) !== -1) return;
+        seen.push(el);
+      }
+      add(d.scrollingElement || d.documentElement);
+      (nodes || []).forEach(function(node) {
+        for (var p = node && node.parentElement; p && p !== d.body; p = p.parentElement) {
+          try {
+            var style = d.defaultView.getComputedStyle(p);
+            if (/(auto|scroll)/.test(style.overflowY || '') && p.scrollHeight > p.clientHeight) add(p);
+          } catch (_) {}
+        }
+      });
+      return seen.map(function(el) { return { el: el, top: el.scrollTop, left: el.scrollLeft }; });
+    }
+
+    function _codexRestoreScrollPositions(snapshot) {
+      (snapshot || []).forEach(function(item) {
+        try {
+          item.el.scrollTop = item.top;
+          item.el.scrollLeft = item.left;
+        } catch (_) {}
+      });
+    }
+
+    async function _primeCodexCollapsedCommandOutputCache(root) {
       var cache = _codexCommandCache();
       var ranRows = root.querySelectorAll('.cursor-interaction, [role="button"]');
       var primed = 0;
+      var candidates = [];
       // Walk newest-first so our small budget covers the most recent commands.
       for (var ri = ranRows.length - 1; ri >= 0 && primed < _CODEX_PRIME_BUDGET; ri--) {
         var row = ranRows[ri];
         var text = (row.innerText || '').trim();
         if (!/^Ran\\s+/i.test(text)) continue;
-        if (/^Ran\\s+\\d+\\s+commands?$/i.test(text)) continue;
         var command = text.replace(/^Ran\\s+/i, '').split('\\n')[0].trim();
         if (!command || command.length > 500) continue;
         var key = _normalizeCodexCommandKey(command);
         if (cache[key]) continue; // already cached (positive or negative)
         primed++;
-        var raw = _readCodexCollapsedRowBody(row);
+        candidates.push({ row: row, command: command, key: key, wasExpanded: row.getAttribute && row.getAttribute('aria-expanded') === 'true' });
+      }
+      var scrollSnapshot = _codexSnapshotScrollPositions(candidates.map(function(c) { return c.row; }));
+      var clicked = [];
+      candidates.forEach(function(c) {
+        if (!c.wasExpanded && c.row.getAttribute && c.row.getAttribute('aria-expanded') === 'false') {
+          try {
+            c.row.click();
+            clicked.push(c.row);
+          } catch (_) {}
+        }
+      });
+      if (clicked.length > 0) await new Promise(function(resolve) { setTimeout(resolve, 100); });
+      for (var ci = 0; ci < candidates.length; ci++) {
+        var c = candidates[ci];
+        var raw = _readCodexCollapsedRowBody(c.row);
         if (!raw) {
-          cache[key] = _CODEX_PRIME_NULL;
+          cache[c.key] = _CODEX_PRIME_NULL;
           continue;
         }
-        var parsed = _parseExpandedCodexCommandOutput(raw, command);
-        cache[key] = (parsed && parsed.output) ? parsed.output : _CODEX_PRIME_NULL;
+        var parsed = _parseExpandedCodexCommandOutput(raw, c.command);
+        cache[c.key] = (parsed && parsed.output) ? parsed.output : _CODEX_PRIME_NULL;
       }
+      for (var xi = clicked.length - 1; xi >= 0; xi--) {
+        try {
+          if (clicked[xi].getAttribute && clicked[xi].getAttribute('aria-expanded') === 'true') clicked[xi].click();
+        } catch (_) {}
+      }
+      _codexRestoreScrollPositions(scrollSnapshot);
     }
 
-    _primeCodexCollapsedCommandOutputCache(d);
+    await _primeCodexCollapsedCommandOutputCache(d);
 
     // Extract diff content from a diffs-container shadow DOM.
     // The shadow DOM uses: <code data-code><div data-gutter>...<div data-content>
@@ -2360,18 +2609,18 @@ const CODEX_DESKTOP_READ_EXPR = `
   function _desktopCmdCache() {
     try {
       var w = d.defaultView || window;
-      w.__remoteAgentCodexDesktopCmdCache = w.__remoteAgentCodexDesktopCmdCache || {};
-      return w.__remoteAgentCodexDesktopCmdCache;
+      w.__remoteAgentCodexDesktopCmdCacheV2 = w.__remoteAgentCodexDesktopCmdCacheV2 || {};
+      return w.__remoteAgentCodexDesktopCmdCacheV2;
     } catch (_) {
       return {};
     }
   }
 
   function _desktopRanButtonKey(btn) {
-    // Stable key per collapsed run-block. Combine the turn-key (if any) with
-    // the button's first child text so re-rendered buttons match.
-    var turn = btn.closest && btn.closest('[data-content-search-turn-key]');
-    var turnKey = turn ? (turn.getAttribute('data-content-search-turn-key') || '') : '';
+    // Stable key per collapsed run-block. Newer Codex Desktop builds use
+    // data-turn-key instead of data-content-search-turn-key.
+    var turn = btn.closest && btn.closest('[data-content-search-turn-key], [data-turn-key]');
+    var turnKey = turn ? (turn.getAttribute('data-content-search-turn-key') || turn.getAttribute('data-turn-key') || '') : '';
     var label = String((btn.innerText || btn.textContent || '')).trim().slice(0, 80);
     var idx = -1;
     if (turn) {
@@ -2386,13 +2635,13 @@ const CODEX_DESKTOP_READ_EXPR = `
   // The previous version did a 6-level textContent climb per button which
   // froze the renderer for seconds on long sessions.
   var _DESKTOP_PRIME_NULL = '\\x00';
-  var _DESKTOP_PRIME_BUDGET = 16;
+  var _DESKTOP_PRIME_BUDGET = 64;
 
   function _desktopCaptureExpandedBox(btn) {
     var btnText = String(btn.innerText || btn.textContent || '');
     if (btnText.length > 80) return btnText.trim();
     var parent = btn.parentElement;
-    for (var depth = 0; parent && depth < 4; depth++, parent = parent.parentElement) {
+    for (var depth = 0; parent && depth < 2; depth++, parent = parent.parentElement) {
       if (parent.matches && parent.matches('[data-thread-find-target="conversation"], main, body')) break;
       var pt = String(parent.innerText || parent.textContent || '');
       if (pt.length > btnText.length + 50 && pt.length < 50000) return pt.trim();
@@ -2400,12 +2649,40 @@ const CODEX_DESKTOP_READ_EXPR = `
     return '';
   }
 
-  function _primeDesktopCollapsedRuns() {
+  function _desktopSnapshotScrollPositions(nodes) {
+    var seen = [];
+    function add(el) {
+      if (!el || seen.indexOf(el) !== -1) return;
+      seen.push(el);
+    }
+    add(d.scrollingElement || d.documentElement);
+    (nodes || []).forEach(function(node) {
+      for (var p = node && node.parentElement; p && p !== d.body; p = p.parentElement) {
+        try {
+          var style = d.defaultView.getComputedStyle(p);
+          if (/(auto|scroll)/.test(style.overflowY || '') && p.scrollHeight > p.clientHeight) add(p);
+        } catch (_) {}
+      }
+    });
+    return seen.map(function(el) { return { el: el, top: el.scrollTop, left: el.scrollLeft }; });
+  }
+
+  function _desktopRestoreScrollPositions(snapshot) {
+    (snapshot || []).forEach(function(item) {
+      try {
+        item.el.scrollTop = item.top;
+        item.el.scrollLeft = item.left;
+      } catch (_) {}
+    });
+  }
+
+  async function _primeDesktopCollapsedRuns() {
     var cache = _desktopCmdCache();
     var convoEl = d.querySelector('[data-thread-find-target="conversation"]');
     if (!convoEl) return;
     var btns = convoEl.querySelectorAll('button[aria-expanded="false"]');
     var primed = 0;
+    var candidates = [];
     // Newest-first so the budget covers the most recent collapsed runs.
     for (var bi = btns.length - 1; bi >= 0 && primed < _DESKTOP_PRIME_BUDGET; bi--) {
       var btn = btns[bi];
@@ -2414,9 +2691,28 @@ const CODEX_DESKTOP_READ_EXPR = `
       var key = _desktopRanButtonKey(btn);
       if (cache[key]) continue;
       primed++;
-      var captured = _desktopCaptureExpandedBox(btn);
-      cache[key] = captured || _DESKTOP_PRIME_NULL;
+      candidates.push({ btn: btn, key: key });
     }
+    var scrollSnapshot = _desktopSnapshotScrollPositions(candidates.map(function(c) { return c.btn; }));
+    var clicked = [];
+    candidates.forEach(function(c) {
+      try {
+        c.btn.click();
+        clicked.push(c.btn);
+      } catch (_) {}
+    });
+    if (clicked.length > 0) await new Promise(function(resolve) { setTimeout(resolve, 120); });
+    for (var ci = 0; ci < candidates.length; ci++) {
+      var c = candidates[ci];
+      var captured = _desktopCaptureExpandedBox(c.btn);
+      cache[c.key] = captured || _DESKTOP_PRIME_NULL;
+    }
+    for (var xi = clicked.length - 1; xi >= 0; xi--) {
+      try {
+        if (clicked[xi].getAttribute && clicked[xi].getAttribute('aria-expanded') === 'true') clicked[xi].click();
+      } catch (_) {}
+    }
+    _desktopRestoreScrollPositions(scrollSnapshot);
   }
 
   // Format a Codex Desktop tool-disclosure button ("Ran 5 commands",
@@ -2428,10 +2724,7 @@ const CODEX_DESKTOP_READ_EXPR = `
     var header = String(btn.innerText || btn.textContent || '').trim().split('\\n')[0].trim();
     if (!header) return '';
     var isEdit = /^(Edited|Created|Deleted)\\b/i.test(header);
-    var body = '';
-    if (btn.getAttribute('aria-expanded') === 'true') {
-      body = _desktopCaptureExpandedBox(btn);
-    }
+    var body = _desktopCaptureExpandedBox(btn);
     if (!body) body = _desktopCachedRunBody(btn);
     if (body) {
       var lines = body.split('\\n');
@@ -3155,11 +3448,19 @@ const CODEX_DESKTOP_READ_EXPR = `
   for (var ti = 0; ti < turns.length; ti++) {
     var turn = turns[ti];
     var userParts = [];
-    var assistantParts = [];
+    var assistantSegments = [];
     var units = Array.from(turn.querySelectorAll('[data-content-search-unit-key]'));
     var turnTs = units.length > 0
       ? _turnTsFromKey(units[0].getAttribute('data-content-search-unit-key'))
       : null;
+    function pushAssistantSegment(value, dedupeAny) {
+      if (!value) return;
+      var cleaned = cleanText(value, 'assistant');
+      if (!cleaned) return;
+      if (assistantSegments.length > 0 && assistantSegments[assistantSegments.length - 1] === cleaned) return;
+      if (dedupeAny && assistantSegments.indexOf(cleaned) !== -1) return;
+      assistantSegments.push(cleaned);
+    }
 
     // Build an ordered content list: assistant/tool units + tool disclosure
     // buttons ("Ran N commands", "Edited 3 files", …). Codex Desktop renders
@@ -3211,10 +3512,10 @@ const CODEX_DESKTOP_READ_EXPR = `
         if (utext) uniquePush(userParts, utext);
       } else if (item.kind === 'unit') {
         var atext = extractUnitText(item.el, item.role);
-        if (atext) uniquePush(assistantParts, atext);
+        if (atext) pushAssistantSegment(atext, false);
       } else if (item.kind === 'tool') {
         var tblock = _formatDesktopToolButton(item.el);
-        if (tblock) uniquePushAny(assistantParts, tblock);
+        if (tblock) pushAssistantSegment(tblock, true);
       }
     }
 
@@ -3227,7 +3528,7 @@ const CODEX_DESKTOP_READ_EXPR = `
     for (var cbi = 0; cbi < commandBlocks.length; cbi++) {
       if (commandBlocks[cbi].closest('[data-content-search-unit-key]')) continue;
       var parsedCommand = parseVisibleCommandBlock(commandBlocks[cbi]);
-      if (parsedCommand) uniquePushAny(assistantParts, parsedCommand);
+      if (parsedCommand) pushAssistantSegment(parsedCommand, true);
     }
 
     // File-change summary cards ("N files changed +A -D" with per-file rows).
@@ -3235,23 +3536,23 @@ const CODEX_DESKTOP_READ_EXPR = `
     // previously dropped on Codex Desktop, so collapsed turns lost the file
     // change list.
     var summaryBlocks = _extractDesktopFileChangeSummaryCards(turn);
-    summaryBlocks.forEach(function(block) { uniquePushAny(assistantParts, block); });
+    summaryBlocks.forEach(function(block) { pushAssistantSegment(block, true); });
 
     // Fallback only: if the interleaved unit/tool walk produced nothing for
     // this turn (turn fully collapsed and not yet expanded by the prime
     // step), fall back to the cached "Worked for X" expanded body so the
     // WebUI still shows something rather than an empty turn.
-    if (assistantParts.length === 0) {
+    if (assistantSegments.length === 0) {
       var workedBody = _cachedDesktopWorkedBodyForTurn(turn);
-      if (workedBody) assistantParts.push(workedBody);
+      if (workedBody) pushAssistantSegment(workedBody, false);
     }
 
     // Append the "Worked for X" header (if present and not already in
-    // assistantParts) so the turn boundary is visible and the accumulator
+    // assistantSegments) so the turn boundary is visible and the accumulator
     // merge logic can detect completion.
     var workedHeader = _extractDesktopWorkedForHeader(turn);
-    if (workedHeader && !assistantParts.some(function(p) { return p && p.indexOf(workedHeader) !== -1; })) {
-      assistantParts.push(workedHeader);
+    if (workedHeader && !assistantSegments.some(function(p) { return p && p.indexOf(workedHeader) !== -1; })) {
+      pushAssistantSegment(workedHeader, false);
     }
 
     if (userParts.length > 0) {
@@ -3259,8 +3560,8 @@ const CODEX_DESKTOP_READ_EXPR = `
       if (turnTs) userMsg.ts = turnTs;
       msgs.push(userMsg);
     }
-    if (assistantParts.length > 0) {
-      var asstMsg = { role: 'assistant', content: assistantParts.join('\\n\\n') };
+    for (var asi = 0; asi < assistantSegments.length; asi++) {
+      var asstMsg = { role: 'assistant', content: assistantSegments[asi] };
       if (turnTs) asstMsg.ts = turnTs;
       msgs.push(asstMsg);
     }
@@ -3281,7 +3582,10 @@ async function readCodexMessages(Runtime, sessionId, usePageEval) {
     preSig = await evalFn(Runtime, CODEX_DOM_SIG_EXPR);
     if (preSig && preSig === cache.sig && cache.result !== null) {
       cache.hits = (cache.hits || 0) + 1;
-      const repaired = expandCodexMessagesRaw(cache.result);
+      const repaired = expandCodexMessagesRaw(cache.result, {
+        structuredBlocks: true,
+        unsupportedFileActions: true,
+      });
       if (repaired !== cache.result) cache.result = repaired;
       return cache.result;
     }
@@ -3290,12 +3594,25 @@ async function readCodexMessages(Runtime, sessionId, usePageEval) {
   }
 
   try {
-    const raw = usePageEval
+    let raw = usePageEval
       ? await evalInPage(Runtime, CODEX_DESKTOP_READ_EXPR, { awaitPromise: true })
-      : await evalInFrame(Runtime, CODEX_READ_EXPR, { awaitPromise: true });
+      : await evalInFrame(Runtime, CODEX_DESKTOP_READ_EXPR, { awaitPromise: true });
+    if (!usePageEval) {
+      try {
+        const parsed = raw ? JSON.parse(raw) : [];
+        if (!Array.isArray(parsed) || parsed.length === 0) {
+          raw = await evalInFrame(Runtime, CODEX_READ_EXPR, { awaitPromise: true });
+        }
+      } catch {
+        raw = await evalInFrame(Runtime, CODEX_READ_EXPR, { awaitPromise: true });
+      }
+    }
     if (raw !== null) {
       resetReadFailures(sessionId);
-      const result = expandCodexMessagesRaw(raw);
+      const result = expandCodexMessagesRaw(raw, {
+        structuredBlocks: true,
+        unsupportedFileActions: true,
+      });
       cache.sig = preSig || '';
       cache.result = result;
       cache.hits = 0;
@@ -6587,6 +6904,7 @@ async function detectAntigravityV2Thinking(Runtime) {
 }
 
 async function readMessages(Runtime, agentType, sessionId) {
+  if (agentType === 'cursor')             return cursorSel.readCursorMessages(Runtime);
   if (agentType === 'codex-desktop')      return readCodexMessages(Runtime, sessionId, true);
   if (agentType === 'codex')              return readCodexMessages(Runtime, sessionId, false);
   if (agentType === 'gemini')             return readGeminiMessages(Runtime, sessionId);
@@ -6949,7 +7267,8 @@ const _ESCAPE_EXPR = `
 // Attempt to stop a running agent generation.
 // Returns { ok: true } on success, { ok: false, code, detail } on failure.
 // 'agent_not_active' means no stop button was found (agent is idle).
-async function interruptAgent(Runtime, agentType, sessionId) {
+async function interruptAgent(Runtime, agentType, sessionId, cdpClient = null) {
+  if (agentType === 'cursor') return cursorSel.interruptCursor(Runtime, cdpClient, sessionId);
   if (agentType === 'antigravity-v2') {
     try {
       const r = await evalInPage(Runtime, `
@@ -8078,6 +8397,7 @@ async function readCodexTaskList(Runtime, usePageEval) {
 // Returns { rate_limited: boolean, until_text: string|null } or null.
 
 async function readRateLimit(Runtime, agentType) {
+  if (agentType === 'cursor') return cursorSel.readCursorRateLimit(Runtime);
   if (agentType === 'codex' || agentType === 'codex-desktop') return readCodexRateLimit(Runtime, agentType === 'codex-desktop');
   if (agentType === 'claude' || agentType === 'claude-desktop') return readClaudeRateLimit(Runtime);
   if (isContinueAgentType(agentType)) return null; // Continue agents use local models — no rate limiting
@@ -8306,6 +8626,17 @@ async function readAgentConfig(Runtime, agentType, workspacePath) {
     } catch {
       return { model_id: 'unknown', mode: 'unknown', permission_mode: 'unknown', available_models: [], file_access_scope: workspacePath || 'unknown' };
     }
+  }
+
+  if (agentType === 'cursor') {
+    const cfg = await cursorSel.readCursorConfig(Runtime);
+    return {
+      model_id: cfg?.model_id || 'unknown',
+      mode: cfg?.mode || 'unknown',
+      available_models: cfg?.available_models || [],
+      available_modes: cfg?.available_modes || [],
+      file_access_scope: workspacePath || 'unknown',
+    };
   }
 
   if (agentType === 'codex' || agentType === 'codex-desktop') {
@@ -8865,6 +9196,12 @@ async function setAgentModel(Runtime, agentType, modelId, sessionId, InputDomain
   }
   if (isRooCodeAgentType(agentType)) {
     return setRooCodeModel(Runtime, modelId, sessionId, InputDomain);
+  }
+  if (agentType === 'cursor') {
+    const r = await cursorSel.setCursorModel(Runtime, modelId);
+    return r.ok
+      ? { ok: true, selected: modelId }
+      : { ok: false, code: 'select_failed', detail: r.detail || 'Model selection failed' };
   }
   if (agentType !== 'claude') {
     return { ok: false, code: 'not_supported', detail: `Model selection not supported for ${agentType}` };
@@ -9802,6 +10139,10 @@ async function detectPermissionDialog(Runtime, agentType) {
   // "Reject all" diff bar which always co-exists with the chat-history
   // "Running background command" prompt that PERMISSION_DIALOG_EXPR would
   // otherwise capture and lock onto.
+  if (agentType === 'cursor') {
+    return cursorSel.detectCursorPermissionDialog(Runtime);
+  }
+
   if (agentType === 'antigravity_panel' || agentType === 'antigravity') {
     try {
       const panelRaw = await evalInPage(Runtime, ANTIGRAVITY_PANEL_PERMISSION_EXPR);
@@ -10165,7 +10506,7 @@ async function respondToSessionErrorPrompt(Runtime, agentType, actionId, session
 
 // Clicks the button matching choiceId in the active permission dialog.
 // Returns { ok: true } or { ok: false, code, detail }.
-async function respondToPermissionDialog(Runtime, agentType, choiceId, sessionId) {
+async function respondToPermissionDialog(Runtime, agentType, choiceId, sessionId, cdpClient = null) {
   try {
     let r;
     let verifyAntigravityPanel = false;
@@ -10274,6 +10615,9 @@ async function respondToPermissionDialog(Runtime, agentType, choiceId, sessionId
         }
         return 'clicked';
       `);
+    } else if (agentType === 'cursor') {
+      const ok = await cursorSel.respondCursorPermissionDialog(Runtime, choiceId, cdpClient);
+      r = ok ? 'clicked' : 'not-found';
     } else if (agentType === 'antigravity_panel' || agentType === 'antigravity') {
       // Try the generic dialog click first, then fall back to the panel-style
       // click — same ordering as detectPermissionDialog so click & detect stay
@@ -10339,6 +10683,8 @@ async function sendMessage(Runtime, agentType, text, sessionId, cdpClient = null
       console.warn(`[${sessionId}] [sel] Antigravity v2 primary send failed (${result.code}:${result.detail}), trying fallback`);
       result = await sendAntigravityV2Fallback(Runtime, text);
     }
+  } else if (agentType === 'cursor') {
+    result = await cursorSel.sendCursorMessage(Runtime, cdpClient, text);
   } else if (agentType === 'codex' || agentType === 'codex-desktop') {
     const usePageEval = agentType === 'codex-desktop';
     result = await sendCodexPrimary(Runtime, text, usePageEval);

@@ -46,11 +46,23 @@ function CodexStandaloneIcon({ size = 24 }) {
   );
 }
 
+// Cursor IDE cursor-arrow icon (matches web logo-cursor.svg)
+const CURSOR_ARROW_D = 'M4 3 L4 19 L13 11 L9 11 L17 3 Z';
+
+function CursorIcon({ size = 24 }) {
+  return (
+    <Svg width={size} height={size} viewBox="0 0 24 24" fill="none">
+      <Path d={CURSOR_ARROW_D} fill="white" />
+    </Svg>
+  );
+}
+
 // Map agent types to their icon components
 const AGENT_ICONS = {
   claude:            (size) => <CompositeIcon rightD={CLAUDE_D} size={size} />,
   codex:             (size) => <CompositeIcon rightD={CODEX_D} size={size} />,
   'codex-desktop':   (size) => <CodexStandaloneIcon size={size} />,
+  cursor:            (size) => <CursorIcon size={size} />,
   gemini:            (size) => <CompositeIcon rightD={GEMINI_D} size={size} />,
   antigravity:       (size) => <AntigravityIcon size={size} />,
   antigravity_panel: (size) => <AntigravityIcon size={size} />,

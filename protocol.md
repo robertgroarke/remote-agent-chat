@@ -1158,6 +1158,28 @@ Rules:
 - Browsers must dismiss any open overlay for this `prompt_id` on receipt.
 - The relay has already applied the `default_choice` to the proxy before broadcasting this event.
 
+### `file_change_response`
+
+Sent by browser to relay to accept or reject a pending Cursor file-change card (auto-apply off).
+
+```json
+{
+  "type": "file_change_response",
+  "protocol_version": 1,
+  "session_id": "sess_123",
+  "change_id": "file-readme-md",
+  "action": "accept",
+  "request_id": "filechg_abc"
+}
+```
+
+Rules:
+
+- `action` is `accept` or `reject`.
+- `change_id` matches an `id` from the latest `file_changes` control result for that session.
+- Relay forwards to the proxy; proxy clicks the matching Accept/Reject control in the Cursor DOM.
+- On success, relay returns `agent_control_result` with `command: "file_change_response"` and `result: "ok"`; browsers should refresh `file_changes`.
+
 ### `agent_interrupt`
 
 Sent by browser to relay to stop a running agent generation.
@@ -1393,7 +1415,8 @@ To reduce migration risk, implement in this order:
 11. `agent_config` on session connect; `agent_config_request`
 12. `agent_interrupt` and `agent_control_result`
 13. `permission_prompt`, `permission_response`, `permission_prompt_expired`
-14. `agent_set_model` with confirming `agent_config`
+14. `file_changes` read and `file_change_response` accept/reject (Cursor)
+15. `agent_set_model` with confirming `agent_config`
 
 ## Acceptance Criteria
 

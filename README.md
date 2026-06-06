@@ -90,6 +90,7 @@ The WebUI groups active sessions by workspace directory in the sidebar and shows
 | Antigravity Chat (built-in agent) | Working |
 | Antigravity v2 Agent Manager (standalone app) | Working - standalone CDP port 9226, project/conversation navigator, history/scheduled-task entry points, new conversation, chat switching, rich transcript blocks |
 | Codex Desktop (MSIX) | Working (separate CDP port) |
+| Cursor IDE (Electron) | Working (CDP port 9227) |
 | Claude Desktop (MSIX) | Blocked — Anthropic requires a signed `CLAUDE_CDP_AUTH` token to allow CDP |
 
 Antigravity v2 is treated as a separate standalone Agent Manager surface, not as the Antigravity IDE side pane. The WebUI exposes its project/conversation controls where available, including conversation history, scheduled-task entry points, project/sub-chat switching, and new conversation launch. v2 transcripts preserve rich assistant output such as markdown, thinking, tool calls, terminal output, file-change summaries, artifacts, prompts, and errors.
@@ -102,7 +103,7 @@ Transcript history hydrates newest-first across agent types. The WebUI shows the
 
 ## How it works
 
-1. **Antigravity IDE** is launched with `--remote-debugging-port=9223`, exposing each agent webview via Chrome DevTools Protocol (CDP). Optional standalone apps use separate ports: Codex Desktop on `9225`, Antigravity v2 Agent Manager on `9226`.
+1. **Antigravity IDE** is launched with `--remote-debugging-port=9223`, exposing each agent webview via Chrome DevTools Protocol (CDP). Optional standalone apps use separate ports: Codex Desktop on `9225`, Antigravity v2 Agent Manager on `9226`, Cursor IDE on `9227`.
 2. **agent-proxy** connects to those webviews via CDP, polls for new messages, follows local CLI transcript files for Claude Code CLI and Codex CLI sessions, and relays them to the relay server over a persistent WebSocket.
 3. **relay-server** brokers messages between the proxy and browser clients, persists history in SQLite, and gates access via Google OAuth.
 4. **Cloudflare Tunnel** (running as a Docker sidecar) punches a secure HTTPS tunnel to your relay so it's reachable from anywhere — no domain, no VPS, no port forwarding needed.
@@ -253,8 +254,8 @@ RELAY_URL=wss://agents.yourdomain.com/proxy-ws
 # Must match PROXY_SECRET in your relay .env
 PROXY_SECRET=<same value as relay>
 
-# CDP ports to scan (9223 = Antigravity IDE, 9225 = Codex Desktop, 9226 = Antigravity v2)
-CDP_PORTS=9223,9225,9226
+# CDP ports to scan (9223 = Antigravity IDE, 9225 = Codex Desktop, 9226 = Antigravity v2, 9227 = Cursor)
+CDP_PORTS=9223,9225,9226,9227
 ```
 
 ---
@@ -273,7 +274,7 @@ Install the proxy as an Antigravity/VS Code extension. No separate process, no s
 4. Open **Settings** (Ctrl+,) and search for `remoteAgentProxy`, then configure:
    - **Relay URL**: `wss://agents.yourdomain.com/proxy-ws`
    - **Proxy Secret**: same value as your relay's `PROXY_SECRET`
-    - **CDP Ports**: `9223` (add `,9225` for Codex Desktop and `,9226` for Antigravity v2)
+    - **CDP Ports**: `9223` (add `,9225` Codex Desktop, `,9226` Antigravity v2, `,9227` Cursor IDE)
 5. The proxy starts automatically. Look for `$(broadcast) Proxy (N)` in the status bar.
 
 Click the status bar item for a quick menu (Stop, Restart, Show Logs).
@@ -330,6 +331,41 @@ CDP_PORTS=9223,9225
 Then restart the proxy.
 
 > **Note:** Claude Desktop (MSIX) is **not supported** — Anthropic requires a signed `CLAUDE_CDP_AUTH` token to allow CDP access, which third parties cannot generate.
+
+## Optional: Cursor IDE
+
+Cursor is a VS Code fork. Enable CDP with a pinned taskbar shortcut (recommended) or any launcher that passes:
+
+```text
+--remote-debugging-port=9227 --remote-debugging-address=127.0.0.1
+```
+
+Add the port to `agent-proxy/.env`:
+
+```env
+CDP_PORTS=9223,9225,9226,9227
+```
+
+Verify at `http://localhost:9227/json/list` — you should see workbench `page` targets with `Cursor` in the title. One proxy session is registered per open workspace window. See `agent-proxy/cursor-cdp-notes.md` for DOM selectors and capability limits.
+
+**Validation (throwaway workspace recommended):** use a dedicated Cursor window (e.g. `C:\temp\cursor-test`) for CDP probes — never the Remote Agent Chat host window. Probes use `agent-proxy/cursor-probe-guard.js`.
+
+```bash
+node tools/cursor-validate-all.js                      # all relay E2E harnesses
+node tools/cursor-live-e2e.js --send-live              # relay WebSocket send
+node tools/cursor-web-e2e.js                           # send + REST history verify
+node tools/cursor-permission-e2e.js                    # permission round-trip
+node tools/cursor-filechange-e2e.js                    # file_change_response (Undo)
+node tools/cursor-agent-switch-e2e.js                  # switch_thread / agent tabs
+node tools/cursor-auto-approve-e2e.js                  # auto-approve toggle + store
+node tools/cursor-auto-approve-restore-test.js         # preference survives proxy restart
+node tools/cursor-capabilities-check.js                # toggle on all Cursor sessions
+node tools/cursor-phase2-smoke.js                      # quick throwaway probe smoke
+```
+
+Results: `CURSOR_SUPPORT_TEST_RESULTS.md`. Long soak: `node tools/cursor-soak.js --minutes 30`.
+
+Then restart the proxy.
 
 ## Optional: Antigravity v2 Agent Manager
 

@@ -62,6 +62,7 @@ android-app/.node22/
 
 # CDP probe/debug scripts and output
 agent-proxy/probe-*.js
+!agent-proxy/probe-cursor-*.js
 agent-proxy/dom_dump*.txt
 agent-proxy/probe-output.txt
 agent-proxy/test.html
@@ -75,6 +76,8 @@ __pycache__/
 # Runtime files
 agent-proxy/proxy-new.log
 agent-proxy/session-store.json
+agent-proxy/session-store.json.*.tmp
+agent-proxy/probe-cursor-*-output.txt
 
 # VSIX build artifacts
 agent-proxy/vscode-ext/*.vsix

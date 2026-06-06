@@ -1,7 +1,7 @@
 import React from 'react';
 import {
   View, Text, Modal, TouchableOpacity, TouchableWithoutFeedback,
-  ScrollView, StyleSheet,
+  ScrollView, StyleSheet, Switch,
 } from 'react-native';
 
 // ── Model / mode constants (matching web UI) ────────────────────────────────
@@ -116,6 +116,9 @@ export default function AgentSettingsSheet({
   const showAntigravityMode = agentType === 'antigravity' || agentType === 'antigravity_panel';
   const showEffort = caps.set_codex_config && config.available_efforts?.length > 0;
   const showAccess = caps.set_codex_config && config.available_access?.length > 0;
+  const autoApproveEnabled = typeof config.auto_approve_permissions === 'boolean'
+    ? config.auto_approve_permissions
+    : false;
 
   return (
     <Modal visible={visible} transparent animationType="slide" onRequestClose={onClose}>
@@ -143,6 +146,21 @@ export default function AgentSettingsSheet({
               value={config.permission_mode || 'default'}
               onChange={handlePermissionChange}
             />
+          )}
+
+          {caps.auto_approve_permissions_toggle && (
+            <View style={s.toggleRow}>
+              <Text style={s.settingLabel}>Tool prompts</Text>
+              <View style={s.toggleControl}>
+                <Text style={s.toggleHint}>Auto-approve permission prompts</Text>
+                <Switch
+                  value={autoApproveEnabled}
+                  onValueChange={(v) => relay?.setAutoApprovePermissions(sessionId, v)}
+                  trackColor={{ false: '#30363d', true: '#1f4d8a' }}
+                  thumbColor={autoApproveEnabled ? '#58a6ff' : '#768390'}
+                />
+              </View>
+            </View>
           )}
 
           {showAntigravityMode && (
@@ -248,6 +266,20 @@ const s = StyleSheet.create({
   },
   settingRow: {
     marginBottom: 16,
+  },
+  toggleRow: {
+    marginBottom: 16,
+  },
+  toggleControl: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    justifyContent: 'space-between',
+    gap: 12,
+  },
+  toggleHint: {
+    flex: 1,
+    color: '#cdd9e5',
+    fontSize: 13,
   },
   settingLabel: {
     color:        '#768390',

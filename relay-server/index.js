@@ -1498,7 +1498,7 @@ const KNOWN_CLIENT_TYPES = new Set([
   'set_codex_config', 'agent_set_mode',
   'new_thread', 'open_panel', 'open_native_window', 'chat_list', 'switch_chat', 'new_chat',
   'thread_list', 'switch_thread', 'switch_workspace', 'terminal_output',
-  'file_changes', 'send_attachment', 'terminal_input',
+  'file_changes', 'file_change_response', 'send_attachment', 'terminal_input',
   'branch_list', 'switch_branch', 'create_branch',
   'skill_list', 'automation_view_action', 'list_directory', 'read_file',
   'steer', 'discard_queued', 'edit_queued',
@@ -3181,7 +3181,7 @@ function handleClientConnection(ws, req) {
       log('info', 'ctrl', 'Set codex config forwarded', { session: sessionId, request_id: requestId });
 
     // ── Panel/agent control commands (Epics 2, 3, 4, 9) ──────────────────
-    } else if (t === 'new_thread' || t === 'open_panel' || t === 'open_native_window' || t === 'chat_list' || t === 'switch_chat' || t === 'new_chat' || t === 'thread_list' || t === 'switch_thread' || t === 'switch_workspace' || t === 'terminal_output' || t === 'file_changes' || t === 'send_attachment' || t === 'terminal_input' || t === 'branch_list' || t === 'switch_branch' || t === 'create_branch' || t === 'skill_list' || t === 'automation_view_action' || t === 'list_directory' || t === 'read_file') {
+    } else if (t === 'new_thread' || t === 'open_panel' || t === 'open_native_window' || t === 'chat_list' || t === 'switch_chat' || t === 'new_chat' || t === 'thread_list' || t === 'switch_thread' || t === 'switch_workspace' || t === 'terminal_output' || t === 'file_changes' || t === 'file_change_response' || t === 'send_attachment' || t === 'terminal_input' || t === 'branch_list' || t === 'switch_branch' || t === 'create_branch' || t === 'skill_list' || t === 'automation_view_action' || t === 'list_directory' || t === 'read_file') {
       const sessionId = msg.session_id || msg.session;
       const requestId = msg.request_id;
       const proxyWs   = proxySockets.get(sessionId);
@@ -3211,6 +3211,8 @@ function handleClientConnection(ws, req) {
         ...(msg.text != null ? { text: msg.text } : {}),
         ...(msg.path != null ? { path: msg.path } : {}),
         ...(msg.max_size != null ? { max_size: msg.max_size } : {}),
+        ...(msg.change_id != null ? { change_id: msg.change_id } : {}),
+        ...(msg.action != null ? { action: msg.action } : {}),
       }));
       log('info', 'ctrl', `${t} forwarded`, { session: sessionId, request_id: requestId });
 

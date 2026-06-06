@@ -130,6 +130,17 @@ export class RelayClient {
     return requestId;
   }
 
+  setAutoApprovePermissions(sessionId, enabled) {
+    const requestId = `autoap-${Date.now()}-${Math.random().toString(36).slice(2, 7)}`;
+    this._send({
+      type: 'agent_set_auto_approve_permissions',
+      session_id: sessionId,
+      enabled: !!enabled,
+      request_id: requestId,
+    });
+    return requestId;
+  }
+
   setAgentPermissionMode(sessionId, mode) {
     const requestId = `perm-${Date.now()}-${Math.random().toString(36).slice(2, 7)}`;
     this._send({ type: 'agent_set_permission_mode', session_id: sessionId, mode, request_id: requestId });
@@ -215,6 +226,18 @@ export class RelayClient {
   requestFileChanges(sessionId) {
     const requestId = `diff-${Date.now()}-${Math.random().toString(36).slice(2, 7)}`;
     this._send({ type: 'file_changes', session_id: sessionId, request_id: requestId });
+    return requestId;
+  }
+
+  respondToFileChange(sessionId, changeId, action) {
+    const requestId = `filechg-${Date.now()}-${Math.random().toString(36).slice(2, 7)}`;
+    this._send({
+      type: 'file_change_response',
+      session_id: sessionId,
+      change_id: changeId,
+      action,
+      request_id: requestId,
+    });
     return requestId;
   }
 

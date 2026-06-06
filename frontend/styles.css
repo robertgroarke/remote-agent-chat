@@ -1639,6 +1639,12 @@ details.content-block {
   font-size: 11px;
 }
 
+.content-block-action-label.unsupported {
+  border-style: dashed;
+  color: var(--text4);
+  background: rgba(143, 173, 214, 0.06);
+}
+
 /* ── Input area ────────────────────────────────────────────── */
 .input-area {
   display: flex;
@@ -4672,12 +4678,28 @@ select.new-session-workspace option { background: var(--bg2); color: var(--text)
 }
 .diff-entry:last-child { border-bottom: none; }
 .diff-file-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
   font-family: 'SF Mono', 'Consolas', 'Monaco', monospace;
   font-size: 12px;
   color: #d2a8ff;
   padding: 4px 0 2px;
   font-weight: 600;
 }
+.diff-file-actions { display: flex; gap: 6px; flex-shrink: 0; }
+.diff-action-accept, .diff-action-reject {
+  font-size: 11px;
+  padding: 2px 8px;
+  border-radius: 4px;
+  border: 1px solid #30363d;
+  background: #21262d;
+  color: #e6edf3;
+  cursor: pointer;
+}
+.diff-action-accept:hover { background: #238636; border-color: #238636; }
+.diff-action-reject:hover { background: #da3633; border-color: #da3633; }
 .diff-file-summary {
   display: flex;
   gap: 6px;

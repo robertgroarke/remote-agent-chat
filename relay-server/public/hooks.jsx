@@ -297,7 +297,7 @@ export function useRelay() {
 
     function shouldPreserveTranscriptInListView(session) {
       if (!session || typeof session !== 'object') return false;
-      return ['codex', 'codex-desktop', 'codex_cli', 'roo_code', 'cline'].includes(session.agent_type);
+      return ['codex', 'codex-desktop', 'cursor', 'codex_cli', 'roo_code', 'cline'].includes(session.agent_type);
     }
 
     function clearSessionTranscript(sessionId) {
@@ -457,6 +457,18 @@ export function useRelay() {
     function requestFileChanges(sessionId) {
       const requestId = `diff-${Date.now()}-${Math.random().toString(36).slice(2, 7)}`;
       send({ type: 'file_changes', session_id: sessionId, request_id: requestId });
+      return requestId;
+    }
+
+    function respondToFileChange(sessionId, changeId, action) {
+      const requestId = `filechg-${Date.now()}-${Math.random().toString(36).slice(2, 7)}`;
+      send({
+        type: 'file_change_response',
+        session_id: sessionId,
+        change_id: changeId,
+        action,
+        request_id: requestId,
+      });
       return requestId;
     }
 
@@ -1021,6 +1033,9 @@ export function useRelay() {
             ? { ...prev, [sid]: { ...prev[sid], submitting_action_id: null, error: msg.error?.message || 'Error prompt action failed' } }
             : prev);
         }
+        if (msg.command === 'file_change_response' && sid && msg.result === 'ok') {
+          requestFileChanges(sid);
+        }
         return;
       }
 
@@ -1238,7 +1253,7 @@ export function useRelay() {
     // where `sessions` / `messages` would be frozen at initial render values).
     handleRelayMessageRef.current = handleRelayMessage;
 
-    return { sessions, messages, historyMeta, historyLoading, connected, unread, setUnread, thinking, thinkingContent, activities, health, deliveryStates, launchStates, justLaunched, setJustLaunched, permissionPrompts, respondToPrompt, errorPrompts, respondToErrorPrompt, interruptSession, agentConfigs, requestAgentConfig, setAgentModel, setAgentEffort, setAgentPermissionMode, setAutoApprovePermissions, setAntigravityMode, setCodexConfig, newThread, openPanel, openNativeWindow, requestChatList, switchChat, newChat, chatLists, requestThreadList, switchThread, threadLists, switchWorkspace, requestTerminalOutput, terminalOutputs, requestFileChanges, fileChanges, sendAttachment, send, sendToSession, steerMessage, discardQueuedMessage, editQueuedMessage, queuedMessages, launchSession, resumeSession, closeSession, activeSessionRef, workspaces, branchLists, requestBranchList, switchBranch, createBranch, skillLists, requestSkillList, automationViews, showCodexAutomation, controlResults, directoryListings, requestDirectoryListing, fileContents, requestFileContent, requestHistory, requestHistoryChunk };
+    return { sessions, messages, historyMeta, historyLoading, connected, unread, setUnread, thinking, thinkingContent, activities, health, deliveryStates, launchStates, justLaunched, setJustLaunched, permissionPrompts, respondToPrompt, errorPrompts, respondToErrorPrompt, interruptSession, agentConfigs, requestAgentConfig, setAgentModel, setAgentEffort, setAgentPermissionMode, setAutoApprovePermissions, setAntigravityMode, setCodexConfig, newThread, openPanel, openNativeWindow, requestChatList, switchChat, newChat, chatLists, requestThreadList, switchThread, threadLists, switchWorkspace, requestTerminalOutput, terminalOutputs, requestFileChanges, respondToFileChange, fileChanges, sendAttachment, send, sendToSession, steerMessage, discardQueuedMessage, editQueuedMessage, queuedMessages, launchSession, resumeSession, closeSession, activeSessionRef, workspaces, branchLists, requestBranchList, switchBranch, createBranch, skillLists, requestSkillList, automationViews, showCodexAutomation, controlResults, directoryListings, requestDirectoryListing, fileContents, requestFileContent, requestHistory, requestHistoryChunk };
   }
 
 // (removed window.useRelay — now an ES module export)

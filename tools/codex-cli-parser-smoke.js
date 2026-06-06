@@ -68,7 +68,14 @@ fs.writeFileSync(liveLikeFixture, [
   { timestamp: iso(-270000), type: 'response_item', payload: { type: 'function_call', name: 'shell_command', call_id: 'done_cmd', arguments: '{"command":"echo done"}' } },
   { timestamp: iso(-269000), type: 'response_item', payload: { type: 'function_call_output', call_id: 'done_cmd', output: 'Exit code: 0\nOutput:\ndone\n' } },
   { timestamp: iso(-260000), type: 'response_item', payload: { type: 'reasoning', summary: [] } },
-  { timestamp: iso(-250000), type: 'event_msg', payload: { type: 'token_count' } },
+  { timestamp: iso(-240000), type: 'event_msg', payload: { type: 'agent_reasoning', text: 'I am checking the live parser path.' } },
+  { timestamp: iso(-230000), type: 'response_item', payload: { type: 'web_search_call', status: 'completed', action: { type: 'search', query: 'Remote Agent Chat Codex CLI fidelity' } } },
+  { timestamp: iso(-229000), type: 'event_msg', payload: { type: 'web_search_end', call_id: 'ws_live', query: 'Remote Agent Chat Codex CLI fidelity' } },
+  { timestamp: iso(-220000), type: 'response_item', payload: { type: 'tool_search_call', call_id: 'tool_search_live', status: 'completed', arguments: { query: 'browser automation', limit: 2 } } },
+  { timestamp: iso(-219000), type: 'response_item', payload: { type: 'tool_search_output', call_id: 'tool_search_live', status: 'completed', tools: [{ name: 'codex_app', tools: [{ name: 'read_thread_terminal' }] }] } },
+  { timestamp: iso(-210000), type: 'event_msg', payload: { type: 'mcp_tool_call_end', call_id: 'mcp_live', invocation: { server: 'codex_app', tool: 'read_thread_terminal', arguments: {} }, result: { Ok: { content: [{ type: 'text', text: 'terminal output' }], structuredContent: { ok: true } } } } },
+  { timestamp: iso(-200000), type: 'event_msg', payload: { type: 'context_compacted' } },
+  { timestamp: iso(-190000), type: 'event_msg', payload: { type: 'token_count' } },
 ].map(entry => JSON.stringify(entry)).join('\n') + '\n');
 const liveLikeSummary = codexCli.readSessionSummary(liveLikeFixture);
 assert(liveLikeSummary, 'expected live-like summary');
@@ -81,6 +88,45 @@ assert(liveLikeSummary.activity.goal, 'expected active goal metadata');
 assert.strictEqual(liveLikeSummary.activity.goal.label, 'Pursuing goal');
 assert.strictEqual(liveLikeSummary.activity.goal.time_used_seconds, 58);
 assert.strictEqual(liveLikeSummary.activity.goal.objective, 'Keep proving live Codex CLI fidelity');
+assert(liveLikeSummary.messages.some(msg => msg.content_blocks?.some(block =>
+  block.type === 'prompt'
+  && block.title === 'Goal updated'
+  && block.content.includes('Keep proving live Codex CLI fidelity')
+)), 'expected /goal updates to render into transcript blocks');
+assert(liveLikeSummary.messages.some(msg => msg.content_blocks?.some(block =>
+  block.type === 'thinking'
+  && block.content.includes('checking the live parser path')
+)), 'expected event_msg agent_reasoning to render as thinking');
+assert(liveLikeSummary.messages.some(msg => msg.content_blocks?.some(block =>
+  block.type === 'tool_call'
+  && block.title === 'Tool: web_search'
+  && block.content.includes('Remote Agent Chat Codex CLI fidelity')
+)), 'expected web_search_call to render as a tool block');
+assert(liveLikeSummary.messages.some(msg => msg.content_blocks?.some(block =>
+  block.type === 'tool_call'
+  && block.title === 'Tool result: web_search'
+  && block.content.includes('ws_live')
+)), 'expected web_search_end to render as a tool result');
+assert(liveLikeSummary.messages.some(msg => msg.content_blocks?.some(block =>
+  block.type === 'tool_call'
+  && block.title === 'Tool: tool_search'
+  && block.content.includes('browser automation')
+)), 'expected tool_search_call to render as a tool block');
+assert(liveLikeSummary.messages.some(msg => msg.content_blocks?.some(block =>
+  block.type === 'tool_call'
+  && block.title === 'Tool result: tool_search'
+  && block.content.includes('codex_app.read_thread_terminal')
+)), 'expected tool_search_output to render matched tool names');
+assert(liveLikeSummary.messages.some(msg => msg.content_blocks?.some(block =>
+  block.type === 'tool_call'
+  && block.title === 'Tool result: codex_app.read_thread_terminal'
+  && block.content.includes('structuredContent')
+  && block.content.includes('terminal output')
+)), 'expected MCP tool result to include invocation and result body');
+assert(liveLikeSummary.messages.some(msg => msg.content_blocks?.some(block =>
+  block.type === 'prompt'
+  && block.title === 'Context compacted'
+)), 'expected context compaction to render into transcript blocks');
 assert(!liveLikeSummary.messages.some(msg =>
   msg.content === 'Reasoning'
   && msg.content_blocks?.some(block => block.type === 'thinking' && !String(block.content || '').trim())

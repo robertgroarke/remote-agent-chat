@@ -8,7 +8,7 @@ import {
 // Bottom sheet showing file changes / diff output from Codex sessions.
 // Color-coded lines: green for additions, red for deletions, blue for hunks.
 
-export default function DiffViewer({ visible, entries, onRefresh, onClose, loading }) {
+export default function DiffViewer({ visible, entries, onRefresh, onClose, loading, onAccept, onReject }) {
   return (
     <Modal
       visible={visible}
@@ -45,8 +45,24 @@ export default function DiffViewer({ visible, entries, onRefresh, onClose, loadi
 
           {(entries || []).map((entry, i) => (
             <View key={i} style={s.entry}>
-              {entry.file && (
-                <Text style={s.fileHeader}>{entry.file}</Text>
+              {(entry.file || entry.path) && (
+                <View style={s.fileHeaderRow}>
+                  <Text style={s.fileHeader}>{entry.file || entry.path}</Text>
+                  {(entry.can_accept || entry.can_reject) && onAccept && onReject && (
+                    <View style={s.fileActions}>
+                      {entry.can_accept && (
+                        <TouchableOpacity onPress={() => onAccept(entry.id || entry.path)} style={s.acceptBtn}>
+                          <Text style={s.actionBtnText}>Accept</Text>
+                        </TouchableOpacity>
+                      )}
+                      {entry.can_reject && (
+                        <TouchableOpacity onPress={() => onReject(entry.id || entry.path)} style={s.rejectBtn}>
+                          <Text style={s.actionBtnText}>Reject</Text>
+                        </TouchableOpacity>
+                      )}
+                    </View>
+                  )}
+                </View>
               )}
               {entry.content ? (
                 <Text style={s.diffContent} selectable>
@@ -147,13 +163,24 @@ const s = StyleSheet.create({
     borderBottomWidth: 1,
     borderBottomColor: '#21262d',
   },
+  fileHeaderRow: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    justifyContent: 'space-between',
+    gap: 8,
+    paddingBottom: 4,
+  },
   fileHeader: {
+    flex: 1,
     fontFamily: mono,
     fontSize: 12,
     color: '#d2a8ff',
     fontWeight: '600',
-    paddingBottom: 4,
   },
+  fileActions: { flexDirection: 'row', gap: 6 },
+  acceptBtn: { backgroundColor: '#238636', borderRadius: 4, paddingHorizontal: 8, paddingVertical: 3 },
+  rejectBtn: { backgroundColor: '#da3633', borderRadius: 4, paddingHorizontal: 8, paddingVertical: 3 },
+  actionBtnText: { color: '#fff', fontSize: 11, fontWeight: '600' },
   diffContent: {
     fontFamily: mono,
     fontSize: 12,

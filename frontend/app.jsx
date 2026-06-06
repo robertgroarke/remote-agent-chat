@@ -9,8 +9,10 @@ const { useState, useRef, useEffect, useLayoutEffect } = React;
 
 const DRAFT_STORAGE_KEY = 'remote-agent-chat:drafts:v1';
 const DEFAULT_INITIAL_HISTORY_LIMIT = 120;
+const CODEX_INITIAL_HISTORY_LIMIT = 500;
 const CODEX_CLI_INITIAL_HISTORY_LIMIT = 160;
 const TRANSCRIPT_RENDER_TAIL_LIMIT = 96;
+const CODEX_TRANSCRIPT_RENDER_TAIL_LIMIT = 512;
 const EMPTY_MESSAGES = Object.freeze([]);
 const SLASH_COMMANDS = [
   { command: '/plan', detail: 'Outline the implementation approach and major steps.' },
@@ -28,6 +30,7 @@ const AGENT_CONFIG = {
   codex:             { name: 'Codex',            color: '#10a37f', abbr: 'CX', logo: '/logo-codex-in-ag.svg' },
   codex_cli:         { name: 'Codex CLI',        color: '#10a37f', abbr: 'CLI', logo: '/logo-codex.svg' },
   'codex-desktop':   { name: 'Codex Desktop',   color: '#10a37f', abbr: 'CX', logo: '/logo-codex.svg' },
+  cursor:            { name: 'Cursor',          color: '#7AA2F7', abbr: 'CR', logo: '/logo-cursor.svg' },
   gemini:            { name: 'Gemini',           color: '#4285f4', abbr: 'GC', logo: '/logo-gemini-in-ag.svg' },
   continue:          { name: 'Continue',         color: '#d29922', abbr: 'CN', logo: '/logo-continue.png' },
   continue_yolo:     { name: 'Continue YOLO',    color: '#f59e0b', abbr: 'CY', logo: '/logo-continue.png' },
@@ -49,6 +52,22 @@ function isClineLikeAgentType(agentType) {
 
 function isRooCodeLikeAgentType(agentType) {
   return agentType === 'roo_code';
+}
+
+function isCodexTranscriptAgentType(agentType) {
+  return agentType === 'codex' || agentType === 'codex-desktop';
+}
+
+function transcriptRenderTailLimitForAgentType(agentType) {
+  return isCodexTranscriptAgentType(agentType)
+    ? CODEX_TRANSCRIPT_RENDER_TAIL_LIMIT
+    : TRANSCRIPT_RENDER_TAIL_LIMIT;
+}
+
+function historyLimitForAgentType(agentType) {
+  if (agentType === 'codex_cli') return CODEX_CLI_INITIAL_HISTORY_LIMIT;
+  if (isCodexTranscriptAgentType(agentType)) return CODEX_INITIAL_HISTORY_LIMIT;
+  return DEFAULT_INITIAL_HISTORY_LIMIT;
 }
 
 function safeString(value, fallback = '') {
@@ -114,10 +133,11 @@ function messageIdentityKey(msg, fallbackIndex = 0) {
   ].join(':');
 }
 
-function scrollIdentityKeysForMessages(messages, renderAll = false) {
+function scrollIdentityKeysForMessages(messages, renderAll = false, tailLimit = TRANSCRIPT_RENDER_TAIL_LIMIT) {
   const list = Array.isArray(messages) ? messages : [];
-  const keySource = (!renderAll && list.length > TRANSCRIPT_RENDER_TAIL_LIMIT)
-    ? list.slice(-TRANSCRIPT_RENDER_TAIL_LIMIT)
+  const limit = Math.max(1, Number(tailLimit) || TRANSCRIPT_RENDER_TAIL_LIMIT);
+  const keySource = (!renderAll && list.length > limit)
+    ? list.slice(-limit)
     : list;
   const offset = list.length - keySource.length;
   return keySource.map((msg, i) => messageIdentityKey(msg, offset + i));
@@ -181,6 +201,23 @@ function contentBlocksFallback(blocks) {
     .join('\n\n');
 }
 
+function ContentBlockActions({ actions }) {
+  if (!Array.isArray(actions) || actions.length === 0) return null;
+  return (
+    <div className="content-block-actions">
+      {actions.map((action, actionIndex) => (
+        <span
+          key={action.id || actionIndex}
+          className={`content-block-action-label${action.unsupported ? ' unsupported' : ''}`}
+          title={action.unsupported ? 'This Codex control is visible in the source app but is not currently available from the web UI.' : undefined}
+        >
+          {action.label || action.id || 'Action'}
+        </span>
+      ))}
+    </div>
+  );
+}
+
 function ContentBlocks({ blocks, monospace, autoExpandLongCodeBlocks, onOpenPath, agentType }) {
   const normalized = normalizeContentBlocks(blocks);
   if (normalized.length === 0) return null;
@@ -234,6 +271,7 @@ function ContentBlocks({ blocks, monospace, autoExpandLongCodeBlocks, onOpenPath
                 {block.status && <span className={`content-block-status ${safeString(block.status).toLowerCase()}`}>{block.status}</span>}
               </summary>
               {body && <pre className="content-block-pre">{body}</pre>}
+              <ContentBlockActions actions={block.actions} />
             </details>
           );
         }
@@ -246,6 +284,7 @@ function ContentBlocks({ blocks, monospace, autoExpandLongCodeBlocks, onOpenPath
                 {block.exit_code != null && <span className="content-block-status">exit {block.exit_code}</span>}
               </summary>
               {body && <pre className="content-block-pre">{body}</pre>}
+              <ContentBlockActions actions={block.actions} />
             </details>
           );
         }
@@ -270,6 +309,7 @@ function ContentBlocks({ blocks, monospace, autoExpandLongCodeBlocks, onOpenPath
                 </div>
               )}
               {body && <MarkdownContent content={body} monospace={monospace} autoExpandLongCodeBlocks={autoExpandLongCodeBlocks} onOpenPath={onOpenPath} />}
+              <ContentBlockActions actions={block.actions} />
             </details>
           );
         }
@@ -286,13 +326,7 @@ function ContentBlocks({ blocks, monospace, autoExpandLongCodeBlocks, onOpenPath
             <div key={index} className={`content-block content-block-${type}`}>
               <div className="content-block-title">{title || type}</div>
               {body && <MarkdownContent content={body} monospace={monospace} autoExpandLongCodeBlocks={autoExpandLongCodeBlocks} onOpenPath={onOpenPath} />}
-              {Array.isArray(block.actions) && block.actions.length > 0 && (
-                <div className="content-block-actions">
-                  {block.actions.map((action, actionIndex) => (
-                    <span key={action.id || actionIndex} className="content-block-action-label">{action.label || action.id || 'Action'}</span>
-                  ))}
-                </div>
-              )}
+              <ContentBlockActions actions={block.actions} />
             </div>
           );
         }
@@ -350,6 +384,7 @@ function normalizeAgentTypeHint(value) {
   if (raw.includes('continue')) return 'continue';
   if (raw.includes('codex cli') || raw.includes('codex_cli')) return 'codex_cli';
   if (raw.includes('codex desktop')) return 'codex-desktop';
+  if (/\bcursor\b/.test(raw) || raw === 'cursor' || raw.includes('cursor ide')) return 'cursor';
   if (raw.includes('codex')) return 'codex';
   if (raw.includes('claude code') || raw.includes('claude')) return 'claude';
   if (raw.includes('antigravity chat') || raw.includes('antigravity_panel')) return 'antigravity_panel';
@@ -2689,7 +2724,7 @@ function TerminalViewer({ entries, onClose, onRefresh }) {
   );
 }
 
-function DiffViewer({ entries, onClose, onRefresh }) {
+function DiffViewer({ entries, onClose, onRefresh, onAccept, onReject }) {
   const summaryChips = (summary) => {
     const text = String(summary || '').trim();
     if (!text) return [];
@@ -2712,7 +2747,19 @@ function DiffViewer({ entries, onClose, onRefresh }) {
           entries.map((entry, i) => (
             <div key={i} className="diff-entry">
               {entry.file && (
-                <div className="diff-file-header">{entry.file}</div>
+                <div className="diff-file-header">
+                  <span>{entry.file || entry.path}</span>
+                  {(entry.can_accept || entry.can_reject) && onAccept && onReject && (
+                    <span className="diff-file-actions">
+                      {entry.can_accept && (
+                        <button type="button" className="diff-action-accept" onClick={() => onAccept(entry.id || entry.path)}>Accept</button>
+                      )}
+                      {entry.can_reject && (
+                        <button type="button" className="diff-action-reject" onClick={() => onReject(entry.id || entry.path)}>Reject</button>
+                      )}
+                    </span>
+                  )}
+                </div>
               )}
               {entry.summary && (
                 <div className="diff-file-summary">
@@ -3485,7 +3532,7 @@ class AppErrorBoundary extends React.Component {
 }
 
 function App() {
-  const { sessions, messages, historyMeta, historyLoading, connected, unread, setUnread, thinking, thinkingContent, activities, health, deliveryStates, launchStates, justLaunched, setJustLaunched, permissionPrompts, respondToPrompt, errorPrompts, respondToErrorPrompt, interruptSession, agentConfigs, requestAgentConfig, setAgentModel, setAgentEffort, setAgentPermissionMode, setAutoApprovePermissions, setAntigravityMode, setCodexConfig, newThread, openPanel, openNativeWindow, requestChatList, switchChat, newChat, chatLists, requestThreadList, switchThread, threadLists, switchWorkspace, requestTerminalOutput, terminalOutputs, requestFileChanges, fileChanges, sendAttachment, send, sendToSession, steerMessage, discardQueuedMessage, editQueuedMessage, queuedMessages, launchSession, resumeSession, closeSession, activeSessionRef, workspaces, branchLists, requestBranchList, switchBranch, createBranch, skillLists, requestSkillList, automationViews, showCodexAutomation, controlResults, directoryListings, requestDirectoryListing, fileContents, requestFileContent, requestHistory, requestHistoryChunk } = useRelay();
+  const { sessions, messages, historyMeta, historyLoading, connected, unread, setUnread, thinking, thinkingContent, activities, health, deliveryStates, launchStates, justLaunched, setJustLaunched, permissionPrompts, respondToPrompt, errorPrompts, respondToErrorPrompt, interruptSession, agentConfigs, requestAgentConfig, setAgentModel, setAgentEffort, setAgentPermissionMode, setAutoApprovePermissions, setAntigravityMode, setCodexConfig, newThread, openPanel, openNativeWindow, requestChatList, switchChat, newChat, chatLists, requestThreadList, switchThread, threadLists, switchWorkspace, requestTerminalOutput, terminalOutputs, requestFileChanges, respondToFileChange, fileChanges, sendAttachment, send, sendToSession, steerMessage, discardQueuedMessage, editQueuedMessage, queuedMessages, launchSession, resumeSession, closeSession, activeSessionRef, workspaces, branchLists, requestBranchList, switchBranch, createBranch, skillLists, requestSkillList, automationViews, showCodexAutomation, controlResults, directoryListings, requestDirectoryListing, fileContents, requestFileContent, requestHistory, requestHistoryChunk } = useRelay();
   const [activeSession, setActiveSession] = useState(null);
   const [drafts, setDrafts]             = useState({});
   const [draftFiles, setDraftFiles]     = useState({});
@@ -3531,10 +3578,15 @@ function App() {
     () => groupSessionsByWorkspace(orderedSessions, agentConfigs),
     [orderedSessions, agentConfigs],
   );
+  const activeSessionMeta = React.useMemo(
+    () => orderedSessions.find(s => sessionIdOf(s) === activeSession),
+    [orderedSessions, activeSession],
+  );
   const activeMessagesForScroll = activeSession && messages[activeSession]
     ? messages[activeSession]
     : EMPTY_MESSAGES;
   const activeTranscriptExpandedForScroll = !!(activeSession && expandedTranscriptSessions[activeSession]);
+  const activeTranscriptRenderTailLimitForScroll = transcriptRenderTailLimitForAgentType(activeSessionMeta?.agent_type);
   const activeActivityForScroll = activeSession ? activities[activeSession] : null;
   const activeThinkingForScroll = activeSession ? (thinkingContent[activeSession] || '') : '';
   const activePermissionPromptForScroll = activeSession ? permissionPrompts[activeSession] || null : null;
@@ -3765,7 +3817,11 @@ function App() {
   function pinTranscriptToNewest() {
     const list = messagesListRef.current;
     if (!list) return;
-    const keys = scrollIdentityKeysForMessages(activeMessagesForScroll, activeTranscriptExpandedForScroll);
+    const keys = scrollIdentityKeysForMessages(
+      activeMessagesForScroll,
+      activeTranscriptExpandedForScroll,
+      activeTranscriptRenderTailLimitForScroll,
+    );
     pinnedToNewestUntilRef.current = Date.now() + 5000;
     stickTranscriptToNewest(keys, 4);
   }
@@ -3776,7 +3832,11 @@ function App() {
   useLayoutEffect(() => {
     const list = messagesListRef.current;
     if (!list) return;
-    const keys = scrollIdentityKeysForMessages(activeMessagesForScroll, activeTranscriptExpandedForScroll);
+    const keys = scrollIdentityKeysForMessages(
+      activeMessagesForScroll,
+      activeTranscriptExpandedForScroll,
+      activeTranscriptRenderTailLimitForScroll,
+    );
     const prev = scrollSnapshotRef.current || {};
     const sameSession = prev.sessionId === activeSession;
     const prevKeys = Array.isArray(prev.keys) ? prev.keys : [];
@@ -3942,10 +4002,7 @@ async function uploadBinaryDraft(sessionId, base64, mimeType, filename) {
   }, [controlResults]);
 
   function historyRequestOptionsFor(sessionMeta) {
-    const limit = sessionMeta?.agent_type === 'codex_cli'
-      ? CODEX_CLI_INITIAL_HISTORY_LIMIT
-      : DEFAULT_INITIAL_HISTORY_LIMIT;
-    return { limit };
+    return { limit: historyLimitForAgentType(sessionMeta?.agent_type) };
   }
 
   function historyRequestOptionsForSessionId(sessionId) {
@@ -4128,13 +4185,14 @@ async function uploadBinaryDraft(sessionId, base64, mimeType, filename) {
     return rawCurrentMessages.slice(baseline);
   }, [rawCurrentMessages, draftBaseline]);
   const renderAllLoadedTranscript = !!(activeSession && expandedTranscriptSessions[activeSession]);
+  const transcriptRenderTailLimit = transcriptRenderTailLimitForAgentType(activeSessionMeta?.agent_type);
   const renderedMessages = React.useMemo(() => {
-    if (renderAllLoadedTranscript || currentMessages.length <= TRANSCRIPT_RENDER_TAIL_LIMIT) {
+    if (renderAllLoadedTranscript || currentMessages.length <= transcriptRenderTailLimit) {
       return currentMessages.filter(msg => hasVisibleMessage(msg));
     }
-    const tailWindow = currentMessages.slice(-TRANSCRIPT_RENDER_TAIL_LIMIT * 2);
-    return tailWindow.filter(msg => hasVisibleMessage(msg)).slice(-TRANSCRIPT_RENDER_TAIL_LIMIT);
-  }, [currentMessages, renderAllLoadedTranscript]);
+    const tailWindow = currentMessages.slice(-transcriptRenderTailLimit * 2);
+    return tailWindow.filter(msg => hasVisibleMessage(msg)).slice(-transcriptRenderTailLimit);
+  }, [currentMessages, renderAllLoadedTranscript, transcriptRenderTailLimit]);
   const hiddenLoadedMessageCount = renderAllLoadedTranscript
     ? 0
     : Math.max(0, currentMessages.length - renderedMessages.length);
@@ -4157,10 +4215,6 @@ async function uploadBinaryDraft(sessionId, base64, mimeType, filename) {
 
   // Resolve display label for the active session
   const activeConfig = activeSession ? (agentConfigs[activeSession] || null) : null;
-  const activeSessionMeta = React.useMemo(
-    () => orderedSessions.find(s => sessionIdOf(s) === activeSession),
-    [orderedSessions, activeSession],
-  );
   const activeHistoryMeta = activeSession ? (historyMeta[activeSession] || null) : null;
   const activeHistoryLoading = activeSession ? (historyLoading[activeSession] || null) : null;
 
@@ -4266,7 +4320,9 @@ async function uploadBinaryDraft(sessionId, base64, mimeType, filename) {
     : '';
   const canLaunchNewThread = !!activeConfig?.capabilities?.new_thread;
   const isCodexDesktop = activeSessionMeta?.agent_type === 'codex-desktop';
-  const newThreadLabel = isCodexDesktop ? 'New chat' : 'New thread';
+  const isCursor = activeSessionMeta?.agent_type === 'cursor';
+  const isDesktopAgent = isCodexDesktop || isCursor;
+  const newThreadLabel = isDesktopAgent ? 'New chat' : 'New thread';
   const activeMachine = activeSessionMeta && typeof activeSessionMeta === 'object'
     ? activeSessionMeta.machine_label
     : '';
@@ -4353,6 +4409,7 @@ async function uploadBinaryDraft(sessionId, base64, mimeType, filename) {
     && (
       activeSessionMeta?.agent_type === 'codex'
       || activeSessionMeta?.agent_type === 'codex-desktop'
+      || activeSessionMeta?.agent_type === 'cursor'
       || activeSessionMeta?.agent_type === 'antigravity_panel'
     )
     && liveThinkingText !== lastAssistantText
@@ -4454,7 +4511,7 @@ async function uploadBinaryDraft(sessionId, base64, mimeType, filename) {
   const hasThreadCap = activeConfig?.capabilities?.thread_list;
   const showDesktopThreadTabs = !!(
     activeSession
-    && activeSessionMeta?.agent_type === 'codex-desktop'
+    && (activeSessionMeta?.agent_type === 'codex-desktop' || activeSessionMeta?.agent_type === 'cursor')
     && hasThreadCap
     && (threadLists[activeSession]?.length > 0 || pendingDraftThreads[activeSession])
     && !showFileBrowser
@@ -4517,14 +4574,14 @@ async function uploadBinaryDraft(sessionId, base64, mimeType, filename) {
     });
   }, [activeSession, isAntigravityV2, rawActiveChatList]);
   React.useEffect(() => {
-    if (!(activeSession && activeSessionMeta?.agent_type === 'codex-desktop' && noMessages)) return undefined;
+    if (!(activeSession && isDesktopAgent && noMessages)) return undefined;
     const tailOptions = historyRequestOptionsFor(activeSessionMeta);
     requestHistory(activeSession, tailOptions);
     const intervalId = setInterval(() => requestHistory(activeSession, tailOptions), 3000);
     return () => clearInterval(intervalId);
   }, [activeSession, activeSessionMeta?.agent_type, noMessages]);
   React.useEffect(() => {
-    if (!(activeSession && activeSessionMeta?.agent_type === 'codex-desktop' && hasThreadCap)) return undefined;
+    if (!(activeSession && isDesktopAgent && hasThreadCap)) return undefined;
     requestThreadList(activeSession);
     const intervalId = setInterval(() => requestThreadList(activeSession), 5000);
     return () => clearInterval(intervalId);
@@ -5226,7 +5283,7 @@ async function uploadBinaryDraft(sessionId, base64, mimeType, filename) {
                   >Render all loaded</button>
                 </div>
               )}
-              {renderAllLoadedTranscript && currentMessages.length > TRANSCRIPT_RENDER_TAIL_LIMIT && (
+              {renderAllLoadedTranscript && currentMessages.length > transcriptRenderTailLimit && (
                 <div className="history-tail-banner transcript-render-window-banner">
                   <span>Rendering all {currentMessages.length.toLocaleString()} loaded messages</span>
                   <button
@@ -5352,6 +5409,8 @@ async function uploadBinaryDraft(sessionId, base64, mimeType, filename) {
           <DiffViewer
             entries={fileChanges[activeSession] || []}
             onRefresh={() => requestFileChanges(activeSession)}
+            onAccept={(changeId) => respondToFileChange(activeSession, changeId, 'accept')}
+            onReject={(changeId) => respondToFileChange(activeSession, changeId, 'reject')}
             onClose={() => setShowDiffViewer(false)}
           />
         )}

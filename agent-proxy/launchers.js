@@ -32,6 +32,10 @@ const ANTIGRAVITY_EXE   = process.env.ANTIGRAVITY_EXE
   || (process.env.LOCALAPPDATA
       ? require('path').join(process.env.LOCALAPPDATA, 'Programs', 'Antigravity', 'Antigravity.exe')
       : 'Antigravity');
+const CURSOR_EXE = process.env.CURSOR_EXE
+  || (process.env.LOCALAPPDATA
+      ? path.join(process.env.LOCALAPPDATA, 'Programs', 'cursor', 'Cursor.exe')
+      : 'Cursor');
 const LAUNCH_TIMEOUT_MS = 30000;
 const POLL_MS           = 1000;
 const SPAWN_SETTLE_MS   = 4000; // wait after spawning Antigravity before polling
@@ -42,6 +46,12 @@ function sleep(ms) { return new Promise(r => setTimeout(r, ms)); }
 
 function targetMatchesAgent(target, agentType) {
   const url = (target.url || '').toLowerCase();
+  const title = (target.title || '').toLowerCase();
+  if (agentType === 'cursor') {
+    return target.type === 'page'
+      && url.includes('workbench.html')
+      && (title.includes('cursor') || url.includes('/programs/cursor/'));
+  }
   if (agentType === 'claude')  return target.type === 'iframe' && (url.includes('anthropic') || url.includes('claude'));
   if (agentType === 'codex')   return target.type === 'iframe' && (url.includes('openai')    || url.includes('chatgpt'));
   if (agentType === 'gemini')  return target.type === 'iframe' && (url.includes('googlecloud')|| url.includes('gemini'));
@@ -97,9 +107,12 @@ async function clickNewSession(Runtime) {
 async function executeNewSessionCommand(port, agentType, workspacePath) {
   llog(`executeNewSessionCommand: agent=${agentType} workspace=${workspacePath || '(any)'}`);
   const targets = await CDP.List({ port });
-  const workbenchPages = targets.filter(t =>
-    t.type === 'page' && t.url && t.url.includes('workbench.html') && !t.url.includes('jetski')
-  );
+  const workbenchPages = targets.filter(t => {
+    if (t.type !== 'page' || !t.url || !t.url.includes('workbench.html') || t.url.includes('jetski')) return false;
+    if (agentType === 'cursor') return (t.title || '').toLowerCase().includes('cursor');
+    if ((t.title || '').toLowerCase().includes('cursor')) return false;
+    return true;
+  });
   if (workbenchPages.length === 0) return { ok: false, detail: 'no-workbench-pages' };
 
   // If workspace specified, sort pages so the matching window comes first
@@ -240,6 +253,17 @@ function spawnAntigravity(port) {
   llog(`Spawning Antigravity on CDP port ${port}`);
   const child = spawn(
     ANTIGRAVITY_EXE,
+    [`--remote-debugging-port=${port}`, '--remote-debugging-address=127.0.0.1'],
+    { detached: true, stdio: 'ignore' }
+  );
+  child.unref();
+  return child;
+}
+
+function spawnCursor(port) {
+  llog(`Spawning Cursor on CDP port ${port} (fallback — prefer elevated taskbar shortcut)`);
+  const child = spawn(
+    CURSOR_EXE,
     [`--remote-debugging-port=${port}`, '--remote-debugging-address=127.0.0.1'],
     { detached: true, stdio: 'ignore' }
   );
@@ -457,6 +481,27 @@ async function launchSession({ agentType, port, sessions, requestId, workspacePa
       onFailure(`Failed to open Codex panel: ${e.message}`, 'panel_open_failed', requestId);
       return;
     }
+  } else if (agentType === 'cursor') {
+    const cursorPort = Number(process.env.CURSOR_CDP_PORT || 9227);
+    const sameType = Array.from(sessions.values()).filter(s => s.agentType === 'cursor');
+    if (sameType.length > 0) {
+      try {
+        const ok = await require('./cursor-selectors').newCursorAgent(sameType[0].client.Runtime);
+        if (ok.ok) {
+          onSuccess({ id: sameType[0].targetId, type: 'page', title: sameType[0].windowTitle }, requestId, workspacePath);
+          return;
+        }
+      } catch (e) {
+        llog(`WARN: newCursorAgent failed: ${e.message}`);
+      }
+    }
+    try {
+      spawnCursor(cursorPort);
+      await sleep(SPAWN_SETTLE_MS);
+    } catch (e) {
+      onFailure(`Failed to spawn Cursor: ${e.message}`, 'spawn_failed', requestId);
+      return;
+    }
   } else {
     // Unknown agent type or Gemini with no existing session — can't spawn
     const label = agentType === 'gemini' ? 'Gemini Code Assist' : agentType;
@@ -496,4 +541,4 @@ async function closeSession({ targetId, port }) {
   }
 }
 
-module.exports = { launchSession, closeSession, spawnAntigravity };
+module.exports = { launchSession, closeSession, spawnAntigravity, spawnCursor };

@@ -33,6 +33,7 @@ const AGENT_DISPLAY = {
   antigravity: 'Antigravity',
   antigravity_panel: 'Antigravity Chat',
   'codex-desktop': 'Codex Desktop',
+  cursor: 'Cursor',
   'claude-desktop': 'Claude Desktop',
 };
 const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;

@@ -81,11 +81,11 @@ export default function ChatScreen({ route, navigation }) {
     // fall back to agentConfig from relay if available
     const caps = agentConfig?.capabilities;
     const at = agentType;
-    const hasChatList    = caps?.chat_list    ?? (at === 'codex' || at === 'codex-desktop' || at === 'antigravity_panel');
+    const hasChatList    = caps?.chat_list    ?? (at === 'codex' || at === 'codex-desktop' || at === 'cursor' || at === 'antigravity_panel');
     const hasOpenPanel   = caps?.open_panel   ?? (at === 'codex' || at === 'antigravity_panel');
-    const hasThreadList  = caps?.thread_list  ?? (at === 'codex-desktop');
+    const hasThreadList  = caps?.thread_list  ?? (at === 'codex-desktop' || at === 'cursor');
     const hasTerminal    = caps?.terminal_output ?? (at === 'codex' || at === 'codex-desktop');
-    const hasFileChanges = caps?.file_changes ?? (at === 'codex' || at === 'codex-desktop');
+    const hasFileChanges = caps?.file_changes ?? (at === 'codex' || at === 'codex-desktop' || at === 'cursor');
     navigation.setOptions({
       headerTitle: () => (
         <View style={{ alignItems: 'center', maxWidth: 120 }}>
@@ -750,7 +750,7 @@ export default function ChatScreen({ route, navigation }) {
           clientRef.current?.requestTerminalOutput(sessionId);
         }}
         onClose={() => setTerminalOpen(false)}
-        onSendInput={agentType === 'codex-desktop' ? (text) => {
+        onSendInput={(agentType === 'codex-desktop' || agentType === 'cursor') ? (text) => {
           clientRef.current?.sendTerminalInput(sessionId, text);
         } : undefined}
       />
@@ -763,6 +763,8 @@ export default function ChatScreen({ route, navigation }) {
           setDiffLoading(true);
           clientRef.current?.requestFileChanges(sessionId);
         }}
+        onAccept={(changeId) => clientRef.current?.respondToFileChange(sessionId, changeId, 'accept')}
+        onReject={(changeId) => clientRef.current?.respondToFileChange(sessionId, changeId, 'reject')}
         onClose={() => setDiffOpen(false)}
       />
 

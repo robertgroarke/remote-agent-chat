@@ -274,6 +274,15 @@ function isoFromMs(ms) {
   return Number.isFinite(ms) && ms > 0 ? new Date(ms).toISOString() : new Date().toISOString();
 }
 
+function latestIso(...values) {
+  let best = 0;
+  for (const value of values) {
+    const ms = value instanceof Date ? value.getTime() : new Date(value || 0).getTime();
+    if (Number.isFinite(ms) && ms > best) best = ms;
+  }
+  return isoFromMs(best);
+}
+
 function msFromUnixSeconds(value) {
   const raw = Number(value);
   return Number.isFinite(raw) && raw > 0 ? raw * 1000 : 0;
@@ -324,6 +333,90 @@ function toolResultBody(payload, knownCall = null) {
   return sections.join('\n\n');
 }
 
+function webSearchBody(payload) {
+  const action = payload?.action || {};
+  const queries = Array.isArray(action.queries) ? action.queries : [];
+  const query = payload?.query || action.query || queries[0] || '';
+  const sections = [
+    'tool: web_search',
+    payload?.call_id ? `call_id: ${payload.call_id}` : null,
+    query ? `query:\n${query}` : null,
+    queries.length > 1 ? `queries:\n${queries.map(q => `- ${q}`).join('\n')}` : null,
+  ].filter(Boolean);
+  return sections.join('\n\n');
+}
+
+function toolSearchCallBody(payload) {
+  const args = payload?.arguments || {};
+  const sections = [
+    'tool: tool_search',
+    payload?.call_id ? `call_id: ${payload.call_id}` : null,
+    Object.keys(args).length ? `arguments:\n${prettyJsonString(args)}` : null,
+  ].filter(Boolean);
+  return sections.join('\n\n');
+}
+
+function toolSearchOutputBody(payload) {
+  const tools = Array.isArray(payload?.tools) ? payload.tools : [];
+  const names = [];
+  for (const namespace of tools) {
+    const ns = namespace?.name || namespace?.namespace || 'tools';
+    const inner = Array.isArray(namespace?.tools) ? namespace.tools : [];
+    if (inner.length === 0) {
+      names.push(String(ns));
+      continue;
+    }
+    for (const tool of inner) {
+      names.push(`${ns}.${tool?.name || tool?.type || 'tool'}`);
+    }
+  }
+  const sections = [
+    'tool: tool_search',
+    payload?.call_id ? `call_id: ${payload.call_id}` : null,
+    names.length ? `matched tools:\n${names.map(name => `- ${name}`).join('\n')}` : null,
+  ].filter(Boolean);
+  return sections.join('\n\n');
+}
+
+function mcpInvocationName(payload) {
+  const invocation = payload?.invocation || {};
+  const server = invocation.server || payload?.server || '';
+  const tool = invocation.tool || payload?.tool || payload?.name || '';
+  if (server && tool) return `${server}.${tool}`;
+  return tool || server || 'MCP tool';
+}
+
+function mcpToolCallBody(payload) {
+  const invocation = payload?.invocation || {};
+  const sections = [
+    `tool: ${mcpInvocationName(payload)}`,
+    payload?.call_id ? `call_id: ${payload.call_id}` : null,
+    invocation.arguments ? `arguments:\n${prettyJsonString(invocation.arguments)}` : null,
+  ].filter(Boolean);
+  return sections.join('\n\n');
+}
+
+function mcpToolResultBody(payload) {
+  const result = payload?.result;
+  const ok = result?.Ok ?? result?.ok ?? result;
+  const structured = ok?.structuredContent || ok?.structured_content || null;
+  const content = Array.isArray(ok?.content)
+    ? ok.content.map(part => part?.text || part?.content || '').filter(Boolean).join('\n\n')
+    : '';
+  const duration = payload?.duration && typeof payload.duration === 'object'
+    ? `${payload.duration.secs || 0}.${String(payload.duration.nanos || 0).padStart(9, '0')}s`
+    : '';
+  const sections = [
+    `tool: ${mcpInvocationName(payload)}`,
+    payload?.call_id ? `call_id: ${payload.call_id}` : null,
+    duration ? `duration: ${duration}` : null,
+    structured ? `structuredContent:\n${prettyJsonString(structured)}` : null,
+    content ? `content:\n${content}` : null,
+    !structured && !content && result ? `result:\n${prettyJsonString(result)}` : null,
+  ].filter(Boolean);
+  return sections.join('\n\n');
+}
+
 function toolBlock(payload, { title, status = 'completed', type = 'tool_call', collapsed, content: contentOverride } = {}) {
   const isOutput = payload?.type === 'function_call_output'
     || payload?.type === 'local_shell_call_output'
@@ -343,6 +436,17 @@ function toolBlock(payload, { title, status = 'completed', type = 'tool_call', c
     ...toolCommandDetails(payload),
   };
   if (collapsed != null) block.collapsed = collapsed;
+  return block;
+}
+
+function promptBlock({ title, content, status = null, collapsed = false }) {
+  const block = {
+    type: 'prompt',
+    title,
+    content: String(content || ''),
+    collapsed,
+  };
+  if (status) block.status = status;
   return block;
 }
 
@@ -502,6 +606,7 @@ function createParseState(filePath) {
     pendingToolCalls: new Map(),
     latestPlan: null,
     activeGoal: null,
+    lastGoalTranscriptKey: '',
     taskStartedAt: 0,
     taskCompletedAt: 0,
     lastEventAt: 0,
@@ -603,6 +708,32 @@ function applyEntryToState(state, entry) {
       const title = knownCall?.name ? `Tool result: ${knownCall.name}` : 'Tool result';
       const block = toolBlock(payload, { title, status: payload.status || 'completed', collapsed: false, content: toolResultBody(payload, knownCall) });
       pushDedup(state.messages, { role: 'assistant', content: functionOutputText(payload, knownCall), content_blocks: [block], ts });
+    } else if (payload.type === 'web_search_call') {
+      const block = toolBlock(payload, {
+        title: 'Tool: web_search',
+        status: payload.status || 'running',
+        collapsed: false,
+        content: webSearchBody(payload),
+      });
+      pushDedup(state.messages, { role: 'assistant', content: '[Tool: web_search]', content_blocks: [block], ts });
+    } else if (payload.type === 'tool_search_call') {
+      rememberToolCall(state, { ...payload, name: 'tool_search', arguments: payload.arguments || {} }, tsMs);
+      const block = toolBlock(payload, {
+        title: 'Tool: tool_search',
+        status: payload.status || 'running',
+        collapsed: false,
+        content: toolSearchCallBody(payload),
+      });
+      pushDedup(state.messages, { role: 'assistant', content: '[Tool: tool_search]', content_blocks: [block], ts });
+    } else if (payload.type === 'tool_search_output') {
+      if (payload?.call_id) state.pendingToolCalls.delete(String(payload.call_id));
+      const block = toolBlock(payload, {
+        title: 'Tool result: tool_search',
+        status: payload.status || 'completed',
+        collapsed: false,
+        content: toolSearchOutputBody(payload),
+      });
+      pushDedup(state.messages, { role: 'assistant', content: '[Tool result: tool_search]', content_blocks: [block], ts });
     }
     return;
   }
@@ -632,10 +763,56 @@ function applyEntryToState(state, entry) {
       pushDedup(state.messages, { role: 'assistant', content: 'Patch applied', content_blocks: [block], ts });
     } else if (payload.type === 'mcp_tool_call_end') {
       if (payload?.call_id) state.pendingToolCalls.delete(String(payload.call_id));
-      const block = toolBlock(payload, { title: payload.tool || payload.name || 'MCP tool', status: payload.status || 'completed' });
-      pushDedup(state.messages, { role: 'assistant', content: functionOutputText(payload), content_blocks: [block], ts });
+      const name = mcpInvocationName(payload);
+      const block = toolBlock(payload, {
+        title: `Tool result: ${name}`,
+        status: payload.status || 'completed',
+        collapsed: false,
+        content: [mcpToolCallBody(payload), mcpToolResultBody(payload)].filter(Boolean).join('\n\n'),
+      });
+      pushDedup(state.messages, { role: 'assistant', content: `[Tool result: ${name}]`, content_blocks: [block], ts });
+    } else if (payload.type === 'agent_reasoning') {
+      const text = payload.text || payload.message || '';
+      if (text) {
+        state.lastReasoningAt = tsMs || state.lastReasoningAt;
+        pushDedup(state.messages, {
+          role: 'assistant',
+          content: 'Reasoning',
+          content_blocks: [{ type: 'thinking', title: 'Reasoning', content: text, collapsed: true }],
+          ts,
+        });
+      }
+    } else if (payload.type === 'web_search_end') {
+      if (payload?.call_id) state.pendingToolCalls.delete(String(payload.call_id));
+      const block = toolBlock(payload, {
+        title: 'Tool result: web_search',
+        status: payload.status || 'completed',
+        collapsed: false,
+        content: webSearchBody(payload),
+      });
+      pushDedup(state.messages, { role: 'assistant', content: '[Tool result: web_search]', content_blocks: [block], ts });
     } else if (payload.type === 'thread_goal_updated') {
-      state.activeGoal = normalizeThreadGoal(payload, tsMs) || state.activeGoal;
+      const goal = normalizeThreadGoal(payload, tsMs);
+      state.activeGoal = goal || state.activeGoal;
+      if (goal?.objective) {
+        const key = `${goal.objective}\n${goal.status}`;
+        if (key !== state.lastGoalTranscriptKey) {
+          state.lastGoalTranscriptKey = key;
+          const content = [
+            `Status: ${goal.status}`,
+            '',
+            goal.objective,
+            goal.timeUsedSeconds ? `\nTime used: ${goal.timeUsedSeconds}s` : '',
+            goal.tokensUsed ? `Tokens used: ${goal.tokensUsed}` : '',
+          ].filter(part => part !== '').join('\n');
+          pushDedup(state.messages, {
+            role: 'assistant',
+            content: `[Goal updated]\n\n${content}`,
+            content_blocks: [promptBlock({ title: 'Goal updated', content, status: goal.status, collapsed: false })],
+            ts,
+          });
+        }
+      }
     } else if (payload.type === 'task_started') {
       state.taskStartedAt = eventTimeMsFromUnixSeconds(payload.started_at, tsMs) || state.taskStartedAt;
     } else if (payload.type === 'task_complete') {
@@ -645,6 +822,14 @@ function applyEntryToState(state, entry) {
       state.taskCompletedAt = tsMs || state.taskCompletedAt;
       state.pendingToolCalls.clear();
       pushDedup(state.messages, { role: 'assistant', content: '[Turn aborted]', ts });
+    } else if (payload.type === 'context_compacted') {
+      const content = payload.message || payload.text || 'Conversation context compacted.';
+      pushDedup(state.messages, {
+        role: 'assistant',
+        content: `[Context compacted]\n\n${content}`,
+        content_blocks: [promptBlock({ title: 'Context compacted', content, collapsed: false })],
+        ts,
+      });
     }
   }
 }
@@ -962,7 +1147,7 @@ function readLightweightSessionSummary(filePath, stat) {
     model_id: meta.model || meta.model_slug || 'default',
     effort: 'medium',
     permission_mode: 'workspace-write',
-    updatedAt: index?.updated_at || stat.mtime.toISOString(),
+    updatedAt: latestIso(index?.updated_at, stat.mtime),
     sizeBytes: stat.size,
   };
 }
@@ -1109,7 +1294,7 @@ function readSessionSummary(filePath, { includeMessages = true, maxHydrateBytes 
     model_id: state.model_id || meta.model || meta.model_slug || 'default',
     effort: state.effort || 'medium',
     permission_mode: state.permission_mode || 'workspace-write',
-    updatedAt: index?.updated_at || stat.mtime.toISOString(),
+    updatedAt: latestIso(index?.updated_at, stat.mtime),
     sizeBytes: stat.size,
     activity: buildCodexCliActivity(state),
   };

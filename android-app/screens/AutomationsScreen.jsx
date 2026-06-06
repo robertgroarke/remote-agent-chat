@@ -63,6 +63,7 @@ const AGENT_CONFIG = {
   'claude-desktop':  { name: 'Claude Desktop',  color: '#cc785c', abbr: 'CD' },
   codex:             { name: 'Codex',            color: '#10a37f', abbr: 'CX' },
   'codex-desktop':   { name: 'Codex Desktop',   color: '#10a37f', abbr: 'CX' },
+  cursor:            { name: 'Cursor',          color: '#7AA2F7', abbr: 'CR' },
   gemini:            { name: 'Gemini',           color: '#4285f4', abbr: 'GC' },
   antigravity:       { name: 'Antigravity',      color: '#a855f7', abbr: 'AG' },
   antigravity_panel: { name: 'Antigravity Chat', color: '#a855f7', abbr: 'AC' },

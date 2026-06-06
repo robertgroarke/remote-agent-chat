@@ -61,6 +61,67 @@ function parseMaybeJson(value, fallback) {
   }
 }
 
+function messageText(message) {
+  if (!message) return '';
+  if (typeof message.content === 'string') return message.content;
+  if (Array.isArray(message.content_blocks)) {
+    return message.content_blocks.map((block) => {
+      if (!block) return '';
+      if (typeof block === 'string') return block;
+      return block.content || block.text || block.markdown || block.title || block.label || '';
+    }).filter(Boolean).join('\n\n');
+  }
+  return String(message.content || '');
+}
+
+function findSuspiciousCodexToolBlocks(messages) {
+  if (!Array.isArray(messages)) return [];
+  const suspects = [];
+  const blockRe = /\[(Bash|Edit) ([^\]\n]*(?:\d+\s+commands?|files?)[^\]\n]*)\]\n([\s\S]*?)\n?\[end\]/gi;
+  for (let i = 0; i < messages.length; i++) {
+    const text = messageText(messages[i]);
+    blockRe.lastIndex = 0;
+    let match;
+    while ((match = blockRe.exec(text))) {
+      const body = String(match[3] || '').trim();
+      const markerHits = (body.match(/\b(?:Sent as goal|Context automatically compacted|Worked for|Working for)\b/g) || []).length;
+      const emptyMultiCommand = /Bash/i.test(match[1]) && /^\d+\s+commands?\b/i.test(String(match[2] || '').trim()) && body.length === 0;
+      if (body.length > 20000 || markerHits >= 3 || emptyMultiCommand) {
+        suspects.push({
+          message_index: i,
+          role: messages[i].role || '',
+          header: `[${match[1]} ${match[2]}]`,
+          body_length: body.length,
+          marker_hits: markerHits,
+          empty_multi_command: emptyMultiCommand,
+          preview: truncate(body, 220),
+        });
+      }
+    }
+  }
+  return suspects;
+}
+
+async function readCodexDesktopVisualUnitStats(Runtime) {
+  try {
+    const result = await Runtime.evaluate({
+      expression: `(() => {
+        const units = Array.from(document.querySelectorAll('[data-content-search-unit-key]'));
+        const turns = new Set();
+        for (const unit of units) {
+          const turn = unit.closest('[data-testid*="conversation-turn"], [data-turn-id], [class*="turn"], article, section') || unit.parentElement;
+          if (turn) turns.add(turn);
+        }
+        return { units: units.length, turns: turns.size };
+      })()`,
+      returnByValue: true,
+    });
+    return result?.result?.value || { units: 0, turns: 0 };
+  } catch (_) {
+    return { units: 0, turns: 0 };
+  }
+}
+
 function createReporter(options) {
   const results = [];
   const summary = { pass: 0, fail: 0, skip_precondition: 0 };
@@ -276,6 +337,34 @@ async function runCodexDesktopSuite(targets, reporter) {
       expected: 'array',
       native_evidence: Array.isArray(messages) && messages.length > 0 ? { last_message: truncate(messages[messages.length - 1].content || '', 220) } : null,
       investigation_hint: 'Check readCodexMessages in selectors.js',
+    });
+
+    const visualUnitStats = await readCodexDesktopVisualUnitStats(Runtime);
+    const visualUnitCount = Number(visualUnitStats.units || 0);
+    const messageCount = Array.isArray(messages) ? messages.length : 0;
+    const segmentationOk = visualUnitCount < 40 || messageCount >= Math.max(20, Math.floor(visualUnitCount * 0.5));
+    reporter.add({
+      surface,
+      test_id: 'codex-desktop.messages.visual-unit-segmentation',
+      status: segmentationOk ? STATUS_PASS : STATUS_FAIL,
+      detail: segmentationOk
+        ? `Selector preserves visual units (${messageCount} messages from ${visualUnitCount} native units)`
+        : `Selector collapsed too many native units (${messageCount} messages from ${visualUnitCount} native units)`,
+      actual: { messages: messageCount, ...visualUnitStats },
+      expected: 'Large Codex Desktop transcripts should not be collapsed into a handful of giant assistant messages',
+      investigation_hint: 'Keep Codex Desktop native assistant/tool units as separate WebUI messages so the chat stays visually faithful',
+    });
+
+    const suspiciousToolBlocks = findSuspiciousCodexToolBlocks(messages);
+    reporter.add({
+      surface,
+      test_id: 'codex-desktop.messages.richness',
+      status: suspiciousToolBlocks.length === 0 ? STATUS_PASS : STATUS_FAIL,
+      detail: suspiciousToolBlocks.length === 0
+        ? 'No oversized/cross-turn collapsed tool bodies detected'
+        : 'Detected ' + suspiciousToolBlocks.length + ' suspicious collapsed tool bodies',
+      native_evidence: suspiciousToolBlocks.slice(0, 3),
+      investigation_hint: 'Collapsed Codex Desktop tool cards should not cache broad ancestor text as command output',
     });
 
     const thinking = await selectors.detectThinking(Runtime, 'codex-desktop');
@@ -556,6 +645,20 @@ async function runIframeSurfaceSuite(targets, reporter, surface, targetOverride 
       actual: Array.isArray(messages) ? messages.length : null,
       investigation_hint: 'Check readMessages dispatch and ' + surface + ' message selectors',
     });
+
+    if (surface === 'codex') {
+      const suspiciousToolBlocks = findSuspiciousCodexToolBlocks(messages);
+      reporter.add({
+        surface,
+        test_id: testPrefix + '.messages.richness',
+        status: suspiciousToolBlocks.length === 0 ? STATUS_PASS : STATUS_FAIL,
+        detail: suspiciousToolBlocks.length === 0
+          ? 'No oversized/cross-turn collapsed tool bodies detected'
+          : 'Detected ' + suspiciousToolBlocks.length + ' suspicious collapsed tool bodies',
+        native_evidence: suspiciousToolBlocks.slice(0, 3),
+        investigation_hint: 'Collapsed Codex side-pane tool cards should not cache broad ancestor text as command output',
+      });
+    }
 
     const thinking = await selectors.detectThinking(Runtime, expectedType);
     reporter.add({

@@ -203,16 +203,61 @@ class ProxyRestartLock:
         except Exception as e:
             print(f"[proxy_restart_lock] Warning: could not kill PID {pid}: {e}")
 
+    @staticmethod
+    def _kill_proxy_launcher():
+        """Stop restart-proxy.bat cmd wrappers so proxy.log handles are released."""
+        ps = (
+            "Get-CimInstance Win32_Process -Filter \"Name='cmd.exe'\" | "
+            "Where-Object { $_.CommandLine -match 'restart-proxy\\.bat' } | "
+            "ForEach-Object { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }"
+        )
+        subprocess.run(
+            ["powershell", "-NoProfile", "-Command", ps],
+            capture_output=True,
+            timeout=20,
+            creationflags=_NO_WINDOW,
+        )
+
+    @staticmethod
+    def _start_proxy_launcher():
+        bat = Path(__file__).parent / "restart-proxy.bat"
+        if not bat.is_file():
+            return
+        os.startfile(str(bat))
+
     def kill_proxy(self):
-        """Kill all node.exe processes connected to the relay."""
+        """Kill proxy launcher + node relay workers, truncate logs, relaunch if needed."""
+        self._kill_proxy_launcher()
         pids = self._get_relay_pids()
         proxy_pids = [p for p in pids if self._is_node_pid(p)]
-        if not proxy_pids:
-            print("[proxy_restart_lock] No proxy processes found connected to relay.")
-            return
-        print(f"[proxy_restart_lock] Killing proxy PIDs: {proxy_pids}")
-        for pid in proxy_pids:
-            self._kill_pid(pid)
+        if proxy_pids:
+            print(f"[proxy_restart_lock] Killing proxy PIDs: {proxy_pids}")
+            for pid in proxy_pids:
+                self._kill_pid(pid)
+        else:
+            print("[proxy_restart_lock] No proxy node processes on relay.")
+        time.sleep(0.5)
+        self._truncate_proxy_logs()
+        self._start_proxy_launcher()
+
+    @staticmethod
+    def _truncate_proxy_logs():
+        """Truncate proxy.log / panel-discovery.log while launcher and node are stopped."""
+        root = Path(__file__).parent
+        for rel in ("proxy.log", "proxy-err.log", "agent-proxy/panel-discovery.log"):
+            path = root / rel
+            if not path.is_file():
+                continue
+            for attempt in range(8):
+                try:
+                    path.write_text("", encoding="utf-8")
+                    print(f"[proxy_restart_lock] Truncated {rel}")
+                    break
+                except OSError as e:
+                    if attempt < 7:
+                        time.sleep(0.4)
+                        continue
+                    print(f"[proxy_restart_lock] Warning: could not truncate {rel}: {e}")
 
     def wait_for_proxy_up(self):
         """
