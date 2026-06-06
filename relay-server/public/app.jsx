@@ -186,17 +186,38 @@ function normalizeContentBlocks(blocks) {
     });
 }
 
+function contentBlockText(block) {
+  if (!block || typeof block !== 'object') return '';
+  const terminalParts = [
+    block.workdir ? `cwd: ${block.workdir}` : null,
+    block.command ? `$ ${block.command}` : null,
+    block.stdout || null,
+    block.stderr ? `stderr:\n${block.stderr}` : null,
+    block.exit_code != null ? `exit code: ${block.exit_code}` : null,
+  ].filter(Boolean);
+  if (terminalParts.length) return terminalParts.join('\n\n');
+  if (Array.isArray(block.files) && block.files.length > 0) {
+    const files = block.files.map(file => [
+      file.path || file.file || '',
+      file.added != null ? `+${file.added}` : '',
+      file.removed != null ? `-${file.removed}` : '',
+    ].filter(Boolean).join(' ')).filter(Boolean).join('\n');
+    return [block.content || block.text || block.markdown || '', files].filter(Boolean).join('\n\n');
+  }
+  return block.content || block.text || block.markdown || block.title || block.label || '';
+}
+
 function hasVisibleMessage(msg) {
   if (!msg) return false;
   if (hasVisibleMessageContent(msg.content)) return true;
   return normalizeContentBlocks(msg.content_blocks).some(block =>
-    normalizeMessageContent(block.content || block.text || block.markdown || block.title || block.label).trim().length > 0
+    normalizeMessageContent(contentBlockText(block)).trim().length > 0
   );
 }
 
 function contentBlocksFallback(blocks) {
   return normalizeContentBlocks(blocks)
-    .map(block => normalizeMessageContent(block.content || block.text || block.markdown || block.title || block.label))
+    .map(block => normalizeMessageContent(contentBlockText(block)))
     .filter(Boolean)
     .join('\n\n');
 }
@@ -289,14 +310,18 @@ function ContentBlocks({ blocks, monospace, autoExpandLongCodeBlocks, onOpenPath
           );
         }
         if (type === 'file_changes') {
+          const open = explicitOpen(block);
           const stats = [
             block.files_changed != null ? `${block.files_changed} files` : null,
             block.additions != null ? `+${block.additions}` : null,
             block.deletions != null ? `-${block.deletions}` : null,
           ].filter(Boolean).join(' ');
           return (
-            <details key={index} className="content-block content-block-file-change">
-              <summary>{title || 'File changes'}{stats ? ` ${stats}` : ''}</summary>
+            <details key={index} className="content-block content-block-file-change" open={open ?? false}>
+              <summary>
+                <span>{title || 'File changes'}{stats ? ` ${stats}` : ''}</span>
+                {block.status && <span className={`content-block-status ${safeString(block.status).toLowerCase()}`}>{block.status}</span>}
+              </summary>
               {Array.isArray(block.files) && block.files.length > 0 && (
                 <div className="content-block-file-list">
                   {block.files.map((file, fileIndex) => (

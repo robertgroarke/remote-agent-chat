@@ -68,6 +68,22 @@ function messageText(message) {
     return message.content_blocks.map((block) => {
       if (!block) return '';
       if (typeof block === 'string') return block;
+      const terminalParts = [
+        block.workdir ? `cwd: ${block.workdir}` : '',
+        block.command ? `$ ${block.command}` : '',
+        block.stdout || '',
+        block.stderr ? `stderr:\n${block.stderr}` : '',
+        block.exit_code != null ? `exit code: ${block.exit_code}` : '',
+      ].filter(Boolean);
+      if (terminalParts.length > 0) return terminalParts.join('\n\n');
+      if (Array.isArray(block.files) && block.files.length > 0) {
+        const files = block.files.map(file => [
+          file.path || file.file || '',
+          file.added != null ? `+${file.added}` : '',
+          file.removed != null ? `-${file.removed}` : '',
+        ].filter(Boolean).join(' ')).filter(Boolean).join('\n');
+        return [block.content || block.text || block.markdown || '', files].filter(Boolean).join('\n\n');
+      }
       return block.content || block.text || block.markdown || block.title || block.label || '';
     }).filter(Boolean).join('\n\n');
   }

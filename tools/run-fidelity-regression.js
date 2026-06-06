@@ -296,13 +296,42 @@ function normalizeContent(text) {
     .trim();
 }
 
+function contentBlockText(block) {
+  if (!block) return '';
+  if (typeof block === 'string') return block;
+  const terminalParts = [
+    block.workdir ? `cwd: ${block.workdir}` : '',
+    block.command ? `$ ${block.command}` : '',
+    block.stdout || '',
+    block.stderr ? `stderr:\n${block.stderr}` : '',
+    block.exit_code != null ? `exit code: ${block.exit_code}` : '',
+  ].filter(Boolean);
+  if (terminalParts.length > 0) return terminalParts.join('\n\n');
+  if (Array.isArray(block.files) && block.files.length > 0) {
+    const files = block.files.map(file => [
+      file.path || file.file || '',
+      file.added != null ? `+${file.added}` : '',
+      file.removed != null ? `-${file.removed}` : '',
+    ].filter(Boolean).join(' ')).filter(Boolean).join('\n');
+    return [block.content || block.text || block.markdown || '', files].filter(Boolean).join('\n\n');
+  }
+  return block.content || block.text || block.markdown || block.title || block.label || '';
+}
+
+function messageText(msg) {
+  if (Array.isArray(msg?.content_blocks) && msg.content_blocks.length > 0) {
+    return msg.content_blocks.map(contentBlockText).filter(Boolean).join('\n\n') || String(msg.content || '');
+  }
+  return String(msg?.content || '');
+}
+
 function normalizeMessages(messages, tail) {
   const list = Array.isArray(messages) ? messages : [];
   const sliced = tail ? list.slice(-tail) : list.slice();
   return sliced
     .map((msg) => {
       const role = String(msg.role || '').trim();
-      let content = normalizeContent(msg.content || '');
+      let content = normalizeContent(messageText(msg));
       if (role === 'user') content = content.replace(/\s*\n+\s*/g, ' ');
       return { role, content };
     })
@@ -354,12 +383,15 @@ function messagesSoftMatch(left, right) {
   const b = right.content || '';
   if (a === b) return true;
   if (!a || !b) return false;
+  const normalizedA = a.replace(/\[Bash\s+/gi, '$ ').replace(/\]\s*\[end\]/g, ' ').replace(/\[end\]/g, ' ').replace(/\s+/g, ' ').trim();
+  const normalizedB = b.replace(/\[Bash\s+/gi, '$ ').replace(/\]\s*\[end\]/g, ' ').replace(/\[end\]/g, ' ').replace(/\s+/g, ' ').trim();
+  if (normalizedA === normalizedB) return true;
   const shorter = a.length <= b.length ? a : b;
   const longer = a.length > b.length ? a : b;
   if (shorter.length >= 80 && longer.startsWith(shorter)) return true;
-  const probeLen = Math.min(160, a.length, b.length);
+  const probeLen = Math.min(160, normalizedA.length, normalizedB.length);
   if (probeLen < 40) return false;
-  return a.substring(0, probeLen) === b.substring(0, probeLen);
+  return normalizedA.substring(0, probeLen) === normalizedB.substring(0, probeLen);
 }
 
 function findContiguousWindow(needleMessages, haystackMessages) {

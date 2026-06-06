@@ -4074,6 +4074,22 @@ class ProxyEngine extends EventEmitter {
       return msg.content_blocks.map(block => {
         if (!block) return '';
         if (typeof block === 'string') return block;
+        const terminalParts = [
+          block.workdir ? `cwd: ${block.workdir}` : '',
+          block.command ? `$ ${block.command}` : '',
+          block.stdout || '',
+          block.stderr ? `stderr:\n${block.stderr}` : '',
+          block.exit_code != null ? `exit code: ${block.exit_code}` : '',
+        ].filter(Boolean);
+        if (terminalParts.length > 0) return terminalParts.join('\n\n');
+        if (Array.isArray(block.files) && block.files.length > 0) {
+          const files = block.files.map(file => [
+            file.path || file.file || '',
+            file.added != null ? `+${file.added}` : '',
+            file.removed != null ? `-${file.removed}` : '',
+          ].filter(Boolean).join(' ')).filter(Boolean).join('\n');
+          return [block.content || block.text || block.markdown || '', files].filter(Boolean).join('\n\n');
+        }
         return block.content || block.text || block.markdown || block.title || block.label || '';
       }).filter(Boolean).join('\n\n') || String(msg?.content || '');
     }
@@ -4096,6 +4112,13 @@ class ProxyEngine extends EventEmitter {
     const right = this._messageContentText(b).replace(/\s+/g, ' ').trim();
     if (!left || !right) return left === right;
     if (left === right) return true;
+    if (
+      (a.agentType === 'codex' || b.agentType === 'codex' || a.agent_type === 'codex' || b.agent_type === 'codex')
+      || (Array.isArray(a.content_blocks) || Array.isArray(b.content_blocks))
+      || /\[[^\]\n]+][\s\S]*?\[end]/.test(left + right)
+    ) {
+      if (this._codexToolKeysSoftMatch(a, b)) return true;
+    }
     const probeLen = Math.min(160, left.length, right.length);
     if (probeLen < 40) return false;
     const leftProbe = left.substring(0, probeLen);
@@ -4297,6 +4320,7 @@ class ProxyEngine extends EventEmitter {
     const merged = acc.slice();
     let searchStart = 0;
     let matchedCount = 0;
+    let matchedUserCount = 0;
     let changed = false;
     let pending = [];
 
@@ -4322,9 +4346,17 @@ class ProxyEngine extends EventEmitter {
       }
       searchStart = matchIdx + 1;
       matchedCount++;
+      if (msg.role === 'user') matchedUserCount++;
     }
 
     if (matchedCount === 0) return { matched: false, changed: false, messages: acc };
+    if (dom.length >= 12) {
+      const requiredMatches = Math.max(2, Math.floor(dom.length * 0.08));
+      if (matchedCount < requiredMatches) return { matched: false, changed: false, messages: acc };
+      if (dom.some(msg => msg && msg.role === 'user') && matchedUserCount === 0) {
+        return { matched: false, changed: false, messages: acc };
+      }
+    }
 
     if (pending.length > 0) {
       merged.push(...pending);
@@ -4377,6 +4409,57 @@ class ProxyEngine extends EventEmitter {
     return blocks;
   }
 
+  _extractStructuredCodexToolBlocks(msg) {
+    const blocks = Array.isArray(msg?.content_blocks) ? msg.content_blocks : [];
+    return blocks.map(block => {
+      if (!block || typeof block !== 'object') return null;
+      if (block.command) {
+        return {
+          raw: null,
+          name: `Bash ${block.command}`,
+          body: [block.stdout || '', block.stderr || '', block.exit_code != null ? `exit code: ${block.exit_code}` : '']
+            .filter(Boolean)
+            .join('\n')
+            .trim(),
+        };
+      }
+      if (Array.isArray(block.files) && block.files.length > 0) {
+        const file = block.files.find(f => f && (f.path || f.file)) || {};
+        return {
+          raw: null,
+          name: `Edit ${file.path || file.file || ''}`.trim(),
+          body: this._messageContentText({ content_blocks: [block] }).trim(),
+        };
+      }
+      return null;
+    }).filter(Boolean);
+  }
+
+  _extractCodexToolBlocks(msg) {
+    return [
+      ...this._extractToolBlocks(this._messageContentText(msg)),
+      ...this._extractStructuredCodexToolBlocks(msg),
+    ];
+  }
+
+  _codexToolKeySet(msg) {
+    const keys = new Set();
+    for (const block of this._extractCodexToolBlocks(msg)) {
+      const key = this._codexToolKey(block);
+      if (key) keys.add(key);
+    }
+    return keys;
+  }
+
+  _codexToolKeysSoftMatch(leftMsg, rightMsg) {
+    const left = this._codexToolKeySet(leftMsg);
+    const right = this._codexToolKeySet(rightMsg);
+    if (left.size === 0 || right.size === 0) return false;
+    let overlap = 0;
+    for (const key of left) if (right.has(key)) overlap++;
+    return overlap >= Math.max(1, Math.min(left.size, right.size));
+  }
+
   _codexToolKey(block) {
     if (!block || !block.name) return '';
     const name = block.name.replace(/\s+/g, ' ').trim();
@@ -4413,8 +4496,8 @@ class ProxyEngine extends EventEmitter {
     const nextContent = this._messageContentText(nextMsg);
     if (!previousContent || !nextContent || previousContent === nextContent) return nextMsg;
 
-    const previousBlocks = this._extractToolBlocks(previousContent);
-    const nextBlocks = this._extractToolBlocks(nextContent);
+    const previousBlocks = this._extractCodexToolBlocks(previousMsg);
+    const nextBlocks = this._extractCodexToolBlocks(nextMsg);
     if (previousBlocks.length === 0 || nextBlocks.length === 0) return nextMsg;
 
     const previousByKey = new Map();
@@ -4430,7 +4513,7 @@ class ProxyEngine extends EventEmitter {
     for (const block of nextBlocks) {
       const key = this._codexToolKey(block);
       const previous = key ? previousByKey.get(key) : null;
-      if (!previous || !this._isRicherCodexToolBody(previous, block)) continue;
+      if (!previous || !block.raw || !this._isRicherCodexToolBody(previous, block)) continue;
       merged = merged.replace(block.raw, previous.raw);
       changed = true;
     }

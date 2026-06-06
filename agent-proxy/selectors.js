@@ -1527,6 +1527,8 @@ function buildClaudeReadExpr(userClass, userText, userTextAlt) {
       if (cls.includes('copyButton') || cls.includes('iconButton') || cls.includes('actionButton')) return '';
       // Skip permission request containers (they have their own detection flow)
       if (cls.includes('permissionRequest')) return '';
+      // Claude thinking cards render as their own structured block.
+      if (cls.includes('thinking_') || cls.includes('thinkingV2_') || cls.includes('thinkingSummary_')) return '';
       // Skip keyboard hints and shortcut indicators
       if (cls.includes('keyboardHints') || cls.includes('shortcutNum')) return '';
       if (tag === 'DETAILS') {
@@ -1540,84 +1542,9 @@ function buildClaudeReadExpr(userClass, userText, userTextAlt) {
         return contentParts ? label + contentParts + '\\n[end]\\n' : label + '[end]\\n';
       }
       if (tag === 'SUMMARY') return '';
-      // Handle tool use containers — format as structured [Tool Name]\\n...\\n[end]
+      // Claude tool cards are emitted as structured content blocks below.
       if (cls.includes('toolUse_')) {
-        var nameEl = node.querySelector('[class*="toolNameText_"]');
-        var descEl = node.querySelector('[class*="toolNameTextSecondary"]');
-        var toolName = nameEl ? nameEl.textContent.trim() : 'Tool';
-        var toolDesc = descEl ? descEl.textContent.trim() : '';
-        var header = toolName + (toolDesc ? ' ' + toolDesc : '');
-        // Check for Monaco diff editor (Edit tool blocks)
-        var diffWrapper = node.querySelector('[class*="diffEditorWrapper_"]');
-        if (diffWrapper) {
-          var secondaryEl = node.querySelector('[class*="secondaryLine_"]');
-          var summary = secondaryEl ? secondaryEl.textContent.trim() : '';
-          var diffEditor = diffWrapper.querySelector('.monaco-diff-editor');
-          var body = summary + '\\n';
-          if (diffEditor) {
-            var origEditor = diffEditor.querySelector('.editor.original');
-            var modEditor = diffEditor.querySelector('.editor.modified');
-            function getViewLineTexts(editor) {
-              if (!editor) return [];
-              return Array.from(editor.querySelectorAll('.view-line')).map(function(l) { return l.textContent; });
-            }
-            var origLines = getViewLineTexts(origEditor);
-            var modLines = getViewLineTexts(modEditor);
-            // Build a simple unified diff
-            if (origLines.length > 0 || modLines.length > 0) {
-              body += fence + 'diff\\n';
-              // Find common prefix/suffix to show only changed region
-              var maxOrig = origLines.length, maxMod = modLines.length;
-              var prefixLen = 0;
-              while (prefixLen < maxOrig && prefixLen < maxMod && origLines[prefixLen] === modLines[prefixLen]) prefixLen++;
-              var suffixLen = 0;
-              while (suffixLen < (maxOrig - prefixLen) && suffixLen < (maxMod - prefixLen) && origLines[maxOrig - 1 - suffixLen] === modLines[maxMod - 1 - suffixLen]) suffixLen++;
-              // Show context lines around changes
-              var ctxStart = Math.max(0, prefixLen - 2);
-              var ctxEndOrig = Math.min(maxOrig, maxOrig - suffixLen + 2);
-              var ctxEndMod = Math.min(maxMod, maxMod - suffixLen + 2);
-              for (var li = ctxStart; li < ctxEndOrig || li < ctxEndMod; li++) {
-                var inSharedPrefix = li < prefixLen;
-                var inSharedSuffix = li >= (maxOrig - suffixLen) && li >= (maxMod - suffixLen);
-                if (inSharedPrefix || inSharedSuffix) {
-                  // Context line (same in both)
-                  if (li < maxMod) body += ' ' + modLines[li] + '\\n';
-                } else {
-                  if (li < maxOrig - suffixLen && li < maxOrig) body += '-' + origLines[li] + '\\n';
-                  if (li < maxMod - suffixLen && li < maxMod) body += '+' + modLines[li] + '\\n';
-                }
-              }
-              body += fence + '\\n';
-            }
-          }
-          return '\\n[' + header + ']\\n' + body + '[end]\\n';
-        }
-        // Extract IN/OUT rows
-        var rows = node.querySelectorAll('[class*="toolBodyRow_"]');
-        var body = '';
-        rows.forEach(function(row) {
-          var labelEl = row.querySelector('[class*="toolBodyRowLabel_"]');
-          var contentEl = row.querySelector('[class*="toolBodyRowContent_"]');
-          var rowLabel = labelEl ? labelEl.textContent.trim() : '';
-          var rowContent = contentEl ? contentEl.textContent.trim() : '';
-          if (rowLabel && rowContent) {
-            body += rowLabel + '\\n' + rowContent + '\\n';
-          }
-        });
-        if (!body) {
-          var bodyEl = node.querySelector('[class*="toolBody_"]');
-          if (bodyEl) {
-            var monacoEditor = bodyEl.querySelector('.monaco-editor:not(.original-in-monaco-diff-editor):not(.modified-in-monaco-diff-editor)');
-            if (monacoEditor) {
-              var lines = Array.from(monacoEditor.querySelectorAll('.view-line')).map(function(l) { return l.textContent; });
-              body = compactToolBody(header, lines.join('\\n'));
-            } else if (!bodyEl.querySelector('.monaco-diff-editor')) {
-              body = compactToolBody(header, bodyEl.textContent);
-            }
-          }
-        }
-        if (!body) return '\\n[' + header + ']\\n[end]\\n';
-        return '\\n[' + header + ']\\n' + body + '[end]\\n';
+        return '';
       }
       if (tag === 'PRE') {
         var codeEl = node.querySelector('code');
@@ -1633,6 +1560,115 @@ function buildClaudeReadExpr(userClass, userText, userTextAlt) {
       return inner;
     }
 
+    function firstText(root, selector) {
+      var el = root.querySelector(selector);
+      return el ? String(el.textContent || '').replace(/\\s+/g, ' ').trim() : '';
+    }
+
+    function toolStatus(header, body, secondary) {
+      var text = [header, body, secondary].join('\\n');
+      if (/\\b(failed|error|cancelled|canceled)\\b/i.test(text)) return 'failed';
+      if (/\\b(running|working|in progress)\\b/i.test(text)) return 'running';
+      return 'completed';
+    }
+
+    function claudeToolBlock(node) {
+      var nameEl = node.querySelector('[class*="toolNameText_"]');
+      var descEl = node.querySelector('[class*="toolNameTextSecondary"]');
+      var plainDescEl = node.querySelector('[class*="toolNameTextSecondaryPlaintext"]');
+      var toolName = nameEl ? nameEl.textContent.trim() : 'Tool';
+      var toolDesc = plainDescEl ? plainDescEl.textContent.trim() : (descEl ? descEl.textContent.trim() : '');
+      var header = (toolName + (toolDesc ? ' ' + toolDesc : '')).replace(/\\s+/g, ' ').trim() || 'Tool';
+      var secondary = firstText(node, '[class*="secondaryLine_"]');
+      var body = '';
+
+      var diffWrapper = node.querySelector('[class*="diffEditorWrapper_"]');
+      if (diffWrapper) {
+        body = secondary ? secondary + '\\n' : '';
+        var diffEditor = diffWrapper.querySelector('.monaco-diff-editor');
+        if (diffEditor) {
+          var origEditor = diffEditor.querySelector('.editor.original');
+          var modEditor = diffEditor.querySelector('.editor.modified');
+          function getViewLineTexts(editor) {
+            if (!editor) return [];
+            return Array.from(editor.querySelectorAll('.view-line')).map(function(l) { return l.textContent; });
+          }
+          var origLines = getViewLineTexts(origEditor);
+          var modLines = getViewLineTexts(modEditor);
+          if (origLines.length > 0 || modLines.length > 0) {
+            body += fence + 'diff\\n';
+            var maxOrig = origLines.length, maxMod = modLines.length;
+            var prefixLen = 0;
+            while (prefixLen < maxOrig && prefixLen < maxMod && origLines[prefixLen] === modLines[prefixLen]) prefixLen++;
+            var suffixLen = 0;
+            while (suffixLen < (maxOrig - prefixLen) && suffixLen < (maxMod - prefixLen) && origLines[maxOrig - 1 - suffixLen] === modLines[maxMod - 1 - suffixLen]) suffixLen++;
+            var ctxStart = Math.max(0, prefixLen - 2);
+            var ctxEndOrig = Math.min(maxOrig, maxOrig - suffixLen + 2);
+            var ctxEndMod = Math.min(maxMod, maxMod - suffixLen + 2);
+            for (var li = ctxStart; li < ctxEndOrig || li < ctxEndMod; li++) {
+              var inSharedPrefix = li < prefixLen;
+              var inSharedSuffix = li >= (maxOrig - suffixLen) && li >= (maxMod - suffixLen);
+              if (inSharedPrefix || inSharedSuffix) {
+                if (li < maxMod) body += ' ' + modLines[li] + '\\n';
+              } else {
+                if (li < maxOrig - suffixLen && li < maxOrig) body += '-' + origLines[li] + '\\n';
+                if (li < maxMod - suffixLen && li < maxMod) body += '+' + modLines[li] + '\\n';
+              }
+            }
+            body += fence + '\\n';
+          }
+        }
+        return {
+          type: 'file_changes',
+          title: header,
+          content: compactToolBody(header, body || node.textContent),
+          status: toolStatus(header, body, secondary),
+          collapsed: false,
+        };
+      }
+
+      var rows = node.querySelectorAll('[class*="toolBodyRow_"]');
+      rows.forEach(function(row) {
+        var labelEl = row.querySelector('[class*="toolBodyRowLabel_"]');
+        var contentEl = row.querySelector('[class*="toolBodyRowContent_"]');
+        var rowLabel = labelEl ? labelEl.textContent.trim() : '';
+        var rowContent = contentEl ? contentEl.textContent.trim() : '';
+        if (rowLabel && rowContent) body += rowLabel + '\\n' + rowContent + '\\n';
+      });
+      if (!body) {
+        var bodyEl = node.querySelector('[class*="toolBody_"]');
+        if (bodyEl) {
+          var monacoEditor = bodyEl.querySelector('.monaco-editor:not(.original-in-monaco-diff-editor):not(.modified-in-monaco-diff-editor)');
+          if (monacoEditor) {
+            var lines = Array.from(monacoEditor.querySelectorAll('.view-line')).map(function(l) { return l.textContent; });
+            body = compactToolBody(header, lines.join('\\n'));
+          } else if (!bodyEl.querySelector('.monaco-diff-editor')) {
+            body = compactToolBody(header, bodyEl.textContent);
+          }
+        }
+      }
+      if (!body && secondary) body = secondary;
+
+      return {
+        type: 'tool_call',
+        title: header,
+        content: compactToolBody(header, body),
+        status: toolStatus(header, body, secondary),
+        collapsed: !body || (!!secondary && !node.querySelector('[class*="toolBody_"]')),
+      };
+    }
+
+    function claudeThinkingBlock(node) {
+      var label = firstText(node, '[class*="thinkingSummary_"]') || 'Thinking';
+      var text = nodeToText(node).trim();
+      return {
+        type: 'thinking',
+        title: label,
+        content: text && text !== label ? text : '',
+        collapsed: true,
+      };
+    }
+
     const msgs = [];
     const els = d.querySelectorAll('.message_07S1Yg');
     els.forEach(function(el) {
@@ -1643,8 +1679,36 @@ function buildClaudeReadExpr(userClass, userText, userTextAlt) {
         const textEl = el.querySelector('${userTextSel}');
         if (textEl) msgs.push({ role: 'user', content: textEl.textContent.trim() });
       } else if (isAssistant) {
+        var blocks = [];
+        Array.from(el.querySelectorAll('[class*="thinking_"]')).forEach(function(thinkingEl) {
+          if (!thinkingEl.closest('[class*="toolUse_"]')) blocks.push(claudeThinkingBlock(thinkingEl));
+        });
+        Array.from(el.querySelectorAll('[class*="toolUse_"]')).forEach(function(toolEl) {
+          blocks.push(claudeToolBlock(toolEl));
+        });
         const text = nodeToText(el).trim();
-        if (text) msgs.push({ role: 'assistant', content: text });
+        if (blocks.length > 0) {
+          var filtered = [];
+          if (text) filtered.push({ type: 'markdown', content: text });
+          blocks.forEach(function(block) {
+            var sig = [
+              block.type || '',
+              block.title || block.label || '',
+              block.content || '',
+            ].join('\\n').trim();
+            if (!sig) return;
+            filtered.push(block);
+          });
+          if (filtered.length > 0) {
+            msgs.push({
+              role: 'assistant',
+              content: text || filtered.map(function(b) { return b.content || b.title || b.label || ''; }).join('\\n\\n'),
+              content_blocks: filtered,
+            });
+          }
+        } else if (text) {
+          msgs.push({ role: 'assistant', content: text });
+        }
       }
     });
     return JSON.stringify(msgs);
