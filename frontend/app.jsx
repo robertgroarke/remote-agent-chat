@@ -317,7 +317,7 @@ function ContentBlocks({ blocks, monospace, autoExpandLongCodeBlocks, onOpenPath
             block.deletions != null ? `-${block.deletions}` : null,
           ].filter(Boolean).join(' ');
           return (
-            <details key={index} className="content-block content-block-file-change" open={open ?? false}>
+            <details key={index} className="content-block content-block-file-change" open={open ?? isCodexCli}>
               <summary>
                 <span>{title || 'File changes'}{stats ? ` ${stats}` : ''}</span>
                 {block.status && <span className={`content-block-status ${safeString(block.status).toLowerCase()}`}>{block.status}</span>}
@@ -2233,6 +2233,13 @@ function AgentSettingsPanel({ session, config, onRequestRefresh, onSetModel, onS
               <span className={`settings-value${permMode === 'unknown' ? ' dim' : ''}`}>{permMode}</span>
             )}
             {permOk && <span className="settings-inline-ok">{permOk}</span>}
+          </div>
+        )}
+
+        {agentType === 'codex_cli' && config?.approval_policy && (
+          <div className="settings-row">
+            <span className="settings-label">Approval policy</span>
+            <span className="settings-value">{config.approval_policy}</span>
           </div>
         )}
 

@@ -60,13 +60,16 @@ const now = Date.now();
 const iso = deltaMs => new Date(now + deltaMs).toISOString();
 fs.writeFileSync(liveLikeFixture, [
   { timestamp: iso(-300000), type: 'session_meta', payload: { id: '00000000-0000-4000-8000-000000000099', cwd: process.cwd(), model: 'gpt-5.5' } },
+  { timestamp: iso(-299000), type: 'turn_context', payload: { cwd: process.cwd(), model: 'gpt-5.5', effort: 'high', sandbox_policy: { type: 'danger-full-access' }, approval_policy: 'never' } },
   { timestamp: iso(-295000), type: 'event_msg', payload: { type: 'task_started' } },
+  { timestamp: iso(-294500), type: 'event_msg', payload: { type: 'thread_name_updated', thread_name: 'Codex CLI fidelity smoke' } },
   { timestamp: iso(-294000), type: 'event_msg', payload: { type: 'thread_goal_updated', goal: { objective: 'Keep proving live Codex CLI fidelity', status: 'active', timeUsedSeconds: 58, tokensUsed: 1234, createdAt: Math.floor((now - 60000) / 1000), updatedAt: Math.floor((now - 1000) / 1000) } } },
   { timestamp: iso(-290000), type: 'response_item', payload: { type: 'message', role: 'user', content: [{ type: 'input_text', text: 'Live task' }] } },
   { timestamp: iso(-280000), type: 'response_item', payload: { type: 'function_call', name: 'update_plan', call_id: 'plan_live', arguments: '{"plan":[{"step":"Do live work","status":"in_progress"}]}' } },
   { timestamp: iso(-279000), type: 'response_item', payload: { type: 'function_call_output', call_id: 'plan_live', output: 'Plan updated' } },
   { timestamp: iso(-270000), type: 'response_item', payload: { type: 'function_call', name: 'shell_command', call_id: 'done_cmd', arguments: '{"command":"echo done"}' } },
   { timestamp: iso(-269000), type: 'response_item', payload: { type: 'function_call_output', call_id: 'done_cmd', output: 'Exit code: 0\nOutput:\ndone\n' } },
+  { timestamp: iso(-268000), type: 'event_msg', payload: { type: 'exec_command_end', command: ['powershell.exe', '-Command', 'Write-Output done'], cwd: process.cwd(), aggregated_output: 'done\n', exit_code: 0 } },
   { timestamp: iso(-260000), type: 'response_item', payload: { type: 'reasoning', summary: [] } },
   { timestamp: iso(-240000), type: 'event_msg', payload: { type: 'agent_reasoning', text: 'I am checking the live parser path.' } },
   { timestamp: iso(-230000), type: 'response_item', payload: { type: 'web_search_call', status: 'completed', action: { type: 'search', query: 'Remote Agent Chat Codex CLI fidelity' } } },
@@ -74,11 +77,27 @@ fs.writeFileSync(liveLikeFixture, [
   { timestamp: iso(-220000), type: 'response_item', payload: { type: 'tool_search_call', call_id: 'tool_search_live', status: 'completed', arguments: { query: 'browser automation', limit: 2 } } },
   { timestamp: iso(-219000), type: 'response_item', payload: { type: 'tool_search_output', call_id: 'tool_search_live', status: 'completed', tools: [{ name: 'codex_app', tools: [{ name: 'read_thread_terminal' }] }] } },
   { timestamp: iso(-210000), type: 'event_msg', payload: { type: 'mcp_tool_call_end', call_id: 'mcp_live', invocation: { server: 'codex_app', tool: 'read_thread_terminal', arguments: {} }, result: { Ok: { content: [{ type: 'text', text: 'terminal output' }], structuredContent: { ok: true } } } } },
+  { timestamp: iso(-205000), type: 'event_msg', payload: { type: 'view_image_tool_call', path: path.join(process.cwd(), 'screenshot.png') } },
+  { timestamp: iso(-202000), type: 'event_msg', payload: { type: 'patch_apply_end', success: true, stdout: 'Success. Updated the following files:\\nM agent-proxy/codex-cli.js\\n', changes: { [path.join(process.cwd(), 'agent-proxy', 'codex-cli.js')]: { type: 'update', unified_diff: '@@ -1 +1\\n-old\\n+new\\n' } } } },
+  { timestamp: iso(-201000), type: 'event_msg', payload: { type: 'error', message: 'Remote compact task failed', codex_error_info: 'other' } },
   { timestamp: iso(-200000), type: 'event_msg', payload: { type: 'context_compacted' } },
-  { timestamp: iso(-190000), type: 'event_msg', payload: { type: 'token_count' } },
+  { timestamp: iso(-195000), type: 'compacted', payload: { message: 'Replaced earlier context with a summary.' } },
+  { timestamp: iso(-190000), type: 'event_msg', payload: { type: 'token_count', info: { total_token_usage: { total_tokens: 42 } }, rate_limits: { primary: { used_percent: 12, resets_at: Math.floor((now + 600000) / 1000) }, secondary: { used_percent: 34, resets_at: Math.floor((now + 3600000) / 1000) }, rate_limit_reached_type: null } } },
 ].map(entry => JSON.stringify(entry)).join('\n') + '\n');
 const liveLikeSummary = codexCli.readSessionSummary(liveLikeFixture);
 assert(liveLikeSummary, 'expected live-like summary');
+assert.strictEqual(liveLikeSummary.title, 'Codex CLI fidelity smoke');
+assert.strictEqual(liveLikeSummary.effort, 'high');
+assert.strictEqual(liveLikeSummary.permission_mode, 'danger-full-access');
+assert.strictEqual(liveLikeSummary.approval_policy, 'never');
+assert.strictEqual(liveLikeSummary.percent_used, 34);
+assert.strictEqual(liveLikeSummary.rate_limit_active, false);
+assert.strictEqual(liveLikeSummary.token_usage.total_tokens, 42);
+const liveLikeLightweight = codexCli.readSessionSummary(liveLikeFixture, { includeMessages: false });
+assert.strictEqual(liveLikeLightweight.title, 'Codex CLI fidelity smoke');
+assert.strictEqual(liveLikeLightweight.effort, 'high');
+assert.strictEqual(liveLikeLightweight.permission_mode, 'danger-full-access');
+assert.strictEqual(liveLikeLightweight.approval_policy, 'never');
 assert.strictEqual(liveLikeSummary.activity.kind, 'generating');
 assert.strictEqual(liveLikeSummary.activity.label, 'Working');
 assert.strictEqual(liveLikeSummary.activity.thinkingContent, 'Do live work');
@@ -108,6 +127,13 @@ assert(liveLikeSummary.messages.some(msg => msg.content_blocks?.some(block =>
   && block.content.includes('ws_live')
 )), 'expected web_search_end to render as a tool result');
 assert(liveLikeSummary.messages.some(msg => msg.content_blocks?.some(block =>
+  block.type === 'terminal'
+  && block.command.includes('powershell.exe')
+  && block.command.includes('"Write-Output done"')
+  && block.workdir === process.cwd()
+  && block.stdout.includes('done')
+)), 'expected argv command and aggregated output terminal events to render faithfully');
+assert(liveLikeSummary.messages.some(msg => msg.content_blocks?.some(block =>
   block.type === 'tool_call'
   && block.title === 'Tool: tool_search'
   && block.content.includes('browser automation')
@@ -123,6 +149,22 @@ assert(liveLikeSummary.messages.some(msg => msg.content_blocks?.some(block =>
   && block.content.includes('structuredContent')
   && block.content.includes('terminal output')
 )), 'expected MCP tool result to include invocation and result body');
+assert(liveLikeSummary.messages.some(msg => msg.content_blocks?.some(block =>
+  block.type === 'artifact'
+  && block.title === 'Image viewed'
+  && block.content.includes('screenshot.png')
+)), 'expected viewed images to render into transcript blocks');
+assert(liveLikeSummary.messages.some(msg => msg.content_blocks?.some(block =>
+  block.type === 'file_changes'
+  && block.collapsed === false
+  && block.files?.[0]?.path.endsWith(path.join('agent-proxy', 'codex-cli.js'))
+  && block.content.includes('```diff')
+)), 'expected object-shaped patch changes to render as expanded file-change diffs');
+assert(liveLikeSummary.messages.some(msg => msg.content_blocks?.some(block =>
+  block.type === 'error'
+  && block.title === 'Error: other'
+  && block.content.includes('Remote compact task failed')
+)), 'expected Codex CLI error events to render explicitly');
 assert(liveLikeSummary.messages.some(msg => msg.content_blocks?.some(block =>
   block.type === 'prompt'
   && block.title === 'Context compacted'

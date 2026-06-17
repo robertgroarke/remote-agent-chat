@@ -1182,6 +1182,7 @@ function compactAgentConfigForAck(config) {
     'mode',
     'conversation_mode',
     'permission_mode',
+    'approval_policy',
     'file_access_scope',
     'branch',
     'effort',

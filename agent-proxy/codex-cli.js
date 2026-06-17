@@ -450,30 +450,87 @@ function promptBlock({ title, content, status = null, collapsed = false }) {
   return block;
 }
 
+function commandText(value) {
+  if (Array.isArray(value)) {
+    return value.map(part => {
+      const raw = String(part ?? '');
+      return /\s/.test(raw) ? `"${raw.replace(/"/g, '\\"')}"` : raw;
+    }).join(' ');
+  }
+  return String(value || '');
+}
+
 function execCommandBlock(payload) {
+  const command = commandText(payload?.command || payload?.cmd || '');
   return {
     type: 'terminal',
-    title: payload?.command ? 'Command' : 'Terminal output',
+    title: command ? 'Command' : 'Terminal output',
     collapsed: false,
-    command: payload?.command || '',
-    stdout: payload?.stdout || payload?.output || '',
+    command,
+    workdir: payload?.cwd || payload?.workdir || '',
+    stdout: payload?.stdout || payload?.output || payload?.aggregated_output || '',
     stderr: payload?.stderr || '',
     exit_code: payload?.exit_code ?? payload?.code ?? null,
   };
 }
 
 function patchBlock(payload) {
-  const changes = Array.isArray(payload?.changes) ? payload.changes : [];
+  const rawChanges = payload?.changes;
+  const changes = Array.isArray(rawChanges)
+    ? rawChanges
+    : (rawChanges && typeof rawChanges === 'object')
+      ? Object.entries(rawChanges).map(([filePath, change]) => ({
+        ...(change && typeof change === 'object' ? change : {}),
+        path: filePath,
+      }))
+      : [];
+  const files = changes.map(change => {
+    const diff = change.unified_diff || change.diff || change.patch || '';
+    const added = change.added ?? change.additions;
+    const removed = change.removed ?? change.deletions;
+    return {
+      path: change.path || change.file || 'file',
+      added,
+      removed,
+      type: change.type || change.status || undefined,
+      diff: diff || undefined,
+    };
+  });
+  const diffBody = files
+    .filter(file => file.diff)
+    .map(file => [
+      `### ${file.path}`,
+      '',
+      '```diff',
+      file.diff,
+      '```',
+    ].join('\n'))
+    .join('\n\n');
+  const output = payload?.stdout || payload?.aggregated_output || payload?.message || '';
   return {
     type: 'file_changes',
     title: 'Patch applied',
-    files_changed: changes.length || undefined,
-    files: changes.map(change => ({
-      path: change.path || change.file || 'file',
-      added: change.added ?? change.additions,
-      removed: change.removed ?? change.deletions,
-    })),
-    content: payload?.message || '',
+    status: payload?.success === false ? 'failed' : 'completed',
+    collapsed: false,
+    files_changed: files.length || undefined,
+    files,
+    content: [output, diffBody].filter(Boolean).join('\n\n'),
+  };
+}
+
+function compactedBlock(payload) {
+  const content = payload?.message || payload?.text || 'Conversation context compacted.';
+  return promptBlock({ title: 'Context compacted', content, collapsed: false });
+}
+
+function viewImageBlock(payload) {
+  const imagePath = payload?.path || payload?.file || payload?.image_path || '';
+  const content = imagePath ? `Viewed image:\n\n${imagePath}` : 'Viewed image.';
+  return {
+    type: 'artifact',
+    title: 'Image viewed',
+    content,
+    path: imagePath || undefined,
   };
 }
 
@@ -607,6 +664,12 @@ function createParseState(filePath) {
     latestPlan: null,
     activeGoal: null,
     lastGoalTranscriptKey: '',
+    threadName: '',
+    tokenUsage: null,
+    rateLimits: null,
+    percentUsed: null,
+    rateLimitActive: false,
+    rateLimitedUntil: null,
     taskStartedAt: 0,
     taskCompletedAt: 0,
     lastEventAt: 0,
@@ -617,6 +680,7 @@ function createParseState(filePath) {
     model_id: 'default',
     effort: 'medium',
     permission_mode: 'workspace-write',
+    approval_policy: null,
   };
 }
 
@@ -659,12 +723,23 @@ function applyEntryToState(state, entry) {
   }
   if (entry.type === 'turn_context' && payload) {
     if (payload.model) state.model_id = payload.model;
-    if (payload.reasoning_effort || payload.model_reasoning_effort) {
-      state.effort = payload.reasoning_effort || payload.model_reasoning_effort;
+    if (payload.effort || payload.reasoning_effort || payload.model_reasoning_effort) {
+      state.effort = payload.effort || payload.reasoning_effort || payload.model_reasoning_effort;
     }
-    if (payload.sandbox_mode || payload.sandbox_policy?.mode) {
-      state.permission_mode = payload.sandbox_mode || payload.sandbox_policy.mode;
+    if (payload.sandbox_mode || payload.sandbox_policy?.mode || payload.sandbox_policy?.type) {
+      state.permission_mode = payload.sandbox_mode || payload.sandbox_policy.mode || payload.sandbox_policy.type;
     }
+    if (payload.approval_policy) state.approval_policy = payload.approval_policy;
+    return;
+  }
+  if (entry.type === 'compacted') {
+    const block = compactedBlock(payload);
+    pushDedup(state.messages, {
+      role: 'assistant',
+      content: `[Context compacted]\n\n${block.content}`,
+      content_blocks: [block],
+      ts,
+    });
     return;
   }
   if (entry.type === 'response_item') {
@@ -813,6 +888,31 @@ function applyEntryToState(state, entry) {
           });
         }
       }
+    } else if (payload.type === 'thread_name_updated') {
+      if (payload.thread_name) state.threadName = String(payload.thread_name || '').trim();
+    } else if (payload.type === 'view_image_tool_call') {
+      const block = viewImageBlock(payload);
+      pushDedup(state.messages, {
+        role: 'assistant',
+        content: `[Image viewed]\n\n${block.content}`,
+        content_blocks: [block],
+        ts,
+      });
+    } else if (payload.type === 'token_count') {
+      state.tokenUsage = payload.info?.total_token_usage || payload.info?.last_token_usage || state.tokenUsage;
+      state.rateLimits = payload.rate_limits || state.rateLimits;
+      const primary = payload.rate_limits?.primary || null;
+      const secondary = payload.rate_limits?.secondary || null;
+      const primaryPct = Number(primary?.used_percent);
+      const secondaryPct = Number(secondary?.used_percent);
+      const pct = Math.max(
+        Number.isFinite(primaryPct) ? primaryPct : -1,
+        Number.isFinite(secondaryPct) ? secondaryPct : -1
+      );
+      if (pct >= 0) state.percentUsed = pct;
+      state.rateLimitActive = !!payload.rate_limits?.rate_limit_reached_type || pct >= 100;
+      const resetAt = primary?.resets_at || secondary?.resets_at;
+      state.rateLimitedUntil = state.rateLimitActive && resetAt ? isoFromMs(msFromUnixSeconds(resetAt)) : null;
     } else if (payload.type === 'task_started') {
       state.taskStartedAt = eventTimeMsFromUnixSeconds(payload.started_at, tsMs) || state.taskStartedAt;
     } else if (payload.type === 'task_complete') {
@@ -822,12 +922,25 @@ function applyEntryToState(state, entry) {
       state.taskCompletedAt = tsMs || state.taskCompletedAt;
       state.pendingToolCalls.clear();
       pushDedup(state.messages, { role: 'assistant', content: '[Turn aborted]', ts });
+    } else if (payload.type === 'error') {
+      const content = payload.message || payload.text || payload.error || 'Codex CLI reported an error.';
+      pushDedup(state.messages, {
+        role: 'assistant',
+        content: `[Error]\n\n${content}`,
+        content_blocks: [{
+          type: 'error',
+          title: payload.codex_error_info ? `Error: ${payload.codex_error_info}` : 'Error',
+          content,
+          status: 'error',
+        }],
+        ts,
+      });
     } else if (payload.type === 'context_compacted') {
-      const content = payload.message || payload.text || 'Conversation context compacted.';
+      const content = compactedBlock(payload).content;
       pushDedup(state.messages, {
         role: 'assistant',
         content: `[Context compacted]\n\n${content}`,
-        content_blocks: [promptBlock({ title: 'Context compacted', content, collapsed: false })],
+        content_blocks: [compactedBlock(payload)],
         ts,
       });
     }
@@ -962,13 +1075,29 @@ function readJsonlHead(filePath, maxLines = 80) {
 
 function readSessionMeta(filePath) {
   const lines = readJsonlHead(filePath, 80);
+  let meta = {};
   for (const line of lines) {
     try {
       const entry = JSON.parse(line);
-      if (entry.type === 'session_meta' && entry.payload) return entry.payload;
+      const payload = entry?.payload || {};
+      if (entry.type === 'session_meta' && payload) {
+        meta = { ...meta, ...payload };
+      } else if (entry.type === 'turn_context' && payload) {
+        if (payload.cwd && !meta.cwd) meta.cwd = payload.cwd;
+        if (payload.model) meta.model = payload.model;
+        if (payload.effort || payload.reasoning_effort || payload.model_reasoning_effort) {
+          meta.effort = payload.effort || payload.reasoning_effort || payload.model_reasoning_effort;
+        }
+        if (payload.sandbox_mode || payload.sandbox_policy?.mode || payload.sandbox_policy?.type) {
+          meta.sandbox_mode = payload.sandbox_mode || payload.sandbox_policy.mode || payload.sandbox_policy.type;
+        }
+        if (payload.approval_policy) meta.approval_policy = payload.approval_policy;
+      } else if (entry.type === 'event_msg' && payload.type === 'thread_name_updated' && payload.thread_name) {
+        meta.thread_name = payload.thread_name;
+      }
     } catch {}
   }
-  return {};
+  return meta;
 }
 
 function trimPathCandidate(raw) {
@@ -1134,7 +1263,7 @@ function readLightweightSessionSummary(filePath, stat) {
     ? candidate.workspacePath
     : null;
   const workspacePath = candidateWorkspacePath || workspace.workspacePath || candidate.workspacePath || null;
-  const titleSource = index?.thread_name || candidate.title || '';
+  const titleSource = index?.thread_name || meta.thread_name || candidate.title || '';
   return {
     cliSessionId,
     filePath,
@@ -1145,8 +1274,9 @@ function readLightweightSessionSummary(filePath, stat) {
     messageCount: 0,
     messagesHydrated: false,
     model_id: meta.model || meta.model_slug || 'default',
-    effort: 'medium',
-    permission_mode: 'workspace-write',
+    effort: meta.effort || 'medium',
+    permission_mode: meta.sandbox_mode || 'workspace-write',
+    approval_policy: meta.approval_policy || null,
     updatedAt: latestIso(index?.updated_at, stat.mtime),
     sizeBytes: stat.size,
   };
@@ -1201,6 +1331,10 @@ function parseCodexJsonlTail(filePath, tailBytes = DEFAULT_HYDRATE_TAIL_BYTES) {
   state.meta = { ...meta };
   if (meta.id) state.cliSessionId = meta.id;
   if (meta.model || meta.model_slug) state.model_id = meta.model || meta.model_slug;
+  if (meta.effort) state.effort = meta.effort;
+  if (meta.sandbox_mode) state.permission_mode = meta.sandbox_mode;
+  if (meta.approval_policy) state.approval_policy = meta.approval_policy;
+  if (meta.thread_name) state.threadName = meta.thread_name;
   const wantedStart = Math.max(0, stat.size - Math.max(1024 * 1024, Number(tailBytes) || DEFAULT_HYDRATE_TAIL_BYTES));
   const startOffset = scanStartAlignedToLine(filePath, wantedStart);
   scanJsonlEntries(filePath, entry => applyEntryToState(state, entry), {
@@ -1216,6 +1350,10 @@ function createChunkParseState(filePath) {
   state.meta = { ...meta };
   if (meta.id) state.cliSessionId = meta.id;
   if (meta.model || meta.model_slug) state.model_id = meta.model || meta.model_slug;
+  if (meta.effort) state.effort = meta.effort;
+  if (meta.sandbox_mode) state.permission_mode = meta.sandbox_mode;
+  if (meta.approval_policy) state.approval_policy = meta.approval_policy;
+  if (meta.thread_name) state.threadName = meta.thread_name;
   return state;
 }
 
@@ -1250,14 +1388,27 @@ function tailSessionSummary(filePath, stat, maxHydrateBytes, tailBytes, hydrateS
   const fallbackMessages = oversizedTranscriptMessage(summary, maxHydrateBytes);
   const messages = tail?.state?.messages?.length ? tail.state.messages : fallbackMessages;
   const tailHydrated = messages !== fallbackMessages;
+  const tailState = tail?.state || null;
   return {
     ...summary,
+    ...(tailState?.model_id ? { model_id: tailState.model_id } : {}),
+    ...(tailState?.effort ? { effort: tailState.effort } : {}),
+    ...(tailState?.permission_mode ? { permission_mode: tailState.permission_mode } : {}),
+    ...(tailState?.approval_policy ? { approval_policy: tailState.approval_policy } : {}),
+    ...(tailState?.tokenUsage ? { token_usage: tailState.tokenUsage } : {}),
+    ...(tailState?.rateLimits ? { rate_limits: tailState.rateLimits } : {}),
+    ...(tailState?.percentUsed != null ? { percent_used: tailState.percentUsed } : {}),
+    ...(tailState ? {
+      rate_limit_active: tailState.rateLimitActive === true,
+      rate_limited_until: tailState.rateLimitActive ? tailState.rateLimitedUntil || 'unknown' : null,
+    } : {}),
+    ...(tailState?.threadName ? { title: tailState.threadName.replace(/\s+/g, ' ').trim().substring(0, 80) } : {}),
     messages,
     messageCount: messages.length,
     messagesHydrated: tailHydrated,
     messagesPartial: true,
     hydrateSkippedReason: tailHydrated ? hydrateSkippedReason : 'file_too_large',
-    activity: tail?.state ? buildCodexCliActivity(tail.state) : null,
+    activity: tailState ? buildCodexCliActivity(tailState) : null,
   };
 }
 
@@ -1277,7 +1428,7 @@ function readSessionSummary(filePath, { includeMessages = true, maxHydrateBytes 
   const index = readSessionIndex().get(state.cliSessionId) || null;
   const meta = state.meta || {};
   const firstUser = state.messages.find(m => m.role === 'user');
-  const titleSource = index?.thread_name || state.firstUserText || firstUser?.content || '';
+  const titleSource = index?.thread_name || state.threadName || state.firstUserText || firstUser?.content || '';
   const title = titleSource.replace(/\s+/g, ' ').trim().substring(0, 80) || 'Codex CLI session';
   const goalObjective = state.activeGoal?.objective || '';
   const workspace = resolveCodexWorkspace(meta.cwd || null, state.firstUserText, firstUser?.content, goalObjective);
@@ -1294,6 +1445,12 @@ function readSessionSummary(filePath, { includeMessages = true, maxHydrateBytes 
     model_id: state.model_id || meta.model || meta.model_slug || 'default',
     effort: state.effort || 'medium',
     permission_mode: state.permission_mode || 'workspace-write',
+    approval_policy: state.approval_policy || null,
+    token_usage: state.tokenUsage || null,
+    rate_limits: state.rateLimits || null,
+    percent_used: state.percentUsed,
+    rate_limit_active: state.rateLimitActive,
+    rate_limited_until: state.rateLimitedUntil,
     updatedAt: latestIso(index?.updated_at, stat.mtime),
     sizeBytes: stat.size,
     activity: buildCodexCliActivity(state),

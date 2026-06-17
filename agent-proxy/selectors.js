@@ -11310,13 +11310,13 @@ async function readCodexThreadList(Runtime, usePageEval) {
           var clickable = threadDivs[i];
           var fullText = (clickable.textContent || '').trim();
           var lines = fullText.split('\\n').map(function(line) { return line.trim(); }).filter(Boolean);
-          var titleLine = lines.find(function(line) { return !/^\\d+[smhd]$/.test(line); }) || fullText;
+          var titleLine = lines.find(function(line) { return !/^\\d+(?:mo|[smhdw])$/.test(line); }) || fullText;
           // Strip trailing age suffixes like "2d", "15m", "3h" that got concatenated
-          var text = titleLine.replace(/\\d+[smhd]$/, '').trim();
+          var text = titleLine.replace(/\\d+(?:mo|[smhdw])$/, '').trim();
           text = text.replace(/[\\uFFFD{}\\]\\[]+/g, ' ').replace(/\\s{2,}/g, ' ').trim();
           if (!text || text.length < 2) continue;
           // Try to extract the age badge from remaining text
-          var ageMatch = fullText.match(/(\\d+[smhd])$/);
+          var ageMatch = fullText.match(/(\\d+(?:mo|[smhdw]))$/);
           var age = ageMatch ? ageMatch[1] : null;
           threads.push({
             id: 'thread-' + threads.length,
@@ -11347,6 +11347,11 @@ async function switchCodexThread(Runtime, threadId, usePageEval) {
     try {
       beforeThreadList = await readCodexThreadList(Runtime, usePageEval);
     } catch {}
+    const beforeIdxMatch = String(threadId || '').match(/^thread-(\d+)$/);
+    const beforeTargetIndex = beforeIdxMatch ? parseInt(beforeIdxMatch[1], 10) : null;
+    if (beforeTargetIndex != null && beforeThreadList[beforeTargetIndex]?.active) {
+      return { ok: true, method: 'already-active', verified: 'active-thread' };
+    }
     const raw = await evalFn(Runtime, `
       (function() {
         function dispatchPress(el) {
@@ -11387,7 +11392,7 @@ async function switchCodexThread(Runtime, threadId, usePageEval) {
             for (var i = 0; i < threadDivs.length; i++) {
               var clickable = threadDivs[i];
               var fullText = (clickable.textContent || '').trim();
-              var text = fullText.replace(/\\d+[smhd]$/, '').trim();
+              var text = fullText.replace(/\\d+(?:mo|[smhdw])$/, '').trim();
               if (!text || text.length < 2) continue;
               clickables.push(clickable);
             }
@@ -11406,8 +11411,8 @@ async function switchCodexThread(Runtime, threadId, usePageEval) {
     try { initial = JSON.parse(raw); } catch { initial = null; }
     const attempted = !!initial?.ok || /^thread-\d+$/.test(String(threadId || ''));
 
-    for (let i = 0; i < 8; i++) {
-      await new Promise(r => setTimeout(r, 350));
+    for (let i = 0; i < 30; i++) {
+      await new Promise(r => setTimeout(r, 500));
       const idxMatch = String(threadId || '').match(/^thread-(\d+)$/);
       const targetIndex = idxMatch ? parseInt(idxMatch[1], 10) : null;
       const targetTitle = (targetIndex != null && beforeThreadList[targetIndex]?.title) ? beforeThreadList[targetIndex].title : null;

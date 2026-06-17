@@ -515,6 +515,7 @@ class ProxyEngine extends EventEmitter {
       return {
         model_id:          domCfg?.model_id || 'gpt-5.5',
         permission_mode:   domCfg?.permission_mode || domCfg?.access_mode || 'workspace-write',
+        approval_policy:   domCfg?.approval_policy || null,
         effort:            domCfg?.effort || 'medium',
         file_access_scope: workspacePath || domCfg?.file_access_scope || 'unknown',
         available_models:  codexCli.CODEX_CLI_MODELS,
@@ -5467,6 +5468,10 @@ class ProxyEngine extends EventEmitter {
       model_id: sessionMeta.model_id || summary.model_id || 'gpt-5.5',
       effort: sessionMeta.effort || summary.effort || 'medium',
       permission_mode: sessionMeta.permission_mode || summary.permission_mode || 'workspace-write',
+      approval_policy: sessionMeta.approval_policy || summary.approval_policy || null,
+      percentUsed: summary.percent_used ?? sessionMeta.percent_used ?? null,
+      rateLimitActive: summary.rate_limit_active === true || sessionMeta.rate_limit_active === true,
+      rate_limited_until: summary.rate_limited_until || sessionMeta.rate_limited_until || null,
     };
   }
 
@@ -5495,6 +5500,34 @@ class ProxyEngine extends EventEmitter {
       session.codexCliFilePath = summary.filePath;
       changed = true;
     }
+    if (summary.model_id && summary.model_id !== session.model_id) {
+      session.model_id = summary.model_id;
+      changed = true;
+    }
+    if (summary.permission_mode && summary.permission_mode !== session.permission_mode) {
+      session.permission_mode = summary.permission_mode;
+      changed = true;
+    }
+    if (summary.effort && summary.effort !== session.effort) {
+      session.effort = summary.effort;
+      changed = true;
+    }
+    if (summary.approval_policy && summary.approval_policy !== session.approval_policy) {
+      session.approval_policy = summary.approval_policy;
+      changed = true;
+    }
+    if (summary.percent_used != null && summary.percent_used !== session.percentUsed) {
+      session.percentUsed = summary.percent_used;
+      changed = true;
+    }
+    if (summary.rate_limit_active != null && (summary.rate_limit_active === true) !== session.rateLimitActive) {
+      session.rateLimitActive = summary.rate_limit_active === true;
+      changed = true;
+    }
+    if (summary.rate_limited_until !== undefined && (summary.rate_limited_until || null) !== (session.rate_limited_until || null)) {
+      session.rate_limited_until = summary.rate_limited_until || null;
+      changed = true;
+    }
     if (changed) {
       session.windowTitle = session.workspace_name || session.windowTitle || 'Codex CLI';
       sessionStore.updateSession(sessionId, {
@@ -5503,6 +5536,13 @@ class ProxyEngine extends EventEmitter {
         window_title: session.windowTitle || null,
         chat_title: session.chat_title || null,
         codex_cli_file_path: session.codexCliFilePath || null,
+        model_id: session.model_id || null,
+        permission_mode: session.permission_mode || null,
+        effort: session.effort || null,
+        approval_policy: session.approval_policy || null,
+        percent_used: session.percentUsed ?? null,
+        rate_limit_active: session.rateLimitActive === true,
+        rate_limited_until: session.rate_limited_until || null,
       });
     }
     return changed;
@@ -5568,6 +5608,10 @@ class ProxyEngine extends EventEmitter {
         model_id: summary.model_id || undefined,
         permission_mode: summary.permission_mode || undefined,
         effort: summary.effort || undefined,
+        approval_policy: summary.approval_policy || undefined,
+        percent_used: summary.percent_used ?? undefined,
+        rate_limit_active: summary.rate_limit_active === true || undefined,
+        rate_limited_until: summary.rate_limited_until || undefined,
         native_cli_started_at: summary.nativeCliStartedAt || undefined,
         native_cli_status: summary.nativeCliStatus || undefined,
         native_cli_window_opened: summary.nativeCliWindowOpened === true || undefined,
@@ -5619,6 +5663,7 @@ class ProxyEngine extends EventEmitter {
       model_id: session.model_id,
       permission_mode: session.permission_mode,
       effort: session.effort,
+      approval_policy: session.approval_policy,
     }, session.workspace_path));
     this._sendToRelay(proto.agentConfig(sessionId, { ...cfg, capabilities: this._buildCapabilities('codex_cli') }));
     return session;
@@ -7013,7 +7058,10 @@ class ProxyEngine extends EventEmitter {
             this._log('info', `[${sessionId}] Replaced stale Codex Desktop accumulated transcript with fresh visual-unit window`);
             this._maybePersistAccumulatedMessages(sessionId, session);
           }
-          if (session.agentType === 'codex' || session.agentType === 'codex-desktop') {
+          if (
+            session.agentType === 'codex-desktop' ||
+            (session.agentType === 'codex' && messages.length <= 8)
+          ) {
             const completionMerge = this._mergeCodexCompletionCollapse(session._accumulatedMessages, messages);
             if (completionMerge.matched) {
               completionCollapseMatched = true;
@@ -7026,16 +7074,18 @@ class ProxyEngine extends EventEmitter {
               this._maybePersistAccumulatedMessages(sessionId, session);
             }
 
-            const sparseMerge = this._mergeCodexSparseTranscriptWindow(session._accumulatedMessages, messages);
-            if (sparseMerge.matched) {
-              completionCollapseMatched = true;
-              if (sparseMerge.changed) {
-                session._accumulatedMessages = sparseMerge.messages;
-                session._accumulatedDirty = true;
-                session._forceHistoryResync = 'codex sparse transcript merge';
-                this._log('info', `[${sessionId}] Merged sparse Codex transcript window into retained history`);
+            if (session.agentType === 'codex-desktop') {
+              const sparseMerge = this._mergeCodexSparseTranscriptWindow(session._accumulatedMessages, messages);
+              if (sparseMerge.matched) {
+                completionCollapseMatched = true;
+                if (sparseMerge.changed) {
+                  session._accumulatedMessages = sparseMerge.messages;
+                  session._accumulatedDirty = true;
+                  session._forceHistoryResync = 'codex desktop sparse transcript merge';
+                  this._log('info', `[${sessionId}] Merged sparse Codex Desktop transcript window into retained history`);
+                }
+                this._maybePersistAccumulatedMessages(sessionId, session);
               }
-              this._maybePersistAccumulatedMessages(sessionId, session);
             }
           }
 
@@ -8586,7 +8636,13 @@ class ProxyEngine extends EventEmitter {
           useStoredAccumulated = requiresTailMatch
             ? (windowOffset >= 0 && windowOffset + domMsgs.length === storedAccumulated.length)
             : windowOffset >= 0;
-          if (!useStoredAccumulated && (agentType === 'codex' || agentType === 'codex-desktop')) {
+          if (
+            !useStoredAccumulated &&
+            (
+              agentType === 'codex-desktop' ||
+              (agentType === 'codex' && domMsgs.length <= 8)
+            )
+          ) {
             const completionMerge = this._mergeCodexCompletionCollapse(storedAccumulated, domMsgs);
             if (completionMerge.matched) {
               storedAccumulated = completionMerge.messages;
