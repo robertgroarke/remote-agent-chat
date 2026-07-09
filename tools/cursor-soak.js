@@ -12,7 +12,6 @@ const cursorSel = require(path.join(__dirname, '..', 'agent-proxy', 'cursor-sele
 const fidelity = require('./run-fidelity-regression');
 
 const CDP_PORT = 9227;
-const SESSION_ID = guard.THROWAWAY_SESSION_ID;
 
 function parseArgs(argv) {
   const opts = { minutes: 20, intervalMs: 15000 };
@@ -57,10 +56,11 @@ async function main() {
     console.log(msg);
   };
 
-  log(`soak start session=${SESSION_ID} minutes=${opts.minutes}`);
+  log(`soak start minutes=${opts.minutes}`);
   const { ws, messages } = await openRelay(deriveRelayWsUrl());
   let errors = 0;
   let ticks = 0;
+  let sessionId = null;
 
   const waitRelaySessions = async () => {
     const t0 = Date.now();
@@ -86,12 +86,14 @@ async function main() {
         const msgs = JSON.parse(await cursorSel.readCursorMessages(client.Runtime) || '[]');
         const thinking = await cursorSel.detectCursorThinking(client.Runtime);
         await client.close();
-        const sessionOk = messages.some((m) =>
-          (m.type === 'connection_ack' || m.type === 'session_list' || m.type === 'session_snapshot')
-          && Array.isArray(m.sessions)
-          && m.sessions.some((s) => (s.session_id || s) === SESSION_ID)
-        );
-        log(`tick ${ticks} msgs=${msgs.length} thinking=${thinking.thinking} relay=${sessionOk}`);
+        const sessionOk = messages.some((m) => {
+          if (!(m.type === 'connection_ack' || m.type === 'session_list' || m.type === 'session_snapshot')) return false;
+          if (!Array.isArray(m.sessions)) return false;
+          const hit = guard.pickThrowawaySession(m.sessions);
+          if (hit) sessionId = hit.session_id || hit;
+          return !!hit;
+        });
+        log(`tick ${ticks} session=${sessionId || '?'} msgs=${msgs.length} thinking=${thinking.thinking} relay=${sessionOk}`);
       } catch (e) {
         errors += 1;
         log(`tick ${ticks} ERROR ${e.message}`);

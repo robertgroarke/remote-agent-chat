@@ -9,9 +9,12 @@ const WebSocket = require(path.join(__dirname, '..', 'relay-server', 'node_modul
 const guard = require(path.join(__dirname, '..', 'agent-proxy', 'cursor-probe-guard'));
 const fidelity = require('./run-fidelity-regression');
 
-const SESSION_ID = guard.THROWAWAY_SESSION_ID;
 const ROOT = path.join(__dirname, '..');
 const STORE_PATH = path.join(ROOT, 'agent-proxy', 'session-store.json');
+
+function sessionIdOf(session) {
+  return typeof session === 'string' ? session : session?.session_id;
+}
 
 function deriveRelayWsUrl() {
   const relayEnv = fidelity.loadEnvFile(path.join(ROOT, 'relay-server', '.env'));
@@ -67,22 +70,23 @@ async function openRelay(clientName) {
 }
 
 async function waitForThrowawaySession(messages) {
-  await waitFor(() => {
+  return waitFor(() => {
     for (let i = messages.length - 1; i >= 0; i--) {
       const m = messages[i];
       if (!Array.isArray(m.sessions)) continue;
-      if (m.sessions.some((s) => (s.session_id || s) === SESSION_ID)) return true;
+      const s = guard.pickThrowawaySession(m.sessions);
+      if (s) return s;
     }
     return null;
   }, 45000, 'throwaway session in session_list');
 }
 
-async function setAutoApprove(ws, messages, enabled) {
+async function setAutoApprove(ws, messages, sessionId, enabled) {
   const requestId = `autoap-${crypto.randomBytes(4).toString('hex')}`;
   const before = messages.length;
   ws.send(JSON.stringify({
     type: 'agent_set_auto_approve_permissions',
-    session_id: SESSION_ID,
+    session_id: sessionId,
     enabled,
     request_id: requestId,
   }));
@@ -94,10 +98,10 @@ async function setAutoApprove(ws, messages, enabled) {
   if (ctrl.result !== 'ok') throw new Error(`toggle failed: ${ctrl.result}`);
   const cfg = messages.slice(before).find(
     (m) => m.type === 'agent_config'
-      && (m.session_id === SESSION_ID || m.session === SESSION_ID)
+      && (m.session_id === sessionId || m.session === sessionId)
       && m.auto_approve_permissions === enabled
   ) || messages.filter(
-    (m) => m.type === 'agent_config' && (m.session_id === SESSION_ID || m.session === SESSION_ID)
+    (m) => m.type === 'agent_config' && (m.session_id === sessionId || m.session === sessionId)
   ).pop();
   if (!!cfg?.auto_approve_permissions !== enabled) {
     throw new Error(`agent_config auto_approve_permissions not ${enabled} after toggle`);
@@ -105,21 +109,21 @@ async function setAutoApprove(ws, messages, enabled) {
   return cfg;
 }
 
-async function requestAgentConfig(ws, messages) {
+async function requestAgentConfig(ws, messages, sessionId) {
   const requestId = `cfg-${Date.now()}`;
   const before = messages.length;
   ws.send(JSON.stringify({
     type: 'agent_config_request',
-    session_id: SESSION_ID,
+    session_id: sessionId,
     request_id: requestId,
   }));
   const cfg = await waitFor(
     () => messages.slice(before).find(
       (m) => m.type === 'agent_config'
-        && (m.session_id === SESSION_ID || m.session === SESSION_ID)
+        && (m.session_id === sessionId || m.session === sessionId)
         && m.request_id === requestId
     ) || messages.filter(
-      (m) => m.type === 'agent_config' && (m.session_id === SESSION_ID || m.session === SESSION_ID)
+      (m) => m.type === 'agent_config' && (m.session_id === sessionId || m.session === sessionId)
     ).pop(),
     30000,
     'agent_config_request response'
@@ -127,9 +131,9 @@ async function requestAgentConfig(ws, messages) {
   return cfg;
 }
 
-function assertStorePersisted() {
+function assertStorePersisted(sessionId) {
   const store = readStore();
-  const sess = store.sessions?.[SESSION_ID];
+  const sess = store.sessions?.[sessionId];
   if (!sess?.auto_approve_permissions) {
     throw new Error('session-store session flag not true before restart');
   }
@@ -142,10 +146,13 @@ function assertStorePersisted() {
 
 async function main() {
   const { ws, messages } = await openRelay('cursor-auto-restore');
+  let SESSION_ID;
   try {
-    await waitForThrowawaySession(messages);
-    await setAutoApprove(ws, messages, true);
-    assertStorePersisted();
+    const session = await waitForThrowawaySession(messages);
+    SESSION_ID = sessionIdOf(session);
+    console.log('session', SESSION_ID);
+    await setAutoApprove(ws, messages, SESSION_ID, true);
+    assertStorePersisted(SESSION_ID);
     console.log('enabled auto-approve ON before restart');
   } finally {
     try { ws.close(); } catch {}
@@ -159,8 +166,9 @@ async function main() {
 
   const { ws: ws2, messages: messages2 } = await openRelay('cursor-auto-restore-verify');
   try {
-    await waitForThrowawaySession(messages2);
-    const cfg = await requestAgentConfig(ws2, messages2);
+    const session2 = await waitForThrowawaySession(messages2);
+    SESSION_ID = sessionIdOf(session2);
+    const cfg = await requestAgentConfig(ws2, messages2, SESSION_ID);
     if (!cfg?.auto_approve_permissions) {
       throw new Error('auto_approve not restored after proxy restart');
     }

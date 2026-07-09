@@ -101,16 +101,14 @@ function sessionIdOf(session) {
 }
 
 function pickCursorSession(sessions, filter) {
-  const throwaway = sessions.find(
-    (s) => s.agent_type === 'cursor' && sessionIdOf(s) === guard.THROWAWAY_SESSION_ID
-  );
+  const throwaway = guard.pickThrowawaySession(sessions);
   if (throwaway) return throwaway;
   const f = (filter || '').toLowerCase();
   return sessions.find((s) => {
     if (s.agent_type !== 'cursor') return false;
     const sid = sessionIdOf(s);
     if (guard.isBlockedSessionId(sid)) return false;
-    const hay = `${s.display_name || ''} ${s.workspace_name || ''} ${s.window_title || ''}`.toLowerCase();
+    const hay = `${s.display_name || ''} ${s.workspace_name || ''} ${s.window_title || ''} ${s.workspace_path || ''}`.toLowerCase();
     return !f || hay.includes(f);
   });
 }
@@ -181,10 +179,10 @@ async function main() {
     );
     const sessionId = sessionIdOf(session);
     if (guard.isBlockedSessionId(sessionId)) {
-      throw new Error(`Blocked relay session ${sessionId} (host/GWA); need ${guard.THROWAWAY_SESSION_ID}`);
+      throw new Error(`Blocked relay session ${sessionId} (host/GWA); need cursor-test throwaway`);
     }
-    if (sessionId !== guard.THROWAWAY_SESSION_ID) {
-      throw new Error(`Relay session ${sessionId} is not throwaway ${guard.THROWAWAY_SESSION_ID}`);
+    if (!guard.isThrowawaySession(session)) {
+      throw new Error(`Relay session ${sessionId} is not cursor-test throwaway (${session.workspace_name || session.window_title || 'unknown'})`);
     }
     console.log('relay session', sessionId, session.display_name || session.workspace_name);
 

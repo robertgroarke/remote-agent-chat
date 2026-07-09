@@ -87,12 +87,12 @@ Body classes when agent UI active: `sidebarvisible unifiedsidebarhidden chat-edi
 
 | Item | Selector | Notes |
 |------|----------|-------|
-| Live input | Last visible `.aislash-editor-input[contenteditable="true"]` inside `.has-composer-editor .composer-bar` | Avoid workbench-wide query (picks sidebar/search). Parent: `.ai-input-full-input-box` → `.composer-input-blur-wrapper` |
-| **Do not** use `.composer-bar.editor` for input lookup | That variant wraps the **entire** transcript (179+ buttons) | Footer-only: `input.closest('.ai-input-full-input-box')` |
+| Live input | TipTap `.ui-prompt-input-editor__input[contenteditable="true"]` (Agents window) or `.aislash-editor-input` (classic workbench) | Skip readonly mirrors (`.ui-prompt-input-tiptap-readonly`, `.aislash-editor-input-readonly`) |
+| **Do not** use `.composer-bar.editor` for broad queries | That variant wraps the **entire** transcript | Scope to `.agent-prompt-input-root` / `.ui-prompt-input` / footer input |
 | Clear before send | `selectAll` + `delete` + remove children + `textContent=''` | Do **not** assign `innerHTML` (TrustedHTML error in Cursor 3.5) |
-| Placeholder | `.aislash-editor-placeholder` | Sibling of input grid |
-| Model picker | `button.ui-model-picker__trigger` inside `.ai-input-full-input-box` | Only button in footer besides input |
-| Send button | **None in footer** | Submit is **`cdpClient.Input.insertText` + `Input.dispatchKeyEvent` Enter** (verified `cleared-input` / transcript growth) |
+| Model picker | `button.ui-model-picker__trigger` (or toolbar model text) | Present near TipTap submit |
+| Send | TipTap `.ui-prompt-input-submit-button` when not Stop; else CDP Enter | Verified `submit_button` / `cdp_enter` |
+| Interrupt | Submit button aria `Stop generation`, else Escape | Shell stop remains separate (`Stop command`) |
 | Shell tool stop | `button[aria-label="Stop command"].ui-shell-tool-call__glass-stop` | Stops in-flight **shell command** only |
 
 ## Streaming / idle detection (verified Phase 2)
@@ -106,16 +106,20 @@ Body classes when agent UI active: `sidebarvisible unifiedsidebarhidden chat-edi
 
 **Idle false-positive fix:** Workbench chrome shows 34× `[class*="thinking"]` while idle — ignore outside `.conversations` / last AI bubble.
 
-## Agent sidebar / threads
+## Agent sidebar / threads (updated 2026-07-09)
 
-| Item | Finding |
-|------|---------|
-| New agent | `aria-label="New Agent (Ctrl+N)\n[Alt] Replace Agent"` on `codicon-add-two` action |
-| Search | `input.agent-sidebar-search-input` placeholder `Search Agents…` (often hidden) |
-| Thread rows | `.agent-sidebar .monaco-list-row` — **0 rows** when sidebar collapsed / no agent history in DOM |
-| Poll behavior | `readCursorAgentList` is **read-only** — returns `[]` if empty; proxy must **not** click sidebar open (caused multi-window flicker; fixed `a44ae00`) |
+Cursor 3.5+ exposes agents on multiple surfaces. `readCursorAgentList` is still
+**read-only** (no poll-time clicks) and merges:
 
-**Follow-up:** User opens Agents sidebar manually with history; re-run `probe-cursor-targeted.js` on throwaway to capture row selectors and `aria-selected`.
+| Source | Selector | Notes |
+|--------|----------|-------|
+| Glass Agents window | `.glass-sidebar-agent-menu-btn` | Standalone "Cursor Agents" page |
+| Unified workbench sidebar | `.agent-sidebar-cell` / `.agent-sidebar-cell-text` | Classic IDE Agents sidebar |
+| Editor tabs | `.tabs-container .tab .label-name` | Open agent transcripts as tabs |
+| Title tab fallback | `.chat-title-tab-title` | At least the active agent when lists are empty |
+
+Active agent is inferred from `.chat-title-tab-title` or selected editor tabs.
+IDs remain stable `agent-{slug}` (age suffixes like `19d` stripped).
 
 ## Mode controls
 
@@ -164,9 +168,10 @@ Agent view (`.agent-sidebar` + editor-group transcript) and regular Composer/Cha
 
 ## File changes / diff
 
-- `.ui-edit-tool-call` cards in transcript expose path + summary; pending edits show a bottom bar with **Undo** / **Keep** / **Review** (not literal Accept/Reject).
-- `readCursorFileChanges` maps **Keep** → `can_accept`, **Undo** → `can_reject`; `file_change_response` clicks via `respondCursorFileChange`.
-- Relay must forward `change_id` + `action` on `file_change_response` (fixed 2026-05-25).
+- Live pending edits show a compact bar (`1 File Undo Keep Review`) near the composer — **not** the whole `.composer-bar.editor` (that includes transcript text).
+- `readCursorFileChanges` / `respondCursorFileChange` climb from Keep to that short bar; Keep→accept, Undo→reject.
+- Transcript `.ui-edit-tool-call` cards remain a fallback for older layouts.
+- Relay must forward `change_id` + `action` on `file_change_response`.
 
 ## Terminal
 
@@ -227,7 +232,8 @@ Optional captured stdout: `probe-cursor-*-output.txt` (local diagnostics, not re
 | `permission_dialogs` | yes | **yes** | Chat approval + optional inline buttons; `tools/cursor-permission-e2e.js` |
 | `auto_approve_permissions_toggle` | yes | **yes** | Per-workspace preference; `tools/cursor-auto-approve-e2e.js` |
 | `new_chat` / `new_thread` | yes | **yes** | `newCursorAgent` click |
-| `chat_list` / `thread_list` / `switch_*` | yes | **yes** | `readCursorAgentList` from `a.label-name` tabs; stable `agent-{slug}` IDs |
+| `chat_list` / `thread_list` / `switch_*` | yes | **yes** | Glass / `.agent-sidebar-cell` / editor tabs; stable `agent-{slug}` IDs |
+| Structured `content_blocks` | yes | **yes** | Thinking / tool_call / file_changes from pair-scoped cards (2026-07-09) |
 | `terminal_input` | yes | **yes** | Write ok |
 | `terminal_output` | **no** | n/a | xterm canvas — no DOM/buffer read; capability gated in proxy |
 | `file_changes` | yes | **yes** | Read + Undo/Keep via `file_change_response`; `tools/cursor-filechange-e2e.js` |

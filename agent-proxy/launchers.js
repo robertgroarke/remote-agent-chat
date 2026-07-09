@@ -50,7 +50,7 @@ function targetMatchesAgent(target, agentType) {
   if (agentType === 'cursor') {
     return target.type === 'page'
       && url.includes('workbench.html')
-      && (title.includes('cursor') || url.includes('/programs/cursor/'));
+      && (title.includes('cursor') || title.includes('agents') || url.includes('/programs/cursor/'));
   }
   if (agentType === 'claude')  return target.type === 'iframe' && (url.includes('anthropic') || url.includes('claude'));
   if (agentType === 'codex')   return target.type === 'iframe' && (url.includes('openai')    || url.includes('chatgpt'));

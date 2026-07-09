@@ -7,8 +7,6 @@ const WebSocket = require(path.join(__dirname, '..', 'relay-server', 'node_modul
 const guard = require(path.join(__dirname, '..', 'agent-proxy', 'cursor-probe-guard'));
 const fidelity = require('./run-fidelity-regression');
 
-const SESSION_ID = guard.THROWAWAY_SESSION_ID;
-
 function deriveRelayWsUrl() {
   const relayEnv = fidelity.loadEnvFile(path.join(__dirname, '..', 'relay-server', '.env'));
   const proxyEnv = fidelity.loadEnvFile(path.join(__dirname, '..', 'agent-proxy', '.env'));
@@ -53,14 +51,17 @@ async function main() {
   });
 
   try {
-    await waitFor(() => {
+    const session = await waitFor(() => {
       for (let i = messages.length - 1; i >= 0; i--) {
         const m = messages[i];
         if (!Array.isArray(m.sessions)) continue;
-        if (m.sessions.some((s) => (s.session_id || s) === SESSION_ID)) return true;
+        const s = guard.pickThrowawaySession(m.sessions);
+        if (s) return s;
       }
       return false;
     }, 45000, 'session');
+    const SESSION_ID = typeof session === 'string' ? session : session.session_id;
+    console.log('session', SESSION_ID);
 
     const onId = `aa-on-${runId}`;
     ws.send(JSON.stringify({ type: 'agent_set_auto_approve_permissions', session_id: SESSION_ID, enabled: true, request_id: onId }));

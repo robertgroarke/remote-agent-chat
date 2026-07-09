@@ -57,7 +57,7 @@ async function main() {
       for (let i = messages.length - 1; i >= 0; i--) {
         const m = messages[i];
         if (!Array.isArray(m.sessions)) continue;
-        return m.sessions.find((s) => s.agent_type === 'cursor' && (s.session_id || s) === guard.THROWAWAY_SESSION_ID);
+        return guard.pickThrowawaySession(m.sessions);
       }
       return null;
     }, 45000, 'session');

@@ -82,7 +82,7 @@ async function main() {
 
   try {
     const session = await waitFor(() => {
-      const s = latestSessions(messages).find((x) => x.agent_type === 'cursor' && sessionIdOf(x) === guard.THROWAWAY_SESSION_ID);
+      const s = guard.pickThrowawaySession(latestSessions(messages));
       return s || null;
     }, 45000, 'throwaway cursor session');
     const sessionId = sessionIdOf(session);

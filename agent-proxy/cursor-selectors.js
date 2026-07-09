@@ -30,7 +30,13 @@
 //
 // 6. Scope queries to the narrowest known root. `d.querySelectorAll`
 //    against the whole document is a last resort, not the first try.
-//    Prefer `.conversations`, `.agent-sidebar`, `.composer-bar`, etc.
+//    Prefer `.conversations`, glass/agent sidebars, `.composer-bar`, etc.
+//
+// 7. Cursor 3.5+ Agents/"glass" UI: agent rows live in
+//    `.glass-sidebar-agent-menu-btn` (not `.agent-sidebar .monaco-list-row`).
+//    Live composer input is TipTap `.ui-prompt-input-editor__input`, not only
+//    `.aislash-editor-input`. Tool/thinking cards often sit as siblings of
+//    `.composer-rendered-message` inside `.composer-human-ai-pair-container`.
 
 const fs = require('fs');
 const path = require('path');
@@ -58,29 +64,210 @@ const CURSOR_READ_EXPR = `
   function squash(text) {
     return String(text || '').replace(/\\n{3,}/g, '\\n\\n').trim();
   }
+  function norm(t) { return String(t || '').replace(/\\s+/g, ' ').trim(); }
+  function classifyNode(node) {
+    if (!node || node.nodeType !== 1) return null;
+    var cls = String(node.className || '');
+    if (/ui-thinking-collapsible/.test(cls)) return 'thinking';
+    if (/ui-edit-tool-call/.test(cls)) return 'file_changes';
+    if (/ui-shell-tool-call/.test(cls)) return 'tool_call';
+    if (/ui-tool-call-card/.test(cls)) return 'tool_call';
+    if (/ui-step-group-collapsible/.test(cls)) return 'tool_call';
+    if (/\\bui-collapsible\\b/.test(cls) && node.querySelector(':scope > .ui-collapsible-header')) {
+      var hdr = norm((node.querySelector(':scope > .ui-collapsible-header') || {}).innerText || '');
+      if (/^thought\\b/i.test(hdr)) return 'thinking';
+      if (/explor|edit|search|ran |running|command|read |grep|glob|shell/i.test(hdr)) return 'tool_call';
+      return 'tool_call';
+    }
+    return null;
+  }
+  function blockStatus(node, kind) {
+    var cls = String(node.className || '');
+    if (/--pending|streaming|generating|running|--with-stop/i.test(cls)) return 'running';
+    if (/failed|error|cancelled|canceled/i.test(cls + ' ' + (node.innerText || ''))) return 'failed';
+    if (kind === 'thinking' || kind === 'tool_call' || kind === 'file_changes') return 'completed';
+    return undefined;
+  }
+  function nodeToBlock(node, kind) {
+    var headerEl = node.querySelector('.ui-collapsible-header');
+    var title = norm(headerEl ? headerEl.innerText : '') || norm(String(node.innerText || '').split('\\n')[0] || '').substring(0, 120);
+    var bodyEl = null;
+    if (headerEl && headerEl.parentElement) {
+      bodyEl = Array.from(headerEl.parentElement.children).find(function(c) {
+        return c !== headerEl && /content|body|details/i.test(String(c.className || ''));
+      }) || null;
+    }
+    var body = squash(bodyEl ? (bodyEl.innerText || '') : (node.innerText || ''));
+    if (headerEl && body.indexOf(title) === 0) {
+      body = squash(body.slice(title.length));
+    }
+    if (kind === 'thinking') {
+      return { type: 'thinking', title: title || 'Thinking', content: body || title, collapsed: true, status: blockStatus(node, kind) };
+    }
+    if (kind === 'file_changes') {
+      var files = [];
+      var pathMatch = String(node.innerText || '').match(/([^\\s\\\\/]+\\.[a-z0-9]{1,12})\\b/i);
+      if (pathMatch) files.push({ path: pathMatch[1] });
+      return {
+        type: 'file_changes',
+        title: title || 'File changes',
+        content: body || title,
+        summary: title,
+        files: files,
+        status: blockStatus(node, kind),
+        collapsed: true,
+      };
+    }
+    return {
+      type: 'tool_call',
+      title: title || 'Tool',
+      label: title || 'Tool',
+      content: body || title,
+      status: blockStatus(node, kind),
+      collapsed: true,
+    };
+  }
+  function markdownFromBubble(el) {
+    // Clone and strip structured cards so markdown content is not duplicated
+    // into both content and content_blocks.
+    var clone = el.cloneNode(true);
+    clone.querySelectorAll(
+      '.ui-thinking-collapsible, .ui-edit-tool-call, .ui-shell-tool-call, .ui-tool-call-card, .ui-step-group-collapsible, .ui-collapsible'
+    ).forEach(function(n) { n.remove(); });
+    return squash(clone.innerText || clone.textContent || '');
+  }
+  function collectStructuredFromRoot(rootEl) {
+    var blocks = [];
+    var markdownParts = [];
+    var seen = [];
+    function already(node) {
+      return seen.some(function(s) { return s === node || (s.contains && s.contains(node)); });
+    }
+    function visit(node) {
+      if (!node || node.nodeType !== 1) return;
+      if (already(node)) return;
+      var roleAttr = (node.getAttribute('data-message-role') || '').toLowerCase();
+      if (node.classList && node.classList.contains('composer-rendered-message') && roleAttr === 'ai') {
+        // Nested structured cards inside the bubble first, then remaining markdown.
+        var nested = [];
+        Array.from(node.querySelectorAll(
+          '.ui-thinking-collapsible, .ui-edit-tool-call, .ui-shell-tool-call, .ui-tool-call-card, .ui-step-group-collapsible'
+        )).forEach(function(card) {
+          if (already(card)) return;
+          if (nested.some(function(n) { return n.contains(card); })) return;
+          nested.push(card);
+        });
+        nested.forEach(function(card) {
+          var kind = classifyNode(card);
+          if (!kind) return;
+          seen.push(card);
+          blocks.push(nodeToBlock(card, kind));
+        });
+        var md = markdownFromBubble(node);
+        if (md) {
+          markdownParts.push(md);
+          blocks.push({ type: 'markdown', content: md });
+        }
+        seen.push(node);
+        return;
+      }
+      var kind = classifyNode(node);
+      if (kind) {
+        seen.push(node);
+        blocks.push(nodeToBlock(node, kind));
+        return;
+      }
+      Array.from(node.children || []).forEach(visit);
+    }
+    Array.from(rootEl.children || []).forEach(visit);
+    // Also catch direct structured siblings that visit may miss when nested wrappers exist.
+    Array.from(rootEl.querySelectorAll(
+      '.ui-thinking-collapsible, .ui-edit-tool-call, .ui-shell-tool-call, .ui-tool-call-card, .ui-step-group-collapsible'
+    )).forEach(function(card) {
+      if (already(card)) return;
+      if (seen.some(function(s) { return s.contains && s.contains(card); })) return;
+      var kind = classifyNode(card);
+      if (!kind) return;
+      seen.push(card);
+      blocks.push(nodeToBlock(card, kind));
+    });
+    return { blocks: blocks, content: squash(markdownParts.join('\\n\\n')) };
+  }
+  function pushMsg(msgs, msg) {
+    if (!msg) return;
+    if (msg.role === 'user') {
+      if (!msg.content) return;
+    } else if (msg.role === 'assistant') {
+      var hasBlocks = Array.isArray(msg.content_blocks) && msg.content_blocks.length > 0;
+      if (!msg.content && !hasBlocks) return;
+      if (!msg.content && hasBlocks) {
+        msg.content = msg.content_blocks.map(function(b) {
+          return squash(b.content || b.title || b.label || '');
+        }).filter(Boolean).join('\\n\\n');
+      }
+    } else return;
+    var prev = msgs.length ? msgs[msgs.length - 1] : null;
+    if (prev && prev.role === msg.role && prev.content === msg.content
+      && JSON.stringify(prev.content_blocks || null) === JSON.stringify(msg.content_blocks || null)) {
+      return;
+    }
+    msgs.push(msg);
+  }
+
   var msgs = [];
   var root = d.querySelector('.conversations');
   if (!root) return JSON.stringify(msgs);
+
+  var pairs = Array.from(root.querySelectorAll('.composer-human-ai-pair-container'));
+  if (pairs.length) {
+    pairs.forEach(function(pair) {
+      // Cursor keeps many empty pair shells in the DOM; skip them.
+      if (!squash(pair.innerText || pair.textContent || '')) return;
+      Array.from(pair.querySelectorAll('.composer-rendered-message[data-message-role="human"]')).forEach(function(el) {
+        pushMsg(msgs, { role: 'user', content: squash(el.innerText || el.textContent || '') });
+      });
+      var structured = collectStructuredFromRoot(pair);
+      // Prefer structured assistant turn when tools/thinking exist; otherwise
+      // fall back to plain AI bubble text so empty pairs still show replies.
+      if (structured.blocks.length > 0) {
+        var onlyMarkdown = structured.blocks.every(function(b) { return b.type === 'markdown'; });
+        pushMsg(msgs, {
+          role: 'assistant',
+          content: structured.content || '',
+          content_blocks: onlyMarkdown ? undefined : structured.blocks,
+        });
+      } else {
+        Array.from(pair.querySelectorAll('.composer-rendered-message[data-message-role="ai"]')).forEach(function(el) {
+          pushMsg(msgs, { role: 'assistant', content: squash(el.innerText || el.textContent || '') });
+        });
+      }
+    });
+    return JSON.stringify(msgs);
+  }
+
+  // Legacy flat transcript (no pair containers).
   var bubbles = Array.from(root.querySelectorAll('.composer-rendered-message'));
   for (var i = 0; i < bubbles.length; i++) {
     var el = bubbles[i];
     var roleAttr = (el.getAttribute('data-message-role') || '').toLowerCase();
-    // Only emit messages with an explicit known role. Defaulting unknown
-    // bubbles to "assistant" contaminates the transcript with metadata rows
-    // and system notices.
     var role;
     if (roleAttr === 'human') role = 'user';
     else if (roleAttr === 'ai') role = 'assistant';
     else continue;
-    // Read innerText verbatim. Tool-call cards (.ui-tool-call-card,
-    // .ui-shell-tool-call, .ui-edit-tool-call) are structured around buttons;
-    // stripping <button> destroys their content. The web UI's markdown
-    // renderer collapses harmless button text on its own.
-    var text = squash(el.innerText || el.textContent || '');
-    if (!text) continue;
-    var prev = msgs.length ? msgs[msgs.length - 1] : null;
-    if (prev && prev.role === role && prev.content === text) continue;
-    msgs.push({ role: role, content: text });
+    if (role === 'user') {
+      pushMsg(msgs, { role: role, content: squash(el.innerText || el.textContent || '') });
+      continue;
+    }
+    var structuredBubble = collectStructuredFromRoot(el);
+    if (structuredBubble.blocks.some(function(b) { return b.type !== 'markdown'; })) {
+      pushMsg(msgs, {
+        role: 'assistant',
+        content: structuredBubble.content || squash(el.innerText || ''),
+        content_blocks: structuredBubble.blocks,
+      });
+    } else {
+      pushMsg(msgs, { role: 'assistant', content: squash(el.innerText || el.textContent || '') });
+    }
   }
   return JSON.stringify(msgs);
 `;
@@ -94,32 +281,47 @@ const CURSOR_CONFIG_EXPR = `
       return r.width > 40 && r.height > 8;
     }
     var trigger = null;
-    var host = d.querySelector('.has-composer-editor .composer-bar, .composer-bar.editor');
+    var host = d.querySelector(
+      '.agent-prompt-input-root, .ui-prompt-input, .agent-conversation-composer, .has-composer-editor .composer-bar, .composer-bar.editor, .composer-bar'
+    );
+    var inputSelectors = '.ui-prompt-input-editor__input[contenteditable="true"], .tiptap.ProseMirror[contenteditable="true"], .aislash-editor-input[contenteditable="true"]';
     var inputs = host
-      ? Array.from(host.querySelectorAll('.aislash-editor-input[contenteditable="true"]'))
+      ? Array.from(host.querySelectorAll(inputSelectors))
       : [];
     var input = null;
     for (var ii = inputs.length - 1; ii >= 0; ii--) {
-      if (isVisible(inputs[ii])) { input = inputs[ii]; break; }
+      if (isVisible(inputs[ii]) && !/readonly/i.test(String(inputs[ii].className || ''))) { input = inputs[ii]; break; }
     }
     if (input) {
-      var box = input.closest('.ai-input-full-input-box, .composer-input-blur-wrapper');
-      if (box) trigger = box.querySelector('button.ui-model-picker__trigger, .ui-model-picker__trigger');
+      var box = input.closest('.ui-prompt-input, .ai-input-full-input-box, .composer-input-blur-wrapper, .agent-prompt-input-root');
+      if (box) trigger = box.querySelector('button.ui-model-picker__trigger, .ui-model-picker__trigger, [class*="model-picker"]');
     }
     if (!trigger && host) {
-      trigger = host.querySelector('button.ui-model-picker__trigger, .ui-model-picker__trigger');
+      trigger = host.querySelector('button.ui-model-picker__trigger, .ui-model-picker__trigger, [class*="model-picker"]');
+    }
+    if (!trigger) {
+      trigger = d.querySelector('button.ui-model-picker__trigger, .ui-model-picker__trigger');
     }
     var model = null;
     if (trigger) {
       model = norm(trigger.getAttribute('aria-label') || trigger.textContent || trigger.innerText || '');
       model = model.replace(/^model\\s*/i, '').trim();
     }
+    // Glass toolbar often shows the model name as plain text near the submit button.
+    if (!model || model === 'unknown') {
+      var toolbar = d.querySelector('.ui-prompt-input-toolbar, .ui-prompt-input__container, .agent-prompt-input-root');
+      if (toolbar) {
+        var t = norm(toolbar.innerText || '');
+        var m = t.match(/Cursor[^\\n]{0,80}|GPT[^\\n]{0,40}|Claude[^\\n]{0,40}|Gemini[^\\n]{0,40}|Grok[^\\n]{0,40}/i);
+        if (m) model = norm(m[0]);
+      }
+    }
     var openList = d.querySelector('[role="listbox"], [role="menu"]');
     if (openList) {
       var selected = openList.querySelector('[aria-selected="true"], [aria-checked="true"]');
       if (selected) model = norm(selected.textContent || selected.getAttribute('aria-label') || '') || model;
     }
-    var modeScope = host || d.querySelector('.composer-bar, .has-composer-editor');
+    var modeScope = host || d.querySelector('.composer-bar, .has-composer-editor, .agent-conversation-composer');
     var modeBtn = modeScope
       ? Array.from(modeScope.querySelectorAll('button, [role="tab"], [role="menuitem"]')).find(function(el) {
           var t = norm((el.textContent || '') + ' ' + (el.getAttribute('aria-label') || '')).toLowerCase();
@@ -136,10 +338,10 @@ const CURSOR_CONFIG_EXPR = `
 const CURSOR_AGENT_LIST_EXPR = `
   return (function() {
     function norm(t) { return String(t || '').replace(/\\s+/g, ' ').trim(); }
-    // Extract the first non-empty line of innerText. Cursor agent rows render
-    // the agent title as the first line and a relative-timestamp ("Updated 2m
-    // ago") plus last-message preview on subsequent lines. Hashing the whole
-    // row produces a different ID every poll as those mutate.
+    // Strip trailing relative age suffixes Cursor appends ("1m", "19d", "2h", "43d").
+    function stripAge(title) {
+      return norm(title).replace(/\\s+\\d+[smhdw]$/i, '').trim();
+    }
     function firstLine(el) {
       var raw = String(el.innerText || el.textContent || '');
       var lines = raw.split(/\\n+/);
@@ -148,6 +350,13 @@ const CURSOR_AGENT_LIST_EXPR = `
         if (line) return line.substring(0, 80);
       }
       return '';
+    }
+    function agentTitleFromButton(btn) {
+      var label = btn.querySelector(
+        '.ui-sidebar-menu-button-label, .ui-sidebar-label-row-title, .ui-sidebar-menu-button-content, .ui-sidebar-label-row-text'
+      );
+      var raw = label ? firstLine(label) : firstLine(btn);
+      return stripAge(raw);
     }
     function slugId(title) {
       var s = norm(title).toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-+|-+$/g, '');
@@ -158,27 +367,156 @@ const CURSOR_AGENT_LIST_EXPR = `
       seen[item.id] = true;
       items.push(item);
     }
+    function isNoiseTitle(title) {
+      if (!title || title.length < 2) return true;
+      return /^(new agent|automations|customize|no agents yet|search agents|agents|workspaces?)$/i.test(title);
+    }
     var items = [];
     var seen = {};
-    var agentsRoot = d.querySelector('.agent-sidebar, [class*="agent-sidebar"], [class*="agents-panel"]');
-    // Note: .sidebar2 is the explorer/SCM/etc. sidebar — too broad. Editor tab
-    // labels (a.label-name) are file tabs, not agents — never include them.
-    if (!agentsRoot) return JSON.stringify([]);
-    var rows = Array.from(agentsRoot.querySelectorAll('.monaco-list-row'));
-    rows.forEach(function(row, idx) {
-      var title = firstLine(row);
-      if (!title || title.length < 2) return;
-      if (/^search agents/i.test(title)) return;
+    var activeTitle = '';
+    var tabTitleEl = d.querySelector('.chat-title-tab-title, .chat-title-tab-trigger .chat-title-tab-title');
+    if (tabTitleEl) activeTitle = stripAge(firstLine(tabTitleEl));
+    if (!activeTitle) {
+      var tabTrigger = d.querySelector('.chat-title-tab-trigger');
+      if (tabTrigger) {
+        activeTitle = stripAge(firstLine(tabTrigger).replace(/^chat title\\.?\\s*/i, ''));
+      }
+    }
+
+    // Active title from glass chat tab OR selected editor agent tabs.
+    if (!activeTitle) {
+      var selectedTabs = Array.from(d.querySelectorAll('.tabs-container .tab.active.selected, .tabs-container .tab.selected, .tabs-container .tab.active'));
+      for (var ti = 0; ti < selectedTabs.length; ti++) {
+        var tLabel = stripAge(firstLine(selectedTabs[ti].querySelector('.label-name') || selectedTabs[ti]));
+        var tAria = stripAge(selectedTabs[ti].getAttribute('aria-label') || '');
+        var cand = tLabel || tAria;
+        if (cand && !isNoiseTitle(cand) && !/\\.[a-z0-9]{1,8}$/i.test(cand) && cand.indexOf('/') === -1 && cand.indexOf('\\\\') === -1) {
+          activeTitle = cand;
+          break;
+        }
+      }
+    }
+
+    // Cursor 3.5+ glass Agents sidebar (visible even when classic .agent-sidebar is absent).
+    var glassBtns = Array.from(d.querySelectorAll('.glass-sidebar-agent-menu-btn'));
+    if (glassBtns.length) {
+      glassBtns.forEach(function(btn, idx) {
+        var title = agentTitleFromButton(btn);
+        if (isNoiseTitle(title)) return;
+        var id = slugId(title);
+        if (!id) return;
+        var active = false;
+        if (activeTitle && norm(title).toLowerCase() === norm(activeTitle).toLowerCase()) active = true;
+        var item = btn.closest('.ui-sidebar-menu-item') || btn;
+        if (item.getAttribute('aria-selected') === 'true' || /selected|active|current/i.test(String(item.className || '') + ' ' + String(btn.className || ''))) {
+          active = true;
+        }
+        pushItem(items, seen, {
+          id: id,
+          title: title,
+          active: active,
+          index: idx,
+          source: 'glass-sidebar',
+        });
+      });
+    }
+
+    // Classic / unified Agents sidebar cells (workbench window).
+    var cells = Array.from(d.querySelectorAll('.agent-sidebar-cell, .unified-agents-sidebar .agent-sidebar-cell'));
+    if (cells.length) {
+      cells.forEach(function(cell, idx) {
+        var textEl = cell.querySelector('.agent-sidebar-cell-text, .agent-sidebar-cell-content');
+        var title = stripAge(textEl ? firstLine(textEl) : firstLine(cell));
+        if (isNoiseTitle(title)) return;
+        var id = slugId(title);
+        if (!id) return;
+        var active = /selected|active|current/i.test(String(cell.className || ''));
+        if (!active && activeTitle && norm(title).toLowerCase() === norm(activeTitle).toLowerCase()) active = true;
+        pushItem(items, seen, {
+          id: id,
+          title: title,
+          active: active,
+          index: items.length + idx,
+          source: 'agent-sidebar-cell',
+        });
+      });
+    }
+
+    // Legacy monaco agent sidebar rows.
+    var agentsRoot = d.querySelector('.agent-sidebar, .unified-agents-sidebar, [class*="agent-sidebar"], [class*="agents-panel"]');
+    if (agentsRoot) {
+      var rows = Array.from(agentsRoot.querySelectorAll('.monaco-list-row'));
+      rows.forEach(function(row, idx) {
+        var title = stripAge(firstLine(row));
+        if (isNoiseTitle(title)) return;
+        var id = slugId(title);
+        if (!id) return;
+        var active = row.getAttribute('aria-selected') === 'true' || row.classList.contains('sidebar-list-item-selected');
+        if (!active && activeTitle && norm(title).toLowerCase() === norm(activeTitle).toLowerCase()) active = true;
+        pushItem(items, seen, {
+          id: id,
+          title: title,
+          active: active,
+          index: items.length + idx,
+          source: 'agent-sidebar',
+        });
+      });
+    }
+
+    // Editor-group agent tabs (composer editors opened as tabs).
+    var editorTabs = Array.from(d.querySelectorAll('.tabs-container .tab'));
+    editorTabs.forEach(function(tab, idx) {
+      var label = stripAge(firstLine(tab.querySelector('.label-name') || tab));
+      var aria = stripAge(tab.getAttribute('aria-label') || '');
+      var title = label || aria;
+      if (isNoiseTitle(title)) return;
+      // Skip obvious file tabs.
+      if (/\\.[a-z0-9]{1,8}$/i.test(title)) return;
+      if (title.indexOf('/') !== -1 || title.indexOf('\\\\') !== -1) return;
       var id = slugId(title);
       if (!id) return;
+      var active = tab.classList.contains('active') || tab.classList.contains('selected') || tab.getAttribute('aria-selected') === 'true';
+      if (!active && activeTitle && norm(title).toLowerCase() === norm(activeTitle).toLowerCase()) active = true;
       pushItem(items, seen, {
         id: id,
         title: title,
-        active: row.getAttribute('aria-selected') === 'true' || row.classList.contains('sidebar-list-item-selected'),
-        index: idx,
-        source: 'agent-sidebar',
+        active: active,
+        index: items.length + idx,
+        source: 'editor-tab',
       });
     });
+
+    // Fallback: at least expose the active chat title tab so remote UI can show a thread.
+    if (!items.length && activeTitle && !isNoiseTitle(activeTitle)) {
+      var tid = slugId(activeTitle);
+      if (tid) {
+        pushItem(items, seen, {
+          id: tid,
+          title: activeTitle,
+          active: true,
+          index: 0,
+          source: 'title-tab',
+        });
+      }
+    }
+
+    // Ensure exactly one active when we know the title tab.
+    if (activeTitle) {
+      var matched = false;
+      items.forEach(function(it) {
+        if (norm(it.title).toLowerCase() === norm(activeTitle).toLowerCase()) {
+          it.active = true;
+          matched = true;
+        } else if (matched) {
+          it.active = false;
+        }
+      });
+      if (matched) {
+        items.forEach(function(it) {
+          if (norm(it.title).toLowerCase() !== norm(activeTitle).toLowerCase()) it.active = false;
+        });
+      }
+    }
     return JSON.stringify(items);
   })();
 `;
@@ -375,16 +713,30 @@ const CURSOR_FIND_COMPOSER_INPUT = `
   }
   function composerHost() {
     return d.querySelector(
-      '.has-composer-editor .composer-bar, .editor-group-container.has-composer-editor .composer-bar, .composer-bar.editor'
+      '.agent-prompt-input-root, .ui-prompt-input, .agent-conversation-composer, .has-composer-editor .composer-bar, .editor-group-container.has-composer-editor .composer-bar, .composer-bar.editor, .composer-bar'
     );
   }
   function findComposerInput() {
     var host = composerHost();
+    var selectors = [
+      '.ui-prompt-input-editor__input[contenteditable="true"]',
+      '.tiptap.ProseMirror.ui-prompt-input-editor__input[contenteditable="true"]',
+      '.tiptap.ProseMirror[contenteditable="true"]',
+      '.aislash-editor-input[contenteditable="true"]',
+      '.aislash-editor-input',
+    ].join(', ');
     var all = host
-      ? Array.from(host.querySelectorAll('.aislash-editor-input[contenteditable="true"]'))
-      : Array.from(d.querySelectorAll('.aislash-editor-input[contenteditable="true"]'));
+      ? Array.from(host.querySelectorAll(selectors))
+      : Array.from(d.querySelectorAll(selectors));
     for (var i = all.length - 1; i >= 0; i--) {
-      if (isVisible(all[i])) return all[i];
+      var el = all[i];
+      if (!isVisible(el)) continue;
+      // Skip readonly transcript mirrors of prior human prompts.
+      if (/readonly/i.test(String(el.className || ''))) continue;
+      if (el.closest && el.closest('.ui-prompt-input-tiptap-readonly, .aislash-editor-input-readonly, .composer-human-message')) continue;
+      var ce = el.getAttribute('contenteditable');
+      if (ce && String(ce).toLowerCase() === 'false') continue;
+      return el;
     }
     return null;
   }
@@ -401,7 +753,7 @@ const CURSOR_FIND_COMPOSER_INPUT = `
   }
   function findComposerFooter(input) {
     if (!input) return null;
-    return input.closest('.composer-input-blur-wrapper, .ai-input-full-input-box');
+    return input.closest('.ui-prompt-input, .agent-prompt-input-root, .composer-input-blur-wrapper, .ai-input-full-input-box');
   }
 `;
 
@@ -502,7 +854,23 @@ async function sendCursorMessage(Runtime, cdpClient, text) {
 
   try {
     await focusComposerInput(Runtime);
-    await dispatchTrustedEnter(Input);
+    // Prefer explicit TipTap submit when it is a Send control; fall back to Enter.
+    const clicked = await evalInPage(Runtime, `
+      function isVisible(el) {
+        if (!el || !el.getBoundingClientRect) return false;
+        var r = el.getBoundingClientRect();
+        return r.width > 0 && r.height > 0;
+      }
+      var btn = d.querySelector('.ui-prompt-input-submit-button');
+      if (!btn || !isVisible(btn)) return 'no-btn';
+      var aria = String(btn.getAttribute('aria-label') || '').toLowerCase();
+      if (aria.includes('stop')) return 'stop-visible';
+      btn.click();
+      return 'clicked';
+    `);
+    if (clicked !== 'clicked') {
+      await dispatchTrustedEnter(Input);
+    }
     await new Promise(r => setTimeout(r, 700));
     const wanted = String(text || '').replace(/\s+/g, ' ').trim().slice(0, 120);
     const observed = await evalInPage(Runtime, `
@@ -522,7 +890,7 @@ async function sendCursorMessage(Runtime, cdpClient, text) {
       return 'pending';
     `);
     if (observed === 'seen-transcript' || observed === 'cleared-input') {
-      return { ok: true, method: 'cdp_enter' };
+      return { ok: true, method: clicked === 'clicked' ? 'submit_button' : 'cdp_enter' };
     }
   } catch (e) {
     return { ok: false, code: 'send_failed', detail: e.message || 'enter_failed' };
@@ -564,13 +932,22 @@ async function interruptCursor(Runtime, cdpClient, sessionId) {
         var rect = el.getBoundingClientRect();
         return rect.width > 0 && rect.height > 0;
       }
-      var scope = d.querySelector('.composer-bar, [class*="composer-bar"], .has-composer-editor') || d;
+      // Glass TipTap submit button doubles as Stop while generating.
+      var submitStop = d.querySelector('.ui-prompt-input-submit-button');
+      if (submitStop && isVisible(submitStop)) {
+        var aria = String(submitStop.getAttribute('aria-label') || '').toLowerCase();
+        if (aria.includes('stop')) { submitStop.click(); return 'clicked-submit-stop'; }
+      }
+      var scope = d.querySelector('.agent-prompt-input-root, .ui-prompt-input, .composer-bar, [class*="composer-bar"], .has-composer-editor, .agent-conversation-composer') || d;
       var btns = Array.from(scope.querySelectorAll('button, [role="button"]')).filter(function(b) {
         if (!isVisible(b)) return false;
         if (b.closest && b.closest('.ui-shell-tool-call')) return false;
         var aria = String(b.getAttribute('aria-label') || '').toLowerCase();
         var cls = String(b.className || '').toLowerCase();
-        return (aria.includes('stop') && aria !== 'stop command') || cls.includes('stop-generat') || cls.includes('composer-stop');
+        return (aria.includes('stop') && aria !== 'stop command') || cls.includes('stop-generat') || cls.includes('composer-stop') || cls.includes('submit-button');
+      }).filter(function(b) {
+        var aria = String(b.getAttribute('aria-label') || '').toLowerCase();
+        return aria.includes('stop');
       });
       if (!btns.length) {
         btns = Array.from(d.querySelectorAll('button[aria-label*="Stop"], button[aria-label*="stop"]')).filter(function(b) {
@@ -582,7 +959,7 @@ async function interruptCursor(Runtime, cdpClient, sessionId) {
       if (btns.length) { btns[0].click(); return 'clicked'; }
       return 'no-btn';
     `);
-    if (r === 'clicked') return { ok: true, method: 'stop_button' };
+    if (r === 'clicked' || r === 'clicked-submit-stop') return { ok: true, method: 'stop_button' };
   } catch (e) {
     console.warn(`[${sessionId}] [interrupt] Cursor stop error: ${e.message}`);
   }
@@ -684,6 +1061,9 @@ async function switchCursorAgent(Runtime, agentId) {
   const raw = await evalInPage(Runtime, `
     return (function() {
       function norm(t) { return String(t || '').replace(/\\s+/g, ' ').trim(); }
+      function stripAge(title) {
+        return norm(title).replace(/\\s+\\d+[smhdw]$/i, '').trim();
+      }
       function firstLine(el) {
         var raw = String(el.innerText || el.textContent || '');
         var lines = raw.split(/\\n+/);
@@ -697,30 +1077,78 @@ async function switchCursorAgent(Runtime, agentId) {
         var s = norm(title).toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-+|-+$/g, '');
         return s ? ('agent-' + s) : '';
       }
+      function titleOfButton(btn) {
+        var label = btn.querySelector(
+          '.ui-sidebar-menu-button-label, .ui-sidebar-label-row-title, .ui-sidebar-menu-button-content, .ui-sidebar-label-row-text'
+        );
+        return stripAge(label ? firstLine(label) : firstLine(btn));
+      }
       var targetId = ${JSON.stringify(agentId)};
-      var agentsRoot = d.querySelector('.agent-sidebar, [class*="agent-sidebar"], [class*="agents-panel"]');
-      if (!agentsRoot) return 'not-found';
-      var rows = Array.from(agentsRoot.querySelectorAll('.monaco-list-row'));
-      for (var i = 0; i < rows.length; i++) {
-        var title = firstLine(rows[i]);
-        if (!title) continue;
-        if (slugId(title) === targetId) {
-          rows[i].click();
-          return 'clicked-sidebar';
+
+      // Glass sidebar first (Cursor 3.5+ Agents window).
+      var glassBtns = Array.from(d.querySelectorAll('.glass-sidebar-agent-menu-btn'));
+      for (var g = 0; g < glassBtns.length; g++) {
+        var gTitle = titleOfButton(glassBtns[g]);
+        if (slugId(gTitle) === targetId) {
+          glassBtns[g].click();
+          return 'clicked-glass';
+        }
+      }
+
+      // Unified / classic agent sidebar cells.
+      var cells = Array.from(d.querySelectorAll('.agent-sidebar-cell'));
+      for (var c = 0; c < cells.length; c++) {
+        var textEl = cells[c].querySelector('.agent-sidebar-cell-text, .agent-sidebar-cell-content');
+        var cTitle = stripAge(textEl ? firstLine(textEl) : firstLine(cells[c]));
+        if (slugId(cTitle) === targetId) {
+          cells[c].click();
+          return 'clicked-cell';
+        }
+      }
+
+      var agentsRoot = d.querySelector('.agent-sidebar, .unified-agents-sidebar, [class*="agent-sidebar"], [class*="agents-panel"]');
+      if (agentsRoot) {
+        var rows = Array.from(agentsRoot.querySelectorAll('.monaco-list-row'));
+        for (var i = 0; i < rows.length; i++) {
+          var title = stripAge(firstLine(rows[i]));
+          if (!title) continue;
+          if (slugId(title) === targetId) {
+            rows[i].click();
+            return 'clicked-sidebar';
+          }
+        }
+      }
+
+      // Editor tabs hosting agent transcripts.
+      var tabs = Array.from(d.querySelectorAll('.tabs-container .tab'));
+      for (var t = 0; t < tabs.length; t++) {
+        var label = stripAge(firstLine(tabs[t].querySelector('.label-name') || tabs[t]));
+        var aria = stripAge(tabs[t].getAttribute('aria-label') || '');
+        var tabTitle = label || aria;
+        if (slugId(tabTitle) === targetId) {
+          tabs[t].click();
+          return 'clicked-tab';
         }
       }
       return 'not-found';
     })();
   `);
-  const ok = raw === 'clicked-sidebar';
+  const ok = raw === 'clicked-sidebar' || raw === 'clicked-glass' || raw === 'clicked-cell' || raw === 'clicked-tab';
   return { ok, detail: ok ? 'clicked' : (raw || 'not-found') };
 }
 
 async function newCursorAgent(Runtime) {
   const raw = await evalInPage(Runtime, `
-    var btn = Array.from(d.querySelectorAll('a, button, [role="button"]')).find(function(el) {
-      var t = (el.getAttribute('aria-label') || '') + ' ' + (el.textContent || '');
-      return /new agent/i.test(t);
+    function isVisible(el) {
+      if (!el || !el.getBoundingClientRect) return false;
+      var r = el.getBoundingClientRect();
+      return r.width > 0 && r.height > 0;
+    }
+    var candidates = Array.from(d.querySelectorAll('a, button, [role="button"], .ui-sidebar-menu-button, .ui-icon-button'));
+    var btn = candidates.find(function(el) {
+      if (!isVisible(el)) return false;
+      var t = ((el.getAttribute('aria-label') || '') + ' ' + (el.textContent || '')).toLowerCase();
+      return /new agent/.test(t);
     });
     if (btn) { btn.click(); return 'clicked'; }
     return 'not-found';
@@ -779,40 +1207,36 @@ const CURSOR_FILE_CHANGES_EXPR = `
       var base = String(path || 'pending').substring(0, 80);
       return 'file-' + base.toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-+|-+$/g, '');
     }
-    function findActionBtn(root, re) {
-      var candidates = Array.from(root.querySelectorAll('button, [role="button"], a, span, div'));
-      for (var i = candidates.length - 1; i >= 0; i--) {
-        var b = candidates[i];
-        if (!isVisible(b) || inConversations(b)) continue;
-        var label = norm(b.innerText || b.textContent || b.getAttribute('aria-label') || '');
-        if (re.test(label)) return b;
-      }
-      return null;
+    function labelOf(el) {
+      return norm(el.innerText || el.textContent || el.getAttribute('aria-label') || '');
     }
-    // Live panel-level Undo/Keep bar only — transcript edit cards are history.
-    var scopes = Array.from(d.querySelectorAll(
-      '.composer-bar, .has-composer-editor .composer-bar, .composer-pane, [class*="composer-footer"], [class*="edit-toolbar"]'
-    ));
-    var host = d.querySelector('.has-composer-editor');
-    if (host && scopes.indexOf(host) === -1) scopes.push(host);
+    // Find Keep/Undo controls, then climb to the compact action bar
+    // ("1 File Undo Keep Review") — never use the whole .composer-bar.editor
+    // which also contains the transcript.
+    var keepBtns = Array.from(d.querySelectorAll('button, [role="button"], a, div, span')).filter(function(el) {
+      return isVisible(el) && !inConversations(el) && /^keep$/i.test(labelOf(el));
+    });
     var out = [];
     var seen = {};
-    scopes.forEach(function(scope, sidx) {
-      if (!scope || inConversations(scope)) return;
-      var keepBtn = findActionBtn(scope, /^keep$/i);
-      var undoBtn = findActionBtn(scope, /^undo$/i);
-      if (!keepBtn || !undoBtn) return;
-      var bar = keepBtn.closest('.composer-bar, [class*="composer"], [class*="diff"], [class*="edit-toolbar"]') || scope;
-      if (inConversations(bar)) return;
-      var barText = norm(bar.innerText || bar.textContent || '');
+    keepBtns.forEach(function(keepBtn, sidx) {
+      var bar = keepBtn.parentElement;
+      for (var depth = 0; bar && depth < 8; depth++) {
+        var text = norm(bar.innerText || '');
+        var hasUndo = /\\bundo\\b/i.test(text);
+        var hasKeep = /\\bkeep\\b/i.test(text);
+        // Compact bar: Keep+Undo and short enough that it is not the transcript host.
+        if (hasUndo && hasKeep && text.length > 0 && text.length < 120) break;
+        bar = bar.parentElement;
+      }
+      if (!bar || inConversations(bar)) return;
+      var barText = norm(bar.innerText || '');
+      if (barText.length >= 120) return;
       var path = '';
-      var fileMatch = barText.match(/([^\\s]+\\.[a-z0-9]{1,8})\\b/i);
+      var fileMatch = barText.match(/([A-Za-z0-9_./\\\\-]+\\.[a-z0-9]{1,12})\\b/);
       if (fileMatch) path = fileMatch[1];
-      else {
-        var line = barText.split(/\\n+/).map(function(l) { return l.trim(); }).find(function(l) {
-          return l && !/^(undo|keep|review|\\d+\\s*files?)$/i.test(l);
-        });
-        path = line ? line.substring(0, 80) : ('pending-' + sidx);
+      if (!path) {
+        var fileCount = barText.match(/(\\d+)\\s*files?/i);
+        path = fileCount ? (fileCount[1] + '-files') : ('pending-' + sidx);
       }
       var id = stableId(path);
       if (seen[id]) return;
@@ -820,7 +1244,7 @@ const CURSOR_FILE_CHANGES_EXPR = `
       out.push({
         id: id,
         path: path,
-        summary: barText.substring(0, 500),
+        summary: barText.substring(0, 200),
         status: 'pending',
         can_accept: true,
         can_reject: true,
@@ -843,38 +1267,69 @@ async function respondCursorFileChange(Runtime, changeId, action) {
   const raw = await evalInPage(Runtime, `
     return (function() {
       function norm(t) { return String(t || '').replace(/\\s+/g, ' ').trim(); }
-      function stableId(path, idx) {
-        var base = String(path || ('change-' + idx));
-        return 'file-' + base.toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-+|-+$/g, '');
+      function isVisible(el) {
+        if (!el || !el.getBoundingClientRect) return false;
+        var r = el.getBoundingClientRect();
+        return r.width > 0 && r.height > 0;
+      }
+      function inConversations(el) {
+        return !!(el && el.closest && el.closest('.conversations'));
+      }
+      function labelOf(el) {
+        return norm(el.innerText || el.textContent || el.getAttribute('aria-label') || '');
       }
       var wanted = ${JSON.stringify(changeId)};
       var action = ${JSON.stringify(action)};
-      var re = action === 'accept' ? /^accept$|^accept all$|^approve$|^keep$/i : /^reject$|^reject all$|^discard$|^undo$/i;
-      var cards = Array.from(d.querySelectorAll('.ui-edit-tool-call, .ui-tool-call-card.ui-edit-tool-call, .ui-tool-call-card'));
-      var card = cards.find(function(c, idx) {
-        var lines = (c.innerText || c.textContent || '').trim().split('\\n');
-        var path = (lines[0] || '').trim();
-        var dataId = c.getAttribute('data-change-id') || c.getAttribute('data-file') || c.getAttribute('data-path');
-        var id = dataId ? String(dataId) : stableId(path, idx);
-        return id === wanted || path === wanted;
-      });
+      var re = action === 'accept'
+        ? /^accept$|^accept all$|^approve$|^keep$/i
+        : /^reject$|^reject all$|^discard$|^undo$/i;
+
+      function findCompactBars() {
+        var keeps = Array.from(d.querySelectorAll('button, [role="button"], a, div, span')).filter(function(el) {
+          return isVisible(el) && !inConversations(el) && /^keep$/i.test(labelOf(el));
+        });
+        var bars = [];
+        var seen = {};
+        keeps.forEach(function(keepBtn) {
+          var bar = keepBtn.parentElement;
+          for (var depth = 0; bar && depth < 8; depth++) {
+            var text = norm(bar.innerText || '');
+            if (/\\bundo\\b/i.test(text) && /\\bkeep\\b/i.test(text) && text.length > 0 && text.length < 120) break;
+            bar = bar.parentElement;
+          }
+          if (!bar || inConversations(bar) || norm(bar.innerText || '').length >= 120) return;
+          if (seen[bar]) return;
+          seen[bar] = true;
+          bars.push(bar);
+        });
+        return bars;
+      }
+
       function pickBtn(root) {
         var found = null;
-        Array.from(root.querySelectorAll('button, [role="button"], a, span, div')).forEach(function(b) {
-          if (found) return;
-          var label = norm(b.innerText || b.textContent || b.getAttribute('aria-label') || '');
-          if (re.test(label)) found = b;
+        Array.from(root.querySelectorAll('button, [role="button"], a, div, span')).forEach(function(b) {
+          if (found || !isVisible(b) || inConversations(b)) return;
+          if (re.test(labelOf(b))) found = b;
         });
         return found;
       }
-      if (!card) return 'no-card';
-      var btn = pickBtn(card) || pickBtn(d);
-      if (!btn) return 'no-btn';
-      btn.click();
-      return 'clicked';
+
+      var bars = findCompactBars();
+      for (var i = 0; i < bars.length; i++) {
+        var btn = pickBtn(bars[i]);
+        if (btn) { btn.click(); return 'clicked-live'; }
+      }
+
+      // Fallback: edit tool cards in transcript (older Cursor builds).
+      var cards = Array.from(d.querySelectorAll('.ui-edit-tool-call'));
+      for (var c = 0; c < cards.length; c++) {
+        var cbtn = pickBtn(cards[c]);
+        if (cbtn) { cbtn.click(); return 'clicked-card'; }
+      }
+      return 'no-btn';
     })();
   `);
-  return raw === 'clicked';
+  return raw === 'clicked-live' || raw === 'clicked-card';
 }
 
 async function acceptCursorFileChange(Runtime, changeId) {
@@ -1104,11 +1559,34 @@ async function detectCursorThinking(Runtime) {
             thinking = true;
             label = 'Generating';
           }
-          // Do not match collapsible "Thought/Working" header text alone — it remains
-          // in history after interrupt. Only live stream/busy markers count.
+        }
+        // Live shell/tool cards often sit outside the AI bubble but inside the pair.
+        var lastPair = null;
+        var pairs = conv.querySelectorAll('.composer-human-ai-pair-container');
+        if (pairs.length) lastPair = pairs[pairs.length - 1];
+        if (!thinking && lastPair) {
+          var running = lastPair.querySelector(
+            '.ui-shell-tool-call--with-stop, .ui-shell-tool-call--pending, [class*="streaming"], [aria-busy="true"], .codicon-loading'
+          );
+          if (running && isVisible(running)) {
+            thinking = true;
+            label = 'Generating';
+          }
+          var editing = Array.from(lastPair.querySelectorAll('.ui-collapsible-header')).some(function(h) {
+            return /^editing\\b/i.test(String(h.innerText || '').trim());
+          });
+          if (editing) { thinking = true; label = 'Generating'; }
         }
       }
-      var composer = d.querySelector('.composer-bar, [class*="composer-bar"]');
+      var submitStop = d.querySelector('.ui-prompt-input-submit-button');
+      if (!thinking && submitStop && isVisible(submitStop)) {
+        var aria = String(submitStop.getAttribute('aria-label') || '').toLowerCase();
+        if (aria.includes('stop')) {
+          thinking = true;
+          label = 'Generating';
+        }
+      }
+      var composer = d.querySelector('.agent-prompt-input-root, .ui-prompt-input, .composer-bar, [class*="composer-bar"]');
       if (!thinking && composer) {
         var stopBtn = Array.from(composer.querySelectorAll('button, [role="button"]')).find(function(b) {
           if (!isVisible(b)) return false;

@@ -8,7 +8,6 @@ const WebSocket = require(path.join(__dirname, '..', 'relay-server', 'node_modul
 const guard = require(path.join(__dirname, '..', 'agent-proxy', 'cursor-probe-guard'));
 const fidelity = require('./run-fidelity-regression');
 
-const SESSION_ID = guard.THROWAWAY_SESSION_ID;
 const STORE_PATH = path.join(__dirname, '..', 'agent-proxy', 'session-store.json');
 
 function deriveRelayWsUrl() {
@@ -59,11 +58,15 @@ function readStore() {
   return JSON.parse(fs.readFileSync(STORE_PATH, 'utf8'));
 }
 
-async function setAutoApprove(ws, messages, enabled) {
+function sessionIdOf(session) {
+  return typeof session === 'string' ? session : session?.session_id;
+}
+
+async function setAutoApprove(ws, messages, sessionId, enabled) {
   const requestId = `autoap-${crypto.randomBytes(4).toString('hex')}`;
   ws.send(JSON.stringify({
     type: 'agent_set_auto_approve_permissions',
-    session_id: SESSION_ID,
+    session_id: sessionId,
     enabled,
     request_id: requestId,
   }));
@@ -74,7 +77,7 @@ async function setAutoApprove(ws, messages, enabled) {
   );
   if (ctrl.result !== 'ok') throw new Error(`toggle failed: ${ctrl.result}`);
   const cfg = await waitFor(
-    () => messages.find((m) => m.type === 'agent_config' && (m.session_id === SESSION_ID || m.session === SESSION_ID)),
+    () => messages.find((m) => m.type === 'agent_config' && (m.session_id === sessionId || m.session === sessionId)),
     15000,
     'agent_config after toggle'
   );
@@ -84,15 +87,17 @@ async function setAutoApprove(ws, messages, enabled) {
 async function main() {
   const { ws, messages } = await openRelay();
   try {
-    await waitFor(() => {
+    const session = await waitFor(() => {
       for (let i = messages.length - 1; i >= 0; i--) {
         const m = messages[i];
         if (!Array.isArray(m.sessions)) continue;
-        const s = m.sessions.find((x) => (x.session_id || x) === SESSION_ID);
+        const s = guard.pickThrowawaySession(m.sessions);
         if (s) return s;
       }
       return null;
     }, 45000, 'throwaway session');
+    const SESSION_ID = sessionIdOf(session);
+    console.log('session', SESSION_ID, session.workspace_name || session.window_title);
 
     const cfgReq = `cfg-req-${Date.now()}`;
     ws.send(JSON.stringify({ type: 'agent_config_request', session_id: SESSION_ID, request_id: cfgReq }));
@@ -107,7 +112,7 @@ async function main() {
     console.log('PASS capability flag true');
 
     const beforeLen = messages.length;
-    await setAutoApprove(ws, messages, true);
+    await setAutoApprove(ws, messages, SESSION_ID, true);
     const cfgOn = messages.slice(beforeLen).find(
       (m) => m.type === 'agent_config' && (m.session_id === SESSION_ID || m.session === SESSION_ID) && m.auto_approve_permissions === true
     ) || messages.filter((m) => m.type === 'agent_config' && (m.session_id === SESSION_ID || m.session === SESSION_ID)).pop();
@@ -122,7 +127,7 @@ async function main() {
     if (!prefHit) throw new Error(`no cursor preference key with auto_approve true (keys: ${prefKeys.join(', ')})`);
     console.log('PASS session-store persisted', prefKeys.find((k) => store.preferences[k]?.auto_approve_permissions));
 
-    await setAutoApprove(ws, messages, false);
+    await setAutoApprove(ws, messages, SESSION_ID, false);
     const cfgOff = messages.filter((m) => m.type === 'agent_config' && (m.session_id === SESSION_ID || m.session === SESSION_ID)).pop();
     if (cfgOff?.auto_approve_permissions) throw new Error('toggle OFF did not clear agent_config');
     console.log('PASS toggle OFF');
