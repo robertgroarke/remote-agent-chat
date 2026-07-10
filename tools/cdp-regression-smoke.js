@@ -563,12 +563,32 @@ async function runAntigravityV2Suite(targets, reporter) {
     const messagesRaw = await selectors.readMessages(Runtime, 'antigravity-v2', 'smoke-antigravity-v2');
     const messages = parseMaybeJson(messagesRaw, []);
     const hasBlocks = Array.isArray(messages) && messages.some(m => Array.isArray(m.content_blocks) && m.content_blocks.length > 0);
+    const nativeToolProbe = await selectors.evalInPage(Runtime, `
+      var labels = Array.from(d.querySelectorAll('[role="article"][aria-label="Agent response"] button')).map(function(button) {
+        return String(button.innerText || button.textContent || '').trim();
+      });
+      return { labels: labels, present: labels.some(function(text) { return text.toLowerCase().indexOf('explored ') === 0; }) };
+    `);
+    const nativeToolSurface = !!nativeToolProbe?.present;
+    const toolBlockCount = Array.isArray(messages) ? messages.reduce((count, message) => {
+      return count + (Array.isArray(message.content_blocks)
+        ? message.content_blocks.filter(block => block && (block.type === 'tool_call' || block.type === 'tool_result' || block.type === 'terminal')).length
+        : 0);
+    }, 0) : 0;
+    const messagesOk = Array.isArray(messages) && (!nativeToolSurface || toolBlockCount > 0);
     reporter.add({
       surface,
       test_id: 'antigravity-v2.messages.read',
-      status: Array.isArray(messages) ? STATUS_PASS : STATUS_FAIL,
-      detail: 'Read ' + (Array.isArray(messages) ? messages.length : 0) + ' v2 transcript messages',
-      native_evidence: Array.isArray(messages) && messages.length > 0 ? { last_message: truncate(messages[messages.length - 1].content || '', 220), has_content_blocks: hasBlocks } : null,
+      status: messagesOk ? STATUS_PASS : STATUS_FAIL,
+      detail: 'Read ' + (Array.isArray(messages) ? messages.length : 0) + ' v2 transcript messages'
+        + (nativeToolSurface ? ' with ' + toolBlockCount + ' structured tool blocks' : ''),
+      native_evidence: Array.isArray(messages) && messages.length > 0 ? {
+        last_message: truncate(messages[messages.length - 1].content || '', 220),
+        has_content_blocks: hasBlocks,
+        native_tool_surface: !!nativeToolSurface,
+        native_tool_labels: Array.isArray(nativeToolProbe?.labels) ? nativeToolProbe.labels.filter(Boolean).slice(-20) : [],
+        tool_block_count: toolBlockCount,
+      } : null,
       investigation_hint: 'Check readAntigravityV2Messages and content_blocks extraction',
     });
 
@@ -695,6 +715,19 @@ async function runIframeSurfaceSuite(targets, reporter, surface, targetOverride 
         detail: 'Read ' + (Array.isArray(chats) ? chats.length : 0) + ' Codex side pane chats',
         native_evidence: Array.isArray(chats) ? chats.slice(0, 3) : null,
         investigation_hint: 'Check readCodexChatList in selectors.js',
+      });
+      const ageSuffixTitles = Array.isArray(chats)
+        ? chats.filter(chat => /\d+\s*(?:s|m|h|d|w|mo|y)$/i.test(String(chat.title || '').trim()))
+        : [];
+      reporter.add({
+        surface,
+        test_id: testPrefix + '.chat-list.title-clean',
+        status: ageSuffixTitles.length === 0 ? STATUS_PASS : STATUS_FAIL,
+        detail: ageSuffixTitles.length === 0
+          ? 'Codex side pane chat titles are age-suffix clean'
+          : 'Detected ' + ageSuffixTitles.length + ' chat titles with trailing age suffixes',
+        native_evidence: ageSuffixTitles.slice(0, 3),
+        investigation_hint: 'Check readCodexChatList title normalization in selectors.js',
       });
     }
 

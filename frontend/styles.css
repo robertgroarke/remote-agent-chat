@@ -704,9 +704,24 @@ body {
 }
 
 .session-tasklist-strip {
-  padding: 10px 18px 0;
-  border-bottom: 1px solid rgba(255, 255, 255, 0.03);
+  padding: 8px 18px 0;
+  border-top: 1px solid rgba(255, 255, 255, 0.06);
   flex-shrink: 0;
+}
+
+.transcript-live-footer {
+  display: flex;
+  flex-direction: column;
+  flex: 0 0 auto;
+  min-height: 0;
+  position: relative;
+  z-index: 1;
+  background: var(--input-area-bg);
+}
+
+.transcript-live-footer .composer-live-status-strip {
+  position: relative;
+  flex: 0 0 auto;
 }
 
 .cline-context-strip {
@@ -890,11 +905,6 @@ body {
 .messages-flex-spacer {
   flex: 1 1 auto;
   min-height: 0;
-}
-
-.messages.compact-footer-gap {
-  padding-bottom: 12px;
-  scroll-padding-bottom: 12px;
 }
 
 .history-tail-banner {
@@ -1394,10 +1404,20 @@ body {
   font-size: 12px; color: var(--text2);
 }
 .queued-item-text {
-  flex: 1; min-width: 0; overflow: hidden;
-  text-overflow: ellipsis; white-space: nowrap;
+  flex: 1; min-width: 0;
+  overflow-wrap: anywhere; white-space: pre-wrap;
   opacity: 0.8;
 }
+.queued-item-status {
+  border: 1px solid rgba(226, 183, 20, 0.35);
+  border-radius: 999px;
+  color: var(--yellow, #e2b714);
+  flex-shrink: 0;
+  font-size: 10px;
+  padding: 1px 6px;
+  text-transform: uppercase;
+}
+.queued-item-status.failed { color: #ff8a80; border-color: rgba(255, 138, 128, 0.4); }
 .queued-actions {
   display: flex; align-items: center; gap: 4px; flex-shrink: 0;
 }
@@ -1538,6 +1558,10 @@ body {
   gap: 8px;
 }
 
+.content-blocks-cursor {
+  gap: 6px;
+}
+
 .content-block {
   max-width: min(980px, 100%);
 }
@@ -1548,12 +1572,96 @@ details.content-block {
   padding-left: 10px;
 }
 
+.content-blocks-cursor details.content-block {
+  border-left-color: rgba(122, 162, 247, 0.28);
+}
+
 .content-block summary {
   cursor: pointer;
   color: var(--text2);
   font-size: 12px;
   font-weight: 600;
   margin-bottom: 4px;
+}
+
+/* Cursor Agents-style subtle status chips ("Worked for 4m", "Thought for 1s"). */
+.content-block-status-chip {
+  display: inline-flex;
+  align-items: center;
+  align-self: flex-start;
+  max-width: 100%;
+  color: var(--text3);
+  font-size: 12px;
+  font-weight: 500;
+  line-height: 1.35;
+  padding: 0;
+  margin: 2px 0;
+  opacity: 0.85;
+}
+
+.content-block-status-chip.thinking {
+  color: var(--text3);
+  font-style: italic;
+}
+
+.content-block-status-chip.tool {
+  color: var(--text2);
+}
+
+.content-blocks-cursor .content-block-markdown {
+  line-height: 1.55;
+}
+
+.content-blocks-cursor .content-block-markdown table {
+  border-collapse: collapse;
+  width: auto;
+  max-width: 100%;
+  margin: 10px 0;
+  font-size: 13px;
+}
+
+.content-blocks-cursor .content-block-markdown th,
+.content-blocks-cursor .content-block-markdown td {
+  border: 1px solid var(--border2);
+  padding: 6px 10px;
+  text-align: left;
+  vertical-align: top;
+}
+
+.content-blocks-cursor .content-block-markdown th {
+  background: var(--bg3);
+  color: var(--text2);
+  font-weight: 600;
+}
+
+.content-blocks-cursor .content-block-markdown tr:nth-child(2n) td {
+  background: rgba(255, 255, 255, 0.02);
+}
+
+.content-blocks-cursor .content-block-markdown code {
+  font-family: 'Cascadia Code', 'SF Mono', Consolas, monospace;
+  font-size: 0.92em;
+  background: rgba(122, 162, 247, 0.12);
+  border-radius: 4px;
+  padding: 1px 5px;
+}
+
+.content-blocks-cursor .content-block-markdown pre {
+  background: var(--code-block-bg);
+  border: 1px solid var(--border2);
+  border-radius: 8px;
+  padding: 10px 12px;
+  overflow-x: auto;
+}
+
+.content-blocks-cursor .content-block-markdown ul,
+.content-blocks-cursor .content-block-markdown ol {
+  margin: 6px 0 6px 1.2em;
+  padding: 0;
+}
+
+.content-blocks-cursor .content-block-markdown li {
+  margin: 3px 0;
 }
 
 .content-block-title {
@@ -1830,6 +1938,14 @@ details.content-block {
   gap: 12px;
 }
 
+.inline-error-prompt-title {
+  color: var(--text-primary);
+  font-size: 14px;
+  font-weight: 600;
+  line-height: 1.4;
+  margin-bottom: 4px;
+}
+
 .inline-error-prompt-message {
   color: #ff8a80;
   font-size: 14px;
@@ -2045,7 +2161,7 @@ details.content-block {
   font-size: 11px;
   line-height: 1.3;
   max-width: 100%;
-  overflow: hidden;
+  overflow: visible;
 }
 .activity-command code {
   display: block;
@@ -2056,10 +2172,11 @@ details.content-block {
   font-family: 'Cascadia Code', 'SF Mono', Consolas, monospace;
   font-size: 10.5px;
   color: var(--text2);
-  white-space: nowrap;
-  overflow: hidden;
-  text-overflow: ellipsis;
-  max-width: min(500px, 60vw);
+  white-space: pre-wrap;
+  overflow: visible;
+  text-overflow: clip;
+  overflow-wrap: anywhere;
+  max-width: 100%;
 }
 
 .activity-tasklist {
@@ -2767,10 +2884,9 @@ mark.code-search-mark.current {
   flex: 1;
   min-width: 0;
   white-space: pre-wrap;
-  overflow: hidden;
-  display: -webkit-box;
-  -webkit-line-clamp: 2;
-  -webkit-box-orient: vertical;
+  overflow: visible;
+  display: block;
+  overflow-wrap: anywhere;
   opacity: 0.95;
 }
 .subagent-stats {
@@ -2852,9 +2968,10 @@ mark.code-search-mark.current {
 .file-changes-title {
   min-width: 0;
   flex: 1;
-  overflow: hidden;
-  text-overflow: ellipsis;
-  white-space: nowrap;
+  overflow: visible;
+  text-overflow: clip;
+  white-space: normal;
+  overflow-wrap: anywhere;
   font-weight: 600;
   font-size: 12px;
 }
@@ -2893,9 +3010,10 @@ mark.code-search-mark.current {
 .file-changes-path {
   min-width: 0;
   flex: 1;
-  overflow: hidden;
-  text-overflow: ellipsis;
-  white-space: nowrap;
+  overflow: visible;
+  text-overflow: clip;
+  white-space: normal;
+  overflow-wrap: anywhere;
   font-family: 'Cascadia Code', 'SF Mono', Consolas, monospace;
   color: var(--text2);
 }

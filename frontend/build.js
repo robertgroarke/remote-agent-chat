@@ -24,7 +24,7 @@ function copyFile(source, destination) {
 }
 
 function syncPublicAssets() {
-  const assets = ['index.html', 'styles.css', 'app.jsx', 'hooks.jsx', 'sw.js'];
+  const assets = ['index.html', 'styles.css', 'app.jsx', 'hooks.jsx', 'file-utils.js', 'sw.js'];
   for (const asset of assets) {
     copyFile(path.join(__dirname, asset), path.join(publicDir, asset));
   }

@@ -11,8 +11,6 @@ const DRAFT_STORAGE_KEY = 'remote-agent-chat:drafts:v1';
 const DEFAULT_INITIAL_HISTORY_LIMIT = 120;
 const CODEX_INITIAL_HISTORY_LIMIT = 500;
 const CODEX_CLI_INITIAL_HISTORY_LIMIT = 160;
-const TRANSCRIPT_RENDER_TAIL_LIMIT = 96;
-const CODEX_TRANSCRIPT_RENDER_TAIL_LIMIT = 512;
 const EMPTY_MESSAGES = Object.freeze([]);
 const SLASH_COMMANDS = [
   { command: '/plan', detail: 'Outline the implementation approach and major steps.' },
@@ -31,6 +29,7 @@ const AGENT_CONFIG = {
   codex_cli:         { name: 'Codex CLI',        color: '#10a37f', abbr: 'CLI', logo: '/logo-codex.svg' },
   'codex-desktop':   { name: 'Codex Desktop',   color: '#10a37f', abbr: 'CX', logo: '/logo-codex.svg' },
   cursor:            { name: 'Cursor',          color: '#7AA2F7', abbr: 'CR', logo: '/logo-cursor.svg' },
+  cursor_cli:        { name: 'Cursor CLI',      color: '#7c6cf0', abbr: 'CLI', logo: '/logo-cursor.svg' },
   gemini:            { name: 'Gemini',           color: '#4285f4', abbr: 'GC', logo: '/logo-gemini-in-ag.svg' },
   continue:          { name: 'Continue',         color: '#d29922', abbr: 'CN', logo: '/logo-continue.png' },
   continue_yolo:     { name: 'Continue YOLO',    color: '#f59e0b', abbr: 'CY', logo: '/logo-continue.png' },
@@ -58,14 +57,8 @@ function isCodexTranscriptAgentType(agentType) {
   return agentType === 'codex' || agentType === 'codex-desktop';
 }
 
-function transcriptRenderTailLimitForAgentType(agentType) {
-  return isCodexTranscriptAgentType(agentType)
-    ? CODEX_TRANSCRIPT_RENDER_TAIL_LIMIT
-    : TRANSCRIPT_RENDER_TAIL_LIMIT;
-}
-
 function historyLimitForAgentType(agentType) {
-  if (agentType === 'codex_cli') return CODEX_CLI_INITIAL_HISTORY_LIMIT;
+  if (agentType === 'codex_cli' || agentType === 'cursor_cli') return CODEX_CLI_INITIAL_HISTORY_LIMIT;
   if (isCodexTranscriptAgentType(agentType)) return CODEX_INITIAL_HISTORY_LIMIT;
   return DEFAULT_INITIAL_HISTORY_LIMIT;
 }
@@ -133,14 +126,9 @@ function messageIdentityKey(msg, fallbackIndex = 0) {
   ].join(':');
 }
 
-function scrollIdentityKeysForMessages(messages, renderAll = false, tailLimit = TRANSCRIPT_RENDER_TAIL_LIMIT) {
+function scrollIdentityKeysForMessages(messages) {
   const list = Array.isArray(messages) ? messages : [];
-  const limit = Math.max(1, Number(tailLimit) || TRANSCRIPT_RENDER_TAIL_LIMIT);
-  const keySource = (!renderAll && list.length > limit)
-    ? list.slice(-limit)
-    : list;
-  const offset = list.length - keySource.length;
-  return keySource.map((msg, i) => messageIdentityKey(msg, offset + i));
+  return list.map((msg, i) => messageIdentityKey(msg, i));
 }
 
 function setScrollTopInstant(element, value) {
@@ -182,6 +170,7 @@ function normalizeContentBlocks(blocks) {
       if (type === 'file_change') return { ...block, type: 'file_changes' };
       if (type === 'tool') return { ...block, type: 'tool_call' };
       if (type === 'thought') return { ...block, type: 'thinking' };
+      if (type === 'worked' || type === 'activity') return { ...block, type: 'status' };
       return block;
     });
 }
@@ -239,10 +228,24 @@ function ContentBlockActions({ actions }) {
   );
 }
 
+function TranscriptDisclosure({ className, summary, children }) {
+  const [open, setOpen] = React.useState(true);
+  return (
+    <details
+      className={className}
+      open={open}
+      onToggle={(event) => setOpen(event.currentTarget.open)}
+    >
+      <summary>{summary}</summary>
+      {children}
+    </details>
+  );
+}
+
 function ContentBlocks({ blocks, monospace, autoExpandLongCodeBlocks, onOpenPath, agentType }) {
   const normalized = normalizeContentBlocks(blocks);
   if (normalized.length === 0) return null;
-  const isCodexCli = safeString(agentType).toLowerCase() === 'codex_cli';
+  const isCursor = safeString(agentType).toLowerCase() === 'cursor';
   function blockBody(block) {
     const terminalParts = [
       block.workdir ? `cwd: ${block.workdir}` : null,
@@ -254,74 +257,83 @@ function ContentBlocks({ blocks, monospace, autoExpandLongCodeBlocks, onOpenPath
     if (terminalParts.length) return terminalParts.join('\n\n');
     return normalizeMessageContent(block.content || block.text || block.markdown || '');
   }
-  function explicitOpen(block) {
-    if (block.collapsed === false || block.default_open === true || block.open === true) return true;
-    if (block.collapsed === true) return false;
-    return null;
-  }
-  function isCodexCliExpandedToolBlock(block, title) {
-    if (!isCodexCli) return false;
-    if (block.command) return true;
-    const normalizedTitle = safeString(title).toLowerCase();
-    if (safeString(block.type).toLowerCase() === 'tool_call') return true;
-    return normalizedTitle.startsWith('tool:')
-      || normalizedTitle.includes('shell_command')
-      || normalizedTitle.includes('local_shell')
-      || normalizedTitle.includes('custom_tool');
-  }
   return (
-    <div className="content-blocks">
+    <div className={`content-blocks${isCursor ? ' content-blocks-cursor' : ''}`}>
       {normalized.map((block, index) => {
         const type = safeString(block.type || 'markdown').toLowerCase();
         const title = safeString(block.title || block.label || block.summary || type);
         const body = blockBody(block);
-        if (type === 'thinking') {
+        if (type === 'status') {
           return (
-            <details key={index} className="content-block content-block-thinking" open={block.collapsed === false}>
-              <summary>{title || 'Thinking'}</summary>
-              {body && <MarkdownContent content={body} monospace={monospace} autoExpandLongCodeBlocks={autoExpandLongCodeBlocks} onOpenPath={onOpenPath} />}
-            </details>
+            <div key={index} className="content-block content-block-status-chip" title={title}>
+              {title || 'Status'}
+            </div>
+          );
+        }
+        if (type === 'thinking') {
+          // Cursor "Thought for Ns" chips are header-only; keep them compact like Agents.
+          const bodyIsTitleOnly = !body || safeString(body).replace(/\s+/g, ' ').trim() === title;
+          if (isCursor && bodyIsTitleOnly) {
+            return (
+              <div key={index} className="content-block content-block-status-chip thinking" title={title}>
+                {title || 'Thinking'}
+              </div>
+            );
+          }
+          return (
+            <TranscriptDisclosure key={index} className="content-block content-block-thinking" summary={title || 'Thinking'}>
+              {body && !bodyIsTitleOnly && <MarkdownContent content={body} monospace={monospace} autoExpandLongCodeBlocks={autoExpandLongCodeBlocks} onOpenPath={onOpenPath} />}
+            </TranscriptDisclosure>
           );
         }
         if (type === 'tool_call') {
-          const open = explicitOpen(block);
+          // Cursor step-group headers ("Explored…", "Running…") are often body-less.
+          const bodyIsTitleOnly = !body || safeString(body).replace(/\s+/g, ' ').trim() === title;
+          if (isCursor && bodyIsTitleOnly) {
+            return (
+              <div key={index} className="content-block content-block-status-chip tool" title={title}>
+                {title || 'Tool'}
+              </div>
+            );
+          }
           return (
-            <details key={index} className="content-block content-block-tool" open={open ?? (block.status === 'running' || isCodexCliExpandedToolBlock(block, title))}>
-              <summary>
+            <TranscriptDisclosure key={index} className="content-block content-block-tool" summary={(
+              <>
                 <span>{title || 'Tool'}</span>
                 {block.status && <span className={`content-block-status ${safeString(block.status).toLowerCase()}`}>{block.status}</span>}
-              </summary>
+              </>
+            )}>
               {body && <pre className="content-block-pre">{body}</pre>}
               <ContentBlockActions actions={block.actions} />
-            </details>
+            </TranscriptDisclosure>
           );
         }
         if (type === 'terminal') {
-          const open = explicitOpen(block);
           return (
-            <details key={index} className="content-block content-block-terminal" open={open ?? isCodexCli}>
-              <summary>
+            <TranscriptDisclosure key={index} className="content-block content-block-terminal" summary={(
+              <>
                 <span>{title || 'Terminal'}</span>
                 {block.exit_code != null && <span className="content-block-status">exit {block.exit_code}</span>}
-              </summary>
+              </>
+            )}>
               {body && <pre className="content-block-pre">{body}</pre>}
               <ContentBlockActions actions={block.actions} />
-            </details>
+            </TranscriptDisclosure>
           );
         }
         if (type === 'file_changes') {
-          const open = explicitOpen(block);
           const stats = [
             block.files_changed != null ? `${block.files_changed} files` : null,
             block.additions != null ? `+${block.additions}` : null,
             block.deletions != null ? `-${block.deletions}` : null,
           ].filter(Boolean).join(' ');
           return (
-            <details key={index} className="content-block content-block-file-change" open={open ?? isCodexCli}>
-              <summary>
+            <TranscriptDisclosure key={index} className="content-block content-block-file-change" summary={(
+              <>
                 <span>{title || 'File changes'}{stats ? ` ${stats}` : ''}</span>
                 {block.status && <span className={`content-block-status ${safeString(block.status).toLowerCase()}`}>{block.status}</span>}
-              </summary>
+              </>
+            )}>
               {Array.isArray(block.files) && block.files.length > 0 && (
                 <div className="content-block-file-list">
                   {block.files.map((file, fileIndex) => (
@@ -335,7 +347,7 @@ function ContentBlocks({ blocks, monospace, autoExpandLongCodeBlocks, onOpenPath
               )}
               {body && <MarkdownContent content={body} monospace={monospace} autoExpandLongCodeBlocks={autoExpandLongCodeBlocks} onOpenPath={onOpenPath} />}
               <ContentBlockActions actions={block.actions} />
-            </details>
+            </TranscriptDisclosure>
           );
         }
         if (type === 'artifact') {
@@ -409,6 +421,7 @@ function normalizeAgentTypeHint(value) {
   if (raw.includes('continue')) return 'continue';
   if (raw.includes('codex cli') || raw.includes('codex_cli')) return 'codex_cli';
   if (raw.includes('codex desktop')) return 'codex-desktop';
+  if (raw.includes('cursor cli') || raw.includes('cursor_cli')) return 'cursor_cli';
   if (/\bcursor\b/.test(raw) || raw === 'cursor' || raw.includes('cursor ide')) return 'cursor';
   if (raw.includes('codex')) return 'codex';
   if (raw.includes('claude code') || raw.includes('claude')) return 'claude';
@@ -1108,7 +1121,8 @@ function QueuedItem({ qm, onSteer, onDiscard, onEdit }) {
   if (qm.native) {
     return (
       <div className="queued-item native">
-        <span className="queued-item-text">{qm.content.length > 80 ? qm.content.substring(0, 77) + '...' : qm.content}</span>
+        <span className="queued-item-text">{qm.content}</span>
+        {qm.status && qm.status !== 'queued' && <span className={`queued-item-status ${qm.status}`}>{qm.status}</span>}
         <div className="queued-actions">
           <button className="steer-btn" onClick={onSteer} title="Click Steer in Codex">Steer ▸</button>
           <button className="queued-trash-btn" onClick={onDiscard} title="Delete queued message">🗑</button>
@@ -1119,7 +1133,7 @@ function QueuedItem({ qm, onSteer, onDiscard, onEdit }) {
 
   return (
     <div className="queued-item">
-      <span className="queued-item-text">{qm.content.length > 80 ? qm.content.substring(0, 77) + '...' : qm.content}</span>
+      <span className="queued-item-text">{qm.content}</span>
       <div className="queued-actions">
         <button className="steer-btn" onClick={onSteer} title="Send to agent now">Steer ▸</button>
         <button className="queued-trash-btn" onClick={onDiscard} title="Discard message">🗑</button>
@@ -1295,12 +1309,18 @@ function formatClockDuration(totalSeconds, { includeSeconds = false } = {}) {
   return `${hours}h ${String(remMinutes).padStart(2, '0')}m`;
 }
 
-function formatGoalElapsed(goal, nowMs) {
+function formatGoalElapsed(goal, nowMs, activity) {
   if (!goal) return '';
   const base = Number(goal.time_used_seconds ?? goal.timeUsedSeconds ?? 0) || 0;
-  const updated = goal.updated_at ? new Date(goal.updated_at).getTime() : 0;
-  const liveDelta = goal.status === 'active' && Number.isFinite(updated) && updated > 0
-    ? Math.max(0, Math.floor((nowMs - updated) / 1000))
+  const goalUpdated = goal.updated_at ? new Date(goal.updated_at).getTime() : 0;
+  const taskStarted = activity?.startedAt ? new Date(activity.startedAt).getTime() : 0;
+  const activityIsLive = activity?.kind && activity.kind !== 'idle';
+  const liveAnchor = Math.max(
+    Number.isFinite(goalUpdated) ? goalUpdated : 0,
+    Number.isFinite(taskStarted) ? taskStarted : 0,
+  );
+  const liveDelta = goal.status === 'active' && activityIsLive && liveAnchor > 0
+    ? Math.max(0, Math.floor((nowMs - liveAnchor) / 1000))
     : 0;
   return formatClockDuration(base + liveDelta);
 }
@@ -1313,7 +1333,7 @@ function ActivityRow({ activity, thinkingText, isClaude, pinned = false, showGoa
   const goalActive = goal?.status === 'active';
   const [nowMs, setNowMs] = React.useState(Date.now());
   React.useEffect(() => {
-    if ((!isActive || !(activity?.startedAt || activity?.updatedAt)) && !goalActive) return undefined;
+    if (!isActive || !(activity?.startedAt || activity?.updatedAt)) return undefined;
     const id = setInterval(() => setNowMs(Date.now()), 1000);
     return () => clearInterval(id);
   }, [isActive, activity?.startedAt, activity?.updatedAt, goalActive, goal?.updated_at]);
@@ -1323,7 +1343,7 @@ function ActivityRow({ activity, thinkingText, isClaude, pinned = false, showGoa
   const hint = activity?.interruptHint || activity?.interrupt_hint || '';
   const labelDetail = [elapsed, hint].filter(Boolean).join(' • ');
   const label = baseLabel && labelDetail ? `${baseLabel} (${labelDetail})` : baseLabel;
-  const goalElapsed = goal ? formatGoalElapsed(goal, nowMs) : '';
+  const goalElapsed = goal ? formatGoalElapsed(goal, nowMs, activity) : '';
   const isThinkingKind = kind === 'thinking' || kind === 'generating';
   const showBlob = isClaude && isThinkingKind;
   const visibleThinkingText = showBlob ? '' : (thinkingText || activity?.thinkingContent || '').trim();
@@ -1369,7 +1389,7 @@ function ActivityRow({ activity, thinkingText, isClaude, pinned = false, showGoa
 function TaskList({ taskList, sessionId }) {
   if (!taskList || !taskList.tasks || taskList.tasks.length === 0) return null;
   const storageKey = sessionId ? `remote-agent-chat:task-list-collapsed:${sessionId}` : null;
-  const defaultCollapsed = taskList.tasks.length > 8;
+  const defaultCollapsed = false;
   const [collapsed, setCollapsed] = React.useState(() => {
     if (!storageKey) return defaultCollapsed;
     const saved = localStorage.getItem(storageKey);
@@ -1578,6 +1598,7 @@ function ErrorPromptInline({ prompt, sessionId, onRespond }) {
   return (
     <div className="inline-error-prompt">
       <div className="inline-error-prompt-body">
+        <div className="inline-error-prompt-title">{safeString(prompt?.title, 'Codex requires attention')}</div>
         <div className="inline-error-prompt-message">{safeString(prompt?.message, 'There was an error handling the model response.')}</div>
         {errorOutput && <pre className="inline-error-prompt-output">{errorOutput}</pre>}
         {prompt?.error && <div className="permission-error">{prompt.error}</div>}
@@ -1614,6 +1635,7 @@ function NewSessionPanel({ launchStates, onLaunch, onResume, onClose, workspaces
   const [customPath,  setCustomPath]  = React.useState('');
   const [claudeCliModel, setClaudeCliModel] = React.useState('deepseek-v4-pro:cloud');
   const [codexCliModel, setCodexCliModel] = React.useState('gpt-5.5');
+  const [cursorCliModel, setCursorCliModel] = React.useState('grok-4.5-fast-high');
   const [requestId,   setRequestId]   = React.useState(null);
   const [history,     setHistory]     = React.useState([]);
   const [historyLoading, setHistoryLoading] = React.useState(false);
@@ -1647,6 +1669,8 @@ function NewSessionPanel({ launchStates, onLaunch, onResume, onClose, workspaces
       ? { model_id: claudeCliModel.trim() || 'default' }
       : agentType === 'codex_cli'
       ? { model_id: codexCliModel.trim() || 'gpt-5.5', permission_mode: 'workspace-write', effort: 'medium' }
+      : agentType === 'cursor_cli'
+      ? { model_id: cursorCliModel.trim() || 'grok-4.5-fast-high', permission_mode: 'force' }
       : {};
     const rid = onLaunch(agentType, wsPath || undefined, launchOptions);
     setRequestId(rid);
@@ -1654,11 +1678,16 @@ function NewSessionPanel({ launchStates, onLaunch, onResume, onClose, workspaces
 
   function handleResume(session) {
     if (isLaunching) return;
-    // Use the session's stored workspace, falling back to the dropdown selection
+    // Prefer the history row's agent type so Resume doesn't launch the wrong product.
+    const resumeAgentType = session.agent_type || agentType;
     const wsPath = session.workspace_path
       || (wsMode === 'custom' ? customPath.trim() : wsMode)
       || undefined;
-    const rid = onResume(session.session_id, agentType, wsPath);
+    const rid = onResume(session.session_id, resumeAgentType, wsPath, {
+      cli_session_id: session.cli_session_id || undefined,
+      model_id: session.model_id || undefined,
+      permission_mode: session.permission_mode || undefined,
+    });
     setRequestId(rid);
   }
 
@@ -1766,6 +1795,18 @@ function NewSessionPanel({ launchStates, onLaunch, onResume, onClose, workspaces
               ))}
             </select>
           )}
+          {agentType === 'cursor_cli' && (
+            <select
+              className="new-session-workspace"
+              value={cursorCliModel}
+              onChange={e => setCursorCliModel(e.target.value)}
+              disabled={isLaunching}
+            >
+              {KNOWN_CURSOR_CLI_MODELS.map(model => (
+                <option key={model.id} value={model.id}>{model.label}</option>
+              ))}
+            </select>
+          )}
           {launchError && <div className="new-session-error">{launchError}</div>}
           <button className="new-session-submit" type="submit" disabled={isLaunching}>
             {isLaunching ? <span className="new-session-spinner" /> : null}
@@ -1798,7 +1839,9 @@ function NewSessionPanel({ launchStates, onLaunch, onResume, onClose, workspaces
             <div className="session-history-empty">No past sessions found</div>
           ) : (
             <div className="session-history-list">
-              {history.map(s => (
+              {history
+                .filter(s => !agentType || !s.agent_type || s.agent_type === agentType)
+                .map(s => (
                 <button
                   key={s.session_id}
                   className="session-history-item"
@@ -1808,6 +1851,7 @@ function NewSessionPanel({ launchStates, onLaunch, onResume, onClose, workspaces
                   <div className="session-history-preview">{s.preview || '(empty session)'}</div>
                   <div className="session-history-meta">
                     <span>{s.message_count} msg{s.message_count !== 1 ? 's' : ''}</span>
+                    {s.agent_type && <span className="session-history-workspace">{AGENT_CONFIG[s.agent_type]?.name || s.agent_type}</span>}
                     {s.workspace_name && <span className="session-history-workspace" title={s.workspace_path || ''}>{s.workspace_name}</span>}
                     <span>{timeAgo(s.last_active_at)}</span>
                   </div>
@@ -1827,8 +1871,11 @@ function NewSessionPanel({ launchStates, onLaunch, onResume, onClose, workspaces
 
 const PERMISSION_MODES = {
   claude: [
-    { value: 'bypassPermissions', label: 'Bypass (allow all)' },
-    { value: 'default',           label: 'Default (ask each time)' },
+    { value: 'default',           label: 'Ask before edit' },
+    { value: 'acceptEdits',       label: 'Edit automatically' },
+    { value: 'plan',              label: 'Plan mode' },
+    { value: 'auto',              label: 'Auto mode' },
+    { value: 'bypassPermissions', label: 'Bypass permissions' },
   ],
   claude_cli: [
     { value: 'default',           label: 'Default' },
@@ -1856,12 +1903,19 @@ const PERMISSION_MODES = {
     { value: 'workspace-write',    label: 'Workspace write' },
     { value: 'danger-full-access', label: 'Full access' },
   ],
+  cursor_cli: [
+    { value: 'default', label: 'Default' },
+    { value: 'force',   label: 'Force (Yolo)' },
+    { value: 'plan',    label: 'Plan' },
+    { value: 'ask',     label: 'Ask' },
+  ],
   codex:  [],  // Codex permission mode not configurable via settings
   gemini: [],  // Gemini permission mode not configurable via settings
 };
 
 function defaultPermissionModeFor(agentType) {
   if (agentType === 'codex_cli') return 'workspace-write';
+  if (agentType === 'cursor_cli') return 'force';
   if (agentType === 'continue_yolo' || agentType === 'roo_code' || agentType === 'cline') return 'ask';
   return 'default';
 }
@@ -1882,9 +1936,14 @@ const KNOWN_CLAUDE_MODELS = [
 ];
 
 const KNOWN_CODEX_CLI_MODELS = [
+  { id: 'gpt-5.6',                     label: 'GPT-5.6' },
+  { id: 'gpt-5.6-sol',                 label: 'GPT-5.6 Sol' },
+  { id: 'gpt-5.6-terra',               label: 'GPT-5.6 Terra' },
+  { id: 'gpt-5.6-luna',                label: 'GPT-5.6 Luna' },
   { id: 'gpt-5.5',                     label: 'GPT-5.5' },
   { id: 'gpt-5.4',                     label: 'GPT-5.4' },
   { id: 'gpt-5.4-mini',                label: 'GPT-5.4 Mini' },
+  { id: 'gpt-5.3-codex-spark',         label: 'GPT-5.3 Codex Spark' },
   { id: 'gpt-5.3-codex',               label: 'GPT-5.3 Codex' },
   { id: 'gpt-5.2-codex',               label: 'GPT-5.2 Codex' },
   { id: 'gpt-5.2',                     label: 'GPT-5.2' },
@@ -1893,6 +1952,17 @@ const KNOWN_CODEX_CLI_MODELS = [
   { id: 'gpt-5',                       label: 'GPT-5' },
   { id: 'ollama:deepseek-v4-pro:cloud', label: 'DeepSeek V4 Pro (Ollama Cloud)' },
   { id: 'ollama:kimi-k2.6:cloud',       label: 'Kimi K2.6 (Ollama Cloud)' },
+];
+
+const KNOWN_CURSOR_CLI_MODELS = [
+  { id: 'grok-4.5-fast-high',          label: 'Grok 4.5 Fast (High)' },
+  { id: 'grok-4.5-fast-xhigh',         label: 'Grok 4.5 Fast (XHigh)' },
+  { id: 'claude-fable-5-thinking-high', label: 'Claude Fable 5 (Thinking High)' },
+  { id: 'claude-opus-4-8-thinking-high',label: 'Claude Opus 4.8 (Thinking High)' },
+  { id: 'composer-2.5',                 label: 'Composer 2.5' },
+  { id: 'composer-2.5-fast',            label: 'Composer 2.5 Fast' },
+  { id: 'gpt-5.5-high',                 label: 'GPT-5.5 (High)' },
+  { id: 'gpt-5.3-codex',                label: 'GPT-5.3 Codex' },
 ];
 
 const ANTIGRAVITY_MODES = [
@@ -1940,6 +2010,7 @@ function composerModelOptionsFor(agentType, config) {
   if (agentType === 'continue_yolo' || agentType === 'continue' || agentType === 'roo_code' || agentType === 'cline') return [];
   if (agentType === 'claude_cli') return KNOWN_CLAUDE_MODELS;
   if (agentType === 'codex_cli') return KNOWN_CODEX_CLI_MODELS;
+  if (agentType === 'cursor_cli') return KNOWN_CURSOR_CLI_MODELS;
   if (agentType === 'antigravity' || agentType === 'antigravity_panel') return KNOWN_ANTIGRAVITY_MODELS;
   if (agentType === 'gemini') return KNOWN_GEMINI_MODELS;
   return KNOWN_CLAUDE_MODELS;
@@ -1998,6 +2069,7 @@ function AgentSettingsPanel({ session, config, onRequestRefresh, onSetModel, onS
   const modeOptions  = modeOptionsFor(agentType, config);
   let modelOptions = (agentType === 'claude' || agentType === 'claude_cli') ? KNOWN_CLAUDE_MODELS
     : agentType === 'codex_cli' ? KNOWN_CODEX_CLI_MODELS
+    : agentType === 'cursor_cli' ? KNOWN_CURSOR_CLI_MODELS
     : (agentType === 'antigravity' || agentType === 'antigravity_panel') ? KNOWN_ANTIGRAVITY_MODELS
     : agentType === 'gemini' ? KNOWN_GEMINI_MODELS
     : [];
@@ -2212,7 +2284,7 @@ function AgentSettingsPanel({ session, config, onRequestRefresh, onSetModel, onS
           </div>
         )}
 
-        {(agentType === 'claude' || agentType === 'claude_cli' || agentType === 'codex_cli' || agentType === 'continue_yolo' || isClineLikeAgentType(agentType)) && (
+        {(agentType === 'claude' || agentType === 'claude_cli' || agentType === 'codex_cli' || agentType === 'cursor_cli' || agentType === 'continue_yolo' || isClineLikeAgentType(agentType)) && (
           <div className="settings-row">
             <span className="settings-label">Permission mode</span>
             {caps.permission_mode_change && permModes.length > 0 ? (
@@ -2243,7 +2315,16 @@ function AgentSettingsPanel({ session, config, onRequestRefresh, onSetModel, onS
           </div>
         )}
 
-        {(agentType === 'claude_cli' || agentType === 'codex_cli') && caps.set_effort && (config?.available_efforts || []).length > 0 && (
+        {agentType === 'claude' && effortLevel && effortLevel !== 'unknown' && (
+          <div className="settings-row">
+            <span className="settings-label">Effort</span>
+            <span className="settings-value">
+              {((config?.available_efforts || []).find(m => m.id === effortLevel) || {}).label || effortLevel}
+            </span>
+          </div>
+        )}
+
+        {(agentType === 'claude_cli' || agentType === 'codex_cli' || agentType === 'cursor_cli') && caps.set_effort && (config?.available_efforts || []).length > 0 && (
           <div className="settings-row">
             <span className="settings-label">Effort</span>
             <select
@@ -3577,7 +3658,6 @@ function App() {
   const [showComposerSettings, setShowComposerSettings] = useState(false);
   const [stopPending, setStopPending]       = useState({});
   const [showJumpButton, setShowJumpButton] = useState(false);
-  const [expandedTranscriptSessions, setExpandedTranscriptSessions] = useState({});
   const [showChatList, setShowChatList]     = useState(false);
   const [agv2NavigatorOpen, setAgv2NavigatorOpen] = useState(true);
   const [optimisticV2ChatFocus, setOptimisticV2ChatFocus] = useState({});
@@ -3617,8 +3697,6 @@ function App() {
   const activeMessagesForScroll = activeSession && messages[activeSession]
     ? messages[activeSession]
     : EMPTY_MESSAGES;
-  const activeTranscriptExpandedForScroll = !!(activeSession && expandedTranscriptSessions[activeSession]);
-  const activeTranscriptRenderTailLimitForScroll = transcriptRenderTailLimitForAgentType(activeSessionMeta?.agent_type);
   const activeActivityForScroll = activeSession ? activities[activeSession] : null;
   const activeThinkingForScroll = activeSession ? (thinkingContent[activeSession] || '') : '';
   const activePermissionPromptForScroll = activeSession ? permissionPrompts[activeSession] || null : null;
@@ -3849,11 +3927,7 @@ function App() {
   function pinTranscriptToNewest() {
     const list = messagesListRef.current;
     if (!list) return;
-    const keys = scrollIdentityKeysForMessages(
-      activeMessagesForScroll,
-      activeTranscriptExpandedForScroll,
-      activeTranscriptRenderTailLimitForScroll,
-    );
+    const keys = scrollIdentityKeysForMessages(activeMessagesForScroll);
     pinnedToNewestUntilRef.current = Date.now() + 5000;
     stickTranscriptToNewest(keys, 4);
   }
@@ -3864,11 +3938,7 @@ function App() {
   useLayoutEffect(() => {
     const list = messagesListRef.current;
     if (!list) return;
-    const keys = scrollIdentityKeysForMessages(
-      activeMessagesForScroll,
-      activeTranscriptExpandedForScroll,
-      activeTranscriptRenderTailLimitForScroll,
-    );
+    const keys = scrollIdentityKeysForMessages(activeMessagesForScroll);
     const prev = scrollSnapshotRef.current || {};
     const sameSession = prev.sessionId === activeSession;
     const prevKeys = Array.isArray(prev.keys) ? prev.keys : [];
@@ -3922,7 +3992,7 @@ function App() {
       clientHeight: list.clientHeight,
       atBottom: atBottom || stickyToNewestRef.current,
     };
-  }, [activeSession, activeMessagesForScroll, activeTranscriptExpandedForScroll, activeLiveScrollVersion]);
+  }, [activeSession, activeMessagesForScroll, activeLiveScrollVersion]);
 
   // Fetch agent config whenever the active session changes
   useEffect(() => {
@@ -4216,18 +4286,9 @@ async function uploadBinaryDraft(sessionId, base64, mimeType, filename) {
     if (baseline >= rawCurrentMessages.length) return EMPTY_MESSAGES;
     return rawCurrentMessages.slice(baseline);
   }, [rawCurrentMessages, draftBaseline]);
-  const renderAllLoadedTranscript = !!(activeSession && expandedTranscriptSessions[activeSession]);
-  const transcriptRenderTailLimit = transcriptRenderTailLimitForAgentType(activeSessionMeta?.agent_type);
   const renderedMessages = React.useMemo(() => {
-    if (renderAllLoadedTranscript || currentMessages.length <= transcriptRenderTailLimit) {
-      return currentMessages.filter(msg => hasVisibleMessage(msg));
-    }
-    const tailWindow = currentMessages.slice(-transcriptRenderTailLimit * 2);
-    return tailWindow.filter(msg => hasVisibleMessage(msg)).slice(-transcriptRenderTailLimit);
-  }, [currentMessages, renderAllLoadedTranscript, transcriptRenderTailLimit]);
-  const hiddenLoadedMessageCount = renderAllLoadedTranscript
-    ? 0
-    : Math.max(0, currentMessages.length - renderedMessages.length);
+    return currentMessages.filter(msg => hasVisibleMessage(msg));
+  }, [currentMessages]);
   const activePrompt    = activeSession ? permissionPrompts[activeSession] || null : null;
   const activeErrorPrompt = activeSession ? errorPrompts[activeSession] || null : null;
   const activeBlockingErrorPrompt = isBlockingErrorPrompt(activeErrorPrompt) ? activeErrorPrompt : null;
@@ -4256,7 +4317,7 @@ async function uploadBinaryDraft(sessionId, base64, mimeType, filename) {
   useEffect(() => {
     if (!activeSession || !connected) return;
     const tailOptions = historyRequestOptionsFor(activeSessionMeta);
-    const chunkSource = activeSessionMeta?.agent_type === 'codex_cli' ? 'native' : 'relay_sqlite';
+    const chunkSource = (activeSessionMeta?.agent_type === 'codex_cli' || activeSessionMeta?.agent_type === 'cursor_cli') ? 'native' : 'relay_sqlite';
     requestHistoryChunk(activeSession, { ...tailOptions, mode: 'tail', source: chunkSource });
   }, [activeSession, connected, activeSessionMeta?.agent_type]);
   const isAntigravityV2 = activeSessionMeta?.agent_type === 'antigravity-v2';
@@ -4418,7 +4479,7 @@ async function uploadBinaryDraft(sessionId, base64, mimeType, filename) {
     && lastUserText
     && !((activeSessionMeta?.agent_type === 'cline' || activeSessionMeta?.agent_type === 'roo_code') && activeContextCard)
   );
-  const assistantMonospace = activeSessionMeta?.agent_type === 'codex' || activeSessionMeta?.agent_type === 'codex_cli';
+  const assistantMonospace = activeSessionMeta?.agent_type === 'codex' || activeSessionMeta?.agent_type === 'codex_cli' || activeSessionMeta?.agent_type === 'cursor_cli';
   const lastAssistantMsg = React.useMemo(() => {
     for (let i = currentMessages.length - 1; i >= 0; i--) {
       if (currentMessages[i]?.role === 'assistant') return currentMessages[i];
@@ -4447,28 +4508,8 @@ async function uploadBinaryDraft(sessionId, base64, mimeType, filename) {
     && liveThinkingText !== lastAssistantText
     && !lastAssistantText.includes(liveThinkingText)
   );
-  const showInlineClaudeActivity = !!(
+  const showTranscriptFooterActivity = !!(
     activeActivity
-    && !activeActivity?.task_list
-    && activeSessionMeta?.agent_type === 'claude'
-  );
-  const isActiveCodexCli = activeSessionMeta?.agent_type === 'codex_cli';
-  const showLiveStatusStrip = !!(
-    activeActivity
-    && !showInlineClaudeActivity
-    && (
-      (!isActiveCodexCli && activeActivity?.goal)
-      || (!isActiveCodexCli && activeActivity?.task_list)
-      || (
-        !isActiveCodexCli
-        && (activeActivity.kind !== 'idle' || hasSubstantiveLiveText(liveThinkingText || activeActivity.thinkingContent || ''))
-      )
-    )
-  );
-  const showCodexCliWorkingStrip = !!(
-    isActiveCodexCli
-    && activeActivity
-    && !showInlineClaudeActivity
     && (
       activeActivity?.goal
       || activeActivity?.task_list
@@ -4485,7 +4526,7 @@ async function uploadBinaryDraft(sessionId, base64, mimeType, filename) {
   const partialHistoryTotal = Number(activeHistoryMeta?.total || partialHistoryLoaded || 0);
   function loadOlderActiveHistory() {
     if (!activeSession) return;
-    const chunkSource = activeSessionMeta?.agent_type === 'codex_cli' ? 'native' : 'relay_sqlite';
+    const chunkSource = (activeSessionMeta?.agent_type === 'codex_cli' || activeSessionMeta?.agent_type === 'cursor_cli') ? 'native' : 'relay_sqlite';
     requestHistoryChunk(activeSession, {
       mode: activeHistoryMeta?.cursor ? 'older' : 'tail',
       source: chunkSource,
@@ -4495,14 +4536,24 @@ async function uploadBinaryDraft(sessionId, base64, mimeType, filename) {
       ...historyRequestOptionsFor(activeSessionMeta),
     });
   }
+  function retryActiveHistory() {
+    if (!activeSession) return;
+    const chunkSource = (activeSessionMeta?.agent_type === 'codex_cli' || activeSessionMeta?.agent_type === 'cursor_cli') ? 'native' : 'relay_sqlite';
+    requestHistoryChunk(activeSession, {
+      ...historyRequestOptionsFor(activeSessionMeta),
+      mode: 'tail',
+      source: chunkSource,
+      userInitiated: true,
+    });
+  }
   const shouldBottomAlignMessages = !!(
     activeSession
-    && (currentMessages.length > 0 || showLiveAssistantDraft || showInlineClaudeActivity)
+    && (currentMessages.length > 0 || showLiveAssistantDraft)
   );
   const activeAgentMemoKey = activeAgentKey(activeAgent);
   const renderedMessageNodes = React.useMemo(() => (
     renderedMessages.map((msg, i) => {
-      const messageKey = messageIdentityKey(msg, hiddenLoadedMessageCount + i);
+      const messageKey = messageIdentityKey(msg, i);
       const preview = transcriptPreview?.sessionId === activeSession && transcriptPreview?.messageKey === messageKey
         ? transcriptPreview
         : null;
@@ -4526,7 +4577,6 @@ async function uploadBinaryDraft(sessionId, base64, mimeType, filename) {
     })
   ), [
     renderedMessages,
-    hiddenLoadedMessageCount,
     activeSession,
     activeAgentMemoKey,
     assistantMonospace,
@@ -4775,7 +4825,7 @@ async function uploadBinaryDraft(sessionId, base64, mimeType, filename) {
           <NewSessionPanel
             launchStates={launchStates}
             onLaunch={(agentType, workspacePath, options) => launchSession(agentType, workspacePath, options)}
-            onResume={(sourceSession, agentType, workspacePath) => resumeSession(sourceSession, agentType, workspacePath)}
+            onResume={(sourceSession, agentType, workspacePath, options) => resumeSession(sourceSession, agentType, workspacePath, options)}
             onClose={() => setShowNewSession(false)}
             workspaces={workspaces}
           />
@@ -5045,25 +5095,6 @@ async function uploadBinaryDraft(sessionId, base64, mimeType, filename) {
           </div>
         </div>
 
-        {activeActivity?.task_list && (
-          <div className="session-tasklist-strip">
-            <TaskList taskList={activeActivity.task_list} sessionId={activeSession} />
-          </div>
-        )}
-
-        {showLiveStatusStrip && (
-          <div className="session-live-status-strip">
-            <ActivityRow
-              activity={activeActivity}
-              thinkingText={activeSession ? (thinkingContent[activeSession] || '') : ''}
-              isClaude={activeSessionMeta?.agent_type === 'claude'}
-              showStatus={!isActiveCodexCli}
-              showCommand={!isActiveCodexCli}
-              pinned
-            />
-          </div>
-        )}
-
         {(activeSessionMeta?.agent_type === 'cline' || activeSessionMeta?.agent_type === 'roo_code') && activeContextCard && (
           <div className={`cline-context-strip ${activeSessionMeta?.agent_type === 'roo_code' ? 'roo-context-strip' : ''}`}>
             <ClineContextCard
@@ -5195,7 +5226,7 @@ async function uploadBinaryDraft(sessionId, base64, mimeType, filename) {
             onClick={pinTranscriptToNewest}
           >↓ Jump to Newest</button>
         )}
-        <div className={`messages${showInlineClaudeActivity ? ' compact-footer-gap' : ''}`} ref={messagesListRef}>
+        <div className="messages" ref={messagesListRef}>
           {shouldBottomAlignMessages && <div className="messages-flex-spacer" />}
           {activePrompt && (
             <PermissionOverlay
@@ -5297,6 +5328,12 @@ async function uploadBinaryDraft(sessionId, base64, mimeType, filename) {
                 ))}
               </div>
             </div>
+          ) : currentMessages.length === 0 && activeHistoryMeta?.error ? (
+            <div className="empty-state history-error-state">
+              <div className="icon">⚠</div>
+              <div>{activeHistoryMeta.error}</div>
+              <button type="button" className="thread-picker-new" onClick={retryActiveHistory}>Retry transcript</button>
+            </div>
           ) : currentMessages.length === 0 && activeHistoryLoading ? (
             <div className="empty-state history-loading-state">
               <span className="new-session-spinner" />
@@ -5304,29 +5341,7 @@ async function uploadBinaryDraft(sessionId, base64, mimeType, filename) {
             </div>
           ) : currentMessages.length === 0 ? (
             <div className="empty-state"><div className="icon">💬</div><div>No messages yet</div></div>
-          ) : (
-            <>
-              {hiddenLoadedMessageCount > 0 && (
-                <div className="history-tail-banner transcript-render-window-banner">
-                  <span>Rendering latest {renderedMessages.length.toLocaleString()} of {currentMessages.length.toLocaleString()} loaded messages</span>
-                  <button
-                    type="button"
-                    onClick={() => setExpandedTranscriptSessions(prev => ({ ...prev, [activeSession]: true }))}
-                  >Render all loaded</button>
-                </div>
-              )}
-              {renderAllLoadedTranscript && currentMessages.length > transcriptRenderTailLimit && (
-                <div className="history-tail-banner transcript-render-window-banner">
-                  <span>Rendering all {currentMessages.length.toLocaleString()} loaded messages</span>
-                  <button
-                    type="button"
-                    onClick={() => setExpandedTranscriptSessions(prev => ({ ...prev, [activeSession]: false }))}
-                  >Return to latest only</button>
-                </div>
-              )}
-              {renderedMessageNodes}
-            </>
-          )}
+          ) : renderedMessageNodes}
           {showLiveAssistantDraft && (
             <div className={`message assistant live-draft${assistantMonospace ? ' monospace' : ''}`}>
               <div className="assistant-gutter">
@@ -5345,11 +5360,6 @@ async function uploadBinaryDraft(sessionId, base64, mimeType, filename) {
               </div>
             </div>
           )}
-          {showInlineClaudeActivity && <ActivityRow
-            activity={activeActivity}
-            thinkingText={activeSession ? (thinkingContent[activeSession] || '') : ''}
-            isClaude
-          />}
           {activeInlineErrorPrompt && !activePrompt && (
             <ErrorPromptInline
               prompt={activeInlineErrorPrompt}
@@ -5359,17 +5369,31 @@ async function uploadBinaryDraft(sessionId, base64, mimeType, filename) {
           )}
           <div ref={messagesEndRef} />
         </div>
-        {!showLiveStatusStrip && !showCodexCliWorkingStrip && activeActivity && !showInlineClaudeActivity && (activeActivity.kind !== 'idle' || hasSubstantiveLiveText(thinkingContent[activeSession] || activeActivity.thinkingContent || '')) && <ActivityRow
-          activity={activeActivity}
-          thinkingText={activeSession ? (thinkingContent[activeSession] || '') : ''}
-          isClaude={activeSessionMeta?.agent_type === 'claude'}
-          pinned
-        />}
         <CodexAutomationPane
           view={activeAutomationView}
           onShow={() => activeSession && showCodexAutomation(activeSession)}
         />
         </div>
+
+        {(activeActivity?.task_list || showTranscriptFooterActivity) && !showFileBrowser && (
+          <div className="transcript-live-footer" data-testid="transcript-live-footer">
+            {activeActivity?.task_list && (
+              <div className="session-tasklist-strip">
+                <TaskList taskList={activeActivity.task_list} sessionId={activeSession} />
+              </div>
+            )}
+            {showTranscriptFooterActivity && (
+              <div className="composer-live-status-strip">
+                <ActivityRow
+                  activity={activeActivity}
+                  thinkingText={activeSession ? (thinkingContent[activeSession] || '') : ''}
+                  isClaude={activeSessionMeta?.agent_type === 'claude'}
+                  pinned
+                />
+              </div>
+            )}
+          </div>
+        )}
 
         {showSettings && activeSession && (
           <AgentSettingsPanel
@@ -5445,17 +5469,6 @@ async function uploadBinaryDraft(sessionId, base64, mimeType, filename) {
             onReject={(changeId) => respondToFileChange(activeSession, changeId, 'reject')}
             onClose={() => setShowDiffViewer(false)}
           />
-        )}
-
-        {showCodexCliWorkingStrip && (
-          <div className="composer-live-status-strip">
-            <ActivityRow
-              activity={activeActivity}
-              thinkingText={activeSession ? (thinkingContent[activeSession] || '') : ''}
-              isClaude={false}
-              pinned
-            />
-          </div>
         )}
 
         <div className="input-area" style={showFileBrowser ? { display: 'none' } : undefined}>
@@ -5704,12 +5717,12 @@ async function uploadBinaryDraft(sessionId, base64, mimeType, filename) {
                     )}
                   </select>
                 )}
-                {(activeSessionMeta?.agent_type === 'claude_cli' || activeSessionMeta?.agent_type === 'codex_cli') && activeConfig?.capabilities?.set_effort && (activeConfig.available_efforts || []).length > 0 && (
+                {(activeSessionMeta?.agent_type === 'claude_cli' || activeSessionMeta?.agent_type === 'codex_cli' || activeSessionMeta?.agent_type === 'cursor_cli') && activeConfig?.capabilities?.set_effort && (activeConfig.available_efforts || []).length > 0 && (
                   <select
                     className="composer-setting-select"
                     value={activeConfig.effort || 'medium'}
                     onChange={e => setAgentEffort(activeSession, e.target.value)}
-                    title={`${activeSessionMeta?.agent_type === 'codex_cli' ? 'Codex' : 'Claude'} CLI effort`}
+                    title={`${activeSessionMeta?.agent_type === 'codex_cli' ? 'Codex' : activeSessionMeta?.agent_type === 'cursor_cli' ? 'Cursor' : 'Claude'} CLI effort`}
                   >
                     {(activeConfig.available_efforts || []).map(m => (
                       <option key={m.id} value={m.id}>{m.label}</option>

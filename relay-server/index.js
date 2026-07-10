@@ -132,6 +132,12 @@ db.exec(`
     updated_at     TEXT NOT NULL DEFAULT (datetime('now'))
   );
 `);
+try {
+  const sessionMetaCols = new Set(db.pragma('table_info(session_meta)').map(r => r.name));
+  if (!sessionMetaCols.has('cli_session_id')) {
+    db.exec(`ALTER TABLE session_meta ADD COLUMN cli_session_id TEXT`);
+  }
+} catch {}
 
 // ── Live schema migrations — must run BEFORE creating indexes on new columns ──
 const existingCols = new Set(db.pragma('table_info(messages)').map(r => r.name));
@@ -378,7 +384,8 @@ const stmtSessionHistory = db.prepare(`
     MAX(m.ts)               AS last_active_at,
     sm.workspace_path,
     sm.workspace_name,
-    sm.agent_type
+    sm.agent_type,
+    sm.cli_session_id
   FROM messages m
   LEFT JOIN session_meta sm ON sm.session_id = m.session
   GROUP BY m.session
@@ -387,16 +394,17 @@ const stmtSessionHistory = db.prepare(`
   LIMIT ?
 `);
 const stmtUpsertSessionMeta = db.prepare(`
-  INSERT INTO session_meta (session_id, workspace_path, workspace_name, agent_type, updated_at)
-  VALUES (?, ?, ?, ?, datetime('now'))
+  INSERT INTO session_meta (session_id, workspace_path, workspace_name, agent_type, cli_session_id, updated_at)
+  VALUES (?, ?, ?, ?, ?, datetime('now'))
   ON CONFLICT(session_id) DO UPDATE SET
     workspace_path = COALESCE(excluded.workspace_path, workspace_path),
     workspace_name = COALESCE(excluded.workspace_name, workspace_name),
     agent_type     = COALESCE(excluded.agent_type, agent_type),
+    cli_session_id = COALESCE(excluded.cli_session_id, cli_session_id),
     updated_at     = datetime('now')
 `);
 const stmtGetSessionMeta = db.prepare(
-  `SELECT session_id, workspace_path, workspace_name, agent_type, updated_at
+  `SELECT session_id, workspace_path, workspace_name, agent_type, cli_session_id, updated_at
    FROM session_meta WHERE session_id = ?`
 );
 const stmtGetHistory     = db.prepare(
@@ -913,6 +921,7 @@ app.get('/api/sessions/history', requireAnyAuth, (req, res) => {
         workspace_path:     r.workspace_path || null,
         workspace_name:     r.workspace_name || null,
         agent_type:         r.agent_type || null,
+        cli_session_id:     r.cli_session_id || null,
       }));
     res.json({ sessions: history });
   } catch (e) {
@@ -1446,18 +1455,28 @@ setInterval(() => {
 
 function startHeartbeat(ws, label) {
   ws._hbAlive = true;
+  ws._hbMisses = 0;
   ws._hbTimer = setInterval(() => {
     if (!ws._hbAlive) {
-      log('warn', 'heartbeat', `${label} missed pong — terminating`);
-      ws.terminate();
-      return;
+      ws._hbMisses += 1;
+      if (ws._hbMisses >= 2) {
+        log('warn', 'heartbeat', `${label} missed two consecutive pongs — terminating`);
+        ws.terminate();
+        return;
+      }
+      log('warn', 'heartbeat', `${label} missed pong — allowing one grace interval`);
+    } else {
+      ws._hbMisses = 0;
     }
     ws._hbAlive = false;
     if (ws.readyState === WebSocket.OPEN) {
       try { ws.ping(); } catch { /* ignore */ }
     }
   }, HEARTBEAT_INTERVAL_MS);
-  ws.on('pong', () => { ws._hbAlive = true; });
+  ws.on('pong', () => {
+    ws._hbAlive = true;
+    ws._hbMisses = 0;
+  });
   ws.on('close', () => clearInterval(ws._hbTimer));
 }
 
@@ -1764,7 +1783,7 @@ function handleProxyConnection(ws, req) {
             session_id: id,
           });
           // Persist workspace info for resume history
-          try { stmtUpsertSessionMeta.run(id, s.workspace_path || null, s.workspace_name || null, s.agent_type || null); } catch {}
+          try { stmtUpsertSessionMeta.run(id, s.workspace_path || null, s.workspace_name || null, s.agent_type || null, s.cli_session_id || null); } catch {}
         }
         touchSession(id);
       });
@@ -1783,7 +1802,7 @@ function handleProxyConnection(ws, req) {
         let count = 0;
         for (const s of sessions) {
           if (!s.session_id) continue;
-          try { stmtUpsertSessionMeta.run(s.session_id, s.workspace_path || null, s.workspace_name || null, s.agent_type || null); count++; } catch {}
+          try { stmtUpsertSessionMeta.run(s.session_id, s.workspace_path || null, s.workspace_name || null, s.agent_type || null, s.cli_session_id || null); count++; } catch {}
         }
         log('info', 'proxy-ws', `Backfilled session_meta for ${count} sessions`);
       }
@@ -1903,8 +1922,18 @@ function handleProxyConnection(ws, req) {
         }
 
         // ── Resume: copy old messages into the new session ──────────────
+        // Skip SQLite replay for Cursor CLI when we resumed the same native
+        // chat id — the proxy already hydrates from local stream-json JSONL.
         if (pending.resume_source && pending.resume_messages && msg.session_id) {
           const newSessionId = msg.session_id;
+          const skipSqliteReplay = (pending.agent_type === 'cursor_cli' || pending.agent_type === 'codex_cli' || pending.agent_type === 'claude_cli')
+            && !!(pending.cli_session_id || msg.cli_session_id);
+          if (skipSqliteReplay) {
+            log('info', 'launch', 'Resumed CLI session — skipping SQLite history copy (native transcript is source of truth)', {
+              request_id: requestId, new_session: newSessionId,
+              source: pending.resume_source, agent_type: pending.agent_type,
+            });
+          } else {
           const oldMessages = pending.resume_messages;
           let copied = 0;
           for (const m of oldMessages) {
@@ -1933,6 +1962,7 @@ function handleProxyConnection(ws, req) {
             messages_copied: copied,
           });
           setTimeout(() => recentResumeSessions.delete(newSessionId), RESUME_TRACK_TTL_MS);
+          }
         }
       }
       log('info', 'launch', 'Session launch acked', { request_id: requestId, session_id: msg.session_id });
@@ -2210,7 +2240,11 @@ function handleProxyConnection(ws, req) {
         alreadyMatches = historiesMatch(existing, messages);
       }
 
-      if (messages.length > 0 && !alreadyMatches) {
+      // A snapshot is authoritative even when it is empty. New-chat and
+      // list-view transitions intentionally send [] to clear the previous
+      // conversation; ignoring that snapshot causes the next native turns to
+      // be appended behind stale SQLite history and appear duplicated.
+      if (!alreadyMatches) {
         if (!existing) existing = getHistoryRows(id);
         const resync = db.transaction((msgs) => {
           stmtDeleteSession.run(id);
@@ -2761,6 +2795,7 @@ function handleClientConnection(ws, req) {
         ...(msg.model_id       ? { model_id:       msg.model_id       } : {}),
         ...(msg.permission_mode ? { permission_mode: msg.permission_mode } : {}),
         ...(msg.effort         ? { effort:         msg.effort         } : {}),
+        ...(msg.cli_session_id ? { cli_session_id: msg.cli_session_id } : {}),
       }));
 
       // Intermediate ack to the requesting browser
@@ -2789,9 +2824,11 @@ function handleClientConnection(ws, req) {
         return;
       }
 
-      // Verify source session has messages
+      // Verify source session has messages — or a native CLI id we can reopen.
       const oldMessages = getHistoryRows(sourceSession);
-      if (oldMessages.length === 0) {
+      const sourceMeta = stmtGetSessionMeta.get(sourceSession);
+      const cliSessionId = msg.cli_session_id || sourceMeta?.cli_session_id || null;
+      if (oldMessages.length === 0 && !cliSessionId) {
         ws.send(JSON.stringify({
           type: 'session_launch_failed', protocol_version: PROTOCOL_VERSION,
           request_id: requestId, agent_type: agentType,
@@ -2820,7 +2857,7 @@ function handleClientConnection(ws, req) {
       );
       pendingLaunches.set(requestId, {
         agent_type:      agentType,
-        workspace_path:  msg.workspace_path || null,
+        workspace_path:  msg.workspace_path || sourceMeta?.workspace_path || null,
         launched_at:     launchedAt,
         timeout_at:      new Date(Date.now() + LAUNCH_TIMEOUT_MS).toISOString(),
         browser_ws:      ws,
@@ -2828,12 +2865,19 @@ function handleClientConnection(ws, req) {
         // Resume metadata — the session_launch_ack handler copies old messages
         resume_source:   sourceSession,
         resume_messages: oldMessages,
+        cli_session_id:  cliSessionId,
       });
 
       proxyWs.send(JSON.stringify({
         type: 'launch_session', protocol_version: PROTOCOL_VERSION,
         request_id: requestId, agent_type: agentType,
-        ...(msg.workspace_path ? { workspace_path: msg.workspace_path } : {}),
+        ...(msg.workspace_path || sourceMeta?.workspace_path
+          ? { workspace_path: msg.workspace_path || sourceMeta.workspace_path }
+          : {}),
+        ...(msg.model_id ? { model_id: msg.model_id } : {}),
+        ...(msg.permission_mode ? { permission_mode: msg.permission_mode } : {}),
+        ...(cliSessionId ? { cli_session_id: cliSessionId } : {}),
+        resume_source_session: sourceSession,
       }));
 
       ws.send(JSON.stringify({

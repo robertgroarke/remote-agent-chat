@@ -81,6 +81,7 @@ fs.writeFileSync(liveLikeFixture, [
   { timestamp: iso(-202000), type: 'event_msg', payload: { type: 'patch_apply_end', success: true, stdout: 'Success. Updated the following files:\\nM agent-proxy/codex-cli.js\\n', changes: { [path.join(process.cwd(), 'agent-proxy', 'codex-cli.js')]: { type: 'update', unified_diff: '@@ -1 +1\\n-old\\n+new\\n' } } } },
   { timestamp: iso(-201000), type: 'event_msg', payload: { type: 'error', message: 'Remote compact task failed', codex_error_info: 'other' } },
   { timestamp: iso(-200000), type: 'event_msg', payload: { type: 'context_compacted' } },
+  { timestamp: iso(-198000), type: 'event_msg', payload: { type: 'thread_rolled_back', num_turns: 1 } },
   { timestamp: iso(-195000), type: 'compacted', payload: { message: 'Replaced earlier context with a summary.' } },
   { timestamp: iso(-190000), type: 'event_msg', payload: { type: 'token_count', info: { total_token_usage: { total_tokens: 42 } }, rate_limits: { primary: { used_percent: 12, resets_at: Math.floor((now + 600000) / 1000) }, secondary: { used_percent: 34, resets_at: Math.floor((now + 3600000) / 1000) }, rate_limit_reached_type: null } } },
 ].map(entry => JSON.stringify(entry)).join('\n') + '\n');
@@ -169,11 +170,40 @@ assert(liveLikeSummary.messages.some(msg => msg.content_blocks?.some(block =>
   block.type === 'prompt'
   && block.title === 'Context compacted'
 )), 'expected context compaction to render into transcript blocks');
+assert(liveLikeSummary.messages.some(msg => msg.content_blocks?.some(block =>
+  block.type === 'prompt'
+  && block.title === 'Thread rolled back'
+  && block.content.includes('Rolled back 1 turn')
+)), 'expected thread rollback event to render explicitly');
 assert(!liveLikeSummary.messages.some(msg =>
   msg.content === 'Reasoning'
   && msg.content_blocks?.some(block => block.type === 'thinking' && !String(block.content || '').trim())
 ), 'empty reasoning summaries should not create placeholder messages');
 try { fs.unlinkSync(liveLikeFixture); } catch {}
+
+const canonicalCliId = '00000000-0000-4000-8000-000000000201';
+const staleMetaId = '00000000-0000-4000-8000-000000000202';
+const canonicalIdFixture = path.join(os.tmpdir(), `rollout-2026-07-09T10-07-34-${canonicalCliId}.jsonl`);
+fs.writeFileSync(canonicalIdFixture, [
+  { timestamp: iso(-1000), type: 'session_meta', payload: { id: staleMetaId, cwd: process.cwd(), model: 'gpt-5.5' } },
+  { timestamp: iso(-900), type: 'response_item', payload: { type: 'message', role: 'user', content: [{ type: 'input_text', text: 'Canonical id check' }] } },
+  { timestamp: iso(-800), type: 'response_item', payload: { type: 'message', role: 'assistant', content: [{ type: 'output_text', text: 'Canonical id confirmed.' }] } },
+].map(entry => JSON.stringify(entry)).join('\n') + '\n');
+assert.strictEqual(codexCli.readSessionSummary(canonicalIdFixture).cliSessionId, canonicalCliId);
+assert.strictEqual(codexCli.readSessionSummary(canonicalIdFixture, { includeMessages: false }).cliSessionId, canonicalCliId);
+assert.strictEqual(codexCli.readSessionSummary(canonicalIdFixture, { maxHydrateBytes: 1 }).cliSessionId, canonicalCliId);
+assert.strictEqual(codexCli.parseCodexJsonlChunk(canonicalIdFixture, { chunkBytes: 256 * 1024 }).state.cliSessionId, canonicalCliId);
+try { fs.unlinkSync(canonicalIdFixture); } catch {}
+
+const metadataOnlyCliId = '00000000-0000-4000-8000-000000000203';
+const metadataOnlyFixture = path.join(os.tmpdir(), `codex-cli-metadata-session-${Date.now()}.jsonl`);
+fs.writeFileSync(metadataOnlyFixture, [
+  { timestamp: iso(-1000), type: 'session_meta', payload: { session_id: metadataOnlyCliId, id: staleMetaId, cwd: process.cwd(), model: 'gpt-5.5' } },
+  { timestamp: iso(-900), type: 'response_item', payload: { type: 'message', role: 'user', content: [{ type: 'input_text', text: 'Metadata id check' }] } },
+].map(entry => JSON.stringify(entry)).join('\n') + '\n');
+assert.strictEqual(codexCli.readSessionSummary(metadataOnlyFixture).cliSessionId, metadataOnlyCliId);
+assert.strictEqual(codexCli.readSessionSummary(metadataOnlyFixture, { includeMessages: false }).cliSessionId, metadataOnlyCliId);
+try { fs.unlinkSync(metadataOnlyFixture); } catch {}
 
 const workspaceInferRoot = fs.mkdtempSync(path.join(os.tmpdir(), `codex-cli-workspace-infer-${Date.now()}-`));
 const inferredParentRepo = path.join(workspaceInferRoot, 'Parent Repo');

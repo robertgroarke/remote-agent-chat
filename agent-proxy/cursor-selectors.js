@@ -65,6 +65,60 @@ const CURSOR_READ_EXPR = `
     return String(text || '').replace(/\\n{3,}/g, '\\n\\n').trim();
   }
   function norm(t) { return String(t || '').replace(/\\s+/g, ' ').trim(); }
+  // Convert Cursor .markdown-root HTML into GFM so the web UI can render
+  // tables/lists/code the way the Agents window shows them. innerText alone
+  // flattens tables into one run-on line.
+  function htmlToMarkdown(root) {
+    if (!root) return '';
+    function walk(node) {
+      if (!node) return '';
+      if (node.nodeType === 3) return node.textContent || '';
+      if (node.nodeType !== 1) return '';
+      var tag = node.tagName.toLowerCase();
+      if (tag === 'br') return '\\n';
+      if (tag === 'script' || tag === 'style' || tag === 'svg') return '';
+      if (tag === 'table') {
+        var rows = Array.from(node.querySelectorAll('tr')).map(function(tr) {
+          return Array.from(tr.querySelectorAll('th,td')).map(function(cell) {
+            return String(cell.innerText || '').trim().replace(/\\|/g, '\\\\|').replace(/\\n+/g, ' ');
+          });
+        }).filter(function(r) { return r.length > 0; });
+        if (!rows.length) return '';
+        var header = rows[0];
+        var sep = header.map(function() { return '---'; });
+        var body = rows.slice(1);
+        return ['| ' + header.join(' | ') + ' |', '| ' + sep.join(' | ') + ' |']
+          .concat(body.map(function(row) { return '| ' + row.join(' | ') + ' |'; }))
+          .join('\\n') + '\\n\\n';
+      }
+      if (tag === 'thead' || tag === 'tbody' || tag === 'tr' || tag === 'th' || tag === 'td') {
+        return Array.from(node.childNodes).map(walk).join('');
+      }
+      var kids = Array.from(node.childNodes).map(walk).join('');
+      if (tag === 'p') return kids.trim() + '\\n\\n';
+      if (/^h[1-6]$/.test(tag)) return Array(Number(tag[1]) + 1).join('#') + ' ' + kids.trim() + '\\n\\n';
+      if (tag === 'li') {
+        var parent = node.parentElement && node.parentElement.tagName.toLowerCase();
+        var prefix = parent === 'ol' ? '1. ' : '- ';
+        return prefix + kids.trim().replace(/\\n+/g, ' ') + '\\n';
+      }
+      if (tag === 'ul' || tag === 'ol') return kids + '\\n';
+      if (tag === 'pre') return '\`\`\`\\n' + String(node.innerText || '').replace(/\\n+$/, '') + '\\n\`\`\`\\n\\n';
+      if (tag === 'code') {
+        if (node.parentElement && node.parentElement.tagName.toLowerCase() === 'pre') return kids;
+        return '\`' + kids + '\`';
+      }
+      if (tag === 'strong' || tag === 'b') return '**' + kids + '**';
+      if (tag === 'em' || tag === 'i') return '*' + kids + '*';
+      if (tag === 'a') return '[' + kids + '](' + (node.getAttribute('href') || '') + ')';
+      if (tag === 'blockquote') {
+        return kids.split('\\n').map(function(l) { return '> ' + l; }).join('\\n') + '\\n\\n';
+      }
+      if (tag === 'hr') return '\\n---\\n\\n';
+      return kids;
+    }
+    return squash(walk(root));
+  }
   function classifyNode(node) {
     if (!node || node.nodeType !== 1) return null;
     var cls = String(node.className || '');
@@ -72,12 +126,19 @@ const CURSOR_READ_EXPR = `
     if (/ui-edit-tool-call/.test(cls)) return 'file_changes';
     if (/ui-shell-tool-call/.test(cls)) return 'tool_call';
     if (/ui-tool-call-card/.test(cls)) return 'tool_call';
-    if (/ui-step-group-collapsible/.test(cls)) return 'tool_call';
+    if (/ui-step-group-collapsible/.test(cls)) {
+      var stepHdr = norm((node.querySelector('.ui-collapsible-header') || {}).innerText || '');
+      // Step-group headers titled Thought/Thinking are thinking chips, not tools.
+      if (/^thought\\b|^thinking\\b/i.test(stepHdr)) return 'thinking';
+      return 'tool_call';
+    }
     if (/\\bui-collapsible\\b/.test(cls) && node.querySelector(':scope > .ui-collapsible-header')) {
       var hdr = norm((node.querySelector(':scope > .ui-collapsible-header') || {}).innerText || '');
-      if (/^thought\\b/i.test(hdr)) return 'thinking';
-      if (/explor|edit|search|ran |running|command|read |grep|glob|shell/i.test(hdr)) return 'tool_call';
-      return 'tool_call';
+      // Cursor Agents shows "Worked for Xm" as a subtle status chip, not a tool card.
+      if (/^worked\\b/i.test(hdr) || /^taking longer\\b/i.test(hdr)) return 'status';
+      if (/^thought\\b|^thinking\\b/i.test(hdr)) return 'thinking';
+      if (/explor|edit|search|ran |running|command|read |grep|glob|shell|creating|editing|monitored|background/i.test(hdr)) return 'tool_call';
+      return 'status';
     }
     return null;
   }
@@ -91,18 +152,47 @@ const CURSOR_READ_EXPR = `
   function nodeToBlock(node, kind) {
     var headerEl = node.querySelector('.ui-collapsible-header');
     var title = norm(headerEl ? headerEl.innerText : '') || norm(String(node.innerText || '').split('\\n')[0] || '').substring(0, 120);
+    // Shell tool cards expose a short description line; prefer that over the
+    // full header dump (command args + "+N" counters).
+    if (kind === 'tool_call') {
+      var desc = node.querySelector('.ui-shell-tool-call__line-description, .ui-tool-call-card__title, .ui-step-group-collapsible .ui-collapsible-header');
+      if (desc) {
+        var descTitle = norm(desc.innerText || '');
+        if (descTitle) title = descTitle.substring(0, 160);
+      } else if (headerEl) {
+        // Keep "Ran …" / "Explored …" first line + short summary when present.
+        var headerLines = String(headerEl.innerText || '').split('\\n').map(function(l) { return l.trim(); }).filter(Boolean);
+        if (headerLines.length >= 2) title = norm(headerLines.slice(0, 2).join(' — ')).substring(0, 160);
+      }
+    }
     var bodyEl = null;
     if (headerEl && headerEl.parentElement) {
       bodyEl = Array.from(headerEl.parentElement.children).find(function(c) {
         return c !== headerEl && /content|body|details/i.test(String(c.className || ''));
       }) || null;
     }
-    var body = squash(bodyEl ? (bodyEl.innerText || '') : (node.innerText || ''));
-    if (headerEl && body.indexOf(title) === 0) {
-      body = squash(body.slice(title.length));
+    // Prefer an explicit body/details pane. Cursor often keeps Thought/Worked/Ran
+    // chips header-only (or with an empty details pane), and innerText of the
+    // whole node is just the header with different newlines — treat that as no body
+    // so the web UI can render Agents-style chips instead of empty <details>.
+    var body = squash(bodyEl ? (bodyEl.innerText || '') : '');
+    if (norm(body) === title) body = '';
+    if (!body) {
+      var full = squash(node.innerText || '');
+      var fullNorm = norm(full);
+      if (fullNorm && fullNorm !== title) {
+        if (fullNorm.indexOf(title) === 0) body = squash(fullNorm.slice(title.length));
+        else body = full;
+      }
+      if (norm(body) === title) body = '';
+    }
+    // Header-only shell/step cards: drop body that is only a whitespace variant of the title.
+    if ((kind === 'tool_call' || kind === 'thinking') && body && norm(body) === norm(title)) body = '';
+    if (kind === 'status') {
+      return { type: 'status', title: title || 'Status', content: '', collapsed: true };
     }
     if (kind === 'thinking') {
-      return { type: 'thinking', title: title || 'Thinking', content: body || title, collapsed: true, status: blockStatus(node, kind) };
+      return { type: 'thinking', title: title || 'Thinking', content: body, collapsed: true, status: blockStatus(node, kind) };
     }
     if (kind === 'file_changes') {
       var files = [];
@@ -111,7 +201,7 @@ const CURSOR_READ_EXPR = `
       return {
         type: 'file_changes',
         title: title || 'File changes',
-        content: body || title,
+        content: body,
         summary: title,
         files: files,
         status: blockStatus(node, kind),
@@ -122,14 +212,15 @@ const CURSOR_READ_EXPR = `
       type: 'tool_call',
       title: title || 'Tool',
       label: title || 'Tool',
-      content: body || title,
+      content: body,
       status: blockStatus(node, kind),
       collapsed: true,
     };
   }
   function markdownFromBubble(el) {
-    // Clone and strip structured cards so markdown content is not duplicated
-    // into both content and content_blocks.
+    // Prefer Cursor's rendered markdown root so tables/lists survive.
+    var mdRoot = el.querySelector('.markdown-root');
+    if (mdRoot) return htmlToMarkdown(mdRoot);
     var clone = el.cloneNode(true);
     clone.querySelectorAll(
       '.ui-thinking-collapsible, .ui-edit-tool-call, .ui-shell-tool-call, .ui-tool-call-card, .ui-step-group-collapsible, .ui-collapsible'
@@ -151,7 +242,7 @@ const CURSOR_READ_EXPR = `
         // Nested structured cards inside the bubble first, then remaining markdown.
         var nested = [];
         Array.from(node.querySelectorAll(
-          '.ui-thinking-collapsible, .ui-edit-tool-call, .ui-shell-tool-call, .ui-tool-call-card, .ui-step-group-collapsible'
+          '.ui-thinking-collapsible, .ui-edit-tool-call, .ui-shell-tool-call, .ui-tool-call-card, .ui-step-group-collapsible, .ui-collapsible'
         )).forEach(function(card) {
           if (already(card)) return;
           if (nested.some(function(n) { return n.contains(card); })) return;
@@ -182,7 +273,7 @@ const CURSOR_READ_EXPR = `
     Array.from(rootEl.children || []).forEach(visit);
     // Also catch direct structured siblings that visit may miss when nested wrappers exist.
     Array.from(rootEl.querySelectorAll(
-      '.ui-thinking-collapsible, .ui-edit-tool-call, .ui-shell-tool-call, .ui-tool-call-card, .ui-step-group-collapsible'
+      '.ui-thinking-collapsible, .ui-edit-tool-call, .ui-shell-tool-call, .ui-tool-call-card, .ui-step-group-collapsible, .ui-collapsible'
     )).forEach(function(card) {
       if (already(card)) return;
       if (seen.some(function(s) { return s.contains && s.contains(card); })) return;
@@ -201,7 +292,9 @@ const CURSOR_READ_EXPR = `
       var hasBlocks = Array.isArray(msg.content_blocks) && msg.content_blocks.length > 0;
       if (!msg.content && !hasBlocks) return;
       if (!msg.content && hasBlocks) {
-        msg.content = msg.content_blocks.map(function(b) {
+        msg.content = msg.content_blocks.filter(function(b) {
+          return b.type === 'markdown' || (b.content && b.type !== 'status');
+        }).map(function(b) {
           return squash(b.content || b.title || b.label || '');
         }).filter(Boolean).join('\\n\\n');
       }
@@ -234,6 +327,8 @@ const CURSOR_READ_EXPR = `
         pushMsg(msgs, {
           role: 'assistant',
           content: structured.content || '',
+          // Keep status chips + markdown together; drop content_blocks only when
+          // there is nothing but plain markdown.
           content_blocks: onlyMarkdown ? undefined : structured.blocks,
         });
       } else {

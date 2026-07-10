@@ -28,6 +28,7 @@ const sessionStore = require('./session-store');
 const launchers    = require('./launchers');
 const claudeCli    = require('./claude-cli');
 const codexCli     = require('./codex-cli');
+const cursorCli    = require('./cursor-cli');
 
 function sleep(ms) { return new Promise(r => setTimeout(r, ms)); }
 
@@ -56,9 +57,14 @@ function staggerOffset(sessionId, key, modulo) {
 // ─── Codex model/effort/access constants ────────────────────────────────────
 
 const CODEX_MODELS = [
+  { id: 'gpt-5.6',         label: 'GPT-5.6' },
+  { id: 'gpt-5.6-sol',     label: 'GPT-5.6 Sol' },
+  { id: 'gpt-5.6-terra',   label: 'GPT-5.6 Terra' },
+  { id: 'gpt-5.6-luna',    label: 'GPT-5.6 Luna' },
   { id: 'gpt-5.5',           label: 'GPT-5.5' },
   { id: 'gpt-5.4',           label: 'GPT-5.4' },
   { id: 'gpt-5.4-mini',      label: 'GPT-5.4 Mini' },
+  { id: 'gpt-5.3-codex-spark', label: 'GPT-5.3 Codex Spark' },
   { id: 'gpt-5.3-codex',     label: 'GPT-5.3 Codex' },
   { id: 'gpt-5.2-codex',     label: 'GPT-5.2 Codex' },
   { id: 'gpt-5.2',           label: 'GPT-5.2' },
@@ -81,12 +87,31 @@ const CODEX_SPEEDS = [
   { id: 'standard', label: 'Standard' },
   { id: 'fast',     label: 'Fast' },
 ];
+const CLAUDE_CODE_PERMISSION_MODES = [
+  { value: 'default',           label: 'Ask before edit' },
+  { value: 'acceptEdits',       label: 'Edit automatically' },
+  { value: 'plan',              label: 'Plan mode' },
+  { value: 'auto',              label: 'Auto mode' },
+  { value: 'bypassPermissions', label: 'Bypass permissions' },
+];
+const CLAUDE_CODE_EFFORTS = [
+  { id: 'low',    label: 'Low' },
+  { id: 'medium', label: 'Medium' },
+  { id: 'high',   label: 'High' },
+];
 
 function normalizeCodexSpeed(value) {
   const speed = String(value || '').toLowerCase().trim();
   if (!speed || speed === 'unknown') return 'standard';
   if (speed === 'default' || speed === 'auto') return 'standard';
   return speed;
+}
+
+function normalizeCodexEffort(value) {
+  const effort = String(value || '').toLowerCase().trim().replace(/_/g, '-');
+  if (!effort || effort === 'unknown') return 'unknown';
+  if (effort === 'xhigh' || effort === 'extra high') return 'extra-high';
+  return effort;
 }
 
 function codexSpeedToConfigValue(speed) {
@@ -124,6 +149,15 @@ const CODEX_CLI_ACTIVE_FILE_MAX_AGE_MS = Math.max(
   60_000,
   parseInt(process.env.CODEX_CLI_ACTIVE_FILE_MAX_AGE_MS || '1800000', 10) || 1_800_000
 );
+
+// ─── Cursor CLI history streaming constants ─────────────────────────────────
+// Env vars: CURSOR_CLI_PATH, CURSOR_CLI_SESSION_LIMIT (20),
+//           CURSOR_CLI_ARCHIVE_MAX_AGE_HOURS (72),
+//           CURSOR_CLI_DISCOVER_ARCHIVES, CURSOR_CLI_WATCH_SESSIONS
+const CURSOR_CLI_HISTORY_CHUNK_BYTES = envMbBytes('CURSOR_CLI_HISTORY_CHUNK_MB', 1, 1, 16);
+const CURSOR_CLI_HISTORY_TAIL_MIN_INTERVAL_MS = 1_500;
+const CURSOR_CLI_HISTORY_OLDER_MIN_INTERVAL_MS = 5_000;
+const CURSOR_CLI_HISTORY_REPEAT_CURSOR_MS = 60_000;
 
 // ─── ProxyEngine class ─────────────────────────────────────────────────────
 
@@ -176,15 +210,20 @@ class ProxyEngine extends EventEmitter {
     this._snapshotTimer = null;
     this._largeHistorySkipLogAt = new Map();
     this._codexCliHistoryChunkRequests = new Map();
+    this._cursorCliWatcher = null;
+    this._cursorCliHistoryChunkRequests = new Map();
 
     // Main poll interval handle
     this._pollTimer = null;
+    this._antigravityV2PollTimer = null;
+    this._antigravityV2PollInProgress = false;
     this._codexCliWatcher = null;
 
     // Window-staggered polling: rotate which parentId (window) gets polled each tick
     // to avoid rapid CDP interactions across multiple Antigravity windows that cause
     // OS-level focus stealing.
     this._pollWindowIndex = 0;
+    this._pollWindowSessionIndexes = new Map();
 
     // Best-effort cache for Antigravity quota usage scraped from the Settings page.
     this._antigravityQuotaCache = { fetchedAt: 0, data: null };
@@ -343,29 +382,30 @@ class ProxyEngine extends EventEmitter {
     const isAntigravityV2 = agentType === 'antigravity-v2';
     const isClaudeCli = agentType === 'claude_cli';
     const isCodexCli = agentType === 'codex_cli';
+    const isCursorCli = agentType === 'cursor_cli';
     const isDesktop = agentType === 'codex-desktop' || agentType === 'claude-desktop' || isCursor;
     const isContinue = agentType === 'continue' || agentType === 'continue_yolo';
     const isRooCode = agentType === 'roo_code';
     const isClineLike = isRooCode || agentType === 'cline';
     return {
-      interrupt:              ['claude', 'claude_cli', 'codex_cli', 'codex', 'gemini', 'continue', 'continue_yolo', 'antigravity', 'antigravity_panel', 'claude-desktop', 'codex-desktop', 'cursor', 'roo_code', 'cline'].includes(agentType),
-      set_model:              ['claude', 'claude_cli', 'codex_cli', 'antigravity', 'antigravity_panel', 'gemini', 'continue', 'continue_yolo', 'cursor'].includes(agentType) || isClineLike,
+      interrupt:              ['claude', 'claude_cli', 'codex_cli', 'cursor_cli', 'codex', 'gemini', 'continue', 'continue_yolo', 'antigravity', 'antigravity_panel', 'claude-desktop', 'codex-desktop', 'cursor', 'roo_code', 'cline'].includes(agentType),
+      set_model:              ['claude', 'claude_cli', 'codex_cli', 'cursor_cli', 'antigravity', 'antigravity_panel', 'gemini', 'continue', 'continue_yolo', 'cursor'].includes(agentType) || isClineLike,
       // Cursor 3.5 Agents UI has no reliable Ask/Edit/Agent/Composer page-level toggle in CDP probes.
       set_mode:               agentType === 'antigravity' || isClineLike,
-      permission_mode_change: agentType === 'claude' || isClaudeCli || isCodexCli || agentType === 'continue_yolo' || isRooCode,
+      permission_mode_change: agentType === 'claude' || isClaudeCli || isCodexCli || isCursorCli || agentType === 'continue_yolo' || isRooCode,
       auto_approve_permissions_toggle: agentType === 'continue' || agentType === 'continue_yolo' || agentType === 'antigravity_panel' || agentType === 'cursor',
-      permission_dialogs:     isClaude || isClaudeCli || isCodexCli || isCodex || agentType === 'antigravity' || agentType === 'antigravity_panel' || isContinue || isClineLike || isCursor,
+      permission_dialogs:     isClaude || isClaudeCli || isCodexCli || isCursorCli || isCodex || agentType === 'antigravity' || agentType === 'antigravity_panel' || isContinue || isClineLike || isCursor,
       set_codex_config:       isCodex,
       set_effort:             isClaudeCli || isCodexCli,
       new_thread:             isDesktop,
       thread_list:            isDesktop,
       switch_thread:          isDesktop,
       switch_workspace:       agentType === 'codex-desktop' || agentType === 'claude-desktop',
-      native_window:          isClaudeCli || isCodexCli || isCursor,
+      native_window:          isClaudeCli || isCodexCli || isCursorCli || isCursor,
       open_panel:             false, // Codex side pane is already open if session exists
       chat_list:              agentType === 'codex' || agentType === 'continue' || agentType === 'antigravity_panel' || agentType === 'claude-desktop' || isCursor || isClineLike || isAntigravityV2,
       switch_chat:            agentType === 'codex' || agentType === 'continue' || agentType === 'antigravity_panel' || agentType === 'claude-desktop' || isCursor || isClineLike || isAntigravityV2,
-      new_chat:               agentType === 'codex' || agentType === 'continue_yolo' || agentType === 'antigravity_panel' || agentType === 'antigravity-v2' || agentType === 'claude-desktop' || agentType === 'cursor' || agentType === 'claude' || isClaudeCli || isCodexCli || isClineLike,
+      new_chat:               agentType === 'codex' || agentType === 'continue_yolo' || agentType === 'antigravity_panel' || agentType === 'antigravity-v2' || agentType === 'claude-desktop' || agentType === 'cursor' || agentType === 'claude' || isClaudeCli || isCodexCli || isCursorCli || isClineLike,
       // Cursor integrated terminal renders via xterm canvas — DOM/a11y read returns [] (see cursor-cdp-notes.md).
       terminal_output:        isCodex || agentType === 'claude-desktop',
       terminal_input:         agentType === 'codex-desktop' || isCursor,
@@ -494,8 +534,16 @@ class ProxyEngine extends EventEmitter {
         : (domCfg?.model_id && domCfg.model_id !== 'unknown' ? domCfg.model_id : (settingsModel || 'unknown'));
       return {
         model_id:          modelId,
+        mode:              domCfg?.mode || permMode,
         permission_mode:   permMode,
+        effort:            domCfg?.effort || 'unknown',
         file_access_scope: workspacePath || 'unknown',
+        available_permission_modes: Array.isArray(domCfg?.available_permission_modes) && domCfg.available_permission_modes.length > 0
+          ? domCfg.available_permission_modes
+          : CLAUDE_CODE_PERMISSION_MODES,
+        available_efforts: Array.isArray(domCfg?.available_efforts) && domCfg.available_efforts.length > 0
+          ? domCfg.available_efforts
+          : CLAUDE_CODE_EFFORTS,
         branch:            branch || 'unknown',
       };
     }
@@ -524,13 +572,25 @@ class ProxyEngine extends EventEmitter {
         branch:            branch || 'unknown',
       };
     }
+    if (agentType === 'cursor_cli') {
+      return {
+        model_id:          domCfg?.model_id || 'grok-4.5-fast-high',
+        permission_mode:   domCfg?.permission_mode || 'force',
+        sandbox:           domCfg?.sandbox || 'disabled',
+        file_access_scope: workspacePath || domCfg?.file_access_scope || 'unknown',
+        available_models:  cursorCli.CURSOR_CLI_MODELS,
+        available_permission_modes: cursorCli.CURSOR_CLI_PERMISSION_MODES,
+        available_sandbox_modes: cursorCli.CURSOR_CLI_SANDBOX_MODES,
+        branch:            branch || 'unknown',
+      };
+    }
     if (agentType === 'codex') {
       const modelId = (domCfg?.model_id && domCfg.model_id !== 'unknown')
         ? domCfg.model_id
         : (codexCfg.model || 'unknown');
-      const effort = (domCfg?.effort && domCfg.effort !== 'unknown')
+      const effort = normalizeCodexEffort((domCfg?.effort && domCfg.effort !== 'unknown')
         ? domCfg.effort
-        : (codexCfg.model_reasoning_effort || codexCfg.reasoning_effort || 'unknown');
+        : (codexCfg.model_reasoning_effort || codexCfg.reasoning_effort || 'unknown'));
       const permissionMode = (domCfg?.permission_mode && domCfg.permission_mode !== 'unknown')
         ? domCfg.permission_mode
         : (codexCfg.sandbox_mode || 'unknown');
@@ -566,9 +626,9 @@ class ProxyEngine extends EventEmitter {
       const modelId = (domCfg?.model_id && domCfg.model_id !== 'unknown')
         ? domCfg.model_id
         : (codexCfg.model || 'unknown');
-      const effort = (domCfg?.effort && domCfg.effort !== 'unknown')
+      const effort = normalizeCodexEffort((domCfg?.effort && domCfg.effort !== 'unknown')
         ? domCfg.effort
-        : (codexCfg.model_reasoning_effort || codexCfg.reasoning_effort || 'unknown');
+        : (codexCfg.model_reasoning_effort || codexCfg.reasoning_effort || 'unknown'));
       const permissionMode = (domCfg?.permission_mode && domCfg.permission_mode !== 'unknown')
         ? domCfg.permission_mode
         : (codexCfg.sandbox_mode || 'unknown');
@@ -1119,6 +1179,8 @@ class ProxyEngine extends EventEmitter {
     session.lastObservedCount = 0;
     session.lastTranscriptSig = '';
     session.pendingLast = null;
+    session._pendingFirstSeenAt = null;
+    session._lastStreamedContent = null;
     session.resyncCandidateSig = null;
     session.waitingForAssistant = false;
     session._forceHistoryResync = reason || 'transcript reset';
@@ -1132,6 +1194,7 @@ class ProxyEngine extends EventEmitter {
       session._lastThreadListSig = threadListSig;
       this._sendToRelay(proto.threadList(sessionId, threads));
     }
+    session._lastThreadList = threads.slice();
 
     const activeThread = threads.find(t => t && t.active);
     const activeThreadKey = activeThread ? `${activeThread.id || ''}:${activeThread.title || ''}` : '';
@@ -1360,6 +1423,9 @@ class ProxyEngine extends EventEmitter {
         if (session.agentType === 'codex_cli' && session.codexCliArchiveDiscovered === true && !session._codexCliChild) {
           continue;
         }
+        if (session.agentType === 'cursor_cli' && session.cursorCliArchiveDiscovered === true && !session._cursorCliChild) {
+          continue;
+        }
         this._readSessionMessages(session, sessionId)
           .then(raw => {
             if (!raw && !session._accumulatedMessages) return;
@@ -1487,8 +1553,10 @@ class ProxyEngine extends EventEmitter {
       }
 
       this._log('info', `[ctrl] agent_interrupt for ${sid} (${sessionData.agentType})`);
-      if (sessionData.agentType === 'claude_cli' || sessionData.agentType === 'codex_cli') {
-        const childKey = sessionData.agentType === 'codex_cli' ? '_codexCliChild' : '_claudeCliChild';
+      if (sessionData.agentType === 'claude_cli' || sessionData.agentType === 'codex_cli' || sessionData.agentType === 'cursor_cli') {
+        const childKey = sessionData.agentType === 'codex_cli' ? '_codexCliChild'
+          : sessionData.agentType === 'cursor_cli' ? '_cursorCliChild'
+          : '_claudeCliChild';
         if (sessionData[childKey]) {
           try { sessionData[childKey].kill(); } catch {}
           sessionData[childKey] = null;
@@ -1723,7 +1791,7 @@ class ProxyEngine extends EventEmitter {
       }
       const modelId = msg.model_id;
       this._log('info', `[ctrl] agent_set_model for ${sid} model=${modelId}`);
-      if (sessionData.agentType === 'claude_cli' || sessionData.agentType === 'codex_cli') {
+      if (sessionData.agentType === 'claude_cli' || sessionData.agentType === 'codex_cli' || sessionData.agentType === 'cursor_cli') {
         const cliAgentType = sessionData.agentType;
         sessionData.model_id = modelId || 'default';
         sessionStore.updateSession(sid, { model_id: sessionData.model_id });
@@ -1731,6 +1799,7 @@ class ProxyEngine extends EventEmitter {
           model_id: sessionData.model_id,
           permission_mode: sessionData.permission_mode,
           effort: sessionData.effort,
+          sandbox: sessionData.sandbox,
         }, sessionData.workspace_path));
         this._sendToRelay(proto.agentConfig(sid, { ...merged, capabilities: this._buildCapabilities(cliAgentType) }));
         this._sendToRelay(proto.agentControlResult(sid, msg.request_id, 'agent_set_model', 'ok'));
@@ -1855,7 +1924,7 @@ class ProxyEngine extends EventEmitter {
       const agentT = sessionData?.agentType;
 
       const isRooCodeLike = agentT === 'roo_code' || agentT === 'cline';
-      if (agentT !== 'claude' && agentT !== 'claude_cli' && agentT !== 'codex_cli' && agentT !== 'continue_yolo' && !isRooCodeLike) {
+      if (agentT !== 'claude' && agentT !== 'claude_cli' && agentT !== 'codex_cli' && agentT !== 'cursor_cli' && agentT !== 'continue_yolo' && !isRooCodeLike) {
         this._sendToRelay(proto.agentControlResult(sid, msg.request_id, 'agent_set_permission_mode', 'failed', {
           code: 'not_supported', message: `Permission mode change not supported for ${agentT || 'unknown'} agent`,
         }));
@@ -1863,13 +1932,18 @@ class ProxyEngine extends EventEmitter {
       }
 
       this._log('info', `[ctrl] agent_set_permission_mode for ${sid} mode=${mode}`);
-      if (agentT === 'claude_cli' || agentT === 'codex_cli') {
-        sessionData.permission_mode = mode || (agentT === 'codex_cli' ? 'workspace-write' : 'default');
+      if (agentT === 'claude_cli' || agentT === 'codex_cli' || agentT === 'cursor_cli') {
+        sessionData.permission_mode = mode || (
+          agentT === 'codex_cli' ? 'workspace-write'
+            : agentT === 'cursor_cli' ? 'force'
+              : 'default'
+        );
         sessionStore.updateSession(sid, { permission_mode: sessionData.permission_mode });
         const merged = this._decorateAgentConfig(sessionData, this._mergeAgentConfig(agentT, {
           model_id: sessionData.model_id,
           permission_mode: sessionData.permission_mode,
           effort: sessionData.effort,
+          sandbox: sessionData.sandbox,
         }, sessionData.workspace_path));
         this._sendToRelay(proto.agentConfig(sid, { ...merged, capabilities: this._buildCapabilities(agentT) }));
         this._sendToRelay(proto.agentControlResult(sid, msg.request_id, 'agent_set_permission_mode', 'ok'));
@@ -2410,6 +2484,17 @@ class ProxyEngine extends EventEmitter {
             sessionData.lastMessageCount = freshMessages.length;
             sessionData.lastObservedCount = freshMessages.length;
             sessionData.lastTranscriptSig = this._transcriptSignature(freshMessages);
+            sessionData.pendingLast = null;
+            sessionData.waitingForAssistant = freshMessages.length > 0 && freshMessages[freshMessages.length - 1]?.role === 'user';
+            if (!sessionData.waitingForAssistant) {
+              const idleActivity = { kind: 'idle', label: '', updated_at: new Date().toISOString() };
+              sessionData.thinking = false;
+              sessionData.thinkingLabel = '';
+              sessionData.thinkingContent = '';
+              sessionData.activity = idleActivity;
+              sessionStore.updateSession(sid, { activity: idleActivity });
+              this._sendToRelay(proto.proxyStatus(sid, sessionData.status || 'healthy', idleActivity));
+            }
             this._sendHistorySnapshot(sid, freshMessages, 'antigravity v2 switch chat');
             this._broadcastSessionSnapshot();
             this._sendToRelay(proto.agentControlResult(sid, requestId, 'switch_chat', 'ok'));
@@ -2491,7 +2576,7 @@ class ProxyEngine extends EventEmitter {
       const agentT = sessionData?.agentType;
       const requestId = msg.request_id;
 
-      if (agentT !== 'codex' && agentT !== 'codex-desktop' && agentT !== 'cursor' && agentT !== 'continue_yolo' && agentT !== 'antigravity_panel' && agentT !== 'antigravity-v2' && agentT !== 'claude-desktop' && agentT !== 'claude' && agentT !== 'claude_cli' && agentT !== 'codex_cli') {
+      if (agentT !== 'codex' && agentT !== 'codex-desktop' && agentT !== 'cursor' && agentT !== 'continue_yolo' && agentT !== 'antigravity_panel' && agentT !== 'antigravity-v2' && agentT !== 'claude-desktop' && agentT !== 'claude' && agentT !== 'claude_cli' && agentT !== 'codex_cli' && agentT !== 'cursor_cli') {
         this._sendToRelay(proto.agentControlResult(sid, requestId, 'new_chat', 'failed', {
           code: 'not_supported', message: `new_chat not supported for ${agentT || 'unknown'}`,
         }));
@@ -2608,6 +2693,91 @@ class ProxyEngine extends EventEmitter {
           newSession ? 'ok' : 'failed',
           newSession ? undefined : { code: 'create_failed', message: 'Could not create Codex CLI session' }
         ));
+        return;
+      }
+
+      if (agentT === 'cursor_cli') {
+        (async () => {
+          let cliSessionId = null;
+          let chatCreated = false;
+          try {
+            cliSessionId = await cursorCli.createChatId();
+            chatCreated = true;
+          } catch (e) {
+            this._log('warn', `[ctrl] cursor create-chat failed, falling back to local uuid: ${e.message}`);
+            cliSessionId = crypto.randomUUID();
+          }
+          const workspacePath = sessionData.workspace_path || process.cwd();
+          const workspaceName = sessionData.workspace_name || path.basename(workspacePath) || 'Cursor CLI';
+          const modelId = sessionData.model_id || 'grok-4.5-fast-high';
+          const permissionMode = sessionData.permission_mode || 'force';
+          const filePath = cursorCli.ensureSessionFile(cliSessionId, {
+            workspacePath,
+            workspaceName,
+            model_id: modelId,
+            permission_mode: permissionMode,
+            title: 'New Cursor CLI session',
+          });
+          const summary = {
+            cliSessionId,
+            filePath,
+            workspacePath,
+            workspaceName,
+            title: 'New Cursor CLI session',
+            messages: [],
+            messageCount: 0,
+            updatedAt: new Date().toISOString(),
+            model_id: modelId,
+            permission_mode: permissionMode,
+            nativeCliStartedAt: new Date().toISOString(),
+            nativeCliStatus: 'native_window_opened',
+            nativeCliWindowOpened: true,
+          };
+          const newSession = this._registerCursorCliSession(summary, { sendInitialHistory: false });
+          if (newSession) {
+            newSession.cursorCliChatCreated = chatCreated;
+            try {
+              const child = cursorCli.startNativeCursorWindow({
+                workspacePath,
+                cliSessionId,
+                resume: chatCreated,
+                model: newSession.model_id,
+                title: `${workspaceName} - Cursor CLI`,
+              });
+              newSession.nativeCliStartedAt = summary.nativeCliStartedAt;
+              newSession.nativeCliStatus = 'native_window_opened';
+              newSession.nativeCliWindowOpened = true;
+              sessionStore.updateSession(newSession.session_id, {
+                native_cli_started_at: newSession.nativeCliStartedAt,
+                native_cli_status: newSession.nativeCliStatus,
+                native_cli_window_opened: true,
+                cursor_cli_file_path: filePath,
+                cursor_cli_chat_created: chatCreated,
+              });
+              this._sendHistorySnapshot(newSession.session_id, this._cursorCliPendingTranscriptMessages(newSession), 'cursor cli native startup');
+              this._log('info', `[ctrl] opened native Cursor CLI window for new_chat ${newSession.session_id} pid=${child?.pid || 'unknown'} model=${newSession.model_id || 'default'}`);
+            } catch (e) {
+              this._log('warn', `[ctrl] new_chat native Cursor CLI window failed for ${newSession.session_id}: ${e.message}`);
+              newSession.nativeCliStatus = 'native_window_failed';
+              sessionStore.updateSession(newSession.session_id, { native_cli_status: newSession.nativeCliStatus });
+              this._sendHistorySnapshot(newSession.session_id, this._cursorCliPendingTranscriptMessages(newSession), 'cursor cli native startup failed');
+            }
+          }
+          this._broadcastSessionSnapshot();
+          this._sendToRelay(proto.agentControlResult(
+            sid,
+            requestId,
+            'new_chat',
+            newSession ? 'ok' : 'failed',
+            newSession ? undefined : { code: 'create_failed', message: 'Could not create Cursor CLI session' }
+          ));
+        })().catch(err => {
+          this._log('warn', `[ctrl] cursor_cli new_chat failed: ${err.message}`);
+          this._sendToRelay(proto.agentControlResult(sid, requestId, 'new_chat', 'failed', {
+            code: 'create_failed',
+            message: err.message,
+          }));
+        });
         return;
       }
 
@@ -3228,7 +3398,7 @@ class ProxyEngine extends EventEmitter {
       const sessionData = this.sessions.get(sid);
       const requestId = msg.request_id;
 
-      if (sessionData?.agentType !== 'claude_cli' && sessionData?.agentType !== 'codex_cli') {
+      if (sessionData?.agentType !== 'claude_cli' && sessionData?.agentType !== 'codex_cli' && sessionData?.agentType !== 'cursor_cli') {
         this._sendToRelay(proto.agentControlResult(sid, requestId, 'open_native_window', 'failed', {
           code: 'not_supported', message: `native window not supported for ${sessionData?.agentType || 'unknown'}`,
         }));
@@ -3242,45 +3412,72 @@ class ProxyEngine extends EventEmitter {
         sessionData.nativeCliStatus = 'native_window_opened';
         sessionData.nativeCliWindowOpened = true;
         const isCodexCli = sessionData.agentType === 'codex_cli';
+        const isCursorCli = sessionData.agentType === 'cursor_cli';
         sessionStore.updateSession(sid, {
           cli_session_id: cliSessionId,
-          ...(isCodexCli ? { codex_cli_archive_discovered: false } : { claude_cli_archive_discovered: false }),
+          ...(isCodexCli ? { codex_cli_archive_discovered: false }
+            : isCursorCli ? { cursor_cli_archive_discovered: false }
+            : { claude_cli_archive_discovered: false }),
           native_cli_started_at: sessionData.nativeCliStartedAt,
           native_cli_status: sessionData.nativeCliStatus,
           native_cli_window_opened: true,
         });
-        const child = isCodexCli
-          ? codexCli.startNativeCodexWindow({
-              workspacePath: sessionData.workspace_path || process.cwd(),
-              cliSessionId,
-              resume: !!sessionData.codexCliFilePath,
-              model: sessionData.model_id,
-              effort: sessionData.effort,
-              permissionMode: sessionData.permission_mode,
-              title: `${sessionData.workspace_name || 'Codex'} - Codex CLI`,
-              elevated: true,
-            })
-          : claudeCli.startNativeClaudeWindow({
-              workspacePath: sessionData.workspace_path || process.cwd(),
-              cliSessionId,
-              resume: !!sessionData.claudeCliFilePath,
-              model: sessionData.model_id,
-              effort: sessionData.effort,
-              permissionMode: sessionData.permission_mode,
-              title: `${sessionData.workspace_name || 'Claude Code'} - Claude CLI`,
-            });
-        this._sendHistorySnapshot(sid, isCodexCli ? this._codexCliPendingTranscriptMessages(sessionData) : this._claudeCliPendingTranscriptMessages(sessionData), `${isCodexCli ? 'codex' : 'claude'} cli native startup`);
-        this._log('info', `[ctrl] opened native ${isCodexCli ? 'Codex' : 'Claude'} CLI window for ${sid} pid=${child?.pid || 'unknown'} model=${sessionData.model_id || 'default'}${isCodexCli ? ` elevated=${child?.remoteAgentElevated === true}` : ''}`);
+        let child;
+        if (isCodexCli) {
+          child = codexCli.startNativeCodexWindow({
+            workspacePath: sessionData.workspace_path || process.cwd(),
+            cliSessionId,
+            resume: !!sessionData.codexCliFilePath,
+            model: sessionData.model_id,
+            effort: sessionData.effort,
+            permissionMode: sessionData.permission_mode,
+            title: `${sessionData.workspace_name || 'Codex'} - Codex CLI`,
+            elevated: true,
+          });
+        } else if (isCursorCli) {
+          const existingSummary = sessionData.cursorCliFilePath
+            ? cursorCli.readSessionSummary(sessionData.cursorCliFilePath, this._cursorCliActiveSummaryOptions())
+            : null;
+          const shouldResumeNative = sessionData.cursorCliChatCreated === true
+            || sessionData.cursor_cli_chat_created === true
+            || !!(existingSummary && existingSummary.messageCount > 0)
+            || sessionData.cursorCliArchiveDiscovered === true;
+          child = cursorCli.startNativeCursorWindow({
+            workspacePath: sessionData.workspace_path || process.cwd(),
+            cliSessionId,
+            resume: shouldResumeNative,
+            model: sessionData.model_id,
+            title: `${sessionData.workspace_name || 'Cursor'} - Cursor CLI`,
+          });
+        } else {
+          child = claudeCli.startNativeClaudeWindow({
+            workspacePath: sessionData.workspace_path || process.cwd(),
+            cliSessionId,
+            resume: !!sessionData.claudeCliFilePath,
+            model: sessionData.model_id,
+            effort: sessionData.effort,
+            permissionMode: sessionData.permission_mode,
+            title: `${sessionData.workspace_name || 'Claude Code'} - Claude CLI`,
+          });
+        }
+        const pendingMsgs = isCodexCli ? this._codexCliPendingTranscriptMessages(sessionData)
+          : isCursorCli ? this._cursorCliPendingTranscriptMessages(sessionData)
+          : this._claudeCliPendingTranscriptMessages(sessionData);
+        const label = isCodexCli ? 'codex' : isCursorCli ? 'cursor' : 'claude';
+        this._sendHistorySnapshot(sid, pendingMsgs, `${label} cli native startup`);
+        this._log('info', `[ctrl] opened native ${isCodexCli ? 'Codex' : isCursorCli ? 'Cursor' : 'Claude'} CLI window for ${sid} pid=${child?.pid || 'unknown'} model=${sessionData.model_id || 'default'}`);
         this._sendToRelay(proto.agentControlResult(sid, requestId, 'open_native_window', 'ok'));
       } catch (e) {
         this._log('warn', `[ctrl] open_native_window failed for ${sid}: ${e.message}`);
         sessionData.nativeCliStatus = 'native_window_failed';
         sessionStore.updateSession(sid, { native_cli_status: sessionData.nativeCliStatus });
-        this._sendHistorySnapshot(
-          sid,
-          sessionData.agentType === 'codex_cli' ? this._codexCliPendingTranscriptMessages(sessionData) : this._claudeCliPendingTranscriptMessages(sessionData),
-          `${sessionData.agentType === 'codex_cli' ? 'codex' : 'claude'} cli native startup failed`
-        );
+        const isCursorCli = sessionData.agentType === 'cursor_cli';
+        const isCodexCli = sessionData.agentType === 'codex_cli';
+        const pendingMsgs = isCodexCli ? this._codexCliPendingTranscriptMessages(sessionData)
+          : isCursorCli ? this._cursorCliPendingTranscriptMessages(sessionData)
+          : this._claudeCliPendingTranscriptMessages(sessionData);
+        const label = isCodexCli ? 'codex' : isCursorCli ? 'cursor' : 'claude';
+        this._sendHistorySnapshot(sid, pendingMsgs, `${label} cli native startup failed`);
         this._sendToRelay(proto.agentControlResult(sid, requestId, 'open_native_window', 'failed', {
           code: 'spawn_failed', message: e.message,
         }));
@@ -3435,6 +3632,130 @@ class ProxyEngine extends EventEmitter {
           request_id: requestId,
           session_id: session.session_id,
           agent_type: agentType,
+        });
+        return;
+      }
+
+      if (agentType === 'cursor_cli') {
+        (async () => {
+          const resumeCliId = msg.cli_session_id
+            || (msg.resume_source_session ? sessionStore.getSession(msg.resume_source_session)?.cli_session_id : null)
+            || null;
+          let cliSessionId = resumeCliId || null;
+          let chatCreated = false;
+          let isResume = !!resumeCliId;
+          if (!cliSessionId) {
+            try {
+              cliSessionId = await cursorCli.createChatId();
+              chatCreated = true;
+            } catch (e) {
+              this._log('warn', `[ctrl] cursor create-chat failed, falling back to local uuid: ${e.message}`);
+              cliSessionId = crypto.randomUUID();
+            }
+          } else {
+            chatCreated = true; // known Cursor chat id — always --resume
+          }
+          const workspace = workspacePath
+            || (msg.resume_source_session ? sessionStore.getSession(msg.resume_source_session)?.workspace_path : null)
+            || process.cwd();
+          const workspaceName = path.basename(workspace) || 'Cursor CLI';
+          const prior = resumeCliId ? cursorCli.findSessionByCliId(resumeCliId) : null;
+          const modelId = msg.model_id
+            || prior?.model_id
+            || (msg.resume_source_session ? sessionStore.getSession(msg.resume_source_session)?.model_id : null)
+            || 'grok-4.5-fast-high';
+          const permissionMode = msg.permission_mode
+            || prior?.permission_mode
+            || (msg.resume_source_session ? sessionStore.getSession(msg.resume_source_session)?.permission_mode : null)
+            || 'force';
+          const existingSummary = prior
+            || (resumeCliId ? cursorCli.findSessionByCliId(resumeCliId) : null);
+          const filePath = existingSummary?.filePath || cursorCli.ensureSessionFile(cliSessionId, {
+            workspacePath: workspace,
+            workspaceName,
+            model_id: modelId,
+            permission_mode: permissionMode,
+            title: isResume ? (existingSummary?.title || 'Resumed Cursor CLI session') : 'New Cursor CLI session',
+          });
+          const hydrated = existingSummary?.messages?.length
+            ? existingSummary
+            : (filePath ? cursorCli.readSessionSummary(filePath, this._cursorCliActiveSummaryOptions()) : null);
+          const summary = {
+            cliSessionId,
+            filePath,
+            workspacePath: hydrated?.workspacePath || workspace,
+            workspaceName: hydrated?.workspaceName || workspaceName,
+            title: hydrated?.title || (isResume ? 'Resumed Cursor CLI session' : 'New Cursor CLI session'),
+            messages: hydrated?.messages || [],
+            messageCount: hydrated?.messageCount || (hydrated?.messages || []).length || 0,
+            updatedAt: hydrated?.updatedAt || new Date().toISOString(),
+            model_id: modelId,
+            permission_mode: permissionMode,
+            nativeCliStartedAt: new Date().toISOString(),
+            nativeCliStatus: 'native_window_opened',
+            nativeCliWindowOpened: true,
+            cursorCliChatCreated: chatCreated || isResume,
+          };
+          const session = this._registerCursorCliSession(summary, { sendInitialHistory: true });
+          if (!session) {
+            this._sendToRelay({
+              type: 'session_launch_failed',
+              protocol_version: proto.PROTOCOL_VERSION,
+              request_id: requestId,
+              agent_type: agentType,
+              reason: 'Could not create Cursor CLI session',
+              error_code: 'create_failed',
+            });
+            return;
+          }
+          session.cursorCliChatCreated = chatCreated || isResume;
+          try {
+            const child = cursorCli.startNativeCursorWindow({
+              workspacePath: session.workspace_path || workspace,
+              cliSessionId,
+              resume: chatCreated || isResume,
+              model: modelId,
+              title: `${session.workspace_name || workspaceName} - Cursor CLI`,
+            });
+            session.nativeCliStartedAt = summary.nativeCliStartedAt;
+            session.nativeCliStatus = 'native_window_opened';
+            session.nativeCliWindowOpened = true;
+            sessionStore.updateSession(session.session_id, {
+              native_cli_started_at: session.nativeCliStartedAt,
+              native_cli_status: session.nativeCliStatus,
+              native_cli_window_opened: true,
+              cursor_cli_file_path: filePath,
+              cursor_cli_chat_created: session.cursorCliChatCreated === true,
+              cli_session_id: cliSessionId,
+              model_id: modelId,
+              permission_mode: permissionMode,
+            });
+            this._sendHistorySnapshot(session.session_id, this._cursorCliPendingTranscriptMessages(session), 'cursor cli native startup');
+            this._log('info', `[ctrl] opened native Cursor CLI window for launch_session ${session.session_id} pid=${child?.pid || 'unknown'} model=${modelId || 'default'} resume=${chatCreated || isResume} cli=${cliSessionId}`);
+          } catch (e) {
+            this._log('warn', `[ctrl] launch_session native Cursor CLI window failed for ${session.session_id}: ${e.message}`);
+            session.nativeCliStatus = 'native_window_failed';
+            sessionStore.updateSession(session.session_id, { native_cli_status: session.nativeCliStatus });
+            this._sendHistorySnapshot(session.session_id, this._cursorCliPendingTranscriptMessages(session), 'cursor cli native startup failed');
+          }
+          this._broadcastSessionSnapshot();
+          this._sendToRelay({
+            type: 'session_launch_ack',
+            protocol_version: proto.PROTOCOL_VERSION,
+            request_id: requestId,
+            session_id: session.session_id,
+            agent_type: agentType,
+          });
+        })().catch(err => {
+          this._log('warn', `[ctrl] cursor_cli launch_session failed: ${err.message}`);
+          this._sendToRelay({
+            type: 'session_launch_failed',
+            protocol_version: proto.PROTOCOL_VERSION,
+            request_id: requestId,
+            agent_type: agentType,
+            reason: err.message || 'Could not create Cursor CLI session',
+            error_code: 'create_failed',
+          });
         });
         return;
       }
@@ -3789,6 +4110,35 @@ class ProxyEngine extends EventEmitter {
     }
   }
 
+  _cursorCliHistoryCursorSig(msg) {
+    const beforeOffset = msg.before_offset ?? msg.beforeOffset ?? msg.cursor?.next_before_offset ?? null;
+    return `${msg.mode || 'tail'}:${beforeOffset ?? 'end'}`;
+  }
+
+  _cursorCliHistoryChunkThrottle(sessionId, msg) {
+    const now = Date.now();
+    const mode = msg.mode === 'older' ? 'older' : 'tail';
+    const minInterval = mode === 'older' ? CURSOR_CLI_HISTORY_OLDER_MIN_INTERVAL_MS : CURSOR_CLI_HISTORY_TAIL_MIN_INTERVAL_MS;
+    const key = `${sessionId}:${mode}`;
+    const cursorSig = this._cursorCliHistoryCursorSig(msg);
+    const previous = this._cursorCliHistoryChunkRequests.get(key);
+    if (previous) {
+      const elapsed = now - previous.at;
+      if (elapsed < minInterval && previous.cursorSig === cursorSig) {
+        const wait = minInterval - elapsed;
+        return {
+          code: 'throttled',
+          message: `Cursor CLI history chunk requests are throttled; retry in ${Math.ceil(wait / 1000)}s`,
+        };
+      }
+      if (elapsed >= CURSOR_CLI_HISTORY_REPEAT_CURSOR_MS) {
+        this._cursorCliHistoryChunkRequests.delete(key);
+      }
+    }
+    this._cursorCliHistoryChunkRequests.set(key, { at: now, cursorSig });
+    return null;
+  }
+
   _codexCliHistoryCursorSig(msg) {
     if (!msg || msg.mode !== 'older') return '';
     const beforeOffset = msg.before_offset ?? msg.beforeOffset ?? msg.cursor?.next_before_offset ?? '';
@@ -3833,7 +4183,7 @@ class ProxyEngine extends EventEmitter {
   _handleHistoryChunkRequest(msg) {
     const sessionId = msg.session_id || msg.session;
     const requestId = msg.request_id || null;
-    const fail = (code, message) => {
+    const fail = (code, message, source = 'codex_cli_jsonl') => {
       if (!sessionId) return;
       this._sendToRelay(proto.historyChunk(sessionId, {
         requestId,
@@ -3841,15 +4191,51 @@ class ProxyEngine extends EventEmitter {
         mode: msg.mode || 'tail',
         partial: false,
         complete: true,
-        source: 'codex_cli_jsonl',
+        source,
         error: { code, message },
       }));
     };
     if (!sessionId) return;
     const session = this.sessions.get(sessionId);
     if (!session) return fail('session_not_found', 'Session not found');
+
+    if (session.agentType === 'cursor_cli') {
+      const filePath = session.cursorCliFilePath || session.cursor_cli_file_path;
+      if (!filePath) return fail('archive_not_found', 'Cursor CLI archive path is unavailable', 'cursor_cli_jsonl');
+      const throttle = this._cursorCliHistoryChunkThrottle(sessionId, msg);
+      if (throttle) return fail(throttle.code, throttle.message, 'cursor_cli_jsonl');
+      const requestedBytes = Number(msg.chunk_bytes || msg.chunkBytes || 0);
+      const chunkBytes = Number.isFinite(requestedBytes) && requestedBytes > 0
+        ? Math.max(256 * 1024, Math.min(16 * 1024 * 1024, Math.floor(requestedBytes)))
+        : CURSOR_CLI_HISTORY_CHUNK_BYTES;
+      const beforeOffset = msg.mode === 'older'
+        ? (msg.before_offset ?? msg.beforeOffset ?? msg.cursor?.next_before_offset ?? null)
+        : null;
+      try {
+        const chunk = cursorCli.parseCursorJsonlChunk(filePath, { beforeOffset, chunkBytes });
+        if (!chunk) return fail('archive_unreadable', 'Cursor CLI archive could not be read', 'cursor_cli_jsonl');
+        const messages = Array.isArray(chunk.state?.messages) ? chunk.state.messages : [];
+        this._sendToRelay(proto.historyChunk(sessionId, {
+          requestId,
+          messages,
+          mode: msg.mode === 'older' ? 'older' : 'tail',
+          startOffset: chunk.startOffset,
+          endOffset: chunk.endOffset,
+          nextBeforeOffset: chunk.nextBeforeOffset,
+          totalBytes: chunk.stat?.size || 0,
+          partial: !!chunk.nextBeforeOffset,
+          complete: !chunk.nextBeforeOffset,
+          source: 'cursor_cli_jsonl',
+        }));
+        this._log('info', `[${sessionId}] Sent Cursor CLI history chunk (${messages.length} msgs, ${chunk.startOffset}-${chunk.endOffset}/${chunk.stat?.size || 0})`);
+      } catch (e) {
+        fail('chunk_read_failed', e.message || 'Cursor CLI archive chunk read failed', 'cursor_cli_jsonl');
+      }
+      return;
+    }
+
     if (session.agentType !== 'codex_cli') {
-      return fail('unsupported_agent_type', 'Chunked native history is only available for Codex CLI sessions');
+      return fail('unsupported_agent_type', 'Chunked native history is only available for Codex CLI or Cursor CLI sessions');
     }
     const filePath = session.codexCliFilePath || session.codex_cli_file_path;
     if (!filePath) return fail('archive_not_found', 'Codex CLI archive path is unavailable');
@@ -3917,6 +4303,38 @@ class ProxyEngine extends EventEmitter {
     }
   }
 
+  _sendCursorCliLiveTailChunk(sessionId, session, reason = 'cursor cli live tail') {
+    const filePath = session?.cursorCliFilePath || session?.cursor_cli_file_path;
+    if (!filePath) return false;
+    try {
+      const chunk = cursorCli.parseCursorJsonlChunk(filePath, { chunkBytes: CURSOR_CLI_HISTORY_CHUNK_BYTES });
+      const messages = Array.isArray(chunk?.state?.messages) ? chunk.state.messages : [];
+      if (!chunk || messages.length === 0) return false;
+      const tailSig = `${chunk.startOffset}:${chunk.endOffset}:${this._transcriptSignature(messages.slice(-64))}`;
+      if (session._lastCursorCliLiveChunkSig === tailSig) return false;
+      session._lastCursorCliLiveChunkSig = tailSig;
+      this._sendToRelay(proto.historyChunk(sessionId, {
+        messages,
+        mode: 'tail',
+        startOffset: chunk.startOffset,
+        endOffset: chunk.endOffset,
+        nextBeforeOffset: chunk.nextBeforeOffset,
+        totalBytes: chunk.stat?.size || 0,
+        partial: !!chunk.nextBeforeOffset,
+        complete: !chunk.nextBeforeOffset,
+        source: 'cursor_cli_live_tail',
+      }));
+      this._log('info', `[${sessionId}] Sent Cursor CLI live tail (${messages.length} msgs, ${reason})`);
+      return true;
+    } catch (e) {
+      if (session._lastCursorCliLiveTailError !== e.message) {
+        session._lastCursorCliLiveTailError = e.message;
+        this._log('warn', `[${sessionId}] Cursor CLI live tail failed: ${e.message}`);
+      }
+      return false;
+    }
+  }
+
   _sendToRelay(msg) {
     const encoded = JSON.stringify(msg);
     const byteLen = Buffer.byteLength(encoded, 'utf8');
@@ -3948,26 +4366,53 @@ class ProxyEngine extends EventEmitter {
         this._pendingPreReadyHistory.set(sid, encoded);
       }
     }
+    if (type === 'proxy_send_result') {
+      const sid = msg.session_id || msg.session;
+      const clientMessageId = msg.client_message_id;
+      if (sid && clientMessageId) {
+        if (!this._pendingPreReadyEvents) this._pendingPreReadyEvents = new Map();
+        const key = `${type}:${sid}:${clientMessageId}`;
+        this._pendingPreReadyEvents.set(key, encoded);
+        // Delivery results are tiny. Bound the queue so a prolonged outage
+        // cannot grow memory without limit.
+        while (this._pendingPreReadyEvents.size > 256) {
+          this._pendingPreReadyEvents.delete(this._pendingPreReadyEvents.keys().next().value);
+        }
+      }
+    }
   }
 
   _flushPendingPreReadyHistory() {
-    const q = this._pendingPreReadyHistory;
-    if (!q || q.size === 0) return;
     if (!(this.relayReady && this.relayWs && this.relayWs.readyState === WebSocket.OPEN)) return;
-    for (const [sid, encoded] of q.entries()) {
-      try {
-        const byteLen = Buffer.byteLength(encoded, 'utf8');
-        if (byteLen > DEFERRED_HISTORY_FLUSH_MAX_BYTES) {
-          this._log('info', `[relay] Skipped deferred history snapshot for ${sid} (${Math.round(byteLen / 1024)} KB); browser will request transcript tail on selection`);
-          continue;
+    const q = this._pendingPreReadyHistory;
+    if (q && q.size > 0) {
+      for (const [sid, encoded] of q.entries()) {
+        try {
+          const byteLen = Buffer.byteLength(encoded, 'utf8');
+          if (byteLen > DEFERRED_HISTORY_FLUSH_MAX_BYTES) {
+            this._log('info', `[relay] Skipped deferred history snapshot for ${sid} (${Math.round(byteLen / 1024)} KB); browser will request transcript tail on selection`);
+            continue;
+          }
+          this.relayWs.send(encoded);
+          this._log('info', `[relay] Flushed deferred history snapshot for ${sid}`);
+        } catch (e) {
+          this._log('warn', `[relay] Failed to flush deferred snapshot for ${sid}: ${e.message}`);
         }
+      }
+      q.clear();
+    }
+
+    const events = this._pendingPreReadyEvents;
+    if (!events || events.size === 0) return;
+    for (const [key, encoded] of events.entries()) {
+      try {
         this.relayWs.send(encoded);
-        this._log('info', `[relay] Flushed deferred history snapshot for ${sid}`);
+        this._log('info', `[relay] Flushed deferred control result ${key}`);
       } catch (e) {
-        this._log('warn', `[relay] Failed to flush deferred snapshot for ${sid}: ${e.message}`);
+        this._log('warn', `[relay] Failed to flush deferred control result ${key}: ${e.message}`);
       }
     }
-    q.clear();
+    events.clear();
   }
 
   _historySnapshotLimitBytes(reason = 'history') {
@@ -4039,6 +4484,7 @@ class ProxyEngine extends EventEmitter {
     const buildSnapshot = (msgs) => proto.historySnapshot(sessionId, msgs);
 
     if (fullMessages.length === 0) {
+      this._log('info', `[${sessionId}] Sending empty history snapshot (${reason})`);
       this._sendToRelay(buildSnapshot([]));
       return;
     }
@@ -4105,6 +4551,20 @@ class ProxyEngine extends EventEmitter {
     }
     if (content == null) return '';
     return String(content);
+  }
+
+  _shouldReplaceAccumulatedMessage(agentType, accumulated, observed) {
+    const accumulatedText = this._messageContentText(accumulated);
+    const observedText = this._messageContentText(observed);
+    if (observedText.length > accumulatedText.length) return true;
+    if (
+      agentType === 'antigravity-v2' &&
+      observedText === accumulatedText &&
+      this._transcriptSignature([observed]) !== this._transcriptSignature([accumulated])
+    ) {
+      return true;
+    }
+    return false;
   }
 
   _messagesSoftMatch(a, b) {
@@ -4568,6 +5028,9 @@ class ProxyEngine extends EventEmitter {
       available_ai_credits: s.availableAiCredits ?? null,
       antigravity_quota_models: Array.isArray(s.antigravityQuotaModels) ? s.antigravityQuotaModels : null,
       is_list_view:       s._panelEmpty        || s._listView || false,
+      ...(s.cliSessionId ? { cli_session_id: s.cliSessionId } : {}),
+      ...(s.model_id ? { model_id: s.model_id } : {}),
+      ...(s.permission_mode ? { permission_mode: s.permission_mode } : {}),
       ...(Array.isArray(s._lastChatList) ? { chat_list: s._lastChatList } : {}),
     }));
   }
@@ -4576,12 +5039,13 @@ class ProxyEngine extends EventEmitter {
     const allSessions = sessionStore.getAllSessions();
     if (allSessions.length === 0) return;
     const backfill = allSessions
-      .filter(s => s.status === 'healthy' && (s.workspace_path || s.workspace_name))
+      .filter(s => s.status === 'healthy' && (s.workspace_path || s.workspace_name || s.cli_session_id))
       .map(s => ({
         session_id:     s.session_id,
         workspace_path: s.workspace_path || null,
         workspace_name: s.workspace_name || null,
         agent_type:     s.agent_type || null,
+        cli_session_id: s.cli_session_id || null,
       }));
     if (backfill.length === 0) return;
     this._log('info', `[relay] Sending session_meta backfill for ${backfill.length} sessions`);
@@ -4638,6 +5102,9 @@ class ProxyEngine extends EventEmitter {
 
       let raw      = await selectors.readMessages(client.Runtime, session.agentType, sessionId);
       let thinking = await selectors.detectThinking(client.Runtime, session.agentType);
+      const sessionTitle = session.agentType === 'claude'
+        ? await selectors.readClaudeSessionTitle(client.Runtime).catch(() => null)
+        : null;
       const perm   = await selectors.detectPermissionDialog(client.Runtime, session.agentType);
       const errorPrompt = await selectors.detectSessionErrorPrompt(client.Runtime, session.agentType).catch(() => null);
       const config = includeConfig
@@ -4661,7 +5128,7 @@ class ProxyEngine extends EventEmitter {
         thinking = await selectors.detectThinking(client.Runtime, session.agentType);
       }
 
-      return { raw, thinking, perm, errorPrompt, config, taskList, contextUsage, rateLimit };
+      return { raw, thinking, sessionTitle, perm, errorPrompt, config, taskList, contextUsage, rateLimit };
     } finally {
       this._log('info', `[${sessionId}] [${focusTag}] poll attach:end`);
       await this._safeClose(client);
@@ -4971,6 +5438,13 @@ class ProxyEngine extends EventEmitter {
       const messages = summary?.messages || [];
       return JSON.stringify(messages.length > 0 ? messages : this._codexCliPendingTranscriptMessages(session));
     }
+    if (session.agentType === 'cursor_cli') {
+      const summary = session.cursorCliFilePath
+        ? cursorCli.readSessionSummary(session.cursorCliFilePath, this._cursorCliActiveSummaryOptions())
+        : null;
+      const messages = summary?.messages || [];
+      return JSON.stringify(messages.length > 0 ? messages : this._cursorCliPendingTranscriptMessages(session));
+    }
     if (this._isEphemeralIframeAgent(session.agentType)) {
       return this._withEphemeralIframeClient(session, client =>
         selectors.readMessages(client.Runtime, session.agentType, sessionId)
@@ -4994,6 +5468,14 @@ class ProxyEngine extends EventEmitter {
         model_id: session.model_id || 'gpt-5.5',
         permission_mode: session.permission_mode || 'workspace-write',
         effort: session.effort || 'medium',
+        file_access_scope: workspacePath || session.workspace_path || 'unknown',
+      };
+    }
+    if (session.agentType === 'cursor_cli') {
+      return {
+        model_id: session.model_id || 'grok-4.5-fast-high',
+        permission_mode: session.permission_mode || 'force',
+        sandbox: session.sandbox || 'disabled',
         file_access_scope: workspacePath || session.workspace_path || 'unknown',
       };
     }
@@ -5071,6 +5553,9 @@ class ProxyEngine extends EventEmitter {
     }
     if (session.agentType === 'codex_cli') {
       return this._sendCodexCliMessage(session, content, sessionId);
+    }
+    if (session.agentType === 'cursor_cli') {
+      return this._sendCursorCliMessage(session, content, sessionId);
     }
     if (this._isEphemeralIframeAgent(session.agentType)) {
       return this._withEphemeralIframeClient(session, client =>
@@ -5548,6 +6033,40 @@ class ProxyEngine extends EventEmitter {
     return changed;
   }
 
+  _codexCliTranscriptKeyMatches(summary, sessionLike) {
+    if (!summary || !sessionLike) return false;
+    const norm = p => String(p || '').replace(/\\/g, '/').replace(/\/+$/, '').toLowerCase();
+    const summaryFile = norm(summary.filePath);
+    const storedFile = norm(sessionLike.codexCliFilePath || sessionLike.codex_cli_file_path);
+    if (summaryFile && storedFile && summaryFile === storedFile) return true;
+    const summaryCliId = String(summary.cliSessionId || '');
+    const storedCliId = String(sessionLike.cliSessionId || sessionLike.cli_session_id || '');
+    return !!summaryCliId && !!storedCliId && summaryCliId === storedCliId;
+  }
+
+  _dedupeCodexCliSessionAliases(summary, canonicalSessionId) {
+    if (!summary?.cliSessionId || !canonicalSessionId) return false;
+    let changed = false;
+    for (const sess of sessionStore.getAllSessions()) {
+      if (sess.agent_type !== 'codex_cli') continue;
+      if (sess.session_id === canonicalSessionId) continue;
+      if (sess.status !== 'healthy') continue;
+      if (!this._codexCliTranscriptKeyMatches(summary, sess)) continue;
+      sessionStore.markDisconnected(sess.session_id);
+      changed = true;
+      this._log('info', `[codex-cli] disconnected duplicate alias ${sess.session_id} for cli=${summary.cliSessionId}`);
+    }
+    for (const [sessionId, session] of this.sessions.entries()) {
+      if (sessionId === canonicalSessionId) continue;
+      if (session.agentType !== 'codex_cli') continue;
+      if (!this._codexCliTranscriptKeyMatches(summary, session)) continue;
+      this.sessions.delete(sessionId);
+      changed = true;
+      this._log('info', `[codex-cli] removed duplicate in-memory alias ${sessionId} for cli=${summary.cliSessionId}`);
+    }
+    return changed;
+  }
+
   _registerCodexCliSession(summary, { sendInitialHistory = true, archiveDiscovered = false, externalActive = null } = {}) {
     if (!summary?.cliSessionId) return null;
     const displayName = 'Codex CLI';
@@ -5618,6 +6137,7 @@ class ProxyEngine extends EventEmitter {
       },
     });
     const sessionId = sessionMeta.session_id;
+    const dedupedAliases = this._dedupeCodexCliSessionAliases(summary, sessionId);
     const existing = this.sessions.get(sessionId);
     if (existing) {
       const externalActiveFlag = externalActive == null
@@ -5631,7 +6151,7 @@ class ProxyEngine extends EventEmitter {
       if (summary.permission_mode) existing.permission_mode = summary.permission_mode;
       if (summary.effort) existing.effort = summary.effort;
       this._setCodexCliActivity(sessionId, existing, summary.activity || existing.activity);
-      if (metaChanged) this._broadcastSessionSnapshot();
+      if (metaChanged || dedupedAliases) this._broadcastSessionSnapshot();
       const summaryMessages = summary.messages || [];
       const effectiveMessages = summaryMessages.length > 0 ? summaryMessages : this._codexCliPendingTranscriptMessages(existing);
       const sig = this._transcriptSignature(effectiveMessages);
@@ -5666,6 +6186,7 @@ class ProxyEngine extends EventEmitter {
       approval_policy: session.approval_policy,
     }, session.workspace_path));
     this._sendToRelay(proto.agentConfig(sessionId, { ...cfg, capabilities: this._buildCapabilities('codex_cli') }));
+    if (dedupedAliases) this._broadcastSessionSnapshot();
     return session;
   }
 
@@ -6050,6 +6571,591 @@ class ProxyEngine extends EventEmitter {
     return Promise.resolve({ ok: true });
   }
 
+  // ─── Cursor CLI session helpers ──────────────────────────────────────────
+
+  _cursorCliPendingTranscriptMessages(session) {
+    const workspaceName = session.workspace_name || session.workspaceName || 'the selected workspace';
+    const model = session.model_id && session.model_id !== 'default' ? session.model_id : 'Default';
+    const permissionMode = session.permission_mode || 'default';
+    return [{
+      role: 'assistant',
+      content: [
+        '**Cursor CLI is waiting for a native transcript.**',
+        '',
+        `Workspace: ${workspaceName}`,
+        `Model: ${model}`,
+        `Permission mode: ${permissionMode}`,
+        '',
+        'Once Cursor Agent creates or updates the JSONL transcript file, this placeholder will be replaced with the real CLI chat history.',
+      ].join('\n'),
+      ts: session.nativeCliStartedAt ? Math.floor(new Date(session.nativeCliStartedAt).getTime() / 1000) : undefined,
+    }];
+  }
+
+  _setCursorCliActivity(sessionId, session, activity) {
+    const nextActivity = activity || { kind: 'idle', label: '', updated_at: new Date().toISOString() };
+    const prevSig = this._activitySemanticSignature(session.activity || null);
+    const nextSig = this._activitySemanticSignature(nextActivity);
+    if (prevSig === nextSig) return false;
+    session.activity = nextActivity;
+    if (nextActivity.thinkingContent) session.thinkingContent = nextActivity.thinkingContent;
+    else session.thinkingContent = '';
+    sessionStore.updateSession(sessionId, { activity: nextActivity });
+    this._sendToRelay(proto.proxyStatus(sessionId, session.status || 'healthy', nextActivity));
+    return true;
+  }
+
+  _buildCursorCliSessionFromSummary(sessionMeta, summary) {
+    const now = new Date().toISOString();
+    return {
+      session_id: sessionMeta.session_id,
+      display_name: sessionMeta.display_name || 'Cursor CLI',
+      workspace_name: summary.workspaceName || sessionMeta.workspace_name,
+      workspace_path: summary.workspacePath || sessionMeta.workspace_path,
+      machine_label: sessionMeta.machine_label,
+      target_signature: sessionMeta.target_signature,
+      chat_title: summary.title || null,
+      client: null,
+      lastMessageCount: summary.messageCount || 0,
+      lastObservedCount: summary.messageCount || 0,
+      lastTranscriptSig: this._transcriptSignature(summary.messages || []),
+      nullPollCount: 0,
+      waitingForAssistant: false,
+      thinking: false,
+      thinkingLabel: '',
+      autoApprovePermissions: false,
+      status: 'healthy',
+      activity: summary.activity || sessionMeta.activity || { kind: 'idle', label: '', updated_at: now },
+      last_seen_at: summary.updatedAt || now,
+      windowTitle: sessionMeta.window_title || summary.workspaceName || 'Cursor CLI',
+      agentType: 'cursor_cli',
+      parentId: null,
+      ext: null,
+      targetId: null,
+      cliSessionId: summary.cliSessionId,
+      cursorCliFilePath: summary.filePath,
+      cursorCliArchiveDiscovered: sessionMeta.cursor_cli_archive_discovered === true,
+      nativeCliStartedAt: sessionMeta.native_cli_started_at || summary.nativeCliStartedAt || null,
+      nativeCliStatus: sessionMeta.native_cli_status || summary.nativeCliStatus || null,
+      nativeCliWindowOpened: sessionMeta.native_cli_window_opened === true || summary.nativeCliWindowOpened === true,
+      cursorCliChatCreated: sessionMeta.cursor_cli_chat_created === true || summary.cursorCliChatCreated === true,
+      model_id: sessionMeta.model_id || summary.model_id || 'grok-4.5-fast-high',
+      permission_mode: sessionMeta.permission_mode || summary.permission_mode || 'force',
+      sandbox: sessionMeta.sandbox || summary.sandbox || 'disabled',
+    };
+  }
+
+  _applyCursorCliSummaryMetadata(sessionId, session, summary) {
+    if (!session || !summary) return false;
+    let changed = false;
+    const nextWorkspaceName = summary.workspaceName || session.workspace_name;
+    const nextWorkspacePath = summary.workspacePath || session.workspace_path;
+    const nextChatTitle = summary.title || session.chat_title;
+    if (nextWorkspaceName && nextWorkspaceName !== session.workspace_name) {
+      session.workspace_name = nextWorkspaceName;
+      changed = true;
+    }
+    if (nextWorkspacePath && nextWorkspacePath !== session.workspace_path) {
+      session.workspace_path = nextWorkspacePath;
+      changed = true;
+    }
+    if (nextChatTitle && nextChatTitle !== session.chat_title) {
+      session.chat_title = nextChatTitle;
+      changed = true;
+    }
+    if (summary.updatedAt && summary.updatedAt !== session.last_seen_at) {
+      session.last_seen_at = summary.updatedAt;
+    }
+    if (summary.filePath && summary.filePath !== session.cursorCliFilePath) {
+      session.cursorCliFilePath = summary.filePath;
+      changed = true;
+    }
+    if (summary.model_id && summary.model_id !== session.model_id) {
+      session.model_id = summary.model_id;
+      changed = true;
+    }
+    if (summary.permission_mode && summary.permission_mode !== session.permission_mode) {
+      session.permission_mode = summary.permission_mode;
+      changed = true;
+    }
+    if (changed) {
+      session.windowTitle = session.workspace_name || session.windowTitle || 'Cursor CLI';
+      sessionStore.updateSession(sessionId, {
+        workspace_path: session.workspace_path || null,
+        workspace_name: session.workspace_name || null,
+        window_title: session.windowTitle || null,
+        chat_title: session.chat_title || null,
+        cursor_cli_file_path: session.cursorCliFilePath || null,
+        model_id: session.model_id || null,
+        permission_mode: session.permission_mode || null,
+      });
+    }
+    return changed;
+  }
+
+  _registerCursorCliSession(summary, { sendInitialHistory = true, archiveDiscovered = false } = {}) {
+    if (!summary?.cliSessionId) return null;
+    const displayName = 'Cursor CLI';
+    const norm = p => String(p || '').replace(/\\/g, '/').replace(/\/+$/, '').toLowerCase();
+    const pendingEntry = Array.from(this.sessions.entries()).find(([, s]) =>
+      s.agentType === 'cursor_cli'
+      && !s.cursorCliFilePath
+      && norm(s.workspace_path) === norm(summary.workspacePath)
+      && (s.cliSessionId === summary.cliSessionId || s.nativeCliWindowOpened === true || s._cursorCliChild)
+    );
+    if (pendingEntry) {
+      const [sessionId, existing] = pendingEntry;
+      const metaChanged = this._applyCursorCliSummaryMetadata(sessionId, existing, summary);
+      existing.cursorCliArchiveDiscovered = archiveDiscovered === true;
+      if (summary.cursorCliChatCreated === true) existing.cursorCliChatCreated = true;
+      existing.cliSessionId = summary.cliSessionId;
+      if (summary.model_id) existing.model_id = summary.model_id;
+      this._setCursorCliActivity(sessionId, existing, summary.activity || existing.activity);
+      sessionStore.updateSession(sessionId, {
+        cli_session_id: existing.cliSessionId,
+        cursor_cli_file_path: existing.cursorCliFilePath || null,
+        cursor_cli_archive_discovered: archiveDiscovered === true,
+        cursor_cli_chat_created: existing.cursorCliChatCreated === true || undefined,
+        chat_title: existing.chat_title || null,
+        workspace_path: existing.workspace_path || null,
+        workspace_name: existing.workspace_name || null,
+      });
+      if (metaChanged) this._broadcastSessionSnapshot();
+      const effectiveMessages = (summary.messages || []).length > 0 ? summary.messages : this._cursorCliPendingTranscriptMessages(existing);
+      const sig = this._transcriptSignature(effectiveMessages);
+      if (sig !== existing.lastTranscriptSig) {
+        existing.lastTranscriptSig = sig;
+        existing.lastObservedCount = effectiveMessages.length;
+        existing.lastMessageCount = effectiveMessages.length;
+        this._sendHistorySnapshot(sessionId, effectiveMessages, 'cursor cli file attached');
+        if (summary.messagesPartial === true) {
+          this._sendCursorCliLiveTailChunk(sessionId, existing, 'cursor cli file attached');
+        }
+      }
+      return existing;
+    }
+    const sessionMeta = sessionStore.resolveVirtualSession({
+      virtualId: `cursor-cli:${summary.cliSessionId}`,
+      agentType: 'cursor_cli',
+      displayName,
+      workspaceName: summary.workspaceName,
+      workspacePath: summary.workspacePath,
+      windowTitle: summary.workspaceName || displayName,
+      extra: {
+        cli_session_id: summary.cliSessionId,
+        cursor_cli_file_path: summary.filePath,
+        cursor_cli_archive_discovered: archiveDiscovered === true,
+        cursor_cli_chat_created: summary.cursorCliChatCreated === true || undefined,
+        chat_title: summary.title || null,
+        model_id: summary.model_id || undefined,
+        permission_mode: summary.permission_mode || undefined,
+        native_cli_started_at: summary.nativeCliStartedAt || undefined,
+        native_cli_status: summary.nativeCliStatus || undefined,
+        native_cli_window_opened: summary.nativeCliWindowOpened === true || undefined,
+      },
+    });
+    const sessionId = sessionMeta.session_id;
+    const existing = this.sessions.get(sessionId);
+    if (existing) {
+      const metaChanged = this._applyCursorCliSummaryMetadata(sessionId, existing, summary);
+      existing.cursorCliArchiveDiscovered = archiveDiscovered === true;
+      if (summary.cursorCliChatCreated === true) existing.cursorCliChatCreated = true;
+      existing.cliSessionId = summary.cliSessionId;
+      if (summary.model_id) existing.model_id = summary.model_id;
+      if (summary.permission_mode) existing.permission_mode = summary.permission_mode;
+      this._setCursorCliActivity(sessionId, existing, summary.activity || existing.activity);
+      if (metaChanged) this._broadcastSessionSnapshot();
+      const summaryMessages = summary.messages || [];
+      const effectiveMessages = summaryMessages.length > 0 ? summaryMessages : this._cursorCliPendingTranscriptMessages(existing);
+      const sig = this._transcriptSignature(effectiveMessages);
+      if (sig !== existing.lastTranscriptSig) {
+        existing.lastTranscriptSig = sig;
+        existing.lastObservedCount = effectiveMessages.length;
+        existing.lastMessageCount = effectiveMessages.length;
+        this._sendHistorySnapshot(sessionId, effectiveMessages, 'cursor cli file changed');
+        if (summary.messagesPartial === true) {
+          this._sendCursorCliLiveTailChunk(sessionId, existing, 'cursor cli file changed');
+        }
+      }
+      return existing;
+    }
+    const session = this._buildCursorCliSessionFromSummary(sessionMeta, summary);
+    this.sessions.set(sessionId, session);
+    this._log('info', `[cursor-cli] registered ${sessionId} cli=${summary.cliSessionId} (${summary.messageCount} msgs)`);
+    if (sendInitialHistory) {
+      const initialMessages = summary.messages?.length ? summary.messages : this._cursorCliPendingTranscriptMessages(session);
+      this._sendHistorySnapshot(sessionId, initialMessages, 'cursor cli discovery');
+      if (summary.messagesPartial === true) {
+        this._sendCursorCliLiveTailChunk(sessionId, session, 'cursor cli discovery');
+      }
+      session.lastTranscriptSig = this._transcriptSignature(initialMessages);
+      session.lastObservedCount = initialMessages.length;
+      session.lastMessageCount = initialMessages.length;
+    }
+    const cfg = this._decorateAgentConfig(session, this._mergeAgentConfig('cursor_cli', {
+      model_id: session.model_id,
+      permission_mode: session.permission_mode,
+      sandbox: session.sandbox,
+    }, session.workspace_path));
+    this._sendToRelay(proto.agentConfig(sessionId, { ...cfg, capabilities: this._buildCapabilities('cursor_cli') }));
+    return session;
+  }
+
+  _cursorCliArchiveDiscoveryEnabled() {
+    return process.env.CURSOR_CLI_DISCOVER_ARCHIVES !== 'false';
+  }
+
+  _cursorCliArchiveSessionLimit() {
+    const limit = parseInt(process.env.CURSOR_CLI_SESSION_LIMIT || '20', 10);
+    return Number.isFinite(limit) && limit >= 0 ? limit : 20;
+  }
+
+  _cursorCliArchiveMaxAgeMs() {
+    const hours = Number(process.env.CURSOR_CLI_ARCHIVE_MAX_AGE_HOURS || '72');
+    if (!Number.isFinite(hours) || hours < 0) return 72 * 60 * 60 * 1000;
+    return hours === 0 ? 0 : hours * 60 * 60 * 1000;
+  }
+
+  _cursorCliArchiveSummaryVisible(summary, nowMs = Date.now()) {
+    const maxAgeMs = this._cursorCliArchiveMaxAgeMs();
+    if (!maxAgeMs) return true;
+    const updatedMs = Date.parse(summary?.updatedAt || summary?.startedAt || '');
+    if (!Number.isFinite(updatedMs)) return true;
+    return nowMs - updatedMs <= maxAgeMs;
+  }
+
+  _cursorCliActiveSummaryOptions() {
+    return {
+      maxHydrateBytes: cursorCli.CURSOR_CLI_ACTIVE_HYDRATE_MAX_BYTES,
+      preferTailBytes: cursorCli.CURSOR_CLI_ACTIVE_HYDRATE_TAIL_BYTES,
+    };
+  }
+
+  async _discoverCursorCliSessions() {
+    const limit = this._cursorCliArchiveSessionLimit();
+    const scanLimit = limit > 0 ? Math.max(limit * 4, 80) : 0;
+    const includeMessages = process.env.CURSOR_CLI_HYDRATE_ARCHIVES === 'true';
+    const nowMs = Date.now();
+    const archiveDiscovery = this._cursorCliArchiveDiscoveryEnabled();
+    let changed = false;
+
+    if (!archiveDiscovery) {
+      // Restore only previously-known healthy sessions from the session store
+      for (const sess of sessionStore.getAllSessions()) {
+        if (sess.agent_type !== 'cursor_cli') continue;
+        if (sess.status !== 'healthy') continue;
+        if (!sess.cli_session_id) continue;
+        if (this.sessions.has(sess.session_id)) continue;
+        let messages = [];
+        let updatedAt = sess.last_seen_at || new Date().toISOString();
+        let activity = sess.activity || null;
+        const filePath = sess.cursor_cli_file_path || null;
+        if (filePath && fs.existsSync(filePath)) {
+          try {
+            const summary = cursorCli.readSessionSummary(filePath, this._cursorCliActiveSummaryOptions());
+            messages = summary?.messages || cursorCli.parseCursorJsonl(filePath);
+            updatedAt = summary?.updatedAt || fs.statSync(filePath).mtime.toISOString();
+            activity = summary?.activity || activity;
+          } catch (e) {
+            this._log('warn', `[cursor-cli] failed to restore transcript ${filePath}: ${e.message}`);
+          }
+        }
+        const before = this.sessions.size;
+        this._registerCursorCliSession({
+          cliSessionId: sess.cli_session_id,
+          filePath,
+          workspacePath: sess.workspace_path || process.cwd(),
+          workspaceName: sess.workspace_name || 'Cursor CLI',
+          title: sess.chat_title || 'Cursor CLI session',
+          messages,
+          messageCount: messages.length,
+          updatedAt,
+          activity,
+          model_id: sess.model_id,
+          permission_mode: sess.permission_mode,
+          cursorCliChatCreated: sess.cursor_cli_chat_created === true,
+        }, { archiveDiscovered: false });
+        const restored = this.sessions.get(sess.session_id);
+        if (restored && sess.cursor_cli_chat_created === true) {
+          restored.cursorCliChatCreated = true;
+        }
+        if (this.sessions.size !== before) changed = true;
+      }
+      if (changed) this._broadcastSessionSnapshot();
+      return;
+    }
+
+    const summaries = cursorCli
+      .discoverSessions(scanLimit, { includeMessages })
+      .filter(summary => this._cursorCliArchiveSummaryVisible(summary, nowMs))
+      .slice(0, limit > 0 ? limit : undefined);
+    const visibleCliIds = new Set(summaries.map(summary => summary.cliSessionId).filter(Boolean));
+    for (const sess of sessionStore.getAllSessions()) {
+      if (sess.agent_type !== 'cursor_cli') continue;
+      if (sess.status !== 'healthy') continue;
+      if (sess.cursor_cli_archive_discovered !== true) continue;
+      if (sess.cli_session_id && visibleCliIds.has(sess.cli_session_id)) continue;
+      sessionStore.markDisconnected(sess.session_id);
+      changed = true;
+    }
+    for (const [sessionId, session] of this.sessions.entries()) {
+      if (session.agentType !== 'cursor_cli') continue;
+      if (session.cursorCliArchiveDiscovered !== true) continue;
+      if (session.cliSessionId && visibleCliIds.has(session.cliSessionId)) continue;
+      this.sessions.delete(sessionId);
+      changed = true;
+    }
+    for (const summary of summaries) {
+      const before = this.sessions.size;
+      this._registerCursorCliSession(summary, { archiveDiscovered: true, sendInitialHistory: summary.messagesHydrated === true });
+      if (this.sessions.size !== before) changed = true;
+    }
+    if (changed) this._broadcastSessionSnapshot();
+  }
+
+  _findCursorCliSummaryByCliId(cliSessionId) {
+    if (!cliSessionId) return null;
+    return cursorCli.findSessionByCliId(cliSessionId, this._cursorCliActiveSummaryOptions());
+  }
+
+  _startCursorCliWatcher() {
+    if (this._cursorCliWatcher) return;
+    const archiveDiscovery = this._cursorCliArchiveDiscoveryEnabled();
+    if (!archiveDiscovery && process.env.CURSOR_CLI_WATCH_SESSIONS !== 'true') {
+      if (!this._cursorCliWatcherDisabledLogged) {
+        this._cursorCliWatcherDisabledLogged = true;
+        this._log('info', '[cursor-cli] archive watcher disabled; using polling (set CURSOR_CLI_WATCH_SESSIONS=true to opt in)');
+      }
+      return;
+    }
+    const watcher = cursorCli.watchSessions(
+      summary => {
+        if (!this._running || !summary?.cliSessionId) return;
+        if (archiveDiscovery && !this._cursorCliArchiveSummaryVisible(summary)) return;
+        const existing = Array.from(this.sessions.values()).find(s =>
+          s.agentType === 'cursor_cli' && s.cliSessionId === summary.cliSessionId
+        );
+        if (!archiveDiscovery && !existing) return;
+        const before = this.sessions.size;
+        const session = this._registerCursorCliSession(summary, { archiveDiscovered: archiveDiscovery });
+        if (session) {
+          const changed = this.sessions.size !== before;
+          if (changed || session.last_seen_at === summary.updatedAt) this._broadcastSessionSnapshot();
+        }
+      },
+      { onError: err => this._log('warn', `[cursor-cli] session watcher: ${err.message}`) }
+    );
+    if (watcher) {
+      this._cursorCliWatcher = watcher;
+      this._log('info', '[cursor-cli] watching Cursor session store for live JSONL changes');
+    } else {
+      this._log('warn', '[cursor-cli] session watcher unavailable; falling back to periodic polling');
+    }
+  }
+
+  _handleCursorCliJsonEvent(session, sessionId, event) {
+    if (!event || typeof event !== 'object') return;
+    const thinkingTypes = new Set(['thinking']);
+    const assistantTypes = new Set(['assistant', 'agent_message', 'assistant_message']);
+    const isThinking = thinkingTypes.has(event.type);
+    const isAssistant = assistantTypes.has(event.type);
+    if (!isThinking && !isAssistant) return;
+    let text = '';
+    if (typeof event.text === 'string') text = event.text;
+    else if (event.message && typeof event.message.content === 'string') text = event.message.content;
+    else if (typeof event.content === 'string') text = event.content;
+    if (!text) return;
+    const prior = session._cursorCliLiveText || '';
+    const nextText = text.startsWith(prior) ? text : `${prior}${text}`;
+    session._cursorCliLiveText = nextText;
+    const activity = {
+      kind: 'generating',
+      label: 'Cursor CLI running',
+      thinkingContent: nextText,
+      updated_at: new Date().toISOString(),
+    };
+    session.activity = activity;
+    this._sendToRelay(proto.proxyStatus(sessionId, session.status || 'healthy', activity));
+  }
+
+  _sendCursorCliMessage(session, content, sessionId) {
+    if (session._cursorCliChild) {
+      return Promise.resolve({ ok: false, code: 'agent_busy', detail: 'Cursor CLI process is already running' });
+    }
+    let cliSessionId = session.cliSessionId || null;
+    const existingSummary = this._findCursorCliSummaryByCliId(cliSessionId)
+      || (session.cursorCliFilePath
+        ? cursorCli.readSessionSummary(session.cursorCliFilePath, this._cursorCliActiveSummaryOptions())
+        : null);
+    if (existingSummary?.filePath) {
+      session.cursorCliFilePath = existingSummary.filePath;
+      session.workspace_path = existingSummary.workspacePath || session.workspace_path;
+      session.workspace_name = existingSummary.workspaceName || session.workspace_name;
+    }
+    // Ensure a cliSessionId is always set before spawning so startCursorExecSession
+    // can create the transcript file and pass --new-session-id or --resume.
+    if (!cliSessionId) {
+      cliSessionId = crypto.randomUUID();
+    }
+    session.cliSessionId = cliSessionId;
+    sessionStore.updateSession(sessionId, { cli_session_id: cliSessionId });
+    // Resume only when the chat already has real transcript turns (or was
+    // created via `agent create-chat`). An empty local meta-only file from
+    // launch/ensureSessionFile must still use --new-session-id on first send.
+    const shouldResume = !!(existingSummary && existingSummary.messageCount > 0)
+      || session.cursorCliChatCreated === true
+      || session.cursor_cli_chat_created === true;
+    const workspacePath = session.workspace_path || process.cwd();
+    const startedAtMs = Date.now();
+    const stderrChunks = [];
+    let child;
+    try {
+      child = cursorCli.startCursorExecSession({
+        workspacePath,
+        cliSessionId,
+        resume: shouldResume,
+        content,
+        model: session.model_id,
+        permissionMode: session.permission_mode,
+        sandbox: session.sandbox,
+        onStdout: () => {},
+        onStderr: chunk => { if (chunk) stderrChunks.push(chunk); },
+        onEvent: event => {
+          this._handleCursorCliJsonEvent(session, sessionId, event);
+        },
+        onExit: (code, err) => {
+          if (session._cursorCliChild === child) session._cursorCliChild = null;
+          (async () => {
+            const resolvedCliSessionId = session.cliSessionId || cliSessionId;
+            let summary = this._findCursorCliSummaryByCliId(resolvedCliSessionId)
+              || cursorCli.findLatestSessionForWorkspace(workspacePath, startedAtMs - 5000, this._cursorCliActiveSummaryOptions());
+            for (let attempt = 0; code === 0 && !summary && attempt < 8; attempt++) {
+              await sleep(250);
+              summary = this._findCursorCliSummaryByCliId(resolvedCliSessionId)
+                || cursorCli.findLatestSessionForWorkspace(workspacePath, startedAtMs - 5000, this._cursorCliActiveSummaryOptions());
+            }
+            if (summary) {
+              session.cliSessionId = summary.cliSessionId;
+              session.cursorCliFilePath = summary.filePath;
+              session.workspace_path = summary.workspacePath || session.workspace_path;
+              session.workspace_name = summary.workspaceName || session.workspace_name;
+              session.chat_title = summary.title || session.chat_title;
+              session.cursorCliArchiveDiscovered = false;
+              this._registerCursorCliSession(summary, { sendInitialHistory: false });
+              const effectiveMessages = summary.messages?.length ? summary.messages : this._cursorCliPendingTranscriptMessages(session);
+              this._sendHistorySnapshot(sessionId, effectiveMessages, 'cursor cli send complete');
+              session.lastMessageCount = effectiveMessages.length;
+              session.lastObservedCount = effectiveMessages.length;
+              session.lastTranscriptSig = this._transcriptSignature(effectiveMessages);
+            } else {
+              const stderr = stderrChunks.join('').trim();
+              this._sendToRelay(proto.proxyMessage(
+                sessionId,
+                'assistant',
+                code === 0 && !err
+                  ? 'Cursor CLI exited without producing a transcript file for this session.'
+                  : `Cursor CLI failed to start or complete the request.\n\n${stderr || err?.message || `Cursor CLI exited with code ${code}`}`
+              ));
+            }
+            const activity = { kind: 'idle', label: summary ? '' : 'Cursor CLI failed', updated_at: new Date().toISOString() };
+            session.activity = activity;
+            session._cursorCliLiveText = '';
+            session.waitingForAssistant = false;
+            sessionStore.updateSession(sessionId, {
+              activity,
+              workspace_path: session.workspace_path || null,
+              workspace_name: session.workspace_name || null,
+              cli_session_id: session.cliSessionId || cliSessionId || null,
+              cursor_cli_file_path: session.cursorCliFilePath || null,
+              cursor_cli_archive_discovered: false,
+            });
+            this._sendToRelay(proto.proxyStatus(sessionId, session.status || 'healthy', activity));
+            this._broadcastSessionSnapshot();
+          })().catch(exitErr => {
+            this._log('warn', `[cursor-cli] send exit handler failed: ${exitErr.message}`);
+          });
+        },
+      });
+    } catch (e) {
+      this._log('warn', `[cursor-cli] failed to spawn Cursor CLI for ${sessionId}: ${e.message}`);
+      return Promise.resolve({ ok: false, code: 'cursor_cli_spawn_failed', detail: e.message });
+    }
+    session._cursorCliChild = child;
+    return Promise.resolve({ ok: true });
+  }
+
+  async _pollSessionCursorCli(sessionId, session) {
+    const now = Date.now();
+    const shouldLookupTranscript = !session._lastCursorCliTranscriptLookupAt
+      || now - session._lastCursorCliTranscriptLookupAt >= 10000;
+    if (!session.cursorCliFilePath && session.cliSessionId && shouldLookupTranscript) {
+      session._lastCursorCliTranscriptLookupAt = now;
+      const nativeStartMs = session.nativeCliStartedAt ? new Date(session.nativeCliStartedAt).getTime() : 0;
+      const summary = this._findCursorCliSummaryByCliId(session.cliSessionId)
+        || cursorCli.findLatestSessionForWorkspace(session.workspace_path || process.cwd(), nativeStartMs ? nativeStartMs - 5000 : 0, this._cursorCliActiveSummaryOptions());
+      if (summary?.filePath) {
+        session.cursorCliFilePath = summary.filePath;
+        session.workspace_path = summary.workspacePath || session.workspace_path;
+        session.workspace_name = summary.workspaceName || session.workspace_name;
+        session.chat_title = summary.title || session.chat_title;
+        sessionStore.updateSession(sessionId, {
+          workspace_path: session.workspace_path || null,
+          workspace_name: session.workspace_name || null,
+          cursor_cli_file_path: session.cursorCliFilePath,
+          cursor_cli_archive_discovered: false,
+          chat_title: session.chat_title || null,
+        });
+      }
+    }
+    let messages = [];
+    let summaryActivity = null;
+    let summaryPartial = false;
+    let transcriptMaybeChanged = !session.cursorCliFilePath;
+    if (session.cursorCliFilePath) {
+      const stat = (() => { try { return fs.statSync(session.cursorCliFilePath); } catch { return null; } })();
+      const fileSig = stat ? `${stat.mtimeMs}:${stat.size}` : '';
+      if (fileSig && fileSig === session._lastCursorCliFileSig && Array.isArray(session._lastCursorCliMessages)) {
+        messages = session._lastCursorCliMessages;
+        summaryActivity = session._lastCursorCliActivity || null;
+        summaryPartial = session._lastCursorCliMessagesPartial === true;
+      } else {
+        transcriptMaybeChanged = true;
+        const summary = cursorCli.readSessionSummary(session.cursorCliFilePath, this._cursorCliActiveSummaryOptions());
+        messages = summary?.messages || [];
+        summaryActivity = summary?.activity || null;
+        summaryPartial = summary?.messagesPartial === true;
+        session._lastCursorCliFileSig = fileSig;
+        session._lastCursorCliMessages = messages;
+        session._lastCursorCliActivity = summaryActivity;
+        session._lastCursorCliMessagesPartial = summaryPartial;
+        if (summary) {
+          if (this._applyCursorCliSummaryMetadata(sessionId, session, summary)) {
+            this._broadcastSessionSnapshot();
+          }
+          if (summary.model_id) session.model_id = summary.model_id;
+          if (summary.permission_mode) session.permission_mode = summary.permission_mode;
+        }
+      }
+    }
+    const effectiveMessages = messages.length > 0 ? messages : this._cursorCliPendingTranscriptMessages(session);
+    if (transcriptMaybeChanged || !session.lastTranscriptSig) {
+      const sig = this._transcriptSignature(effectiveMessages);
+      if (sig !== session.lastTranscriptSig) {
+        session.lastTranscriptSig = sig;
+        session.lastObservedCount = effectiveMessages.length;
+        session.lastMessageCount = effectiveMessages.length;
+        this._sendHistorySnapshot(sessionId, effectiveMessages, messages.length > 0 ? 'cursor cli poll' : 'cursor cli pending transcript');
+        if (messages.length > 0 && summaryPartial) {
+          this._sendCursorCliLiveTailChunk(sessionId, session, 'cursor cli poll');
+        }
+      }
+    }
+    const fallbackActivity = session._cursorCliChild
+      ? { kind: 'generating', label: 'Cursor CLI running', thinkingContent: session._cursorCliLiveText || '', updated_at: new Date().toISOString() }
+      : (session.activity?.kind === 'idle' ? session.activity : { kind: 'idle', label: '', updated_at: new Date().toISOString() });
+    this._setCursorCliActivity(sessionId, session, summaryActivity || fallbackActivity);
+  }
+
   async _pollSessionCodexCli(sessionId, session) {
     const now = Date.now();
     const shouldLookupTranscript = !session._lastCodexCliTranscriptLookupAt
@@ -6378,6 +7484,7 @@ class ProxyEngine extends EventEmitter {
     const newActivity = { kind, label, updated_at: new Date().toISOString() };
     if (session.taskList) newActivity.task_list = session.taskList;
     if (session.contextCard) newActivity.context_card = session.contextCard;
+    if (thinkingState.goal) newActivity.goal = thinkingState.goal;
     if (thinkingState.thinkingContent) newActivity.thinkingContent = thinkingState.thinkingContent;
 
     const prevKind = session.activity?.kind || 'idle';
@@ -6385,7 +7492,19 @@ class ProxyEngine extends EventEmitter {
     const currThinkingContent = thinkingState.thinkingContent || '';
     const prevContextSig = session.activity?.context_card ? JSON.stringify(session.activity.context_card) : '';
     const currContextSig = newActivity.context_card ? JSON.stringify(newActivity.context_card) : '';
-    if (thinkingState.thinking !== session.thinking || label !== session.thinkingLabel || kind !== prevKind || currThinkingContent !== prevThinkingContent || currContextSig !== prevContextSig) {
+    const prevGoalSig = session.activity?.goal ? JSON.stringify([
+      session.activity.goal.label,
+      session.activity.goal.status,
+      session.activity.goal.objective,
+      session.activity.goal.time_used_seconds,
+    ]) : '';
+    const currGoalSig = newActivity.goal ? JSON.stringify([
+      newActivity.goal.label,
+      newActivity.goal.status,
+      newActivity.goal.objective,
+      newActivity.goal.time_used_seconds,
+    ]) : '';
+    if (thinkingState.thinking !== session.thinking || label !== session.thinkingLabel || kind !== prevKind || currThinkingContent !== prevThinkingContent || currContextSig !== prevContextSig || currGoalSig !== prevGoalSig) {
       session.thinking = thinkingState.thinking;
       session.thinkingLabel = label;
       session.thinkingContent = currThinkingContent;
@@ -6463,10 +7582,17 @@ class ProxyEngine extends EventEmitter {
       return;
     }
 
-    const { raw, thinking: ts, perm, config, rateLimit } = pollResult;
+    const { raw, thinking: ts, sessionTitle, perm, errorPrompt, config, rateLimit } = pollResult;
     const thinkingState = ts && typeof ts === 'object'
       ? ts
       : { thinking: false, label: '', thinkingContent: '' };
+
+    if (sessionTitle && sessionTitle !== session.chat_title) {
+      this._log('info', `[${sessionId}] Claude conversation title: "${session.chat_title || ''}" -> "${sessionTitle}"`);
+      session.chat_title = sessionTitle;
+      sessionStore.updateSession(sessionId, { chat_title: sessionTitle });
+      this._broadcastSessionSnapshot();
+    }
 
     if (!raw) {
       session.nullPollCount = (session.nullPollCount || 0) + 1;
@@ -6608,12 +7734,25 @@ class ProxyEngine extends EventEmitter {
     const label = thinkingState.label || (active ? 'Generating' : '');
     const newActivity = { kind, label, updated_at: new Date().toISOString() };
     if (session.taskList) newActivity.task_list = session.taskList;
+    if (thinkingState.goal) newActivity.goal = thinkingState.goal;
     if (thinkingState.thinkingContent) newActivity.thinkingContent = thinkingState.thinkingContent;
 
     const prevKind = session.activity?.kind || 'idle';
     const prevThinkingContent = session.thinkingContent || '';
     const currThinkingContent = thinkingState.thinkingContent || '';
-    if (thinkingState.thinking !== session.thinking || label !== session.thinkingLabel || kind !== prevKind || currThinkingContent !== prevThinkingContent) {
+    const prevGoalSig = session.activity?.goal ? JSON.stringify([
+      session.activity.goal.label,
+      session.activity.goal.status,
+      session.activity.goal.objective,
+      session.activity.goal.time_used_seconds,
+    ]) : '';
+    const currGoalSig = newActivity.goal ? JSON.stringify([
+      newActivity.goal.label,
+      newActivity.goal.status,
+      newActivity.goal.objective,
+      newActivity.goal.time_used_seconds,
+    ]) : '';
+    if (thinkingState.thinking !== session.thinking || label !== session.thinkingLabel || kind !== prevKind || currThinkingContent !== prevThinkingContent || currGoalSig !== prevGoalSig) {
       session.thinking = thinkingState.thinking;
       session.thinkingLabel = label;
       session.thinkingContent = currThinkingContent;
@@ -6626,6 +7765,7 @@ class ProxyEngine extends EventEmitter {
     }
 
     await this._handlePermissionDialogState(sessionId, session, perm);
+    await this._handleSessionErrorPromptState(sessionId, session, errorPrompt);
 
     session._rateLimitPollCount = includeRateLimit ? 0 : ((session._rateLimitPollCount || 0) + 1);
     if (includeRateLimit) {
@@ -6670,14 +7810,19 @@ class ProxyEngine extends EventEmitter {
     session._pollInProgress = true;
 
     try {
-      // Continue and Roo Code use ephemeral CDP.  Claude used to but now uses persistent
-      // connections (see _isEphemeralIframeAgent for rationale) because ephemeral
-      // attach itself steals focus in Electron.
+      // Iframe-backed editor agents need target-specific CDP reads so stale
+      // workbench window metadata does not mask the active webview transcript.
       if (session.agentType === 'claude_cli') {
         return await this._pollSessionClaudeCli(sessionId, session);
       }
       if (session.agentType === 'codex_cli') {
         return await this._pollSessionCodexCli(sessionId, session);
+      }
+      if (session.agentType === 'cursor_cli') {
+        return await this._pollSessionCursorCli(sessionId, session);
+      }
+      if (session.agentType === 'claude') {
+        return await this._pollSessionClaude(sessionId, session);
       }
       if (session.agentType === 'continue' || session.agentType === 'continue_yolo' || session.agentType === 'roo_code' || session.agentType === 'cline') {
         return await this._pollSessionContinue(sessionId, session);
@@ -6896,7 +8041,8 @@ class ProxyEngine extends EventEmitter {
 
       if (session.agentType === 'antigravity-v2') {
         const now = Date.now();
-        if (!session._lastV2MetaPollAt || now - session._lastV2MetaPollAt > 30000) {
+        const needsImmediateConversationIdentity = !!session._listView || !!session._newChatPending;
+        if (needsImmediateConversationIdentity || !session._lastV2MetaPollAt || now - session._lastV2MetaPollAt > 30000) {
           session._lastV2MetaPollAt = now;
           try {
             const active = await selectors.readAntigravityV2ActiveConversation(session.client.Runtime);
@@ -6908,20 +8054,17 @@ class ProxyEngine extends EventEmitter {
               this._log('info', `[${sessionId}] Antigravity v2 conversation changed: ${session.v2ConversationId || 'unknown'} -> ${active.conversation_id}`);
               session.v2ConversationId = active.conversation_id;
               session._listView = false;
+              delete session._newChatPending;
               session.chat_title = activeChat?.title || active.title || session.chat_title;
               session.windowTitle = activeChat?.title || active.title || session.windowTitle;
               session.workspace_name = activeChat?.project || session.workspace_name || 'Antigravity v2';
-              session.lastMessageCount = 0;
-              session.lastObservedCount = 0;
-              session.lastTranscriptSig = '';
-              session.pendingLast = null;
-              session.resyncCandidateSig = null;
-              session._accumulatedMessages = null;
+              this._resetTranscriptState(session, 'antigravity v2 conversation change');
               sessionStore.updateSession(sessionId, {
                 window_title: session.windowTitle,
                 workspace_name: session.workspace_name,
                 chat_title: session.chat_title,
                 antigravity_v2_conversation_id: active.conversation_id,
+                accumulated_messages: null,
               });
               this._broadcastSessionSnapshot();
             } else if (active && !active.conversation_id && !session._listView) {
@@ -7023,10 +8166,46 @@ class ProxyEngine extends EventEmitter {
         }
       }
 
-      // Skip stale message processing when the visible surface is in empty/list-view mode
-      if (session._panelEmpty || session._listView) return;
+      // Skip stale message processing when the visible surface is in empty/list-view mode.
+      // Codex Desktop still needs one pass below while already flagged list-view so
+      // it can clear stale relay history after discovery/restores.
+      if (session._panelEmpty || (session._listView && session.agentType !== 'codex-desktop')) return;
 
       let messages = JSON.parse(raw);
+      if (session.agentType === 'codex-desktop') {
+        const desktopThreads = Array.isArray(session._lastThreadList) ? session._lastThreadList : [];
+        const hasThreadRows = desktopThreads.length > 0;
+        const hasActiveThread = hasThreadRows && desktopThreads.some(t => t && t.active);
+        const shouldBeListView = hasThreadRows && !hasActiveThread && messages.length === 0;
+        if (shouldBeListView) {
+          const wasListView = !!session._listView;
+          let clearedMessages = false;
+          if (!session._listView) {
+            this._log('info', `[${sessionId}] Codex Desktop thread list/home visible with no active thread; entering list-view mode`);
+            this._sendHistorySnapshot(sessionId, [], 'codex desktop list view clear');
+            clearedMessages = true;
+          }
+          if (session.lastMessageCount > 0) {
+            this._log('info', `[${sessionId}] Codex Desktop list view - clearing ${session.lastMessageCount} stale messages from web UI`);
+            session.lastMessageCount = 0;
+            session.lastObservedCount = 0;
+            session.lastTranscriptSig = '';
+            session.waitingForAssistant = false;
+            session.pendingLast = null;
+            session._accumulatedMessages = null;
+            sessionStore.updateSession(sessionId, { accumulated_messages: null });
+          }
+          session._listView = true;
+          if (!wasListView || clearedMessages) {
+            this._broadcastSessionSnapshot();
+          }
+        } else if (session._listView && (!hasThreadRows || hasActiveThread || messages.length > 0)) {
+          this._log('info', `[${sessionId}] Codex Desktop active transcript resumed; leaving list-view mode`);
+          session._listView = false;
+          this._broadcastSessionSnapshot();
+        }
+        if (session._listView) return;
+      }
       if (session.agentType === 'codex-desktop') {
         messages = this._maybeUseCodexDesktopArchive(sessionId, session, messages);
       }
@@ -7139,8 +8318,10 @@ class ProxyEngine extends EventEmitter {
                 if (mergedMsg !== dom[domIdx]) {
                   dom[domIdx] = mergedMsg;
                 }
-                // Keep the longer version
-                if (this._messageContentText(dom[domIdx]).length > this._messageContentText(acc[accIdx]).length) {
+                // Keep growing content. Antigravity v2 also finalizes metadata such as
+                // `Thinking.` -> `Thought for 1s` without changing block text; retain
+                // those equal-text structural updates so relay history matches native.
+                if (this._shouldReplaceAccumulatedMessage(session.agentType, acc[accIdx], dom[domIdx])) {
                   acc[accIdx] = dom[domIdx];
                   session._accumulatedDirty = true;
                   if (accIdx < acc.length - 1) expandedHistoricalMessage = true;
@@ -7263,10 +8444,18 @@ class ProxyEngine extends EventEmitter {
         return;
       }
 
+      const pendingTail = session.pendingLast !== null
+        ? effectiveMessages[session.lastMessageCount]
+        : null;
+      const isV2PendingAssistantMutation = session.agentType === 'antigravity-v2' &&
+        session.pendingLast?.role === 'assistant' &&
+        pendingTail?.role === 'assistant';
+
       if (
         session.lastTranscriptSig &&
         transcriptSig !== session.lastTranscriptSig &&
-        effectiveMessages.length === prevObservedCount
+        effectiveMessages.length === prevObservedCount &&
+        !isV2PendingAssistantMutation
       ) {
         // Chat switch detection: if the FIRST message content differs from
         // what we last sent, this isn't a streaming mutation — the user
@@ -7321,7 +8510,12 @@ class ProxyEngine extends EventEmitter {
       if (session.pendingLast !== null) {
         const p       = session.pendingLast;
         const current = effectiveMessages[session.lastMessageCount];
-        if (current && current.role === p.role && current.content === p.content) {
+        const pendingMatchesCurrent = current && current.role === p.role && (
+          session.agentType === 'antigravity-v2'
+            ? this._transcriptSignature([current]) === this._transcriptSignature([p])
+            : current.content === p.content
+        );
+        if (pendingMatchesCurrent) {
           if (session.agentType === 'codex-desktop' && p.role === 'assistant') {
             try {
               const ts = await selectors.detectThinking(session.client.Runtime, session.agentType);
@@ -7360,14 +8554,17 @@ class ProxyEngine extends EventEmitter {
           // Codex (both side pane and Desktop) benefits from a much shorter
           // threshold because its transcript/tool output evolves rapidly.
           const isCodexAny = session.agentType === 'codex' || session.agentType === 'codex-desktop' || session.agentType === 'cursor';
-          const streamFlushMs = isCodexAny ? 1500 : 5000;
+          const streamFlushMs = session.agentType === 'antigravity-v2' ? 500 : (isCodexAny ? 1500 : 5000);
           // Previously codex-desktop assistant updates were held back here, which
           // left the WebUI permanently stale during long generations (the /goal
           // task case where the assistant grows for hours without "stabilising").
           // Stream them through like every other agent — the relay's per-session
           // history throttle already coalesces over-frequent broadcasts.
-          if (pendingAge > streamFlushMs && current.content !== session._lastStreamedContent) {
-            session._lastStreamedContent = current.content;
+          const streamedSignature = session.agentType === 'antigravity-v2'
+            ? this._transcriptSignature([current])
+            : current.content;
+          if (pendingAge > streamFlushMs && streamedSignature !== session._lastStreamedContent) {
+            session._lastStreamedContent = streamedSignature;
             this._sendHistorySnapshot(sessionId, effectiveMessages, 'assistant completion');
             this._log('info', `[${sessionId}] Streaming flush (${effectiveMessages.length} msgs, pending ${Math.round(pendingAge / 1000)}s)`);
           }
@@ -7397,6 +8594,9 @@ class ProxyEngine extends EventEmitter {
         session.lastMessageCount = effectiveMessages.length - 1;
         const last = effectiveMessages[effectiveMessages.length - 1];
         session.pendingLast = last;
+        if (session.agentType === 'antigravity-v2' && last?.role === 'assistant') {
+          session._pendingFirstSeenAt = Date.now();
+        }
       }
 
       session.lastObservedCount = effectiveMessages.length;
@@ -7584,16 +8784,12 @@ class ProxyEngine extends EventEmitter {
 
       // Native queue detection — Codex side-panel queue items (messages with Steer buttons)
       if (session.agentType === 'codex' || session.agentType === 'codex-desktop') {
-        const nativeQueuePollEvery = session.agentType === 'codex-desktop' ? 30 : 10;
+        const nativeQueuePollEvery = 10;
         if (session._nativeQueuePollCount === undefined) {
           session._nativeQueuePollCount = staggerOffset(sessionId, 'nativeQueue', nativeQueuePollEvery);
         }
         session._nativeQueuePollCount += 1;
-        const codexAuxBusy = session.activity?.kind === 'generating' || session.activity?.kind === 'thinking';
-        if (codexAuxBusy) session._lastBusyAt = Date.now();
-        const auxRelevant = codexAuxBusy ||
-          (session._lastBusyAt && Date.now() - session._lastBusyAt < 30000);
-        if (auxRelevant && !session._nativeQueuePollInProgress && session._nativeQueuePollCount >= nativeQueuePollEvery) {
+        if (!session._nativeQueuePollInProgress && session._nativeQueuePollCount >= nativeQueuePollEvery) {
           session._nativeQueuePollCount = 0;
           session._nativeQueuePollInProgress = true;
           const usePageEval = session.agentType === 'codex-desktop';
@@ -7744,7 +8940,7 @@ class ProxyEngine extends EventEmitter {
   async _pollPermissions(sessionId) {
     const session = this.sessions.get(sessionId);
     if (!session) return;
-    if (session.agentType === 'claude_cli' || session.agentType === 'codex_cli') return;
+    if (session.agentType === 'claude_cli' || session.agentType === 'codex_cli' || session.agentType === 'cursor_cli') return;
     if (session.agentType === 'continue' || session.agentType === 'continue_yolo') {
       try {
         const promptState = await this._withEphemeralIframeClient(session, async client => {
@@ -8200,7 +9396,7 @@ class ProxyEngine extends EventEmitter {
       if (DESKTOP_PORT_MAP[t._cdpPort]) return false;
       if (/\s-\s*Cursor\b/i.test(title)) return false;
       if (/\/c\/[0-9a-f-]{36}/i.test(url)) return true;
-      if (/^https?:\/\/127\.0\.0\.1:\d+\/?$/i.test(url) && /^Antigravity$/i.test(title.trim())) return true;
+      if (/^https?:\/\/127\.0\.0\.1:\d+\/?(?:\?[^#]*)?(?:#.*)?$/i.test(url) && /^Antigravity$/i.test(title.trim())) return true;
       return false;
     };
     const looksLikeAntigravityWorkbenchPage = (t) => {
@@ -8391,7 +9587,10 @@ class ProxyEngine extends EventEmitter {
           agentType: 'antigravity-v2',
           workspaceName,
           workspacePath: null,
-          sigOverride: `antigravity-v2::target::${target._cdpPort || 9226}::${target.id}`,
+          // Agent Manager owns one logical surface per CDP port. The target ID
+          // changes on a full app restart, so including it forks the durable
+          // relay/sidebar identity instead of reconnecting the existing session.
+          sigOverride: `antigravity-v2::app::${target._cdpPort || 9226}`,
         });
         const sessionId = sessionMeta.session_id;
         if (this.sessions.has(sessionId)) {
@@ -8606,6 +9805,9 @@ class ProxyEngine extends EventEmitter {
             initialActiveThreadKey = initialActiveThread ? `${initialActiveThread.id || ''}:${initialActiveThread.title || ''}` : '';
             if (Array.isArray(initialThreadList) && initialThreadList.length > 0) {
               this._sendToRelay(proto.threadList(sessionId, initialThreadList));
+              if (!initialActiveThread && domMsgs.length === 0) {
+                initialListView = true;
+              }
             }
           } catch (e) {
             this._log('warn', `[discover] initial codex desktop thread list failed for ${sessionId}: ${e.message}`);
@@ -8658,13 +9860,23 @@ class ProxyEngine extends EventEmitter {
           : (useStoredAccumulated ? storedAccumulated : domMsgs);
         const initialCount = initialMsgs.length;
 
+        const innerClaudeTitle = agentType === 'claude'
+          ? await this._withTimeout(
+              selectors.readClaudeSessionTitle(client.Runtime),
+              1500,
+              `initial claude title ${sessionId.substring(0, 8)}`
+            ).catch(() => null)
+          : null;
         const firstUserMsg = initialMsgs.find(m => m.role === 'user');
         const rawFirstText = typeof firstUserMsg?.content === 'string'
           ? firstUserMsg.content
           : (Array.isArray(firstUserMsg?.content)
               ? firstUserMsg.content.map(c => c.text || c.content || '').join(' ')
               : '');
-        const chatTitle = rawFirstText.replace(/\s+/g, ' ').trim().substring(0, 60) || null;
+        const chatTitle = innerClaudeTitle || rawFirstText.replace(/\s+/g, ' ').trim().substring(0, 60) || null;
+        if (chatTitle && chatTitle !== sessionMeta.chat_title) {
+          sessionStore.updateSession(sessionId, { chat_title: chatTitle });
+        }
         const initialActiveChat = Array.isArray(initialChatList) ? initialChatList.find(c => c && c.active) : null;
         const initialActiveChatKey = initialActiveChat ? `${initialActiveChat.id || ''}:${initialActiveChat.title || ''}` : '';
 
@@ -8704,6 +9916,7 @@ class ProxyEngine extends EventEmitter {
           _listView:        initialListView,
           _lastChatListSig: initialChatList ? JSON.stringify(initialChatList.map(c => `${c.id || ''}:${c.title || ''}:${!!c.active}`)) : '',
           _lastThreadListSig: initialThreadList ? JSON.stringify(initialThreadList.map(t => `${t.id || ''}:${t.title || ''}:${!!t.active}:${t.age || ''}`)) : '',
+          _lastThreadList: initialThreadList ? initialThreadList.slice() : [],
           _activeChatKey:   initialActiveChatKey,
           _activeThreadTitle: initialActiveThread?.title || null,
           _activeThreadKey:   initialActiveThreadKey,
@@ -8764,6 +9977,8 @@ class ProxyEngine extends EventEmitter {
         );
         if (shouldSendInitialHistory) {
           this._sendHistorySnapshot(sessionId, initialMsgs, 'initial discovery');
+        } else if (initialListView && (agentType === 'codex' || agentType === 'codex-desktop')) {
+          this._sendHistorySnapshot(sessionId, [], `${agentType} initial list view clear`);
         }
         if (initialChatList) {
           this._sendToRelay(proto.chatList(sessionId, initialChatList));
@@ -9287,8 +10502,33 @@ class ProxyEngine extends EventEmitter {
     await this._discoverClaudeCliSessions();
     await this._discoverCodexCliSessions();
     this._startCodexCliWatcher();
+    await this._discoverCursorCliSessions();
+    this._startCursorCliWatcher();
     await this._discoverTargets();
     await this._refreshAntigravityQuotaUsage(true);
+
+    // Antigravity v2 must not share the sequential desktop/side-pane poll
+    // queue. Large Codex transcripts can keep that queue occupied for more
+    // than a minute, leaving Agent Manager's final structured snapshot and
+    // idle transition stale in the WebUI. Keep one bounded, non-overlapping
+    // v2 lane so unrelated harnesses cannot starve its completion updates.
+    this._antigravityV2PollTimer = setInterval(async () => {
+      if (!this._running || this._antigravityV2PollInProgress) return;
+      const v2Session = Array.from(this.sessions.entries()).find(([, session]) =>
+        session.agentType === 'antigravity-v2'
+      );
+      if (!v2Session) return;
+      this._antigravityV2PollInProgress = true;
+      try {
+        const [sessionId] = v2Session;
+        await this._pollSessionBounded(sessionId);
+        await this._pollPermissionsBounded(sessionId);
+      } catch (e) {
+        this._log('warn', '[poll] Antigravity v2 lane: ' + e.message);
+      } finally {
+        this._antigravityV2PollInProgress = false;
+      }
+    }, this.POLL_INTERVAL_MS);
 
     let tick = 0;
     this._pollTimer = setInterval(async () => {
@@ -9319,6 +10559,9 @@ class ProxyEngine extends EventEmitter {
         try {
           await this._withTimeout(this._discoverCodexCliSessions(), 10000, 'tick discoverCodexCli');
         } catch (e) { this._log('warn', `[poll] discoverCodexCli: ${e.message}`); }
+        try {
+          await this._withTimeout(this._discoverCursorCliSessions(), 10000, 'tick discoverCursorCli');
+        } catch (e) { this._log('warn', `[poll] discoverCursorCli: ${e.message}`); }
       }
 
       if (tick % 30 === 0 && this.sessions.size > 0) {
@@ -9342,6 +10585,12 @@ class ProxyEngine extends EventEmitter {
       const windowGroups = new Map(); // parentId → [sessionId, ...]
       for (const [sessionId, session] of this.sessions.entries()) {
         if (session.agentType === 'codex_cli' && session.codexCliArchiveDiscovered === true && !session._codexCliChild) {
+          continue;
+        }
+        if (session.agentType === 'cursor_cli' && session.cursorCliArchiveDiscovered === true && !session._cursorCliChild) {
+          continue;
+        }
+        if (session.agentType === 'antigravity-v2') {
           continue;
         }
         if (
@@ -9420,8 +10669,15 @@ class ProxyEngine extends EventEmitter {
 
         // Poll a small slice of the selected window. Polling every session in
         // a busy window can monopolize the tick and starve desktop app reads.
+        const group = windowGroups.get(activeKey) || [];
         let polledWindowSessions = 0;
-        for (const sessionId of windowGroups.get(activeKey)) {
+        let visitedWindowSessions = 0;
+        const startIndex = group.length > 0
+          ? ((this._pollWindowSessionIndexes.get(activeKey) || 0) % group.length)
+          : 0;
+        while (visitedWindowSessions < group.length && polledWindowSessions < 2) {
+          const sessionId = group[(startIndex + visitedWindowSessions) % group.length];
+          visitedWindowSessions++;
           const session = this.sessions.get(sessionId);
           if (!session) continue;
           // Throttle Continue sessions — CDP eval on their iframe steals
@@ -9443,13 +10699,17 @@ class ProxyEngine extends EventEmitter {
             session._continuePollCount = 0;
             await this._pollSessionBounded(sessionId);
             polledWindowSessions++;
-            if (polledWindowSessions >= 2) break;
             continue;
           }
           await this._pollSessionBounded(sessionId);
           await this._pollPermissionsBounded(sessionId);
           polledWindowSessions++;
-          if (polledWindowSessions >= 2) break;
+        }
+        if (group.length > 0) {
+          this._pollWindowSessionIndexes.set(
+            activeKey,
+            (startIndex + Math.max(visitedWindowSessions, 1)) % group.length
+          );
         }
       }
       } catch (e) {
@@ -9468,6 +10728,11 @@ class ProxyEngine extends EventEmitter {
     this._log('info', '[proxy] Stopping engine...');
 
     if (this._pollTimer) { clearInterval(this._pollTimer); this._pollTimer = null; }
+    if (this._antigravityV2PollTimer) {
+      clearInterval(this._antigravityV2PollTimer);
+      this._antigravityV2PollTimer = null;
+    }
+    this._antigravityV2PollInProgress = false;
     if (this._snapshotTimer) { clearTimeout(this._snapshotTimer); this._snapshotTimer = null; }
     if (this._codexCliWatcher) {
       try { this._codexCliWatcher.close(); } catch {}

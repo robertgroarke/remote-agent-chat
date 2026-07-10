@@ -9,9 +9,14 @@ let chokidar = null;
 try { chokidar = require('chokidar'); } catch {}
 
 const CODEX_CLI_MODELS = [
+  { id: 'gpt-5.6',                     label: 'GPT-5.6' },
+  { id: 'gpt-5.6-sol',                 label: 'GPT-5.6 Sol' },
+  { id: 'gpt-5.6-terra',               label: 'GPT-5.6 Terra' },
+  { id: 'gpt-5.6-luna',                label: 'GPT-5.6 Luna' },
   { id: 'gpt-5.5',                     label: 'GPT-5.5' },
   { id: 'gpt-5.4',                     label: 'GPT-5.4' },
   { id: 'gpt-5.4-mini',                label: 'GPT-5.4 Mini' },
+  { id: 'gpt-5.3-codex-spark',         label: 'GPT-5.3 Codex Spark' },
   { id: 'gpt-5.3-codex',               label: 'GPT-5.3 Codex' },
   { id: 'gpt-5.2-codex',               label: 'GPT-5.2 Codex' },
   { id: 'gpt-5.2',                     label: 'GPT-5.2' },
@@ -26,6 +31,7 @@ const CODEX_CLI_EFFORTS = [
   { id: 'low',    label: 'Low' },
   { id: 'medium', label: 'Medium' },
   { id: 'high',   label: 'High' },
+  { id: 'xhigh',  label: 'Extra High' },
 ];
 
 const CODEX_CLI_ACCESS_MODES = [
@@ -523,6 +529,14 @@ function compactedBlock(payload) {
   return promptBlock({ title: 'Context compacted', content, collapsed: false });
 }
 
+function rollbackBlock(payload) {
+  const turns = Number(payload?.num_turns || payload?.turns || 0);
+  const content = turns > 0
+    ? `Rolled back ${turns} ${turns === 1 ? 'turn' : 'turns'}.`
+    : 'Thread rolled back.';
+  return promptBlock({ title: 'Thread rolled back', content, status: 'completed', collapsed: false });
+}
+
 function viewImageBlock(payload) {
   const imagePath = payload?.path || payload?.file || payload?.image_path || '';
   const content = imagePath ? `Viewed image:\n\n${imagePath}` : 'Viewed image.';
@@ -651,11 +665,29 @@ function buildCodexCliActivity(state, { nowMs = Date.now() } = {}) {
   return activity;
 }
 
+function sessionIdFromFilePath(filePath) {
+  return path.basename(filePath, '.jsonl').match(/([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})$/i)?.[1] || '';
+}
+
+function fallbackSessionIdFromPath(filePath) {
+  return path.basename(filePath, '.jsonl').replace(/^rollout-/, '');
+}
+
+function metadataSessionId(meta) {
+  return String(meta?.session_id || meta?.id || '').trim();
+}
+
+function applyMetadataSessionId(state, meta) {
+  const metaId = metadataSessionId(meta);
+  if (metaId && !state.fileCliSessionId) state.cliSessionId = metaId;
+}
+
 function createParseState(filePath) {
-  const fileIdMatch = path.basename(filePath, '.jsonl').match(/([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})$/i);
+  const fileCliSessionId = sessionIdFromFilePath(filePath);
   return {
     filePath,
-    cliSessionId: fileIdMatch?.[1] || path.basename(filePath, '.jsonl').replace(/^rollout-/, ''),
+    fileCliSessionId,
+    cliSessionId: fileCliSessionId || fallbackSessionIdFromPath(filePath),
     meta: {},
     messages: [],
     firstUserText: '',
@@ -717,7 +749,7 @@ function applyEntryToState(state, entry) {
   if (tsMs) state.lastEventAt = tsMs;
   if (entry.type === 'session_meta' && payload) {
     state.meta = { ...state.meta, ...payload };
-    if (payload.id) state.cliSessionId = payload.id;
+    applyMetadataSessionId(state, payload);
     if (payload.model || payload.model_slug) state.model_id = payload.model || payload.model_slug;
     return;
   }
@@ -941,6 +973,14 @@ function applyEntryToState(state, entry) {
         role: 'assistant',
         content: `[Context compacted]\n\n${content}`,
         content_blocks: [compactedBlock(payload)],
+        ts,
+      });
+    } else if (payload.type === 'thread_rolled_back') {
+      const block = rollbackBlock(payload);
+      pushDedup(state.messages, {
+        role: 'assistant',
+        content: `[Thread rolled back]\n\n${block.content}`,
+        content_blocks: [block],
         ts,
       });
     }
@@ -1241,9 +1281,9 @@ function readSessionCandidate(filePath, stat) {
   }
   const workspace = resolveCodexWorkspace(meta.cwd || null, firstUserText);
   const workspacePath = workspace.workspacePath || null;
-  const fileIdMatch = path.basename(filePath, '.jsonl').match(/([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})$/i);
+  const fileCliSessionId = sessionIdFromFilePath(filePath);
   return {
-    cliSessionId: meta.id || fileIdMatch?.[1] || path.basename(filePath, '.jsonl').replace(/^rollout-/, ''),
+    cliSessionId: fileCliSessionId || metadataSessionId(meta) || fallbackSessionIdFromPath(filePath),
     filePath,
     workspacePath,
     workspaceName: workspace.workspaceName,
@@ -1256,7 +1296,7 @@ function readSessionCandidate(filePath, stat) {
 function readLightweightSessionSummary(filePath, stat) {
   const meta = readSessionMeta(filePath);
   const candidate = readSessionCandidate(filePath, stat);
-  const cliSessionId = meta.id || candidate.cliSessionId;
+  const cliSessionId = candidate.cliSessionId || metadataSessionId(meta);
   const index = readSessionIndex().get(cliSessionId) || null;
   const workspace = resolveCodexWorkspace(meta.cwd || null, candidate.title);
   const candidateWorkspacePath = candidate.workspacePath && !isHomeWorkspace(candidate.workspacePath)
@@ -1329,7 +1369,7 @@ function parseCodexJsonlTail(filePath, tailBytes = DEFAULT_HYDRATE_TAIL_BYTES) {
   const meta = readSessionMeta(filePath);
   const state = createParseState(filePath);
   state.meta = { ...meta };
-  if (meta.id) state.cliSessionId = meta.id;
+  applyMetadataSessionId(state, meta);
   if (meta.model || meta.model_slug) state.model_id = meta.model || meta.model_slug;
   if (meta.effort) state.effort = meta.effort;
   if (meta.sandbox_mode) state.permission_mode = meta.sandbox_mode;
@@ -1348,7 +1388,7 @@ function createChunkParseState(filePath) {
   const meta = readSessionMeta(filePath);
   const state = createParseState(filePath);
   state.meta = { ...meta };
-  if (meta.id) state.cliSessionId = meta.id;
+  applyMetadataSessionId(state, meta);
   if (meta.model || meta.model_slug) state.model_id = meta.model || meta.model_slug;
   if (meta.effort) state.effort = meta.effort;
   if (meta.sandbox_mode) state.permission_mode = meta.sandbox_mode;

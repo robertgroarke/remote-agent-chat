@@ -25,6 +25,7 @@ EXPOSE 3500
 # Fix /data volume permissions at startup (host volume may be root-owned),
 # then drop to non-root 'app' user
 COPY entrypoint.sh /entrypoint.sh
-RUN chmod +x /entrypoint.sh
+# Windows checkouts may leave CRLF; Alpine execve rejects "#!/bin/sh\r".
+RUN sed -i 's/\r$//' /entrypoint.sh && chmod +x /entrypoint.sh
 ENTRYPOINT ["/entrypoint.sh"]
 CMD ["node", "index.js"]

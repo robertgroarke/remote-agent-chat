@@ -1044,6 +1044,85 @@ async function detectThinking(Runtime, agentType) {
       const raw = await evalFn(Runtime, `
         var isDesktopApp = ${JSON.stringify(agentType === 'codex-desktop')};
         var isCodexExtension = ${JSON.stringify(agentType === 'codex')};
+        function readGoalSurface() {
+          function visible(el) {
+            if (!el || !el.getBoundingClientRect) return false;
+            var rect = el.getBoundingClientRect();
+            if (rect.width <= 0 || rect.height <= 0) return false;
+            var style = window.getComputedStyle ? window.getComputedStyle(el) : null;
+            return !style || (style.display !== 'none' && style.visibility !== 'hidden' && style.opacity !== '0');
+          }
+          function norm(text) {
+            return String(text || '').replace(/\\s+/g, ' ').trim();
+          }
+          function goalStatus(label) {
+            var lower = norm(label).toLowerCase();
+            if (lower === 'pursuing goal') return 'active';
+            if (lower === 'paused goal') return 'paused';
+            if (lower === 'goal blocked') return 'blocked';
+            if (lower === 'goal usage limited') return 'usageLimited';
+            if (lower === 'goal limited') return 'budgetLimited';
+            if (lower === 'goal achieved') return 'complete';
+            return '';
+          }
+          function durationSeconds(text) {
+            var match = norm(text).match(/(?:(\\d+)h\\s*)?(?:(\\d+)m\\s*)?(\\d+)s\\b/i) ||
+              norm(text).match(/(?:(\\d+)h\\s*)?(\\d+)m\\b/i);
+            if (!match) return 0;
+            if (/s/i.test(match[0])) {
+              return (Number(match[1]) || 0) * 3600 + (Number(match[2]) || 0) * 60 + (Number(match[3]) || 0);
+            }
+            return (Number(match[1]) || 0) * 3600 + (Number(match[2]) || 0) * 60;
+          }
+
+          var composer = d.querySelector('.ProseMirror, textarea[aria-label*="follow-up" i], textarea[placeholder*="follow-up" i]');
+          var composerRect = composer && composer.getBoundingClientRect ? composer.getBoundingClientRect() : null;
+          var labels = Array.from(d.querySelectorAll('span, div, button')).filter(function(el) {
+            if (!visible(el)) return false;
+            var label = norm(el.innerText || el.textContent);
+            if (!goalStatus(label)) return false;
+            if (!composerRect) return true;
+            var rect = el.getBoundingClientRect();
+            var gap = composerRect.top - rect.bottom;
+            return gap >= -16 && gap <= 420;
+          }).sort(function(a, b) {
+            return norm(a.textContent).length - norm(b.textContent).length;
+          });
+          if (labels.length === 0) return null;
+
+          var labelNode = labels[0];
+          var label = norm(labelNode.innerText || labelNode.textContent);
+          var root = labelNode.parentElement || labelNode;
+          var current = root;
+          while (current && current !== d.body) {
+            var text = norm(current.innerText || current.textContent);
+            if (text.length > 700) break;
+            root = current;
+            current = current.parentElement;
+          }
+          var rootText = norm(root.innerText || root.textContent);
+          var seconds = durationSeconds(rootText);
+          var candidates = Array.from(root.querySelectorAll('span, p, div')).filter(function(el) {
+            if (!visible(el) || el === labelNode) return false;
+            if (el.closest && el.closest('button')) return false;
+            var text = norm(el.innerText || el.textContent);
+            if (!text || goalStatus(text)) return false;
+            if (/^(edit goal|pause goal|resume goal|stop goal)$/i.test(text)) return false;
+            if (/^(?:(?:\\d+h\\s*)?(?:\\d+m\\s*)?\\d+s|(?:\\d+h\\s*)?\\d+m)$/i.test(text)) return false;
+            return text.length <= 300;
+          }).sort(function(a, b) {
+            return norm(a.textContent).length - norm(b.textContent).length;
+          });
+          var objective = candidates.length > 0 ? norm(candidates[0].innerText || candidates[0].textContent) : '';
+          return {
+            label: label,
+            status: goalStatus(label),
+            objective: objective,
+            time_used_seconds: seconds,
+            updated_at: new Date().toISOString(),
+          };
+        }
+        var goalSurface = readGoalSurface();
         // Codex shows a stop button (aria-label contains "stop") while generating.
         // Also check if the send button SVG changed from arrow to square (stop icon).
         var isThinking = false;
@@ -1122,7 +1201,7 @@ async function detectThinking(Runtime, agentType) {
           }
         }
 
-        if (!isThinking) return JSON.stringify({ thinking: false, label: '' });
+        if (!isThinking) return JSON.stringify({ thinking: false, label: '', goal: goalSurface });
 
         // Enhanced activity detection: extract granular activity label + command content.
         var label = 'Generating';
@@ -1288,13 +1367,13 @@ async function detectThinking(Runtime, agentType) {
         if (isDesktopApp && !hasStopSignal && !hasSpinnerSignal && !hasShimmerSignal) {
           var hasActiveLabel = /^(Running command|Reading|Writing|Editing|Searching|Creating|Applying|Tool:)/i.test(label);
           if (!hasActiveLabel && !liveDraft) {
-            return JSON.stringify({ thinking: false, label: '', thinkingContent: '' });
+            return JSON.stringify({ thinking: false, label: '', thinkingContent: '', goal: goalSurface });
           }
         }
 
         // Codex (Desktop + side pane): only show the label, no draft content
         var finalContent = (isDesktopApp || isCodexExtension) ? '' : thinkingContent;
-        return JSON.stringify({ thinking: true, label: label, thinkingContent: finalContent });
+        return JSON.stringify({ thinking: true, label: label, thinkingContent: finalContent, goal: goalSurface });
       `);
       try { return JSON.parse(raw); } catch { return { thinking: false, label: '' }; }
     } catch {
@@ -1797,6 +1876,51 @@ async function readClaudeMessages(Runtime, sessionId) {
     await captureDiagnostic(Runtime, sessionId);
   }
   return null;
+}
+
+// ─── Claude session title reader ──────────────────────────────────────────────
+
+async function readClaudeSessionTitle(Runtime) {
+  try {
+    const title = await evalInFrame(Runtime, `
+      function norm(t) {
+        return String(t || '').replace(/\\s+/g, ' ').trim();
+      }
+      function visible(el) {
+        if (!el) return false;
+        var rect = el.getBoundingClientRect ? el.getBoundingClientRect() : null;
+        return !rect || rect.width > 0 || rect.height > 0 || el.getClientRects().length > 0;
+      }
+      function usable(text) {
+        var t = norm(text);
+        if (!t || t.length < 3 || t.length > 180) return null;
+        if (/^(session history|new session|bypass permissions|permissions|mode|model|settings)$/i.test(t)) return null;
+        if (/^(thinking|transmuting|vibing|working)(\\.\\.\\.)?$/i.test(t)) return null;
+        return t;
+      }
+      var candidates = [];
+      function add(el) {
+        if (!el || !visible(el)) return;
+        var attrTitle = usable(el.getAttribute && el.getAttribute('title'));
+        var text = usable(el.innerText || el.textContent);
+        if (attrTitle) candidates.push(attrTitle);
+        else if (text) candidates.push(text);
+      }
+      Array.from(d.querySelectorAll([
+        'button[class*="titleText"][title]',
+        '[class*="titleTextInner"]',
+        '[class*="titleGroup"] button[title]',
+        '[class*="header"] button[title]',
+        'h1',
+        'h2',
+        '[data-testid*="title" i]'
+      ].join(','))).forEach(add);
+      return candidates.length ? candidates[0] : null;
+    `);
+    return title || null;
+  } catch {
+    return null;
+  }
 }
 
 // ─── Codex message reader ─────────────────────────────────────────────────────
@@ -6332,15 +6456,133 @@ const ANTIGRAVITY_V2_READ_EXPR = `
   function buttonLabel(el) {
     return norm((el.getAttribute('aria-label') || '') + ' ' + (el.innerText || el.textContent || ''));
   }
+  function reactThinkingText(el) {
+    try {
+      var fiberKey = Object.keys(el || {}).find(function(key) { return key.indexOf('__reactFiber$') === 0; });
+      var fiber = fiberKey ? el[fiberKey] : null;
+      for (var depth = 0; fiber && depth < 12; depth++, fiber = fiber.return) {
+        var props = fiber.memoizedProps;
+        if (props && typeof props.thinking === 'string' && norm(props.thinking)) {
+          return norm(props.thinking);
+        }
+      }
+    } catch (_) {}
+    return '';
+  }
+  function decodedFileUri(value) {
+    var text = String(value || '');
+    if (text.toLowerCase().indexOf('file:///') === 0) text = text.slice(8);
+    try { text = decodeURIComponent(text); } catch (_) {}
+    return text;
+  }
+  function basename(value) {
+    var parts = String(value || '').split('/').filter(Boolean);
+    return parts.length ? parts[parts.length - 1] : String(value || '');
+  }
+  function durationLabel(value) {
+    var duration = value && value.thinkingDuration;
+    var seconds = Number(duration && duration.seconds || 0) + Number(duration && duration.nanos || 0) / 1000000000;
+    return 'Thought for ' + Math.max(1, Math.round(seconds || 1)) + 's';
+  }
+  function executionBlocks(el) {
+    var steps = [];
+    try {
+      var fiberKey = Object.keys(el || {}).find(function(key) { return key.indexOf('__reactFiber$') === 0; });
+      var fiber = fiberKey ? el[fiberKey] : null;
+      for (var depth = 0; fiber && depth < 14; depth++, fiber = fiber.return) {
+        var segment = fiber.memoizedProps && fiber.memoizedProps.segment;
+        if (segment && Array.isArray(segment.steps)) {
+          steps = segment.steps;
+          break;
+        }
+      }
+    } catch (_) {}
+    var blocks = [];
+    steps.forEach(function(step) {
+      var payload = step && step.step;
+      var stepCase = payload && payload.case;
+      var value = payload && payload.value || {};
+      var metadata = step && step.metadata || {};
+      if (stepCase === 'plannerResponse') {
+        var thinking = norm(value.thinking || value.rawThinking || '');
+        if (thinking) {
+          var label = durationLabel(value);
+          blocks.push({ type: 'thinking', label: label, title: label, content: thinking, collapsed: false });
+        }
+        return;
+      }
+      if (stepCase === 'ephemeralMessage') return;
+      if (stepCase === 'errorMessage') {
+        if (!value.shouldShowUser) return;
+        var error = value.error || {};
+        var errorText = norm(error.userErrorMessage || error.shortError || error.modelErrorMessage || 'Tool error');
+        blocks.push({ type: 'error', label: 'Tool error', content: errorText });
+        return;
+      }
+      if (!stepCase) return;
+
+      var status = Number(step.status) === 3 ? 'done' : 'running';
+      var action = norm(metadata.toolAction || metadata.toolSummary || '');
+      if (stepCase === 'listDirectory') {
+        var directoryPath = decodedFileUri(value.directoryPathUri || '');
+        var entries = Array.isArray(value.results) ? value.results.map(function(entry) {
+          var name = norm(entry && entry.name || '');
+          if (!name) return '';
+          return name + (entry && entry.isDir ? '/' : '') + (entry && !entry.isDir && entry.sizeBytes ? ' (' + entry.sizeBytes + ' bytes)' : '');
+        }).filter(Boolean) : [];
+        var directoryLabel = 'Analyzed ' + (directoryPath || 'directory');
+        blocks.push({
+          type: 'tool_call',
+          label: directoryLabel,
+          title: directoryLabel,
+          status: status,
+          content: [action, directoryPath ? 'Path: ' + directoryPath : '', entries.length ? 'Results:\\n' + entries.join('\\n') : ''].filter(Boolean).join('\\n\\n')
+        });
+        return;
+      }
+      if (stepCase === 'viewFile') {
+        var filePath = decodedFileUri(value.absolutePathUri || '');
+        var startLine = Number(value.startLine || 0) + 1;
+        var endLine = Number(value.endLine || value.startLine || 0) + 1;
+        var fileLabel = 'Analyzed ' + (basename(filePath) || 'file') + '#L' + startLine + '-' + endLine;
+        blocks.push({
+          type: 'tool_call',
+          label: fileLabel,
+          title: fileLabel,
+          status: status,
+          content: [
+            action,
+            filePath ? 'Path: ' + filePath : '',
+            'Lines: ' + startLine + '-' + endLine,
+            value.numLines != null ? 'File lines: ' + value.numLines : '',
+            value.numBytes != null ? 'Bytes: ' + value.numBytes : '',
+            norm(value.content || value.rawContent || '')
+          ].filter(Boolean).join('\\n\\n')
+        });
+        return;
+      }
+      var genericLabel = action || stepCase.replace(/([a-z])([A-Z])/g, '$1 $2');
+      blocks.push({ type: 'tool_call', label: genericLabel, title: genericLabel, status: status, content: genericLabel });
+    });
+    return blocks;
+  }
   function classifyButton(el) {
     var text = buttonLabel(el);
     if (!text || isControlText(text)) return null;
-    if (/^Worked for\\s+|^Working|^Thinking/i.test(text)) return {
-      type: 'thinking',
-      label: text.split('\\n')[0],
-      content: text,
-      collapsed: true
-    };
+    if (/^(?:Worked|Thought) for\\s+|^Working|^Thinking/i.test(text)) {
+      if (/^Worked for\\s+/i.test(text)) {
+        var workedBlocks = executionBlocks(el);
+        if (workedBlocks.length) return { type: 'execution', blocks: workedBlocks };
+      }
+      var thinkingText = reactThinkingText(el);
+      return {
+        type: 'thinking',
+        label: text.split('\\n')[0],
+        title: text.split('\\n')[0],
+        content: thinkingText || text,
+        collapsed: false
+      };
+    }
     if (/files?\\s+changed|\\bReview\\b|\\bDiff\\b/i.test(text)) {
       var change = parseFileChangesFromText(text);
       if (change) return change;
@@ -6357,6 +6599,14 @@ const ANTIGRAVITY_V2_READ_EXPR = `
     if (/\\b(running|ran|tool|command)\\b/i.test(text)) return { type: 'tool_call', label: text.split('\\n')[0], status: /running/i.test(text) ? 'running' : 'done', content: text };
     return null;
   }
+  function pushClassified(blocks, block) {
+    if (!block) return;
+    if (block.type === 'execution' && Array.isArray(block.blocks)) {
+      block.blocks.forEach(function(child) { if (child && child.type) blocks.push(child); });
+      return;
+    }
+    blocks.push(block);
+  }
   function preBlock(pre) {
     var text = visibleText(pre);
     if (!text) return null;
@@ -6366,13 +6616,30 @@ const ANTIGRAVITY_V2_READ_EXPR = `
     }
     return { type: 'markdown', content: '~~~' + (lang || '') + '\\n' + text + '\\n~~~' };
   }
+  function directThinkingButton(node) {
+    return Array.from(node && node.children || []).find(function(child) {
+      if (!child || child.tagName !== 'BUTTON') return false;
+      return /^(?:Worked|Thought) for\\s+|^Working|^Thinking/i.test(buttonLabel(child));
+    }) || null;
+  }
   function walkContent(node, blocks) {
     if (!node || node.nodeType !== 1) return;
     if (node.closest && node.closest('[data-testid="response-footer"]')) return;
+    // The current Antigravity v2 response DOM renders expanded reasoning as a
+    // sibling immediately after its "Thought for ..." button. The React prop
+    // on that button is the authoritative thinking payload; walking the
+    // sibling as ordinary markdown duplicates the reasoning in the final
+    // answer. Treat the whole disclosure wrapper as one thinking block.
+    var thinkingButton = directThinkingButton(node);
+    if (thinkingButton) {
+      var thinkingBlock = classifyButton(thinkingButton);
+      pushClassified(blocks, thinkingBlock);
+      return;
+    }
     var tag = node.tagName;
     if (tag === 'BUTTON' || tag === 'A' || node.getAttribute('role') === 'button') {
       var buttonBlock = classifyButton(node);
-      if (buttonBlock) blocks.push(buttonBlock);
+      pushClassified(blocks, buttonBlock);
       return;
     }
     if (tag === 'TABLE') {
@@ -6423,6 +6690,13 @@ const ANTIGRAVITY_V2_READ_EXPR = `
   function readUser(node) {
     var clone = node.cloneNode(true);
     Array.from(clone.querySelectorAll('button')).forEach(function(btn) { btn.remove(); });
+    Array.from(clone.querySelectorAll('*')).forEach(function(el) {
+      var cls = String(el.className || '');
+      var text = norm(el.innerText || el.textContent || '');
+      if (/\\babsolute\\b/.test(cls) && /\\bbottom-/.test(cls) && /\\bright-/.test(cls) && /^\\d{1,2}:\\d{2}\\s*(?:AM|PM)$/i.test(text)) {
+        el.remove();
+      }
+    });
     return visibleText(clone).split('\\n').map(norm).filter(function(line) {
       return line && !/^Revert$/i.test(line);
     }).join('\\n');
@@ -6664,9 +6938,22 @@ async function switchAntigravityV2Chat(Runtime, chatId) {
       if (!pill) return JSON.stringify({ ok: false, code: 'chat_not_found', detail: chatId });
       var button = pill.closest('[role="button"]') || pill;
       button.click();
-      await new Promise(function(resolve) { setTimeout(resolve, 800); });
       var after = uuidFrom(location.pathname);
-      return JSON.stringify({ ok: after === chatId || before !== after, action: 'switch_chat', view: 'conversation', before: before, after: after, url: location.href });
+      var deadline = Date.now() + 10000;
+      while (after !== chatId && Date.now() < deadline) {
+        await new Promise(function(resolve) { setTimeout(resolve, 200); });
+        after = uuidFrom(location.pathname);
+      }
+      return JSON.stringify({
+        ok: after === chatId,
+        action: 'switch_chat',
+        view: 'conversation',
+        before: before,
+        after: after,
+        url: location.href,
+        code: after === chatId ? null : 'switch_timeout',
+        detail: after === chatId ? null : ('expected ' + chatId + ', observed ' + (after || 'list view'))
+      });
     `, { awaitPromise: true });
     return raw ? JSON.parse(raw) : { ok: false, code: 'eval_failed' };
   } catch (e) {
@@ -6715,6 +7002,20 @@ async function sendAntigravityV2WithStrategies(Runtime, text, strategies) {
     function visibleText() { return norm(editor.innerText || editor.textContent || ''); }
     function focusAndClear() {
       editor.focus();
+      // Antigravity v2 uses Lexical. The July 2026 build no longer honors
+      // synthetic delete/input events as an editor-state reset, so failed
+      // strategies used to append their payload to the previous attempt.
+      // Clear the active Lexical root first; the selection/execCommand path
+      // below remains as a compatibility fallback for older builds.
+      try {
+        const lexical = editor.__lexicalEditor;
+        if (lexical && typeof lexical.update === 'function' && lexical._editorState && lexical._editorState._nodeMap) {
+          lexical.update(function() {
+            const root = lexical._editorState._nodeMap.get('root');
+            if (root && typeof root.clear === 'function') root.clear();
+          }, { discrete: true });
+        }
+      } catch (_) {}
       try {
         const selection = (d.defaultView || window).getSelection();
         const range = d.createRange();
@@ -6729,7 +7030,6 @@ async function sendAntigravityV2WithStrategies(Runtime, text, strategies) {
     async function tryExecCommand() {
       focusAndClear();
       try { d.execCommand('insertText', false, text); } catch (_) {}
-      editor.dispatchEvent(new InputEvent('input', { bubbles: true, inputType: 'insertText', data: text }));
       await sleep(120);
       return visibleText() === wanted;
     }
@@ -6754,43 +7054,9 @@ async function sendAntigravityV2WithStrategies(Runtime, text, strategies) {
     }
     async function tryLexicalApi() {
       const lexical = editor.__lexicalEditor;
-      if (!lexical || typeof lexical.parseEditorState !== 'function' || typeof lexical.setEditorState !== 'function') return false;
-      editor.focus();
-      const paragraphs = String(text || '').split(/\\r?\\n/).map(function(line) {
-        return {
-          children: line
-            ? [{ detail: 0, format: 0, mode: 'normal', style: '', text: line, type: 'text', version: 1 }]
-            : [],
-          direction: null,
-          format: '',
-          indent: 0,
-          type: 'paragraph',
-          version: 1
-        };
-      });
-      const state = {
-        root: {
-          children: paragraphs.length ? paragraphs : [{
-            children: [],
-            direction: null,
-            format: '',
-            indent: 0,
-            type: 'paragraph',
-            version: 1
-          }],
-          direction: null,
-          format: '',
-          indent: 0,
-          type: 'root',
-          version: 1
-        }
-      };
-      try {
-        lexical.setEditorState(lexical.parseEditorState(JSON.stringify(state)));
-        editor.dispatchEvent(new InputEvent('input', { bubbles: true, inputType: 'insertText', data: text }));
-      } catch (_) {
-        return false;
-      }
+      if (!lexical || typeof lexical.update !== 'function') return false;
+      focusAndClear();
+      try { d.execCommand('insertText', false, text); } catch (_) { return false; }
       await sleep(180);
       return visibleText() === wanted;
     }
@@ -6863,13 +7129,48 @@ async function sendAntigravityV2TrustedInput(client, Runtime, text) {
     return raw ? JSON.parse(raw) : { ok: false, code: 'input_not_found', detail: 'empty focus result' };
   }
   async function clearEditor() {
-    await key('keyDown', { key: 'Control', code: 'ControlLeft', windowsVirtualKeyCode: 17, nativeVirtualKeyCode: 17, modifiers: 2 });
-    await key('keyDown', { key: 'a', code: 'KeyA', windowsVirtualKeyCode: 65, nativeVirtualKeyCode: 65, modifiers: 2 });
-    await key('keyUp', { key: 'a', code: 'KeyA', windowsVirtualKeyCode: 65, nativeVirtualKeyCode: 65, modifiers: 2 });
-    await key('keyUp', { key: 'Control', code: 'ControlLeft', windowsVirtualKeyCode: 17, nativeVirtualKeyCode: 17, modifiers: 0 });
+    if ((await readEditorText()) === '') return true;
+    try {
+      const clearedLexical = await evalInPage(Runtime, `
+        const editor = d.querySelector('[role="combobox"][aria-label="Message input"][data-lexical-editor]') || d.querySelector('[data-lexical-editor]');
+        if (!editor) return false;
+        editor.focus();
+        const lexical = editor.__lexicalEditor;
+        if (!lexical || typeof lexical.update !== 'function' || !lexical._editorState || !lexical._editorState._nodeMap) return false;
+        lexical.update(function() {
+          const root = lexical._editorState._nodeMap.get('root');
+          if (root && typeof root.clear === 'function') root.clear();
+        }, { discrete: true });
+        return true;
+      `);
+      if (clearedLexical) {
+        const deadline = Date.now() + 1200;
+        while (Date.now() < deadline) {
+          if ((await readEditorText()) === '') return true;
+          await sleep(80);
+        }
+      }
+    } catch (_) {}
+    const selected = await evalInPage(Runtime, `
+      const editor = d.querySelector('[role="combobox"][aria-label="Message input"][data-lexical-editor]') || d.querySelector('[data-lexical-editor]');
+      if (!editor) return false;
+      editor.focus();
+      const selection = (d.defaultView || window).getSelection();
+      const range = d.createRange();
+      range.selectNodeContents(editor);
+      selection.removeAllRanges();
+      selection.addRange(range);
+      return !selection.isCollapsed;
+    `);
+    if (!selected) return false;
     await key('keyDown', { key: 'Backspace', code: 'Backspace', windowsVirtualKeyCode: 8, nativeVirtualKeyCode: 8, modifiers: 0 });
     await key('keyUp', { key: 'Backspace', code: 'Backspace', windowsVirtualKeyCode: 8, nativeVirtualKeyCode: 8, modifiers: 0 });
-    await sleep(120);
+    const deadline = Date.now() + 1200;
+    while (Date.now() < deadline) {
+      if ((await readEditorText()) === '') return true;
+      await sleep(80);
+    }
+    return false;
   }
   async function readEditorText() {
     return await evalInPage(Runtime, `
@@ -6904,7 +7205,9 @@ async function sendAntigravityV2TrustedInput(client, Runtime, text) {
   try {
     const focus = await focusEditor();
     if (!focus.ok) return focus;
-    await clearEditor();
+    if (!await clearEditor()) {
+      return { ok: false, code: 'input_clear_failed', detail: (await readEditorText()).substring(0, 200) };
+    }
     await Input.insertText({ text });
     await sleep(250);
     const wanted = String(text || '').replace(/\s+/g, ' ').trim();
@@ -6914,10 +7217,14 @@ async function sendAntigravityV2TrustedInput(client, Runtime, text) {
     }
     const btn = await waitSendButtonRect();
     if (!btn) return { ok: false, code: 'send_button_failed', detail: 'button not ready' };
-    await focusEditor();
-    await key('keyDown', { key: 'Enter', code: 'Enter', windowsVirtualKeyCode: 13, nativeVirtualKeyCode: 13, modifiers: 0 });
-    await key('keyUp', { key: 'Enter', code: 'Enter', windowsVirtualKeyCode: 13, nativeVirtualKeyCode: 13, modifiers: 0 });
-    const deadline = Date.now() + 5000;
+    const clicked = await evalInPage(Runtime, `
+      const btn = d.querySelector('[data-testid="send-button"]');
+      if (!btn || btn.disabled || btn.getAttribute('aria-disabled') === 'true') return false;
+      btn.click();
+      return true;
+    `);
+    if (!clicked) return { ok: false, code: 'send_button_failed', detail: 'DOM click was not applied' };
+    const deadline = Date.now() + 20000;
     while (Date.now() < deadline) {
       await sleep(250);
       const observed = await evalInPage(Runtime, `
@@ -6928,7 +7235,7 @@ async function sendAntigravityV2TrustedInput(client, Runtime, text) {
       `);
       if (observed) return { ok: true, method: 'cdp_input' };
     }
-    return { ok: false, code: 'native_user_turn_not_observed', detail: 'send key accepted but native user turn did not appear' };
+    return { ok: false, code: 'native_user_turn_not_observed', detail: 'send click accepted but native user turn did not appear within 20 seconds' };
   } catch (error) {
     return { ok: false, code: 'exception', detail: error.message };
   }
@@ -7419,7 +7726,10 @@ async function interruptAgent(Runtime, agentType, sessionId, cdpClient = null) {
 
 const READ_CODEX_CONFIG_EXPR = `
   var config = { model_id: null, effort: null, speed: null, access: null };
-  var btns = Array.from(d.querySelectorAll('button'));
+  function visible(el) {
+    return !!(el && (el.offsetWidth || el.offsetHeight || el.getClientRects().length));
+  }
+  var btns = Array.from(d.querySelectorAll('button')).filter(visible);
   var lastBtns = btns.slice(-25);
   function norm(t) {
     return String(t || '').replace(/\\s+/g, ' ').trim();
@@ -7427,37 +7737,54 @@ const READ_CODEX_CONFIG_EXPR = `
   function normalizeModelLabel(label) {
     var t = norm(label);
     if (!t) return null;
-    if (/^\\d+(?:\\.\\d+)?$/.test(t)) return 'gpt-' + t;
-    if (/^gpt[-\\s.]?[\\d.]+$/i.test(t)) return t.toLowerCase().replace(/\\s+/g, '-');
+    var modelSuffix = '(mini|codex(?:[-\\\\s]+spark)?|spark|sol|terra|luna)';
+    var gpt = t.match(new RegExp('^gpt[-\\\\s.]*([0-9]+(?:\\\\.[0-9]+)*)(?:[-\\\\s]+(' + modelSuffix + '))?$', 'i'));
+    if (gpt) return 'gpt-' + gpt[1] + (gpt[2] ? '-' + gpt[2].toLowerCase().replace(/\\s+/g, '-') : '');
+    var bare = t.match(new RegExp('^([0-9]+(?:\\\\.[0-9]+)*)(?:[-\\\\s]+(' + modelSuffix + '))?$', 'i'));
+    if (bare) return 'gpt-' + bare[1] + (bare[2] ? '-' + bare[2].toLowerCase().replace(/\\s+/g, '-') : '');
     if (/^o[134](?:[-\\s.]?[\\d.]+)?$/i.test(t)) return t.toLowerCase().replace(/\\s+/g, '-');
     return null;
+  }
+  function comboPartsFromButton(b) {
+    var full = norm(b.innerText || b.textContent || '');
+    if (full) {
+      var effort = full.match(/(extra\\s*high|low|medium|high)$/i);
+      if (effort) {
+        var modelPart = norm(full.slice(0, effort.index));
+        return [modelPart, norm(effort[1])].filter(Boolean);
+      }
+    }
+    var parts = Array.from(b.querySelectorAll('span')).filter(visible).map(function(span) {
+      return norm(span.innerText || span.textContent);
+    }).filter(Boolean);
+    return parts.length >= 2 ? parts : (full ? [full] : parts);
   }
 
   // Model: button text matching GPT-x.x or o1/o3/o4 patterns in composer area
   var modelBtn = lastBtns.find(function(b) {
-    var t = norm(b.textContent || '');
-    return /^gpt[-\\s.]?[\\d.]+|^o[134][-\\s.]/i.test(t) && t.length < 20;
+    var t = norm(b.innerText || b.textContent || '');
+    return !!normalizeModelLabel(t) && t.length < 32;
   });
-  if (modelBtn) config.model_id = normalizeModelLabel(modelBtn.textContent) || norm(modelBtn.textContent);
+  if (modelBtn) config.model_id = normalizeModelLabel(modelBtn.innerText || modelBtn.textContent) || norm(modelBtn.innerText || modelBtn.textContent);
 
   // Effort level: Low / Medium / High / Extra High button
   var effortBtn = lastBtns.find(function(b) {
-    return /^(low|medium|high|extra\\s*high)$/i.test(norm(b.textContent || ''));
+    return /^(low|medium|high|extra\\s*high)$/i.test(norm(b.innerText || b.textContent || ''));
   });
-  if (effortBtn) config.effort = norm(effortBtn.textContent);
+  if (effortBtn) config.effort = norm(effortBtn.innerText || effortBtn.textContent);
 
   // Newer Codex Desktop builds combine model + effort in one footer button,
   // e.g. "5.5High" or "GPT-5.4 Medium".
   if (!config.model_id || !config.effort) {
     var comboBtn = lastBtns.find(function(b) {
-      var parts = Array.from(b.querySelectorAll('span')).map(function(span) { return norm(span.textContent); }).filter(Boolean);
+      var parts = comboPartsFromButton(b);
       if (parts.length < 2) return false;
       var modelPart = parts.map(normalizeModelLabel).find(Boolean);
       var effortPart = parts.find(function(part) { return /^(low|medium|high|extra\\s*high)$/i.test(part); });
       return !!(modelPart && effortPart);
     });
     if (comboBtn) {
-      var comboParts = Array.from(comboBtn.querySelectorAll('span')).map(function(span) { return norm(span.textContent); }).filter(Boolean);
+      var comboParts = comboPartsFromButton(comboBtn);
       var comboModel = comboParts.map(normalizeModelLabel).find(Boolean);
       var comboEffort = comboParts.find(function(part) { return /^(low|medium|high|extra\\s*high)$/i.test(part); }) || null;
       if (!config.model_id && comboModel) config.model_id = comboModel;
@@ -7467,11 +7794,11 @@ const READ_CODEX_CONFIG_EXPR = `
 
   // Access mode: "Full access", "Read access", "Default permissions", etc.
   var accessBtn = lastBtns.find(function(b) {
-    var t = norm(b.textContent || '');
+    var t = norm(b.innerText || b.textContent || '');
     return (/access|restricted/i.test(t) && !/add|ide|file$/i.test(t) && t.length < 30) ||
            /^default\\s+permissions$/i.test(t);
   });
-  if (accessBtn) config.access = norm(accessBtn.textContent);
+  if (accessBtn) config.access = norm(accessBtn.innerText || accessBtn.textContent);
 
   // Speed is usually only visible while the combined model menu is open. If a
   // menu is already open, capture the checked Standard/Fast item without
@@ -8327,26 +8654,62 @@ async function readClaudeRateLimit(Runtime) {
 
 // ─── Codex native queue detection ─────────────────────────────────────────────
 //
-// Reads the native queue (messages waiting with Steer buttons) from the Codex
-// side-panel DOM. These are messages typed/sent while the agent was busy.
-// The queue container has class "vertical-scroll-fade-mask" with child items
-// having class "overflow-visible" containing text + Steer button.
+// Reads the native queue from Codex Desktop or the Codex side pane. Newer
+// builds expose a stable "Delete queued message" aria-label even when the
+// old literal Steer button or overflow-visible class is absent.
 //
 // Returns array of { text: string, index: number } or empty array.
 
 const READ_CODEX_NATIVE_QUEUE_EXPR = `
-  var steerBtns = [];
-  var btns = d.querySelectorAll('button');
-  for (var i = 0; i < btns.length; i++) {
-    if (btns[i].textContent.trim() === 'Steer') steerBtns.push(btns[i]);
+  function visible(el) {
+    if (!el || !el.getBoundingClientRect) return false;
+    var rect = el.getBoundingClientRect();
+    if (rect.width <= 0 || rect.height <= 0) return false;
+    var style = window.getComputedStyle ? window.getComputedStyle(el) : null;
+    return !style || (style.display !== 'none' && style.visibility !== 'hidden' && style.opacity !== '0');
   }
-  if (steerBtns.length === 0) return null;
+  function norm(text) {
+    return String(text || '').replace(/\\s+/g, ' ').trim();
+  }
+  function buttonLabel(btn) {
+    return norm(btn.getAttribute('aria-label') || btn.getAttribute('title') || btn.innerText || btn.textContent || '');
+  }
+  var buttons = Array.from(d.querySelectorAll('button, [role="button"]')).filter(visible);
+  var deleteButtons = buttons.filter(function(btn) { return /^Delete queued message$/i.test(buttonLabel(btn)); });
+  var steerButtons = buttons.filter(function(btn) { return /^Steer$/i.test(buttonLabel(btn)); });
+  var anchors = deleteButtons.length > 0 ? deleteButtons : steerButtons;
+  if (anchors.length === 0) return null;
+  var queuePaused = Array.from(d.querySelectorAll('[role="status"], [role="alert"], div, span')).some(function(el) {
+    return visible(el) && /^Queue paused because you interrupted[.!]?$/i.test(norm(el.innerText || el.textContent));
+  });
   var items = [];
-  for (var i = 0; i < steerBtns.length; i++) {
-    var container = steerBtns[i].closest('.overflow-visible') || steerBtns[i].parentElement;
-    var textEl = container.querySelector('[class*="text-size-chat"]');
-    var text = textEl ? textEl.textContent.trim() : container.textContent.replace('Steer', '').trim();
-    if (text) items.push({ text: text, index: i });
+  for (var i = 0; i < anchors.length; i++) {
+    var anchor = anchors[i];
+    var container = anchor.closest('[data-testid*="queue" i], [class*="overflow-visible"], li, article') || anchor.parentElement;
+    var current = container;
+    for (var up = 0; up < 4 && current && current.parentElement; up++) {
+      var parent = current.parentElement;
+      var parentAnchors = parent.querySelectorAll('button[aria-label="Delete queued message"]').length;
+      if (deleteButtons.length > 0 && parentAnchors !== 1) break;
+      if (norm(parent.innerText || parent.textContent).length > 2400) break;
+      container = parent;
+      current = parent;
+    }
+    if (!container) continue;
+    var textEl = container.querySelector('[class*="text-size-chat"], textarea, [contenteditable="true"], [data-testid*="message-text" i]');
+    var text = textEl && 'value' in textEl ? norm(textEl.value) : norm(textEl && (textEl.innerText || textEl.textContent));
+    var containerText = norm(container.innerText || container.textContent);
+    if (!text) {
+      text = containerText;
+      Array.from(container.querySelectorAll('button, [role="button"]')).forEach(function(btn) {
+        var label = buttonLabel(btn);
+        if (label) text = norm(text.replace(label, ''));
+      });
+      text = norm(text.replace(/Queue paused because you interrupted[.!]?/ig, ''));
+    }
+    if (!text) continue;
+    var state = queuePaused ? 'paused' : (/could not be sent|retry.*continue the queue/i.test(containerText) ? 'failed' : 'queued');
+    items.push({ text: text, index: i, state: state });
   }
   return JSON.stringify(items);
 `;
@@ -8498,7 +8861,51 @@ async function readRateLimit(Runtime, agentType) {
 // so the function survives minor Claude Code extension version bumps.
 
 const READ_AGENT_CONFIG_EXPR = `
-  var config = { model_id: null, permission_mode: null };
+  var config = {
+    model_id: 'default',
+    mode: null,
+    permission_mode: null,
+    effort: null,
+    available_permission_modes: [
+      { value: 'default',           label: 'Ask before edit' },
+      { value: 'acceptEdits',       label: 'Edit automatically' },
+      { value: 'plan',              label: 'Plan mode' },
+      { value: 'auto',              label: 'Auto mode' },
+      { value: 'bypassPermissions', label: 'Bypass permissions' }
+    ],
+    available_efforts: [
+      { id: 'low',    label: 'Low' },
+      { id: 'medium', label: 'Medium' },
+      { id: 'high',   label: 'High' }
+    ]
+  };
+
+  function norm(text) {
+    return String(text || '').replace(/\\s+/g, ' ').trim();
+  }
+
+  function compact(text) {
+    return norm(text).toLowerCase().replace(/[^a-z0-9]+/g, '');
+  }
+
+  function normalizeClaudeMode(raw) {
+    var token = compact(raw);
+    if (!token) return null;
+    if (token.indexOf('bypasspermission') !== -1 || token.indexOf('bypapermiion') !== -1) return 'bypassPermissions';
+    if (token.indexOf('editautomatically') !== -1 || token.indexOf('acceptedit') !== -1) return 'acceptEdits';
+    if (token.indexOf('planmode') !== -1 || token === 'plan') return 'plan';
+    if (token.indexOf('automode') !== -1 || token === 'auto') return 'auto';
+    if (token.indexOf('askbeforeedit') !== -1 || token.indexOf('akbeforeedit') !== -1 || token === 'default') return 'default';
+    return null;
+  }
+
+  function normalizeEffort(raw) {
+    var token = compact(raw);
+    if (token.indexOf('high') !== -1) return 'high';
+    if (token.indexOf('medium') !== -1 || token.indexOf('med') !== -1) return 'medium';
+    if (token.indexOf('low') !== -1) return 'low';
+    return null;
+  }
 
   // ── Permission mode ─────────────────────────────────────────────────────────
   // Claude Code 2.x stores the current permission mode in data-permission-mode
@@ -8506,12 +8913,39 @@ const READ_AGENT_CONFIG_EXPR = `
   var fieldset = d.querySelector('fieldset[data-permission-mode]');
   if (fieldset) {
     config.permission_mode = fieldset.getAttribute('data-permission-mode');
+    config.mode = config.permission_mode;
   } else {
     // Fallback: body text scan for known permission mode strings
     var allText = (d.body ? d.body.innerText : '').substring(0, 8000);
     if (/bypassPermissions/i.test(allText)) config.permission_mode = 'bypassPermissions';
     else if (/autoApprove/i.test(allText))  config.permission_mode = 'autoApprove';
     else if (/default/i.test(allText) && /permission/i.test(allText)) config.permission_mode = 'default';
+  }
+
+  if (!config.permission_mode) {
+    var modeButtons = Array.from(d.querySelectorAll('button, [role="button"]'));
+    for (var i = 0; i < modeButtons.length; i++) {
+      var btn = modeButtons[i];
+      var label = norm((btn.getAttribute('title') || '') + ' ' + (btn.innerText || btn.textContent || ''));
+      var parsedMode = normalizeClaudeMode(label);
+      if (parsedMode) {
+        config.permission_mode = parsedMode;
+        config.mode = parsedMode;
+        break;
+      }
+    }
+  }
+
+  var effortEls = Array.from(d.querySelectorAll('button, [role="button"], span')).filter(function(el) {
+    var text = norm((el.getAttribute && (el.getAttribute('title') || '')) + ' ' + (el.innerText || el.textContent || ''));
+    return /effort/i.test(text) || /\\((low|medium|high)\\)/i.test(text);
+  });
+  for (var ei = 0; ei < effortEls.length; ei++) {
+    var effort = normalizeEffort((effortEls[ei].getAttribute && effortEls[ei].getAttribute('title') || '') + ' ' + (effortEls[ei].innerText || effortEls[ei].textContent || ''));
+    if (effort) {
+      config.effort = effort;
+      break;
+    }
   }
 
   return JSON.stringify(config);
@@ -8733,8 +9167,12 @@ async function readAgentConfig(Runtime, agentType, workspacePath) {
     if (!raw) return null;
     const parsed = JSON.parse(raw);
     return {
-      model_id:          parsed.model_id      || 'unknown',
+      model_id:          parsed.model_id      || 'default',
+      mode:              parsed.mode          || parsed.permission_mode || 'unknown',
       permission_mode:   parsed.permission_mode || 'unknown',
+      effort:            parsed.effort        || 'unknown',
+      available_permission_modes: parsed.available_permission_modes || [],
+      available_efforts: parsed.available_efforts || [],
       file_access_scope: workspacePath         || 'unknown',
     };
   } catch {
@@ -9358,11 +9796,14 @@ async function setAgentPermissionMode(Runtime, agentType, mode, sessionId, Input
   }
 
   const targetMap = {
-    default: 'askbeforeedits',
-    bypassPermissions: 'bypasspermissions',
+    default: ['askbeforeedit', 'askbeforeedits', 'akbeforeedit'],
+    acceptEdits: ['editautomatically', 'acceptedit'],
+    plan: ['planmode', 'plan'],
+    auto: ['automode', 'auto'],
+    bypassPermissions: ['bypasspermission', 'bypasspermissions', 'bypapermiion'],
   };
-  const targetToken = targetMap[mode];
-  if (!targetToken) {
+  const targetTokens = targetMap[mode];
+  if (!targetTokens) {
     return { ok: false, code: 'invalid_mode', detail: `Unsupported permission mode: ${mode}` };
   }
 
@@ -9391,14 +9832,19 @@ async function setAgentPermissionMode(Runtime, agentType, mode, sessionId, Input
 
       trigger.click();
 
-      var menuItems = Array.from(d.querySelectorAll('button[class*="menuItem"], [class*="menuItemV2"]'))
-        .filter(function(el) { return !!el.offsetParent; });
+      var menuItems = Array.from(d.querySelectorAll('button[class*="menuItem"], [class*="menuItemV2"], button'))
+        .filter(function(el) {
+          if (!el.offsetParent) return false;
+          var token = norm(el.textContent || '');
+          return /ask|edit|plan|auto|bypa|permi/.test(token);
+        });
       if (menuItems.length === 0) return JSON.stringify({ error: 'no_menu_items' });
 
       var target = null;
+      var targetTokens = ${JSON.stringify(targetTokens)};
       for (var i = 0; i < menuItems.length; i++) {
         var token = norm(menuItems[i].textContent || '');
-        if (token.indexOf(${JSON.stringify(targetToken)}) !== -1) {
+        if (targetTokens.some(function(targetToken) { return token.indexOf(targetToken) !== -1; })) {
           target = menuItems[i];
           break;
         }
@@ -10229,6 +10675,92 @@ async function detectPermissionDialog(Runtime, agentType) {
 }
 
 async function detectSessionErrorPrompt(Runtime, agentType) {
+  if (agentType === 'codex' || agentType === 'codex-desktop') {
+    try {
+      const evalFn = agentType === 'codex-desktop' ? evalInPage : evalInFrame;
+      const raw = await evalFn(Runtime, `
+        function hasVisibleBox(el) {
+          if (!el || !el.getBoundingClientRect) return false;
+          var rect = el.getBoundingClientRect();
+          return rect.width > 0 && rect.height > 0;
+        }
+        function isVisible(el) {
+          if (!el || !hasVisibleBox(el)) return false;
+          var style = window.getComputedStyle ? window.getComputedStyle(el) : null;
+          return !style || (style.display !== 'none' && style.visibility !== 'hidden' && style.opacity !== '0');
+        }
+        function norm(text) {
+          return String(text || '').replace(/\\s+/g, ' ').trim();
+        }
+        function buttonLabel(btn) {
+          return norm(btn.getAttribute('aria-label') || btn.getAttribute('title') || btn.innerText || btn.textContent || '');
+        }
+        function actionIdForLabel(label) {
+          var text = norm(label).toLowerCase();
+          if (text === 'retry with faster model') return 'retry_with_faster_model';
+          if (/^(retry|try again|resubmit|try sending .* again)$/i.test(text)) return 'retry';
+          if (/dismiss|close|hide/i.test(text)) return 'dismiss';
+          return null;
+        }
+        function looksLikeCodexNotice(text) {
+          return /thinking a bit more about this request|hang tight or retry with a faster model|response (?:is )?(?:delayed|queued)|request (?:is )?(?:delayed|queued)|queue paused because|queued message could not be sent|continue the queue|worktree task queued|temporarily unavailable|service unavailable|something went wrong|try again/i.test(text || '');
+        }
+
+        var roots = Array.from(d.querySelectorAll('[role="status"][aria-live], [role="alert"], [role="dialog"], [aria-live="assertive"]'))
+          .filter(function(el) { return isVisible(el) && looksLikeCodexNotice(norm(el.innerText || el.textContent)); })
+          .sort(function(a, b) {
+            return norm(a.innerText || a.textContent).length - norm(b.innerText || b.textContent).length;
+          });
+        var root = roots[0] || null;
+        if (!root) {
+          var titleNode = Array.from(d.querySelectorAll('div, span, p, h1, h2, h3')).filter(function(el) {
+            return isVisible(el) && /^Our systems are thinking a bit more about this request before responding[.!â€¦]?$/i.test(norm(el.innerText || el.textContent));
+          }).sort(function(a, b) {
+            return norm(a.textContent).length - norm(b.textContent).length;
+          })[0];
+          if (titleNode) {
+            root = titleNode.closest('[role="status"], [role="alert"], [role="dialog"], [aria-live]') || titleNode.parentElement;
+          }
+        }
+        if (!root) return null;
+
+        var rootText = norm(root.innerText || root.textContent);
+        var slowResponse = /thinking a bit more about this request|retry with a faster model/i.test(rootText);
+        var title = slowResponse
+          ? 'Our systems are thinking a bit more about this request before responding'
+          : (rootText.split(/(?<=[.!?])\\s+/)[0] || 'Codex requires attention');
+        var buttons = Array.from(root.querySelectorAll('button, [role="button"]')).filter(isVisible);
+        var actions = [];
+        var seen = {};
+        buttons.forEach(function(btn) {
+          var label = buttonLabel(btn);
+          var actionId = actionIdForLabel(label);
+          if (!actionId || seen[actionId]) return;
+          seen[actionId] = true;
+          actions.push({ action_id: actionId, label: label || actionId });
+        });
+        var description = rootText;
+        if (description.indexOf(title) === 0) description = norm(description.substring(title.length));
+        actions.forEach(function(action) {
+          description = norm(description.replace(action.label, ''));
+        });
+        return JSON.stringify({
+          title: title,
+          message: description || title,
+          error_output: null,
+          actions: actions,
+          display_mode: 'inline',
+          blocking: false,
+          notice_kind: slowResponse ? 'slow_response' : 'codex_notice',
+        });
+      `);
+      if (!raw) return null;
+      const parsed = JSON.parse(raw);
+      return parsed && parsed.title ? parsed : null;
+    } catch {
+      return null;
+    }
+  }
   if (agentType !== 'continue' && agentType !== 'continue_yolo') return null;
   try {
     const raw = await evalInFrame(Runtime, `
@@ -10424,6 +10956,64 @@ async function detectSessionErrorPrompt(Runtime, agentType) {
 }
 
 async function respondToSessionErrorPrompt(Runtime, agentType, actionId, sessionId) {
+  if (agentType === 'codex' || agentType === 'codex-desktop') {
+    try {
+      const evalFn = agentType === 'codex-desktop' ? evalInPage : evalInFrame;
+      const result = await evalFn(Runtime, `
+        function hasVisibleBox(el) {
+          if (!el || !el.getBoundingClientRect) return false;
+          var rect = el.getBoundingClientRect();
+          return rect.width > 0 && rect.height > 0;
+        }
+        function isVisible(el) {
+          if (!el || !hasVisibleBox(el)) return false;
+          var style = window.getComputedStyle ? window.getComputedStyle(el) : null;
+          return !style || (style.display !== 'none' && style.visibility !== 'hidden' && style.opacity !== '0');
+        }
+        function norm(text) {
+          return String(text || '').replace(/\\s+/g, ' ').trim();
+        }
+        function buttonLabel(btn) {
+          return norm(btn.getAttribute('aria-label') || btn.getAttribute('title') || btn.innerText || btn.textContent || '');
+        }
+        function actionIdForLabel(label) {
+          var text = norm(label).toLowerCase();
+          if (text === 'retry with faster model') return 'retry_with_faster_model';
+          if (/^(retry|try again|resubmit|try sending .* again)$/i.test(text)) return 'retry';
+          if (/dismiss|close|hide/i.test(text)) return 'dismiss';
+          return null;
+        }
+        function looksLikeCodexNotice(text) {
+          return /thinking a bit more about this request|hang tight or retry with a faster model|response (?:is )?(?:delayed|queued)|request (?:is )?(?:delayed|queued)|queue paused because|queued message could not be sent|continue the queue|worktree task queued|temporarily unavailable|service unavailable|something went wrong|try again/i.test(text || '');
+        }
+        function clickLikeUser(btn) {
+          var rect = btn.getBoundingClientRect();
+          var opts = { bubbles: true, cancelable: true, view: window, clientX: rect.x + rect.width / 2, clientY: rect.y + rect.height / 2, button: 0 };
+          try { btn.dispatchEvent(new PointerEvent('pointerdown', opts)); } catch {}
+          btn.dispatchEvent(new MouseEvent('mousedown', opts));
+          try { btn.dispatchEvent(new PointerEvent('pointerup', opts)); } catch {}
+          btn.dispatchEvent(new MouseEvent('mouseup', opts));
+          btn.dispatchEvent(new MouseEvent('click', opts));
+        }
+
+        var root = Array.from(d.querySelectorAll('[role="status"][aria-live], [role="alert"], [role="dialog"], [aria-live="assertive"]'))
+          .filter(function(el) { return isVisible(el) && looksLikeCodexNotice(norm(el.innerText || el.textContent)); })
+          .sort(function(a, b) { return norm(a.textContent).length - norm(b.textContent).length; })[0];
+        if (!root) return 'prompt_not_found';
+        var target = Array.from(root.querySelectorAll('button, [role="button"]')).find(function(btn) {
+          return isVisible(btn) && actionIdForLabel(buttonLabel(btn)) === ${JSON.stringify(actionId)};
+        });
+        if (!target) return 'action_not_found';
+        if (target.disabled || target.getAttribute('aria-disabled') === 'true') return 'disabled';
+        clickLikeUser(target);
+        return 'clicked';
+      `);
+      if (result === 'clicked') return { ok: true };
+      return { ok: false, code: result || 'click_failed', detail: `Codex notice action ${actionId} was not clicked (${result || 'unknown'})` };
+    } catch (error) {
+      return { ok: false, code: 'exception', detail: error.message };
+    }
+  }
   if (agentType !== 'continue' && agentType !== 'continue_yolo') {
     return { ok: false, code: 'not_supported', detail: `Session error prompt action not supported for ${agentType}` };
   }
@@ -10739,13 +11329,14 @@ async function sendMessage(Runtime, agentType, text, sessionId, cdpClient = null
     result = await sendAntigravityPanelPrimary(Runtime, text);
   } else if (agentType === 'antigravity-v2') {
     result = await sendAntigravityV2TrustedInput(cdpClient, Runtime, text);
-    if (!result.ok && result.code !== 'not_supported') {
-      console.warn(`[${sessionId}] [sel] Antigravity v2 CDP input send failed (${result.code}:${result.detail}), trying DOM strategies`);
-    }
-    if (!result.ok) result = await sendAntigravityV2Primary(Runtime, text);
-    if (!result.ok) {
-      console.warn(`[${sessionId}] [sel] Antigravity v2 primary send failed (${result.code}:${result.detail}), trying fallback`);
-      result = await sendAntigravityV2Fallback(Runtime, text);
+    if (!result.ok && result.code === 'not_supported') {
+      result = await sendAntigravityV2Primary(Runtime, text);
+      if (!result.ok) {
+        console.warn(`[${sessionId}] [sel] Antigravity v2 primary send failed (${result.code}:${result.detail}), trying fallback`);
+        result = await sendAntigravityV2Fallback(Runtime, text);
+      }
+    } else if (!result.ok) {
+      console.warn(`[${sessionId}] [sel] Antigravity v2 trusted send failed (${result.code}:${result.detail}); refusing append-only DOM fallbacks`);
     }
   } else if (agentType === 'cursor') {
     result = await cursorSel.sendCursorMessage(Runtime, cdpClient, text);
@@ -10799,9 +11390,19 @@ async function sendMessage(Runtime, agentType, text, sessionId, cdpClient = null
 // by clicking the relevant toolbar buttons and selecting the desired option.
 // Operates on page-level DOM (usePageEval=true).
 
-async function setCodexDesktopConfig(Runtime, { model_id, effort, access_mode, speed }, usePageEval = true) {
+async function setCodexDesktopConfig(Runtime, { model_id, effort, access_mode, speed }, usePageEval = true, InputDomain = null) {
   const results = {};
   const evalFn = usePageEval ? evalInPage : evalInFrame;
+
+  function codexModelIdToLabel(id) {
+    const raw = String(id || '').trim();
+    const match = raw.toLowerCase().match(/^gpt-(\d+(?:\.\d+)*)(?:-(.+))?$/);
+    if (!match) return raw.toUpperCase().replace(/^GPT-/, 'GPT-');
+    const suffix = match[2]
+      ? ' ' + match[2].split('-').filter(Boolean).map(part => part.charAt(0).toUpperCase() + part.slice(1)).join(' ')
+      : '';
+    return `GPT-${match[1]}${suffix}`;
+  }
 
   async function closeMenus() {
     try {
@@ -10816,8 +11417,22 @@ async function setCodexDesktopConfig(Runtime, { model_id, effort, access_mode, s
           return 'ok';
         })();
       `);
+      if (InputDomain) {
+        try {
+          await InputDomain.dispatchKeyEvent({ type: 'keyDown', key: 'Escape', code: 'Escape' });
+          await InputDomain.dispatchKeyEvent({ type: 'keyUp', key: 'Escape', code: 'Escape' });
+        } catch {}
+      }
       await new Promise(r => setTimeout(r, 120));
     } catch {}
+  }
+
+  async function dispatchCdpClick(coords) {
+    if (!InputDomain || !coords || !Number.isFinite(coords.x) || !Number.isFinite(coords.y)) return false;
+    await InputDomain.dispatchMouseEvent({ type: 'mousePressed', x: coords.x, y: coords.y, button: 'left', clickCount: 1 });
+    await new Promise(r => setTimeout(r, 60));
+    await InputDomain.dispatchMouseEvent({ type: 'mouseReleased', x: coords.x, y: coords.y, button: 'left', clickCount: 1 });
+    return true;
   }
 
   async function clickOpenCombinedModelMenu() {
@@ -10835,18 +11450,53 @@ async function setCodexDesktopConfig(Runtime, { model_id, effort, access_mode, s
           el.dispatchEvent(new w.MouseEvent('mouseup', opts));
           el.dispatchEvent(new w.MouseEvent('click', opts));
         }
-        var btns = Array.from(d.querySelectorAll('button'));
+        function visible(el) {
+          return !!(el && (el.offsetWidth || el.offsetHeight || el.getClientRects().length));
+        }
+        var btns = Array.from(d.querySelectorAll('button')).filter(visible);
+        function isModelPart(p) {
+          var suffix = '(mini|codex(?:[-\\\\s]+spark)?|spark|sol|terra|luna)';
+          return new RegExp('^\\\\d+(?:\\\\.\\\\d+)*(?:[-\\\\s]+' + suffix + ')?$', 'i').test(p) ||
+            new RegExp('^gpt[-\\\\s.]*\\\\d+(?:\\\\.\\\\d+)*(?:[-\\\\s]+' + suffix + ')?$', 'i').test(p);
+        }
+        function comboPartsFromButton(b) {
+          var full = norm(b.innerText || b.textContent || '');
+          if (full) {
+            var effort = full.match(/(extra\\s*high|low|medium|high)$/i);
+            if (effort) {
+              var modelPart = norm(full.slice(0, effort.index));
+              return [modelPart, norm(effort[1])].filter(Boolean);
+            }
+          }
+          var parts = Array.from(b.querySelectorAll('span')).filter(visible).map(function(s) {
+            return norm(s.innerText || s.textContent);
+          }).filter(Boolean);
+          return parts.length >= 2 ? parts : (full ? [full] : parts);
+        }
         var trigger = btns.slice(-40).find(function(b) {
-          var parts = Array.from(b.querySelectorAll('span')).map(function(s) { return norm(s.textContent); }).filter(Boolean);
-          var hasModel = parts.some(function(p) { return /^\\d+(?:\\.\\d+)?$/.test(p) || /^gpt[-\\s.]?[\\d.]+$/i.test(p); });
+          var parts = comboPartsFromButton(b);
+          var hasModel = parts.some(isModelPart);
           var hasEffort = parts.some(function(p) { return /^(low|medium|high|extra\\s*high)$/i.test(p); });
           return hasModel && hasEffort;
         });
         if (!trigger) return 'no-trigger';
+        if (${InputDomain ? 'true' : 'false'}) {
+          var r = trigger.getBoundingClientRect();
+          return JSON.stringify({ clicked: false, x: r.left + r.width / 2, y: r.top + r.height / 2, label: norm(trigger.innerText || trigger.textContent || '') });
+        }
         press(trigger);
         return 'clicked';
       })();
     `);
+    if (InputDomain && typeof triggerClicked === 'string' && triggerClicked.trim().startsWith('{')) {
+      try {
+        const coords = JSON.parse(triggerClicked);
+        await dispatchCdpClick(coords);
+        return { ok: true, detail: 'cdp-clicked', selected: coords.label || null };
+      } catch (e) {
+        return { ok: false, detail: `cdp-trigger: ${e.message}` };
+      }
+    }
     return triggerClicked === 'clicked' ? { ok: true, detail: triggerClicked } : { ok: false, detail: triggerClicked };
   }
 
@@ -10867,20 +11517,36 @@ async function setCodexDesktopConfig(Runtime, { model_id, effort, access_mode, s
           el.dispatchEvent(new w.MouseEvent('click', opts));
         }
         var target = ${optStr};
+        var targetCompact = target.replace(/^gpt[-\\s.]*/i, '').replace(/[^a-z0-9.]+/g, '');
         var candidates = Array.from(d.querySelectorAll('[role="menuitem"],[role="option"],[role="listitem"],button'));
         var item = candidates.find(function(el) {
           if (!(el.offsetWidth || el.offsetHeight || el.getClientRects().length)) return false;
           var t = norm(el.innerText || el.textContent || '').toLowerCase();
           var firstLine = t.split(/\\n|\\r/)[0].trim();
+          var firstCompact = firstLine.replace(/^gpt[-\\s.]*/i, '').replace(/[^a-z0-9.]+/g, '');
           return t === target || firstLine === target ||
             t.indexOf(target + ' ') === 0 ||
-            t.replace(/\\s+/g,'') === target.replace(/\\s+/g,'');
+            t.replace(/\\s+/g,'') === target.replace(/\\s+/g,'') ||
+            firstCompact === targetCompact;
         });
         if (!item) return 'no-option';
+        if (${InputDomain ? 'true' : 'false'}) {
+          var r = item.getBoundingClientRect();
+          return JSON.stringify({ clicked: false, x: r.left + r.width / 2, y: r.top + r.height / 2, label: norm(item.innerText || item.textContent || '') });
+        }
         press(item);
         return 'clicked';
       })();
     `);
+    if (InputDomain && typeof optClicked === 'string' && optClicked.trim().startsWith('{')) {
+      try {
+        const coords = JSON.parse(optClicked);
+        await dispatchCdpClick(coords);
+        return { ok: true, detail: 'cdp-clicked', selected: coords.label || optionText };
+      } catch (e) {
+        return { ok: false, detail: `cdp-option: ${e.message}` };
+      }
+    }
     return { ok: optClicked === 'clicked', detail: optClicked };
   }
 
@@ -10901,13 +11567,26 @@ async function setCodexDesktopConfig(Runtime, { model_id, effort, access_mode, s
         var candidates = Array.from(d.querySelectorAll('[role="menuitem"],button'));
         var item = candidates.find(function(el) {
           if (!(el.offsetWidth || el.offsetHeight || el.getClientRects().length)) return false;
-          return /^GPT[-\\s.]?\\d/i.test(norm(el.innerText || el.textContent || ''));
+          return /^(?:GPT[-\\s.]?)?\\d+(?:\\.\\d+)*/i.test(norm(el.innerText || el.textContent || ''));
         });
         if (!item) return 'no-model-menuitem';
+        if (${InputDomain ? 'true' : 'false'}) {
+          var r = item.getBoundingClientRect();
+          return JSON.stringify({ clicked: false, x: r.left + r.width / 2, y: r.top + r.height / 2, label: norm(item.innerText || item.textContent || '') });
+        }
         press(item);
         return 'clicked';
       })();
     `);
+    if (InputDomain && typeof optClicked === 'string' && optClicked.trim().startsWith('{')) {
+      try {
+        const coords = JSON.parse(optClicked);
+        await dispatchCdpClick(coords);
+        return { ok: true, detail: 'cdp-clicked', selected: coords.label || null };
+      } catch (e) {
+        return { ok: false, detail: `cdp-model-menu: ${e.message}` };
+      }
+    }
     return { ok: optClicked === 'clicked', detail: optClicked };
   }
 
@@ -10934,10 +11613,22 @@ async function setCodexDesktopConfig(Runtime, { model_id, effort, access_mode, s
           return (${triggerPatternFn})(t);
         });
         if (!trigger) return 'no-trigger';
+        if (${InputDomain ? 'true' : 'false'}) {
+          var r = trigger.getBoundingClientRect();
+          return JSON.stringify({ clicked: false, x: r.left + r.width / 2, y: r.top + r.height / 2, label: (trigger.innerText || trigger.textContent || '').trim() });
+        }
         press(trigger);
         return 'clicked';
       })();
     `);
+    if (InputDomain && typeof triggerClicked === 'string' && triggerClicked.trim().startsWith('{')) {
+      try {
+        const coords = JSON.parse(triggerClicked);
+        await dispatchCdpClick(coords);
+      } catch (e) {
+        return { ok: false, detail: `trigger: cdp-trigger ${e.message}` };
+      }
+    } else
     if (triggerClicked !== 'clicked') return { ok: false, detail: `trigger: ${triggerClicked}` };
 
     await new Promise(r => setTimeout(r, 350));
@@ -10945,7 +11636,7 @@ async function setCodexDesktopConfig(Runtime, { model_id, effort, access_mode, s
   }
 
   if (model_id) {
-    const label = model_id.toUpperCase().replace(/^GPT-/, 'GPT-');
+    const label = codexModelIdToLabel(model_id);
     const combinedOpen = await clickOpenCombinedModelMenu();
     if (combinedOpen.ok) {
       await new Promise(r => setTimeout(r, 350));
@@ -10960,7 +11651,7 @@ async function setCodexDesktopConfig(Runtime, { model_id, effort, access_mode, s
       await closeMenus();
     } else {
       results.model = await clickOption(
-        'function(t){ return /^gpt[-\\s.]?[\\d.]+|^o[134][-\\s.]/i.test(t) && t.length < 20; }',
+        'function(t){ var suffix = "(mini|codex(?:[-\\\\s]+spark)?|spark|sol|terra|luna)"; return (new RegExp("^gpt[-\\\\s.]*\\\\d+(?:\\\\.\\\\d+)*(?:[-\\\\s]+" + suffix + ")?(?:\\\\s+(?:low|medium|high|extra\\\\s*high))?$", "i").test(t) || new RegExp("^\\\\d+(?:\\\\.\\\\d+)*(?:[-\\\\s]+" + suffix + ")?(?:\\\\s+(?:low|medium|high|extra\\\\s*high))?$", "i").test(t) || /^o[134][-\\s.]/i.test(t)) && t.length < 80; }',
         label
       );
     }
@@ -11293,38 +11984,74 @@ async function readCodexThreadList(Runtime, usePageEval) {
     const raw = await evalFn(Runtime, `
       var threads = [];
 
-      // Codex Desktop DOM (confirmed via live CDP inspection 2026-03-22):
-      //   <nav> contains action buttons (New thread, Automations, Skills) and thread list
-      //   Thread items are <div.group.cursor-interaction.rounded-lg> with text content
-      //   Active thread has aria-current="page" on that div
+      // Codex Desktop DOM:
+      //   <nav> contains action buttons (New thread, Automations, Skills) and thread list.
+      //   Older builds used <div.group.cursor-interaction.rounded-lg> rows.
+      //   Current builds use ARIA list/listitem rows with an inner role=button and
+      //   Tailwind arbitrary radius classes (rounded-[var(--radius-token-row)]).
+      //   Active thread has aria-current="page" on the row/button when available.
       //   BUT: when Automations/Skills are selected, aria-current="page" moves to
       //   the button, not a thread — so we must not rely on aria-current for discovery.
       //
-      // Strategy: directly query all div.group.cursor-interaction.rounded-lg in <nav>.
-      // These are thread items (buttons like New thread use <button> tags, not <div>).
+      function normalizeThreadRowText(fullText) {
+        var lines = String(fullText || '').split('\\n').map(function(line) { return line.trim(); }).filter(Boolean);
+        var titleLine = lines.find(function(line) { return !/^\\d+(?:mo|[smhdw])$/.test(line); }) || String(fullText || '');
+        var text = titleLine.replace(/\\d+(?:mo|[smhdw])$/, '').trim();
+        return text.replace(/[\\uFFFD{}\\]\\[]+/g, ' ').replace(/\\s{2,}/g, ' ').trim();
+      }
+
+      function codexThreadClickableFromListItem(item) {
+        if (!item || item.getAttribute('aria-label')) return null;
+        var candidates = Array.from(item.querySelectorAll('[role="button"], div[class*="cursor-interaction"]'));
+        for (var ci = 0; ci < candidates.length; ci++) {
+          var candidate = candidates[ci];
+          var cls = String(candidate.className || '');
+          var aria = candidate.getAttribute('aria-label') || '';
+          var text = (candidate.textContent || '').trim();
+          if (!text || !/\\d+(?:mo|[smhdw])$/.test(text)) continue;
+          if (aria) continue;
+          if (/cursor-grab/.test(cls)) continue;
+          if (!/cursor-interaction/.test(cls)) continue;
+          if (!/(rounded-lg|rounded-\\[|height-token-row|--height-token-row)/.test(cls)) continue;
+          return candidate;
+        }
+        return null;
+      }
+
+      function isVisible(el) {
+        return !!(el && el.offsetParent !== null);
+      }
+
+      var seen = new Set();
+      function addThreadCandidate(clickable, item) {
+        if (!clickable || seen.has(clickable) || !isVisible(clickable)) return;
+        seen.add(clickable);
+        var fullText = (clickable.textContent || '').trim();
+        if (!/\\d+(?:mo|[smhdw])$/.test(fullText)) return;
+        var text = normalizeThreadRowText(fullText);
+        if (!text || text.length < 2) return;
+        var ageMatch = fullText.match(/(\\d+(?:mo|[smhdw]))$/);
+        var active = clickable.getAttribute('aria-current') === 'page' ||
+          clickable.getAttribute('aria-selected') === 'true' ||
+          (item && (item.getAttribute('aria-current') === 'page' || item.getAttribute('aria-selected') === 'true'));
+        threads.push({
+          id: 'thread-' + threads.length,
+          title: text.substring(0, 100),
+          age: ageMatch ? ageMatch[1] : null,
+          active: !!active,
+          index: threads.length
+        });
+      }
 
       var nav = d.querySelector('nav');
       if (nav) {
-        var threadDivs = Array.from(nav.querySelectorAll('div[class*="group"][class*="cursor-interaction"][class*="rounded-lg"]'));
-        for (var i = 0; i < threadDivs.length; i++) {
-          var clickable = threadDivs[i];
-          var fullText = (clickable.textContent || '').trim();
-          var lines = fullText.split('\\n').map(function(line) { return line.trim(); }).filter(Boolean);
-          var titleLine = lines.find(function(line) { return !/^\\d+(?:mo|[smhdw])$/.test(line); }) || fullText;
-          // Strip trailing age suffixes like "2d", "15m", "3h" that got concatenated
-          var text = titleLine.replace(/\\d+(?:mo|[smhdw])$/, '').trim();
-          text = text.replace(/[\\uFFFD{}\\]\\[]+/g, ' ').replace(/\\s{2,}/g, ' ').trim();
-          if (!text || text.length < 2) continue;
-          // Try to extract the age badge from remaining text
-          var ageMatch = fullText.match(/(\\d+(?:mo|[smhdw]))$/);
-          var age = ageMatch ? ageMatch[1] : null;
-          threads.push({
-            id: 'thread-' + threads.length,
-            title: text.substring(0, 100),
-            age: age,
-            active: clickable.getAttribute('aria-current') === 'page',
-            index: threads.length
-          });
+        var listItems = Array.from(nav.querySelectorAll('[role="listitem"]'));
+        for (var li = 0; li < listItems.length; li++) {
+          addThreadCandidate(codexThreadClickableFromListItem(listItems[li]), listItems[li]);
+        }
+        var legacyRows = Array.from(nav.querySelectorAll('div[class*="group"][class*="cursor-interaction"][class*="rounded-lg"], div[class*="group"][class*="cursor-interaction"][class*="rounded-["]'));
+        for (var i = 0; i < legacyRows.length; i++) {
+          addThreadCandidate(legacyRows[i], legacyRows[i].closest('[role="listitem"]'));
         }
       }
 
@@ -11375,6 +12102,54 @@ async function switchCodexThread(Runtime, threadId, usePageEval) {
         }
         var targetId = ${JSON.stringify(threadId)};
 
+        function normalizeThreadRowText(fullText) {
+          var lines = String(fullText || '').split('\\n').map(function(line) { return line.trim(); }).filter(Boolean);
+          var titleLine = lines.find(function(line) { return !/^\\d+(?:mo|[smhdw])$/.test(line); }) || String(fullText || '');
+          var text = titleLine.replace(/\\d+(?:mo|[smhdw])$/, '').trim();
+          return text.replace(/[\\uFFFD{}\\]\\[]+/g, ' ').replace(/\\s{2,}/g, ' ').trim();
+        }
+
+        function codexThreadClickableFromListItem(item) {
+          if (!item || item.getAttribute('aria-label')) return null;
+          var candidates = Array.from(item.querySelectorAll('[role="button"], div[class*="cursor-interaction"]'));
+          for (var ci = 0; ci < candidates.length; ci++) {
+            var candidate = candidates[ci];
+            var cls = String(candidate.className || '');
+            var aria = candidate.getAttribute('aria-label') || '';
+            var text = (candidate.textContent || '').trim();
+            if (!text || !/\\d+(?:mo|[smhdw])$/.test(text)) continue;
+            if (aria) continue;
+            if (/cursor-grab/.test(cls)) continue;
+            if (!/cursor-interaction/.test(cls)) continue;
+            if (!/(rounded-lg|rounded-\\[|height-token-row|--height-token-row)/.test(cls)) continue;
+            return candidate;
+          }
+          return null;
+        }
+
+        function collectThreadClickables() {
+          var clickables = [];
+          var seen = new Set();
+          var nav = d.querySelector('nav');
+          if (!nav) return clickables;
+          function add(clickable) {
+            if (!clickable || seen.has(clickable) || clickable.offsetParent === null) return;
+            seen.add(clickable);
+            var fullText = (clickable.textContent || '').trim();
+            if (!/\\d+(?:mo|[smhdw])$/.test(fullText)) return;
+            var text = normalizeThreadRowText(fullText);
+            if (!text || text.length < 2) return;
+            clickables.push(clickable);
+          }
+          var listItems = Array.from(nav.querySelectorAll('[role="listitem"]'));
+          for (var li = 0; li < listItems.length; li++) {
+            add(codexThreadClickableFromListItem(listItems[li]));
+          }
+          var legacyRows = Array.from(nav.querySelectorAll('div[class*="group"][class*="cursor-interaction"][class*="rounded-lg"], div[class*="group"][class*="cursor-interaction"][class*="rounded-["]'));
+          for (var i = 0; i < legacyRows.length; i++) add(legacyRows[i]);
+          return clickables;
+        }
+
         // Strategy 1: Find by data attribute
         var el = d.querySelector('[data-thread-id="' + targetId + '"]') ||
                  d.querySelector('[data-conversation-id="' + targetId + '"]');
@@ -11385,18 +12160,7 @@ async function switchCodexThread(Runtime, threadId, usePageEval) {
         if (idxMatch) {
           var idx = parseInt(idxMatch[1], 10);
 
-          var clickables = [];
-          var nav = d.querySelector('nav');
-          if (nav) {
-            var threadDivs = Array.from(nav.querySelectorAll('div[class*="group"][class*="cursor-interaction"][class*="rounded-lg"]'));
-            for (var i = 0; i < threadDivs.length; i++) {
-              var clickable = threadDivs[i];
-              var fullText = (clickable.textContent || '').trim();
-              var text = fullText.replace(/\\d+(?:mo|[smhdw])$/, '').trim();
-              if (!text || text.length < 2) continue;
-              clickables.push(clickable);
-            }
-          }
+          var clickables = collectThreadClickables();
 
           if (clickables[idx]) {
             dispatchPress(clickables[idx]);
@@ -11409,7 +12173,7 @@ async function switchCodexThread(Runtime, threadId, usePageEval) {
     `);
     let initial;
     try { initial = JSON.parse(raw); } catch { initial = null; }
-    const attempted = !!initial?.ok || /^thread-\d+$/.test(String(threadId || ''));
+    const attempted = !!initial?.ok;
 
     for (let i = 0; i < 30; i++) {
       await new Promise(r => setTimeout(r, 500));
@@ -11423,6 +12187,12 @@ async function switchCodexThread(Runtime, threadId, usePageEval) {
         }
         if (JSON.stringify(afterThreadList || []) !== JSON.stringify(beforeThreadList || [])) {
           return { ok: true, method: initial.method, verified: 'thread-list-changed' };
+        }
+      } catch {}
+      try {
+        const visibleMessages = JSON.parse(await readCodexMessages(Runtime, 'codex-desktop-switch-verify', usePageEval) || '[]');
+        if (Array.isArray(visibleMessages) && visibleMessages.length > 0) {
+          return { ok: true, method: initial?.method, verified: 'transcript-visible' };
         }
       } catch {}
       try {
@@ -11446,7 +12216,7 @@ async function switchCodexThread(Runtime, threadId, usePageEval) {
     if (!attempted) {
       return initial || { ok: false, detail: 'switch-not-attempted' };
     }
-    return { ok: false, detail: 'thread-switch-not-observed', method: initial?.method };
+    return { ok: true, method: initial?.method, verified: 'click-dispatched' };
   } catch (e) {
     return { ok: false, code: 'cdp_error', detail: e.message };
   }
@@ -11555,6 +12325,14 @@ async function readCodexChatList(Runtime, usePageEval, navigateToList = false) {
 
   const raw = await evalFn(Runtime, `
       var chats = [];
+      function normTitle(raw) {
+        var text = String(raw || '').replace(/\\s+/g, ' ').trim();
+        // Codex side-pane list items render title and age as adjacent text
+        // ("Add Codex CLI support1mo"). Strip only the trailing relative-age
+        // token so the web UI title matches the visible conversation title.
+        text = text.replace(/\\s*(?:now|just now|\\d+\\s*(?:s|sec|secs|m|min|mins|h|hr|hrs|d|day|days|w|wk|wks|mo|mon|mons|month|months|y|yr|yrs))$/i, '').trim();
+        return text;
+      }
 
       // Strategy 1: Look for conversation/thread list items (sidebar or panel)
       // Common patterns: nav items, list items with conversation titles
@@ -11569,7 +12347,7 @@ async function readCodexChatList(Runtime, usePageEval, navigateToList = false) {
         for (var i = 0; i < listItems.length; i++) {
           var el = listItems[i];
           var id = el.getAttribute('data-thread-id') || el.getAttribute('data-conversation-id') || ('idx-' + i);
-          var title = (el.textContent || '').trim().substring(0, 100);
+          var title = normTitle(el.textContent || '').substring(0, 100);
           if (!title) continue;
           var active = false;
           try { active = el.classList.contains('active') || el.classList.contains('selected') || el.getAttribute('aria-selected') === 'true' || el.getAttribute('aria-current') === 'true'; } catch(e) {}
@@ -11598,7 +12376,7 @@ async function readCodexChatList(Runtime, usePageEval, navigateToList = false) {
       containers.forEach(function(btns, container) {
         if (btns.length < 2 || chats.length > 0) return;
         btns.forEach(function(btn, idx) {
-          var title = (btn.textContent || '').trim().substring(0, 100);
+          var title = normTitle(btn.textContent || '').substring(0, 100);
           if (!title) return;
           var active = false;
           try { active = btn.classList.contains('active') || btn.classList.contains('selected') || btn.getAttribute('aria-selected') === 'true'; } catch(e) {}
@@ -12744,6 +13522,7 @@ module.exports = {
   detectAgentType,
   detectThinking,
   readMessages,
+  readClaudeSessionTitle,
   readAgentConfig,
   setAgentModel,
   setAgentPermissionMode,

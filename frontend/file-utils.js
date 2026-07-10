@@ -25,6 +25,7 @@ const AGENT_DISPLAY = {
   claude_cli: 'Claude Code CLI',
   codex: 'Codex',
   codex_cli: 'Codex CLI',
+  cursor_cli: 'Cursor CLI',
   gemini: 'Gemini',
   continue: 'Continue',
   continue_yolo: 'Continue YOLO',

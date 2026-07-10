@@ -9,6 +9,8 @@ const { useState, useEffect, useRef, useCallback } = React;
 
 const DEFAULT_HISTORY_TAIL_LIMIT = 120;
 const CODEX_CLI_HISTORY_CHUNK_BYTES = 1024 * 1024;
+const HISTORY_CHUNK_TIMEOUT_MS = 15000;
+const MAX_HISTORY_CHUNK_RETRIES = 1;
 
 function shallowMapMerge(prev, next) {
   const entries = Object.entries(next || {});
@@ -32,6 +34,63 @@ function sameSessionList(a, b) {
     if (JSON.stringify(left[i] ?? null) !== JSON.stringify(right[i] ?? null)) return false;
   }
   return true;
+}
+
+export function shouldMergeHistorySnapshot(type, msg, priorHistoryMeta) {
+  // Proxy history_snapshot events are authoritative mirrors of the current
+  // native transcript. They must replace any optimistic/live deltas already
+  // rendered in the browser, even when the session previously loaded a
+  // chunked SQLite tail. Inheriting that old chunked mode turns a replacement
+  // snapshot into an append and duplicates the just-sent user turn.
+  const authoritativeFullSnapshot = (type === 'history_snapshot' || type === 'history')
+    && !msg?.partial
+    && (!msg?.mode || msg.mode === 'full');
+  if (authoritativeFullSnapshot) return false;
+  return !!(
+    msg?.partial
+    || msg?.mode === 'tail'
+    || priorHistoryMeta?.mode === 'chunked'
+    || priorHistoryMeta?.partial
+  );
+}
+
+function stableHistoryMessageId(msg) {
+  if (!msg) return '';
+  if (msg.id != null) return `id\u0001${msg.id}`;
+  if (msg.server_message_id != null) return `server\u0001${msg.server_message_id}`;
+  if (msg.sequence != null && msg.ts != null) return `seq\u0001${msg.sequence}\u0001${msg.ts}\u0001${msg.role || ''}`;
+  if (msg.client_msg_id) return `client\u0001${msg.client_msg_id}`;
+  return '';
+}
+
+export function historyMessagesOverlapMatch(left, right) {
+  if (!left || !right) return false;
+  const leftId = stableHistoryMessageId(left);
+  const rightId = stableHistoryMessageId(right);
+  if (leftId && rightId) return leftId === rightId;
+  return left.role === right.role && String(left.content || '') === String(right.content || '');
+}
+
+export function mergeHistoryTailByOverlap(existing, incoming) {
+  const current = Array.isArray(existing) ? existing : [];
+  const nextIncoming = Array.isArray(incoming) ? incoming : [];
+  if (!current.length) return nextIncoming;
+  if (!nextIncoming.length) return current;
+
+  const maxOverlap = Math.min(current.length, nextIncoming.length);
+  for (let overlap = maxOverlap; overlap >= 1; overlap--) {
+    let matches = true;
+    for (let index = 0; index < overlap; index++) {
+      if (!historyMessagesOverlapMatch(current[current.length - overlap + index], nextIncoming[index])) {
+        matches = false;
+        break;
+      }
+    }
+    if (!matches) continue;
+    if (overlap === nextIncoming.length) return current;
+    return [...current, ...nextIncoming.slice(overlap)];
+  }
+  return null;
 }
 
 export function useRelay() {
@@ -87,7 +146,19 @@ export function useRelay() {
       wsRef.current = ws;
 
       ws.onopen  = () => setConnected(true);
-      ws.onclose = () => { setConnected(false); setTimeout(connect, 3000); };
+      ws.onclose = () => {
+        Object.values(historyChunkTimers.current).forEach(timer => clearTimeout(timer));
+        historyChunkTimers.current = {};
+        Object.keys(historyChunkState.current).forEach(id => {
+          historyChunkState.current[id] = {
+            ...(historyChunkState.current[id] || {}),
+            inFlight: false,
+          };
+        });
+        setHistoryLoading({});
+        setConnected(false);
+        setTimeout(connect, 3000);
+      };
 
       ws.onmessage = (e) => {
         let msg;
@@ -219,6 +290,12 @@ export function useRelay() {
         historyChunkState.current[id] = { ...(historyChunkState.current[id] || {}), source, chunkBytes, limit: options.limit || historyChunkState.current[id]?.limit || null, inFlight: true, mode, lastRequestSig: requestCursorSig, lastRequestAt: nowMs };
       }
       latestHistoryChunkRequest.current[id] = requestId;
+      setHistoryMeta(prev => {
+        if (!prev[id]?.error) return prev;
+        const nextMeta = { ...prev[id] };
+        delete nextMeta.error;
+        return { ...prev, [id]: nextMeta };
+      });
       setHistoryLoading(prev => ({
         ...prev,
         [id]: { mode, kind: 'chunked', requestedAt: Date.now(), requestId },
@@ -238,6 +315,41 @@ export function useRelay() {
       if (mode === 'older' && beforeOffset != null) payload.before_offset = beforeOffset;
       if (mode === 'older' && beforeId != null) payload.before_id = beforeId;
       send(payload);
+      historyChunkTimers.current[id] = setTimeout(() => {
+        delete historyChunkTimers.current[id];
+        if (latestHistoryChunkRequest.current[id] !== requestId) return;
+        const latestState = historyChunkState.current[id] || {};
+        if (!latestState.inFlight) return;
+        historyChunkState.current[id] = { ...latestState, inFlight: false };
+
+        const retryAttempt = Number(options.retryAttempt || 0);
+        if (retryAttempt < MAX_HISTORY_CHUNK_RETRIES && wsRef.current?.readyState === WebSocket.OPEN) {
+          requestHistoryChunk(id, {
+            ...options,
+            mode,
+            source,
+            beforeOffset,
+            beforeId,
+            chunkBytes,
+            retryAttempt: retryAttempt + 1,
+          });
+          return;
+        }
+
+        setHistoryLoading(prev => {
+          if (prev[id]?.requestId !== requestId) return prev;
+          const next = { ...prev };
+          delete next[id];
+          return next;
+        });
+        setHistoryMeta(prev => ({
+          ...prev,
+          [id]: {
+            ...(prev[id] || {}),
+            error: 'Transcript history request timed out. Retry to load the latest messages.',
+          },
+        }));
+      }, HISTORY_CHUNK_TIMEOUT_MS);
     }
 
     function messageDedupeKey(msg) {
@@ -264,6 +376,8 @@ export function useRelay() {
         });
         return older.length ? [...older, ...current] : current;
       }
+      const overlapMerged = mergeHistoryTailByOverlap(current, nextIncoming);
+      if (overlapMerged) return overlapMerged;
       const seen = new Set(current.map(messageDedupeKey));
       const merged = [...current];
       let added = 0;
@@ -282,6 +396,8 @@ export function useRelay() {
       const nextIncoming = Array.isArray(incoming) ? incoming : [];
       if (!current.length) return nextIncoming;
       if (!nextIncoming.length) return current;
+      const overlapMerged = mergeHistoryTailByOverlap(current, nextIncoming);
+      if (overlapMerged) return overlapMerged;
       const seen = new Set(current.map(messageDedupeKey));
       const merged = [...current];
       let added = 0;
@@ -297,7 +413,7 @@ export function useRelay() {
 
     function shouldPreserveTranscriptInListView(session) {
       if (!session || typeof session !== 'object') return false;
-      return ['codex', 'codex-desktop', 'cursor', 'codex_cli', 'roo_code', 'cline'].includes(session.agent_type);
+      return ['codex', 'codex-desktop', 'cursor', 'codex_cli', 'cursor_cli', 'roo_code', 'cline'].includes(session.agent_type);
     }
 
     function clearSessionTranscript(sessionId) {
@@ -543,7 +659,9 @@ export function useRelay() {
     }
 
     // Resumes an old session by launching a new agent and replaying history.
-    function resumeSession(sourceSession, agentType, workspacePath) {
+    // For Cursor/Codex/Claude CLI, pass cli_session_id so the proxy resumes the
+    // same native chat instead of creating a brand-new one.
+    function resumeSession(sourceSession, agentType, workspacePath, options = {}) {
       const requestId = `resume-${Date.now()}-${Math.random().toString(36).slice(2, 7)}`;
       setLaunchStates(prev => ({ ...prev, [requestId]: { status: 'launching', agentType } }));
       send({
@@ -551,6 +669,9 @@ export function useRelay() {
         source_session: sourceSession,
         agent_type: agentType || 'claude',
         workspace_path: workspacePath || undefined,
+        cli_session_id: options.cli_session_id || undefined,
+        model_id: options.model_id || undefined,
+        permission_mode: options.permission_mode || undefined,
         request_id: requestId,
       });
       return requestId;
@@ -742,12 +863,7 @@ export function useRelay() {
         }
         const nextMessages = msg.messages || [];
         const priorHistoryMeta = historyMeta[id] || null;
-        const shouldMergeTailSnapshot = !!(
-          msg.partial
-          || msg.mode === 'tail'
-          || priorHistoryMeta?.mode === 'chunked'
-          || priorHistoryMeta?.partial
-        );
+        const shouldMergeTailSnapshot = shouldMergeHistorySnapshot(t, msg, priorHistoryMeta);
         setMessages(prev => {
           const merged = shouldMergeTailSnapshot
             ? mergeHistoryTailSnapshot(prev[id], nextMessages)
@@ -805,6 +921,14 @@ export function useRelay() {
             inFlight: false,
           };
           clearTimeout(historyChunkTimers.current[id]);
+          delete historyChunkTimers.current[id];
+          setHistoryMeta(prev => ({
+            ...prev,
+            [id]: {
+              ...(prev[id] || {}),
+              error: String(msg.error?.message || msg.error || 'Transcript history could not be loaded.'),
+            },
+          }));
           return;
         }
         const mode = msg.mode === 'older' ? 'older' : 'tail';
@@ -831,6 +955,7 @@ export function useRelay() {
             cursor,
             bytes_total: cursor.total_bytes || 0,
           };
+          delete nextMeta.error;
           if (JSON.stringify(prev[id] || null) === JSON.stringify(nextMeta)) return prev;
           return { ...prev, [id]: nextMeta };
         });
@@ -847,6 +972,7 @@ export function useRelay() {
           nextBeforeId,
         };
         clearTimeout(historyChunkTimers.current[id]);
+        delete historyChunkTimers.current[id];
         return;
       }
 
@@ -1128,6 +1254,7 @@ export function useRelay() {
               content: item.text,
               native: true,
               nativeIndex: item.index,
+              status: item.state || 'queued',
             }));
             return { ...prev, [sid]: [...existing, ...native] };
           });

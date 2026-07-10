@@ -148,6 +148,7 @@ function historySnapshot(sessionId, messages) {
     messages,
     // legacy compat
     session: sessionId,
+    history: messages,
   };
 }
 
