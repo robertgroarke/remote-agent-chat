@@ -133,6 +133,9 @@ export function useRelay() {
     const latestHistoryChunkRequest = useRef({});
     const historyChunkTimers = useRef({});
     const historyChunkState = useRef({});
+    const modelChangeGrace = useRef({});
+    const activeCursorThreadIdentity = useRef({});
+    const pendingCursorThreadHistoryReset = useRef({});
 
     const send = useCallback((msg) => {
       if (wsRef.current?.readyState === WebSocket.OPEN) {
@@ -268,6 +271,7 @@ export function useRelay() {
       if (wsRef.current?.readyState !== WebSocket.OPEN) return;
       const mode = options.mode === 'older' ? 'older' : 'tail';
       const source = options.source || 'relay_sqlite';
+      const replace = mode === 'tail' && options.replace !== false;
       const beforeOffset = options.beforeOffset ?? options.before_offset ?? null;
       const beforeId = options.beforeId ?? options.before_id ?? null;
       const requestCursorSig = `${mode}\u0001${source}\u0001${beforeOffset ?? ''}\u0001${beforeId ?? ''}`;
@@ -285,7 +289,7 @@ export function useRelay() {
       const chunkBytes = Math.max(256 * 1024, Math.min(16 * 1024 * 1024, Number(options.chunkBytes || options.chunk_bytes || CODEX_CLI_HISTORY_CHUNK_BYTES) || CODEX_CLI_HISTORY_CHUNK_BYTES));
       if (mode === 'tail') {
         clearTimeout(historyChunkTimers.current[id]);
-        historyChunkState.current[id] = { source, chunkBytes, limit: options.limit || null, inFlight: true, mode, lastRequestSig: requestCursorSig, lastRequestAt: nowMs };
+        historyChunkState.current[id] = { source, chunkBytes, limit: options.limit || null, inFlight: true, mode, replace, lastRequestSig: requestCursorSig, lastRequestAt: nowMs };
       } else {
         historyChunkState.current[id] = { ...(historyChunkState.current[id] || {}), source, chunkBytes, limit: options.limit || historyChunkState.current[id]?.limit || null, inFlight: true, mode, lastRequestSig: requestCursorSig, lastRequestAt: nowMs };
       }
@@ -307,6 +311,7 @@ export function useRelay() {
         request_id: requestId,
         mode,
         source,
+        replace,
         chunk_bytes: chunkBytes,
       };
       const limit = Number(options.limit || options.tailLimit || 0);
@@ -460,14 +465,11 @@ export function useRelay() {
       send({ type: 'agent_config_request', session_id: sessionId, request_id: requestId });
     }
 
-    // Track sessions with in-flight model changes to suppress stale config updates
-    const modelChangeGrace = {};
-
     function setAgentModel(sessionId, modelId) {
       const requestId = `model-${Date.now()}-${Math.random().toString(36).slice(2, 7)}`;
       send({ type: 'agent_set_model', session_id: sessionId, model_id: modelId, request_id: requestId });
       // Suppress config overwrites for 10s while the model change propagates
-      modelChangeGrace[sessionId] = Date.now() + 10000;
+      modelChangeGrace.current[sessionId] = Date.now() + 10000;
       // Optimistically update the config
       setAgentConfigs(prev => {
         const existing = prev[sessionId] || {};
@@ -567,6 +569,12 @@ export function useRelay() {
     function requestTerminalOutput(sessionId) {
       const requestId = `term-${Date.now()}-${Math.random().toString(36).slice(2, 7)}`;
       send({ type: 'terminal_output', session_id: sessionId, request_id: requestId });
+      return requestId;
+    }
+
+    function sendTerminalInput(sessionId, text) {
+      const requestId = `termin-${Date.now()}-${Math.random().toString(36).slice(2, 7)}`;
+      send({ type: 'terminal_input', session_id: sessionId, request_id: requestId, text });
       return requestId;
     }
 
@@ -863,7 +871,10 @@ export function useRelay() {
         }
         const nextMessages = msg.messages || [];
         const priorHistoryMeta = historyMeta[id] || null;
-        const shouldMergeTailSnapshot = shouldMergeHistorySnapshot(t, msg, priorHistoryMeta);
+        const forceCursorIdentityReplace = !!pendingCursorThreadHistoryReset.current[id]
+          && nextMessages.length > 0;
+        const shouldMergeTailSnapshot = !forceCursorIdentityReplace
+          && shouldMergeHistorySnapshot(t, msg, priorHistoryMeta);
         setMessages(prev => {
           const merged = shouldMergeTailSnapshot
             ? mergeHistoryTailSnapshot(prev[id], nextMessages)
@@ -895,6 +906,7 @@ export function useRelay() {
           delete next[id];
           return next;
         });
+        if (forceCursorIdentityReplace) delete pendingCursorThreadHistoryReset.current[id];
         return;
       }
 
@@ -902,10 +914,17 @@ export function useRelay() {
       if (t === 'history_chunk') {
         const id = msg.session || msg.session_id;
         if (!id) return;
+        const currentChunkState = historyChunkState.current[id] || {};
+        const isCompatibleTailResponse = (
+          msg.mode !== 'older'
+          && currentChunkState.mode === 'tail'
+          && (msg.source || 'relay_sqlite') === (currentChunkState.source || 'relay_sqlite')
+        );
         if (
           msg.request_id
           && latestHistoryChunkRequest.current[id]
           && latestHistoryChunkRequest.current[id] !== msg.request_id
+          && !isCompatibleTailResponse
         ) {
           return;
         }
@@ -936,10 +955,12 @@ export function useRelay() {
         const nextBeforeOffset = cursor.next_before_offset ?? null;
         const nextBeforeId = cursor.next_before_id ?? null;
         const hasMore = !!(msg.partial && (nextBeforeOffset != null || nextBeforeId != null));
-        const estimatedMessages = mergeHistoryChunk(messages[id], msg.messages || [], mode);
+        const incoming = Array.isArray(msg.messages) ? msg.messages : [];
+        const replaceTail = mode === 'tail' && msg.replace === true;
+        const estimatedMessages = replaceTail ? incoming : mergeHistoryChunk(messages[id], incoming, mode);
         const estimatedLength = estimatedMessages.length;
         setMessages(prev => {
-          const merged = mergeHistoryChunk(prev[id], msg.messages || [], mode);
+          const merged = replaceTail ? incoming : mergeHistoryChunk(prev[id], incoming, mode);
           if (merged === prev[id]) return prev;
           return { ...prev, [id]: merged };
         });
@@ -947,7 +968,9 @@ export function useRelay() {
           const nextMeta = {
             ...(prev[id] || {}),
             partial: hasMore,
-            loaded: Math.max(Number(prev[id]?.loaded || 0), Number(msg.loaded_messages || 0), estimatedLength),
+            loaded: replaceTail
+              ? (Number(msg.loaded_messages ?? estimatedLength) || estimatedLength)
+              : Math.max(Number(prev[id]?.loaded || 0), Number(msg.loaded_messages || 0), estimatedLength),
             total: Number(msg.total_messages || prev[id]?.total || estimatedLength) || estimatedLength,
             limit: null,
             mode: 'chunked',
@@ -1070,7 +1093,18 @@ export function useRelay() {
       // ── Thread list (Epic 2) ──────────────────────────────────────────────
       if (t === 'thread_list') {
         const sid = msg.session_id || msg.session;
-        if (sid) setThreadLists(prev => ({ ...prev, [sid]: msg.threads || [] }));
+        if (sid) {
+          const threads = msg.threads || [];
+          const activeThread = threads.find(thread => thread?.active);
+          const cursorIdentity = String(activeThread?.cache_key || '');
+          const previousIdentity = activeCursorThreadIdentity.current[sid] || '';
+          if (cursorIdentity && previousIdentity && cursorIdentity !== previousIdentity) {
+            pendingCursorThreadHistoryReset.current[sid] = cursorIdentity;
+            clearSessionTranscript(sid);
+          }
+          if (cursorIdentity) activeCursorThreadIdentity.current[sid] = cursorIdentity;
+          setThreadLists(prev => ({ ...prev, [sid]: threads }));
+        }
         return;
       }
 
@@ -1120,16 +1154,31 @@ export function useRelay() {
         const sid = msg.session_id || msg.session;
         if (!sid) return;
         // Don't overwrite optimistic model change during grace period
-        if (modelChangeGrace[sid] && Date.now() < modelChangeGrace[sid]) {
+        if (modelChangeGrace.current[sid] && Date.now() < modelChangeGrace.current[sid]) {
           // Merge but keep the optimistic model_id
           setAgentConfigs(prev => {
             const existing = prev[sid] || {};
-            return { ...prev, [sid]: { ...msg, model_id: existing.model_id || msg.model_id } };
+            const next = { ...existing, ...msg, model_id: existing.model_id || msg.model_id };
+            if ((!Array.isArray(msg.available_models) || msg.available_models.length === 0)
+                && Array.isArray(existing.available_models)
+                && existing.available_models.length > 0) {
+              next.available_models = existing.available_models;
+            }
+            return { ...prev, [sid]: next };
           });
           return;
         }
-        delete modelChangeGrace[sid];
-        setAgentConfigs(prev => ({ ...prev, [sid]: msg }));
+        delete modelChangeGrace.current[sid];
+        setAgentConfigs(prev => {
+          const existing = prev[sid] || {};
+          const next = { ...existing, ...msg };
+          if ((!Array.isArray(msg.available_models) || msg.available_models.length === 0)
+              && Array.isArray(existing.available_models)
+              && existing.available_models.length > 0) {
+            next.available_models = existing.available_models;
+          }
+          return { ...prev, [sid]: next };
+        });
         return;
       }
 
@@ -1138,12 +1187,11 @@ export function useRelay() {
         if (msg.request_id) {
           setControlResults(prev => ({ ...prev, [msg.request_id]: { ...msg, received_at: Date.now() } }));
         }
-        if (sid && msg.result === 'ok' && (msg.command === 'new_thread' || msg.command === 'switch_thread')) {
+        if (sid && msg.result === 'ok' && msg.command === 'new_thread') {
+          // The proxy emits an authoritative history snapshot as part of a
+          // successful same-session thread creation. Do not start a later
+          // empty-store fetch that can leave the new draft stuck loading.
           clearSessionTranscript(sid);
-          const tailOptions = { limit: DEFAULT_HISTORY_TAIL_LIMIT };
-          requestHistory(sid, tailOptions);
-          setTimeout(() => requestHistory(sid, tailOptions), 300);
-          setTimeout(() => requestHistory(sid, tailOptions), 900);
         }
         if (msg.command === 'permission_response' && sid) {
           if (msg.result === 'ok') {
@@ -1380,7 +1428,7 @@ export function useRelay() {
     // where `sessions` / `messages` would be frozen at initial render values).
     handleRelayMessageRef.current = handleRelayMessage;
 
-    return { sessions, messages, historyMeta, historyLoading, connected, unread, setUnread, thinking, thinkingContent, activities, health, deliveryStates, launchStates, justLaunched, setJustLaunched, permissionPrompts, respondToPrompt, errorPrompts, respondToErrorPrompt, interruptSession, agentConfigs, requestAgentConfig, setAgentModel, setAgentEffort, setAgentPermissionMode, setAutoApprovePermissions, setAntigravityMode, setCodexConfig, newThread, openPanel, openNativeWindow, requestChatList, switchChat, newChat, chatLists, requestThreadList, switchThread, threadLists, switchWorkspace, requestTerminalOutput, terminalOutputs, requestFileChanges, respondToFileChange, fileChanges, sendAttachment, send, sendToSession, steerMessage, discardQueuedMessage, editQueuedMessage, queuedMessages, launchSession, resumeSession, closeSession, activeSessionRef, workspaces, branchLists, requestBranchList, switchBranch, createBranch, skillLists, requestSkillList, automationViews, showCodexAutomation, controlResults, directoryListings, requestDirectoryListing, fileContents, requestFileContent, requestHistory, requestHistoryChunk };
+    return { sessions, messages, historyMeta, historyLoading, connected, unread, setUnread, thinking, thinkingContent, activities, health, deliveryStates, launchStates, justLaunched, setJustLaunched, permissionPrompts, respondToPrompt, errorPrompts, respondToErrorPrompt, interruptSession, agentConfigs, requestAgentConfig, setAgentModel, setAgentEffort, setAgentPermissionMode, setAutoApprovePermissions, setAntigravityMode, setCodexConfig, newThread, openPanel, openNativeWindow, requestChatList, switchChat, newChat, chatLists, requestThreadList, switchThread, threadLists, switchWorkspace, requestTerminalOutput, sendTerminalInput, terminalOutputs, requestFileChanges, respondToFileChange, fileChanges, sendAttachment, send, sendToSession, steerMessage, discardQueuedMessage, editQueuedMessage, queuedMessages, launchSession, resumeSession, closeSession, activeSessionRef, workspaces, branchLists, requestBranchList, switchBranch, createBranch, skillLists, requestSkillList, automationViews, showCodexAutomation, controlResults, directoryListings, requestDirectoryListing, fileContents, requestFileContent, requestHistory, requestHistoryChunk };
   }
 
 // (removed window.useRelay — now an ES module export)

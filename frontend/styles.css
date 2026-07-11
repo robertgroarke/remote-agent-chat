@@ -2141,19 +2141,32 @@ details.content-block {
 }
 
 .activity-goal {
-  display: inline-flex;
+  display: flex;
+  flex-wrap: wrap;
   align-items: center;
   gap: 5px;
   min-width: 0;
+  max-width: 100%;
   color: #b15cff;
   font-family: 'Cascadia Code', 'SF Mono', Consolas, monospace;
   font-size: 11px;
   line-height: 1.35;
+}
+
+.activity-goal-label,
+.activity-goal-time {
   white-space: nowrap;
 }
 
 .activity-goal-time {
   color: #c98aff;
+}
+
+.activity-goal-objective {
+  flex-basis: 100%;
+  color: #d9b8ff;
+  white-space: normal;
+  overflow-wrap: anywhere;
 }
 
 .activity-command {
@@ -4735,6 +4748,51 @@ select.new-session-workspace option { background: var(--bg2); color: var(--text)
   overflow-y: auto;
   line-height: 1.5;
 }
+.terminal-input-form {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 8px;
+  padding: 10px 12px;
+  border-top: 1px solid var(--border);
+  background: var(--bg2);
+}
+.terminal-input {
+  flex: 1 1 240px;
+  min-width: 0;
+  padding: 7px 9px;
+  border: 1px solid var(--border);
+  border-radius: 5px;
+  background: var(--bg);
+  color: var(--text);
+  font-family: 'SF Mono', 'Consolas', 'Monaco', monospace;
+  font-size: 12px;
+}
+.terminal-input:focus {
+  border-color: #58a6ff;
+  outline: none;
+}
+.terminal-input-send {
+  padding: 7px 12px;
+  border: 1px solid #58a6ff;
+  border-radius: 5px;
+  background: #58a6ff;
+  color: #0d1117;
+  cursor: pointer;
+  font-size: 12px;
+  font-weight: 600;
+}
+.terminal-input-send:disabled {
+  cursor: default;
+  opacity: 0.45;
+}
+.terminal-input-status {
+  flex-basis: 100%;
+  color: var(--text2);
+  font-size: 11px;
+}
+.terminal-input-status.ok { color: var(--success); }
+.terminal-input-status.failed { color: var(--error); }
 .terminal-toggle.active {
   background: #58a6ff !important;
   color: var(--bg) !important;

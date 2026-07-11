@@ -3,6 +3,7 @@
 
 const CDP = require('../agent-proxy/node_modules/chrome-remote-interface');
 const selectors = require('../agent-proxy/selectors');
+const { withCodexDesktopCdpLock } = require('../agent-proxy/codex-desktop-cdp-lock');
 
 const PORT = 9225;
 const FIXTURE_ID = 'remote-agent-chat-codex-notice-fixture';
@@ -45,7 +46,7 @@ async function main() {
       host.id = ${JSON.stringify(FIXTURE_ID)};
       host.style.cssText = 'position:fixed;left:420px;top:' + Math.max(20, composerTop - 150) + 'px;width:660px;z-index:2147483647;background:white;color:black;padding:8px;';
       host.innerHTML = [
-        '<div data-fixture="goal"><span>Pursuing goal</span><span>Restore Codex notice fidelity</span><span>8m 41s</span></div>',
+        '<div data-fixture="goal"><span>Pursuing goal</span><span>Restore Codex notice fidelity&#10;&#10;This deliberately long original prompt must not be forwarded as part of the compact goal objective.</span><span>8m 41s</span></div>',
         '<div class="overflow-visible" data-testid="queued-message"><span class="text-size-chat">' + ${JSON.stringify('A deliberately long queued Codex message that must remain fully visible in the remote web UI without an ellipsis or an eighty character cutoff.')} + '</span><button type="button">Steer</button><button type="button" aria-label="Delete queued message">x</button></div>',
         '<div role="status" aria-live="polite">',
         '<div>Our systems are thinking a bit more about this request before responding</div>',
@@ -94,7 +95,7 @@ async function main() {
   }
 }
 
-main().catch(error => {
+withCodexDesktopCdpLock('codex-desktop-notice', main, { waitMs: 90000 }).catch(error => {
   console.error(`FAIL ${error.message}`);
   if (error.detail !== undefined) console.error(JSON.stringify(error.detail, null, 2));
   process.exit(1);

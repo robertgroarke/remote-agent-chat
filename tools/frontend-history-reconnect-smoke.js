@@ -2,6 +2,7 @@
 'use strict';
 
 const assert = require('assert');
+const fs = require('fs');
 const path = require('path');
 const vm = require('vm');
 const esbuild = require('../frontend/node_modules/esbuild');
@@ -185,10 +186,13 @@ secondSocket.open();
 relay.requestHistoryChunk('reconnect-session', { source: 'native' });
 assert.equal(secondSocket.sent.length, 1, 'reconnected socket should be allowed to request history again');
 const reconnectRequest = secondSocket.sent[0];
+assert.equal(reconnectRequest.replace, true, 'tail history requests should replace stale browser state by default');
 secondSocket.receive({
   type: 'history_chunk',
   session_id: 'reconnect-session',
   request_id: reconnectRequest.request_id,
+  mode: 'tail',
+  replace: reconnectRequest.replace,
   source: 'codex_cli_jsonl',
   messages: [{ role: 'assistant', content: 'restored' }],
   loaded_messages: 1,
@@ -199,6 +203,57 @@ secondSocket.receive({
 assert.equal(states[1]['reconnect-session'][0].content, 'restored');
 assert.equal(states[3]['reconnect-session'], undefined, 'successful history should clear loading state');
 
+states[1]['replace-session'] = [
+  { role: 'user', content: 'stale duplicated turn' },
+  { role: 'assistant', content: 'stale duplicated reply' },
+];
+relay.requestHistoryChunk('replace-session', { source: 'relay_sqlite' });
+const replaceRequest = secondSocket.sent.find(message => message.session_id === 'replace-session');
+assert.equal(replaceRequest.replace, true, 'relay SQLite tail request should request authoritative replacement');
+secondSocket.receive({
+  type: 'history_chunk',
+  session_id: 'replace-session',
+  request_id: replaceRequest.request_id,
+  mode: 'tail',
+  replace: true,
+  source: 'relay_sqlite',
+  messages: [{ role: 'assistant', content: 'authoritative tail only' }],
+  loaded_messages: 1,
+  total_messages: 1,
+  partial: false,
+  cursor: {},
+});
+assert.deepEqual(
+  states[1]['replace-session'].map(message => message.content),
+  ['authoritative tail only'],
+  'authoritative tail should remove a stale duplicated browser prefix instead of merging it',
+);
+
+relay.requestHistoryChunk('stale-tail-session', { source: 'relay_sqlite' });
+const staleTailRequests = () => secondSocket.sent.filter(message => message.session_id === 'stale-tail-session');
+const firstStaleTailRequest = staleTailRequests()[0];
+runTimer(15000);
+assert.equal(staleTailRequests().length, 2, 'tail timeout should advance to one retry request');
+secondSocket.receive({
+  type: 'history_chunk',
+  session_id: 'stale-tail-session',
+  request_id: firstStaleTailRequest.request_id,
+  mode: 'tail',
+  replace: true,
+  source: 'relay_sqlite',
+  messages: [{ role: 'assistant', content: 'compatible earlier tail' }],
+  loaded_messages: 1,
+  total_messages: 1,
+  partial: false,
+  cursor: {},
+});
+assert.equal(
+  states[1]['stale-tail-session'][0].content,
+  'compatible earlier tail',
+  'a compatible authoritative tail must not be discarded after the retry ID advances',
+);
+assert.equal(states[3]['stale-tail-session'], undefined, 'compatible tail should clear retry loading state');
+
 relay.requestHistoryChunk('timeout-session', { source: 'native' });
 assert.equal(secondSocket.sent.filter(message => message.session_id === 'timeout-session').length, 1);
 runTimer(15000);
@@ -206,5 +261,17 @@ assert.equal(secondSocket.sent.filter(message => message.session_id === 'timeout
 runTimer(15000);
 assert.equal(states[3]['timeout-session'], undefined, 'final timeout should clear loading state');
 assert.match(states[2]['timeout-session'].error, /timed out/i, 'final timeout should expose an actionable error');
+
+const appSource = fs.readFileSync(path.join(__dirname, '..', 'frontend', 'app.jsx'), 'utf8');
+assert.match(
+  appSource,
+  /const CODEX_CLI_INITIAL_HISTORY_CHUNK_BYTES = 256 \* 1024;/,
+  'native CLI initial history must remain bounded so another selected session is not starved by initial rendering',
+);
+assert.match(
+  appSource,
+  /\? \{ chunkBytes: CODEX_CLI_INITIAL_HISTORY_CHUNK_BYTES \}/,
+  'Codex/Cursor CLI initial history requests must carry the bounded chunk size',
+);
 
 console.log('frontend history reconnect smoke: PASS');

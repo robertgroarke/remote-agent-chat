@@ -12,6 +12,11 @@ const crypto     = require('crypto');
 const jwt        = require('jsonwebtoken');
 const Database   = require('better-sqlite3');
 const admin      = require('firebase-admin');
+const {
+  UNSOLICITED_HISTORY_TAIL_LIMIT,
+  buildUnsolicitedHistoryPayload,
+  canBroadcastHistoryToBrowser,
+} = require('./history-broadcast-policy');
 
 // ── Config ────────────────────────────────────────────────────────────────────
 
@@ -42,7 +47,6 @@ const HEARTBEAT_INTERVAL_MS   = 30_000;
 const HEARTBEAT_TIMEOUT_MS    = 10_000;
 const HEALTH_DEGRADE_AFTER_MS = 120_000;  // inactivity threshold → degraded
 const LAUNCH_TIMEOUT_MS       = 30_000;   // max wait for proxy to confirm a new session
-const LARGE_HISTORY_BROADCAST_LIMIT = 250;
 const DEFAULT_HISTORY_CHUNK_LIMIT = 120;
 const MAX_HISTORY_CHUNK_LIMIT = 500;
 const NATIVE_HISTORY_TAIL_MIN_INTERVAL_MS = 1_500;
@@ -1036,6 +1040,10 @@ const pendingErrorPrompts = new Map();
 const agentConfigs    = new Map();
 // In-flight control request routing: request_id → browser WebSocket
 const pendingCtrlReqs = new Map();
+// Payload-backed controls emit both a payload and an agent_control_result. Track
+// both halves so either arrival order reaches the initiating browser before the
+// routing entry is released.
+const pendingPayloadCtrlState = new Map();
 const pendingPromptResponses = new Map();
 const pendingErrorPromptResponses = new Map();
 const nativeHistoryChunkRequests = new Map();
@@ -1045,8 +1053,13 @@ const statusBroadcastState = new Map();
 
 function broadcastToBrowsers(msg) {
   const data = JSON.stringify(msg);
+  const isHistoryBroadcast = msg?.type === 'history' || msg?.type === 'history_snapshot';
   for (const ws of browserClients) {
-    if (ws.readyState === WebSocket.OPEN) ws.send(data);
+    if (ws.readyState !== WebSocket.OPEN) continue;
+    // Unsolicited history is expendable live-tail state. Do not queue it in
+    // front of explicit history/control responses for the selected session.
+    if (isHistoryBroadcast && !canBroadcastHistoryToBrowser(ws)) continue;
+    ws.send(data);
   }
 }
 
@@ -2131,11 +2144,20 @@ function handleProxyConnection(ws, req) {
     } else if (t === 'directory_listing') {
       const requestId = msg.request_id;
       const targetWs  = requestId ? pendingCtrlReqs.get(requestId) : null;
-      if (requestId) pendingCtrlReqs.delete(requestId);
       if (targetWs && targetWs.readyState === WebSocket.OPEN) {
         targetWs.send(JSON.stringify(msg));
       } else {
         broadcastToBrowsers(msg);
+      }
+      const controlState = requestId ? pendingPayloadCtrlState.get(requestId) : null;
+      if (controlState) {
+        controlState.payloadSeen = true;
+        if (controlState.ackSeen) {
+          pendingPayloadCtrlState.delete(requestId);
+          pendingCtrlReqs.delete(requestId);
+        }
+      } else if (requestId) {
+        pendingCtrlReqs.delete(requestId);
       }
       log('info', 'ctrl', 'Directory listing received', { session: msg.session_id, path: msg.path, count: (msg.entries || []).length });
 
@@ -2143,11 +2165,20 @@ function handleProxyConnection(ws, req) {
     } else if (t === 'file_content') {
       const requestId = msg.request_id;
       const targetWs  = requestId ? pendingCtrlReqs.get(requestId) : null;
-      if (requestId) pendingCtrlReqs.delete(requestId);
       if (targetWs && targetWs.readyState === WebSocket.OPEN) {
         targetWs.send(JSON.stringify(msg));
       } else {
         broadcastToBrowsers(msg);
+      }
+      const controlState = requestId ? pendingPayloadCtrlState.get(requestId) : null;
+      if (controlState) {
+        controlState.payloadSeen = true;
+        if (controlState.ackSeen) {
+          pendingPayloadCtrlState.delete(requestId);
+          pendingCtrlReqs.delete(requestId);
+        }
+      } else if (requestId) {
+        pendingCtrlReqs.delete(requestId);
       }
       log('info', 'ctrl', 'File content received', { session: msg.session_id, path: msg.path, truncated: msg.truncated });
 
@@ -2155,12 +2186,17 @@ function handleProxyConnection(ws, req) {
     } else if (t === 'agent_control_result') {
       const requestId = msg.request_id;
       const targetWs  = requestId ? pendingCtrlReqs.get(requestId) : null;
-      const payloadBackedControl =
-        msg.result === 'ok' &&
-        (msg.command === 'read_file' || msg.command === 'list_directory');
-      // Preserve the request mapping until the actual payload arrives for commands
-      // whose successful control ack is followed by a separate response body.
-      if (requestId && !payloadBackedControl) pendingCtrlReqs.delete(requestId);
+      const controlState = requestId ? pendingPayloadCtrlState.get(requestId) : null;
+      if (controlState && msg.result === 'ok') {
+        controlState.ackSeen = true;
+        if (controlState.payloadSeen) {
+          pendingPayloadCtrlState.delete(requestId);
+          pendingCtrlReqs.delete(requestId);
+        }
+      } else if (requestId) {
+        pendingPayloadCtrlState.delete(requestId);
+        pendingCtrlReqs.delete(requestId);
+      }
       const promptMeta = requestId ? pendingPromptResponses.get(requestId) : null;
       const errorPromptMeta = requestId ? pendingErrorPromptResponses.get(requestId) : null;
       if (requestId) pendingPromptResponses.delete(requestId);
@@ -2226,7 +2262,7 @@ function handleProxyConnection(ws, req) {
       const messages = msg.messages || [];
       if (!id || !Array.isArray(messages)) return;
 
-      const isLargeHistory = messages.length > LARGE_HISTORY_BROADCAST_LIMIT;
+      const isLargeHistory = messages.length > UNSOLICITED_HISTORY_TAIL_LIMIT;
       let existing = null;
       let existingLength = 0;
       let alreadyMatches = false;
@@ -2253,34 +2289,31 @@ function handleProxyConnection(ws, req) {
         });
         resync(messages);
         log('info', 'history', `Resynced ${existingLength}→${messages.length}`, { session: id });
-        const buildPayload = () => ({ type: 'history', session: id, messages: getHistoryRows(id) });
-        const buildTailPayload = () => {
+        const buildPayload = () => {
           const total = getHistoryCount(id);
-          const tail = getHistoryRowsTail(id, LARGE_HISTORY_BROADCAST_LIMIT);
-          return {
-            type: 'history',
-            session: id,
-            messages: tail,
-            partial: total > tail.length,
-            total_messages: total,
-            loaded_messages: tail.length,
-            limit: LARGE_HISTORY_BROADCAST_LIMIT,
-            mode: 'tail',
-          };
+          const rows = total > UNSOLICITED_HISTORY_TAIL_LIMIT
+            ? getHistoryRowsTail(id, UNSOLICITED_HISTORY_TAIL_LIMIT)
+            : getHistoryRows(id);
+          return buildUnsolicitedHistoryPayload(id, rows, total);
         };
-        if (messages.length <= LARGE_HISTORY_BROADCAST_LIMIT) {
+        if (messages.length === 0) {
+          // Navigation/new-chat clears must land immediately.
           broadcastToBrowsers(buildPayload());
         } else {
-          // Throttle and broadcast only the tail; full history stays available
-          // through explicit history requests.
-          scheduleHistoryBroadcast(id, buildTailPayload);
+          scheduleHistoryBroadcast(id, buildPayload);
         }
       } else if (!isLargeHistory && existing && existing.length === 0 && messages.length > 0) {
         db.transaction((msgs) => {
           msgs.forEach(m => insertMessage(id, m.role, m.content, null, 'delivered', nextSeq(id), m.ts, m.content_blocks));
         })(messages);
         log('info', 'history', `Stored ${messages.length} msgs`, { session: id });
-        broadcastToBrowsers({ type: 'history', session: id, messages: getHistoryRows(id) });
+        scheduleHistoryBroadcast(id, () => {
+          const total = getHistoryCount(id);
+          const rows = total > UNSOLICITED_HISTORY_TAIL_LIMIT
+            ? getHistoryRowsTail(id, UNSOLICITED_HISTORY_TAIL_LIMIT)
+            : getHistoryRows(id);
+          return buildUnsolicitedHistoryPayload(id, rows, total);
+        });
       }
 
     // ── Rate limit events (A12-02, proxy side added in A12-03) ────────────
@@ -2501,6 +2534,7 @@ function handleClientConnection(ws, req) {
           session_id: id,
           request_id: requestId,
           mode: msg.mode === 'older' ? 'older' : 'tail',
+          replace: msg.mode !== 'older' && msg.replace === true,
           source: 'relay_sqlite',
           source_session: result.source_session,
           messages: result.messages,
@@ -3243,7 +3277,12 @@ function handleClientConnection(ws, req) {
         }));
         return;
       }
-      if (requestId) pendingCtrlReqs.set(requestId, ws);
+      if (requestId) {
+        pendingCtrlReqs.set(requestId, ws);
+        if (t === 'list_directory' || t === 'read_file') {
+          pendingPayloadCtrlState.set(requestId, { payloadSeen: false, ackSeen: false });
+        }
+      }
       proxyWs.send(JSON.stringify({
         type:             t,
         protocol_version: PROTOCOL_VERSION,
@@ -3343,7 +3382,10 @@ function handleClientConnection(ws, req) {
     browserClients.delete(ws);
     // Clean up pending control requests that targeted this browser
     for (const [reqId, targetWs] of pendingCtrlReqs) {
-      if (targetWs === ws) pendingCtrlReqs.delete(reqId);
+      if (targetWs === ws) {
+        pendingCtrlReqs.delete(reqId);
+        pendingPayloadCtrlState.delete(reqId);
+      }
     }
   });
 }

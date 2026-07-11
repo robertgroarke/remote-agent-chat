@@ -6,10 +6,21 @@ const path = require('path');
 
 const root = path.join(__dirname, '..');
 const scripts = [
+  'cursor-accumulator-smoke.js',
+  'cursor-restart-identity-smoke.js',
+  'cursor-agent-identity-smoke.js',
+  'cursor-capability-contract-smoke.js',
+  'frontend-terminal-input-smoke.js',
+  'frontend-model-control-smoke.js',
+  'frontend-cursor-new-chat-smoke.js',
+  'cursor-capabilities-check.js',
   'cursor-phase2-smoke.js',
   'cursor-web-e2e.js',
-  'cursor-filechange-e2e.js',
+  'cursor-terminal-input-e2e.js',
+  'cursor-file-browser-e2e.js',
   'cursor-agent-switch-e2e.js',
+  'cursor-new-chat-e2e.js',
+  'cursor-model-e2e.js',
   'cursor-permission-e2e.js',
   'cursor-auto-approve-e2e.js',
 ];
@@ -25,7 +36,7 @@ function runScript(script, attempts = 2) {
     if (r.status === 0) return { ok: true, script };
     if (i < attempts - 1) {
       console.log('RETRY', script, `(exit ${r.status})`);
-      spawnSync('python', ['proxy_restart_lock.py', '--agent', 'cursor-validate-retry'], {
+      spawnSync('python', ['proxy_restart_lock.py', '--agent', 'harness-restoration'], {
         cwd: root,
         encoding: 'utf8',
         timeout: 120000,

@@ -1,6 +1,7 @@
 #!/usr/bin/env node
 'use strict';
 const path = require('path');
+const assert = require('assert');
 const WebSocket = require(path.join(__dirname, '..', 'relay-server', 'node_modules', 'ws'));
 const guard = require(path.join(__dirname, '..', 'agent-proxy', 'cursor-probe-guard'));
 const fidelity = require('./run-fidelity-regression');
@@ -39,10 +40,10 @@ function deriveRelayWsUrl() {
   const cursor = sessions.filter((s) => s.agent_type === 'cursor');
   console.log(`cursor sessions: ${cursor.length}`);
   if (!cursor.length) {
-    console.log('no cursor sessions on relay');
     ws.close();
-    return;
+    throw new Error('no cursor sessions on relay');
   }
+  let throwawayChecked = false;
   for (const s of cursor) {
     const sid = s.session_id || s;
     const req = `cap-${sid.slice(0, 8)}-${Date.now()}`;
@@ -59,10 +60,29 @@ function deriveRelayWsUrl() {
       if (cfg?.capabilities) break;
       await new Promise((r) => setTimeout(r, 400));
     }
+    const trueCapabilities = Object.keys(cfg?.capabilities || {}).filter(key => cfg.capabilities[key] === true).sort();
     console.log(sid.slice(0, 8), s.workspace_name || s.display_name, {
       toggle: cfg?.capabilities?.auto_approve_permissions_toggle,
       enabled: cfg?.auto_approve_permissions,
+      trueCapabilities,
     });
+    if (guard.isThrowawaySession(s)) {
+      const expectedTrue = [
+        'auto_approve_permissions_toggle', 'chat_list', 'file_browser',
+        'interrupt', 'new_chat', 'new_thread', 'permission_dialogs', 'set_model',
+        'switch_chat', 'switch_thread', 'terminal_input', 'thread_list',
+      ].sort();
+      assert.deepEqual(trueCapabilities, expectedTrue, 'throwaway Cursor capability surface drifted');
+      assert.equal(cfg.capabilities.native_window, false, 'Cursor IDE must not advertise native_window');
+      assert.equal(cfg.capabilities.file_changes, false,
+        'Cursor 3.5 Review/Commit must not advertise removed Keep/Undo controls');
+      assert.equal(cfg.capabilities.branch_list, false, 'non-Git throwaway must not advertise branch_list');
+      assert.equal(cfg.capabilities.switch_branch, false, 'non-Git throwaway must not advertise switch_branch');
+      assert.equal(cfg.capabilities.create_branch, false, 'non-Git throwaway must not advertise create_branch');
+      throwawayChecked = true;
+    }
   }
+  assert.equal(throwawayChecked, true, 'cursor-test throwaway session was not checked');
+  console.log('PASS live cursor-test capability contract');
   ws.close();
 })().catch((e) => { console.error(e); process.exit(1); });

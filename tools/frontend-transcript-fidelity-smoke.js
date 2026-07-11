@@ -28,7 +28,7 @@ assert.match(app, /<details[\s\S]*?open=\{open\}[\s\S]*?onToggle=/);
 assert((app.match(/<TranscriptDisclosure\b/g) || []).length >= 4,
   'thinking, tool, terminal, and file-change blocks must use expanded disclosures');
 
-const messagesIndex = app.indexOf('<div className="messages" ref={messagesListRef}>');
+const messagesIndex = app.indexOf('<div className="messages"');
 const footerIndex = app.indexOf('className="transcript-live-footer"');
 const inputIndex = app.indexOf('<div className="input-area"');
 assert(messagesIndex >= 0 && footerIndex > messagesIndex && inputIndex > footerIndex,
@@ -37,6 +37,8 @@ assert.match(app, /const defaultCollapsed = false;/,
   'task lists must not auto-collapse based on length');
 assert.match(app, /inline-error-prompt-title/,
   'inline Codex notices must render their native title');
+assert.match(app, /activity-goal-objective[^\n]*\{goal\.objective\}/,
+  'goal status rows must render the native objective as visible text');
 assert(!app.includes("qm.content.substring(0, 77)"),
   'queued Codex content must not be truncated at 80 characters');
 assert.match(app, /function formatGoalElapsed\(goal, nowMs, activity\)[\s\S]*?const liveAnchor = Math\.max\([\s\S]*?activityIsLive/,
@@ -72,6 +74,9 @@ assert(subagentRule && !/line-clamp|text-overflow:\s*ellipsis/.test(subagentRule
 const queuedItemRule = styles.match(/\.queued-item-text\s*\{([\s\S]*?)\}/)?.[1] || '';
 assert(queuedItemRule && /white-space:\s*pre-wrap/.test(queuedItemRule) && !/text-overflow:\s*ellipsis/.test(queuedItemRule),
   'queued Codex content must wrap in full without ellipsis');
+const goalObjectiveRule = styles.match(/\.activity-goal-objective\s*\{([\s\S]*?)\}/)?.[1] || '';
+assert(goalObjectiveRule && /white-space:\s*normal/.test(goalObjectiveRule) && /overflow-wrap:\s*anywhere/.test(goalObjectiveRule),
+  'goal objectives must remain fully visible at narrow viewport widths');
 
 assert(bundle.includes('transcript-live-footer'), 'compiled bundle is missing the live footer');
 assert(!bundle.includes('Rendering latest'), 'compiled bundle still contains transcript auto-windowing');

@@ -4,6 +4,7 @@
 const fs = require('fs');
 const path = require('path');
 const selectors = require('../agent-proxy/selectors');
+const { withCodexDesktopCdpLock } = require('../agent-proxy/codex-desktop-cdp-lock');
 
 function requireCdp() {
   try {
@@ -118,17 +119,25 @@ function findSuspiciousCodexToolBlocks(messages) {
   return suspects;
 }
 
-async function readCodexDesktopVisualUnitStats(Runtime) {
+async function readCodexDesktopVisualUnitStats(Runtime, maxRecentUnits = 0) {
   try {
     const result = await Runtime.evaluate({
       expression: `(() => {
-        const units = Array.from(document.querySelectorAll('[data-content-search-unit-key]'));
-        const turns = new Set();
-        for (const unit of units) {
-          const turn = unit.closest('[data-testid*="conversation-turn"], [data-turn-id], [class*="turn"], article, section') || unit.parentElement;
-          if (turn) turns.add(turn);
+        const allUnits = Array.from(document.querySelectorAll('[data-content-search-unit-key]'));
+        const allTurnIds = [];
+        for (const unit of allUnits) {
+          const turnId = String(unit.getAttribute('data-content-search-unit-key') || '').split(':')[0];
+          if (turnId && !allTurnIds.includes(turnId)) allTurnIds.push(turnId);
         }
-        return { units: units.length, turns: turns.size };
+        const limit = ${Math.max(0, Number(maxRecentUnits) || 0)};
+        const selectedUnits = limit ? allUnits.slice(-limit) : allUnits;
+        const selectedIds = new Set(selectedUnits.map(unit => String(unit.getAttribute('data-content-search-unit-key') || '').split(':')[0]));
+        return {
+          units: selectedUnits.length,
+          turns: selectedIds.size,
+          total_units: allUnits.length,
+          total_turns: allTurnIds.length,
+        };
       })()`,
       returnByValue: true,
     });
@@ -342,7 +351,16 @@ async function runCodexDesktopSuite(targets, reporter) {
       investigation_hint: 'Check readAgentConfig for codex-desktop in selectors.js',
     });
 
-    const messagesRaw = await selectors.readMessages(Runtime, 'codex-desktop', 'smoke-codex-desktop');
+    const recentTurnLimit = 24;
+    const recentUnitLimit = 96;
+    const messageReadStartedAt = Date.now();
+    const messagesRaw = await selectors.readMessages(
+      Runtime,
+      'codex-desktop',
+      'smoke-codex-desktop',
+      { maxRecentTurns: recentTurnLimit, maxRecentUnits: recentUnitLimit },
+    );
+    const messageReadMs = Date.now() - messageReadStartedAt;
     const messages = parseMaybeJson(messagesRaw, []);
     reporter.add({
       surface,
@@ -355,7 +373,17 @@ async function runCodexDesktopSuite(targets, reporter) {
       investigation_hint: 'Check readCodexMessages in selectors.js',
     });
 
-    const visualUnitStats = await readCodexDesktopVisualUnitStats(Runtime);
+    reporter.add({
+      surface,
+      test_id: 'codex-desktop.messages.bounded-read',
+      status: messageReadMs < 6000 ? STATUS_PASS : STATUS_FAIL,
+      detail: `Read recent ${recentTurnLimit}-turn/${recentUnitLimit}-unit window in ${messageReadMs}ms`,
+      actual: messageReadMs,
+      expected: '<6000ms during active large-history sessions',
+      investigation_hint: 'Keep recurring Codex Desktop reads bounded to a recent native turn window',
+    });
+
+    const visualUnitStats = await readCodexDesktopVisualUnitStats(Runtime, recentUnitLimit);
     const visualUnitCount = Number(visualUnitStats.units || 0);
     const messageCount = Array.isArray(messages) ? messages.length : 0;
     const segmentationOk = visualUnitCount < 40 || messageCount >= Math.max(20, Math.floor(visualUnitCount * 0.5));
@@ -403,7 +431,7 @@ async function runCodexDesktopSuite(targets, reporter) {
       investigation_hint: 'Check readCodexThreadList in selectors.js',
     });
 
-    const terminal = await selectors.readCodexTerminalOutput(Runtime, true);
+    const terminal = selectors.codexTerminalEntriesFromMessages(messages);
     reporter.add({
       surface,
       test_id: 'codex-desktop.terminal.read',
@@ -413,7 +441,7 @@ async function runCodexDesktopSuite(targets, reporter) {
       investigation_hint: 'Check readCodexTerminalOutput in selectors.js',
     });
 
-    const changes = await selectors.readCodexFileChanges(Runtime, true);
+    const changes = selectors.codexFileChangeEntriesFromMessages(messages);
     reporter.add({
       surface,
       test_id: 'codex-desktop.changes.read',
@@ -900,7 +928,10 @@ async function runSmokeSuite(options = {}) {
 
 async function main(argv = process.argv.slice(2)) {
   const options = parseArgs(argv);
-  const report = await runSmokeSuite(options);
+  const run = () => runSmokeSuite(options);
+  const report = options.surfaces.includes('codex-desktop')
+    ? await withCodexDesktopCdpLock('codex-desktop-cdp-regression', run, { waitMs: 90000 })
+    : await run();
 
   if (options.json) {
     const jsonText = JSON.stringify(report, null, 2);

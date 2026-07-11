@@ -11,6 +11,7 @@ const DRAFT_STORAGE_KEY = 'remote-agent-chat:drafts:v1';
 const DEFAULT_INITIAL_HISTORY_LIMIT = 120;
 const CODEX_INITIAL_HISTORY_LIMIT = 500;
 const CODEX_CLI_INITIAL_HISTORY_LIMIT = 160;
+const CODEX_CLI_INITIAL_HISTORY_CHUNK_BYTES = 256 * 1024;
 const EMPTY_MESSAGES = Object.freeze([]);
 const SLASH_COMMANDS = [
   { command: '/plan', detail: 'Outline the implementation approach and major steps.' },
@@ -1360,8 +1361,9 @@ function ActivityRow({ activity, thinkingText, isClaude, pinned = false, showGoa
       <div className="activity-copy">
         {showGoal && goal && (
           <div className="activity-goal" title={goal.objective || ''}>
-            <span>{goal.label || 'Pursuing goal'}</span>
+            <span className="activity-goal-label">{goal.label || 'Pursuing goal'}</span>
             {goalElapsed && <span className="activity-goal-time">({goalElapsed})</span>}
+            {goal.objective && <span className="activity-goal-objective">{goal.objective}</span>}
           </div>
         )}
         {showStatus && (label || showBlob) && (
@@ -2689,7 +2691,7 @@ function ThreadHistoryPanel({ threads, sessionId, onSwitch, onNew, onClose, newL
         ) : (
           threads.map((thread, i) => (
             <button
-              key={thread.id || i}
+              key={thread.cache_key || thread.id || i}
               className={`chat-list-item${thread.active ? ' active' : ''}`}
               onClick={() => onSwitch(thread.id)}
               title={thread.title}
@@ -2718,7 +2720,7 @@ function ThreadTabsBar({ threads, activeThreadId, onSwitch, onNew, onOpenHistory
           const isActive = activeThreadId ? thread.id === activeThreadId : !!thread.active;
           return (
             <button
-              key={thread.id || i}
+              key={thread.cache_key || thread.id || i}
               className={`thread-tab${isActive ? ' active' : ''}`}
               type="button"
               title={thread.title || 'Untitled'}
@@ -2811,28 +2813,66 @@ function BranchSelectorPanel({ branchData, sessionId, currentBranch, onSwitch, o
 
 // ─── Terminal viewer (Epic 4) ──────────────────────────────────────────────────
 // Collapsible panel showing terminal/command output from Codex sessions.
-function TerminalViewer({ entries, onClose, onRefresh }) {
+function TerminalViewer({ entries, canRead, canInput, onClose, onRefresh, onSend, controlResults }) {
+  const [command, setCommand] = useState('');
+  const [requestId, setRequestId] = useState(null);
+  const controlResult = requestId ? controlResults?.[requestId] : null;
+
+  function submitCommand(event) {
+    event.preventDefault();
+    const text = command.trim();
+    if (!text || !onSend) return;
+    setRequestId(onSend(text));
+    setCommand('');
+  }
+
   return (
     <div className="terminal-viewer">
       <div className="terminal-viewer-header">
-        <span className="terminal-viewer-title">Terminal Output</span>
-        <button className="terminal-viewer-refresh" onClick={onRefresh} title="Refresh">↻</button>
+        <span className="terminal-viewer-title">Terminal</span>
+        {canRead && <button className="terminal-viewer-refresh" onClick={onRefresh} title="Refresh">↻</button>}
         <button className="terminal-viewer-close" onClick={onClose} title="Close">✕</button>
       </div>
-      <div className="terminal-viewer-body">
-        {(!entries || entries.length === 0) ? (
-          <div className="terminal-viewer-empty">No terminal output captured</div>
-        ) : (
-          entries.map((entry, i) => (
-            <div key={i} className="terminal-entry">
-              {entry.command && (
-                <div className="terminal-command">$ {entry.command}</div>
-              )}
-              <pre className="terminal-output">{entry.output}</pre>
+      {canRead ? (
+        <div className="terminal-viewer-body">
+          {(!entries || entries.length === 0) ? (
+            <div className="terminal-viewer-empty">No terminal output captured</div>
+          ) : (
+            entries.map((entry, i) => (
+              <div key={i} className="terminal-entry">
+                {entry.command && (
+                  <div className="terminal-command">$ {entry.command}</div>
+                )}
+                <pre className="terminal-output">{entry.output}</pre>
+              </div>
+            ))
+          )}
+        </div>
+      ) : (
+        <div className="terminal-viewer-empty">Terminal output is unavailable for this harness.</div>
+      )}
+      {canInput && (
+        <form className="terminal-input-form" onSubmit={submitCommand}>
+          <input
+            className="terminal-input"
+            type="text"
+            value={command}
+            onChange={event => setCommand(event.target.value)}
+            placeholder="Enter a command in this session's terminal"
+            aria-label="Terminal command"
+          />
+          <button className="terminal-input-send" type="submit" disabled={!command.trim()}>Run</button>
+          {requestId && (
+            <div className={`terminal-input-status ${controlResult?.result || 'pending'}`} role="status">
+              {!controlResult
+                ? 'Command pending…'
+                : controlResult.result === 'ok'
+                  ? 'Command sent'
+                  : `Command failed: ${controlResult.error?.message || controlResult.error?.code || 'unknown error'}`}
             </div>
-          ))
-        )}
-      </div>
+          )}
+        </form>
+      )}
     </div>
   );
 }
@@ -3645,7 +3685,7 @@ class AppErrorBoundary extends React.Component {
 }
 
 function App() {
-  const { sessions, messages, historyMeta, historyLoading, connected, unread, setUnread, thinking, thinkingContent, activities, health, deliveryStates, launchStates, justLaunched, setJustLaunched, permissionPrompts, respondToPrompt, errorPrompts, respondToErrorPrompt, interruptSession, agentConfigs, requestAgentConfig, setAgentModel, setAgentEffort, setAgentPermissionMode, setAutoApprovePermissions, setAntigravityMode, setCodexConfig, newThread, openPanel, openNativeWindow, requestChatList, switchChat, newChat, chatLists, requestThreadList, switchThread, threadLists, switchWorkspace, requestTerminalOutput, terminalOutputs, requestFileChanges, respondToFileChange, fileChanges, sendAttachment, send, sendToSession, steerMessage, discardQueuedMessage, editQueuedMessage, queuedMessages, launchSession, resumeSession, closeSession, activeSessionRef, workspaces, branchLists, requestBranchList, switchBranch, createBranch, skillLists, requestSkillList, automationViews, showCodexAutomation, controlResults, directoryListings, requestDirectoryListing, fileContents, requestFileContent, requestHistory, requestHistoryChunk } = useRelay();
+  const { sessions, messages, historyMeta, historyLoading, connected, unread, setUnread, thinking, thinkingContent, activities, health, deliveryStates, launchStates, justLaunched, setJustLaunched, permissionPrompts, respondToPrompt, errorPrompts, respondToErrorPrompt, interruptSession, agentConfigs, requestAgentConfig, setAgentModel, setAgentEffort, setAgentPermissionMode, setAutoApprovePermissions, setAntigravityMode, setCodexConfig, newThread, openPanel, openNativeWindow, requestChatList, switchChat, newChat, chatLists, requestThreadList, switchThread, threadLists, switchWorkspace, requestTerminalOutput, sendTerminalInput, terminalOutputs, requestFileChanges, respondToFileChange, fileChanges, sendAttachment, send, sendToSession, steerMessage, discardQueuedMessage, editQueuedMessage, queuedMessages, launchSession, resumeSession, closeSession, activeSessionRef, workspaces, branchLists, requestBranchList, switchBranch, createBranch, skillLists, requestSkillList, automationViews, showCodexAutomation, controlResults, directoryListings, requestDirectoryListing, fileContents, requestFileContent, requestHistory, requestHistoryChunk } = useRelay();
   const [activeSession, setActiveSession] = useState(null);
   const [drafts, setDrafts]             = useState({});
   const [draftFiles, setDraftFiles]     = useState({});
@@ -4104,7 +4144,13 @@ async function uploadBinaryDraft(sessionId, base64, mimeType, filename) {
   }, [controlResults]);
 
   function historyRequestOptionsFor(sessionMeta) {
-    return { limit: historyLimitForAgentType(sessionMeta?.agent_type) };
+    const agentType = sessionMeta?.agent_type;
+    return {
+      limit: historyLimitForAgentType(agentType),
+      ...((agentType === 'codex_cli' || agentType === 'cursor_cli')
+        ? { chunkBytes: CODEX_CLI_INITIAL_HISTORY_CHUNK_BYTES }
+        : {}),
+    };
   }
 
   function historyRequestOptionsForSessionId(sessionId) {
@@ -4591,11 +4637,12 @@ async function uploadBinaryDraft(sessionId, base64, mimeType, filename) {
   ]);
   // Auto-fetch thread list for desktop sessions with no messages (e.g. Codex Desktop showing chat picker)
   const hasThreadCap = activeConfig?.capabilities?.thread_list;
+  const hasNativeDraftThread = !!activeSessionMeta?.is_new_chat_draft;
   const showDesktopThreadTabs = !!(
     activeSession
     && (activeSessionMeta?.agent_type === 'codex-desktop' || activeSessionMeta?.agent_type === 'cursor')
     && hasThreadCap
-    && (threadLists[activeSession]?.length > 0 || pendingDraftThreads[activeSession])
+    && (threadLists[activeSession]?.length > 0 || pendingDraftThreads[activeSession] || hasNativeDraftThread)
     && !showFileBrowser
   );
   const desktopThreadTabs = React.useMemo(() => {
@@ -4610,6 +4657,13 @@ async function uploadBinaryDraft(sessionId, base64, mimeType, filename) {
     }
     return list.slice(0, 8);
   }, [activeSession, threadLists, optimisticThreadFocus]);
+  const activeTranscriptRenderKey = React.useMemo(() => {
+    const focusedThreadId = optimisticThreadFocus[activeSession];
+    const activeThread = (threadLists[activeSession] || []).find(thread => thread?.active);
+    const activeThreadId = activeThread?.cache_key || activeThread?.id;
+    const draftKey = (pendingDraftThreads[activeSession] || hasNativeDraftThread) ? 'draft' : '';
+    return `${activeSession || 'none'}:${draftKey || focusedThreadId || activeThreadId || 'default'}`;
+  }, [activeSession, threadLists, optimisticThreadFocus, pendingDraftThreads, hasNativeDraftThread]);
   const noMessages = currentMessages.length === 0;
   React.useEffect(() => {
     if (activeSession && hasThreadCap && noMessages) {
@@ -4656,12 +4710,12 @@ async function uploadBinaryDraft(sessionId, base64, mimeType, filename) {
     });
   }, [activeSession, isAntigravityV2, rawActiveChatList]);
   React.useEffect(() => {
-    if (!(activeSession && isDesktopAgent && noMessages)) return undefined;
+    if (!(activeSession && isDesktopAgent && noMessages) || hasNativeDraftThread) return undefined;
     const tailOptions = historyRequestOptionsFor(activeSessionMeta);
     requestHistory(activeSession, tailOptions);
     const intervalId = setInterval(() => requestHistory(activeSession, tailOptions), 3000);
     return () => clearInterval(intervalId);
-  }, [activeSession, activeSessionMeta?.agent_type, noMessages]);
+  }, [activeSession, activeSessionMeta?.agent_type, noMessages, hasNativeDraftThread]);
   React.useEffect(() => {
     if (!(activeSession && isDesktopAgent && hasThreadCap)) return undefined;
     requestThreadList(activeSession);
@@ -4718,9 +4772,6 @@ async function uploadBinaryDraft(sessionId, base64, mimeType, filename) {
     setShowThreadList(false);
     newThread(sessionId);
     if (agentConfigs[sessionId]?.capabilities?.thread_list) {
-      const tailOptions = historyRequestOptionsForSessionId(sessionId);
-      setTimeout(() => requestHistory(sessionId, tailOptions), 150);
-      setTimeout(() => requestHistory(sessionId, tailOptions), 650);
       setTimeout(() => requestThreadList(sessionId), 400);
       setTimeout(() => requestThreadList(sessionId), 1400);
     }
@@ -4732,9 +4783,6 @@ async function uploadBinaryDraft(sessionId, base64, mimeType, filename) {
     setOptimisticThreadFocus(prev => ({ ...prev, [sessionId]: threadId }));
     setDraftMessageBaselines(prev => ({ ...prev, [sessionId]: 0 }));
     switchThread(sessionId, threadId);
-    const tailOptions = historyRequestOptionsForSessionId(sessionId);
-    setTimeout(() => requestHistory(sessionId, tailOptions), 120);
-    setTimeout(() => requestHistory(sessionId, tailOptions), 550);
     setTimeout(() => requestThreadList(sessionId), 300);
     setTimeout(() => requestThreadList(sessionId), 1200);
   }
@@ -5013,14 +5061,14 @@ async function uploadBinaryDraft(sessionId, base64, mimeType, filename) {
                       threads
                     </button>
                   )}
-                  {activeConfig?.capabilities?.terminal_output && (
+                  {(activeConfig?.capabilities?.terminal_output || activeConfig?.capabilities?.terminal_input) && (
                     <button
                       className={`context-pill terminal-toggle${showTerminal ? ' active' : ''}`}
-                      title="View terminal output"
+                      title="Open terminal controls"
                       onClick={() => {
                         const next = !showTerminal;
                         setShowTerminal(next);
-                        if (next) requestTerminalOutput(activeSession);
+                        if (next && activeConfig?.capabilities?.terminal_output) requestTerminalOutput(activeSession);
                       }}
                     >
                       terminal
@@ -5149,7 +5197,7 @@ async function uploadBinaryDraft(sessionId, base64, mimeType, filename) {
           <ThreadTabsBar
             threads={desktopThreadTabs}
             activeThreadId={optimisticThreadFocus[activeSession] || null}
-            showDraftTab={!!pendingDraftThreads[activeSession]}
+            showDraftTab={!!pendingDraftThreads[activeSession] || hasNativeDraftThread}
             newLabel={newThreadLabel}
             onSwitch={(threadId) => handleSwitchThread(activeSession, threadId)}
             onNew={() => handleNewThread(activeSession)}
@@ -5226,7 +5274,7 @@ async function uploadBinaryDraft(sessionId, base64, mimeType, filename) {
             onClick={pinTranscriptToNewest}
           >↓ Jump to Newest</button>
         )}
-        <div className="messages" ref={messagesListRef}>
+        <div className="messages" key={activeTranscriptRenderKey} ref={messagesListRef}>
           {shouldBottomAlignMessages && <div className="messages-flex-spacer" />}
           {activePrompt && (
             <PermissionOverlay
@@ -5263,13 +5311,13 @@ async function uploadBinaryDraft(sessionId, base64, mimeType, filename) {
           )}
           {!activeSession ? (
             <div className="empty-state"><div className="icon">🤖</div><div>Select an agent session</div></div>
-          ) : currentMessages.length === 0 && hasThreadCap && activeSessionMeta?.is_list_view && (threadLists[activeSession]?.length > 0) && !pendingDraftThreads[activeSession] ? (
+          ) : currentMessages.length === 0 && hasThreadCap && activeSessionMeta?.is_list_view && (threadLists[activeSession]?.length > 0) && !pendingDraftThreads[activeSession] && !hasNativeDraftThread ? (
             <div className="thread-picker-empty">
               <div className="thread-picker-header">Select a chat</div>
               <div className="thread-picker-list">
                 {threadLists[activeSession].map((thread, i) => (
                   <button
-                    key={thread.id || i}
+                    key={thread.cache_key || thread.id || i}
                     className={`thread-picker-item${thread.active ? ' active' : ''}`}
                     onClick={() => {
                       handleSwitchThread(activeSession, thread.id);
@@ -5453,10 +5501,14 @@ async function uploadBinaryDraft(sessionId, base64, mimeType, filename) {
           />
         )}
 
-        {!showFileBrowser && showTerminal && activeSession && activeConfig?.capabilities?.terminal_output && (
+        {!showFileBrowser && showTerminal && activeSession && (activeConfig?.capabilities?.terminal_output || activeConfig?.capabilities?.terminal_input) && (
           <TerminalViewer
             entries={terminalOutputs[activeSession] || []}
+            canRead={!!activeConfig?.capabilities?.terminal_output}
+            canInput={!!activeConfig?.capabilities?.terminal_input}
             onRefresh={() => requestTerminalOutput(activeSession)}
+            onSend={text => sendTerminalInput(activeSession, text)}
+            controlResults={controlResults}
             onClose={() => setShowTerminal(false)}
           />
         )}

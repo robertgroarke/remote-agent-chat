@@ -1096,24 +1096,57 @@ async function detectThinking(Runtime, agentType) {
           var current = root;
           while (current && current !== d.body) {
             var text = norm(current.innerText || current.textContent);
+            // The first ancestor carrying the elapsed timer is the complete
+            // goal row. Do not climb into the above-composer queue, where a
+            // neighboring slow-response notice can become an objective candidate.
+            if (durationSeconds(text) > 0) {
+              root = current;
+              break;
+            }
             if (text.length > 700) break;
             root = current;
             current = current.parentElement;
           }
-          var rootText = norm(root.innerText || root.textContent);
+          var compactRoot = labelNode.parentElement || labelNode;
+          var rootText = norm(compactRoot.innerText || compactRoot.textContent) || norm(root.innerText || root.textContent);
           var seconds = durationSeconds(rootText);
-          var candidates = Array.from(root.querySelectorAll('span, p, div')).filter(function(el) {
-            if (!visible(el) || el === labelNode) return false;
-            if (el.closest && el.closest('button')) return false;
-            var text = norm(el.innerText || el.textContent);
-            if (!text || goalStatus(text)) return false;
-            if (/^(edit goal|pause goal|resume goal|stop goal)$/i.test(text)) return false;
-            if (/^(?:(?:\\d+h\\s*)?(?:\\d+m\\s*)?\\d+s|(?:\\d+h\\s*)?\\d+m)$/i.test(text)) return false;
-            return text.length <= 300;
-          }).sort(function(a, b) {
-            return norm(a.textContent).length - norm(b.textContent).length;
-          });
-          var objective = candidates.length > 0 ? norm(candidates[0].innerText || candidates[0].textContent) : '';
+          function goalObjectiveText(el) {
+            // The live truncated chip preserves its raw prompt boundary in
+            // textContent while browser fixtures preserve <br><br> in innerText.
+            // Use whichever representation actually retains a blank line.
+            var textRaw = String(el.textContent || '').replace(/\\r\\n?/g, '\\n').trim();
+            var innerRaw = String(el.innerText || '').replace(/\\r\\n?/g, '\\n').trim();
+            var raw = /\\n\\s*\\n/.test(textRaw) ? textRaw : (innerRaw || textRaw);
+            // Current Codex builds can append the original prompt after a
+            // blank line inside the same truncated objective span. The first
+            // paragraph is the visible goal objective; forwarding the whole
+            // prompt would both leak unrelated transcript text and exceed the
+            // compact status surface.
+            return raw.split(/\\n\\s*\\n/)[0].replace(/\\s+/g, ' ').trim();
+          }
+          function goalCandidates(scope) {
+            return Array.from(scope.querySelectorAll('span, p, div')).map(function(el) {
+              return { el: el, text: goalObjectiveText(el) };
+            }).filter(function(candidate) {
+              var el = candidate.el;
+              if (!visible(el) || el === labelNode) return false;
+              if (el.closest && el.closest('button')) return false;
+              var text = candidate.text;
+              if (!text || goalStatus(text)) return false;
+              if (/^(edit goal|pause goal|resume goal|stop goal)$/i.test(text)) return false;
+              if (/^(?:(?:\\d+h\\s*)?(?:\\d+m\\s*)?\\d+s|(?:\\d+h\\s*)?\\d+m)$/i.test(text)) return false;
+              return text.length <= 300;
+            }).sort(function(a, b) {
+              return a.text.length - b.text.length;
+            });
+          }
+          // The label, objective, and timer are siblings in current Codex
+          // builds. Prefer that compact surface so nearby notices cannot be
+          // mistaken for the objective; retain the climbed-root scan only as
+          // a compatibility fallback for older DOM shapes.
+          var candidates = goalCandidates(compactRoot);
+          if (candidates.length === 0 && compactRoot !== root) candidates = goalCandidates(root);
+          var objective = candidates.length > 0 ? candidates[0].text : '';
           return {
             label: label,
             status: goalStatus(label),
@@ -2781,6 +2814,12 @@ const CODEX_READ_EXPR = `
 `;
 
 const CODEX_DESKTOP_READ_EXPR = `
+  var _REMOTE_AGENT_RECENT_TURN_LIMIT = (typeof __remoteAgentMaxRecentTurns === 'number' && __remoteAgentMaxRecentTurns > 0)
+    ? Math.floor(__remoteAgentMaxRecentTurns)
+    : 0;
+  var _REMOTE_AGENT_RECENT_UNIT_LIMIT = (typeof __remoteAgentMaxRecentUnits === 'number' && __remoteAgentMaxRecentUnits > 0)
+    ? Math.floor(__remoteAgentMaxRecentUnits)
+    : 0;
   var bt = String.fromCharCode(96);
   var fence = bt + bt + bt;
   var BLOCK_TAGS = { DIV:1, P:1, LI:1, TR:1, H1:1, H2:1, H3:1, H4:1, H5:1, H6:1, BLOCKQUOTE:1, SECTION:1, ARTICLE:1 };
@@ -2823,7 +2862,9 @@ const CODEX_DESKTOP_READ_EXPR = `
   // The previous version did a 6-level textContent climb per button which
   // froze the renderer for seconds on long sessions.
   var _DESKTOP_PRIME_NULL = '\\x00';
-  var _DESKTOP_PRIME_BUDGET = 64;
+  var _DESKTOP_PRIME_BUDGET = _REMOTE_AGENT_RECENT_TURN_LIMIT
+    ? Math.min(24, Math.max(8, _REMOTE_AGENT_RECENT_TURN_LIMIT * 2))
+    : 64;
 
   function _desktopCaptureExpandedBox(btn) {
     var btnText = String(btn.innerText || btn.textContent || '');
@@ -3359,7 +3400,7 @@ const CODEX_DESKTOP_READ_EXPR = `
     if (minus) return { adds: null, dels: parseInt(minus[1], 10) || 0 };
     return null;
   }
-  function _extractDesktopFileChangeSummaryCards(container) {
+  function _extractDesktopFileChangeSummaryCards(container, floorEl) {
     if (!container || !container.querySelectorAll) return [];
     var candidates = Array.from(container.querySelectorAll('[class*="rounded-xl"], .mt-3'))
       .filter(function(card) {
@@ -3369,6 +3410,12 @@ const CODEX_DESKTOP_READ_EXPR = `
     candidates = candidates.filter(function(card) {
       return !candidates.some(function(other) { return other !== card && card.contains(other); });
     });
+    if (floorEl) {
+      candidates = candidates.filter(function(card) {
+        if (card === floorEl || card.contains(floorEl)) return true;
+        return !!(floorEl.compareDocumentPosition(card) & 4);
+      });
+    }
     var seen = {};
     var blocks = [];
     candidates.forEach(function(card) {
@@ -3423,9 +3470,10 @@ const CODEX_DESKTOP_READ_EXPR = `
     });
     return blocks;
   }
-  function _extractDesktopWorkedForHeader(turn) {
+  function _extractDesktopWorkedForHeader(turn, floorEl) {
     var btns = Array.from(turn.querySelectorAll('button[aria-expanded]'));
-    for (var i = 0; i < btns.length; i++) {
+    for (var i = btns.length - 1; i >= 0; i--) {
+      if (floorEl && btns[i] !== floorEl && !btns[i].contains(floorEl) && !(floorEl.compareDocumentPosition(btns[i]) & 4)) continue;
       var t = (btns[i].textContent || '').trim();
       if (/^Worked for /i.test(t) || /^Working for /i.test(t)) return t;
     }
@@ -3495,7 +3543,11 @@ const CODEX_DESKTOP_READ_EXPR = `
     return text;
   }
 
-  function _DESKTOP_WORKED_PRIME_BUDGET() { return 12; }
+  function _DESKTOP_WORKED_PRIME_BUDGET() {
+    return _REMOTE_AGENT_RECENT_TURN_LIMIT
+      ? Math.min(12, _REMOTE_AGENT_RECENT_TURN_LIMIT)
+      : 12;
+  }
 
   async function _primeDesktopWorkedForTurns() {
     var cache = _desktopWorkedCache();
@@ -3520,6 +3572,9 @@ const CODEX_DESKTOP_READ_EXPR = `
       var t = (b.innerText || '').trim();
       return /^Worked for /i.test(t) || /^Working for /i.test(t);
     });
+    if (_REMOTE_AGENT_RECENT_TURN_LIMIT && expanded.length > _REMOTE_AGENT_RECENT_TURN_LIMIT * 2) {
+      expanded = expanded.slice(-_REMOTE_AGENT_RECENT_TURN_LIMIT * 2);
+    }
     for (var ei = 0; ei < expanded.length; ei++) {
       var ebtn = expanded[ei];
       var key = _desktopWorkedTurnKey(ebtn);
@@ -3595,14 +3650,21 @@ const CODEX_DESKTOP_READ_EXPR = `
     return a;
   }
   var allUnits = Array.from(convo.querySelectorAll('[data-content-search-unit-key]'));
+  var selectedUnits = _REMOTE_AGENT_RECENT_UNIT_LIMIT && allUnits.length > _REMOTE_AGENT_RECENT_UNIT_LIMIT
+    ? allUnits.slice(-_REMOTE_AGENT_RECENT_UNIT_LIMIT)
+    : allUnits;
+  var _selectedUnitKeys = {};
+  for (var _sui = 0; _sui < selectedUnits.length; _sui++) {
+    _selectedUnitKeys[selectedUnits[_sui].getAttribute('data-content-search-unit-key') || ''] = true;
+  }
   var _turnGroups = {};
   var _turnGroupOrder = [];
-  for (var _ui = 0; _ui < allUnits.length; _ui++) {
-    var _ukey = allUnits[_ui].getAttribute('data-content-search-unit-key') || '';
+  for (var _ui = 0; _ui < selectedUnits.length; _ui++) {
+    var _ukey = selectedUnits[_ui].getAttribute('data-content-search-unit-key') || '';
     var _tid = _ukey.split(':')[0];
     if (!_tid) continue;
     if (!_turnGroups[_tid]) { _turnGroups[_tid] = []; _turnGroupOrder.push(_tid); }
-    _turnGroups[_tid].push(allUnits[_ui]);
+    _turnGroups[_tid].push(selectedUnits[_ui]);
   }
   var turns = [];
   for (var _gi = 0; _gi < _turnGroupOrder.length; _gi++) {
@@ -3614,6 +3676,9 @@ const CODEX_DESKTOP_READ_EXPR = `
       var _turnEl = _desktopTurnLca(_groupUnits);
       if (_turnEl) turns.push(_turnEl);
     }
+  }
+  if (_REMOTE_AGENT_RECENT_TURN_LIMIT && turns.length > _REMOTE_AGENT_RECENT_TURN_LIMIT) {
+    turns = turns.slice(-_REMOTE_AGENT_RECENT_TURN_LIMIT);
   }
 
   var msgs = [];
@@ -3637,7 +3702,15 @@ const CODEX_DESKTOP_READ_EXPR = `
     var turn = turns[ti];
     var userParts = [];
     var assistantSegments = [];
-    var units = Array.from(turn.querySelectorAll('[data-content-search-unit-key]'));
+    var units = Array.from(turn.querySelectorAll('[data-content-search-unit-key]')).filter(function(unit) {
+      return !!_selectedUnitKeys[unit.getAttribute('data-content-search-unit-key') || ''];
+    });
+    var recentFloor = _REMOTE_AGENT_RECENT_UNIT_LIMIT && units.length > 0 ? units[0] : null;
+    function isAtOrAfterRecentFloor(el) {
+      if (!recentFloor || !el) return true;
+      if (el === recentFloor || el.contains(recentFloor)) return true;
+      return !!(recentFloor.compareDocumentPosition(el) & 4);
+    }
     var turnTs = units.length > 0
       ? _turnTsFromKey(units[0].getAttribute('data-content-search-unit-key'))
       : null;
@@ -3672,6 +3745,7 @@ const CODEX_DESKTOP_READ_EXPR = `
     var acceptedToolBtns = [];
     for (var tb = 0; tb < toolBtnCandidates.length; tb++) {
       var tbtn = toolBtnCandidates[tb];
+      if (!isAtOrAfterRecentFloor(tbtn)) continue;
       var tbHeader = (tbtn.innerText || '').trim().split('\\n')[0];
       if (!_isDesktopToolHeader(tbHeader)) continue;
       // "Worked for X" is the turn-level container toggle, not a tool row.
@@ -3714,6 +3788,7 @@ const CODEX_DESKTOP_READ_EXPR = `
     // NOT inside a unit to capture Shell boxes without duplicating unit content.
     var commandBlocks = Array.from(turn.querySelectorAll('[class*="group/command"]'));
     for (var cbi = 0; cbi < commandBlocks.length; cbi++) {
+      if (!isAtOrAfterRecentFloor(commandBlocks[cbi])) continue;
       if (commandBlocks[cbi].closest('[data-content-search-unit-key]')) continue;
       var parsedCommand = parseVisibleCommandBlock(commandBlocks[cbi]);
       if (parsedCommand) pushAssistantSegment(parsedCommand, true);
@@ -3723,7 +3798,7 @@ const CODEX_DESKTOP_READ_EXPR = `
     // These show up after a "Worked for" header on completed turns and were
     // previously dropped on Codex Desktop, so collapsed turns lost the file
     // change list.
-    var summaryBlocks = _extractDesktopFileChangeSummaryCards(turn);
+    var summaryBlocks = _extractDesktopFileChangeSummaryCards(turn, recentFloor);
     summaryBlocks.forEach(function(block) { pushAssistantSegment(block, true); });
 
     // Fallback only: if the interleaved unit/tool walk produced nothing for
@@ -3738,7 +3813,7 @@ const CODEX_DESKTOP_READ_EXPR = `
     // Append the "Worked for X" header (if present and not already in
     // assistantSegments) so the turn boundary is visible and the accumulator
     // merge logic can detect completion.
-    var workedHeader = _extractDesktopWorkedForHeader(turn);
+    var workedHeader = _extractDesktopWorkedForHeader(turn, recentFloor);
     if (workedHeader && !assistantSegments.some(function(p) { return p && p.indexOf(workedHeader) !== -1; })) {
       pushAssistantSegment(workedHeader, false);
     }
@@ -3758,17 +3833,29 @@ const CODEX_DESKTOP_READ_EXPR = `
   return JSON.stringify(msgs);
 `;
 
-async function readCodexMessages(Runtime, sessionId, usePageEval) {
+async function readCodexMessages(Runtime, sessionId, usePageEval, options = {}) {
   // Cheap dirty-check before the expensive DOM walk. If the conversation
   // signature is unchanged from the last successful read, return the cached
   // result. The downstream caller will see the same transcriptSig and take
   // no action — but we avoid blocking Codex's renderer with a full parse.
+  const maxRecentTurns = usePageEval
+    ? Math.max(0, Math.min(100, Number(options.maxRecentTurns) || 0))
+    : 0;
+  const maxRecentUnits = usePageEval
+    ? Math.max(0, Math.min(500, Number(options.maxRecentUnits) || 0))
+    : 0;
   const cache = _getCodexReadCache(sessionId);
   const evalFn = usePageEval ? evalInPage : evalInFrame;
   let preSig = null;
   try {
     preSig = await evalFn(Runtime, CODEX_DOM_SIG_EXPR);
-    if (preSig && preSig === cache.sig && cache.result !== null) {
+    if (
+      preSig &&
+      preSig === cache.sig &&
+      cache.result !== null &&
+      Number(cache.maxRecentTurns || 0) === maxRecentTurns &&
+      Number(cache.maxRecentUnits || 0) === maxRecentUnits
+    ) {
       cache.hits = (cache.hits || 0) + 1;
       const repaired = expandCodexMessagesRaw(cache.result, {
         structuredBlocks: true,
@@ -3782,8 +3869,11 @@ async function readCodexMessages(Runtime, sessionId, usePageEval) {
   }
 
   try {
+    const desktopReadExpr = maxRecentTurns || maxRecentUnits
+      ? `var __remoteAgentMaxRecentTurns = ${maxRecentTurns};\nvar __remoteAgentMaxRecentUnits = ${maxRecentUnits};\n${CODEX_DESKTOP_READ_EXPR}`
+      : CODEX_DESKTOP_READ_EXPR;
     let raw = usePageEval
-      ? await evalInPage(Runtime, CODEX_DESKTOP_READ_EXPR, { awaitPromise: true })
+      ? await evalInPage(Runtime, desktopReadExpr, { awaitPromise: true })
       : await evalInFrame(Runtime, CODEX_DESKTOP_READ_EXPR, { awaitPromise: true });
     if (!usePageEval) {
       try {
@@ -3804,6 +3894,8 @@ async function readCodexMessages(Runtime, sessionId, usePageEval) {
       cache.sig = preSig || '';
       cache.result = result;
       cache.hits = 0;
+      cache.maxRecentTurns = maxRecentTurns;
+      cache.maxRecentUnits = maxRecentUnits;
       return result;
     }
   } catch (e) {
@@ -7274,10 +7366,10 @@ async function detectAntigravityV2Thinking(Runtime) {
   }
 }
 
-async function readMessages(Runtime, agentType, sessionId) {
+async function readMessages(Runtime, agentType, sessionId, options = {}) {
   if (agentType === 'cursor')             return cursorSel.readCursorMessages(Runtime);
-  if (agentType === 'codex-desktop')      return readCodexMessages(Runtime, sessionId, true);
-  if (agentType === 'codex')              return readCodexMessages(Runtime, sessionId, false);
+  if (agentType === 'codex-desktop')      return readCodexMessages(Runtime, sessionId, true, options);
+  if (agentType === 'codex')              return readCodexMessages(Runtime, sessionId, false, options);
   if (agentType === 'gemini')             return readGeminiMessages(Runtime, sessionId);
   if (isRooCodeAgentType(agentType))      return readRooCodeMessages(Runtime, sessionId);
   if (isContinueAgentType(agentType))     return readContinueMessages(Runtime, sessionId);
@@ -8013,8 +8105,36 @@ const READ_CODEX_TERMINAL_OUTPUT_EXPR = `
   return JSON.stringify(results);
 `;
 
+function codexTerminalEntriesFromMessages(messages) {
+  const structured = [];
+  const source = Array.isArray(messages) ? messages : [];
+  for (let messageIndex = 0; messageIndex < source.length; messageIndex++) {
+    const blocks = Array.isArray(source[messageIndex]?.content_blocks)
+      ? source[messageIndex].content_blocks
+      : [];
+    for (let blockIndex = 0; blockIndex < blocks.length; blockIndex++) {
+      const block = blocks[blockIndex];
+      if (block?.type !== 'terminal') continue;
+      structured.push({
+        command: block.command || block.label || null,
+        output: block.stdout == null ? '' : String(block.stdout),
+        turnId: `message-${messageIndex}-terminal-${blockIndex}`,
+        status: block.status || null,
+        exit_code: block.exit_code ?? null,
+        collapsed: false,
+      });
+    }
+  }
+  return structured;
+}
+
 async function readCodexTerminalOutput(Runtime, usePageEval) {
   try {
+    const messageRaw = await readCodexMessages(Runtime, 'codex-terminal-output', usePageEval);
+    const messages = messageRaw ? JSON.parse(messageRaw) : [];
+    const structured = codexTerminalEntriesFromMessages(messages);
+    if (structured.length > 0) return structured;
+
     const evalFn = usePageEval ? evalInPage : evalInFrame;
     const raw = await evalFn(Runtime, READ_CODEX_TERMINAL_OUTPUT_EXPR);
     if (!raw) return [];
@@ -8176,8 +8296,46 @@ const READ_CODEX_FILE_CHANGES_EXPR = `
   return JSON.stringify(results);
 `;
 
+function codexFileChangeEntriesFromMessages(messages) {
+  const structured = [];
+  const source = Array.isArray(messages) ? messages : [];
+  for (let messageIndex = 0; messageIndex < source.length; messageIndex++) {
+    const blocks = Array.isArray(source[messageIndex]?.content_blocks)
+      ? source[messageIndex].content_blocks
+      : [];
+    for (let blockIndex = 0; blockIndex < blocks.length; blockIndex++) {
+      const block = blocks[blockIndex];
+      if (block?.type !== 'file_changes') continue;
+      const files = Array.isArray(block.files) ? block.files : [];
+      const paths = files.map(file => String(file?.path || file?.file || file || '').trim()).filter(Boolean);
+      const actions = Array.isArray(block.actions) ? block.actions : [];
+      const supportedActions = actions.filter(action => action && action.unsupported !== true);
+      structured.push({
+        id: `message-${messageIndex}-file-changes-${blockIndex}`,
+        file: paths.join(', ') || null,
+        files,
+        files_changed: block.files_changed ?? files.length,
+        additions: block.additions ?? null,
+        deletions: block.deletions ?? null,
+        content: block.content == null ? '' : String(block.content),
+        summary: block.summary || null,
+        type: 'diff',
+        actions,
+        can_accept: supportedActions.some(action => /accept|keep/i.test(`${action.id || ''} ${action.label || ''}`)),
+        can_reject: supportedActions.some(action => /reject|undo/i.test(`${action.id || ''} ${action.label || ''}`)),
+      });
+    }
+  }
+  return structured;
+}
+
 async function readCodexFileChanges(Runtime, usePageEval) {
   try {
+    const messageRaw = await readCodexMessages(Runtime, 'codex-file-changes', usePageEval);
+    const messages = messageRaw ? JSON.parse(messageRaw) : [];
+    const structured = codexFileChangeEntriesFromMessages(messages);
+    if (structured.length > 0) return structured;
+
     const evalFn = usePageEval ? evalInPage : evalInFrame;
     const raw = await evalFn(Runtime, READ_CODEX_FILE_CHANGES_EXPR);
     if (!raw) return [];
@@ -11316,7 +11474,7 @@ async function respondToPermissionDialog(Runtime, agentType, choiceId, sessionId
 
 // ─── Send dispatch (with fallback) ────────────────────────────────────────────
 
-async function sendMessage(Runtime, agentType, text, sessionId, cdpClient = null) {
+async function sendMessage(Runtime, agentType, text, sessionId, cdpClient = null, options = {}) {
   let result;
 
   if (agentType === 'antigravity') {
@@ -11339,7 +11497,7 @@ async function sendMessage(Runtime, agentType, text, sessionId, cdpClient = null
       console.warn(`[${sessionId}] [sel] Antigravity v2 trusted send failed (${result.code}:${result.detail}); refusing append-only DOM fallbacks`);
     }
   } else if (agentType === 'cursor') {
-    result = await cursorSel.sendCursorMessage(Runtime, cdpClient, text);
+    result = await cursorSel.sendCursorMessage(Runtime, cdpClient, text, options);
   } else if (agentType === 'codex' || agentType === 'codex-desktop') {
     const usePageEval = agentType === 'codex-desktop';
     result = await sendCodexPrimary(Runtime, text, usePageEval);
@@ -12022,6 +12180,30 @@ async function readCodexThreadList(Runtime, usePageEval) {
         return !!(el && el.offsetParent !== null);
       }
 
+      // Current Codex Desktop builds expose a purpose-built, stable contract
+      // on every sidebar row. Prefer it over presentation classes and age
+      // suffixes, neither of which are present in the July 2026 build.
+      var actionRows = Array.from(d.querySelectorAll('[data-app-action-sidebar-thread-row]'));
+      for (var ar = 0; ar < actionRows.length; ar++) {
+        var actionRow = actionRows[ar];
+        if (!isVisible(actionRow)) continue;
+        var actionId = actionRow.getAttribute('data-app-action-sidebar-thread-id') || '';
+        var actionTitle = actionRow.getAttribute('data-app-action-sidebar-thread-title')
+          || (actionRow.innerText || actionRow.textContent || '').trim();
+        actionTitle = actionTitle.replace(/\\s+/g, ' ').trim();
+        if (!actionId || !actionTitle) continue;
+        threads.push({
+          id: actionId,
+          title: actionTitle.substring(0, 200),
+          age: null,
+          active: actionRow.getAttribute('data-app-action-sidebar-thread-active') === 'true'
+            || actionRow.getAttribute('aria-current') === 'page'
+            || actionRow.getAttribute('aria-selected') === 'true',
+          index: threads.length
+        });
+      }
+      if (threads.length > 0) return JSON.stringify(threads);
+
       var seen = new Set();
       function addThreadCandidate(clickable, item) {
         if (!clickable || seen.has(clickable) || !isVisible(clickable)) return;
@@ -12074,6 +12256,10 @@ async function switchCodexThread(Runtime, threadId, usePageEval) {
     try {
       beforeThreadList = await readCodexThreadList(Runtime, usePageEval);
     } catch {}
+    const beforeStableTarget = beforeThreadList.find(thread => thread?.id === threadId) || null;
+    if (beforeStableTarget?.active) {
+      return { ok: true, method: 'already-active', verified: 'active-thread-id' };
+    }
     const beforeIdxMatch = String(threadId || '').match(/^thread-(\d+)$/);
     const beforeTargetIndex = beforeIdxMatch ? parseInt(beforeIdxMatch[1], 10) : null;
     if (beforeTargetIndex != null && beforeThreadList[beforeTargetIndex]?.active) {
@@ -12150,7 +12336,13 @@ async function switchCodexThread(Runtime, threadId, usePageEval) {
           return clickables;
         }
 
-        // Strategy 1: Find by data attribute
+        // Strategy 0: Current Codex Desktop stable action-row contract.
+        var actionRow = Array.from(d.querySelectorAll('[data-app-action-sidebar-thread-row]')).find(function(row) {
+          return row.getAttribute('data-app-action-sidebar-thread-id') === targetId;
+        });
+        if (actionRow) { dispatchPress(actionRow); return JSON.stringify({ ok: true, method: 'app-action-thread-id' }); }
+
+        // Strategy 1: Older data attributes.
         var el = d.querySelector('[data-thread-id="' + targetId + '"]') ||
                  d.querySelector('[data-conversation-id="' + targetId + '"]');
         if (el) { dispatchPress(el); return JSON.stringify({ ok: true, method: 'data-attr' }); }
@@ -12182,9 +12374,13 @@ async function switchCodexThread(Runtime, threadId, usePageEval) {
       const targetTitle = (targetIndex != null && beforeThreadList[targetIndex]?.title) ? beforeThreadList[targetIndex].title : null;
       try {
         const afterThreadList = await readCodexThreadList(Runtime, usePageEval);
+        if (beforeStableTarget && afterThreadList.some(thread => thread?.id === threadId && thread.active)) {
+          return { ok: true, method: initial.method, verified: 'active-thread-id' };
+        }
         if (targetIndex != null && afterThreadList[targetIndex]?.active) {
           return { ok: true, method: initial.method, verified: 'active-thread' };
         }
+        if (beforeStableTarget) continue;
         if (JSON.stringify(afterThreadList || []) !== JSON.stringify(beforeThreadList || [])) {
           return { ok: true, method: initial.method, verified: 'thread-list-changed' };
         }
@@ -12215,6 +12411,9 @@ async function switchCodexThread(Runtime, threadId, usePageEval) {
     }
     if (!attempted) {
       return initial || { ok: false, detail: 'switch-not-attempted' };
+    }
+    if (beforeStableTarget) {
+      return { ok: false, method: initial?.method, detail: `thread-switch-not-verified: ${threadId}` };
     }
     return { ok: true, method: initial?.method, verified: 'click-dispatched' };
   } catch (e) {
@@ -13585,9 +13784,11 @@ module.exports = {
   newCodexChat,
   // Epic 4 — Terminal output
   readCodexTerminalOutput,
+  codexTerminalEntriesFromMessages,
   writeCodexTerminalInput,
   // Epic 5 — File changes / diff viewer
   readCodexFileChanges,
+  codexFileChangeEntriesFromMessages,
   // Epic 6 — Image/file attachment
   injectCodexImage,
   // Epic 7 — Sandbox status

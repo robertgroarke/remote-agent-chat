@@ -1,0 +1,61 @@
+#!/usr/bin/env node
+'use strict';
+
+const { spawnSync } = require('child_process');
+const path = require('path');
+const { withCodexDesktopCdpLock } = require('../agent-proxy/codex-desktop-cdp-lock');
+
+const root = path.join(__dirname, '..');
+const stepTimeoutMs = Number(process.env.CODEX_DESKTOP_VALIDATE_STEP_TIMEOUT_MS || 60000);
+const steps = [
+  ['proxy syntax', ['--check', 'agent-proxy/proxy-engine.js']],
+  ['selector syntax', ['--check', 'agent-proxy/selectors.js']],
+  ['protocol syntax', ['--check', 'agent-proxy/protocol.js']],
+  ['relay syntax', ['--check', 'relay-server/index.js']],
+  ['target discovery regression', ['tools/codex-desktop-target-discovery-smoke.js']],
+  ['native thread list regression', ['tools/codex-desktop-thread-list-smoke.js']],
+  ['structured terminal and file-change regression', ['tools/codex-desktop-structured-controls-smoke.js']],
+  ['read-only terminal and file-change relay E2E', ['tools/codex-desktop-readonly-controls-e2e.js']],
+  ['active fidelity normalization regression', ['tools/codex-fidelity-normalization-smoke.js']],
+  ['prompt reconnect regression', ['tools/proxy-prompt-reconnect-smoke.js']],
+  ['notice, goal, queue, and action fixture', ['tools/codex-notice-smoke.js']],
+  ['frontend history regression', ['tools/frontend-history-reconnect-smoke.js']],
+  ['frontend transcript fidelity', ['tools/frontend-transcript-fidelity-smoke.js']],
+  ['Codex Desktop CDP regression', ['tools/cdp-regression-smoke.js', '--surfaces', 'codex-desktop', '--strict']],
+  ['native/relay fidelity tail', ['tools/run-fidelity-regression.js', '--surfaces', 'codex-desktop', '--allow-active', '--tail', '40', '--strict']],
+];
+
+function runStep(label, args) {
+  console.log(`\n=== ${label} ===`);
+  const result = spawnSync(process.execPath, args, {
+    cwd: root,
+    encoding: 'utf8',
+    stdio: 'inherit',
+    timeout: stepTimeoutMs,
+  });
+  if (result.error) {
+    if (result.error.code === 'ETIMEDOUT') {
+      throw new Error(`${label} timed out after ${stepTimeoutMs}ms`);
+    }
+    throw result.error;
+  }
+  if (result.status !== 0) {
+    throw new Error(`${label} failed with exit code ${result.status || 1}`);
+  }
+}
+
+async function main() {
+  runStep('CDP serialization regression', ['tools/codex-desktop-cdp-lock-smoke.js']);
+  await withCodexDesktopCdpLock('codex-desktop-validate-all', async () => {
+    for (const [label, args] of steps) {
+      runStep(label, args);
+    }
+  }, { waitMs: 90000 });
+
+  console.log('\nCodex Desktop validate-all: PASS');
+}
+
+main().catch(error => {
+  console.error(error.stack || error.message);
+  process.exit(1);
+});

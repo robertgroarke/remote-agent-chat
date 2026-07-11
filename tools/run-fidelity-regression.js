@@ -6,6 +6,7 @@ const fs = require('fs');
 const path = require('path');
 const selectors = require('../agent-proxy/selectors');
 const sessionStore = require('../agent-proxy/session-store');
+const { withCodexDesktopCdpLock } = require('../agent-proxy/codex-desktop-cdp-lock');
 
 function requireFromLocalOr(dir, mod) {
   try {
@@ -31,6 +32,7 @@ const PORTS = {
 const STATUS_PASS = 'pass';
 const STATUS_FAIL = 'fail_fidelity';
 const STATUS_SKIP = 'skip_precondition';
+const sleep = ms => new Promise(resolve => setTimeout(resolve, ms));
 
 const PATTERNS = {
   claude: [/Anthropic\.claude-code/i],
@@ -287,6 +289,12 @@ function normalizeWindowsPaths(text) {
 function normalizeContent(text) {
   const noTimestamps = stripTimestampOnlyLines(String(text || '').replace(/\r\n/g, '\n'))
     .replace(/\b\d{1,2}:\d{2}\s?(?:AM|PM)(?:,\s*\d{1,2}\/\d{1,2}\/\d{4})?\s*$/i, '')
+    // Active Codex terminal cards continuously rewrite this elapsed label.
+    // Compare the command/output body strictly while ignoring only the
+    // sampling-time-dependent in-progress timer. Completed "Ran ... for Ns"
+    // durations remain untouched and must still match exactly.
+    .replace(/(Running command)(?:\s+for)?\s+(?:(?:\d+h\s*)?(?:\d+m\s*)?\d+s|(?:\d+h\s*)?\d+m)(?=\s|$|[A-Z])/gi, '$1')
+    .replace(/(Working) for\s+(?:(?:\d+h\s*)?(?:\d+m\s*)?\d+s|(?:\d+h\s*)?\d+m)(?=\s|$|[A-Z])/gi, '$1')
     .replace(/([.!?])(?=[A-Z])/g, '$1 ');
   const withNormalizedPaths = normalizeWindowsPaths(noTimestamps);
   return withNormalizedPaths
@@ -635,10 +643,17 @@ async function readWebuiHistory(session, context) {
   return { source: null, messages: null, error: apiResult.error || 'no available history source' };
 }
 
-async function collectNativeTranscript(surface, target, sessionId) {
+async function collectNativeTranscript(surface, target, sessionId, options = {}) {
   if (surface === 'codex-desktop') {
     return withTarget(PORTS.codexDesktop, target, async (Runtime) => {
-      return parseMaybeJson(await selectors.readMessages(Runtime, 'codex-desktop', sessionId || `fidelity-${surface}`), []);
+      const recentTurnLimit = options.tail ? Math.max(24, Math.ceil(options.tail / 2) + 4) : 0;
+      const recentUnitLimit = options.tail ? Math.max(128, options.tail * 3 + 32) : 0;
+      return parseMaybeJson(await selectors.readMessages(
+        Runtime,
+        'codex-desktop',
+        sessionId || `fidelity-${surface}`,
+        recentTurnLimit ? { maxRecentTurns: recentTurnLimit, maxRecentUnits: recentUnitLimit } : {},
+      ), []);
     });
   }
 
@@ -667,8 +682,8 @@ async function collectNativeTranscript(surface, target, sessionId) {
 }
 
 async function runSurfaceComparison(surface, target, mappedSession, context, reporter) {
-  const nativeMessages = await collectNativeTranscript(surface, target, mappedSession?.session_id);
-  const webuiResult = await readWebuiHistory(mappedSession, context);
+  let nativeMessages = await collectNativeTranscript(surface, target, mappedSession?.session_id, context.options);
+  let webuiResult = await readWebuiHistory(mappedSession, context);
 
   if (!Array.isArray(nativeMessages)) {
     reporter.add({
@@ -693,10 +708,10 @@ async function runSurfaceComparison(surface, target, mappedSession, context, rep
     return;
   }
 
-  const normalizedNative = normalizeMessages(nativeMessages, context.options.tail);
-  const normalizedWebui = normalizeMessages(webuiResult.messages, context.options.tail);
-  const normalizedNativeFull = normalizeMessages(nativeMessages, null);
-  const normalizedWebuiFull = normalizeMessages(webuiResult.messages, null);
+  let normalizedNative = normalizeMessages(nativeMessages, context.options.tail);
+  let normalizedWebui = normalizeMessages(webuiResult.messages, context.options.tail);
+  let normalizedNativeFull = normalizeMessages(nativeMessages, null);
+  let normalizedWebuiFull = normalizeMessages(webuiResult.messages, null);
 
   if (!context.options.allowActive) {
     const thinking = surface === 'codex-desktop'
@@ -799,7 +814,62 @@ async function runSurfaceComparison(surface, target, mappedSession, context, rep
     return;
   }
 
-  const previewComparison = compareSequences(normalizedNative, normalizedWebui);
+  let previewComparison = compareSequences(normalizedNative, normalizedWebui);
+  let activeSamplingAttempts = 1;
+  if (surface === 'codex-desktop' && context.options.allowActive && !previewComparison.exact) {
+    // A live relay snapshot is sampled after the native DOM and may represent
+    // either side of a streaming poll boundary. Bracket it with fresh native
+    // reads and refreshed relay snapshots; accept only a fully exact pair.
+    // This removes sampling races without weakening any message comparison.
+    const nativeCandidates = [{
+      messages: nativeMessages,
+      normalized: normalizedNative,
+      full: normalizedNativeFull,
+    }];
+    for (let retry = 0; retry < 4 && !previewComparison.exact; retry++) {
+      await sleep(150);
+      const candidateMessages = await collectNativeTranscript(
+        surface,
+        target,
+        mappedSession?.session_id,
+        context.options,
+      );
+      activeSamplingAttempts++;
+      if (Array.isArray(candidateMessages)) {
+        nativeCandidates.push({
+          messages: candidateMessages,
+          normalized: normalizeMessages(candidateMessages, context.options.tail),
+          full: normalizeMessages(candidateMessages, null),
+        });
+      }
+
+      let exactCandidate = nativeCandidates.find(candidate =>
+        compareSequences(candidate.normalized, normalizedWebui).exact
+      );
+      if (!exactCandidate) {
+        const refreshedWebui = await readWebuiHistory(mappedSession, context);
+        if (Array.isArray(refreshedWebui.messages)) {
+          webuiResult = refreshedWebui;
+          normalizedWebui = normalizeMessages(refreshedWebui.messages, context.options.tail);
+          normalizedWebuiFull = normalizeMessages(refreshedWebui.messages, null);
+          exactCandidate = nativeCandidates.find(candidate =>
+            compareSequences(candidate.normalized, normalizedWebui).exact
+          );
+        }
+      }
+      if (exactCandidate) {
+        nativeMessages = exactCandidate.messages;
+        normalizedNative = exactCandidate.normalized;
+        normalizedNativeFull = exactCandidate.full;
+      } else if (nativeCandidates.length > 0) {
+        const latest = nativeCandidates[nativeCandidates.length - 1];
+        nativeMessages = latest.messages;
+        normalizedNative = latest.normalized;
+        normalizedNativeFull = latest.full;
+      }
+      previewComparison = compareSequences(normalizedNative, normalizedWebui);
+    }
+  }
   const trailingPartial = detectTrailingPartialMismatch(normalizedNative, normalizedWebui, previewComparison);
   if (trailingPartial) {
     reporter.add({
@@ -867,6 +937,7 @@ async function runSurfaceComparison(surface, target, mappedSession, context, rep
       accumulated_window_offset: accumulatedWindowOffset >= 0 ? accumulatedWindowOffset : null,
       accumulated_window_length: passAccumulatedWindow ? normalizedNativeFull.length : null,
       accumulated_subsequence: accumulatedSubsequence,
+      active_sampling_attempts: activeSamplingAttempts,
       exact: comparison.exact,
     },
     investigation_hint: 'Check selector/native DOM first, then proxy session state, then relay history, then frontend rendering',
@@ -978,7 +1049,10 @@ async function runFidelitySuite(options = {}) {
 
 async function main(argv = process.argv.slice(2)) {
   const options = parseArgs(argv);
-  const report = await runFidelitySuite(options);
+  const run = () => runFidelitySuite(options);
+  const report = options.surfaces.includes('codex-desktop')
+    ? await withCodexDesktopCdpLock('codex-desktop-fidelity', run, { waitMs: 90000 })
+    : await run();
 
   if (options.json) {
     const jsonText = JSON.stringify(report, null, 2);

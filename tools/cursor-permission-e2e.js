@@ -79,6 +79,7 @@ async function main() {
   const runId = crypto.randomBytes(4).toString('hex');
   const cdpTarget = await findCdpTarget();
   const { ws, messages } = await openRelay(deriveRelayWsUrl());
+  let client = null;
 
   try {
     const session = await waitFor(() => {
@@ -101,8 +102,9 @@ async function main() {
       'auto-approve off'
     );
 
-    const prompt = `Run exactly this shell command and wait for my approval before executing: echo RAC_PERM_E2E_${runId}`;
+    const prompt = `Prepare exactly this shell command but do not execute it yet: echo RAC_PERM_E2E_${runId}. Reply exactly: PENDING COMMAND echo RAC_PERM_E2E_${runId} awaiting your approval.`;
     const requestId = `perm-e2e-${runId}`;
+    const promptStart = messages.length;
     ws.send(JSON.stringify({ type: 'send', session: sessionId, content: prompt, client_message_id: requestId }));
 
     await waitFor(
@@ -112,11 +114,20 @@ async function main() {
     );
 
     const promptMsg = await waitFor(
-      () => messages.find((m) => m.type === 'permission_prompt' && (m.session_id === sessionId || m.session === sessionId)),
+      () => messages.slice(promptStart).find((m) =>
+        m.type === 'permission_prompt'
+        && (m.session_id === sessionId || m.session === sessionId)
+        && String(m.message || '').includes(`RAC_PERM_E2E_${runId}`)
+      ),
       120000,
       'permission_prompt'
     );
     console.log('permission_prompt', promptMsg.prompt_id, (promptMsg.choices || []).map((c) => c.choice_id));
+
+    client = await CDP({ port: CDP_PORT, target: cdpTarget.id });
+    await client.Runtime.enable();
+    const baselineMessages = JSON.parse(await cursorSel.readCursorMessages(client.Runtime) || '[]');
+    const baselineSerialized = JSON.stringify(baselineMessages);
 
     const respId = `perm-resp-${runId}`;
     ws.send(JSON.stringify({
@@ -135,17 +146,22 @@ async function main() {
     if (ctrl.result !== 'ok') throw new Error(`permission_response failed: ${ctrl.result} ${ctrl.error?.message || ''}`);
     console.log('permission_response ok');
 
-    const client = await CDP({ port: CDP_PORT, target: cdpTarget.id });
-    try {
-      await client.Runtime.enable();
+    await waitFor(async () => {
+      const nativeMessages = JSON.parse(await cursorSel.readCursorMessages(client.Runtime) || '[]');
+      const serialized = JSON.stringify(nativeMessages);
+      // Cursor virtualizes older pairs, so the visible native window can remain
+      // a fixed length while the approved pair replaces rows at the top.
+      const changedMessages = nativeMessages.slice(-4);
+      const blocks = changedMessages.flatMap((message) => Array.isArray(message.content_blocks) ? message.content_blocks : []);
+      const commandTool = blocks.some((block) => block?.type === 'tool_call');
+      const commandTokenVisible = JSON.stringify(changedMessages).includes(`RAC_PERM_E2E_${runId}`);
       const still = await cursorSel.detectCursorPermissionDialog(client.Runtime);
-      if (still && still.choices?.length) console.warn('WARN permission dialog still visible after allow');
-    } finally {
-      try { await client.close(); } catch {}
-    }
+      return serialized !== baselineSerialized && commandTool && commandTokenVisible && !(still && still.choices?.length);
+    }, 90000, 'approved command attempt and prompt clearance');
 
     console.log('PASS cursor permission relay E2E');
   } finally {
+    try { await client?.close(); } catch {}
     try { ws.close(); } catch {}
   }
 }

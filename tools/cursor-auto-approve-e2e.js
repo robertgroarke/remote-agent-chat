@@ -64,6 +64,7 @@ function sessionIdOf(session) {
 
 async function setAutoApprove(ws, messages, sessionId, enabled) {
   const requestId = `autoap-${crypto.randomBytes(4).toString('hex')}`;
+  const startIndex = messages.length;
   ws.send(JSON.stringify({
     type: 'agent_set_auto_approve_permissions',
     session_id: sessionId,
@@ -77,7 +78,11 @@ async function setAutoApprove(ws, messages, sessionId, enabled) {
   );
   if (ctrl.result !== 'ok') throw new Error(`toggle failed: ${ctrl.result}`);
   const cfg = await waitFor(
-    () => messages.find((m) => m.type === 'agent_config' && (m.session_id === sessionId || m.session === sessionId)),
+    () => messages.slice(startIndex).find((m) =>
+      m.type === 'agent_config'
+      && (m.session_id === sessionId || m.session === sessionId)
+      && m.auto_approve_permissions === enabled
+    ),
     15000,
     'agent_config after toggle'
   );
@@ -111,11 +116,7 @@ async function main() {
     }
     console.log('PASS capability flag true');
 
-    const beforeLen = messages.length;
-    await setAutoApprove(ws, messages, SESSION_ID, true);
-    const cfgOn = messages.slice(beforeLen).find(
-      (m) => m.type === 'agent_config' && (m.session_id === SESSION_ID || m.session === SESSION_ID) && m.auto_approve_permissions === true
-    ) || messages.filter((m) => m.type === 'agent_config' && (m.session_id === SESSION_ID || m.session === SESSION_ID)).pop();
+    const cfgOn = await setAutoApprove(ws, messages, SESSION_ID, true);
     if (!cfgOn?.auto_approve_permissions) throw new Error('agent_config auto_approve_permissions not true after ON');
     console.log('PASS toggle ON in agent_config');
 
@@ -127,8 +128,7 @@ async function main() {
     if (!prefHit) throw new Error(`no cursor preference key with auto_approve true (keys: ${prefKeys.join(', ')})`);
     console.log('PASS session-store persisted', prefKeys.find((k) => store.preferences[k]?.auto_approve_permissions));
 
-    await setAutoApprove(ws, messages, SESSION_ID, false);
-    const cfgOff = messages.filter((m) => m.type === 'agent_config' && (m.session_id === SESSION_ID || m.session === SESSION_ID)).pop();
+    const cfgOff = await setAutoApprove(ws, messages, SESSION_ID, false);
     if (cfgOff?.auto_approve_permissions) throw new Error('toggle OFF did not clear agent_config');
     console.log('PASS toggle OFF');
 

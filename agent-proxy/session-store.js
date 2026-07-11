@@ -38,6 +38,19 @@ function _copyForSave() {
         };
       }
     }
+    if (copy.cursor_agent_histories && typeof copy.cursor_agent_histories === 'object') {
+      const size = Buffer.byteLength(JSON.stringify(copy.cursor_agent_histories), 'utf8');
+      if (size > MAX_ACCUMULATED_BYTES) {
+        delete copy.cursor_agent_histories;
+        copy.cursor_agent_histories_omitted = {
+          reason: 'size_limit',
+          thread_count: Object.keys(sess.cursor_agent_histories || {}).length,
+          bytes: size,
+          limit: MAX_ACCUMULATED_BYTES,
+          updated_at: new Date().toISOString(),
+        };
+      }
+    }
     sessions[sid] = copy;
   }
   return { sessions, preferences: _store.preferences || {} };
@@ -104,6 +117,56 @@ function buildTargetSignature(targetUrl, windowTitle, agentType) {
   return crypto.createHash('sha1').update(raw).digest('hex').substring(0, 16);
 }
 
+function _normalizeCursorWorkspacePath(value) {
+  return String(value || '')
+    .trim()
+    .replace(/\//g, '\\')
+    .replace(/\\+$/, '')
+    .toLowerCase();
+}
+
+function _normalizeCursorWorkspaceName(value) {
+  return String(value || '').replace(/\s+/g, ' ').trim().toLowerCase();
+}
+
+function buildCursorStableSignatureSource({ workspacePath, workspaceName, windowTitle }) {
+  const normalizedPath = _normalizeCursorWorkspacePath(workspacePath);
+  if (normalizedPath) return `cursor::workspace::${normalizedPath}`;
+  const normalizedName = _normalizeCursorWorkspaceName(workspaceName || windowTitle || 'cursor');
+  return `cursor::surface::${normalizedName || 'cursor'}`;
+}
+
+function _cursorSessionHistoryDepth(session) {
+  const accumulated = Array.isArray(session?.accumulated_messages)
+    ? session.accumulated_messages.length
+    : 0;
+  const histories = session?.cursor_agent_histories && typeof session.cursor_agent_histories === 'object'
+    ? Object.values(session.cursor_agent_histories)
+    : [];
+  const deepestHistory = histories.reduce((max, messages) => (
+    Array.isArray(messages) ? Math.max(max, messages.length) : max
+  ), 0);
+  return Math.max(accumulated, deepestHistory);
+}
+
+function findCursorStableSession(sessions, { workspacePath, workspaceName, windowTitle }) {
+  const normalizedPath = _normalizeCursorWorkspacePath(workspacePath);
+  const normalizedName = _normalizeCursorWorkspaceName(workspaceName || windowTitle);
+  const matches = Object.entries(sessions || {}).filter(([, session]) => {
+    if (session?.agent_type !== 'cursor') return false;
+    const sessionPath = _normalizeCursorWorkspacePath(session.workspace_path);
+    if (normalizedPath) return sessionPath === normalizedPath;
+    if (sessionPath) return false;
+    return _normalizeCursorWorkspaceName(session.workspace_name || session.window_title) === normalizedName;
+  });
+  matches.sort((a, b) => {
+    const historyDelta = _cursorSessionHistoryDepth(b[1]) - _cursorSessionHistoryDepth(a[1]);
+    if (historyDelta) return historyDelta;
+    return String(a[1]?.created_at || '').localeCompare(String(b[1]?.created_at || ''));
+  });
+  return matches[0] || null;
+}
+
 // ─── Session resolution ───────────────────────────────────────────────────────
 //
 // Given a discovered CDP target, find or create the durable session record.
@@ -116,6 +179,27 @@ function resolveSession({ target, windowTitle, agentType, workspaceName, workspa
   const targetSignature = sigOverride
     ? crypto.createHash('sha1').update(sigOverride).digest('hex').substring(0, 16)
     : buildTargetSignature(target.url, windowTitle, agentType);
+
+  // Cursor target IDs change on every full app restart. Resolve its stable
+  // workspace identity before the generic signature/target matches so a short
+  // duplicate created by an earlier failed restart cannot take precedence over
+  // the original durable transcript.
+  const cursorMatch = agentType === 'cursor'
+    ? findCursorStableSession(_store.sessions, { workspacePath, workspaceName, windowTitle })
+    : null;
+  if (cursorMatch) {
+    const [sid, sess] = cursorMatch;
+    sess.target_signature = targetSignature;
+    sess.target_id = target.id;
+    sess.last_seen_at = new Date().toISOString();
+    sess.status = 'healthy';
+    if (windowTitle) sess.window_title = windowTitle;
+    if (workspaceName && !/^window-\d+$/.test(workspaceName)) sess.workspace_name = workspaceName;
+    if (workspacePath) sess.workspace_path = workspacePath;
+    _saveStore();
+    console.log(`[session-store] Matched ${sid} via stable Cursor workspace (sig migrated to ${targetSignature})`);
+    return { ...sess, _matched_existing: true };
+  }
 
   // Primary match: same signature (stable URL parameters)
   for (const [sid, sess] of Object.entries(_store.sessions)) {
@@ -316,6 +400,8 @@ function getAllSessions() {
 }
 
 module.exports = {
+  buildCursorStableSignatureSource,
+  findCursorStableSession,
   resolveSession,
   resolveVirtualSession,
   updateSession,

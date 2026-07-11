@@ -164,6 +164,7 @@ function historyChunk(sessionId, options = {}) {
     partial = false,
     complete = !partial,
     source = 'native',
+    replace = false,
     error = null,
   } = options;
   const cursor = {
@@ -180,6 +181,7 @@ function historyChunk(sessionId, options = {}) {
     request_id: requestId || null,
     mode,
     source,
+    replace: !!replace,
     messages: Array.isArray(messages) ? messages : [],
     partial: !!partial,
     complete: !!complete,
