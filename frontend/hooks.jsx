@@ -106,6 +106,42 @@ export function removeSupersededCliTranscriptPlaceholders(messages) {
   return current.filter(message => !isPendingPlaceholder(message));
 }
 
+export function shouldRefreshNativeCliPlaceholder(session, messages) {
+  const agentType = session?.agent_type || session?.agentType || '';
+  if (agentType !== 'codex_cli' && agentType !== 'cursor_cli') return false;
+  if (!Array.isArray(messages) || messages.length !== 1) return false;
+  const only = messages[0];
+  if (only?.role !== 'assistant') return false;
+  return /\*\*(?:Codex|Cursor) CLI is waiting for a native transcript\.\*\*/.test(String(only.content || ''));
+}
+
+export function sessionMetadataActivityMaps(sessionList) {
+  const activities = {};
+  const thinkingContent = {};
+  const thinking = {};
+  (sessionList || []).forEach(session => {
+    if (!session || typeof session !== 'object' || !session.session_id || !session.activity) return;
+    const kind = session.activity.kind || 'working';
+    const label = session.activity.label || (kind === 'idle' ? '' : 'Working');
+    activities[session.session_id] = {
+      kind,
+      label,
+      updatedAt: session.activity.updated_at || null,
+      startedAt: session.activity.started_at || null,
+      interruptHint: session.activity.interrupt_hint || '',
+      goal: session.activity.goal || null,
+      task_list: session.activity.task_list || null,
+      context_card: session.activity.context_card || null,
+      thinkingContent: session.activity.thinkingContent || '',
+    };
+    thinkingContent[session.session_id] = session.activity.thinkingContent || '';
+    thinking[session.session_id] = ['thinking', 'generating', 'running_command', 'applying_patch', 'reading_files', 'working'].includes(kind)
+      ? label
+      : false;
+  });
+  return { activities, thinkingContent, thinking };
+}
+
 export function useRelay() {
     const [sessions,        setSessions]        = useState([]);   // string IDs (legacy) or metadata objects (v1)
     const [messages,        setMessages]        = useState({});   // sessionId -> [{role, content, _cid?, _optimistic?, _delivered?}]
@@ -186,34 +222,10 @@ export function useRelay() {
     useEffect(() => { connect(); }, [connect]);
 
     function mergeSessionMetadataActivity(sessionList) {
-      const next = {};
-      const nextThinkingContent = {};
-      const nextThinking = {};
-      (sessionList || []).forEach(session => {
-        if (!session || typeof session !== 'object' || !session.session_id || !session.activity) return;
-        const kind = session.activity.kind || 'working';
-        const label = session.activity.label || (kind === 'idle' ? '' : 'Working');
-        next[session.session_id] = {
-          kind,
-          label,
-          updatedAt: session.activity.updated_at || null,
-          startedAt: session.activity.started_at || null,
-          interruptHint: session.activity.interrupt_hint || '',
-          goal: session.activity.goal || null,
-          task_list: session.activity.task_list || null,
-          context_card: session.activity.context_card || null,
-          thinkingContent: session.activity.thinkingContent || '',
-        };
-        if (session.activity.thinkingContent != null) {
-          nextThinkingContent[session.session_id] = session.activity.thinkingContent || '';
-        }
-        if (['thinking', 'generating', 'running_command', 'applying_patch', 'reading_files', 'working'].includes(kind)) {
-          nextThinking[session.session_id] = label;
-        }
-      });
-      setActivities(prev => shallowMapMerge(prev, next));
-      setThinkingContent(prev => shallowMapMerge(prev, nextThinkingContent));
-      setThinking(prev => shallowMapMerge(prev, nextThinking));
+      const normalized = sessionMetadataActivityMaps(sessionList);
+      setActivities(prev => shallowMapMerge(prev, normalized.activities));
+      setThinkingContent(prev => shallowMapMerge(prev, normalized.thinkingContent));
+      setThinking(prev => shallowMapMerge(prev, normalized.thinking));
     }
 
     function mergeSessionConfigHints(sessionList) {

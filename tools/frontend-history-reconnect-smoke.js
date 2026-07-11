@@ -108,9 +108,28 @@ vm.runInContext(built.outputFiles[0].text, context, { filename: 'hooks.bundle.cj
 const shouldMergeHistorySnapshot = moduleRecord.exports.shouldMergeHistorySnapshot;
 const mergeHistoryTailByOverlap = moduleRecord.exports.mergeHistoryTailByOverlap;
 const removeSupersededCliTranscriptPlaceholders = moduleRecord.exports.removeSupersededCliTranscriptPlaceholders;
+const shouldRefreshNativeCliPlaceholder = moduleRecord.exports.shouldRefreshNativeCliPlaceholder;
+const sessionMetadataActivityMaps = moduleRecord.exports.sessionMetadataActivityMaps;
 assert.equal(typeof shouldMergeHistorySnapshot, 'function');
 assert.equal(typeof mergeHistoryTailByOverlap, 'function');
 assert.equal(typeof removeSupersededCliTranscriptPlaceholders, 'function');
+assert.equal(typeof shouldRefreshNativeCliPlaceholder, 'function');
+assert.equal(typeof sessionMetadataActivityMaps, 'function');
+assert.deepEqual(
+  sessionMetadataActivityMaps([
+    { session_id: 'active-cli', activity: { kind: 'generating', label: 'Working', thinkingContent: 'running' } },
+    { session_id: 'idle-cli', activity: { kind: 'idle', label: '', thinkingContent: '' } },
+  ]),
+  {
+    activities: {
+      'active-cli': { kind: 'generating', label: 'Working', updatedAt: null, startedAt: null, interruptHint: '', goal: null, task_list: null, context_card: null, thinkingContent: 'running' },
+      'idle-cli': { kind: 'idle', label: '', updatedAt: null, startedAt: null, interruptHint: '', goal: null, task_list: null, context_card: null, thinkingContent: '' },
+    },
+    thinkingContent: { 'active-cli': 'running', 'idle-cli': '' },
+    thinking: { 'active-cli': 'Working', 'idle-cli': false },
+  },
+  'session snapshots must explicitly clear stale thinking state for idle sessions',
+);
 const staleCodexPlaceholder = {
   role: 'assistant',
   content: '**Codex CLI is waiting for a native transcript.**\n\nOnce Codex creates or updates the JSONL transcript file, this placeholder will be replaced with the real CLI chat history.',
@@ -119,6 +138,25 @@ assert.strictEqual(
   removeSupersededCliTranscriptPlaceholders([staleCodexPlaceholder])[0],
   staleCodexPlaceholder,
   'a genuinely pending CLI session must retain its only placeholder',
+);
+assert.equal(
+  shouldRefreshNativeCliPlaceholder({ agent_type: 'codex_cli' }, [staleCodexPlaceholder]),
+  true,
+  'a selected Codex CLI placeholder must trigger a native history refresh after proxy reconnect',
+);
+const staleCursorPlaceholder = {
+  role: 'assistant',
+  content: '**Cursor CLI is waiting for a native transcript.**\n\nOnce Cursor Agent creates or updates the JSONL transcript file, this placeholder will be replaced with the real CLI chat history.',
+};
+assert.equal(
+  shouldRefreshNativeCliPlaceholder({ agent_type: 'cursor_cli' }, [staleCursorPlaceholder]),
+  true,
+  'a selected Cursor CLI placeholder must trigger a native history refresh after proxy reconnect',
+);
+assert.equal(
+  shouldRefreshNativeCliPlaceholder({ agent_type: 'cursor_cli' }, [staleCursorPlaceholder, { role: 'user', content: 'real turn' }]),
+  false,
+  'real Cursor CLI history must not trigger repeated placeholder refreshes',
 );
 assert.deepEqual(
   removeSupersededCliTranscriptPlaceholders([

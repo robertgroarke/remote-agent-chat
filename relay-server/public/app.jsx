@@ -3,7 +3,7 @@
 
 import { getLang, isTextFile, sessionLabel } from './file-utils.js';
 import { MarkdownContent } from './markdown.js';
-import { useRelay } from './hooks.jsx';
+import { shouldRefreshNativeCliPlaceholder, useRelay } from './hooks.jsx';
 
 const { useState, useRef, useEffect, useLayoutEffect } = React;
 
@@ -3737,6 +3737,7 @@ function App() {
   const activeMessagesForScroll = activeSession && messages[activeSession]
     ? messages[activeSession]
     : EMPTY_MESSAGES;
+  const activeNativeCliPlaceholder = shouldRefreshNativeCliPlaceholder(activeSessionMeta, activeMessagesForScroll);
   const activeActivityForScroll = activeSession ? activities[activeSession] : null;
   const activeThinkingForScroll = activeSession ? (thinkingContent[activeSession] || '') : '';
   const activePermissionPromptForScroll = activeSession ? permissionPrompts[activeSession] || null : null;
@@ -4367,6 +4368,11 @@ async function uploadBinaryDraft(sessionId, base64, mimeType, filename) {
     const chunkSource = (activeSessionMeta?.agent_type === 'codex_cli' || activeSessionMeta?.agent_type === 'cursor_cli') ? 'native' : 'relay_sqlite';
     requestHistoryChunk(activeSession, { ...tailOptions, mode: 'tail', source: chunkSource });
   }, [activeSession, connected, activeSessionMeta?.agent_type]);
+  useEffect(() => {
+    if (!activeSession || !connected || !activeNativeCliPlaceholder) return;
+    const tailOptions = historyRequestOptionsFor(activeSessionMeta);
+    requestHistoryChunk(activeSession, { ...tailOptions, mode: 'tail', source: 'native' });
+  }, [activeSession, connected, activeNativeCliPlaceholder]);
   const isAntigravityV2 = activeSessionMeta?.agent_type === 'antigravity-v2';
   const rawActiveChatList = activeSession ? (chatLists[activeSession] || []) : [];
   const optimisticV2Focus = activeSession ? optimisticV2ChatFocus[activeSession] : null;
@@ -5122,7 +5128,7 @@ async function uploadBinaryDraft(sessionId, base64, mimeType, filename) {
                   {activeConfig?.capabilities?.native_window && (
                     <button
                       className="context-pill open-panel-btn"
-                      title="Open this Claude CLI session in a native command window"
+                      title={`Open this ${agentTypeLabel(activeSessionMeta?.agent_type) || 'CLI'} session in a native command window`}
                       onClick={() => openNativeWindow(activeSession)}
                     >
                       native

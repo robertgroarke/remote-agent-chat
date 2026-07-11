@@ -454,10 +454,11 @@ class ProxyEngine extends EventEmitter {
       set_mode:               agentType === 'antigravity' || isClineLike,
       permission_mode_change: agentType === 'claude' || isClaudeCli || isCodexCli || isCursorCli || agentType === 'continue_yolo' || isRooCode,
       auto_approve_permissions_toggle: agentType === 'continue' || agentType === 'continue_yolo' || agentType === 'antigravity_panel' || agentType === 'cursor',
-      // Headless `codex exec` has no actionable approval dialog channel. Its
-      // sandbox/access mode is configurable, but native prompts cannot be
-      // answered through the JSONL transport, so do not advertise that control.
-      permission_dialogs:     isClaude || isClaudeCli || isCursorCli || isCodex || agentType === 'antigravity' || agentType === 'antigravity_panel' || isContinue || isClineLike || isCursor,
+      // Headless Codex/Cursor CLI runs have no actionable approval-dialog
+      // channel. Their sandbox/access modes are configurable, but native
+      // prompts cannot be answered through the JSONL transport, so do not
+      // advertise that control.
+      permission_dialogs:     isClaude || isClaudeCli || isCodex || agentType === 'antigravity' || agentType === 'antigravity_panel' || isContinue || isClineLike || isCursor,
       set_codex_config:       isCodex,
       set_effort:             isClaudeCli || isCodexCli,
       new_thread:             isDesktop,
@@ -1837,6 +1838,16 @@ class ProxyEngine extends EventEmitter {
             }));
             return;
           }
+        } else if (sessionData.agentType === 'cursor_cli' && sessionData[childKey]) {
+          sessionData._cursorCliInterrupted = true;
+          const stopped = cursorCli.stopCursorExecSession(sessionData[childKey]);
+          if (!stopped.ok) {
+            sessionData._cursorCliInterrupted = false;
+            this._sendToRelay(proto.agentControlResult(sid, msg.request_id, 'agent_interrupt', 'failed', {
+              code: 'interrupt_failed', message: stopped.detail || 'Could not stop Cursor CLI process tree',
+            }));
+            return;
+          }
         } else if (sessionData[childKey]) {
           try { sessionData[childKey].kill(); } catch {}
           sessionData[childKey] = null;
@@ -1846,6 +1857,7 @@ class ProxyEngine extends EventEmitter {
         sessionStore.updateSession(sid, {
           activity,
           ...(sessionData.agentType === 'codex_cli' ? { codex_cli_interrupted: true } : {}),
+          ...(sessionData.agentType === 'cursor_cli' ? { cursor_cli_interrupted: true } : {}),
         });
         this._sendToRelay(proto.proxyStatus(sid, sessionData.status || 'healthy', activity));
         this._sendToRelay(proto.agentControlResult(sid, msg.request_id, 'agent_interrupt', 'ok'));
@@ -2091,9 +2103,11 @@ class ProxyEngine extends EventEmitter {
         const cliAgentType = sessionData.agentType;
         sessionData.model_id = modelId || 'default';
         if (cliAgentType === 'codex_cli') sessionData.codexCliModelConfigured = true;
+        if (cliAgentType === 'cursor_cli') sessionData.cursorCliModelConfigured = true;
         sessionStore.updateSession(sid, {
           model_id: sessionData.model_id,
           ...(cliAgentType === 'codex_cli' ? { codex_cli_model_configured: true } : {}),
+          ...(cliAgentType === 'cursor_cli' ? { cursor_cli_model_configured: true } : {}),
         });
         const merged = this._decorateAgentConfig(sessionData, this._mergeAgentConfig(cliAgentType, {
           model_id: sessionData.model_id,
@@ -2248,9 +2262,11 @@ class ProxyEngine extends EventEmitter {
               : 'default'
         );
         if (agentT === 'codex_cli') sessionData.codexCliPermissionConfigured = true;
+        if (agentT === 'cursor_cli') sessionData.cursorCliPermissionConfigured = true;
         sessionStore.updateSession(sid, {
           permission_mode: sessionData.permission_mode,
           ...(agentT === 'codex_cli' ? { codex_cli_permission_configured: true } : {}),
+          ...(agentT === 'cursor_cli' ? { cursor_cli_permission_configured: true } : {}),
         });
         const merged = this._decorateAgentConfig(sessionData, this._mergeAgentConfig(agentT, {
           model_id: sessionData.model_id,
@@ -3149,6 +3165,8 @@ class ProxyEngine extends EventEmitter {
                 cliSessionId,
                 resume: chatCreated,
                 model: newSession.model_id,
+                permissionMode: newSession.permission_mode,
+                sandbox: newSession.sandbox,
                 title: `${workspaceName} - Cursor CLI`,
               });
               newSession.nativeCliStartedAt = summary.nativeCliStartedAt;
@@ -3892,6 +3910,8 @@ class ProxyEngine extends EventEmitter {
             cliSessionId,
             resume: shouldResumeNative,
             model: sessionData.model_id,
+            permissionMode: sessionData.permission_mode,
+            sandbox: sessionData.sandbox,
             title: `${sessionData.workspace_name || 'Cursor'} - Cursor CLI`,
           });
         } else {
@@ -4168,6 +4188,8 @@ class ProxyEngine extends EventEmitter {
               cliSessionId,
               resume: chatCreated || isResume,
               model: modelId,
+              permissionMode,
+              sandbox: session.sandbox,
               title: `${session.workspace_name || workspaceName} - Cursor CLI`,
             });
             session.nativeCliStartedAt = summary.nativeCliStartedAt;
@@ -7114,7 +7136,10 @@ class ProxyEngine extends EventEmitter {
   }
 
   _setCursorCliActivity(sessionId, session, activity) {
-    const nextActivity = activity || { kind: 'idle', label: '', updated_at: new Date().toISOString() };
+    const observedActivity = activity || { kind: 'idle', label: '', updated_at: new Date().toISOString() };
+    const nextActivity = session._cursorCliInterrupted === true
+      ? { kind: 'idle', label: 'Interrupted', updated_at: session.activity?.updated_at || new Date().toISOString() }
+      : observedActivity;
     const prevSig = this._activitySemanticSignature(session.activity || null);
     const nextSig = this._activitySemanticSignature(nextActivity);
     if (prevSig === nextSig) return false;
@@ -7128,6 +7153,7 @@ class ProxyEngine extends EventEmitter {
 
   _buildCursorCliSessionFromSummary(sessionMeta, summary) {
     const now = new Date().toISOString();
+    const interrupted = sessionMeta.cursor_cli_interrupted === true;
     return {
       session_id: sessionMeta.session_id,
       display_name: sessionMeta.display_name || 'Cursor CLI',
@@ -7146,7 +7172,9 @@ class ProxyEngine extends EventEmitter {
       thinkingLabel: '',
       autoApprovePermissions: false,
       status: 'healthy',
-      activity: summary.activity || sessionMeta.activity || { kind: 'idle', label: '', updated_at: now },
+      activity: interrupted
+        ? { kind: 'idle', label: 'Interrupted', updated_at: sessionMeta.activity?.updated_at || now }
+        : (summary.activity || sessionMeta.activity || { kind: 'idle', label: '', updated_at: now }),
       last_seen_at: summary.updatedAt || now,
       windowTitle: sessionMeta.window_title || summary.workspaceName || 'Cursor CLI',
       agentType: 'cursor_cli',
@@ -7163,6 +7191,9 @@ class ProxyEngine extends EventEmitter {
       model_id: sessionMeta.model_id || summary.model_id || 'grok-4.5-fast-high',
       permission_mode: sessionMeta.permission_mode || summary.permission_mode || 'force',
       sandbox: sessionMeta.sandbox || summary.sandbox || 'disabled',
+      cursorCliModelConfigured: sessionMeta.cursor_cli_model_configured === true,
+      cursorCliPermissionConfigured: sessionMeta.cursor_cli_permission_configured === true,
+      _cursorCliInterrupted: interrupted,
     };
   }
 
@@ -7191,11 +7222,11 @@ class ProxyEngine extends EventEmitter {
       session.cursorCliFilePath = summary.filePath;
       changed = true;
     }
-    if (summary.model_id && summary.model_id !== session.model_id) {
+    if (session.cursorCliModelConfigured !== true && summary.model_id && summary.model_id !== session.model_id) {
       session.model_id = summary.model_id;
       changed = true;
     }
-    if (summary.permission_mode && summary.permission_mode !== session.permission_mode) {
+    if (session.cursorCliPermissionConfigured !== true && summary.permission_mode && summary.permission_mode !== session.permission_mode) {
       session.permission_mode = summary.permission_mode;
       changed = true;
     }
@@ -7230,8 +7261,8 @@ class ProxyEngine extends EventEmitter {
       existing.cursorCliArchiveDiscovered = archiveDiscovered === true;
       if (summary.cursorCliChatCreated === true) existing.cursorCliChatCreated = true;
       existing.cliSessionId = summary.cliSessionId;
-      if (summary.model_id) existing.model_id = summary.model_id;
-      this._setCursorCliActivity(sessionId, existing, summary.activity || existing.activity);
+      if (existing.cursorCliModelConfigured !== true && summary.model_id) existing.model_id = summary.model_id;
+      this._setCursorCliActivity(sessionId, existing, summary.activity);
       sessionStore.updateSession(sessionId, {
         cli_session_id: existing.cliSessionId,
         cursor_cli_file_path: existing.cursorCliFilePath || null,
@@ -7242,19 +7273,25 @@ class ProxyEngine extends EventEmitter {
         workspace_name: existing.workspace_name || null,
       });
       if (metaChanged) this._broadcastSessionSnapshot();
-      const effectiveMessages = (summary.messages || []).length > 0 ? summary.messages : this._cursorCliPendingTranscriptMessages(existing);
-      const sig = this._transcriptSignature(effectiveMessages);
-      if (sig !== existing.lastTranscriptSig) {
-        existing.lastTranscriptSig = sig;
-        existing.lastObservedCount = effectiveMessages.length;
-        existing.lastMessageCount = effectiveMessages.length;
-        this._sendHistorySnapshot(sessionId, effectiveMessages, 'cursor cli file attached');
-        if (summary.messagesPartial === true) {
-          this._sendCursorCliLiveTailChunk(sessionId, existing, 'cursor cli file attached');
+      if (cursorCli.shouldApplyCursorSummaryHistory(summary, sendInitialHistory)) {
+        const effectiveMessages = (summary.messages || []).length > 0 ? summary.messages : this._cursorCliPendingTranscriptMessages(existing);
+        const sig = this._transcriptSignature(effectiveMessages);
+        if (sig !== existing.lastTranscriptSig) {
+          existing.lastTranscriptSig = sig;
+          existing.lastObservedCount = effectiveMessages.length;
+          existing.lastMessageCount = effectiveMessages.length;
+          this._sendHistorySnapshot(sessionId, effectiveMessages, 'cursor cli file attached');
+          if (summary.messagesPartial === true) {
+            this._sendCursorCliLiveTailChunk(sessionId, existing, 'cursor cli file attached');
+          }
         }
       }
       return existing;
     }
+    const storedConfig = sessionStore.getAllSessions().find(sess => (
+      sess.agent_type === 'cursor_cli'
+      && (sess.cli_session_id === summary.cliSessionId || sess.virtual_id === `cursor-cli:${summary.cliSessionId}`)
+    ));
     const sessionMeta = sessionStore.resolveVirtualSession({
       virtualId: `cursor-cli:${summary.cliSessionId}`,
       agentType: 'cursor_cli',
@@ -7268,8 +7305,8 @@ class ProxyEngine extends EventEmitter {
         cursor_cli_archive_discovered: archiveDiscovered === true,
         cursor_cli_chat_created: summary.cursorCliChatCreated === true || undefined,
         chat_title: summary.title || null,
-        model_id: summary.model_id || undefined,
-        permission_mode: summary.permission_mode || undefined,
+        model_id: storedConfig?.cursor_cli_model_configured === true ? undefined : (summary.model_id || undefined),
+        permission_mode: storedConfig?.cursor_cli_permission_configured === true ? undefined : (summary.permission_mode || undefined),
         native_cli_started_at: summary.nativeCliStartedAt || undefined,
         native_cli_status: summary.nativeCliStatus || undefined,
         native_cli_window_opened: summary.nativeCliWindowOpened === true || undefined,
@@ -7282,26 +7319,29 @@ class ProxyEngine extends EventEmitter {
       existing.cursorCliArchiveDiscovered = archiveDiscovered === true;
       if (summary.cursorCliChatCreated === true) existing.cursorCliChatCreated = true;
       existing.cliSessionId = summary.cliSessionId;
-      if (summary.model_id) existing.model_id = summary.model_id;
-      if (summary.permission_mode) existing.permission_mode = summary.permission_mode;
-      this._setCursorCliActivity(sessionId, existing, summary.activity || existing.activity);
+      if (existing.cursorCliModelConfigured !== true && summary.model_id) existing.model_id = summary.model_id;
+      if (existing.cursorCliPermissionConfigured !== true && summary.permission_mode) existing.permission_mode = summary.permission_mode;
+      this._setCursorCliActivity(sessionId, existing, summary.activity);
       if (metaChanged) this._broadcastSessionSnapshot();
-      const summaryMessages = summary.messages || [];
-      const effectiveMessages = summaryMessages.length > 0 ? summaryMessages : this._cursorCliPendingTranscriptMessages(existing);
-      const sig = this._transcriptSignature(effectiveMessages);
-      if (sig !== existing.lastTranscriptSig) {
-        existing.lastTranscriptSig = sig;
-        existing.lastObservedCount = effectiveMessages.length;
-        existing.lastMessageCount = effectiveMessages.length;
-        this._sendHistorySnapshot(sessionId, effectiveMessages, 'cursor cli file changed');
-        if (summary.messagesPartial === true) {
-          this._sendCursorCliLiveTailChunk(sessionId, existing, 'cursor cli file changed');
+      if (cursorCli.shouldApplyCursorSummaryHistory(summary, sendInitialHistory)) {
+        const summaryMessages = summary.messages || [];
+        const effectiveMessages = summaryMessages.length > 0 ? summaryMessages : this._cursorCliPendingTranscriptMessages(existing);
+        const sig = this._transcriptSignature(effectiveMessages);
+        if (sig !== existing.lastTranscriptSig) {
+          existing.lastTranscriptSig = sig;
+          existing.lastObservedCount = effectiveMessages.length;
+          existing.lastMessageCount = effectiveMessages.length;
+          this._sendHistorySnapshot(sessionId, effectiveMessages, 'cursor cli file changed');
+          if (summary.messagesPartial === true) {
+            this._sendCursorCliLiveTailChunk(sessionId, existing, 'cursor cli file changed');
+          }
         }
       }
       return existing;
     }
     const session = this._buildCursorCliSessionFromSummary(sessionMeta, summary);
     this.sessions.set(sessionId, session);
+    sessionStore.updateSession(sessionId, { activity: session.activity });
     this._log('info', `[cursor-cli] registered ${sessionId} cli=${summary.cliSessionId} (${summary.messageCount} msgs)`);
     if (sendInitialHistory) {
       const initialMessages = summary.messages?.length ? summary.messages : this._cursorCliPendingTranscriptMessages(session);
@@ -7503,6 +7543,8 @@ class ProxyEngine extends EventEmitter {
     if (session._cursorCliChild) {
       return Promise.resolve({ ok: false, code: 'agent_busy', detail: 'Cursor CLI process is already running' });
     }
+    session._cursorCliInterrupted = false;
+    sessionStore.updateSession(sessionId, { cursor_cli_interrupted: false });
     let cliSessionId = session.cliSessionId || null;
     const existingSummary = this._findCursorCliSummaryByCliId(cliSessionId)
       || (session.cursorCliFilePath
@@ -7545,6 +7587,7 @@ class ProxyEngine extends EventEmitter {
           this._handleCursorCliJsonEvent(session, sessionId, event);
         },
         onExit: (code, err) => {
+          const wasInterrupted = session._cursorCliInterrupted === true;
           if (session._cursorCliChild === child) session._cursorCliChild = null;
           (async () => {
             const resolvedCliSessionId = session.cliSessionId || cliSessionId;
@@ -7568,8 +7611,11 @@ class ProxyEngine extends EventEmitter {
               session.lastMessageCount = effectiveMessages.length;
               session.lastObservedCount = effectiveMessages.length;
               session.lastTranscriptSig = this._transcriptSignature(effectiveMessages);
-            } else {
+            }
+            const failed = !wasInterrupted && (code !== 0 || !!err || !summary);
+            if (failed) {
               const stderr = stderrChunks.join('').trim();
+              this._log('warn', `[cursor-cli] request failed for ${sessionId}: ${stderr || err?.message || `exit ${code}`}`);
               this._sendToRelay(proto.proxyMessage(
                 sessionId,
                 'assistant',
@@ -7578,7 +7624,11 @@ class ProxyEngine extends EventEmitter {
                   : `Cursor CLI failed to start or complete the request.\n\n${stderr || err?.message || `Cursor CLI exited with code ${code}`}`
               ));
             }
-            const activity = { kind: 'idle', label: summary ? '' : 'Cursor CLI failed', updated_at: new Date().toISOString() };
+            const activity = {
+              kind: 'idle',
+              label: wasInterrupted ? 'Interrupted' : (failed ? 'Cursor CLI failed' : ''),
+              updated_at: new Date().toISOString(),
+            };
             session.activity = activity;
             session._cursorCliLiveText = '';
             session.waitingForAssistant = false;
@@ -7589,6 +7639,7 @@ class ProxyEngine extends EventEmitter {
               cli_session_id: session.cliSessionId || cliSessionId || null,
               cursor_cli_file_path: session.cursorCliFilePath || null,
               cursor_cli_archive_discovered: false,
+              cursor_cli_interrupted: wasInterrupted,
             });
             this._sendToRelay(proto.proxyStatus(sessionId, session.status || 'healthy', activity));
             this._broadcastSessionSnapshot();
@@ -7653,8 +7704,8 @@ class ProxyEngine extends EventEmitter {
           if (this._applyCursorCliSummaryMetadata(sessionId, session, summary)) {
             this._broadcastSessionSnapshot();
           }
-          if (summary.model_id) session.model_id = summary.model_id;
-          if (summary.permission_mode) session.permission_mode = summary.permission_mode;
+          if (session.cursorCliModelConfigured !== true && summary.model_id) session.model_id = summary.model_id;
+          if (session.cursorCliPermissionConfigured !== true && summary.permission_mode) session.permission_mode = summary.permission_mode;
         }
       }
     }

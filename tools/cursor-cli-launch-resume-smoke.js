@@ -35,6 +35,7 @@ function assert(cond, msg) {
   assert(shouldResumeLaunch === true, 'launch should resume create-chat id');
 
   await new Promise((resolve, reject) => {
+    let timer;
     const child = cursorCli.startCursorExecSession({
       workspacePath,
       cliSessionId: chatId,
@@ -42,10 +43,14 @@ function assert(cond, msg) {
       content: 'Reply with exactly: CURSOR_CLI_LAUNCH_RESUME_OK',
       model: 'grok-4.5-fast-high',
       permissionMode: 'force',
-      onExit: (code, err) => (err || code !== 0 ? reject(err || new Error('exit ' + code)) : resolve()),
+      onExit: (code, err) => {
+        clearTimeout(timer);
+        if (err || code !== 0) reject(err || new Error('exit ' + code));
+        else resolve();
+      },
     });
-    if (!child) reject(new Error('null child'));
-    setTimeout(() => reject(new Error('timeout')), 120000);
+    if (!child) return reject(new Error('null child'));
+    timer = setTimeout(() => reject(new Error('timeout')), 120000);
   });
 
   const after = cursorCli.readSessionSummary(filePath);
@@ -59,6 +64,7 @@ function assert(cond, msg) {
 
   const before = fs.statSync(filePath).size;
   await new Promise((resolve, reject) => {
+    let timer;
     const child = cursorCli.startCursorExecSession({
       workspacePath: found.workspacePath || workspacePath,
       cliSessionId: found.cliSessionId,
@@ -66,10 +72,14 @@ function assert(cond, msg) {
       content: 'Reply with exactly: CURSOR_CLI_WEB_RESUME_OK',
       model: 'grok-4.5-fast-high',
       permissionMode: 'force',
-      onExit: (code, err) => (err || code !== 0 ? reject(err || new Error('exit ' + code)) : resolve()),
+      onExit: (code, err) => {
+        clearTimeout(timer);
+        if (err || code !== 0) reject(err || new Error('exit ' + code));
+        else resolve();
+      },
     });
-    if (!child) reject(new Error('null child'));
-    setTimeout(() => reject(new Error('timeout')), 120000);
+    if (!child) return reject(new Error('null child'));
+    timer = setTimeout(() => reject(new Error('timeout')), 120000);
   });
   assert(fs.statSync(filePath).size > before, 'web resume did not append');
 

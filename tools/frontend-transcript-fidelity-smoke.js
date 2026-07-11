@@ -41,6 +41,10 @@ assert.match(app, /activity-goal-objective[^\n]*\{goal\.objective\}/,
   'goal status rows must render the native objective as visible text');
 assert(!app.includes("qm.content.substring(0, 77)"),
   'queued Codex content must not be truncated at 80 characters');
+assert(!app.includes('Open this Claude CLI session in a native command window'),
+  'native-window labels must name the selected CLI harness');
+assert.match(app, /Open this \$\{agentTypeLabel\(activeSessionMeta\?\.agent_type\)/,
+  'native-window labels must derive the visible harness name');
 assert.match(app, /function formatGoalElapsed\(goal, nowMs, activity\)[\s\S]*?const liveAnchor = Math\.max\([\s\S]*?activityIsLive/,
   'goal elapsed time must use the current active-task anchor, not idle wall-clock time');
 const goalFormatterSource = app.match(/function formatGoalElapsed\(goal, nowMs, activity\) \{[\s\S]*?\n\}/)?.[0];

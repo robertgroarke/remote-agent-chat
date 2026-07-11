@@ -304,7 +304,7 @@ function buildToolCallBlock(completedEvent, startedEvent) {
       stderr,
       exit_code: exitCode,
       status: failure ? 'failed' : 'completed',
-      collapsed: true,
+      collapsed: false,
       call_id: callId || undefined,
     };
   }
@@ -321,7 +321,7 @@ function buildToolCallBlock(completedEvent, startedEvent) {
     title: description,
     content: content || compactJson(toolData),
     status: 'completed',
-    collapsed: true,
+    collapsed: false,
     tool_name: toolType || undefined,
     call_id: callId || undefined,
   };
@@ -360,7 +360,7 @@ function flushPendingThinking(state, tsMs) {
   pushDedup(state.messages, {
     role: 'assistant',
     content: '',
-    content_blocks: [{ type: 'thinking', title: 'Thinking', content: text, collapsed: true }],
+    content_blocks: [{ type: 'thinking', title: 'Thinking', content: text, collapsed: false }],
     ts,
   });
 }
@@ -745,17 +745,64 @@ function existingFile(value) {
 
 function commandForPath(commandPath) {
   if (/\.m?js$/i.test(commandPath)) return { command: process.execPath, argsPrefix: [commandPath], shell: false };
+  if (process.platform === 'win32' && /\.ps1$/i.test(commandPath)) {
+    return {
+      command: path.join(process.env.SystemRoot || 'C:\\Windows', 'System32', 'WindowsPowerShell', 'v1.0', 'powershell.exe'),
+      argsPrefix: ['-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', commandPath],
+      shell: false,
+    };
+  }
   if (process.platform === 'win32' && /\.(cmd|bat)$/i.test(commandPath)) {
+    // Cursor's generated .cmd launchers forward `%*` through another
+    // PowerShell process. Going through cmd.exe first corrupts embedded quotes
+    // in prompts (for example `-Command "..."`), turning prompt fragments into
+    // Cursor CLI options. Prefer the adjacent PowerShell launcher so spawn can
+    // preserve every argument exactly.
+    const ps1Path = commandPath.replace(/\.(cmd|bat)$/i, '.ps1');
+    if (existingFile(ps1Path)) return commandForPath(ps1Path);
     return { command: 'cmd.exe', argsPrefix: ['/d', '/s', '/c', commandPath], shell: false };
   }
   return { command: commandPath, argsPrefix: [], shell: false };
 }
 
+function resolveVersionedCursorCommand(agentRoot) {
+  if (!agentRoot) return null;
+  const directNode = existingFile(path.join(agentRoot, 'node.exe'));
+  const directIndex = existingFile(path.join(agentRoot, 'index.js'));
+  if (directNode && directIndex) {
+    return { command: directNode, argsPrefix: [directIndex], shell: false };
+  }
+  const versionsRoot = path.join(agentRoot, 'versions');
+  let entries = [];
+  try { entries = fs.readdirSync(versionsRoot, { withFileTypes: true }); } catch {}
+  const candidates = entries
+    .filter(entry => entry.isDirectory() && /^\d{4}\.\d{1,2}\.\d{1,2}(?:-\d{2}-\d{2}-\d{2})?-[a-f0-9]+$/i.test(entry.name))
+    .map(entry => {
+      const dir = path.join(versionsRoot, entry.name);
+      return {
+        name: entry.name,
+        node: existingFile(path.join(dir, 'node.exe')),
+        index: existingFile(path.join(dir, 'index.js')),
+      };
+    })
+    .filter(entry => entry.node && entry.index)
+    .sort((a, b) => b.name.localeCompare(a.name));
+  const latest = candidates[0];
+  return latest ? { command: latest.node, argsPrefix: [latest.index], shell: false } : null;
+}
+
 function resolveCursorCommand() {
   const explicit = existingFile(process.env.CURSOR_CLI_PATH);
-  if (explicit) return commandForPath(explicit);
+  if (explicit) {
+    const installCommand = resolveVersionedCursorCommand(path.dirname(explicit));
+    if (installCommand) return installCommand;
+    return commandForPath(explicit);
+  }
   const localApp = process.env.LOCALAPPDATA || path.join(homeDir(), 'AppData', 'Local');
-  const agentCmd = existingFile(path.join(localApp, 'cursor-agent', 'agent.cmd'));
+  const agentRoot = path.join(localApp, 'cursor-agent');
+  const installCommand = resolveVersionedCursorCommand(agentRoot);
+  if (installCommand) return installCommand;
+  const agentCmd = existingFile(path.join(agentRoot, 'agent.cmd'));
   if (agentCmd) return commandForPath(agentCmd);
   for (const bin of ['agent', 'cursor-agent']) {
     const where = process.platform === 'win32'
@@ -763,7 +810,10 @@ function resolveCursorCommand() {
       : spawnSync('which', [bin], { encoding: 'utf8', timeout: 2000 });
     if (where.status === 0) {
       const found = String(where.stdout || '').split(/\r?\n/).map(s => s.trim()).find(Boolean);
-      if (found) return commandForPath(found);
+      if (found) {
+        const foundInstallCommand = resolveVersionedCursorCommand(path.dirname(found));
+        return foundInstallCommand || commandForPath(found);
+      }
     }
   }
   return null;
@@ -908,6 +958,29 @@ function startCursorExecSession(opts) {
   return child;
 }
 
+function stopCursorExecSession(child) {
+  const pid = Number(child?.pid ?? child);
+  if (!Number.isInteger(pid) || pid <= 0) {
+    return { ok: false, detail: 'No owned Cursor CLI process to stop' };
+  }
+  if (process.platform !== 'win32') {
+    try {
+      child.kill('SIGTERM');
+      return { ok: true, detail: `stopped process ${pid}` };
+    } catch (e) {
+      return { ok: false, detail: e.message };
+    }
+  }
+  const result = spawnSync('taskkill.exe', ['/PID', String(pid), '/T', '/F'], {
+    windowsHide: true,
+    encoding: 'utf8',
+  });
+  const detail = String(result.stdout || result.stderr || '').trim();
+  return result.status === 0
+    ? { ok: true, detail: detail || `stopped process tree ${pid}` }
+    : { ok: false, detail: detail || `taskkill exited with ${result.status}` };
+}
+
 function quoteCmdArg(value) {
   const s = String(value ?? '');
   return `"${s.replace(/"/g, '""')}"`;
@@ -917,12 +990,28 @@ function quotePowerShellString(value) {
   return `'${String(value ?? '').replace(/'/g, "''")}'`;
 }
 
-function startNativeCursorWindow({ workspacePath, cliSessionId, resume = false, model, title } = {}) {
+function buildNativeCursorWindowPowerShell({ cwd, launcherPath } = {}) {
+  return [
+    'Start-Process',
+    '-FilePath', quotePowerShellString('cmd.exe'),
+    '-WorkingDirectory', quotePowerShellString(cwd || process.cwd()),
+    '-ArgumentList', `${quotePowerShellString('/k')}, ${quotePowerShellString(launcherPath)}`,
+    '-WindowStyle', 'Normal',
+    '-PassThru', '|', 'Select-Object', '-ExpandProperty', 'Id',
+  ].join(' ');
+}
+
+function startNativeCursorWindow({ workspacePath, cliSessionId, resume = false, model, permissionMode, sandbox, title } = {}) {
   const cwd = workspacePath || process.cwd();
   const resolved = resolveCursorCommand();
   const baseBin = resolved ? [resolved.command, ...resolved.argsPrefix] : ['agent'];
 
   const args = [];
+  if (permissionMode === 'force' || permissionMode === 'yolo') args.push('--force');
+  else if (permissionMode === 'plan') args.push('--mode', 'plan');
+  else if (permissionMode === 'ask') args.push('--mode', 'ask');
+  if (sandbox === 'enabled' || sandbox === true) args.push('--sandbox', 'enabled');
+  else if (sandbox === 'disabled' || sandbox === false) args.push('--sandbox', 'disabled');
   if (workspacePath) args.push('--workspace', workspacePath);
   if (resume && cliSessionId) args.push('--resume', cliSessionId);
   else if (cliSessionId) args.push('--new-session-id', cliSessionId);
@@ -945,37 +1034,20 @@ function startNativeCursorWindow({ workspacePath, cliSessionId, resume = false, 
     '',
   ].join('\r\n'));
 
-  const wtProbe = spawnSync('where.exe', ['wt'], { encoding: 'utf8', timeout: 1000, windowsHide: true });
-  const hasWt = wtProbe.status === 0 && String(wtProbe.stdout || '').trim();
-
-  let child;
-  if (hasWt) {
-    child = spawn('wt.exe', ['cmd.exe', '/k', launcherPath], {
-      cwd,
-      shell: false,
-      detached: true,
-      stdio: 'ignore',
-      windowsHide: false,
-    });
-  } else {
-    const ps = [
-      'Start-Process',
-      '-FilePath', quotePowerShellString('cmd.exe'),
-      '-WorkingDirectory', quotePowerShellString(cwd),
-      '-ArgumentList', quotePowerShellString(`/k ${quoteCmdArg(launcherPath)}`),
-      '-WindowStyle', 'Normal',
-    ].join(' ');
-    child = spawn('powershell.exe', ['-NoProfile', '-ExecutionPolicy', 'Bypass', '-Command', ps], {
-      cwd,
-      shell: false,
-      detached: true,
-      stdio: 'ignore',
-      windowsHide: true,
-    });
+  const ps = buildNativeCursorWindowPowerShell({ cwd, launcherPath });
+  const result = spawnSync('powershell.exe', ['-NoProfile', '-ExecutionPolicy', 'Bypass', '-Command', ps], {
+    cwd,
+    shell: false,
+    encoding: 'utf8',
+    // Windows 11 delegates visible console sessions through the default terminal.
+    // Hiding this short-lived handoff can create a hidden or failed native session.
+    windowsHide: false,
+  });
+  if (result.status !== 0 || result.error) {
+    const detail = String(result.stderr || result.error?.message || `PowerShell exited ${result.status}`).trim();
+    throw new Error(`Could not open Cursor CLI window: ${detail}`);
   }
-
-  child.unref();
-  return child;
+  return { pid: Number(String(result.stdout || '').trim()) || null };
 }
 
 function watchSessions(onSummary, { onError, debounceMs = 120, summaryOptions = {} } = {}) {
@@ -1056,6 +1128,10 @@ function buildActivityFromState(state, { nowMs = Date.now() } = {}) {
   };
 }
 
+function shouldApplyCursorSummaryHistory(summary, sendInitialHistory = true) {
+  return sendInitialHistory !== false || (Array.isArray(summary?.messages) && summary.messages.length > 0);
+}
+
 module.exports = {
   CURSOR_CLI_MODELS,
   CURSOR_CLI_PERMISSION_MODES,
@@ -1075,7 +1151,10 @@ module.exports = {
   appendStreamEvent,
   ensureSessionFile,
   startCursorExecSession,
+  stopCursorExecSession,
+  buildNativeCursorWindowPowerShell,
   startNativeCursorWindow,
   watchSessions,
   buildActivityFromState,
+  shouldApplyCursorSummaryHistory,
 };

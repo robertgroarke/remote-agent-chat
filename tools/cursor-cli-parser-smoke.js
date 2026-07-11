@@ -2,6 +2,7 @@
 
 const fs = require('fs');
 const crypto = require('crypto');
+const path = require('path');
 const cursorCli = require('../agent-proxy/cursor-cli');
 
 function assert(cond, msg) {
@@ -24,6 +25,30 @@ function writeFixture(events) {
 }
 
 (async () => {
+  const proxySource = fs.readFileSync(path.join(__dirname, '..', 'agent-proxy', 'proxy-engine.js'), 'utf8');
+  assert(
+    /activity: interrupted[\s\S]*\(summary\.activity \|\| sessionMeta\.activity \|\| \{ kind: 'idle', label: '', updated_at: now \}\)/.test(proxySource),
+    'Cursor CLI discovery must preserve interrupted idle and otherwise treat a completed summary as authoritative idle',
+  );
+  assert(
+    (proxySource.match(/_setCursorCliActivity\(sessionId, existing, summary\.activity\);/g) || []).length >= 2,
+    'Cursor CLI re-registration must clear stale stored activity',
+  );
+  assert(
+    /sessionStore\.updateSession\(sessionId, \{ activity: session\.activity \}\);/.test(proxySource),
+    'new Cursor CLI discovery must persist its authoritative activity',
+  );
+  assert(
+    /cursor_cli_model_configured: true/.test(proxySource)
+      && /cursor_cli_permission_configured: true/.test(proxySource),
+    'Cursor CLI configuration controls must persist explicit model and permission choices',
+  );
+  assert(
+    /session\.cursorCliModelConfigured !== true && summary\.model_id/.test(proxySource)
+      && /session\.cursorCliPermissionConfigured !== true && summary\.permission_mode/.test(proxySource),
+    'Cursor CLI discovery must not overwrite explicit configuration with archived metadata',
+  );
+
   console.log('--- parser fixture ---');
   const fixture = writeFixture([
     { type: 'system', subtype: 'init', cwd: 'c:\\temp\\cursor-test', model: 'Cursor Grok 4.5 Medium Fast', permissionMode: 'default' },
@@ -69,6 +94,11 @@ function writeFixture(events) {
   assert(terminalBlock.command === 'echo hello', 'bad terminal.command: ' + terminalBlock.command);
   assert(String(terminalBlock.stdout || '').includes('hello'), 'bad terminal.stdout: ' + terminalBlock.stdout);
   assert(terminalBlock.exit_code === 0, 'bad exit_code: ' + terminalBlock.exit_code);
+  const collapsibleBlocks = fixture.summary.messages
+    .flatMap((m) => m.content_blocks || [])
+    .filter((b) => b.type === 'thinking' || b.type === 'terminal' || b.type === 'tool_call' || b.type === 'file_changes');
+  assert(collapsibleBlocks.length >= 2, 'expected thinking and tool blocks in fixture');
+  assert(collapsibleBlocks.every((b) => b.collapsed === false), 'Cursor CLI transcript blocks must expand by default');
   console.log('PASS parser fixture', {
     messageCount: fixture.summary.messageCount,
     terminal: terminalBlock,
@@ -93,6 +123,7 @@ function writeFixture(events) {
 
   const events = [];
   await new Promise((resolve, reject) => {
+    let timer;
     const child = cursorCli.startCursorExecSession({
       workspacePath,
       cliSessionId: chatId,
@@ -101,10 +132,14 @@ function writeFixture(events) {
       model: 'grok-4.5-fast-high',
       permissionMode: 'force',
       onEvent: (ev) => events.push(ev),
-      onExit: (code, err) => (err || code !== 0 ? reject(err || new Error('exit ' + code)) : resolve()),
+      onExit: (code, err) => {
+        clearTimeout(timer);
+        if (err || code !== 0) reject(err || new Error('exit ' + code));
+        else resolve();
+      },
     });
-    if (!child) reject(new Error('null child'));
-    setTimeout(() => reject(new Error('timeout')), 120000);
+    if (!child) return reject(new Error('null child'));
+    timer = setTimeout(() => reject(new Error('timeout')), 120000);
   });
   assert(events.some((e) => e.type === 'result'), 'no result');
   assert(events.some((e) => e.type === 'assistant'), 'no assistant');
@@ -119,6 +154,7 @@ function writeFixture(events) {
 
   const before = fs.statSync(filePath).size;
   await new Promise((resolve, reject) => {
+    let timer;
     const child = cursorCli.startCursorExecSession({
       workspacePath,
       cliSessionId: chatId,
@@ -126,10 +162,14 @@ function writeFixture(events) {
       content: 'Reply with exactly: CURSOR_CLI_SMOKE_RESUME_OK',
       model: 'grok-4.5-fast-high',
       permissionMode: 'force',
-      onExit: (code, err) => (err || code !== 0 ? reject(err || new Error('exit ' + code)) : resolve()),
+      onExit: (code, err) => {
+        clearTimeout(timer);
+        if (err || code !== 0) reject(err || new Error('exit ' + code));
+        else resolve();
+      },
     });
-    if (!child) reject(new Error('null child'));
-    setTimeout(() => reject(new Error('timeout')), 120000);
+    if (!child) return reject(new Error('null child'));
+    timer = setTimeout(() => reject(new Error('timeout')), 120000);
   });
   const after = cursorCli.readSessionSummary(filePath);
   assert(fs.statSync(filePath).size > before, 'resume did not grow file');
@@ -147,18 +187,25 @@ function writeFixture(events) {
     title: 'Cursor CLI tool smoke',
   });
   await new Promise((resolve, reject) => {
+    let timer;
     const child = cursorCli.startCursorExecSession({
       workspacePath,
       cliSessionId: toolChatId,
       resume: true,
-      content: 'Run the shell command exactly: echo CURSOR_CLI_TOOL_OK',
+      content: process.platform === 'win32'
+        ? 'Run the shell command exactly: powershell -NoProfile -Command "Start-Sleep -Milliseconds 10; Write-Output CURSOR_CLI_TOOL_OK"'
+        : 'Run the shell command exactly: printf CURSOR_CLI_TOOL_OK',
       model: 'grok-4.5-fast-high',
       permissionMode: 'force',
       onEvent: (ev) => toolEvents.push(ev),
-      onExit: (code, err) => (err || code !== 0 ? reject(err || new Error('exit ' + code)) : resolve()),
+      onExit: (code, err) => {
+        clearTimeout(timer);
+        if (err || code !== 0) reject(err || new Error('exit ' + code));
+        else resolve();
+      },
     });
-    if (!child) reject(new Error('null child'));
-    setTimeout(() => reject(new Error('timeout')), 120000);
+    if (!child) return reject(new Error('null child'));
+    timer = setTimeout(() => reject(new Error('timeout')), 120000);
   });
   const toolSummary = cursorCli.readSessionSummary(toolFile);
   const toolBlock = toolSummary.messages.flatMap((m) => m.content_blocks || []).find((b) => b.type === 'terminal' || b.type === 'tool_call');
