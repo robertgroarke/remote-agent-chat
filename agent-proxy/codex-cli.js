@@ -142,7 +142,7 @@ function reasoningText(payload) {
 
 function isCodexContextNoise(text) {
   const trimmed = String(text || '').trim();
-  return /^<environment_context>[\s\S]*<\/environment_context>$/i.test(trimmed)
+  return /^<(?:recommended_plugins|environment_context|codex_internal_context|goal_context|turn_aborted)(?:\s|>)/i.test(trimmed)
     || /^# AGENTS\.md instructions\b/i.test(trimmed);
 }
 
@@ -791,7 +791,7 @@ function applyEntryToState(state, entry) {
         pushDedup(state.messages, {
           role: 'assistant',
           content: 'Reasoning',
-          content_blocks: [{ type: 'thinking', title: 'Reasoning', content: text, collapsed: true }],
+          content_blocks: [{ type: 'thinking', title: 'Reasoning', content: text, collapsed: false }],
           ts,
         });
       }
@@ -885,7 +885,7 @@ function applyEntryToState(state, entry) {
         pushDedup(state.messages, {
           role: 'assistant',
           content: 'Reasoning',
-          content_blocks: [{ type: 'thinking', title: 'Reasoning', content: text, collapsed: true }],
+          content_blocks: [{ type: 'thinking', title: 'Reasoning', content: text, collapsed: false }],
           ts,
         });
       }
@@ -1628,7 +1628,12 @@ function buildCodexArgs({ execMode = false, cliSessionId, resume = true, model, 
     args.push('-c', `model_reasoning_effort="${effort}"`);
   }
   if (permissionMode && permissionMode !== 'default' && permissionMode !== 'unknown') {
-    args.push('-s', permissionMode);
+    // `codex exec resume` has a narrower option surface than `codex exec`:
+    // 0.144.1 rejects `-s/--sandbox` after the resume subcommand. The
+    // underlying config key remains supported, so use it only for exec-resume
+    // while keeping the documented flag for new exec/native TUI launches.
+    if (execResume) args.push('-c', `sandbox_mode="${permissionMode}"`);
+    else args.push('-s', permissionMode);
   }
   if (resume && cliSessionId) args.push(cliSessionId);
   if (Array.isArray(extraArgs) && extraArgs.length > 0) args.push(...extraArgs);
@@ -1704,19 +1709,42 @@ function startCodexExecSession({ workspacePath, cliSessionId, resume = true, con
   return child;
 }
 
-function buildNativeCodexWindowPowerShell({ cwd, launcherPath, elevated = true } = {}) {
+function stopCodexExecSession(child) {
+  const pid = Number(child?.pid ?? child);
+  if (!Number.isInteger(pid) || pid <= 0) {
+    return { ok: false, detail: 'No owned Codex CLI process to stop' };
+  }
+  if (process.platform !== 'win32') {
+    try {
+      child.kill('SIGTERM');
+      return { ok: true, detail: `stopped process ${pid}` };
+    } catch (e) {
+      return { ok: false, detail: e.message };
+    }
+  }
+  const result = spawnSync('taskkill.exe', ['/PID', String(pid), '/T', '/F'], {
+    windowsHide: true,
+    encoding: 'utf8',
+  });
+  const detail = String(result.stdout || result.stderr || '').trim();
+  return result.status === 0
+    ? { ok: true, detail: detail || `stopped process tree ${pid}` }
+    : { ok: false, detail: detail || `taskkill exited with ${result.status}` };
+}
+
+function buildNativeCodexWindowPowerShell({ cwd, launcherPath, elevated = false } = {}) {
   const ps = [
     'Start-Process',
     '-FilePath', quotePowerShellString('cmd.exe'),
     '-WorkingDirectory', quotePowerShellString(cwd || process.cwd()),
-    '-ArgumentList', quotePowerShellString(`/k ${quoteCmdArg(launcherPath)}`),
+    '-ArgumentList', `${quotePowerShellString('/k')}, ${quotePowerShellString(launcherPath)}`,
   ];
   if (elevated) ps.push('-Verb', quotePowerShellString('RunAs'));
-  ps.push('-WindowStyle', 'Normal');
+  ps.push('-WindowStyle', 'Normal', '-PassThru', '|', 'Select-Object', '-ExpandProperty', 'Id');
   return ps.join(' ');
 }
 
-function startNativeCodexWindow({ workspacePath, cliSessionId, resume = true, model, effort, permissionMode, title, elevated = true } = {}) {
+function startNativeCodexWindow({ workspacePath, cliSessionId, resume = true, model, effort, permissionMode, title, elevated = false } = {}) {
   const cwd = workspacePath || process.cwd();
   if (process.platform !== 'win32') {
     const args = buildCodexArgs({ cliSessionId, resume, model, effort, permissionMode, workspacePath: cwd });
@@ -1725,7 +1753,8 @@ function startNativeCodexWindow({ workspacePath, cliSessionId, resume = true, mo
   const args = buildCodexArgs({ cliSessionId, resume, model, effort, permissionMode, workspacePath: cwd });
   const windowTitle = String(title || 'Codex CLI').replace(/["&<>|]/g, '').slice(0, 80) || 'Codex CLI';
   const launcherPath = path.join(os.tmpdir(), `remote-agent-codex-cli-${cliSessionId || Date.now()}.cmd`);
-  const commandLine = ['codex', ...args].map(quoteCmdArg).join(' ');
+  const resolved = resolveCodexCommand();
+  const commandLine = [resolved.command, ...resolved.argsPrefix, ...args].map(quoteCmdArg).join(' ');
   fs.writeFileSync(launcherPath, [
     '@echo off',
     `title ${windowTitle}`,
@@ -1734,16 +1763,21 @@ function startNativeCodexWindow({ workspacePath, cliSessionId, resume = true, mo
     '',
   ].join('\r\n'));
   const ps = buildNativeCodexWindowPowerShell({ cwd, launcherPath, elevated });
-  const child = spawn('powershell.exe', ['-NoProfile', '-ExecutionPolicy', 'Bypass', '-Command', ps], {
+  const result = spawnSync('powershell.exe', ['-NoProfile', '-ExecutionPolicy', 'Bypass', '-Command', ps], {
     cwd,
     shell: false,
-    detached: true,
-    stdio: 'ignore',
-    windowsHide: true,
+    encoding: 'utf8',
+    // Hiding this short-lived launcher causes Windows 11's default-terminal
+    // delegation to create an unusable hidden/failed cmd session. Keep the
+    // launcher visible long enough for Start-Process to hand off the real TUI.
+    windowsHide: false,
   });
-  child.remoteAgentElevated = !!elevated;
-  child.unref();
-  return child;
+  if (result.status !== 0 || result.error) {
+    const detail = String(result.stderr || result.error?.message || `PowerShell exited ${result.status}`).trim();
+    throw new Error(`Could not open Codex CLI window: ${detail}`);
+  }
+  const pid = Number(String(result.stdout || '').trim()) || null;
+  return { pid, remoteAgentElevated: !!elevated };
 }
 
 function watchSessions({ onSummary, onError, debounceMs = 120, summaryOptions = {} } = {}) {
@@ -1799,8 +1833,10 @@ module.exports = {
   recentActiveSessionSummaries,
   runningCodexCliProcessCount,
   readSessionSummary,
+  buildCodexArgs,
   resolveCodexCommand,
   startCodexExecSession,
+  stopCodexExecSession,
   buildNativeCodexWindowPowerShell,
   startNativeCodexWindow,
   watchSessions,

@@ -107,8 +107,28 @@ vm.runInContext(built.outputFiles[0].text, context, { filename: 'hooks.bundle.cj
 
 const shouldMergeHistorySnapshot = moduleRecord.exports.shouldMergeHistorySnapshot;
 const mergeHistoryTailByOverlap = moduleRecord.exports.mergeHistoryTailByOverlap;
+const removeSupersededCliTranscriptPlaceholders = moduleRecord.exports.removeSupersededCliTranscriptPlaceholders;
 assert.equal(typeof shouldMergeHistorySnapshot, 'function');
 assert.equal(typeof mergeHistoryTailByOverlap, 'function');
+assert.equal(typeof removeSupersededCliTranscriptPlaceholders, 'function');
+const staleCodexPlaceholder = {
+  role: 'assistant',
+  content: '**Codex CLI is waiting for a native transcript.**\n\nOnce Codex creates or updates the JSONL transcript file, this placeholder will be replaced with the real CLI chat history.',
+};
+assert.strictEqual(
+  removeSupersededCliTranscriptPlaceholders([staleCodexPlaceholder])[0],
+  staleCodexPlaceholder,
+  'a genuinely pending CLI session must retain its only placeholder',
+);
+assert.deepEqual(
+  removeSupersededCliTranscriptPlaceholders([
+    staleCodexPlaceholder,
+    { role: 'user', content: 'real turn' },
+    { role: 'assistant', content: 'real reply' },
+  ]).map(message => message.content),
+  ['real turn', 'real reply'],
+  'stored CLI placeholders must disappear once real transcript history exists',
+);
 assert.equal(
   shouldMergeHistorySnapshot(
     'history_snapshot',

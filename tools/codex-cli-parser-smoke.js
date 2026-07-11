@@ -60,6 +60,12 @@ const now = Date.now();
 const iso = deltaMs => new Date(now + deltaMs).toISOString();
 fs.writeFileSync(liveLikeFixture, [
   { timestamp: iso(-300000), type: 'session_meta', payload: { id: '00000000-0000-4000-8000-000000000099', cwd: process.cwd(), model: 'gpt-5.5' } },
+  { timestamp: iso(-299500), type: 'response_item', payload: { type: 'message', role: 'user', content: [
+    { type: 'input_text', text: '<recommended_plugins>\nPrivate injected plugin catalog\n</recommended_plugins>' },
+    { type: 'input_text', text: `<environment_context>\n<cwd>${process.cwd()}</cwd>\n</environment_context>` },
+  ] } },
+  { timestamp: iso(-299400), type: 'response_item', payload: { type: 'message', role: 'user', content: [{ type: 'input_text', text: '<codex_internal_context source="goal">\n<objective>Hidden objective transport</objective>\n</codex_internal_context>' }] } },
+  { timestamp: iso(-299300), type: 'response_item', payload: { type: 'message', role: 'user', content: [{ type: 'input_text', text: '<goal_context>\n<objective>Legacy hidden objective transport</objective>\n</goal_context>' }] } },
   { timestamp: iso(-299000), type: 'turn_context', payload: { cwd: process.cwd(), model: 'gpt-5.5', effort: 'high', sandbox_policy: { type: 'danger-full-access' }, approval_policy: 'never' } },
   { timestamp: iso(-295000), type: 'event_msg', payload: { type: 'task_started' } },
   { timestamp: iso(-294500), type: 'event_msg', payload: { type: 'thread_name_updated', thread_name: 'Codex CLI fidelity smoke' } },
@@ -94,6 +100,9 @@ assert.strictEqual(liveLikeSummary.approval_policy, 'never');
 assert.strictEqual(liveLikeSummary.percent_used, 34);
 assert.strictEqual(liveLikeSummary.rate_limit_active, false);
 assert.strictEqual(liveLikeSummary.token_usage.total_tokens, 42);
+assert(!liveLikeSummary.messages.some(msg => /recommended_plugins|environment_context|codex_internal_context|goal_context/.test(msg.content || '')), 'injected Codex context must not render as user transcript');
+assert(liveLikeSummary.messages.some(msg => msg.role === 'user' && msg.content === 'Live task'), 'real post-context user turn must remain');
+assert(!liveLikeSummary.messages.some(msg => msg.content_blocks?.some(block => block.collapsed === true)), 'all Codex CLI structured blocks must be expanded by default');
 const liveLikeLightweight = codexCli.readSessionSummary(liveLikeFixture, { includeMessages: false });
 assert.strictEqual(liveLikeLightweight.title, 'Codex CLI fidelity smoke');
 assert.strictEqual(liveLikeLightweight.effort, 'high');

@@ -93,6 +93,19 @@ export function mergeHistoryTailByOverlap(existing, incoming) {
   return null;
 }
 
+export function removeSupersededCliTranscriptPlaceholders(messages) {
+  const current = Array.isArray(messages) ? messages : [];
+  const isPendingPlaceholder = message => {
+    const content = String(message?.content || '');
+    return /\*\*(?:Claude Code|Codex|Cursor) CLI is waiting for a native transcript\.\*\*/i.test(content)
+      && /placeholder will be replaced with the real CLI chat history/i.test(content);
+  };
+  if (!current.some(isPendingPlaceholder) || !current.some(message => !isPendingPlaceholder(message))) {
+    return current;
+  }
+  return current.filter(message => !isPendingPlaceholder(message));
+}
+
 export function useRelay() {
     const [sessions,        setSessions]        = useState([]);   // string IDs (legacy) or metadata objects (v1)
     const [messages,        setMessages]        = useState({});   // sessionId -> [{role, content, _cid?, _optimistic?, _delivered?}]
@@ -876,9 +889,10 @@ export function useRelay() {
         const shouldMergeTailSnapshot = !forceCursorIdentityReplace
           && shouldMergeHistorySnapshot(t, msg, priorHistoryMeta);
         setMessages(prev => {
-          const merged = shouldMergeTailSnapshot
+          const mergedRaw = shouldMergeTailSnapshot
             ? mergeHistoryTailSnapshot(prev[id], nextMessages)
             : nextMessages;
+          const merged = removeSupersededCliTranscriptPlaceholders(mergedRaw);
           if (merged === prev[id]) return prev;
           return { ...prev, [id]: merged };
         });
@@ -960,7 +974,9 @@ export function useRelay() {
         const estimatedMessages = replaceTail ? incoming : mergeHistoryChunk(messages[id], incoming, mode);
         const estimatedLength = estimatedMessages.length;
         setMessages(prev => {
-          const merged = replaceTail ? incoming : mergeHistoryChunk(prev[id], incoming, mode);
+          const merged = removeSupersededCliTranscriptPlaceholders(
+            replaceTail ? incoming : mergeHistoryChunk(prev[id], incoming, mode)
+          );
           if (merged === prev[id]) return prev;
           return { ...prev, [id]: merged };
         });
@@ -1002,7 +1018,10 @@ export function useRelay() {
       if (t === 'history_delta') {
         const id      = msg.session || msg.session_id;
         const newMsgs = msg.messages || msg.events || [];
-        if (id) setMessages(prev => ({ ...prev, [id]: [...(prev[id] || []), ...newMsgs] }));
+        if (id) setMessages(prev => ({
+          ...prev,
+          [id]: removeSupersededCliTranscriptPlaceholders([...(prev[id] || []), ...newMsgs]),
+        }));
         return;
       }
 
@@ -1406,14 +1425,20 @@ export function useRelay() {
                 _cid: prev_msg._cid,
                 _optimistic: prev_msg._optimistic,
               };
-              return { ...prev, [id]: updated };
+              return { ...prev, [id]: removeSupersededCliTranscriptPlaceholders(updated) };
             }
           }
           // Deduplicate: skip if any existing message already has this exact role + content
           if (existing.some(m => m.role === role && m.content === content)) {
             return prev;
           }
-          return { ...prev, [id]: [...existing, { role, content, ...(contentBlocks ? { content_blocks: contentBlocks } : {}), ts: msg.ts || Date.now(), _delivered: role === 'user' }] };
+          return {
+            ...prev,
+            [id]: removeSupersededCliTranscriptPlaceholders([
+              ...existing,
+              { role, content, ...(contentBlocks ? { content_blocks: contentBlocks } : {}), ts: msg.ts || Date.now(), _delivered: role === 'user' },
+            ]),
+          };
         });
 
         if (role === 'assistant' && id !== activeSessionRef.current) {

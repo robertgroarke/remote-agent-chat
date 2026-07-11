@@ -454,7 +454,10 @@ class ProxyEngine extends EventEmitter {
       set_mode:               agentType === 'antigravity' || isClineLike,
       permission_mode_change: agentType === 'claude' || isClaudeCli || isCodexCli || isCursorCli || agentType === 'continue_yolo' || isRooCode,
       auto_approve_permissions_toggle: agentType === 'continue' || agentType === 'continue_yolo' || agentType === 'antigravity_panel' || agentType === 'cursor',
-      permission_dialogs:     isClaude || isClaudeCli || isCodexCli || isCursorCli || isCodex || agentType === 'antigravity' || agentType === 'antigravity_panel' || isContinue || isClineLike || isCursor,
+      // Headless `codex exec` has no actionable approval dialog channel. Its
+      // sandbox/access mode is configurable, but native prompts cannot be
+      // answered through the JSONL transport, so do not advertise that control.
+      permission_dialogs:     isClaude || isClaudeCli || isCursorCli || isCodex || agentType === 'antigravity' || agentType === 'antigravity_panel' || isContinue || isClineLike || isCursor,
       set_codex_config:       isCodex,
       set_effort:             isClaudeCli || isCodexCli,
       new_thread:             isDesktop,
@@ -1824,13 +1827,26 @@ class ProxyEngine extends EventEmitter {
             }));
             return;
           }
+        } else if (sessionData.agentType === 'codex_cli' && sessionData[childKey]) {
+          sessionData._codexCliInterrupted = true;
+          const stopped = codexCli.stopCodexExecSession(sessionData[childKey]);
+          if (!stopped.ok) {
+            sessionData._codexCliInterrupted = false;
+            this._sendToRelay(proto.agentControlResult(sid, msg.request_id, 'agent_interrupt', 'failed', {
+              code: 'interrupt_failed', message: stopped.detail || 'Could not stop Codex CLI process tree',
+            }));
+            return;
+          }
         } else if (sessionData[childKey]) {
           try { sessionData[childKey].kill(); } catch {}
           sessionData[childKey] = null;
         }
         const activity = { kind: 'idle', label: 'Interrupted', updated_at: new Date().toISOString() };
         sessionData.activity = activity;
-        sessionStore.updateSession(sid, { activity });
+        sessionStore.updateSession(sid, {
+          activity,
+          ...(sessionData.agentType === 'codex_cli' ? { codex_cli_interrupted: true } : {}),
+        });
         this._sendToRelay(proto.proxyStatus(sid, sessionData.status || 'healthy', activity));
         this._sendToRelay(proto.agentControlResult(sid, msg.request_id, 'agent_interrupt', 'ok'));
         return;
@@ -2074,7 +2090,11 @@ class ProxyEngine extends EventEmitter {
       if (sessionData.agentType === 'claude_cli' || sessionData.agentType === 'codex_cli' || sessionData.agentType === 'cursor_cli') {
         const cliAgentType = sessionData.agentType;
         sessionData.model_id = modelId || 'default';
-        sessionStore.updateSession(sid, { model_id: sessionData.model_id });
+        if (cliAgentType === 'codex_cli') sessionData.codexCliModelConfigured = true;
+        sessionStore.updateSession(sid, {
+          model_id: sessionData.model_id,
+          ...(cliAgentType === 'codex_cli' ? { codex_cli_model_configured: true } : {}),
+        });
         const merged = this._decorateAgentConfig(sessionData, this._mergeAgentConfig(cliAgentType, {
           model_id: sessionData.model_id,
           permission_mode: sessionData.permission_mode,
@@ -2227,7 +2247,11 @@ class ProxyEngine extends EventEmitter {
             : agentT === 'cursor_cli' ? 'force'
               : 'default'
         );
-        sessionStore.updateSession(sid, { permission_mode: sessionData.permission_mode });
+        if (agentT === 'codex_cli') sessionData.codexCliPermissionConfigured = true;
+        sessionStore.updateSession(sid, {
+          permission_mode: sessionData.permission_mode,
+          ...(agentT === 'codex_cli' ? { codex_cli_permission_configured: true } : {}),
+        });
         const merged = this._decorateAgentConfig(sessionData, this._mergeAgentConfig(agentT, {
           model_id: sessionData.model_id,
           permission_mode: sessionData.permission_mode,
@@ -2296,7 +2320,11 @@ class ProxyEngine extends EventEmitter {
         return;
       }
       sessionData.effort = effort;
-      sessionStore.updateSession(sid, { effort });
+      if (sessionData.agentType === 'codex_cli') sessionData.codexCliEffortConfigured = true;
+      sessionStore.updateSession(sid, {
+        effort,
+        ...(sessionData.agentType === 'codex_cli' ? { codex_cli_effort_configured: true } : {}),
+      });
       const merged = this._decorateAgentConfig(sessionData, this._mergeAgentConfig(sessionData.agentType, {
         model_id: sessionData.model_id,
         permission_mode: sessionData.permission_mode,
@@ -3053,7 +3081,7 @@ class ProxyEngine extends EventEmitter {
               effort: newSession.effort,
               permissionMode: newSession.permission_mode,
               title: `${workspaceName} - Codex CLI`,
-              elevated: true,
+              elevated: false,
             });
             this._sendHistorySnapshot(newSession.session_id, this._codexCliPendingTranscriptMessages(newSession), 'codex cli native startup');
             this._log('info', `[ctrl] opened native Codex CLI window for new_chat ${newSession.session_id} pid=${child?.pid || 'unknown'} model=${newSession.model_id || 'default'} elevated=${child?.remoteAgentElevated === true}`);
@@ -3849,7 +3877,7 @@ class ProxyEngine extends EventEmitter {
             effort: sessionData.effort,
             permissionMode: sessionData.permission_mode,
             title: `${sessionData.workspace_name || 'Codex'} - Codex CLI`,
-            elevated: true,
+            elevated: false,
           });
         } else if (isCursorCli) {
           const existingSummary = sessionData.cursorCliFilePath
@@ -3882,7 +3910,10 @@ class ProxyEngine extends EventEmitter {
           : isCursorCli ? this._cursorCliPendingTranscriptMessages(sessionData)
           : this._claudeCliPendingTranscriptMessages(sessionData);
         const label = isCodexCli ? 'codex' : isCursorCli ? 'cursor' : 'claude';
-        this._sendHistorySnapshot(sid, pendingMsgs, `${label} cli native startup`);
+        const hasTranscript = isCodexCli ? !!sessionData.codexCliFilePath
+          : isCursorCli ? !!sessionData.cursorCliFilePath
+          : !!sessionData.claudeCliFilePath;
+        if (!hasTranscript) this._sendHistorySnapshot(sid, pendingMsgs, `${label} cli native startup`);
         this._log('info', `[ctrl] opened native ${isCodexCli ? 'Codex' : isCursorCli ? 'Cursor' : 'Claude'} CLI window for ${sid} pid=${child?.pid || 'unknown'} model=${sessionData.model_id || 'default'}`);
         this._sendToRelay(proto.agentControlResult(sid, requestId, 'open_native_window', 'ok'));
       } catch (e) {
@@ -3895,7 +3926,10 @@ class ProxyEngine extends EventEmitter {
           : isCursorCli ? this._cursorCliPendingTranscriptMessages(sessionData)
           : this._claudeCliPendingTranscriptMessages(sessionData);
         const label = isCodexCli ? 'codex' : isCursorCli ? 'cursor' : 'claude';
-        this._sendHistorySnapshot(sid, pendingMsgs, `${label} cli native startup failed`);
+        const hasTranscript = isCodexCli ? !!sessionData.codexCliFilePath
+          : isCursorCli ? !!sessionData.cursorCliFilePath
+          : !!sessionData.claudeCliFilePath;
+        if (!hasTranscript) this._sendHistorySnapshot(sid, pendingMsgs, `${label} cli native startup failed`);
         this._sendToRelay(proto.agentControlResult(sid, requestId, 'open_native_window', 'failed', {
           code: 'spawn_failed', message: e.message,
         }));
@@ -4026,7 +4060,7 @@ class ProxyEngine extends EventEmitter {
             effort,
             permissionMode,
             title: `${workspaceName} - Codex CLI`,
-            elevated: true,
+            elevated: false,
           });
           session.nativeCliStartedAt = summary.nativeCliStartedAt;
           session.nativeCliStatus = 'native_window_opened';
@@ -6356,7 +6390,10 @@ class ProxyEngine extends EventEmitter {
   }
 
   _setCodexCliActivity(sessionId, session, activity) {
-    const nextActivity = activity || { kind: 'idle', label: '', updated_at: new Date().toISOString() };
+    const observedActivity = activity || { kind: 'idle', label: '', updated_at: new Date().toISOString() };
+    const nextActivity = session._codexCliInterrupted === true && observedActivity.kind !== 'idle'
+      ? { kind: 'idle', label: 'Interrupted', updated_at: session.activity?.updated_at || new Date().toISOString() }
+      : observedActivity;
     const prevSig = this._activitySemanticSignature(session.activity || null);
     const nextSig = this._activitySemanticSignature(nextActivity);
     if (prevSig === nextSig) return false;
@@ -6370,6 +6407,7 @@ class ProxyEngine extends EventEmitter {
 
   _buildCodexCliSessionFromSummary(sessionMeta, summary) {
     const now = new Date().toISOString();
+    const interrupted = sessionMeta.codex_cli_interrupted === true;
     return {
       session_id: sessionMeta.session_id,
       display_name: sessionMeta.display_name || 'Codex CLI',
@@ -6388,7 +6426,9 @@ class ProxyEngine extends EventEmitter {
       thinkingLabel: '',
       autoApprovePermissions: false,
       status: 'healthy',
-      activity: summary.activity || sessionMeta.activity || { kind: 'idle', label: '', updated_at: now },
+      activity: interrupted
+        ? { kind: 'idle', label: 'Interrupted', updated_at: sessionMeta.activity?.updated_at || now }
+        : (summary.activity || sessionMeta.activity || { kind: 'idle', label: '', updated_at: now }),
       last_seen_at: summary.updatedAt || now,
       windowTitle: sessionMeta.window_title || summary.workspaceName || 'Codex CLI',
       agentType: 'codex_cli',
@@ -6409,6 +6449,10 @@ class ProxyEngine extends EventEmitter {
       percentUsed: summary.percent_used ?? sessionMeta.percent_used ?? null,
       rateLimitActive: summary.rate_limit_active === true || sessionMeta.rate_limit_active === true,
       rate_limited_until: summary.rate_limited_until || sessionMeta.rate_limited_until || null,
+      codexCliModelConfigured: sessionMeta.codex_cli_model_configured === true,
+      codexCliPermissionConfigured: sessionMeta.codex_cli_permission_configured === true,
+      codexCliEffortConfigured: sessionMeta.codex_cli_effort_configured === true,
+      _codexCliInterrupted: interrupted,
     };
   }
 
@@ -6437,15 +6481,15 @@ class ProxyEngine extends EventEmitter {
       session.codexCliFilePath = summary.filePath;
       changed = true;
     }
-    if (summary.model_id && summary.model_id !== session.model_id) {
+    if (session.codexCliModelConfigured !== true && summary.model_id && summary.model_id !== session.model_id) {
       session.model_id = summary.model_id;
       changed = true;
     }
-    if (summary.permission_mode && summary.permission_mode !== session.permission_mode) {
+    if (session.codexCliPermissionConfigured !== true && summary.permission_mode && summary.permission_mode !== session.permission_mode) {
       session.permission_mode = summary.permission_mode;
       changed = true;
     }
-    if (summary.effort && summary.effort !== session.effort) {
+    if (session.codexCliEffortConfigured !== true && summary.effort && summary.effort !== session.effort) {
       session.effort = summary.effort;
       changed = true;
     }
@@ -6525,9 +6569,14 @@ class ProxyEngine extends EventEmitter {
     const norm = p => String(p || '').replace(/\\/g, '/').replace(/\/+$/, '').toLowerCase();
     const pendingEntry = Array.from(this.sessions.entries()).find(([, s]) =>
       s.agentType === 'codex_cli'
-      && !s.codexCliFilePath
-      && norm(s.workspace_path) === norm(summary.workspacePath)
-      && (s.cliSessionId === summary.cliSessionId || s.nativeCliWindowOpened === true || s._codexCliChild)
+      && (
+        this._codexCliTranscriptKeyMatches(summary, s)
+        || (
+          !s.codexCliFilePath
+          && norm(s.workspace_path) === norm(summary.workspacePath)
+          && (s.cliSessionId === summary.cliSessionId || s.nativeCliWindowOpened === true || s._codexCliChild)
+        )
+      )
     );
     if (pendingEntry) {
       const [sessionId, existing] = pendingEntry;
@@ -6538,7 +6587,12 @@ class ProxyEngine extends EventEmitter {
       existing.codexCliArchiveDiscovered = archiveDiscovered === true;
       existing.codexCliExternalActive = externalActiveFlag;
       existing.cliSessionId = summary.cliSessionId;
-      if (summary.model_id) existing.model_id = summary.model_id;
+      const migratedMeta = sessionStore.migrateVirtualSession(
+        sessionId,
+        `codex-cli:${summary.cliSessionId}`,
+        'codex_cli'
+      );
+      if (migratedMeta?.target_signature) existing.target_signature = migratedMeta.target_signature;
       this._setCodexCliActivity(sessionId, existing, summary.activity || existing.activity);
       sessionStore.updateSession(sessionId, {
         cli_session_id: existing.cliSessionId,
@@ -6550,7 +6604,11 @@ class ProxyEngine extends EventEmitter {
         workspace_name: existing.workspace_name || null,
       });
       if (metaChanged) this._broadcastSessionSnapshot();
-      const effectiveMessages = (summary.messages || []).length > 0 ? summary.messages : this._codexCliPendingTranscriptMessages(existing);
+      const summaryMessages = summary.messages || [];
+      const effectiveMessages = summaryMessages.length > 0
+        ? summaryMessages
+        : (summary.filePath ? [] : this._codexCliPendingTranscriptMessages(existing));
+      if (effectiveMessages.length === 0) return existing;
       const sig = this._transcriptSignature(effectiveMessages);
       if (sig !== existing.lastTranscriptSig) {
         existing.lastTranscriptSig = sig;
@@ -6563,6 +6621,10 @@ class ProxyEngine extends EventEmitter {
       }
       return existing;
     }
+    const storedConfig = sessionStore.getAllSessions().find(sess => (
+      sess.agent_type === 'codex_cli'
+      && (sess.cli_session_id === summary.cliSessionId || sess.virtual_id === `codex-cli:${summary.cliSessionId}`)
+    ));
     const sessionMeta = sessionStore.resolveVirtualSession({
       virtualId: `codex-cli:${summary.cliSessionId}`,
       agentType: 'codex_cli',
@@ -6576,9 +6638,9 @@ class ProxyEngine extends EventEmitter {
         codex_cli_archive_discovered: archiveDiscovered === true,
         codex_cli_external_active: externalActive === true,
         chat_title: summary.title || null,
-        model_id: summary.model_id || undefined,
-        permission_mode: summary.permission_mode || undefined,
-        effort: summary.effort || undefined,
+        model_id: storedConfig?.codex_cli_model_configured === true ? undefined : (summary.model_id || undefined),
+        permission_mode: storedConfig?.codex_cli_permission_configured === true ? undefined : (summary.permission_mode || undefined),
+        effort: storedConfig?.codex_cli_effort_configured === true ? undefined : (summary.effort || undefined),
         approval_policy: summary.approval_policy || undefined,
         percent_used: summary.percent_used ?? undefined,
         rate_limit_active: summary.rate_limit_active === true || undefined,
@@ -6599,13 +6661,13 @@ class ProxyEngine extends EventEmitter {
       existing.codexCliArchiveDiscovered = archiveDiscovered === true;
       existing.codexCliExternalActive = externalActiveFlag;
       existing.cliSessionId = summary.cliSessionId;
-      if (summary.model_id) existing.model_id = summary.model_id;
-      if (summary.permission_mode) existing.permission_mode = summary.permission_mode;
-      if (summary.effort) existing.effort = summary.effort;
       this._setCodexCliActivity(sessionId, existing, summary.activity || existing.activity);
       if (metaChanged || dedupedAliases) this._broadcastSessionSnapshot();
       const summaryMessages = summary.messages || [];
-      const effectiveMessages = summaryMessages.length > 0 ? summaryMessages : this._codexCliPendingTranscriptMessages(existing);
+      const effectiveMessages = summaryMessages.length > 0
+        ? summaryMessages
+        : (summary.filePath ? [] : this._codexCliPendingTranscriptMessages(existing));
+      if (effectiveMessages.length === 0) return existing;
       const sig = this._transcriptSignature(effectiveMessages);
       if (sig !== existing.lastTranscriptSig) {
         existing.lastTranscriptSig = sig;
@@ -6622,14 +6684,18 @@ class ProxyEngine extends EventEmitter {
     this.sessions.set(sessionId, session);
     this._log('info', `[codex-cli] registered ${sessionId} cli=${summary.cliSessionId} (${summary.messageCount} msgs)`);
     if (sendInitialHistory) {
-      const initialMessages = summary.messages?.length ? summary.messages : this._codexCliPendingTranscriptMessages(session);
-      this._sendHistorySnapshot(sessionId, initialMessages, 'codex cli discovery');
-      if (summary.messagesPartial === true) {
-        this._sendCodexCliLiveTailChunk(sessionId, session, 'codex cli discovery');
+      const initialMessages = summary.messages?.length
+        ? summary.messages
+        : (summary.filePath ? [] : this._codexCliPendingTranscriptMessages(session));
+      if (initialMessages.length > 0) {
+        this._sendHistorySnapshot(sessionId, initialMessages, 'codex cli discovery');
+        if (summary.messagesPartial === true) {
+          this._sendCodexCliLiveTailChunk(sessionId, session, 'codex cli discovery');
+        }
+        session.lastTranscriptSig = this._transcriptSignature(initialMessages);
+        session.lastObservedCount = initialMessages.length;
+        session.lastMessageCount = initialMessages.length;
       }
-      session.lastTranscriptSig = this._transcriptSignature(initialMessages);
-      session.lastObservedCount = initialMessages.length;
-      session.lastMessageCount = initialMessages.length;
     }
     const cfg = this._decorateAgentConfig(session, this._mergeAgentConfig('codex_cli', {
       model_id: session.model_id,
@@ -6920,6 +6986,8 @@ class ProxyEngine extends EventEmitter {
     if (session._codexCliChild) {
       return Promise.resolve({ ok: false, code: 'agent_busy', detail: 'Codex CLI process is already running' });
     }
+    session._codexCliInterrupted = false;
+    sessionStore.updateSession(sessionId, { codex_cli_interrupted: false });
     let cliSessionId = session.cliSessionId || null;
     const existingSummary = session.codexCliFilePath
       ? null
@@ -6963,7 +7031,8 @@ class ProxyEngine extends EventEmitter {
             this._handleCodexCliJsonEvent(session, sessionId, stdoutBuffer.trim());
             stdoutBuffer = '';
           }
-        if (session._codexCliChild === child) session._codexCliChild = null;
+          const wasInterrupted = session._codexCliInterrupted === true;
+          if (session._codexCliChild === child) session._codexCliChild = null;
         (async () => {
           const resolvedCliSessionId = session.cliSessionId || cliSessionId;
           let summary = this._findCodexCliSummaryByCliId(resolvedCliSessionId)
@@ -6986,7 +7055,7 @@ class ProxyEngine extends EventEmitter {
             session.lastMessageCount = effectiveMessages.length;
             session.lastObservedCount = effectiveMessages.length;
             session.lastTranscriptSig = this._transcriptSignature(effectiveMessages);
-          } else {
+          } else if (!wasInterrupted) {
             const stderr = stderrChunks.join('').trim();
             this._sendToRelay(proto.proxyMessage(
               sessionId,
@@ -6996,7 +7065,7 @@ class ProxyEngine extends EventEmitter {
                 : `Codex CLI failed to start or complete the request.\n\n${stderr || err?.message || `Codex CLI exited with code ${code}`}`
             ));
           }
-          const activity = { kind: 'idle', label: summary ? '' : 'Codex CLI failed', updated_at: new Date().toISOString() };
+          const activity = { kind: 'idle', label: summary || wasInterrupted ? (wasInterrupted ? 'Interrupted' : '') : 'Codex CLI failed', updated_at: new Date().toISOString() };
           session.activity = activity;
           session._codexCliLiveText = '';
           session.waitingForAssistant = false;
@@ -7656,14 +7725,13 @@ class ProxyEngine extends EventEmitter {
           if (this._applyCodexCliSummaryMetadata(sessionId, session, summary)) {
             this._broadcastSessionSnapshot();
           }
-          if (summary.model_id) session.model_id = summary.model_id;
-          if (summary.permission_mode) session.permission_mode = summary.permission_mode;
-          if (summary.effort) session.effort = summary.effort;
         }
       }
     }
-    const effectiveMessages = messages.length > 0 ? messages : this._codexCliPendingTranscriptMessages(session);
-    if (transcriptMaybeChanged || !session.lastTranscriptSig) {
+    const effectiveMessages = messages.length > 0
+      ? messages
+      : (session.codexCliFilePath ? [] : this._codexCliPendingTranscriptMessages(session));
+    if (effectiveMessages.length > 0 && (transcriptMaybeChanged || !session.lastTranscriptSig)) {
       const sig = this._transcriptSignature(effectiveMessages);
       if (sig !== session.lastTranscriptSig) {
         session.lastTranscriptSig = sig;

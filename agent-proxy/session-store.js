@@ -330,6 +330,27 @@ function updateSession(session_id, updates) {
   _saveStore();
 }
 
+function migrateVirtualSession(session_id, virtualId, agentType = null) {
+  const session = _store.sessions[session_id];
+  if (!session || !virtualId) return null;
+  const effectiveAgentType = agentType || session.agent_type;
+  const targetSignature = crypto.createHash('sha1')
+    .update(`${effectiveAgentType}|virtual|${virtualId}`)
+    .digest('hex')
+    .substring(0, 16);
+  for (const [otherId, other] of Object.entries(_store.sessions)) {
+    if (otherId === session_id || other.target_signature !== targetSignature) continue;
+    other.status = 'disconnected';
+    other.last_seen_at = new Date().toISOString();
+  }
+  session.virtual_id = virtualId;
+  session.target_signature = targetSignature;
+  session.last_seen_at = new Date().toISOString();
+  session.status = 'healthy';
+  _saveStore();
+  return { ...session };
+}
+
 function markDisconnected(session_id) {
   updateSession(session_id, {
     status:       'disconnected',
@@ -407,6 +428,7 @@ module.exports = {
   resolveSession,
   resolveVirtualSession,
   updateSession,
+  migrateVirtualSession,
   markDisconnected,
   updatePreference,
   getPreference,
