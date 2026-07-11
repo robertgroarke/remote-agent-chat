@@ -273,5 +273,10 @@ assert.match(
   /\? \{ chunkBytes: CODEX_CLI_INITIAL_HISTORY_CHUNK_BYTES \}/,
   'Codex/Cursor CLI initial history requests must carry the bounded chunk size',
 );
+assert.match(
+  appSource,
+  /function selectSession\(id, sessionMeta\)[\s\S]*?requestHistory\(id, historyRequestOptionsFor\(sessionMeta\)\)/,
+  'selecting a session must refresh history even when a stale startup placeholder is already rendered',
+);
 
 console.log('frontend history reconnect smoke: PASS');

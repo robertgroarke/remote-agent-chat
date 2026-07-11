@@ -275,7 +275,9 @@ function resolveVirtualSession({ virtualId, agentType, displayName, workspaceNam
       if (windowTitle)   sess.window_title   = windowTitle;
       if (workspaceName) sess.workspace_name = workspaceName;
       if (workspacePath) sess.workspace_path = workspacePath;
-      if (extra && typeof extra === 'object') Object.assign(sess, extra);
+      if (extra && typeof extra === 'object') {
+        Object.assign(sess, Object.fromEntries(Object.entries(extra).filter(([, value]) => value !== undefined)));
+      }
       _saveStore();
       console.log(`[session-store] Matched virtual ${sid} via sig=${targetSignature}`);
       return { ...sess, _matched_existing: true };

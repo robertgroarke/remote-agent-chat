@@ -4166,6 +4166,7 @@ async function uploadBinaryDraft(sessionId, base64, mimeType, filename) {
     setShowSlashMenu(false);
     setShowChatList(false);
     setShowThreadList(false);
+    setTimeout(() => requestHistory(id, historyRequestOptionsFor(sessionMeta)), 120);
   }
 
   // ── File attachment ───────────────────────────────────────────────────────

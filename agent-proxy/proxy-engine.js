@@ -430,6 +430,7 @@ class ProxyEngine extends EventEmitter {
     const isClaudeCli = agentType === 'claude_cli';
     const isCodexCli = agentType === 'codex_cli';
     const isCursorCli = agentType === 'cursor_cli';
+    const isStoreBackedCli = isClaudeCli || isCodexCli || isCursorCli;
     const isDesktop = agentType === 'codex-desktop' || agentType === 'claude-desktop' || isCursor;
     const isContinue = agentType === 'continue' || agentType === 'continue_yolo';
     const isRooCode = agentType === 'roo_code';
@@ -440,6 +441,12 @@ class ProxyEngine extends EventEmitter {
       && fs.existsSync(workspacePath)
     );
     const cursorHasGitWorkspace = !isCursor || this._isGitWorkspace(workspacePath);
+    const cliHasWorkspace = !isStoreBackedCli || (
+      typeof workspacePath === 'string'
+      && workspacePath !== 'unknown'
+      && fs.existsSync(workspacePath)
+    );
+    const cliHasGitWorkspace = !isStoreBackedCli || this._isGitWorkspace(workspacePath);
     return {
       interrupt:              ['claude', 'claude_cli', 'codex_cli', 'cursor_cli', 'codex', 'gemini', 'continue', 'continue_yolo', 'antigravity', 'antigravity_panel', 'claude-desktop', 'codex-desktop', 'cursor', 'roo_code', 'cline'].includes(agentType),
       set_model:              ['claude', 'claude_cli', 'codex_cli', 'cursor_cli', 'antigravity', 'antigravity_panel', 'gemini', 'continue', 'continue_yolo', 'cursor'].includes(agentType) || isClineLike,
@@ -456,7 +463,11 @@ class ProxyEngine extends EventEmitter {
       switch_workspace:       agentType === 'codex-desktop' || agentType === 'claude-desktop',
       // Cursor IDE is already the native surface. The open-native-window command
       // launches CLI processes only and must not be advertised for the IDE.
-      native_window:          isClaudeCli || isCodexCli || isCursorCli,
+      // Claude Code 2.1.207 exits a prompt-less `--resume <id>` with
+      // "No deferred tool marker found" instead of reopening the TUI. A new
+      // Claude chat still opens its initial native window, but an advertised
+      // reopen control would fail for every transcript-backed session.
+      native_window:          isCodexCli || isCursorCli,
       open_panel:             false, // Codex side pane is already open if session exists
       chat_list:              agentType === 'codex' || agentType === 'continue' || agentType === 'antigravity_panel' || agentType === 'claude-desktop' || isCursor || isClineLike || isAntigravityV2,
       switch_chat:            agentType === 'codex' || agentType === 'continue' || agentType === 'antigravity_panel' || agentType === 'claude-desktop' || isCursor || isClineLike || isAntigravityV2,
@@ -473,12 +484,12 @@ class ProxyEngine extends EventEmitter {
       send_attachment:        isCodex,
       // Cursor workspaces are not necessarily Git repositories. Avoid rendering
       // branch controls that can only return git_error for the current session.
-      branch_list:            !isAntigravityV2 && cursorHasGitWorkspace,
-      switch_branch:          !isAntigravityV2 && cursorHasGitWorkspace,
-      create_branch:          !isAntigravityV2 && cursorHasGitWorkspace,
+      branch_list:            !isAntigravityV2 && cursorHasGitWorkspace && cliHasGitWorkspace,
+      switch_branch:          !isAntigravityV2 && cursorHasGitWorkspace && cliHasGitWorkspace,
+      create_branch:          !isAntigravityV2 && cursorHasGitWorkspace && cliHasGitWorkspace,
       skill_list:             agentType === 'codex-desktop',
       automation_view:        agentType === 'codex-desktop',
-      file_browser:           !isAntigravityV2 && cursorHasWorkspace, // v2 exposes only a worktree label until a real path is verified
+      file_browser:           !isAntigravityV2 && cursorHasWorkspace && cliHasWorkspace, // v2 exposes only a worktree label until a real path is verified
     };
   }
 
@@ -1803,7 +1814,17 @@ class ProxyEngine extends EventEmitter {
         const childKey = sessionData.agentType === 'codex_cli' ? '_codexCliChild'
           : sessionData.agentType === 'cursor_cli' ? '_cursorCliChild'
           : '_claudeCliChild';
-        if (sessionData[childKey]) {
+        if (sessionData.agentType === 'claude_cli' && sessionData[childKey]) {
+          sessionData._claudeCliInterrupted = true;
+          const stopped = claudeCli.stopNativeClaudeWindow(sessionData[childKey]);
+          if (!stopped.ok) {
+            sessionData._claudeCliInterrupted = false;
+            this._sendToRelay(proto.agentControlResult(sid, msg.request_id, 'agent_interrupt', 'failed', {
+              code: 'interrupt_failed', message: stopped.detail || 'Could not stop Claude CLI process tree',
+            }));
+            return;
+          }
+        } else if (sessionData[childKey]) {
           try { sessionData[childKey].kill(); } catch {}
           sessionData[childKey] = null;
         }
@@ -1961,6 +1982,7 @@ class ProxyEngine extends EventEmitter {
               permissionMode: sessionData.permission_mode,
               title: `${sessionData.workspace_name || 'Claude Code'} - Claude CLI`,
             });
+            sessionData.nativeClaudeWindowChild = child;
             this._log('info', `[ctrl] reopened native Claude CLI window for ${sid} pid=${child?.pid || 'unknown'}`);
             this._sendToRelay(proto.agentControlResult(sid, msg.request_id, 'error_prompt_action', 'ok'));
           } catch (e) {
@@ -1984,6 +2006,12 @@ class ProxyEngine extends EventEmitter {
               return;
             }
             try {
+              const stopped = sessionData.nativeClaudeWindowChild
+                ? claudeCli.stopNativeClaudeWindow(sessionData.nativeClaudeWindowChild)
+                : { ok: true, detail: 'no tracked pre-trust process' };
+              if (!stopped.ok) {
+                throw new Error(`Could not close pre-trust Claude CLI window: ${stopped.detail}`);
+              }
               const child = claudeCli.startNativeClaudeWindow({
                 workspacePath: sessionData.workspace_path || process.cwd(),
                 cliSessionId: sessionData.cliSessionId || crypto.randomUUID(),
@@ -1993,6 +2021,7 @@ class ProxyEngine extends EventEmitter {
                 permissionMode: sessionData.permission_mode,
                 title: `${sessionData.workspace_name || 'Claude Code'} - Claude CLI`,
               });
+              sessionData.nativeClaudeWindowChild = child;
               this._log('info', `[ctrl] trusted workspace and reopened native Claude CLI window for ${sid} pid=${child?.pid || 'unknown'}`);
               this._sendToRelay(proto.agentControlResult(sid, msg.request_id, 'error_prompt_action', 'ok'));
             } catch (e) {
@@ -2964,6 +2993,7 @@ class ProxyEngine extends EventEmitter {
               permissionMode: newSession.permission_mode,
               title: `${workspaceName} - Claude CLI`,
             });
+            newSession.nativeClaudeWindowChild = child;
             newSession.nativeCliStartedAt = summary.nativeCliStartedAt;
             newSession.nativeCliStatus = 'native_window_opened';
             newSession.nativeCliWindowOpened = true;
@@ -3846,6 +3876,7 @@ class ProxyEngine extends EventEmitter {
             permissionMode: sessionData.permission_mode,
             title: `${sessionData.workspace_name || 'Claude Code'} - Claude CLI`,
           });
+          sessionData.nativeClaudeWindowChild = child;
         }
         const pendingMsgs = isCodexCli ? this._codexCliPendingTranscriptMessages(sessionData)
           : isCursorCli ? this._cursorCliPendingTranscriptMessages(sessionData)
@@ -3923,6 +3954,7 @@ class ProxyEngine extends EventEmitter {
             permissionMode,
             title: `${workspaceName} - Claude CLI`,
           });
+          session.nativeClaudeWindowChild = child;
           session.nativeCliStartedAt = summary.nativeCliStartedAt;
           session.nativeCliStatus = 'native_window_opened';
           session.nativeCliWindowOpened = true;
@@ -5804,7 +5836,9 @@ class ProxyEngine extends EventEmitter {
   }
 
   _claudeCliTrustPrompt(session) {
-    if (session.claudeCliFilePath) return null;
+    const workspacePath = session.workspace_path || session.workspacePath;
+    if (claudeCli.isWorkspaceTrusted(workspacePath)) return null;
+    if (!workspacePath && session.claudeCliFilePath) return null;
     const workspaceName = session.workspace_name || session.workspaceName || 'the selected workspace';
     return {
       title: 'Claude CLI needs workspace trust',
@@ -6084,7 +6118,7 @@ class ProxyEngine extends EventEmitter {
       session.lastMessageCount = initialMessages.length;
     }
     const cfg = this._decorateAgentConfig(session, this._mergeAgentConfig('claude_cli', null, session.workspace_path));
-    this._sendToRelay(proto.agentConfig(sessionId, { ...cfg, capabilities: this._buildCapabilities('claude_cli') }));
+    this._sendToRelay(proto.agentConfig(sessionId, { ...cfg, capabilities: this._buildCapabilities('claude_cli', session.workspace_path) }));
     return session;
   }
 
@@ -6191,6 +6225,8 @@ class ProxyEngine extends EventEmitter {
       },
       onExit: (code, err) => {
         if (session._claudeCliChild === child) session._claudeCliChild = null;
+        const wasInterrupted = session._claudeCliInterrupted === true;
+        session._claudeCliInterrupted = false;
         (async () => {
           let summary = this._findClaudeCliSummaryByCliId(cliSessionId);
           for (let attempt = 0; code === 0 && !summary && attempt < 8; attempt++) {
@@ -6210,7 +6246,7 @@ class ProxyEngine extends EventEmitter {
             session.lastObservedCount = effectiveMessages.length;
             session.lastTranscriptSig = this._transcriptSignature(effectiveMessages);
           }
-          if (!summary && (code !== 0 || err)) {
+          if (!summary && !wasInterrupted && (code !== 0 || err)) {
             const stderr = stderrChunks.join('').trim();
             const detail = stderr || err?.message || `Claude CLI exited with code ${code}`;
             this._sendToRelay(proto.proxyMessage(
@@ -6218,7 +6254,7 @@ class ProxyEngine extends EventEmitter {
               'assistant',
               `Claude CLI failed to start or complete the request.\n\n${detail}`
             ));
-          } else if (!summary) {
+          } else if (!summary && !wasInterrupted) {
             this._sendToRelay(proto.proxyMessage(
               sessionId,
               'assistant',
@@ -6227,7 +6263,7 @@ class ProxyEngine extends EventEmitter {
           }
           const activity = {
             kind: 'idle',
-            label: code === 0 && summary ? '' : 'Claude CLI failed',
+            label: wasInterrupted ? 'Interrupted' : (code === 0 && summary ? '' : 'Claude CLI failed'),
             updated_at: new Date().toISOString(),
           };
           session.activity = activity;
@@ -6241,7 +6277,7 @@ class ProxyEngine extends EventEmitter {
             claude_cli_archive_discovered: false,
           });
           this._sendToRelay(proto.proxyStatus(sessionId, session.status || 'healthy', activity));
-          if (code !== 0 || err) {
+          if (!wasInterrupted && (code !== 0 || err)) {
             this._log('warn', `[claude-cli] send exited code=${code} err=${err?.message || ''} stderr=${stderrChunks.join('').slice(0, 500)}`);
           }
           this._broadcastSessionSnapshot();
@@ -6300,7 +6336,7 @@ class ProxyEngine extends EventEmitter {
     await this._handleSessionErrorPromptState(
       sessionId,
       session,
-      messages.length > 0 ? null : this._claudeCliTrustPrompt(session)
+      this._claudeCliTrustPrompt(session)
     );
   }
 
@@ -11203,6 +11239,29 @@ class ProxyEngine extends EventEmitter {
       }
     }, this.POLL_INTERVAL_MS);
 
+    // Claude CLI transcripts and lifecycle state are local-file/process reads.
+    // They must not rotate through the much slower CDP/window group queue,
+    // where a large unrelated history can delay interrupt and trust updates
+    // for tens of seconds. Poll every active/restored Claude CLI session in a
+    // bounded, non-overlapping lane instead.
+    this._claudeCliPollTimer = setInterval(async () => {
+      if (!this._running || this._claudeCliPollInProgress) return;
+      const claudeCliSessionIds = Array.from(this.sessions.entries())
+        .filter(([, session]) => session.agentType === 'claude_cli')
+        .map(([sessionId]) => sessionId);
+      if (claudeCliSessionIds.length === 0) return;
+      this._claudeCliPollInProgress = true;
+      try {
+        for (const sessionId of claudeCliSessionIds) {
+          await this._pollSessionBounded(sessionId);
+        }
+      } catch (e) {
+        this._log('warn', '[poll] Claude CLI lane: ' + e.message);
+      } finally {
+        this._claudeCliPollInProgress = false;
+      }
+    }, this.POLL_INTERVAL_MS);
+
     let tick = 0;
     this._pollTimer = setInterval(async () => {
       if (!this._running) return;
@@ -11264,6 +11323,9 @@ class ProxyEngine extends EventEmitter {
           continue;
         }
         if (session.agentType === 'antigravity-v2' || session.agentType === 'codex-desktop') {
+          continue;
+        }
+        if (session.agentType === 'claude_cli') {
           continue;
         }
         if (
@@ -11410,6 +11472,11 @@ class ProxyEngine extends EventEmitter {
       this._codexDesktopPollTimer = null;
     }
     this._codexDesktopPollInProgress = false;
+    if (this._claudeCliPollTimer) {
+      clearInterval(this._claudeCliPollTimer);
+      this._claudeCliPollTimer = null;
+    }
+    this._claudeCliPollInProgress = false;
     if (this._snapshotTimer) { clearTimeout(this._snapshotTimer); this._snapshotTimer = null; }
     if (this._codexCliWatcher) {
       try { this._codexCliWatcher.close(); } catch {}
