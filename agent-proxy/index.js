@@ -12,7 +12,7 @@ const path = require('path');
 require('dotenv').config({ path: path.join(__dirname, '.env'), override: true });
 const { ProxyEngine } = require('./proxy-engine');
 
-const CDP_PORTS = (process.env.CDP_PORTS || process.env.CDP_PORT || '9223,9226,9225')
+const CDP_PORTS = (process.env.CDP_PORTS || process.env.CDP_PORT || '9223,9228,9225,9226,9227')
   .split(',')
   .map(s => parseInt(s.trim(), 10))
   .filter(Number.isFinite);

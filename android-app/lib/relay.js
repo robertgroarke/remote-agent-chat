@@ -6,17 +6,28 @@
 
 import { getStoredJwt, RELAY_URL } from './auth';
 
-const RECONNECT_BASE_MS = 1_000;
-const RECONNECT_MAX_MS  = 30_000;
-const HEARTBEAT_MS      = 30_000;
+const RECONNECT_DELAYS_MS = [250, 500, 1_000, 2_000, 3_000];
+const DEFAULT_HEARTBEAT_MS = 10_000;
+const DEFAULT_HEARTBEAT_TIMEOUT_MS = 30_000;
+
+export function classifyRelayRtt(rttMs) {
+  if (!Number.isFinite(rttMs) || rttMs < 0) return 'connecting';
+  if (rttMs <= 500) return 'healthy';
+  if (rttMs <= 2_000) return 'slow';
+  return 'poor';
+}
 
 export class RelayClient {
   constructor(onMessage) {
     this.onMessage      = onMessage;  // (msg) => void — called for every incoming event
     this.ws             = null;
-    this.reconnectMs    = RECONNECT_BASE_MS;
+    this.reconnectAttempt = 0;
     this._reconnectTimer = null;
     this._heartbeatTimer = null;
+    this._heartbeatIntervalMs = DEFAULT_HEARTBEAT_MS;
+    this._heartbeatTimeoutMs = DEFAULT_HEARTBEAT_TIMEOUT_MS;
+    this._heartbeatSequence = 0;
+    this._heartbeatPending = new Map();
     this.stopped        = false;
   }
 
@@ -36,9 +47,9 @@ export class RelayClient {
 
     this.ws.onopen = () => {
       console.log('[RelayClient] Connected to', wsBase);
-      this.reconnectMs = RECONNECT_BASE_MS;
-      this._startHeartbeat();
+      this.reconnectAttempt = 0;
       this.onMessage({ type: '_connected' });
+      this.onMessage({ type: '_connection_health', state: 'connecting', rttMs: null, lastAckAt: null });
       // Ask for current session list and history on connect
       this._send({ type: 'connection_hello', last_sequence: 0 });
     };
@@ -46,21 +57,30 @@ export class RelayClient {
     this.ws.onmessage = (e) => {
       try {
         const msg = JSON.parse(e.data);
+        if (msg.type === 'connection_ack') {
+          this._heartbeatIntervalMs = Math.max(1_000, Number(msg.heartbeat_interval_ms) || DEFAULT_HEARTBEAT_MS);
+          this._heartbeatTimeoutMs = Math.max(
+            this._heartbeatIntervalMs * 2,
+            Number(msg.heartbeat_timeout_ms) || DEFAULT_HEARTBEAT_TIMEOUT_MS,
+          );
+          this._startHeartbeat();
+        } else if (msg.type === 'heartbeat_ack') {
+          this._handleHeartbeatAck(msg);
+        }
         // Emit initial activity from session_list metadata so badges appear
         // immediately on connect (before the first 'status' event arrives)
-        if (msg.type === 'session_list' && Array.isArray(msg.sessions)) {
+        if ((msg.type === 'session_list' || msg.type === 'connection_ack') && Array.isArray(msg.sessions)) {
           this.onMessage(msg);
           for (const s of msg.sessions) {
             if (s && typeof s === 'object' && s.session_id && s.activity) {
               const kind = s.activity.kind || 'idle';
-              if (kind !== 'idle') {
-                this.onMessage({
-                  type:     'status',
-                  session:  s.session_id,
-                  thinking: kind !== 'idle',
-                  label:    s.activity.label || '',
-                });
-              }
+              this.onMessage({
+                type:     'status',
+                session:  s.session_id,
+                thinking: kind !== 'idle',
+                label:    s.activity.label || '',
+                activity: s.activity,
+              });
             }
           }
           return;
@@ -77,6 +97,7 @@ export class RelayClient {
       console.log('[RelayClient] Disconnected', e?.code, e?.reason);
       this._stopHeartbeat();
       this.onMessage({ type: '_disconnected' });
+      this.onMessage({ type: '_connection_health', state: 'offline', rttMs: null, lastAckAt: null });
       if (!this.stopped) this._scheduleReconnect();
     };
   }
@@ -85,20 +106,23 @@ export class RelayClient {
 
   sendMessage(sessionId, content, clientMsgId) {
     this._send({
-      type:          'send',
-      session:       sessionId,
+      type:              'send',
+      session:           sessionId,
       content,
-      client_msg_id: clientMsgId || `${Date.now()}-${Math.random().toString(36).slice(2)}`,
+      client_message_id: clientMsgId || `${Date.now()}-${Math.random().toString(36).slice(2)}`,
     });
   }
 
-  resumeSession(sourceSession, agentType, workspacePath) {
+  resumeSession(sourceSession, agentType, workspacePath, options = {}) {
     const requestId = `resume-${Date.now()}-${Math.random().toString(36).slice(2, 7)}`;
     this._send({
       type: 'resume_session',
       source_session: sourceSession,
       agent_type: agentType || 'claude',
       workspace_path: workspacePath || undefined,
+      cli_session_id: options.cli_session_id || undefined,
+      model_id: options.model_id || undefined,
+      permission_mode: options.permission_mode || undefined,
       request_id: requestId,
     });
     return requestId;
@@ -108,6 +132,49 @@ export class RelayClient {
     this._send({ type: 'get_history', session: sessionId, after_sequence: afterSeq });
   }
 
+  requestHistoryChunk(sessionId, options = {}) {
+    const requestId = `histchunk-${Date.now()}-${Math.random().toString(36).slice(2, 7)}`;
+    const mode = options.mode === 'older' ? 'older' : 'tail';
+    const message = {
+      type: 'history_chunk_request',
+      session: sessionId,
+      session_id: sessionId,
+      request_id: requestId,
+      mode,
+      source: 'relay_sqlite',
+      replace: false,
+      limit: Math.max(1, Math.min(500, Number(options.limit) || 200)),
+    };
+    if (mode === 'older' && options.beforeId != null) message.before_id = options.beforeId;
+    this._send(message);
+    return requestId;
+  }
+
+  launchSession(agentType, workspacePath, options = {}) {
+    const requestId = `launch-${Date.now()}-${Math.random().toString(36).slice(2, 7)}`;
+    this._send({
+      type: 'launch_session',
+      agent_type: agentType,
+      workspace_path: workspacePath || undefined,
+      model_id: options.model_id || undefined,
+      permission_mode: options.permission_mode || undefined,
+      effort: options.effort || undefined,
+      request_id: requestId,
+    });
+    return requestId;
+  }
+
+  closeSession(sessionId, isDisconnected = false) {
+    const requestId = `close-${Date.now()}-${Math.random().toString(36).slice(2, 7)}`;
+    this._send({
+      type: isDisconnected ? 'dismiss_session' : 'close_session',
+      session: sessionId,
+      session_id: sessionId,
+      request_id: requestId,
+    });
+    return requestId;
+  }
+
   interrupt(sessionId) {
     this._send({ type: 'agent_interrupt', session_id: sessionId });
   }
@@ -115,6 +182,68 @@ export class RelayClient {
   respondToPermission(sessionId, promptId, choiceId) {
     const requestId = `prompt-${Date.now()}-${Math.random().toString(36).slice(2, 7)}`;
     this._send({ type: 'permission_response', session_id: sessionId, prompt_id: promptId, choice_id: choiceId, request_id: requestId });
+    return requestId;
+  }
+
+  respondToErrorPrompt(sessionId, promptId, actionId) {
+    const requestId = `errprompt-${Date.now()}-${Math.random().toString(36).slice(2, 7)}`;
+    this._send({
+      type: 'error_prompt_action',
+      session_id: sessionId,
+      prompt_id: promptId,
+      action_id: actionId,
+      request_id: requestId,
+    });
+    return requestId;
+  }
+
+  steerMessage(sessionId, clientMessageId, content, nativeIndex) {
+    const message = {
+      type: 'steer',
+      session_id: sessionId,
+      client_message_id: clientMessageId,
+      content,
+    };
+    if (nativeIndex != null) message.native_index = nativeIndex;
+    this._send(message);
+  }
+
+  discardQueuedMessage(sessionId, clientMessageId) {
+    this._send({
+      type: 'discard_queued',
+      session_id: sessionId,
+      client_message_id: clientMessageId,
+    });
+  }
+
+  editQueuedMessage(sessionId, clientMessageId, content) {
+    this._send({
+      type: 'edit_queued',
+      session_id: sessionId,
+      client_message_id: clientMessageId,
+      content,
+    });
+  }
+
+  requestDirectoryListing(sessionId, dirPath = '.') {
+    const requestId = `dir-${Date.now()}-${Math.random().toString(36).slice(2, 7)}`;
+    this._send({
+      type: 'list_directory',
+      session_id: sessionId,
+      request_id: requestId,
+      path: dirPath || '.',
+    });
+    return requestId;
+  }
+
+  requestFileContent(sessionId, filePath) {
+    const requestId = `file-${Date.now()}-${Math.random().toString(36).slice(2, 7)}`;
+    this._send({
+      type: 'read_file',
+      session_id: sessionId,
+      request_id: requestId,
+      path: filePath,
+    });
     return requestId;
   }
 
@@ -164,6 +293,12 @@ export class RelayClient {
   openPanel(sessionId) {
     const requestId = `panel-${Date.now()}-${Math.random().toString(36).slice(2, 7)}`;
     this._send({ type: 'open_panel', session_id: sessionId, request_id: requestId });
+    return requestId;
+  }
+
+  openNativeWindow(sessionId) {
+    const requestId = `native-${Date.now()}-${Math.random().toString(36).slice(2, 7)}`;
+    this._send({ type: 'open_native_window', session_id: sessionId, request_id: requestId });
     return requestId;
   }
 
@@ -297,19 +432,55 @@ export class RelayClient {
 
   _startHeartbeat() {
     this._stopHeartbeat();
-    this._heartbeatTimer = setInterval(() => this._send({ type: 'ping' }), HEARTBEAT_MS);
+    this._sendHeartbeat();
+    this._heartbeatTimer = setInterval(() => this._sendHeartbeat(), this._heartbeatIntervalMs);
   }
 
   _stopHeartbeat() {
     clearInterval(this._heartbeatTimer);
+    this._heartbeatTimer = null;
+    for (const pending of this._heartbeatPending.values()) clearTimeout(pending.timeout);
+    this._heartbeatPending.clear();
+  }
+
+  _sendHeartbeat() {
+    if (this.ws?.readyState !== WebSocket.OPEN || this._heartbeatPending.size > 0) return;
+    const requestId = `android-hb-${Date.now()}-${++this._heartbeatSequence}`;
+    const sentAt = Date.now();
+    const timeout = setTimeout(() => {
+      if (!this._heartbeatPending.has(requestId)) return;
+      this._heartbeatPending.delete(requestId);
+      this.onMessage({ type: '_connection_health', state: 'stale', rttMs: null, lastAckAt: null });
+      try { this.ws?.close(); } catch {}
+    }, this._heartbeatTimeoutMs);
+    this._heartbeatPending.set(requestId, { sentAt, timeout });
+    this._send({
+      type: 'heartbeat', protocol_version: 1, request_id: requestId,
+      client_ts: new Date(sentAt).toISOString(),
+    });
+  }
+
+  _handleHeartbeatAck(message) {
+    const pending = this._heartbeatPending.get(message.request_id);
+    if (!pending) return;
+    clearTimeout(pending.timeout);
+    this._heartbeatPending.delete(message.request_id);
+    const rttMs = Math.max(0, Date.now() - pending.sentAt);
+    this.onMessage({
+      type: '_connection_health',
+      state: classifyRelayRtt(rttMs),
+      rttMs,
+      lastAckAt: Date.now(),
+    });
   }
 
   _scheduleReconnect() {
     clearTimeout(this._reconnectTimer);
-    console.log(`[RelayClient] Reconnecting in ${this.reconnectMs}ms`);
+    const delay = RECONNECT_DELAYS_MS[Math.min(this.reconnectAttempt, RECONNECT_DELAYS_MS.length - 1)];
+    this.reconnectAttempt += 1;
+    console.log(`[RelayClient] Reconnecting in ${delay}ms`);
     this._reconnectTimer = setTimeout(() => {
-      this.reconnectMs = Math.min(this.reconnectMs * 2, RECONNECT_MAX_MS);
       this.connect();
-    }, this.reconnectMs);
+    }, delay);
   }
 }

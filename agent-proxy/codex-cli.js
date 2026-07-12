@@ -4,6 +4,7 @@ const fs = require('fs');
 const os = require('os');
 const path = require('path');
 const { spawn, spawnSync } = require('child_process');
+const { normalizeNativeLaunchMode, backgroundNativeLaunchResult } = require('./native-launch-mode');
 
 let chokidar = null;
 try { chokidar = require('chokidar'); } catch {}
@@ -456,6 +457,28 @@ function promptBlock({ title, content, status = null, collapsed = false }) {
   return block;
 }
 
+function noticeBlock({ title, content, tone = 'info', status = null, actions = null }) {
+  const block = {
+    type: 'notice',
+    title,
+    content: String(content || ''),
+    tone,
+  };
+  if (status) block.status = status;
+  if (Array.isArray(actions) && actions.length) block.actions = actions;
+  return block;
+}
+
+function planBlock(taskList, { title = 'Plan' } = {}) {
+  return {
+    type: 'plan',
+    title,
+    total: taskList?.total || 0,
+    completed: taskList?.completed || 0,
+    tasks: Array.isArray(taskList?.tasks) ? taskList.tasks : [],
+  };
+}
+
 function commandText(value) {
   if (Array.isArray(value)) {
     return value.map(part => {
@@ -526,7 +549,7 @@ function patchBlock(payload) {
 
 function compactedBlock(payload) {
   const content = payload?.message || payload?.text || 'Conversation context compacted.';
-  return promptBlock({ title: 'Context compacted', content, collapsed: false });
+  return noticeBlock({ title: 'Context compacted', content });
 }
 
 function rollbackBlock(payload) {
@@ -534,7 +557,7 @@ function rollbackBlock(payload) {
   const content = turns > 0
     ? `Rolled back ${turns} ${turns === 1 ? 'turn' : 'turns'}.`
     : 'Thread rolled back.';
-  return promptBlock({ title: 'Thread rolled back', content, status: 'completed', collapsed: false });
+  return noticeBlock({ title: 'Thread rolled back', content, status: 'completed' });
 }
 
 function viewImageBlock(payload) {
@@ -733,7 +756,10 @@ function rememberToolCall(state, payload, startedAtMs = 0) {
   state.toolCalls.set(callId, known);
   state.pendingToolCalls.set(callId, known);
   const taskList = known.name === 'update_plan' ? planTaskListFromArgs(argsRaw) : null;
-  if (taskList) state.latestPlan = taskList;
+  if (taskList) {
+    known.taskList = taskList;
+    state.latestPlan = taskList;
+  }
   return known;
 }
 
@@ -796,14 +822,16 @@ function applyEntryToState(state, entry) {
         });
       }
     } else if (payload.type === 'function_call' || payload.type === 'local_shell_call') {
-      rememberToolCall(state, payload, tsMs);
-      const block = toolBlock(payload, { title: payload.name ? `Tool: ${payload.name}` : 'Tool call', status: payload.status || 'completed', collapsed: false });
+      const knownCall = rememberToolCall(state, payload, tsMs);
+      const block = knownCall?.taskList
+        ? planBlock(knownCall.taskList)
+        : toolBlock(payload, { title: payload.name ? `Tool: ${payload.name}` : 'Tool call', status: payload.status || 'completed', collapsed: false });
       pushDedup(state.messages, { role: 'assistant', content: functionCallText(payload), content_blocks: [block], ts });
     } else if (payload.type === 'function_call_output' || payload.type === 'local_shell_call_output') {
       const knownCall = lookupToolCall(state, payload);
       if (payload?.call_id) state.pendingToolCalls.delete(String(payload.call_id));
       const title = knownCall?.name ? `Tool result: ${knownCall.name}` : 'Tool result';
-      const block = toolBlock(payload, { title, status: payload.status || 'completed', collapsed: false, content: toolResultBody(payload, knownCall) });
+      const block = toolBlock(payload, { title, type: 'tool_result', status: payload.status || 'completed', collapsed: false, content: toolResultBody(payload, knownCall) });
       pushDedup(state.messages, { role: 'assistant', content: functionOutputText(payload, knownCall), content_blocks: [block], ts });
     } else if (payload.type === 'custom_tool_call') {
       rememberToolCall(state, payload, tsMs);
@@ -813,7 +841,7 @@ function applyEntryToState(state, entry) {
       const knownCall = lookupToolCall(state, payload);
       if (payload?.call_id) state.pendingToolCalls.delete(String(payload.call_id));
       const title = knownCall?.name ? `Tool result: ${knownCall.name}` : 'Tool result';
-      const block = toolBlock(payload, { title, status: payload.status || 'completed', collapsed: false, content: toolResultBody(payload, knownCall) });
+      const block = toolBlock(payload, { title, type: 'tool_result', status: payload.status || 'completed', collapsed: false, content: toolResultBody(payload, knownCall) });
       pushDedup(state.messages, { role: 'assistant', content: functionOutputText(payload, knownCall), content_blocks: [block], ts });
     } else if (payload.type === 'web_search_call') {
       const block = toolBlock(payload, {
@@ -836,6 +864,7 @@ function applyEntryToState(state, entry) {
       if (payload?.call_id) state.pendingToolCalls.delete(String(payload.call_id));
       const block = toolBlock(payload, {
         title: 'Tool result: tool_search',
+        type: 'tool_result',
         status: payload.status || 'completed',
         collapsed: false,
         content: toolSearchOutputBody(payload),
@@ -873,6 +902,7 @@ function applyEntryToState(state, entry) {
       const name = mcpInvocationName(payload);
       const block = toolBlock(payload, {
         title: `Tool result: ${name}`,
+        type: 'tool_result',
         status: payload.status || 'completed',
         collapsed: false,
         content: [mcpToolCallBody(payload), mcpToolResultBody(payload)].filter(Boolean).join('\n\n'),
@@ -893,6 +923,7 @@ function applyEntryToState(state, entry) {
       if (payload?.call_id) state.pendingToolCalls.delete(String(payload.call_id));
       const block = toolBlock(payload, {
         title: 'Tool result: web_search',
+        type: 'tool_result',
         status: payload.status || 'completed',
         collapsed: false,
         content: webSearchBody(payload),
@@ -915,7 +946,7 @@ function applyEntryToState(state, entry) {
           pushDedup(state.messages, {
             role: 'assistant',
             content: `[Goal updated]\n\n${content}`,
-            content_blocks: [promptBlock({ title: 'Goal updated', content, status: goal.status, collapsed: false })],
+            content_blocks: [noticeBlock({ title: 'Goal updated', content, status: goal.status })],
             ts,
           });
         }
@@ -1744,7 +1775,10 @@ function buildNativeCodexWindowPowerShell({ cwd, launcherPath, elevated = false 
   return ps.join(' ');
 }
 
-function startNativeCodexWindow({ workspacePath, cliSessionId, resume = true, model, effort, permissionMode, title, elevated = false } = {}) {
+function startNativeCodexWindow({ workspacePath, cliSessionId, resume = true, model, effort, permissionMode, title, elevated = false, launchMode = 'foreground' } = {}) {
+  if (normalizeNativeLaunchMode(launchMode) === 'background') {
+    return backgroundNativeLaunchResult('codex_cli');
+  }
   const cwd = workspacePath || process.cwd();
   if (process.platform !== 'win32') {
     const args = buildCodexArgs({ cliSessionId, resume, model, effort, permissionMode, workspacePath: cwd });
@@ -1780,8 +1814,8 @@ function startNativeCodexWindow({ workspacePath, cliSessionId, resume = true, mo
   return { pid, remoteAgentElevated: !!elevated };
 }
 
-function watchSessions({ onSummary, onError, debounceMs = 120, summaryOptions = {} } = {}) {
-  const root = sessionsDir();
+function watchSessions({ onSummary, onError, debounceMs = 120, summaryOptions = {}, rootDir = sessionsDir() } = {}) {
+  const root = rootDir;
   if (!chokidar || !fs.existsSync(root)) return null;
   const timers = new Map();
   const flush = filePath => {

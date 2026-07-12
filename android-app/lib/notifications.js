@@ -16,6 +16,16 @@ const PUSH_ENDPOINT = `${RELAY_URL}/fcm-token`;
 // Must be called before any notifications can be shown on Android.
 
 export async function configureNotificationChannels() {
+  await Notifications.setNotificationChannelAsync('permission-required', {
+    name:             'Permission Required',
+    description:      'Notifies when an agent needs approval before it can continue.',
+    importance:       Notifications.AndroidImportance.HIGH,
+    vibrationPattern: [0, 250, 150, 250],
+    lightColor:       '#d29922',
+    sound:            true,
+    lockscreenVisibility: Notifications.AndroidNotificationVisibility.PUBLIC,
+  });
+
   await Notifications.setNotificationChannelAsync('agent-idle', {
     name:             'Agent Ready',
     description:      'Notifies when an agent finishes a task and is waiting for input.',
@@ -24,6 +34,23 @@ export async function configureNotificationChannels() {
     lightColor:       '#58a6ff',
     sound:            true,
     lockscreenVisibility: Notifications.AndroidNotificationVisibility.PUBLIC,
+  });
+
+  await Notifications.setNotificationChannelAsync('agent-error', {
+    name:             'Agent Needs Attention',
+    description:      'Notifies when an agent errors or becomes rate limited.',
+    importance:       Notifications.AndroidImportance.HIGH,
+    vibrationPattern: [0, 300, 150, 300],
+    lightColor:       '#f85149',
+    sound:            true,
+    lockscreenVisibility: Notifications.AndroidNotificationVisibility.PUBLIC,
+  });
+
+  await Notifications.setNotificationChannelAsync('session-offline', {
+    name:        'Session Offline',
+    description: 'Notifies when an agent session disconnects from the relay.',
+    importance:  Notifications.AndroidImportance.DEFAULT,
+    sound:       false,
   });
 
   await Notifications.setNotificationChannelAsync('rate-limit', {
@@ -49,8 +76,14 @@ export async function registerForPushNotifications(jwt) {
 
   if (finalStatus !== 'granted') return null;
 
-  const tokenData  = await Notifications.getExpoPushTokenAsync();
-  const pushToken  = tokenData.data;
+  // The relay sends through Firebase Admin, so it needs the native Android FCM
+  // registration token. Expo push tokens are only valid with Expo's push service.
+  const tokenData = await Notifications.getDevicePushTokenAsync();
+  if (tokenData.type !== 'fcm' || typeof tokenData.data !== 'string' || !tokenData.data) {
+    console.warn('[notifications] Expected a native Android FCM token.');
+    return null;
+  }
+  const pushToken = tokenData.data;
 
   await _uploadToken(pushToken, jwt);
   return pushToken;
@@ -58,8 +91,10 @@ export async function registerForPushNotifications(jwt) {
 
 // Listen for token rotation (FCM sometimes rotates tokens) and re-upload.
 export function subscribeToTokenRefresh(jwt) {
-  return Notifications.addPushTokenListener(async ({ data: newToken }) => {
-    if (newToken) await _uploadToken(newToken, jwt);
+  return Notifications.addPushTokenListener(async tokenData => {
+    if (tokenData?.type === 'fcm' && typeof tokenData.data === 'string' && tokenData.data) {
+      await _uploadToken(tokenData.data, jwt);
+    }
   });
 }
 
@@ -73,7 +108,7 @@ async function _uploadToken(pushToken, jwt) {
         'Content-Type':  'application/json',
         'Authorization': `Bearer ${jwt}`,
       },
-      body: JSON.stringify({ token: pushToken, platform: 'android' }),
+      body: JSON.stringify({ fcm_token: pushToken, platform: 'android' }),
     });
     if (!resp.ok) console.warn('[notifications] Token upload failed:', resp.status);
   } catch (err) {

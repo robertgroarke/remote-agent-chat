@@ -33,7 +33,7 @@ assert(summary.messages.some(msg => msg.content_blocks?.some(block =>
   && block.collapsed === false
 )));
 assert(summary.messages.some(msg => msg.content_blocks?.some(block =>
-  block.type === 'tool_call'
+  block.type === 'tool_result'
   && block.title === 'Tool result: shell_command'
   && block.content.includes('tool: shell_command')
   && block.content.includes('"changed"')
@@ -118,7 +118,7 @@ assert.strictEqual(liveLikeSummary.activity.goal.label, 'Pursuing goal');
 assert.strictEqual(liveLikeSummary.activity.goal.time_used_seconds, 58);
 assert.strictEqual(liveLikeSummary.activity.goal.objective, 'Keep proving live Codex CLI fidelity');
 assert(liveLikeSummary.messages.some(msg => msg.content_blocks?.some(block =>
-  block.type === 'prompt'
+  block.type === 'notice'
   && block.title === 'Goal updated'
   && block.content.includes('Keep proving live Codex CLI fidelity')
 )), 'expected /goal updates to render into transcript blocks');
@@ -132,7 +132,7 @@ assert(liveLikeSummary.messages.some(msg => msg.content_blocks?.some(block =>
   && block.content.includes('Remote Agent Chat Codex CLI fidelity')
 )), 'expected web_search_call to render as a tool block');
 assert(liveLikeSummary.messages.some(msg => msg.content_blocks?.some(block =>
-  block.type === 'tool_call'
+  block.type === 'tool_result'
   && block.title === 'Tool result: web_search'
   && block.content.includes('ws_live')
 )), 'expected web_search_end to render as a tool result');
@@ -149,12 +149,12 @@ assert(liveLikeSummary.messages.some(msg => msg.content_blocks?.some(block =>
   && block.content.includes('browser automation')
 )), 'expected tool_search_call to render as a tool block');
 assert(liveLikeSummary.messages.some(msg => msg.content_blocks?.some(block =>
-  block.type === 'tool_call'
+  block.type === 'tool_result'
   && block.title === 'Tool result: tool_search'
   && block.content.includes('codex_app.read_thread_terminal')
 )), 'expected tool_search_output to render matched tool names');
 assert(liveLikeSummary.messages.some(msg => msg.content_blocks?.some(block =>
-  block.type === 'tool_call'
+  block.type === 'tool_result'
   && block.title === 'Tool result: codex_app.read_thread_terminal'
   && block.content.includes('structuredContent')
   && block.content.includes('terminal output')
@@ -176,11 +176,11 @@ assert(liveLikeSummary.messages.some(msg => msg.content_blocks?.some(block =>
   && block.content.includes('Remote compact task failed')
 )), 'expected Codex CLI error events to render explicitly');
 assert(liveLikeSummary.messages.some(msg => msg.content_blocks?.some(block =>
-  block.type === 'prompt'
+  block.type === 'notice'
   && block.title === 'Context compacted'
 )), 'expected context compaction to render into transcript blocks');
 assert(liveLikeSummary.messages.some(msg => msg.content_blocks?.some(block =>
-  block.type === 'prompt'
+  block.type === 'notice'
   && block.title === 'Thread rolled back'
   && block.content.includes('Rolled back 1 turn')
 )), 'expected thread rollback event to render explicitly');

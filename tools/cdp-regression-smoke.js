@@ -17,7 +17,8 @@ function requireCdp() {
 const CDP = requireCdp();
 
 const PORTS = {
-  antigravity: 9223,
+  vscode: 9223,
+  antigravity: 9228,
   antigravityV2: 9226,
   codexDesktop: 9225,
 };
@@ -231,7 +232,7 @@ async function listTargetsByPort() {
   const meta = {};
   for (const [name, port] of Object.entries(PORTS)) {
     try {
-      meta[name] = await CDP.List({ port });
+      meta[name] = (await CDP.List({ port })).map(target => ({ ...target, _cdpPort: port, _hostKey: name }));
     } catch (error) {
       meta[name] = { error: error.message };
     }
@@ -240,7 +241,7 @@ async function listTargetsByPort() {
 }
 
 async function withTarget(port, target, fn) {
-  const client = await CDP({ port, target: target.id });
+  const client = await CDP({ port: target._cdpPort || port, target: target.id });
   try {
     await client.Runtime.enable();
     return await fn(client.Runtime, client);
@@ -271,7 +272,7 @@ async function findBestRooCodeTarget(targets) {
   let bestScore = -1;
   for (const t of candidates) {
     try {
-      const client = await CDP({ port: PORTS.antigravity, target: t.id });
+      const client = await CDP({ port: t._cdpPort || PORTS.antigravity, target: t.id });
       try {
         await client.Runtime.enable();
         const res = await client.Runtime.evaluate({
@@ -471,8 +472,8 @@ async function runWorkbenchSuite(targets, reporter) {
       surface,
       test_id: 'workbench.target.detect',
       status: STATUS_SKIP,
-      detail: 'No Antigravity workbench page target found on port 9223',
-      investigation_hint: 'Open Antigravity IDE with remote debugging enabled on port 9223',
+      detail: 'No Antigravity workbench page target found on port 9228',
+      investigation_hint: 'Open Antigravity IDE with remote debugging enabled on port 9228',
     });
     return null;
   }
@@ -649,8 +650,8 @@ async function runIframeSurfaceSuite(targets, reporter, surface, targetOverride 
       surface,
       test_id: testPrefix + '.target.detect',
       status: STATUS_SKIP,
-      detail: 'No live ' + surface + ' iframe target found on port 9223',
-      investigation_hint: 'Open the ' + surface + ' surface in Antigravity before running the smoke suite',
+      detail: 'No live ' + surface + ' iframe target found on VS Code port 9223 or Antigravity IDE port 9228',
+      investigation_hint: 'Open the ' + surface + ' surface in a configured editor host before running the smoke suite',
     });
     return;
   }
@@ -844,17 +845,20 @@ async function runSmokeSuite(options = {}) {
   const targetsByPort = await listTargetsByPort();
 
   const meta = {
+    vscode_targets: Array.isArray(targetsByPort.vscode) ? targetsByPort.vscode.length : 0,
     antigravity_targets: Array.isArray(targetsByPort.antigravity) ? targetsByPort.antigravity.length : 0,
     antigravity_v2_targets: Array.isArray(targetsByPort.antigravityV2) ? targetsByPort.antigravityV2.length : 0,
     codex_desktop_targets: Array.isArray(targetsByPort.codexDesktop) ? targetsByPort.codexDesktop.length : 0,
+    vscode_error: Array.isArray(targetsByPort.vscode) ? null : targetsByPort.vscode.error,
     antigravity_error: Array.isArray(targetsByPort.antigravity) ? null : targetsByPort.antigravity.error,
     antigravity_v2_error: Array.isArray(targetsByPort.antigravityV2) ? null : targetsByPort.antigravityV2.error,
     codex_desktop_error: Array.isArray(targetsByPort.codexDesktop) ? null : targetsByPort.codexDesktop.error,
   };
 
   const needsAntigravityPort = options.surfaces.some(surface =>
-    surface === 'workbench' ||
-    surface === 'antigravity_panel' ||
+    surface === 'workbench' || surface === 'antigravity_panel'
+  );
+  const needsEditorExtensionPort = options.surfaces.some(surface =>
     surface === 'claude' ||
     surface === 'codex' ||
     surface === 'continue' ||
@@ -864,13 +868,28 @@ async function runSmokeSuite(options = {}) {
   const needsCodexDesktopPort = options.surfaces.includes('codex-desktop');
   const needsAntigravityV2Port = options.surfaces.includes('antigravity-v2');
 
+  const editorTargets = [
+    ...(Array.isArray(targetsByPort.vscode) ? targetsByPort.vscode : []),
+    ...(Array.isArray(targetsByPort.antigravity) ? targetsByPort.antigravity : []),
+  ];
+
   if (needsAntigravityPort && !Array.isArray(targetsByPort.antigravity)) {
     reporter.add({
       surface: 'workbench',
       test_id: 'workbench.port.connect',
       status: STATUS_FAIL,
       detail: 'Could not list Antigravity CDP targets: ' + targetsByPort.antigravity.error,
-      investigation_hint: 'Check port 9223 and whether Antigravity was launched with remote debugging',
+      investigation_hint: 'Check port 9228 and whether Antigravity IDE was launched with remote debugging',
+    });
+  }
+
+  if (needsEditorExtensionPort && editorTargets.length === 0) {
+    reporter.add({
+      surface: 'workbench',
+      test_id: 'editor-host.port.connect',
+      status: STATUS_FAIL,
+      detail: 'Could not find extension targets on VS Code 9223 or Antigravity IDE 9228',
+      investigation_hint: 'Launch at least one supported editor host with remote debugging',
     });
   }
 
@@ -908,19 +927,18 @@ async function runSmokeSuite(options = {}) {
 
   for (const surface of ['claude', 'codex', 'continue', 'roo_code', 'cline']) {
     if (!options.surfaces.includes(surface)) continue;
-    const antigravityTargets = Array.isArray(targetsByPort.antigravity) ? targetsByPort.antigravity : [];
     if (surface === 'codex') {
-      const codexTargets = findMatchingTargets(antigravityTargets, PATTERNS.codex);
+      const codexTargets = findMatchingTargets(editorTargets, PATTERNS.codex);
       if (codexTargets.length === 0) {
-        await runIframeSurfaceSuite(antigravityTargets, reporter, surface);
+        await runIframeSurfaceSuite(editorTargets, reporter, surface);
       } else {
         for (let i = 0; i < codexTargets.length; i++) {
-          await runIframeSurfaceSuite(antigravityTargets, reporter, surface, codexTargets[i], i);
+          await runIframeSurfaceSuite(editorTargets, reporter, surface, codexTargets[i], i);
         }
       }
       continue;
     }
-    await runIframeSurfaceSuite(antigravityTargets, reporter, surface);
+    await runIframeSurfaceSuite(editorTargets, reporter, surface);
   }
 
   return reporter.buildReport(meta);

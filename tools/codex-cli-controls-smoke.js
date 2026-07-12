@@ -99,7 +99,8 @@ assert.doesNotMatch(proxySource, /const wasInterrupted = session\._codexCliInter
 assert.match(proxySource, /codex_cli_interrupted: true/);
 assert.match(proxySource, /const interrupted = sessionMeta\.codex_cli_interrupted === true/);
 assert.match(proxySource, /sessionStore\.updateSession\(sessionId, \{ codex_cli_interrupted: false \}\)/);
-assert.match(proxySource, /permission_dialogs:\s+isClaude \|\| isClaudeCli \|\| isCodex/);
+assert.match(proxySource, /permission_dialogs:\s+isClaude \|\| isClaudeCli \|\| agentType === 'codex-desktop'/);
+assert.doesNotMatch(proxySource, /permission_dialogs:[^\n]*\|\| isCodex \|\|/);
 assert.doesNotMatch(proxySource, /permission_dialogs:[^\n]*isCodexCli/);
 assert.doesNotMatch(proxySource, /permission_dialogs:[^\n]*isCursorCli/);
 assert.match(

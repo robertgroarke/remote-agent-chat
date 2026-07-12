@@ -8,6 +8,11 @@ const path = require('path');
 const { resolveCodexCommand } = require('../agent-proxy/codex-cli');
 
 const root = path.join(__dirname, '..');
+const args = process.argv.slice(2);
+if (args.some(arg => arg !== '--read-only')) {
+  console.error('Codex CLI validate-all only supports --read-only.');
+  process.exit(2);
+}
 const stages = [
   ['Codex CLI parser syntax', process.execPath, ['--check', 'agent-proxy/codex-cli.js']],
   ['Proxy engine syntax', process.execPath, ['--check', 'agent-proxy/proxy-engine.js']],
@@ -55,3 +60,4 @@ runStage('Codex CLI version', codex.command, [...codex.argsPrefix, '--version'])
 
 const total = stages.length + 2;
 console.log(`ALL CODEX CLI VALIDATION STAGES PASS (${total}/${total})`);
+console.log('READ-ONLY PASS (no chats, prompts, controls, or service restarts were performed)');

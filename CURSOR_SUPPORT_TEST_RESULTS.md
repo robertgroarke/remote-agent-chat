@@ -60,7 +60,9 @@ Read-poll safety: `a44ae00` — `readCursorAgentList` does not click sidebar.
 - **evalInPage return bug:** `CURSOR_AGENT_LIST_EXPR`, `CURSOR_PERMISSION_EXPR`, `CURSOR_FILE_CHANGES_EXPR`, `CURSOR_CONFIG_EXPR`, `switchCursorAgent`, `respondCursorPermissionDialog`, and `respondCursorFileChange` now `return` IIFE results so polling reads are not always empty/false.
 - **Agent IDs:** title-slug stable IDs (`agent-{slug}`), not index-based.
 - **Protocol:** `file_change_response` documented; relay `KNOWN_CLIENT_TYPES` includes it; frontend/Android Accept/Reject in DiffViewer.
-- **Validation bundle:** `node tools/cursor-validate-all.js` runs smoke + relay E2Es (permission test disables auto-approve first).
+- **Validation bundles:** `node tools/cursor-validate-all.js --read-only` runs safe
+  smoke/capability checks; `--send-live` adds the throwaway relay E2Es (permission test
+  disables auto-approve first).
 
 ---
 
@@ -87,4 +89,4 @@ Read-poll safety: `a44ae00` — `readCursorAgentList` does not click sidebar.
 
 Cursor remote chat is **production-ready** for send, relay, REST history, interrupt, config, agent list/switch (glass + workbench), structured transcript blocks, permission round-trip, file-change Undo/Keep, and per-session auto-approve.
 
-**Regression bundle (2026-07-09):** `node tools/cursor-validate-all.js` → ALL PASS.
+**Regression bundle (2026-07-09):** `node tools/cursor-validate-all.js --send-live` → ALL PASS.

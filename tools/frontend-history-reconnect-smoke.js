@@ -110,11 +110,13 @@ const mergeHistoryTailByOverlap = moduleRecord.exports.mergeHistoryTailByOverlap
 const removeSupersededCliTranscriptPlaceholders = moduleRecord.exports.removeSupersededCliTranscriptPlaceholders;
 const shouldRefreshNativeCliPlaceholder = moduleRecord.exports.shouldRefreshNativeCliPlaceholder;
 const sessionMetadataActivityMaps = moduleRecord.exports.sessionMetadataActivityMaps;
+const reconnectDelays = moduleRecord.exports.RELAY_RECONNECT_DELAYS_MS;
 assert.equal(typeof shouldMergeHistorySnapshot, 'function');
 assert.equal(typeof mergeHistoryTailByOverlap, 'function');
 assert.equal(typeof removeSupersededCliTranscriptPlaceholders, 'function');
 assert.equal(typeof shouldRefreshNativeCliPlaceholder, 'function');
 assert.equal(typeof sessionMetadataActivityMaps, 'function');
+assert.deepEqual(reconnectDelays, [250, 500, 1000, 2000, 3000], 'relay reconnect must begin below the 3-second recovery target');
 assert.deepEqual(
   sessionMetadataActivityMaps([
     { session_id: 'active-cli', activity: { kind: 'generating', label: 'Working', thinkingContent: 'running' } },
@@ -238,7 +240,7 @@ assert.equal(firstSocket.sent.length, 1, 'initial history request should be sent
 firstSocket.close();
 assert.deepEqual(states[3], {}, 'socket close should clear visible loading state');
 
-runTimer(3000);
+runTimer(250);
 const secondSocket = FakeWebSocket.instances[1];
 secondSocket.open();
 relay.requestHistoryChunk('reconnect-session', { source: 'native' });
@@ -260,6 +262,34 @@ secondSocket.receive({
 });
 assert.equal(states[1]['reconnect-session'][0].content, 'restored');
 assert.equal(states[3]['reconnect-session'], undefined, 'successful history should clear loading state');
+
+states[1]['delta-session'] = [
+  { id: 1, sequence: 40, role: 'user', content: 'already loaded' },
+  { id: 2, sequence: 41, role: 'assistant', content: 'existing reply' },
+];
+relay.requestHistory('delta-session', { afterSequence: 41 });
+const deltaRequest = secondSocket.sent.find(message => message.session_id === 'delta-session');
+assert.equal(deltaRequest.type, 'history_request', 'reconnect resync must use the versioned history request');
+assert.equal(deltaRequest.after_sequence, 41, 'reconnect resync must request only sequences after the local tail');
+assert.equal(deltaRequest.limit, undefined, 'delta resync must not replay a bounded tail');
+secondSocket.receive({
+  type: 'history_delta',
+  session_id: 'delta-session',
+  request_id: deltaRequest.request_id,
+  after_sequence: 41,
+  last_sequence: 42,
+  total_messages: 3,
+  messages: [
+    { id: 2, sequence: 41, role: 'assistant', content: 'existing reply' },
+    { id: 3, sequence: 42, role: 'assistant', content: 'new delta reply' },
+  ],
+});
+assert.deepEqual(
+  states[1]['delta-session'].map(message => message.content),
+  ['already loaded', 'existing reply', 'new delta reply'],
+  'history deltas must append only unseen messages',
+);
+assert.equal(states[3]['delta-session'], undefined, 'delta completion must clear loading state');
 
 states[1]['replace-session'] = [
   { role: 'user', content: 'stale duplicated turn' },
@@ -335,6 +365,16 @@ assert.match(
   appSource,
   /function selectSession\(id, sessionMeta\)[\s\S]*?requestHistory\(id, historyRequestOptionsFor\(sessionMeta\)\)/,
   'selecting a session must refresh history even when a stale startup placeholder is already rendered',
+);
+assert.match(
+  appSource,
+  /list\.scrollTop < 160[\s\S]*?requestOlderHistoryRef\.current\?\.\(\)/,
+  'intentional top-of-scroll navigation must trigger one bounded older-history request',
+);
+assert.match(
+  appSource,
+  /lastSequence > 0[\s\S]*?requestHistory\(activeSession, \{ afterSequence: lastSequence \}\)/,
+  'reconnect with sequenced local history must request a delta instead of replacing the tail',
 );
 
 console.log('frontend history reconnect smoke: PASS');

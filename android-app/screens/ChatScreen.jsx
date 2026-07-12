@@ -9,11 +9,15 @@ import {
 import * as ImagePicker    from 'expo-image-picker';
 import * as DocumentPicker from 'expo-document-picker';
 import * as FileSystem     from 'expo-file-system';
+import AsyncStorage        from '@react-native-async-storage/async-storage';
 import { RelayClient }      from '../lib/relay';
 import { getStoredJwt, signOut, RELAY_URL } from '../lib/auth';
 import MessageBubble         from '../components/MessageBubble';
 import ActivityRow           from '../components/ActivityRow';
 import PermissionPrompt      from '../components/PermissionPrompt';
+import ErrorPrompt           from '../components/ErrorPrompt';
+import QueuedMessageBar      from '../components/QueuedMessageBar';
+import FileBrowserSheet      from '../components/FileBrowserSheet';
 import AgentSettingsSheet    from '../components/AgentSettingsSheet';
 import ChatListSheet         from '../components/ChatListSheet';
 import ThreadHistorySheet    from '../components/ThreadHistorySheet';
@@ -21,16 +25,36 @@ import TerminalViewer        from '../components/TerminalViewer';
 import DiffViewer            from '../components/DiffViewer';
 import BranchSelectorSheet   from '../components/BranchSelectorSheet';
 
+const DRAFT_STORAGE_PREFIX = 'remote-agent-chat:draft:v1:';
+const HISTORY_PAGE_SIZE = 200;
+const DELIVERY_STAGE_TIMEOUT_MS = Object.freeze({
+  queued: 10000,
+  accepted: 30000,
+  delivered: 30000,
+  steered: 30000,
+});
+const SLASH_COMMANDS = [
+  { command: '/plan', detail: 'Outline the implementation approach and major steps.' },
+  { command: '/review', detail: 'Review the current changes for bugs, regressions, and missing tests.' },
+  { command: '/fix', detail: 'Implement or repair the current issue.' },
+  { command: '/summarize', detail: 'Summarize the current state and important changes.' },
+];
+
 export default function ChatScreen({ route, navigation }) {
   const { sessionId, title, agentType } = route.params;
 
   const [messages,  setMessages]  = useState([]);
   const [activity,  setActivity]  = useState(null);
   const [connected, setConnected] = useState(false);
+  const [connectionHealth, setConnectionHealth] = useState({ state: 'connecting', rttMs: null });
   const [permPrompt, setPermPrompt] = useState(null);   // current permission prompt
+  const [errorPrompt, setErrorPrompt] = useState(null); // current actionable error prompt
   const [input,     setInput]     = useState('');
+  const [slashMenuDismissed, setSlashMenuDismissed] = useState(false);
   const [sendPending,   setSendPending]   = useState(false);   // waiting for echo
   const [failedMsg,     setFailedMsg]     = useState(null);    // { sessionId, text, clientMsgId }
+  const [deliveryStates, setDeliveryStates] = useState({});    // client message id -> delivery lifecycle
+  const [queuedMessages, setQueuedMessages] = useState([]);    // proxy/native queue items for this session
   const [reconnectInfo, setReconnectInfo] = useState(null);  // { attempt, nextRetryMs }
   const [unreadCount,   setUnreadCount]   = useState(0);     // new messages while scrolled up
   const [showJumpBtn,   setShowJumpBtn]   = useState(false); // show jump-to-bottom button
@@ -54,10 +78,29 @@ export default function ChatScreen({ route, navigation }) {
   const [branchList,     setBranchList]     = useState([]);
   const [branchCurrent,  setBranchCurrent]  = useState('');
   const [branchLoading,  setBranchLoading]  = useState(false);
+  const [fileBrowserOpen, setFileBrowserOpen] = useState(false);
+  const [directoryListing, setDirectoryListing] = useState({ path: '.', entries: [] });
+  const [viewingFile, setViewingFile] = useState(null);
+  const [fileContent, setFileContent] = useState(null);
+  const [fileBrowserLoading, setFileBrowserLoading] = useState(false);
+  const [fileBrowserError, setFileBrowserError] = useState(null);
+  const [historyCursor, setHistoryCursor] = useState(null);
+  const [hasOlderHistory, setHasOlderHistory] = useState(false);
+  const [historyLoadingOlder, setHistoryLoadingOlder] = useState(false);
+  const [historyError, setHistoryError] = useState(null);
+  const [controlResults, setControlResults] = useState({});
+  const errorPromptIsBlocking = !!errorPrompt
+    && errorPrompt.blocking !== false
+    && errorPrompt.display_mode !== 'inline';
+  const composerBlockedByPrompt = !!permPrompt || errorPromptIsBlocking;
 
   const clientRef       = useRef(null);
   const flatListRef     = useRef(null);
+  const inputRef        = useRef(null);
   const sendTimer       = useRef(null);
+  const deliveryStageTimers = useRef({});
+  const deliveryRecords = useRef({});
+  const deliveryStatesRef = useRef({});
   const isAtBottom      = useRef(true);
   const seenSequences   = useRef(new Set());
   const pendingMsgId    = useRef(null);   // { _id, _text } of in-flight message
@@ -65,11 +108,68 @@ export default function ChatScreen({ route, navigation }) {
   const messageQueue    = useRef([]);     // offline queue: [{ text, clientMsgId }], max 5
   const scrollMetrics   = useRef({ contentHeight: 0, layoutHeight: 0, offsetY: 0 });
   const configRetryRef  = useRef(null);
+  const draftLoadedRef  = useRef(false);
+  const historyUserScrolledRef = useRef(false);
+  const historyLoadingRef = useRef(false);
+  const historyRequestTimerRef = useRef(null);
 
   // Keep ref in sync with state for use inside memoized callbacks
   function updateFailedMsg(val) {
     failedMsgRef.current = val;
     setFailedMsg(val);
+  }
+
+  function clearDeliveryStageTimeout(clientMsgId) {
+    const timer = deliveryStageTimers.current[clientMsgId];
+    if (timer) clearTimeout(timer);
+    delete deliveryStageTimers.current[clientMsgId];
+  }
+
+  function setTrackedDeliveryState(clientMsgId, state) {
+    if (!clientMsgId) return;
+    deliveryStatesRef.current[clientMsgId] = state;
+    setDeliveryStates(prev => ({ ...prev, [clientMsgId]: state }));
+  }
+
+  function failDelivery(clientMsgId, reason) {
+    if (!clientMsgId) return;
+    if (deliveryStatesRef.current[clientMsgId] === 'agent_started') return;
+    const record = deliveryRecords.current[clientMsgId];
+    clearDeliveryStageTimeout(clientMsgId);
+    delete deliveryRecords.current[clientMsgId];
+    setTrackedDeliveryState(clientMsgId, 'failed');
+    setMessages(prev => prev.map(item => item._cid === clientMsgId
+      ? { ...item, _sendError: reason || 'Send failed' }
+      : item));
+    if (record) updateFailedMsg({
+      sessionId,
+      text: record.text,
+      clientMsgId,
+      reason: reason || 'Send failed',
+    });
+    if (pendingMsgId.current?._id === clientMsgId) {
+      clearTimeout(sendTimer.current);
+      setSendPending(false);
+      pendingMsgId.current = null;
+    }
+  }
+
+  function armDeliveryStageTimeout(clientMsgId, stage, reason) {
+    clearDeliveryStageTimeout(clientMsgId);
+    const timeoutMs = DELIVERY_STAGE_TIMEOUT_MS[stage];
+    const record = deliveryRecords.current[clientMsgId];
+    if (!timeoutMs || !record) return;
+    deliveryRecords.current[clientMsgId] = { ...record, stage };
+    deliveryStageTimers.current[clientMsgId] = setTimeout(() => {
+      delete deliveryStageTimers.current[clientMsgId];
+      if (deliveryRecords.current[clientMsgId]?.stage !== stage) return;
+      failDelivery(clientMsgId, reason);
+    }, timeoutMs);
+  }
+
+  function completeDelivery(clientMsgId) {
+    clearDeliveryStageTimeout(clientMsgId);
+    delete deliveryRecords.current[clientMsgId];
   }
 
   // ── Navigation header ───────────────────────────────────────────────────────
@@ -83,9 +183,11 @@ export default function ChatScreen({ route, navigation }) {
     const at = agentType;
     const hasChatList    = caps?.chat_list    ?? (at === 'codex' || at === 'codex-desktop' || at === 'cursor' || at === 'antigravity_panel');
     const hasOpenPanel   = caps?.open_panel   ?? (at === 'codex' || at === 'antigravity_panel');
+    const hasNativeWindow = caps?.native_window ?? (at === 'codex_cli' || at === 'cursor_cli');
     const hasThreadList  = caps?.thread_list  ?? (at === 'codex-desktop' || at === 'cursor');
     const hasTerminal    = caps?.terminal_output ?? (at === 'codex' || at === 'codex-desktop');
     const hasFileChanges = caps?.file_changes ?? (at === 'codex' || at === 'codex-desktop' || at === 'cursor');
+    const hasFileBrowser = !!caps?.file_browser;
     navigation.setOptions({
       headerTitle: () => (
         <View style={{ alignItems: 'center', maxWidth: 120 }}>
@@ -104,6 +206,17 @@ export default function ChatScreen({ route, navigation }) {
               activeOpacity={0.7}
             >
               <Text style={hr.btnText}>Panel</Text>
+            </TouchableOpacity>
+          )}
+          {hasNativeWindow && (
+            <TouchableOpacity
+              onPress={() => clientRef.current?.openNativeWindow(sessionId)}
+              style={hr.btn}
+              activeOpacity={0.7}
+              accessibilityRole="button"
+              accessibilityLabel="Open native command window"
+            >
+              <Text style={hr.btnText}>Native</Text>
             </TouchableOpacity>
           )}
           {hasThreadList && (
@@ -143,6 +256,23 @@ export default function ChatScreen({ route, navigation }) {
               activeOpacity={0.7}
             >
               <Text style={hr.btnText}>Diff</Text>
+            </TouchableOpacity>
+          )}
+          {hasFileBrowser && (
+            <TouchableOpacity
+              onPress={() => {
+                setFileBrowserOpen(true);
+                setViewingFile(null);
+                setFileBrowserError(null);
+                setFileBrowserLoading(true);
+                clientRef.current?.requestDirectoryListing(sessionId, '.');
+              }}
+              style={hr.btn}
+              activeOpacity={0.7}
+              accessibilityRole="button"
+              accessibilityLabel="Browse workspace files"
+            >
+              <Text style={hr.btnText}>Files</Text>
             </TouchableOpacity>
           )}
           {hasChatList && (
@@ -198,7 +328,8 @@ export default function ChatScreen({ route, navigation }) {
       case '_connected':
         setConnected(true);
         setReconnectInfo(null);
-        clientRef.current?.requestHistory(sessionId);
+        setHistoryError(null);
+        requestHistoryTail();
         clientRef.current?.requestAgentConfig(sessionId);
         // Retry config request after 3s if not received
         clearTimeout(configRetryRef.current);
@@ -226,12 +357,13 @@ export default function ChatScreen({ route, navigation }) {
 
       case '_disconnected':
         setConnected(false);
+        historyLoadingRef.current = false;
+        clearTimeout(historyRequestTimerRef.current);
+        setHistoryLoadingOlder(false);
         // Mark pending send as failed
         if (pendingMsgId.current) {
-          clearTimeout(sendTimer.current);
-          setSendPending(false);
-          updateFailedMsg({ sessionId, text: pendingMsgId.current._text, clientMsgId: pendingMsgId.current._id });
-          pendingMsgId.current = null;
+          const failedPending = pendingMsgId.current;
+          failDelivery(failedPending._id, 'Connection lost before the relay confirmed delivery.');
         }
         if (msg.reason === 'unauthenticated') {
           signOut().then(() => navigation.replace('Login'));
@@ -240,6 +372,10 @@ export default function ChatScreen({ route, navigation }) {
 
       case '_reconnecting':
         setReconnectInfo({ attempt: msg.attempt, nextRetryMs: msg.nextRetryMs });
+        break;
+
+      case '_connection_health':
+        setConnectionHealth({ state: msg.state || 'connecting', rttMs: msg.rttMs ?? null });
         break;
 
       case 'history': {
@@ -259,23 +395,90 @@ export default function ChatScreen({ route, navigation }) {
           if (seenSequences.current.has(msg.sequence)) break;
           seenSequences.current.add(msg.sequence);
         }
-        // Detect echo of our sent message
-        if (msg.role === 'user' && pendingMsgId.current &&
-            (msg.client_msg_id === pendingMsgId.current._id ||
-             msg.content === pendingMsgId.current._text)) {
+        const clientMsgId = msg.client_message_id || msg.client_msg_id || null;
+        const matchesPending = msg.role === 'user' && pendingMsgId.current &&
+          (clientMsgId === pendingMsgId.current._id || msg.content === pendingMsgId.current._text);
+        const matchedClientMsgId = matchesPending ? (clientMsgId || pendingMsgId.current._id) : clientMsgId;
+        // Detect the authoritative proxy echo of our optimistic user message.
+        if (matchesPending) {
           clearTimeout(sendTimer.current);
           setSendPending(false);
           pendingMsgId.current = null;
+          if (deliveryStatesRef.current[matchedClientMsgId] !== 'agent_started') {
+            setTrackedDeliveryState(matchedClientMsgId, 'delivered');
+            armDeliveryStageTimeout(matchedClientMsgId, 'delivered', 'Message reached the agent, but agent activity did not start in time.');
+          }
         }
-        setMessages(prev => mergeSorted([...prev, msg]));
+        setMessages(prev => {
+          const withoutOptimisticEcho = msg.role === 'user'
+            ? prev.filter(item => !(item._optimistic && (
+                (matchedClientMsgId && item._cid === matchedClientMsgId) ||
+                (matchesPending && item.content === msg.content)
+              )))
+            : prev;
+          return mergeSorted([...withoutOptimisticEcho, {
+            ...msg,
+            ...(msg.role === 'user' ? {
+              _delivered: true,
+              ...(matchedClientMsgId ? { _cid: matchedClientMsgId, _optimistic: true } : {}),
+            } : {}),
+          }]);
+        });
+        break;
+      }
+
+      case 'history_chunk': {
+        const sid = msg.session_id || msg.session;
+        if (sid !== sessionId || (msg.source && msg.source !== 'relay_sqlite')) break;
+        historyLoadingRef.current = false;
+        clearTimeout(historyRequestTimerRef.current);
+        setHistoryLoadingOlder(false);
+        if (msg.error && (!msg.messages || msg.messages.length === 0)) {
+          setHistoryError(msg.error?.message || msg.error || 'Transcript history could not be loaded.');
+          break;
+        }
+        const incoming = (msg.messages || []).filter(message => {
+          if (message.sequence == null) return true;
+          if (seenSequences.current.has(message.sequence)) return false;
+          seenSequences.current.add(message.sequence);
+          return true;
+        });
+        setMessages(prev => mergeSorted([...prev, ...incoming]));
+        const nextBeforeId = msg.cursor?.next_before_id ?? null;
+        setHistoryCursor(nextBeforeId);
+        setHasOlderHistory(!!msg.partial && nextBeforeId != null);
+        setHistoryError(null);
         break;
       }
 
       case 'status': {
-        // Relay sends { type: 'status', session, thinking, label }
+        // Preserve the canonical activity object. It carries the stable elapsed-time
+        // anchor, granular tool label, interrupt hint, and live partial output.
         if (msg.session !== sessionId) break;
-        if (msg.thinking) {
-          setActivity({ generating: true, label: msg.label || 'Thinking' });
+        if (msg.activity && typeof msg.activity === 'object') {
+          const kind = msg.activity.kind || (msg.thinking ? 'thinking' : 'idle');
+          setActivity({
+            ...msg.activity,
+            kind,
+            generating: msg.activity.generating ?? msg.thinking ?? ![
+              'idle', 'waiting_for_user', 'completed', 'done', 'failed', 'error', 'interrupted',
+            ].includes(String(kind).toLowerCase()),
+            label: msg.activity.label || msg.label || (msg.thinking ? 'Thinking' : ''),
+            thinkingContent: msg.thinking_content
+              ?? msg.activity.thinkingContent
+              ?? msg.activity.thinking_content
+              ?? '',
+          });
+        } else if (msg.thinking) {
+          const now = new Date().toISOString();
+          setActivity({
+            kind: 'thinking',
+            generating: true,
+            label: msg.label || 'Thinking',
+            started_at: now,
+            updated_at: now,
+            thinkingContent: msg.thinking_content || '',
+          });
         } else {
           setActivity(null);
         }
@@ -294,21 +497,28 @@ export default function ChatScreen({ route, navigation }) {
         break;
       }
 
-      case 'agent_control_result': {
+      case 'session_error_prompt': {
         const sid = msg.session_id || msg.session;
         if (sid !== sessionId) break;
-        if (msg.command === 'permission_response') {
-          if (msg.result === 'ok') {
-            setPermPrompt(null);
-          } else if (msg.result === 'failed') {
-            setPermPrompt(prev => prev ? { ...prev, submitting: null, error: msg.error?.message || 'Failed' } : null);
-          }
-        }
+        setErrorPrompt({ ...msg, received_at: Date.now() });
+        break;
+      }
+
+      case 'session_error_prompt_cleared': {
+        const sid = msg.session_id || msg.session;
+        if (sid !== sessionId) break;
+        setErrorPrompt(prev => prev?.prompt_id === msg.prompt_id ? null : prev);
         break;
       }
 
       case 'connection_ack': {
-        // Extract config from initial handshake if available
+        // Restore durable prompts and config from the initial handshake.
+        const openPermission = (msg.open_prompts || [])
+          .find(prompt => (prompt.session_id || prompt.session) === sessionId);
+        const openError = (msg.open_error_prompts || [])
+          .find(prompt => (prompt.session_id || prompt.session) === sessionId);
+        setPermPrompt(openPermission ? { ...openPermission, received_at: Date.now() } : null);
+        setErrorPrompt(openError ? { ...openError, received_at: Date.now() } : null);
         if (msg.agent_configs && msg.agent_configs[sessionId]) {
           setAgentConfig(msg.agent_configs[sessionId]);
         }
@@ -329,6 +539,23 @@ export default function ChatScreen({ route, navigation }) {
         // Config change acknowledged — refresh config
         const sid = msg.session_id || msg.session;
         if (sid !== sessionId) break;
+        if (msg.request_id) {
+          setControlResults(prev => ({ ...prev, [msg.request_id]: { ...msg, received_at: Date.now() } }));
+        }
+        if (msg.command === 'permission_response') {
+          if (msg.result === 'ok') {
+            setPermPrompt(null);
+          } else if (msg.result === 'failed') {
+            setPermPrompt(prev => prev
+              ? { ...prev, submitting_choice_id: null, error: msg.error?.message || 'Permission response failed' }
+              : null);
+          }
+        }
+        if (msg.command === 'error_prompt_action' && msg.result === 'failed') {
+          setErrorPrompt(prev => prev
+            ? { ...prev, submitting_action_id: null, error: msg.error?.message || 'Error prompt action failed' }
+            : null);
+        }
         if (msg.result === 'ok') {
           clientRef.current?.requestAgentConfig(sessionId);
         } else if (msg.result === 'failed') {
@@ -339,8 +566,164 @@ export default function ChatScreen({ route, navigation }) {
           if (cmd === 'terminal_output') setTerminalLoading(false);
           if (cmd === 'file_changes')    setDiffLoading(false);
           if (cmd === 'branch_list')     setBranchLoading(false);
+          if (cmd === 'list_directory' || cmd === 'read_file') {
+            setFileBrowserLoading(false);
+            setFileBrowserError(msg.error?.message || msg.error || 'Could not load workspace files.');
+          }
+          if (cmd === 'open_native_window') {
+            Alert.alert('Could not open native window', msg.error?.message || 'The desktop proxy rejected the request.');
+          }
           console.warn('[ChatScreen] control failed:', cmd, msg.error);
         }
+        break;
+      }
+
+      case 'message_accepted': {
+        const cid = msg.client_message_id;
+        const current = cid ? deliveryStatesRef.current[cid] : null;
+        if (cid && !['busy_queued', 'steered', 'delivered', 'agent_started'].includes(current)) {
+          setTrackedDeliveryState(cid, 'accepted');
+          armDeliveryStageTimeout(cid, 'accepted', 'Relay accepted the message, but native delivery timed out.');
+        }
+        break;
+      }
+
+      case 'message_delivered':
+      case 'proxy_send_result': {
+        const cid = msg.client_message_id;
+        if (!cid) break;
+        if (msg.type === 'proxy_send_result' && msg.result === 'failed') {
+          failDelivery(cid, msg.reason || msg.message || msg.error?.message || 'The desktop proxy rejected the message.');
+          break;
+        }
+        if (deliveryStatesRef.current[cid] !== 'agent_started') {
+          setTrackedDeliveryState(cid, 'delivered');
+          armDeliveryStageTimeout(cid, 'delivered', 'Message reached the agent, but agent activity did not start in time.');
+        }
+        setMessages(prev => prev.map(item => item._cid === cid
+          ? { ...item, _delivered: true }
+          : item));
+        if (pendingMsgId.current?._id === cid) {
+          clearTimeout(sendTimer.current);
+          setSendPending(false);
+          pendingMsgId.current = null;
+        }
+        break;
+      }
+
+      case 'agent_started': {
+        const cid = msg.client_message_id;
+        if (!cid) break;
+        completeDelivery(cid);
+        setTrackedDeliveryState(cid, 'agent_started');
+        setMessages(prev => prev.map(item => item._cid === cid
+          ? { ...item, _delivered: true, _agentStarted: true }
+          : item));
+        break;
+      }
+
+      case 'message_failed': {
+        const cid = msg.client_message_id;
+        if (!cid) break;
+        failDelivery(cid, msg.reason || msg.message || msg.error?.message || 'Send failed.');
+        break;
+      }
+
+      case 'message_queued': {
+        const cid = msg.client_message_id;
+        const sid = msg.session_id || msg.session;
+        if (sid && sid !== sessionId) break;
+        if (cid) {
+          clearDeliveryStageTimeout(cid);
+          setTrackedDeliveryState(cid, 'busy_queued');
+          if (deliveryRecords.current[cid]) {
+            deliveryRecords.current[cid] = { ...deliveryRecords.current[cid], stage: 'busy_queued' };
+          }
+          setQueuedMessages(prev => {
+            const next = {
+              cid,
+              content: msg.content || prev.find(item => item.cid === cid)?.content || '',
+              queuedAt: msg.queued_at,
+            };
+            return [...prev.filter(item => item.cid !== cid), next];
+          });
+          if (pendingMsgId.current?._id === cid) {
+            clearTimeout(sendTimer.current);
+            setSendPending(false);
+            pendingMsgId.current = null;
+          }
+        }
+        break;
+      }
+
+      case 'queue_delivered': {
+        const cid = msg.client_message_id;
+        const sid = msg.session_id || msg.session;
+        if (sid && sid !== sessionId) break;
+        if (cid) {
+          setTrackedDeliveryState(cid, 'accepted');
+          armDeliveryStageTimeout(cid, 'accepted', 'Queued message left the relay, but native delivery timed out.');
+          setQueuedMessages(prev => prev.filter(item => item.cid !== cid));
+        }
+        break;
+      }
+
+      case 'steer_result': {
+        const cid = msg.client_message_id;
+        const sid = msg.session_id || msg.session;
+        if (sid && sid !== sessionId) break;
+        if (cid) {
+          if (msg.result === 'ok') {
+            setTrackedDeliveryState(cid, 'steered');
+            armDeliveryStageTimeout(cid, 'steered', 'Message was steered, but agent activity did not start in time.');
+          } else {
+            failDelivery(cid, msg.error?.message || msg.error || 'The desktop proxy rejected the message.');
+          }
+          const error = msg.error?.message || msg.error || 'The desktop proxy rejected the request.';
+          setQueuedMessages(prev => msg.result === 'ok'
+            ? prev.filter(item => item.cid !== cid)
+            : prev.map(item => item.cid === cid
+              ? { ...item, pending_action: null, error }
+              : item));
+          if (msg.result !== 'ok') Alert.alert('Could not steer message', error);
+        }
+        break;
+      }
+
+      case 'native_queue': {
+        const sid = msg.session_id || msg.session;
+        if (sid !== sessionId) break;
+        const nativeItems = (msg.items || []).map((item, index) => ({
+          cid: `native-${index}`,
+          content: item.text || '',
+          native: true,
+          nativeIndex: item.index,
+          status: item.state || 'queued',
+        }));
+        setQueuedMessages(prev => [
+          ...prev.filter(item => !item.native),
+          ...nativeItems,
+        ]);
+        break;
+      }
+
+      case 'directory_listing': {
+        const sid = msg.session_id || msg.session;
+        if (sid !== sessionId) break;
+        setDirectoryListing({ path: msg.path || '.', entries: msg.entries || [] });
+        setViewingFile(null);
+        setFileBrowserLoading(false);
+        setFileBrowserError(null);
+        break;
+      }
+
+      case 'file_content': {
+        const sid = msg.session_id || msg.session;
+        if (sid !== sessionId) break;
+        setViewingFile(msg.path);
+        setFileContent({ path: msg.path, content: msg.content || '', truncated: !!msg.truncated });
+        setFileBrowserLoading(false);
+        setFileBrowserError(null);
         break;
       }
 
@@ -398,6 +781,28 @@ export default function ChatScreen({ route, navigation }) {
   // ── Connect on mount ────────────────────────────────────────────────────────
 
   useEffect(() => {
+    clearTimeout(sendTimer.current);
+    Object.values(deliveryStageTimers.current).forEach(timer => clearTimeout(timer));
+    deliveryStageTimers.current = {};
+    deliveryRecords.current = {};
+    deliveryStatesRef.current = {};
+    pendingMsgId.current = null;
+    setSendPending(false);
+    setDeliveryStates({});
+    setControlResults({});
+    updateFailedMsg(null);
+    setMessages([]);
+    seenSequences.current.clear();
+    setHistoryCursor(null);
+    setHasOlderHistory(false);
+    setHistoryLoadingOlder(false);
+    setHistoryError(null);
+    historyLoadingRef.current = false;
+    historyUserScrolledRef.current = false;
+    clearTimeout(historyRequestTimerRef.current);
+  }, [sessionId]);
+
+  useEffect(() => {
     const client = new RelayClient(handleMessage);
     clientRef.current = client;
     client.connect();
@@ -405,9 +810,38 @@ export default function ChatScreen({ route, navigation }) {
       client.disconnect();
       clientRef.current = null;
       clearTimeout(sendTimer.current);
+      Object.values(deliveryStageTimers.current).forEach(timer => clearTimeout(timer));
+      deliveryStageTimers.current = {};
+      deliveryRecords.current = {};
       clearTimeout(configRetryRef.current);
+      clearTimeout(historyRequestTimerRef.current);
     };
   }, [handleMessage]);
+
+  // Restore and persist a separate composer draft for every session.
+  useEffect(() => {
+    let active = true;
+    draftLoadedRef.current = false;
+    AsyncStorage.getItem(`${DRAFT_STORAGE_PREFIX}${sessionId}`)
+      .then(value => {
+        if (active) setInput(value || '');
+      })
+      .catch(() => {})
+      .finally(() => {
+        if (active) draftLoadedRef.current = true;
+      });
+    return () => { active = false; };
+  }, [sessionId]);
+
+  useEffect(() => {
+    if (!draftLoadedRef.current) return undefined;
+    const timer = setTimeout(() => {
+      const key = `${DRAFT_STORAGE_PREFIX}${sessionId}`;
+      const op = input ? AsyncStorage.setItem(key, input) : AsyncStorage.removeItem(key);
+      op.catch(() => {});
+    }, 150);
+    return () => clearTimeout(timer);
+  }, [input, sessionId]);
 
   // ── Auto-scroll ─────────────────────────────────────────────────────────────
 
@@ -439,20 +873,33 @@ export default function ChatScreen({ route, navigation }) {
 
   function doSend(text, clientMsgId) {
     const id = clientMsgId || `${Date.now()}-${Math.random().toString(36).slice(2)}`;
+    clearDeliveryStageTimeout(id);
+    deliveryRecords.current[id] = { text, stage: 'queued' };
     pendingMsgId.current = { _id: id, _text: text };
     setSendPending(true);
+    setTrackedDeliveryState(id, 'queued');
+    setMessages(prev => prev.some(item => item._cid === id)
+      ? prev.map(item => item._cid === id
+        ? { ...item, content: text, _optimistic: true, _queued: false, _delivered: false, _agentStarted: false, _sendError: null }
+        : item)
+      : [...prev, {
+          role: 'user',
+          content: text,
+          _cid: id,
+          _optimistic: true,
+          timestamp: new Date().toISOString(),
+        }]);
     updateFailedMsg(null);
     clientRef.current.sendMessage(sessionId, text, id);
+    armDeliveryStageTimeout(id, 'queued', 'Timed out waiting for relay acceptance.');
 
-    // 5s timeout — mark as failed if no echo
+    // Bound the composer while the stage-specific lifecycle timer owns the retry state.
     clearTimeout(sendTimer.current);
     sendTimer.current = setTimeout(() => {
       if (pendingMsgId.current?._id === id) {
-        setSendPending(false);
-        updateFailedMsg({ sessionId, text, clientMsgId: id });
-        pendingMsgId.current = null;
+        failDelivery(id, 'Timed out waiting for relay acceptance.');
       }
-    }, 5_000);
+    }, DELIVERY_STAGE_TIMEOUT_MS.queued);
   }
 
   // ── Attachment helpers ──────────────────────────────────────────────────────
@@ -570,11 +1017,12 @@ export default function ChatScreen({ route, navigation }) {
       if (messageQueue.current.length >= 5) return;
       const id = `${Date.now()}-${Math.random().toString(36).slice(2)}`;
       messageQueue.current.push({ text: content, clientMsgId: id });
-      setMessages(prev => mergeSorted([...prev, {
-        role: 'user', content, _queued: true,
+      setDeliveryStates(prev => ({ ...prev, [id]: connected ? 'busy_queued' : 'offline_queued' }));
+      setMessages(prev => [...prev, {
+        role: 'user', content, _queued: true, _cid: id, _optimistic: true,
         sequence: -(messageQueue.current.length),
         timestamp: new Date().toISOString(),
-      }]));
+      }]);
       return;
     }
 
@@ -588,8 +1036,115 @@ export default function ChatScreen({ route, navigation }) {
   }
 
   function handlePermChoice(promptId, choiceId) {
+    setPermPrompt(prev => prev
+      ? { ...prev, submitting_choice_id: choiceId, error: null }
+      : null);
     clientRef.current?.respondToPermission(sessionId, promptId, choiceId);
-    setPermPrompt(null);
+  }
+
+  function handleErrorPromptAction(promptId, actionId) {
+    setErrorPrompt(prev => prev
+      ? { ...prev, submitting_action_id: actionId, error: null }
+      : null);
+    clientRef.current?.respondToErrorPrompt(sessionId, promptId, actionId);
+  }
+
+  function handleSteerQueued(item) {
+    setDeliveryStates(prev => ({ ...prev, [item.cid]: 'busy_queued' }));
+    setQueuedMessages(prev => prev.map(queued => queued.cid === item.cid
+      ? { ...queued, pending_action: 'steer', error: null }
+      : queued));
+    clientRef.current?.steerMessage(sessionId, item.cid, item.content, item.nativeIndex);
+  }
+
+  function handleDiscardQueued(item) {
+    clientRef.current?.discardQueuedMessage(sessionId, item.cid);
+    setQueuedMessages(prev => prev.filter(queued => queued.cid !== item.cid));
+    setDeliveryStates(prev => {
+      const next = { ...prev };
+      delete next[item.cid];
+      return next;
+    });
+    setMessages(prev => prev.filter(message => message._cid !== item.cid));
+  }
+
+  function handleEditQueued(item, content) {
+    setQueuedMessages(prev => prev.map(queued => queued.cid === item.cid
+      ? { ...queued, content }
+      : queued));
+    setMessages(prev => prev.map(message => message._cid === item.cid
+      ? { ...message, content }
+      : message));
+    clientRef.current?.editQueuedMessage(sessionId, item.cid, content);
+  }
+
+  function navigateFileBrowser(path) {
+    setViewingFile(null);
+    setFileContent(null);
+    setFileBrowserError(null);
+    setFileBrowserLoading(true);
+    clientRef.current?.requestDirectoryListing(sessionId, path || '.');
+  }
+
+  function openFilePreview(path) {
+    setViewingFile(path);
+    setFileContent(null);
+    setFileBrowserError(null);
+    setFileBrowserLoading(true);
+    clientRef.current?.requestFileContent(sessionId, path);
+  }
+
+  function refreshFileBrowser() {
+    setFileBrowserError(null);
+    setFileBrowserLoading(true);
+    if (viewingFile) clientRef.current?.requestFileContent(sessionId, viewingFile);
+    else clientRef.current?.requestDirectoryListing(sessionId, directoryListing.path || '.');
+  }
+
+  function loadOlderHistory() {
+    if (!hasOlderHistory || historyLoadingRef.current || historyCursor == null || !connected) return;
+    historyLoadingRef.current = true;
+    setHistoryLoadingOlder(true);
+    setHistoryError(null);
+    clientRef.current?.requestHistoryChunk(sessionId, {
+      mode: 'older',
+      beforeId: historyCursor,
+      limit: HISTORY_PAGE_SIZE,
+    });
+    armHistoryTimeout();
+  }
+
+  function retryHistoryTail() {
+    if (historyLoadingRef.current || !connected) return;
+    requestHistoryTail();
+  }
+
+  function requestHistoryTail() {
+    historyLoadingRef.current = true;
+    setHistoryError(null);
+    clientRef.current?.requestHistoryChunk(sessionId, { mode: 'tail', limit: HISTORY_PAGE_SIZE });
+    armHistoryTimeout();
+  }
+
+  function armHistoryTimeout() {
+    clearTimeout(historyRequestTimerRef.current);
+    historyRequestTimerRef.current = setTimeout(() => {
+      historyLoadingRef.current = false;
+      setHistoryLoadingOlder(false);
+      setHistoryError('Transcript history timed out. Tap to retry.');
+    }, 15000);
+  }
+
+  const slashQuery = input.startsWith('/') ? input.slice(1).trim().toLowerCase() : '';
+  const filteredSlashCommands = input.startsWith('/')
+    && !slashMenuDismissed
+    ? SLASH_COMMANDS.filter(item => item.command.slice(1).includes(slashQuery))
+    : [];
+
+  function applySlashCommand(command) {
+    setInput(`${command} `);
+    setSlashMenuDismissed(true);
+    requestAnimationFrame(() => inputRef.current?.focus());
   }
 
   // ── Render ──────────────────────────────────────────────────────────────────
@@ -611,13 +1166,53 @@ export default function ChatScreen({ route, navigation }) {
           </Text>
         </View>
       )}
+      {connected && (
+        <View style={s.connectionHealthBar} accessibilityLabel={`Relay ${connectionHealth.state}`}>
+          <View style={[
+            s.connectionHealthDot,
+            { backgroundColor: connectionHealth.state === 'healthy' ? '#3fb950' : connectionHealth.state === 'slow' ? '#d29922' : '#f0883e' },
+          ]} />
+          <Text style={s.connectionHealthText}>
+            {`Relay ${connectionHealth.state}${connectionHealth.rttMs != null ? ` · ${connectionHealth.rttMs} ms` : ''}`}
+          </Text>
+        </View>
+      )}
 
       <FlatList
         ref={flatListRef}
         data={messages}
         keyExtractor={(item, i) => (item.sequence != null ? String(item.sequence) : String(i))}
-        renderItem={({ item }) => <MessageBubble message={item} />}
+        renderItem={({ item }) => (
+          <MessageBubble
+            message={item}
+            agentType={agentType}
+            deliveryState={item._cid ? deliveryStates[item._cid] : null}
+          />
+        )}
         contentContainerStyle={s.messageList}
+        maintainVisibleContentPosition={{ minIndexForVisible: 0 }}
+        ListHeaderComponent={hasOlderHistory || historyLoadingOlder || historyError ? (
+          <View style={s.historyHeader}>
+            {!!historyError && <Text style={s.historyError} accessibilityRole="alert">{historyError}</Text>}
+            {!!historyError && !hasOlderHistory && (
+              <TouchableOpacity style={s.historyButton} onPress={retryHistoryTail} accessibilityRole="button">
+                <Text style={s.historyButtonText}>Retry history</Text>
+              </TouchableOpacity>
+            )}
+            {hasOlderHistory && (
+              <TouchableOpacity
+                style={s.historyButton}
+                onPress={loadOlderHistory}
+                disabled={historyLoadingOlder}
+                accessibilityRole="button"
+              >
+                {historyLoadingOlder
+                  ? <ActivityIndicator size="small" color="#58a6ff" />
+                  : <Text style={s.historyButtonText}>Load earlier messages</Text>}
+              </TouchableOpacity>
+            )}
+          </View>
+        ) : null}
         onScroll={e => {
           const { contentOffset, contentSize, layoutMeasurement } = e.nativeEvent;
           scrollMetrics.current = {
@@ -626,6 +1221,10 @@ export default function ChatScreen({ route, navigation }) {
             offsetY: contentOffset.y,
           };
           const distFromBottom = contentSize.height - contentOffset.y - layoutMeasurement.height;
+          if (contentOffset.y > 100) historyUserScrolledRef.current = true;
+          if (contentOffset.y < 60 && historyUserScrolledRef.current && hasOlderHistory && !historyLoadingOlder) {
+            loadOlderHistory();
+          }
           const wasAtBottom = isAtBottom.current;
           isAtBottom.current = distFromBottom < 80;
           if (!wasAtBottom && isAtBottom.current) {
@@ -676,12 +1275,24 @@ export default function ChatScreen({ route, navigation }) {
 
       <ActivityRow activity={activity} />
       <PermissionPrompt prompt={permPrompt} onChoice={handlePermChoice} />
+      <ErrorPrompt
+        prompt={permPrompt ? null : errorPrompt}
+        blocking={errorPromptIsBlocking}
+        onAction={handleErrorPromptAction}
+      />
 
       {failedMsg && (
         <TouchableOpacity style={s.failedRow} onPress={handleRetry} activeOpacity={0.7}>
-          <Text style={s.failedText}>Send failed — tap to retry</Text>
+          <Text style={s.failedText}>{failedMsg.reason || 'Send failed'} — tap to retry</Text>
         </TouchableOpacity>
       )}
+
+      <QueuedMessageBar
+        items={queuedMessages}
+        onSteer={handleSteerQueued}
+        onDiscard={handleDiscardQueued}
+        onEdit={handleEditQueued}
+      />
 
       {attachment && (
         <View style={s.attachPreview}>
@@ -699,6 +1310,23 @@ export default function ChatScreen({ route, navigation }) {
         </View>
       )}
 
+      {filteredSlashCommands.length > 0 && (
+        <View style={s.slashMenu} accessibilityRole="menu">
+          {filteredSlashCommands.map(item => (
+            <TouchableOpacity
+              key={item.command}
+              style={s.slashItem}
+              onPress={() => applySlashCommand(item.command)}
+              accessibilityRole="menuitem"
+              accessibilityLabel={`${item.command}. ${item.detail}`}
+            >
+              <Text style={s.slashCommand}>{item.command}</Text>
+              <Text style={s.slashDetail}>{item.detail}</Text>
+            </TouchableOpacity>
+          ))}
+        </View>
+      )}
+
       <View style={s.inputRow}>
         <TouchableOpacity
           style={s.attachBtn}
@@ -709,9 +1337,13 @@ export default function ChatScreen({ route, navigation }) {
           <Text style={s.attachBtnText}>📎</Text>
         </TouchableOpacity>
         <TextInput
+          ref={inputRef}
           style={s.input}
           value={input}
-          onChangeText={setInput}
+          onChangeText={value => {
+            setInput(value);
+            setSlashMenuDismissed(false);
+          }}
           placeholder="Message…"
           placeholderTextColor="#444c56"
           multiline
@@ -719,9 +1351,9 @@ export default function ChatScreen({ route, navigation }) {
           returnKeyType="default"
         />
         <TouchableOpacity
-          style={[s.sendBtn, (!input.trim() && !attachment || sendPending || uploading) && s.sendBtnDisabled]}
+          style={[s.sendBtn, (!input.trim() && !attachment || sendPending || uploading || composerBlockedByPrompt) && s.sendBtnDisabled]}
           onPress={handleSend}
-          disabled={(!input.trim() && !attachment) || sendPending || uploading}
+          disabled={(!input.trim() && !attachment) || sendPending || uploading || composerBlockedByPrompt}
           activeOpacity={0.7}
         >
           {sendPending || uploading ? (
@@ -739,6 +1371,7 @@ export default function ChatScreen({ route, navigation }) {
         config={agentConfig}
         relay={clientRef.current}
         sessionId={sessionId}
+        controlResults={controlResults}
       />
 
       <TerminalViewer
@@ -766,6 +1399,29 @@ export default function ChatScreen({ route, navigation }) {
         onAccept={(changeId) => clientRef.current?.respondToFileChange(sessionId, changeId, 'accept')}
         onReject={(changeId) => clientRef.current?.respondToFileChange(sessionId, changeId, 'reject')}
         onClose={() => setDiffOpen(false)}
+      />
+
+      <FileBrowserSheet
+        visible={fileBrowserOpen}
+        listing={directoryListing}
+        viewingFile={viewingFile}
+        fileContent={fileContent}
+        loading={fileBrowserLoading}
+        error={fileBrowserError}
+        onNavigate={navigateFileBrowser}
+        onOpenFile={openFilePreview}
+        onBack={() => {
+          setViewingFile(null);
+          setFileContent(null);
+          setFileBrowserError(null);
+        }}
+        onRefresh={refreshFileBrowser}
+        onClose={() => {
+          setFileBrowserOpen(false);
+          setViewingFile(null);
+          setFileContent(null);
+          setFileBrowserError(null);
+        }}
       />
 
       <ThreadHistorySheet
@@ -874,10 +1530,46 @@ const s = StyleSheet.create({
     color:    '#f0883e',
     fontSize: 12,
   },
+  connectionHealthBar: {
+    minHeight: 24,
+    paddingHorizontal: 12,
+    flexDirection: 'row',
+    alignItems: 'center',
+    justifyContent: 'center',
+    gap: 6,
+    backgroundColor: '#0d1117',
+  },
+  connectionHealthDot: {
+    width: 7,
+    height: 7,
+    borderRadius: 4,
+  },
+  connectionHealthText: {
+    color: '#8b949e',
+    fontSize: 11,
+  },
   messageList: {
     paddingVertical: 12,
     flexGrow:        1,
   },
+  historyHeader: {
+    alignItems: 'center',
+    paddingHorizontal: 14,
+    paddingBottom: 10,
+  },
+  historyButton: {
+    minHeight: 36,
+    minWidth: 180,
+    alignItems: 'center',
+    justifyContent: 'center',
+    borderWidth: 1,
+    borderColor: '#30363d',
+    borderRadius: 18,
+    backgroundColor: '#161b22',
+    paddingHorizontal: 14,
+  },
+  historyButtonText: { color: '#58a6ff', fontSize: 12, fontWeight: '700' },
+  historyError: { color: '#ff7b72', fontSize: 12, marginBottom: 8, textAlign: 'center' },
   emptyList: {
     flex:           1,
     justifyContent: 'center',
@@ -961,6 +1653,32 @@ const s = StyleSheet.create({
     borderTopColor:  '#30363d',
     backgroundColor: '#161b22',
     gap:             8,
+  },
+  slashMenu: {
+    marginHorizontal: 10,
+    marginBottom:      4,
+    paddingVertical:   4,
+    borderWidth:       1,
+    borderColor:       '#30363d',
+    borderRadius:      10,
+    backgroundColor:   '#1c2128',
+    overflow:          'hidden',
+  },
+  slashItem: {
+    paddingHorizontal: 12,
+    paddingVertical:   8,
+    borderBottomWidth: StyleSheet.hairlineWidth,
+    borderBottomColor: '#30363d',
+  },
+  slashCommand: {
+    color:      '#58a6ff',
+    fontSize:   13,
+    fontWeight: '700',
+  },
+  slashDetail: {
+    color:     '#8b949e',
+    fontSize:  11,
+    marginTop: 2,
   },
   attachBtn: {
     width:          36,

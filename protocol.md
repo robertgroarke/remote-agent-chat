@@ -120,11 +120,14 @@ Every `session_up`, `session_snapshot`, and session-bearing history event should
   "session": {
     "session_id": "uuid",
     "agent_type": "claude|codex|gemini|unknown",
+    "host_type": "vscode|antigravity_ide|unknown_editor|null",
+    "host_label": "VS Code",
     "display_name": "Codex",
     "window_title": "repo-name",
     "workspace_name": "repo-name",
-    "workspace_path": "C:\\\\Users\\\\Robert\\\\Documents\\\\Remote Agent Chat",
-    "machine_label": "Robert-Windows",
+    "workspace_path": "C:\\\\workspace\\\\remote-agent-chat",
+    "project_root": "C:\\\\workspace\\\\remote-agent-chat",
+    "machine_label": "agent-workstation",
     "target_signature": "sha-like-or-derived-string",
     "target_id": "transient-target-id",
     "is_list_view": false,
@@ -148,9 +151,18 @@ Required fields:
 Recommended fields:
 
 - `display_name`
+- `host_type`: native editor host identity for iframe-backed sessions. This is
+  independent of `agent_type`; for example, Claude Code can run in VS Code or
+  Antigravity IDE without changing its agent type.
+- `host_label`: user-facing label for `host_type`.
 - `window_title`
 - `workspace_name`
 - `workspace_path`
+- `project_root`: canonical grouping root resolved by the proxy. For Git linked
+  worktrees this is the working tree that owns the common `.git` directory, so
+  sibling worktrees share one project identity. Non-Git directories use their
+  resolved workspace directory. Clients must not derive sidebar group identity
+  from harness, thread, branch, window, or workspace display names.
 - `last_seen_at`
 - `is_list_view`: true when the native surface is on a conversation picker,
   history, scheduled-task, or new-conversation view rather than an active
@@ -188,7 +200,7 @@ Proxy example:
   "peer_role": "proxy",
   "client_name": "agent-proxy",
   "client_version": "dev",
-  "machine_label": "Robert-Windows"
+  "machine_label": "agent-workstation"
 }
 ```
 
@@ -260,6 +272,14 @@ Rules:
 - peers should send heartbeats on the interval provided by `connection_ack`
 - the relay should mark a connection stale if no heartbeat or other message arrives before `heartbeat_timeout_ms`
 - session health must be derived separately from socket liveness when needed
+- clients correlate `heartbeat_ack.request_id` with the local send timestamp and expose
+  round-trip time as connection health: healthy at <=500 ms, slow at <=2 s, and poor above
+  2 s; a missed application-heartbeat timeout closes the socket so bounded reconnect and
+  diff resync begin immediately
+- a user send created while the client socket is offline remains one optimistic bubble in
+  an explicit offline queue. After `connection_ack`, the client flushes it with the same
+  `client_message_id`, then resumes the ordinary accepted/delivered/agent-started receipt
+  lifecycle. Offline residence time is not a relay-acceptance timeout.
 
 ## Session Lifecycle Events
 
@@ -608,6 +628,13 @@ Rules:
 - use `source: "native"` for native archive readers such as Codex CLI JSONL
 - for older relay chunks, send `mode: "older"` plus `before_id`
 - for older native byte chunks, send `mode: "older"` plus `before_offset`
+- while the selected transcript remains partial, an intentional scroll within
+  160 px of the top requests one older chunk; the client preserves the visible
+  scroll anchor after prepending and keeps the explicit Load older button as a
+  keyboard-accessible fallback
+- after reconnect, a client that already has a positive message `sequence`
+  sends `history_request.after_sequence` instead of replaying its tail; only a
+  first load or a sequence-less legacy transcript requests a replacement tail
 
 ### `history_chunk`
 
@@ -664,6 +691,8 @@ Sent by proxy to relay after handshake and whenever rediscovery materially chang
       "target_signature": "sig_abc",
       "window_title": "Remote Agent Chat",
       "workspace_name": "Remote Agent Chat",
+      "workspace_path": "C:\\\\workspace\\\\remote-agent-chat",
+      "project_root": "C:\\\\workspace\\\\remote-agent-chat",
       "status": "healthy"
     }
   ]
@@ -691,8 +720,9 @@ Sent by proxy to relay when the proxy observes transcript content.
 ```
 
 `content_blocks` is optional. When present it is an ordered array of structured
-rendering blocks such as `markdown`, `thinking`, `tool_call`, `terminal`,
-`file_changes`, `artifact`, `prompt`, or `error`. Receivers must preserve it
+rendering blocks such as `markdown`, `thinking`, `tool_call`, `tool_result`,
+`terminal`, `file_changes`, `artifact`, `prompt`, `plan`, `queued_message`,
+`notice`, `error`, or `status`. Receivers must preserve it
 through persistence and replay while continuing to treat `content` as the plain
 text fallback for older clients.
 
@@ -703,17 +733,26 @@ Canonical block fields:
   { "type": "markdown", "content": "Rendered Markdown including tables and fenced code." },
   { "type": "thinking", "label": "Worked for 5m", "content": "Reasoning/work summary text", "collapsed": true },
   { "type": "tool_call", "label": "Run command", "status": "running|done|error", "content": "Visible tool body" },
+  { "type": "tool_result", "label": "Command result", "status": "done|error", "content": "Visible tool output", "call_id": "call_123" },
   { "type": "terminal", "command": "npm test", "stdout": "...", "stderr": "", "exit_code": 0 },
   { "type": "file_changes", "summary": "2 files changed", "files": [{ "path": "x.js", "added": 52, "removed": 5 }] },
   { "type": "artifact", "label": "Walkthrough", "artifact_type": "walkthrough", "content": "Visible artifact text" },
   { "type": "prompt", "label": "Permission required", "content": "Prompt text", "actions": [{ "id": "allow", "label": "Allow" }] },
-  { "type": "error", "label": "Failed", "content": "Error text", "actions": [{ "id": "retry", "label": "Retry" }] }
+  { "type": "plan", "label": "Plan", "total": 2, "completed": 1, "tasks": [{ "id": "step-1", "text": "Inspect state", "state": "completed" }, { "id": "step-2", "text": "Apply fix", "state": "in_progress" }] },
+  { "type": "queued_message", "label": "Queued message", "content": "Send after the current turn", "client_message_id": "msg_cli_123" },
+  { "type": "notice", "label": "Context compacted", "content": "Older context was summarized.", "tone": "info|warning|error", "actions": [{ "id": "retry", "label": "Retry" }] },
+  { "type": "error", "label": "Failed", "content": "Error text", "actions": [{ "id": "retry", "label": "Retry" }] },
+  { "type": "status", "label": "Worked for 5m", "status": "working|done|idle" }
 ]
 ```
 
 Senders must not emit off-spec block types. If a reader sees legacy `code`, it
 should normalize it to a `markdown` block containing a fenced code block. Legacy
 `file_change` should normalize to `file_changes`.
+Legacy `tool_output`/`result`, `task_list`, `queue`/`queued`, and
+`banner`/`notification` should normalize to `tool_result`, `plan`,
+`queued_message`, and `notice` respectively. Tool results must remain distinct
+from tool calls so clients can preserve call/result order and visual treatment.
 
 ### `proxy_send_result`
 
@@ -747,6 +786,32 @@ Failure example:
 }
 ```
 
+### `agent_started`
+
+Sent by the relay after a delivered browser send is followed by native harness activity.
+This is the final correlated send-lifecycle receipt: it proves that the message was not
+only injected, but that the agent began processing it. The relay correlates the first
+active `proxy_status`/`status` transition after `proxy_send_result.result=delivered` and
+expires unmatched correlations after two minutes.
+
+```json
+{
+  "type": "agent_started",
+  "protocol_version": 1,
+  "session_id": "sess_123",
+  "client_message_id": "msg_cli_123",
+  "delivered_at": "2026-03-19T10:16:32.000Z",
+  "started_at": "2026-03-19T10:16:32.240Z",
+  "activity": {
+    "kind": "thinking",
+    "label": "Thinking"
+  }
+}
+```
+
+Clients advance the matching optimistic user bubble to `agent_started` and must ignore
+unmatched IDs. A later failure for the same ID still wins and remains retryable.
+
 ### `proxy_status`
 
 Sent by proxy when session health or activity changes.
@@ -760,10 +825,17 @@ Sent by proxy when session health or activity changes.
   "activity": {
     "kind": "thinking",
     "label": "Thinking",
+    "started_at": "2026-03-19T10:17:42.000Z",
     "updated_at": "2026-03-19T10:18:00.000Z"
   }
 }
 ```
+
+The relay guarantees a stable `activity.started_at` for every continuous active
+interval. If a producer omits it, the relay anchors the interval at the first active
+status and carries that timestamp across later tool/kind/label changes until an inactive
+status arrives. Clients use this field for the live elapsed-time ticker; `updated_at`
+continues to describe the most recent observation and must not reset elapsed time.
 
 ### `chat_list`
 
@@ -831,7 +903,7 @@ Sent by browser to relay. Relay forwards to proxy unchanged (after auth check).
   "protocol_version": 1,
   "request_id": "launch_abc123",
   "agent_type": "claude",
-  "workspace_path": "C:\\Users\\Robert\\Documents\\Remote Agent Chat",
+  "workspace_path": "C:\\workspace\\remote-agent-chat",
   "window_title": "Remote Agent Chat"
 }
 ```
@@ -1358,6 +1430,145 @@ Rules:
 
 - `agent_control_result` is always point-to-point (originating browser only), never broadcast.
 - For `agent_set_model`: `agent_control_result` confirms the command was received and attempted; the confirming `agent_config` event is what the browser should use to update the displayed model.
+
+## Relay Notification Preferences API
+
+Notification categories are persisted by authenticated relay user and shared by the web UI
+and Android app. Cookie-authenticated browser requests and Android bearer-token requests use
+the same endpoints.
+
+### `GET /api/preferences/notifications`
+
+Response:
+
+```json
+{
+  "preferences": {
+    "permission_required": true,
+    "agent_ready": true,
+    "agent_error": true,
+    "session_offline": true,
+    "rate_limit_cleared": true
+  }
+}
+```
+
+### `PUT /api/preferences/notifications`
+
+Request fields are optional booleans; omitted categories keep their current value.
+
+```json
+{
+  "preferences": {
+    "permission_required": true,
+    "agent_ready": false,
+    "agent_error": true,
+    "session_offline": true,
+    "rate_limit_cleared": true
+  }
+}
+```
+
+The response returns `ok: true` and the complete normalized `preferences` object. The relay
+maps permission prompts to `permission_required`, completed-task idle transitions to
+`agent_ready`, errors and active rate limits to `agent_error`, disconnected sessions to
+`session_offline`, and cleared limits to `rate_limit_cleared`. Missing preference rows default
+all categories to enabled. Per-session mute is applied after category filtering.
+
+### PWA Web Push subscription API
+
+Authenticated browser clients use `GET /api/push/web-config` to retrieve the relay's stable
+VAPID public key. `POST /api/push/web-subscription` accepts the browser `PushSubscription`
+JSON (`endpoint`, `keys.p256dh`, and `keys.auth`) and stores it for the authenticated email.
+`DELETE /api/push/web-subscription` accepts `{ "endpoint": "..." }` and removes only that
+user's subscription. VAPID keys are generated once and persisted in the relay SQLite data
+volume. Web Push uses the same five global categories and per-session mute filter as Android
+FCM; HTTP 404/410 subscriptions are removed after a send attempt.
+
+## Relay History Maintenance API
+
+Authenticated operators can measure and maintain the SQLite transcript store without copying a
+live WAL database:
+
+- `GET /api/maintenance/history?retention_days=90` returns database/WAL bytes, transcript and
+  session counts, oldest/newest timestamps, and inactive-session prune candidates.
+- `POST /api/maintenance/history/backup` starts or returns the current bounded background
+  SQLite online-backup job. `GET /api/maintenance/history/backup` reports `idle`, `running`,
+  `complete`, or `failed`; completed jobs include the timestamped path and byte count.
+  A same-size completed backup from the last 24 hours is reused unless `reuse_recent: false`.
+- `POST /api/maintenance/history/prune` requires `retention_days` and the exact confirmation
+  string `PRUNE_INACTIVE_HISTORY`, plus the exact path of the newest completed backup from the
+  last 24 hours. It deletes only sessions that are both unclaimed by a live proxy and older than
+  the retention cutoff.
+
+The endpoints use the same cookie-or-bearer authorization boundary as other private relay APIs.
+See `docs/HISTORY_STORE_OPERATIONS.md` for retention, backup-copy, restore, and verification rules.
+
+## Duplicate Proxy Alarm
+
+The relay tracks the complete set of session IDs claimed by every live proxy connection.
+When two live proxies claim the same session, browser and Android clients receive:
+
+```json
+{
+  "type": "duplicate_proxy_alarm",
+  "active": true,
+  "duplicate_sessions": [
+    { "session_id": "sess_123", "proxy_ids": ["desktop-a", "desktop-b"] }
+  ],
+  "server_ts": "2026-07-11T22:00:00.000Z"
+}
+```
+
+`connection_ack.duplicate_proxy_alarms` restores active alarms after client reconnect. The
+relay sends `active: false` with an empty array as soon as the duplicate claim disappears.
+Clients must keep the warning visible while the array is non-empty; last-writer-wins session
+routing does not make the collision safe.
+
+## Relay Session Preferences API
+
+Session display names, hidden/archive state, and per-session notification mute are persisted
+by authenticated relay user and shared by the web UI and Android app.
+
+- `GET /api/preferences/sessions` returns a `preferences` object keyed by `session_id`.
+- `PUT /api/preferences/sessions/:sessionId` accepts a partial `preference` object with
+  `display_name` (string, at most 100 characters), `archived` (boolean), and `muted`
+  (boolean), then returns the complete normalized preference.
+- `DELETE /api/preferences/sessions/:sessionId` resets that user's preference row.
+
+Example:
+
+```json
+{
+  "preference": {
+    "display_name": "Release checks",
+    "archived": false,
+    "muted": true
+  }
+}
+```
+
+Archived sessions stay available to the management surface for restore but are omitted from
+the normal sidebar/session list. A muted session continues receiving transcript and status
+events; only push notification delivery is suppressed for that session.
+
+## Nightly Validation Status API
+
+The hidden Windows nightly task runs every `tools/*-validate-all.js` entry point with
+`--read-only`, appends one JSONL record per harness locally, and publishes each latest result
+to the authenticated relay API.
+
+- `GET /api/maintenance/validation` returns the latest persisted result for each harness.
+- `PUT /api/maintenance/validation` accepts a single `validation` object containing
+  `harness`, `status` (`pass`, `fail`, or `timed_out`), `app_version`, `validator`, `run_id`,
+  `duration_ms`, optional `exit_code`, bounded `detail`, and ISO `completed_at`.
+- The relay broadcasts `nightly_validation_status` with `validations` and the non-passing
+  `failures` subset after each update.
+- `connection_ack.nightly_validation_failures` restores persistent warnings after web or
+  Android reconnect. A later passing result for a harness removes it from the warning.
+
+Only the six supported validation harness IDs are accepted. Both endpoints require the same
+cookie or bearer authentication as the other maintenance APIs.
 
 ## Error Codes
 

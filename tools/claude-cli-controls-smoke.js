@@ -63,8 +63,8 @@ const claudeCli = require('../agent-proxy/claude-cli');
     assert.match(proxySource, /sessionData\.nativeClaudeWindowChild = child/);
     assert.match(proxySource, /sessionData\._claudeCliInterrupted = true;[\s\S]*?stopNativeClaudeWindow\(sessionData\[childKey\]\)/);
     assert.match(proxySource, /const wasInterrupted = session\._claudeCliInterrupted === true/);
-    assert.match(proxySource, /const cliHasGitWorkspace = !isStoreBackedCli \|\| this\._isGitWorkspace\(workspacePath\)/);
-    assert.match(proxySource, /branch_list:\s+!isAntigravityV2 && cursorHasGitWorkspace && cliHasGitWorkspace/);
+    assert.match(proxySource, /const hasGitWorkspace = hasWorkspace && this\._isGitWorkspace\(workspacePath\)/);
+    assert.match(proxySource, /branch_list:\s+!isAntigravityV2 && hasGitWorkspace/);
     assert.match(proxySource, /_buildCapabilities\('claude_cli', session\.workspace_path\)/);
     assert.match(proxySource, /native_window:\s+isCodexCli \|\| isCursorCli/);
 

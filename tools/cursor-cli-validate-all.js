@@ -8,12 +8,20 @@ const { spawnSync } = require('child_process');
 const { resolveCursorCommand } = require('../agent-proxy/cursor-cli');
 
 const root = path.join(__dirname, '..');
+const args = process.argv.slice(2);
+const readOnly = args.includes('--read-only');
+const sendLive = args.includes('--send-live');
+if (args.some(arg => arg !== '--read-only' && arg !== '--send-live') || readOnly === sendLive) {
+  console.error('Choose exactly one Cursor CLI validation mode: --read-only or --send-live.');
+  process.exit(2);
+}
 const stages = [
   ['Cursor CLI parser syntax', process.execPath, ['--check', 'agent-proxy/cursor-cli.js']],
   ['Proxy engine syntax', process.execPath, ['--check', 'agent-proxy/proxy-engine.js']],
   ['Session store syntax', process.execPath, ['--check', 'agent-proxy/session-store.js']],
   ['Protocol syntax', process.execPath, ['--check', 'agent-proxy/protocol.js']],
-  ['Cursor CLI parser, lifecycle, and quoted-tool smoke', process.execPath, ['tools/cursor-cli-parser-smoke.js']],
+  ['Cursor CLI parser, lifecycle, and quoted-tool smoke', process.execPath,
+    ['tools/cursor-cli-parser-smoke.js', ...(readOnly ? ['--read-only'] : [])]],
   ['Cursor CLI controls and interrupt smoke', process.execPath, ['tools/cursor-cli-controls-smoke.js']],
   ['Frontend history reconnect smoke', process.execPath, ['tools/frontend-history-reconnect-smoke.js']],
   ['Frontend transcript fidelity smoke', process.execPath, ['tools/frontend-transcript-fidelity-smoke.js']],
@@ -56,3 +64,4 @@ runStage('Cursor Agent CLI version', cursor.command, [...cursor.argsPrefix, '--v
 
 const total = stages.length + 2;
 console.log(`ALL CURSOR CLI VALIDATION STAGES PASS (${total}/${total})`);
+if (readOnly) console.log('READ-ONLY PASS (live CLI send/resume/tool stages were intentionally not run)');

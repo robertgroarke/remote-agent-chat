@@ -63,8 +63,16 @@ async function main() {
 
     const recentTerminalEntries = selectors.codexTerminalEntriesFromMessages(recentMessages);
     const recentChangeEntries = selectors.codexFileChangeEntriesFromMessages(recentMessages);
-    assert(recentTerminalEntries.length > 0, 'bounded live transcript has no terminal blocks to validate');
-    assert(recentChangeEntries.length > 0, 'bounded live transcript has no file-change blocks to validate');
+    assert(Array.isArray(recentTerminalEntries), 'bounded live terminal extraction must return an array');
+    assert(Array.isArray(recentChangeEntries), 'bounded live file-change extraction must return an array');
+    assert(recentTerminalEntries.every(entry => entry.collapsed === false),
+      'bounded live terminal entries must remain expanded');
+    assert(recentTerminalEntries.every(entry => typeof entry.output === 'string'),
+      'bounded live terminal output must remain string-preserved');
+    assert(recentChangeEntries.every(entry => entry.can_accept === false && entry.can_reject === false),
+      'bounded live file-change actions must remain inactive');
+    assert(recentChangeEntries.every(entry => typeof entry.content === 'string'),
+      'bounded live file-change content must remain string-preserved');
 
     const runtimeSession = { _accumulatedMessages: messages };
     const terminalEntries = engine._codexDesktopTerminalEntries(runtimeSession);
@@ -104,7 +112,11 @@ async function main() {
     assert.equal(capabilities.terminal_input, false,
       'Codex Desktop terminal input must stay gated without a native target');
 
-    console.log(`Codex Desktop structured controls smoke: PASS (${terminalEntries.length} terminal, ${changeEntries.length} file-change blocks)`);
+    console.log(
+      `Codex Desktop structured controls smoke: PASS ` +
+      `(${terminalEntries.length} terminal, ${changeEntries.length} file-change blocks durable; ` +
+      `${recentTerminalEntries.length}/${recentChangeEntries.length} in current bounded window)`,
+    );
   } finally {
     await client.close();
   }

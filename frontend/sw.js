@@ -1,14 +1,12 @@
 'use strict';
 
-const CACHE_NAME = 'agent-chat-v57';
+const CACHE_NAME = 'agent-chat-v70';
+const ASSET_VERSION = '20260712-light-code-1';
 
 const SHELL_ASSETS = [
   '/',
-  '/styles.css',
-  '/file-utils.js',
-  '/markdown.js',
-  '/hooks.jsx',
-  '/app.jsx',
+  `/styles.css?v=${ASSET_VERSION}`,
+  `/dist/bundle.js?v=${ASSET_VERSION}`,
   '/manifest.json',
   '/icon.png',
   '/logo-antigravity.svg',
@@ -18,6 +16,8 @@ const SHELL_ASSETS = [
   '/logo-codex-in-ag.svg',
   '/logo-gemini-in-ag.svg',
 ];
+
+const VERSIONED_SHELL_ASSETS = new Set(SHELL_ASSETS.filter(asset => asset.includes('?')));
 
 // ── Install: cache shell assets ───────────────────────────────────────────────
 
@@ -42,6 +42,38 @@ self.addEventListener('activate', event => {
 });
 
 // ── Fetch: network-first with shell fallback ──────────────────────────────────
+
+self.addEventListener('push', event => {
+  let payload = {};
+  try {
+    payload = event.data ? event.data.json() : {};
+  } catch {
+    payload = { body: event.data ? event.data.text() : '' };
+  }
+  const data = payload.data || {};
+  event.waitUntil(self.registration.showNotification(payload.title || 'Remote Agent Chat', {
+    body: payload.body || 'An agent needs your attention.',
+    icon: '/icon.png',
+    badge: '/icon.png',
+    tag: `${data.type || 'agent-update'}:${data.session_id || ''}`,
+    renotify: true,
+    data,
+  }));
+});
+
+self.addEventListener('notificationclick', event => {
+  event.notification.close();
+  const data = event.notification.data || {};
+  const sessionQuery = data.session_id ? `?session=${encodeURIComponent(data.session_id)}` : '';
+  event.waitUntil(self.clients.matchAll({ type: 'window', includeUncontrolled: true }).then(windows => {
+    const existing = windows.find(client => new URL(client.url).origin === self.location.origin);
+    if (existing) {
+      existing.postMessage({ type: 'push_notification_clicked', data });
+      return existing.focus();
+    }
+    return self.clients.openWindow(`/${sessionQuery}`);
+  }));
+});
 
 self.addEventListener('fetch', event => {
   const url = new URL(event.request.url);
@@ -68,11 +100,19 @@ self.addEventListener('fetch', event => {
     return;
   }
 
+  // Versioned build artifacts are immutable. Serve them directly from the
+  // warm PWA cache; a new HTML cache key and cache generation activate every
+  // deployed frontend revision.
+  if (VERSIONED_SHELL_ASSETS.has(`${url.pathname}${url.search}`)) {
+    event.respondWith(
+      caches.match(event.request).then(cached => cached || fetch(event.request))
+    );
+    return;
+  }
+
   // Shell JS/CSS should be network-first so UI fixes aren't masked by stale SW cache.
   if (
     url.pathname === '/styles.css' ||
-    url.pathname === '/hooks.jsx' ||
-    url.pathname === '/app.jsx' ||
     url.pathname === '/dist/bundle.js'
   ) {
     event.respondWith(

@@ -4,6 +4,9 @@ const fs = require('fs');
 const crypto = require('crypto');
 const path = require('path');
 const cursorCli = require('../agent-proxy/cursor-cli');
+const readOnly = process.argv.includes('--read-only');
+const readOnlyHome = readOnly ? fs.mkdtempSync(path.join(require('os').tmpdir(), 'remote-agent-cursor-cli-readonly-')) : null;
+if (readOnlyHome) process.env.USERPROFILE = readOnlyHome;
 
 function assert(cond, msg) {
   if (!cond) throw new Error(msg);
@@ -78,6 +81,28 @@ function writeFixture(events) {
         },
       },
     },
+    {
+      type: 'tool_call',
+      subtype: 'started',
+      call_id: 'c2',
+      tool_call: {
+        readToolCall: {
+          args: { path: 'README.md' },
+          description: 'Read README',
+        },
+      },
+    },
+    {
+      type: 'tool_call',
+      subtype: 'completed',
+      call_id: 'c2',
+      tool_call: {
+        readToolCall: {
+          result: { success: { content: 'fixture file content' } },
+          description: 'Read README',
+        },
+      },
+    },
     { type: 'assistant', message: { role: 'assistant', content: [{ type: 'text', text: 'Done' }] }, timestamp_ms: 1 },
     { type: 'assistant', message: { role: 'assistant', content: [{ type: 'text', text: 'Done.' }] } },
     { type: 'result', subtype: 'success', result: 'Done.' },
@@ -94,9 +119,22 @@ function writeFixture(events) {
   assert(terminalBlock.command === 'echo hello', 'bad terminal.command: ' + terminalBlock.command);
   assert(String(terminalBlock.stdout || '').includes('hello'), 'bad terminal.stdout: ' + terminalBlock.stdout);
   assert(terminalBlock.exit_code === 0, 'bad exit_code: ' + terminalBlock.exit_code);
+  const genericToolBlocks = fixture.summary.messages
+    .flatMap((m) => m.content_blocks || [])
+    .filter((b) => b.call_id === 'c2');
+  assert(genericToolBlocks.length === 2, 'non-shell tool call/result must remain distinct');
+  const genericCall = genericToolBlocks.find((b) => b.type === 'tool_call');
+  const genericResult = genericToolBlocks.find((b) => b.type === 'tool_result');
+  assert(genericCall, 'missing generic tool_call block');
+  assert(genericResult, 'missing generic tool_result block');
+  assert(/README\.md/.test(genericCall.content), 'generic call missing arguments');
+  assert(!/fixture file content/.test(genericCall.content), 'generic call flattened its result');
+  assert(/fixture file content/.test(genericResult.content), 'generic result missing output');
+  assert(genericResult.status === 'completed', 'generic result status mismatch');
+  assert(genericCall.collapsed === false && genericResult.collapsed === false, 'generic blocks must expand by default');
   const collapsibleBlocks = fixture.summary.messages
     .flatMap((m) => m.content_blocks || [])
-    .filter((b) => b.type === 'thinking' || b.type === 'terminal' || b.type === 'tool_call' || b.type === 'file_changes');
+    .filter((b) => b.type === 'thinking' || b.type === 'terminal' || b.type === 'tool_call' || b.type === 'tool_result' || b.type === 'file_changes');
   assert(collapsibleBlocks.length >= 2, 'expected thinking and tool blocks in fixture');
   assert(collapsibleBlocks.every((b) => b.collapsed === false), 'Cursor CLI transcript blocks must expand by default');
   console.log('PASS parser fixture', {
@@ -104,6 +142,12 @@ function writeFixture(events) {
     terminal: terminalBlock,
     title: fixture.summary.title,
   });
+
+  if (readOnly) {
+    fs.rmSync(readOnlyHome, { recursive: true, force: true });
+    console.log('READ-ONLY PASS (fixture used an isolated temporary session store; live CLI stages skipped)');
+    return;
+  }
 
   console.log('--- live send/resume ---');
   const resolved = cursorCli.resolveCursorCommand();

@@ -20,11 +20,12 @@ This extension replaces the standalone `agent-proxy` Node.js process — no back
 |---|---|---|
 | **Relay URL** | WebSocket URL of your relay server | `wss://agents.yourdomain.com/proxy-ws` |
 | **Proxy Secret** | Shared secret (must match relay) | `pxy-abc123...` |
-| **CDP Ports** | Comma-separated CDP ports | `9223` or `9223,9225` |
+| **CDP Ports** | Comma-separated CDP ports | `9223,9228,9225,9226,9227` |
 | **Machine Label** | Label for this machine (optional) | *(defaults to hostname)* |
 | **Auto Start** | Start proxy on activation | `true` (default) |
 
-3. **Launch Antigravity with CDP enabled** using `launch-antigravity-cdp.bat`
+3. **Launch editor hosts with CDP enabled**: VS Code on 9223 and, when needed,
+   Antigravity IDE via `launch-antigravity-ide-cdp-9228.bat`
 
 The proxy starts automatically. Look for the status indicator in the status bar.
 
@@ -42,7 +43,9 @@ Click the status bar item for a quick menu (Stop, Restart, Show Logs).
 
 ## Multi-Window Support
 
-Only one Antigravity window runs the proxy at a time (the "leader"). Other windows enter standby mode automatically. If the leader window is closed, a standby window takes over within 5–15 seconds.
+Only one extension-host window runs the proxy at a time (the "leader"). Other
+windows enter standby mode automatically. If the leader window is closed, a
+standby window takes over within 5–15 seconds.
 
 ## Commands
 

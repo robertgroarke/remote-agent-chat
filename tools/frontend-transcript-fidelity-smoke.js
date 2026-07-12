@@ -9,9 +9,12 @@ const root = path.join(__dirname, '..');
 const read = relativePath => fs.readFileSync(path.join(root, relativePath), 'utf8');
 
 const app = read('frontend/app.jsx');
+const hooks = read('frontend/hooks.jsx');
 const markdown = read('frontend/markdown.js');
 const styles = read('frontend/styles.css');
 const bundle = read('frontend/dist/bundle.js');
+const indexHtml = read('frontend/index.html');
+const serviceWorker = read('frontend/sw.js');
 
 for (const forbidden of [
   'TRANSCRIPT_RENDER_TAIL_LIMIT',
@@ -28,11 +31,15 @@ assert.match(app, /<details[\s\S]*?open=\{open\}[\s\S]*?onToggle=/);
 assert((app.match(/<TranscriptDisclosure\b/g) || []).length >= 4,
   'thinking, tool, terminal, and file-change blocks must use expanded disclosures');
 
-const messagesIndex = app.indexOf('<div className="messages"');
+const messagesIndex = app.indexOf('className={`messages harness-theme');
 const footerIndex = app.indexOf('className="transcript-live-footer"');
 const inputIndex = app.indexOf('<div className="input-area"');
 assert(messagesIndex >= 0 && footerIndex > messagesIndex && inputIndex > footerIndex,
   'live task/activity footer must be in document flow between transcript and composer');
+assert.match(app, /data-agent-type=\{activeSessionMeta\?\.agent_type \|\| 'default'\}/,
+  'transcript root must expose its active harness identity');
+assert.match(app, /\['claude_cli', 'codex_cli', 'cursor_cli'\]\.includes\(activeSessionMeta\?\.agent_type\)/,
+  'only CLI harnesses should force terminal-style assistant monospace');
 assert.match(app, /const defaultCollapsed = false;/,
   'task lists must not auto-collapse based on length');
 assert.match(app, /inline-error-prompt-title/,
@@ -71,6 +78,24 @@ assert.match(markdown, /file-changes-toggle[^\n]*aria-expanded="true"/,
   'file-change sections must initialize expanded');
 
 assert.match(styles, /\.transcript-live-footer\s*\{[\s\S]*?display:\s*flex;[\s\S]*?position:\s*relative;/);
+assert.match(hooks, /t === 'message_delivered'[\s\S]*?t === 'proxy_send_result'[\s\S]*?msg\.result === 'delivered'/,
+  'web client must consume canonical and raw proxy delivery results');
+assert.match(hooks, /t === 'message_failed'[\s\S]*?t === 'proxy_send_result'[\s\S]*?msg\.result === 'failed'/,
+  'web client must consume canonical and raw proxy failure results');
+assert.match(app, /status === 'delivered'[\s\S]*?Delivered to agent/,
+  'web delivery status must render proxy-confirmed delivery');
+for (const harness of ['claude', 'codex', 'codex-desktop', 'cursor', 'continue', 'antigravity-v2', 'claude_cli', 'codex_cli', 'cursor_cli']) {
+  assert(styles.includes(`.harness-theme-${harness}`), `missing transcript theme pack for ${harness}`);
+}
+const continueTheme = styles.match(/\.harness-theme-continue,[\s\S]*?\n\}/)?.[0] || '';
+assert.match(continueTheme, /--harness-body-font:\s*system-ui/);
+assert.match(continueTheme, /--harness-body-size:\s*14px/);
+assert.match(continueTheme, /--harness-body-line:\s*21px/);
+assert.match(continueTheme, /--harness-code-size:\s*14px/);
+assert.match(continueTheme, /--harness-code-line:\s*21px/);
+for (const token of ['--harness-body-font', '--harness-body-size', '--harness-body-line', '--harness-code-font', '--harness-thinking']) {
+  assert(styles.includes(token), `missing harness theme token ${token}`);
+}
 assert.match(styles, /\.activity-command code\s*\{[\s\S]*?white-space:\s*pre-wrap;[\s\S]*?overflow-wrap:\s*anywhere;/);
 const subagentRule = styles.match(/\.subagent-prompt\s*\{([\s\S]*?)\}/)?.[1] || '';
 assert(subagentRule && !/line-clamp|text-overflow:\s*ellipsis/.test(subagentRule),
@@ -83,9 +108,19 @@ assert(goalObjectiveRule && /white-space:\s*normal/.test(goalObjectiveRule) && /
   'goal objectives must remain fully visible at narrow viewport widths');
 
 assert(bundle.includes('transcript-live-footer'), 'compiled bundle is missing the live footer');
+assert(bundle.includes('harness-theme-'), 'compiled bundle is missing per-harness transcript theming');
+assert(bundle.includes('agent_started'), 'compiled bundle is missing the final send lifecycle receipt');
 assert(!bundle.includes('Rendering latest'), 'compiled bundle still contains transcript auto-windowing');
+const assetVersion = serviceWorker.match(/const ASSET_VERSION = '([^']+)'/)?.[1];
+const cacheName = serviceWorker.match(/const CACHE_NAME = '([^']+)'/)?.[1];
+assert(assetVersion, 'service worker is missing ASSET_VERSION');
+assert(/^agent-chat-v\d+$/.test(cacheName || ''), 'service-worker cache generation is invalid');
+assert(indexHtml.includes(`styles.css?v=${assetVersion}`),
+  'stylesheet cachebuster does not match the service-worker asset version');
+assert(indexHtml.includes(`bundle.js?v=${assetVersion}`),
+  'bundle cachebuster does not match the service-worker asset version');
 
-for (const asset of ['app.jsx', 'hooks.jsx', 'styles.css']) {
+for (const asset of ['app.jsx', 'hooks.jsx', 'workspace-groups.js', 'styles.css', 'index.html', 'sw.js']) {
   assert.strictEqual(
     read(`relay-server/public/${asset}`),
     read(`frontend/${asset}`),

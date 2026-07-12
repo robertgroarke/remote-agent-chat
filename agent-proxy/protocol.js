@@ -8,6 +8,8 @@
 
 'use strict';
 
+const { resolveProjectRoot } = require('./project-root');
+
 const PROTOCOL_VERSION = 1;
 
 // ─── Connection lifecycle ─────────────────────────────────────────────────────
@@ -45,7 +47,13 @@ function sessionSnapshot(sessions, workspaces, proxyId) {
   const msg = {
     type: 'proxy_session_snapshot',
     protocol_version: PROTOCOL_VERSION,
-    sessions,
+    sessions: (sessions || []).map(session => {
+      if (!session || typeof session !== 'object') return session;
+      return {
+        ...session,
+        project_root: resolveProjectRoot(session.workspace_path),
+      };
+    }),
     // legacy compat: relay may still read session_list
     // (we send session_list separately in broadcastSessionSnapshot)
   };

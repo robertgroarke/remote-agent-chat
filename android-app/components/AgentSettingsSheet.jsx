@@ -1,4 +1,4 @@
-import React from 'react';
+import React, { useEffect, useRef, useState } from 'react';
 import {
   View, Text, Modal, TouchableOpacity, TouchableWithoutFeedback,
   ScrollView, StyleSheet, Switch,
@@ -46,7 +46,7 @@ const PERMISSION_MODES = [
 
 // ── Picker row component ────────────────────────────────────────────────────
 
-function SettingRow({ label, options, value, onChange }) {
+function SettingRow({ label, options, value, onChange, disabled = false }) {
   return (
     <View style={s.settingRow}>
       <Text style={s.settingLabel}>{label}</Text>
@@ -57,8 +57,9 @@ function SettingRow({ label, options, value, onChange }) {
             return (
               <TouchableOpacity
                 key={opt.id}
-                style={[s.chip, active && s.chipActive]}
+                style={[s.chip, active && s.chipActive, disabled && s.chipDisabled]}
                 onPress={() => onChange(opt.id)}
+                disabled={disabled}
                 activeOpacity={0.7}
               >
                 <Text style={[s.chipText, active && s.chipTextActive]}>{opt.label}</Text>
@@ -74,10 +75,92 @@ function SettingRow({ label, options, value, onChange }) {
 // ── Main sheet ──────────────────────────────────────────────────────────────
 
 export default function AgentSettingsSheet({
-  visible, onClose, agentType, config, relay, sessionId,
+  visible, onClose, agentType, config, relay, sessionId, controlResults,
 }) {
-  if (!config) return null;
+  const [controlStates, setControlStates] = useState({});
+  const controlTimers = useRef({});
+  const hasConfig = !!config;
+  config = config || {};
   const caps = config.capabilities || {};
+
+  const isPending = field => ['pending', 'awaiting_config'].includes(controlStates[field]?.status);
+  const valueFor = (field, current) => isPending(field) ? controlStates[field].requestedValue : current;
+
+  function clearControlTimer(field) {
+    if (controlTimers.current[field]) clearTimeout(controlTimers.current[field]);
+    delete controlTimers.current[field];
+  }
+
+  function submitControl(field, previousValue, requestedValue, submit) {
+    clearControlTimer(field);
+    const requestId = submit?.();
+    if (!requestId) return;
+    setControlStates(prev => ({
+      ...prev,
+      [field]: { requestId, previousValue, requestedValue, status: 'pending', error: null },
+    }));
+    controlTimers.current[field] = setTimeout(() => {
+      setControlStates(prev => ({
+        ...prev,
+        [field]: { ...prev[field], status: 'failed', error: 'Timed out waiting for the agent to confirm this setting.' },
+      }));
+    }, 15000);
+  }
+
+  useEffect(() => () => {
+    Object.values(controlTimers.current).forEach(timer => clearTimeout(timer));
+    controlTimers.current = {};
+  }, []);
+
+  useEffect(() => {
+    Object.values(controlTimers.current).forEach(timer => clearTimeout(timer));
+    controlTimers.current = {};
+    setControlStates({});
+  }, [sessionId]);
+
+  useEffect(() => {
+    setControlStates(prev => {
+      let changed = false;
+      const next = { ...prev };
+      Object.entries(prev).forEach(([field, state]) => {
+        if (!['pending', 'awaiting_config'].includes(state.status)) return;
+        const result = controlResults?.[state.requestId];
+        if (!result) return;
+        if (result.result === 'failed') {
+          clearControlTimer(field);
+          next[field] = { ...state, status: 'failed', error: result.error?.message || result.error || 'The agent rejected this setting.' };
+          changed = true;
+        } else if (result.result === 'ok' && state.status !== 'awaiting_config') {
+          next[field] = { ...state, status: 'awaiting_config' };
+          changed = true;
+        }
+      });
+      return changed ? next : prev;
+    });
+  }, [controlResults]);
+
+  useEffect(() => {
+    const confirmedValues = {
+      model: config.model_id,
+      permission_mode: config.permission_mode,
+      auto_approve_permissions: config.auto_approve_permissions,
+      mode: config.conversation_mode || config.mode,
+      effort: config.effort,
+      access_mode: config.permission_mode,
+      workspace: config.available_workspaces?.find(workspace => workspace.active)?.id || config.file_access_scope,
+    };
+    setControlStates(prev => {
+      let changed = false;
+      const next = { ...prev };
+      Object.entries(prev).forEach(([field, state]) => {
+        if (!['pending', 'awaiting_config'].includes(state.status) || confirmedValues[field] !== state.requestedValue) return;
+        clearControlTimer(field);
+        next[field] = { ...state, status: 'ok', error: null };
+        changed = true;
+      });
+      return changed ? next : prev;
+    });
+  }, [config.model_id, config.permission_mode, config.auto_approve_permissions, config.conversation_mode, config.mode, config.effort, config.file_access_scope, config.available_workspaces]);
 
   function modelsForAgent() {
     if (agentType === 'antigravity' || agentType === 'antigravity_panel') return KNOWN_ANTIGRAVITY_MODELS;
@@ -88,26 +171,26 @@ export default function AgentSettingsSheet({
 
   function handleModelChange(modelId) {
     if (caps.set_codex_config) {
-      relay?.setCodexConfig(sessionId, { model_id: modelId });
+      submitControl('model', config.model_id, modelId, () => relay?.setCodexConfig(sessionId, { model_id: modelId }));
     } else {
-      relay?.setAgentModel(sessionId, modelId);
+      submitControl('model', config.model_id, modelId, () => relay?.setAgentModel(sessionId, modelId));
     }
   }
 
   function handlePermissionChange(mode) {
-    relay?.setAgentPermissionMode(sessionId, mode);
+    submitControl('permission_mode', config.permission_mode, mode, () => relay?.setAgentPermissionMode(sessionId, mode));
   }
 
   function handleModeChange(mode) {
-    relay?.setAntigravityMode(sessionId, mode);
+    submitControl('mode', config.conversation_mode || config.mode, mode, () => relay?.setAntigravityMode(sessionId, mode));
   }
 
   function handleEffortChange(effort) {
-    relay?.setCodexConfig(sessionId, { effort });
+    submitControl('effort', config.effort, effort, () => relay?.setCodexConfig(sessionId, { effort }));
   }
 
   function handleAccessChange(accessMode) {
-    relay?.setCodexConfig(sessionId, { access_mode: accessMode });
+    submitControl('access_mode', config.permission_mode, accessMode, () => relay?.setCodexConfig(sessionId, { access_mode: accessMode }));
   }
 
   const showModel = caps.set_model || caps.set_codex_config ||
@@ -119,6 +202,8 @@ export default function AgentSettingsSheet({
   const autoApproveEnabled = typeof config.auto_approve_permissions === 'boolean'
     ? config.auto_approve_permissions
     : false;
+
+  if (!hasConfig) return null;
 
   return (
     <Modal visible={visible} transparent animationType="slide" onRequestClose={onClose}>
@@ -134,8 +219,9 @@ export default function AgentSettingsSheet({
             <SettingRow
               label="Model"
               options={modelsForAgent()}
-              value={config.model_id || 'default'}
+              value={valueFor('model', config.model_id || 'default')}
               onChange={handleModelChange}
+              disabled={isPending('model')}
             />
           )}
 
@@ -143,8 +229,9 @@ export default function AgentSettingsSheet({
             <SettingRow
               label="Permissions"
               options={PERMISSION_MODES}
-              value={config.permission_mode || 'default'}
+              value={valueFor('permission_mode', config.permission_mode || 'default')}
               onChange={handlePermissionChange}
+              disabled={isPending('permission_mode')}
             />
           )}
 
@@ -154,8 +241,9 @@ export default function AgentSettingsSheet({
               <View style={s.toggleControl}>
                 <Text style={s.toggleHint}>Auto-approve permission prompts</Text>
                 <Switch
-                  value={autoApproveEnabled}
-                  onValueChange={(v) => relay?.setAutoApprovePermissions(sessionId, v)}
+                  value={valueFor('auto_approve_permissions', autoApproveEnabled)}
+                  disabled={isPending('auto_approve_permissions')}
+                  onValueChange={(v) => submitControl('auto_approve_permissions', autoApproveEnabled, v, () => relay?.setAutoApprovePermissions(sessionId, v))}
                   trackColor={{ false: '#30363d', true: '#1f4d8a' }}
                   thumbColor={autoApproveEnabled ? '#58a6ff' : '#768390'}
                 />
@@ -167,8 +255,9 @@ export default function AgentSettingsSheet({
             <SettingRow
               label="Mode"
               options={ANTIGRAVITY_MODES}
-              value={config.conversation_mode || 'Planning'}
+              value={valueFor('mode', config.conversation_mode || config.mode || 'Planning')}
               onChange={handleModeChange}
+              disabled={isPending('mode')}
             />
           )}
 
@@ -176,8 +265,9 @@ export default function AgentSettingsSheet({
             <SettingRow
               label="Effort"
               options={config.available_efforts}
-              value={(config.effort || 'medium').toLowerCase()}
+              value={valueFor('effort', (config.effort || 'medium').toLowerCase())}
               onChange={handleEffortChange}
+              disabled={isPending('effort')}
             />
           )}
 
@@ -185,8 +275,9 @@ export default function AgentSettingsSheet({
             <SettingRow
               label="Access"
               options={config.available_access}
-              value={config.permission_mode || 'workspace-write'}
+              value={valueFor('access_mode', config.permission_mode || 'workspace-write')}
               onChange={handleAccessChange}
+              disabled={isPending('access_mode')}
             />
           )}
 
@@ -201,9 +292,19 @@ export default function AgentSettingsSheet({
             <SettingRow
               label="Switch Workspace"
               options={config.available_workspaces.map(ws => ({ id: ws.id || ws.title, label: ws.title }))}
-              value={config.available_workspaces.find(ws => ws.active)?.id || config.available_workspaces[0]?.id}
-              onChange={(wsId) => relay?.switchWorkspace(sessionId, wsId)}
+              value={valueFor('workspace', config.available_workspaces.find(ws => ws.active)?.id || config.available_workspaces[0]?.id)}
+              disabled={isPending('workspace')}
+              onChange={(wsId) => submitControl('workspace', config.available_workspaces.find(ws => ws.active)?.id, wsId, () => relay?.switchWorkspace(sessionId, wsId))}
             />
+          )}
+
+          {Object.values(controlStates).some(state => ['pending', 'awaiting_config', 'failed'].includes(state.status)) && (
+            <View style={[s.controlStatus, Object.values(controlStates).some(state => state.status === 'failed') && s.controlStatusFailed]}>
+              <Text style={[s.controlStatusText, Object.values(controlStates).some(state => state.status === 'failed') && s.controlStatusTextFailed]}>
+                {Object.values(controlStates).find(state => state.status === 'failed')?.error
+                  || `Saving ${Object.entries(controlStates).find(([, state]) => ['pending', 'awaiting_config'].includes(state.status))?.[0]?.replace(/_/g, ' ')}…`}
+              </Text>
+            </View>
           )}
 
           {config.branch && config.branch !== 'unknown' && (
@@ -307,6 +408,26 @@ const s = StyleSheet.create({
   chipActive: {
     backgroundColor: '#1f4d8a',
     borderColor:     '#58a6ff',
+  },
+  chipDisabled: {
+    opacity: 0.55,
+  },
+  controlStatus: {
+    marginTop: 8,
+    paddingVertical: 8,
+    paddingHorizontal: 10,
+    borderRadius: 7,
+    backgroundColor: 'rgba(88,166,255,0.10)',
+  },
+  controlStatusFailed: {
+    backgroundColor: 'rgba(248,81,73,0.10)',
+  },
+  controlStatusText: {
+    color: '#58a6ff',
+    fontSize: 12,
+  },
+  controlStatusTextFailed: {
+    color: '#f85149',
   },
   chipText: {
     color:    '#768390',

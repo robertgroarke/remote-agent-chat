@@ -1,7 +1,7 @@
 import React, { useState } from 'react';
 import {
   View, Text, Modal, TouchableOpacity, TouchableWithoutFeedback,
-  ScrollView, StyleSheet, ActivityIndicator, Platform, TextInput,
+  ScrollView, StyleSheet, ActivityIndicator, Platform, TextInput, useColorScheme,
 } from 'react-native';
 
 // ── TerminalViewer (Epic 4) ─────────────────────────────────────────────────
@@ -11,6 +11,7 @@ import {
 export default function TerminalViewer({ visible, entries, onRefresh, onClose, loading, onSendInput }) {
   const [input, setInput] = useState('');
   const [sending, setSending] = useState(false);
+  const light = useColorScheme() === 'light';
 
   function handleSend() {
     const text = input.trim();
@@ -33,9 +34,9 @@ export default function TerminalViewer({ visible, entries, onRefresh, onClose, l
         <View style={s.backdrop} />
       </TouchableWithoutFeedback>
 
-      <View style={s.sheet}>
-        <View style={s.header}>
-          <Text style={s.title}>Terminal</Text>
+      <View style={[s.sheet, light && s.sheetLight]}>
+        <View style={[s.header, light && s.headerLight]}>
+          <Text style={[s.title, light && s.textLight]}>Terminal</Text>
           <TouchableOpacity onPress={onRefresh} style={s.refreshBtn} activeOpacity={0.7}>
             <Text style={s.refreshBtnText}>↻</Text>
           </TouchableOpacity>
@@ -47,34 +48,34 @@ export default function TerminalViewer({ visible, entries, onRefresh, onClose, l
         <ScrollView style={s.body} contentContainerStyle={s.bodyContent}>
           {loading && (
             <View style={s.loadingRow}>
-              <ActivityIndicator size="small" color="#888" />
+              <ActivityIndicator size="small" color={light ? '#57606a' : '#888'} />
               <Text style={s.loadingText}>Loading output…</Text>
             </View>
           )}
 
           {!loading && (!entries || entries.length === 0) && (
-            <Text style={s.emptyText}>No terminal output captured</Text>
+            <Text style={[s.emptyText, light && s.mutedLight]}>No terminal output captured</Text>
           )}
 
           {(entries || []).map((entry, i) => (
-            <View key={i} style={s.entry}>
+            <View key={i} style={[s.entry, light && s.entryLight]}>
               {entry.command && (
-                <Text style={s.command}>$ {entry.command}</Text>
+                <Text style={[s.command, light && s.commandLight]}>$ {entry.command}</Text>
               )}
-              <Text style={s.output} selectable>{entry.output}</Text>
+              <Text style={[s.output, light && s.outputLight]} selectable>{entry.output}</Text>
             </View>
           ))}
         </ScrollView>
 
         {onSendInput && (
-          <View style={s.inputRow}>
-            <Text style={s.prompt}>$</Text>
+          <View style={[s.inputRow, light && s.inputRowLight]}>
+            <Text style={[s.prompt, light && s.commandLight]}>$</Text>
             <TextInput
-              style={s.input}
+              style={[s.input, light && s.inputLight]}
               value={input}
               onChangeText={setInput}
               placeholder="Type a command…"
-              placeholderTextColor="#444c56"
+              placeholderTextColor={light ? '#6e7781' : '#444c56'}
               autoCapitalize="none"
               autoCorrect={false}
               returnKeyType="send"
@@ -112,6 +113,9 @@ const s = StyleSheet.create({
     maxHeight: '65%',
     paddingBottom: 20,
   },
+  sheetLight: {
+    backgroundColor: '#f6f8fa',
+  },
   header: {
     flexDirection: 'row',
     alignItems: 'center',
@@ -119,6 +123,9 @@ const s = StyleSheet.create({
     paddingVertical: 12,
     borderBottomWidth: 1,
     borderBottomColor: '#21262d',
+  },
+  headerLight: {
+    borderBottomColor: '#d0d7de',
   },
   title: {
     flex: 1,
@@ -175,6 +182,9 @@ const s = StyleSheet.create({
     borderBottomWidth: 1,
     borderBottomColor: '#21262d',
   },
+  entryLight: {
+    borderBottomColor: '#d0d7de',
+  },
   command: {
     fontFamily: Platform.OS === 'ios' ? 'Menlo' : 'monospace',
     fontSize: 12,
@@ -182,11 +192,17 @@ const s = StyleSheet.create({
     fontWeight: '600',
     paddingBottom: 2,
   },
+  commandLight: {
+    color: '#0550ae',
+  },
   output: {
     fontFamily: Platform.OS === 'ios' ? 'Menlo' : 'monospace',
     fontSize: 12,
     color: '#c9d1d9',
     lineHeight: 18,
+  },
+  outputLight: {
+    color: '#24292f',
   },
   inputRow: {
     flexDirection: 'row',
@@ -196,6 +212,9 @@ const s = StyleSheet.create({
     borderTopWidth: 1,
     borderTopColor: '#21262d',
     gap: 6,
+  },
+  inputRowLight: {
+    borderTopColor: '#d0d7de',
   },
   prompt: {
     fontFamily: Platform.OS === 'ios' ? 'Menlo' : 'monospace',
@@ -216,6 +235,11 @@ const s = StyleSheet.create({
     paddingVertical: 8,
     height: 38,
   },
+  inputLight: {
+    color: '#24292f',
+    backgroundColor: '#ffffff',
+    borderColor: '#d0d7de',
+  },
   sendBtn: {
     width: 38,
     height: 38,
@@ -231,5 +255,11 @@ const s = StyleSheet.create({
     color: '#58a6ff',
     fontSize: 18,
     fontWeight: '700',
+  },
+  textLight: {
+    color: '#24292f',
+  },
+  mutedLight: {
+    color: '#57606a',
   },
 });

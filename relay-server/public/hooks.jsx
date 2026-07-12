@@ -11,6 +11,20 @@ const DEFAULT_HISTORY_TAIL_LIMIT = 120;
 const CODEX_CLI_HISTORY_CHUNK_BYTES = 1024 * 1024;
 const HISTORY_CHUNK_TIMEOUT_MS = 15000;
 const MAX_HISTORY_CHUNK_RETRIES = 1;
+export const CONFIG_CONTROL_TIMEOUT_MS = 15000;
+export const DELIVERY_STAGE_TIMEOUT_MS = Object.freeze({
+  queued: 10000,
+  accepted: 30000,
+  delivered: 30000,
+  steered: 30000,
+});
+export const RELAY_RECONNECT_DELAYS_MS = [250, 500, 1000, 2000, 3000];
+const STARTUP_DEFERRED_RELAY_TYPES = new Set([
+  'history',
+  'history_snapshot',
+  'history_chunk',
+  'chat_list',
+]);
 
 function shallowMapMerge(prev, next) {
   const entries = Object.entries(next || {});
@@ -69,6 +83,38 @@ export function historyMessagesOverlapMatch(left, right) {
   const rightId = stableHistoryMessageId(right);
   if (leftId && rightId) return leftId === rightId;
   return left.role === right.role && String(left.content || '') === String(right.content || '');
+}
+
+export function preserveOptimisticMessagesAcrossHistory(authoritativeMessages, previousMessages) {
+  const source = Array.isArray(authoritativeMessages) ? authoritativeMessages : [];
+  const pending = (Array.isArray(previousMessages) ? previousMessages : [])
+    .filter(message => message?._optimistic && message?._cid);
+  if (pending.length === 0) return source;
+  const authoritative = [...source];
+
+  pending.forEach(optimistic => {
+    const matchIndex = authoritative.findIndex(message => (
+      message?.role === 'user'
+      && (
+        message.client_message_id === optimistic._cid
+        || message.client_msg_id === optimistic._cid
+        || String(message.content || '') === String(optimistic.content || '')
+      )
+    ));
+    if (matchIndex >= 0) {
+      authoritative[matchIndex] = {
+        ...authoritative[matchIndex],
+        _cid: optimistic._cid,
+        _optimistic: true,
+        _delivered: optimistic._delivered || authoritative[matchIndex]._delivered,
+        _agentStarted: optimistic._agentStarted || authoritative[matchIndex]._agentStarted,
+        _sendError: optimistic._sendError || null,
+      };
+    } else {
+      authoritative.push(optimistic);
+    }
+  });
+  return authoritative;
 }
 
 export function mergeHistoryTailByOverlap(existing, incoming) {
@@ -148,12 +194,13 @@ export function useRelay() {
     const [historyMeta,     setHistoryMeta]     = useState({});   // sessionId -> { partial, loaded, total, limit, mode }
     const [historyLoading,  setHistoryLoading]  = useState({});   // sessionId -> { mode, requestedAt, requestId }
     const [connected,       setConnected]       = useState(false);
+    const [connectionHealth, setConnectionHealth] = useState({ state: 'connecting', rttMs: null, lastAckAt: null });
     const [unread,          setUnread]          = useState({});   // sessionId -> count
     const [thinking,        setThinking]        = useState({});   // sessionId -> label string | false
     const [thinkingContent, setThinkingContent] = useState({});   // sessionId -> string (Claude Code thinking text) | ''
     const [activities,      setActivities]      = useState({});   // sessionId -> { kind, label, updatedAt } | false
     const [health,          setHealth]          = useState({});   // sessionId -> 'healthy'|'degraded'|'disconnected'
-    const [deliveryStates,  setDeliveryStates]  = useState({});   // clientMsgId -> 'queued'|'accepted'|'failed'|'busy_queued'|'steered'
+    const [deliveryStates,  setDeliveryStates]  = useState({});   // includes offline_queued plus relay/native lifecycle states
     const [queuedMessages,  setQueuedMessages]  = useState({});   // sessionId -> [{ cid, content, queuedAt }]
     const [launchStates,      setLaunchStates]      = useState({});   // requestId -> { status:'launching'|'failed', agentType, error? }
     const [justLaunched,      setJustLaunched]      = useState(null); // session_id of most recently launched session (for auto-select)
@@ -169,11 +216,28 @@ export function useRelay() {
     const [skillLists,        setSkillLists]        = useState({});   // sessionId -> { installed: [...], recommended: [...] }
     const [automationViews,   setAutomationViews]   = useState({});   // sessionId -> Codex Desktop native automation pane snapshot
     const [controlResults,    setControlResults]    = useState({});   // requestId -> latest agent_control_result
+    const [configControlStates, setConfigControlStates] = useState({}); // sessionId:field -> pending/ok/failed transaction
     const [directoryListings, setDirectoryListings] = useState({});  // sessionId -> { path, entries }
     const [fileContents,      setFileContents]      = useState({});  // sessionId:path -> { path, content, truncated }
+    const [duplicateProxyAlarms, setDuplicateProxyAlarms] = useState([]);
+    const [nightlyValidationFailures, setNightlyValidationFailures] = useState([]);
 
     const thinkingTimers   = useRef({});
+    const deliveryTimers   = useRef({});
+    const deliveryStatesRef = useRef({});
+    const configControlStatesRef = useRef({});
+    const configControlTimers = useRef({});
+    const agentConfigsRef = useRef({});
     const wsRef            = useRef(null);
+    const reconnectAttempt = useRef(0);
+    const reconnectTimer   = useRef(null);
+    const heartbeatTimer = useRef(null);
+    const heartbeatTimeoutTimer = useRef(null);
+    const heartbeatPending = useRef(null);
+    const heartbeatSequence = useRef(0);
+    const heartbeatIntervalMs = useRef(10000);
+    const heartbeatTimeoutMs = useRef(30000);
+    const offlineSendQueue = useRef([]);
     const activeSessionRef = useRef(null);
     const handleRelayMessageRef = useRef(null);
     const historyRequestSerial = useRef(0);
@@ -182,9 +246,44 @@ export function useRelay() {
     const latestHistoryChunkRequest = useRef({});
     const historyChunkTimers = useRef({});
     const historyChunkState = useRef({});
-    const modelChangeGrace = useRef({});
     const activeCursorThreadIdentity = useRef({});
     const pendingCursorThreadHistoryReset = useRef({});
+    const startupReady = useRef(false);
+    const startupDeferredMessages = useRef(new Map());
+    const startupDrainHandle = useRef(null);
+
+    function cancelStartupDrain() {
+      const pending = startupDrainHandle.current;
+      startupDrainHandle.current = null;
+      if (!pending) return;
+      if (pending.kind === 'idle' && typeof cancelIdleCallback === 'function') cancelIdleCallback(pending.id);
+      else clearTimeout(pending.id);
+    }
+
+    function scheduleStartupDrain() {
+      if (startupDrainHandle.current || startupDeferredMessages.current.size === 0) return;
+      const drainOne = () => {
+        startupDrainHandle.current = null;
+        const iterator = startupDeferredMessages.current.entries().next();
+        if (iterator.done) return;
+        const [key, deferred] = iterator.value;
+        startupDeferredMessages.current.delete(key);
+        handleRelayMessageRef.current?.(deferred);
+        scheduleStartupDrain();
+      };
+      if (typeof requestIdleCallback === 'function') {
+        startupDrainHandle.current = { kind: 'idle', id: requestIdleCallback(drainOne, { timeout: 250 }) };
+      } else {
+        startupDrainHandle.current = { kind: 'timer', id: setTimeout(drainOne, 32) };
+      }
+    }
+
+    function markStartupReadyAfterPaint() {
+      requestAnimationFrame(() => requestAnimationFrame(() => {
+        startupReady.current = true;
+        scheduleStartupDrain();
+      }));
+    }
 
     const send = useCallback((msg) => {
       if (wsRef.current?.readyState === WebSocket.OPEN) {
@@ -192,13 +291,170 @@ export function useRelay() {
       }
     }, []);
 
+    function clearRelayHeartbeat() {
+      if (heartbeatTimer.current) clearInterval(heartbeatTimer.current);
+      if (heartbeatTimeoutTimer.current) clearTimeout(heartbeatTimeoutTimer.current);
+      heartbeatTimer.current = null;
+      heartbeatTimeoutTimer.current = null;
+      heartbeatPending.current = null;
+    }
+
+    function sendRelayHeartbeat(ws = wsRef.current) {
+      if (!ws || ws.readyState !== WebSocket.OPEN || heartbeatPending.current) return;
+      const requestId = `web-hb-${Date.now()}-${++heartbeatSequence.current}`;
+      const sentAt = Date.now();
+      heartbeatPending.current = { requestId, sentAt };
+      ws.send(JSON.stringify({
+        type: 'heartbeat', protocol_version: 1, request_id: requestId,
+        client_ts: new Date(sentAt).toISOString(),
+      }));
+      heartbeatTimeoutTimer.current = setTimeout(() => {
+        if (heartbeatPending.current?.requestId !== requestId) return;
+        heartbeatPending.current = null;
+        heartbeatTimeoutTimer.current = null;
+        setConnectionHealth({ state: 'stale', rttMs: null, lastAckAt: null });
+        try { ws.close(); } catch {}
+      }, heartbeatTimeoutMs.current);
+    }
+
+    function startRelayHeartbeat(msg, ws = wsRef.current) {
+      clearRelayHeartbeat();
+      heartbeatIntervalMs.current = Math.max(1000, Number(msg?.heartbeat_interval_ms) || 10000);
+      heartbeatTimeoutMs.current = Math.max(
+        heartbeatIntervalMs.current * 2,
+        Number(msg?.heartbeat_timeout_ms) || 30000,
+      );
+      sendRelayHeartbeat(ws);
+      heartbeatTimer.current = setInterval(() => sendRelayHeartbeat(ws), heartbeatIntervalMs.current);
+    }
+
+    function handleHeartbeatAck(msg) {
+      const pending = heartbeatPending.current;
+      if (!pending || pending.requestId !== msg.request_id) return;
+      if (heartbeatTimeoutTimer.current) clearTimeout(heartbeatTimeoutTimer.current);
+      heartbeatTimeoutTimer.current = null;
+      heartbeatPending.current = null;
+      const rttMs = Math.max(0, Date.now() - pending.sentAt);
+      const state = rttMs <= 500 ? 'healthy' : rttMs <= 2000 ? 'slow' : 'poor';
+      setConnectionHealth({ state, rttMs, lastAckAt: Date.now() });
+    }
+
+    function clearDeliveryTimeout(clientMessageId) {
+      const timer = deliveryTimers.current[clientMessageId];
+      if (timer) clearTimeout(timer);
+      delete deliveryTimers.current[clientMessageId];
+    }
+
+    function setTrackedDeliveryState(clientMessageId, state) {
+      if (!clientMessageId) return;
+      deliveryStatesRef.current[clientMessageId] = state;
+      setDeliveryStates(prev => ({ ...prev, [clientMessageId]: state }));
+    }
+
+    function markDeliveryFailed(clientMessageId, reason) {
+      if (!clientMessageId) return;
+      if (deliveryStatesRef.current[clientMessageId] === 'agent_started') return;
+      clearDeliveryTimeout(clientMessageId);
+      setTrackedDeliveryState(clientMessageId, 'failed');
+      setMessages(prev => {
+        const next = { ...prev };
+        Object.keys(next).forEach(sessionId => {
+          next[sessionId] = (next[sessionId] || []).map(message => (
+            message._cid === clientMessageId ? { ...message, _sendError: reason || 'Send failed' } : message
+          ));
+        });
+        return next;
+      });
+    }
+
+    function armDeliveryTimeout(clientMessageId, stage, reason) {
+      clearDeliveryTimeout(clientMessageId);
+      const timeoutMs = DELIVERY_STAGE_TIMEOUT_MS[stage];
+      if (!timeoutMs) return;
+      deliveryTimers.current[clientMessageId] = setTimeout(() => {
+        delete deliveryTimers.current[clientMessageId];
+        if (deliveryStatesRef.current[clientMessageId] !== stage) return;
+        markDeliveryFailed(clientMessageId, reason);
+      }, timeoutMs);
+    }
+
+    useEffect(() => { agentConfigsRef.current = agentConfigs; }, [agentConfigs]);
+
+    function configControlKey(sessionId, field) {
+      return `${sessionId}:${field}`;
+    }
+
+    function setConfigControlState(key, value) {
+      configControlStatesRef.current = { ...configControlStatesRef.current, [key]: value };
+      setConfigControlStates(configControlStatesRef.current);
+    }
+
+    function clearConfigControlTimer(key) {
+      const timer = configControlTimers.current[key];
+      if (timer) clearTimeout(timer);
+      delete configControlTimers.current[key];
+    }
+
+    function rollbackConfigControl(key, error) {
+      const transaction = configControlStatesRef.current[key];
+      if (!transaction || !['pending', 'awaiting_config'].includes(transaction.status)) return;
+      clearConfigControlTimer(key);
+      const current = agentConfigsRef.current[transaction.sessionId] || {};
+      const restored = { ...current, [transaction.configKey]: transaction.previousValue };
+      agentConfigsRef.current = { ...agentConfigsRef.current, [transaction.sessionId]: restored };
+      setAgentConfigs(prev => ({
+        ...prev,
+        [transaction.sessionId]: { ...(prev[transaction.sessionId] || {}), [transaction.configKey]: transaction.previousValue },
+      }));
+      setConfigControlState(key, { ...transaction, status: 'failed', error: error || 'Control change failed and was rolled back.', completedAt: Date.now() });
+    }
+
+    function submitConfigControl(sessionId, field, configKey, requestedValue, payload, requestId) {
+      const key = configControlKey(sessionId, field);
+      clearConfigControlTimer(key);
+      const current = agentConfigsRef.current[sessionId] || {};
+      const transaction = {
+        sessionId, field, configKey, requestId,
+        previousValue: current[configKey], requestedValue,
+        status: 'pending', error: null, startedAt: Date.now(),
+      };
+      const optimistic = { ...current, [configKey]: requestedValue };
+      agentConfigsRef.current = { ...agentConfigsRef.current, [sessionId]: optimistic };
+      setAgentConfigs(prev => ({ ...prev, [sessionId]: { ...(prev[sessionId] || {}), [configKey]: requestedValue } }));
+      setConfigControlState(key, transaction);
+      configControlTimers.current[key] = setTimeout(
+        () => rollbackConfigControl(key, 'Timed out waiting for the agent to confirm this setting.'),
+        CONFIG_CONTROL_TIMEOUT_MS,
+      );
+      send({ ...payload, session_id: sessionId, request_id: requestId });
+      return requestId;
+    }
+
+    function reconcileConfigControls(sessionId, configMessage) {
+      Object.entries(configControlStatesRef.current).forEach(([key, transaction]) => {
+        if (transaction.sessionId !== sessionId || !['pending', 'awaiting_config'].includes(transaction.status)) return;
+        if (!Object.prototype.hasOwnProperty.call(configMessage, transaction.configKey)) return;
+        if (configMessage[transaction.configKey] !== transaction.requestedValue) return;
+        clearConfigControlTimer(key);
+        setConfigControlState(key, { ...transaction, status: 'ok', error: null, completedAt: Date.now() });
+      });
+    }
+
     const connect = useCallback(() => {
+      cancelStartupDrain();
+      startupReady.current = false;
+      startupDeferredMessages.current.clear();
       const proto = location.protocol === 'https:' ? 'wss' : 'ws';
       const ws    = new WebSocket(`${proto}://${location.host}/client-ws`);
       wsRef.current = ws;
 
-      ws.onopen  = () => setConnected(true);
+      ws.onopen  = () => {
+        reconnectAttempt.current = 0;
+        setConnected(true);
+        setConnectionHealth({ state: 'connecting', rttMs: null, lastAckAt: null });
+      };
       ws.onclose = () => {
+        clearRelayHeartbeat();
         Object.values(historyChunkTimers.current).forEach(timer => clearTimeout(timer));
         historyChunkTimers.current = {};
         Object.keys(historyChunkState.current).forEach(id => {
@@ -209,7 +465,14 @@ export function useRelay() {
         });
         setHistoryLoading({});
         setConnected(false);
-        setTimeout(connect, 3000);
+        setConnectionHealth({ state: 'offline', rttMs: null, lastAckAt: null });
+        if (wsRef.current !== ws) return;
+        const attempt = reconnectAttempt.current++;
+        const delay = RELAY_RECONNECT_DELAYS_MS[Math.min(attempt, RELAY_RECONNECT_DELAYS_MS.length - 1)];
+        reconnectTimer.current = setTimeout(() => {
+          reconnectTimer.current = null;
+          connect();
+        }, delay);
       };
 
       ws.onmessage = (e) => {
@@ -219,13 +482,51 @@ export function useRelay() {
       };
     }, [send]); // eslint-disable-line react-hooks/exhaustive-deps
 
-    useEffect(() => { connect(); }, [connect]);
+    useEffect(() => {
+      connect();
+      return () => {
+        if (reconnectTimer.current) clearTimeout(reconnectTimer.current);
+        clearRelayHeartbeat();
+        Object.values(deliveryTimers.current).forEach(timer => clearTimeout(timer));
+        deliveryTimers.current = {};
+        Object.values(configControlTimers.current).forEach(timer => clearTimeout(timer));
+        configControlTimers.current = {};
+        cancelStartupDrain();
+        const current = wsRef.current;
+        wsRef.current = null;
+        try { current?.close(); } catch {}
+      };
+    }, [connect]);
 
     function mergeSessionMetadataActivity(sessionList) {
       const normalized = sessionMetadataActivityMaps(sessionList);
       setActivities(prev => shallowMapMerge(prev, normalized.activities));
       setThinkingContent(prev => shallowMapMerge(prev, normalized.thinkingContent));
       setThinking(prev => shallowMapMerge(prev, normalized.thinking));
+    }
+
+    function clearRemovedSessionActivity(sessionList) {
+      const liveIds = new Set((sessionList || []).map(session => (
+        session && typeof session === 'object' ? session.session_id : session
+      )).filter(Boolean));
+      const retainLive = previous => {
+        let changed = false;
+        const next = { ...previous };
+        Object.keys(next).forEach(id => {
+          if (liveIds.has(id)) return;
+          delete next[id];
+          changed = true;
+        });
+        return changed ? next : previous;
+      };
+      Object.keys(thinkingTimers.current).forEach(id => {
+        if (liveIds.has(id)) return;
+        clearTimeout(thinkingTimers.current[id]);
+        delete thinkingTimers.current[id];
+      });
+      setActivities(retainLive);
+      setThinkingContent(retainLive);
+      setThinking(retainLive);
     }
 
     function mergeSessionConfigHints(sessionList) {
@@ -275,14 +576,21 @@ export function useRelay() {
       if (wsRef.current?.readyState !== WebSocket.OPEN) return;
       const requestId = `hist-${Date.now()}-${++historyRequestSerial.current}`;
       latestHistoryRequest.current[id] = requestId;
-      const mode = options.full ? 'full' : 'tail';
+      const afterSequence = Math.max(0, Math.floor(Number(options.afterSequence ?? options.after_sequence) || 0));
+      const mode = afterSequence > 0 ? 'delta' : (options.full ? 'full' : 'tail');
       setHistoryLoading(prev => ({
         ...prev,
         [id]: { mode, requestedAt: Date.now(), requestId },
       }));
-      const payload = { type: 'get_history', session: id, request_id: requestId };
+      const payload = {
+        type: afterSequence > 0 ? 'history_request' : 'get_history',
+        session: id,
+        session_id: id,
+        request_id: requestId,
+      };
+      if (afterSequence > 0) payload.after_sequence = afterSequence;
       const limit = Number(options.limit || options.tailLimit || 0);
-      if (Number.isFinite(limit) && limit > 0 && !options.full) {
+      if (afterSequence <= 0 && Number.isFinite(limit) && limit > 0 && !options.full) {
         payload.limit = Math.floor(limit);
         payload.tail = true;
       }
@@ -492,53 +800,38 @@ export function useRelay() {
 
     function setAgentModel(sessionId, modelId) {
       const requestId = `model-${Date.now()}-${Math.random().toString(36).slice(2, 7)}`;
-      send({ type: 'agent_set_model', session_id: sessionId, model_id: modelId, request_id: requestId });
-      // Suppress config overwrites for 10s while the model change propagates
-      modelChangeGrace.current[sessionId] = Date.now() + 10000;
-      // Optimistically update the config
-      setAgentConfigs(prev => {
-        const existing = prev[sessionId] || {};
-        return { ...prev, [sessionId]: { ...existing, model_id: modelId } };
-      });
-      return requestId;
+      return submitConfigControl(sessionId, 'model', 'model_id', modelId, { type: 'agent_set_model', model_id: modelId }, requestId);
     }
 
     function setAgentEffort(sessionId, effort) {
       const requestId = `effort-${Date.now()}-${Math.random().toString(36).slice(2, 7)}`;
-      send({ type: 'agent_set_effort', session_id: sessionId, effort, request_id: requestId });
-      setAgentConfigs(prev => {
-        const existing = prev[sessionId] || {};
-        return { ...prev, [sessionId]: { ...existing, effort } };
-      });
-      return requestId;
+      return submitConfigControl(sessionId, 'effort', 'effort', effort, { type: 'agent_set_effort', effort }, requestId);
     }
 
     function setAgentPermissionMode(sessionId, mode) {
       const requestId = `perm-${Date.now()}-${Math.random().toString(36).slice(2, 7)}`;
-      send({ type: 'agent_set_permission_mode', session_id: sessionId, mode, request_id: requestId });
-      return requestId;
+      return submitConfigControl(sessionId, 'permission_mode', 'permission_mode', mode, { type: 'agent_set_permission_mode', mode }, requestId);
     }
 
     function setAutoApprovePermissions(sessionId, enabled) {
       const requestId = `autoperm-${Date.now()}-${Math.random().toString(36).slice(2, 7)}`;
-      setAgentConfigs(prev => {
-        const existing = prev[sessionId] || {};
-        return { ...prev, [sessionId]: { ...existing, auto_approve_permissions: !!enabled } };
-      });
-      send({ type: 'agent_set_auto_approve_permissions', session_id: sessionId, enabled: !!enabled, request_id: requestId });
-      return requestId;
+      return submitConfigControl(sessionId, 'auto_approve_permissions', 'auto_approve_permissions', !!enabled, { type: 'agent_set_auto_approve_permissions', enabled: !!enabled }, requestId);
     }
 
     function setAntigravityMode(sessionId, mode) {
       const requestId = `mode-${Date.now()}-${Math.random().toString(36).slice(2, 7)}`;
-      send({ type: 'agent_set_mode', session_id: sessionId, mode, request_id: requestId });
-      return requestId;
+      const configKey = Object.prototype.hasOwnProperty.call(agentConfigsRef.current[sessionId] || {}, 'conversation_mode') ? 'conversation_mode' : 'mode';
+      return submitConfigControl(sessionId, 'mode', configKey, mode, { type: 'agent_set_mode', mode }, requestId);
     }
 
     function setCodexConfig(sessionId, { model_id, effort, speed, access_mode, workspace_mode }) {
       const requestId = `codex-cfg-${Date.now()}-${Math.random().toString(36).slice(2, 7)}`;
-      send({ type: 'set_codex_config', session_id: sessionId, model_id, effort, speed, access_mode, workspace_mode, request_id: requestId });
-      return requestId;
+      const options = [
+        ['model', 'model_id', model_id], ['effort', 'effort', effort], ['speed', 'speed', speed],
+        ['access_mode', 'permission_mode', access_mode], ['workspace_mode', 'workspace_mode', workspace_mode],
+      ];
+      const [field, configKey, requestedValue] = options.find(([, , value]) => value != null) || ['codex_config', 'model_id', model_id];
+      return submitConfigControl(sessionId, field, configKey, requestedValue, { type: 'set_codex_config', model_id, effort, speed, access_mode, workspace_mode }, requestId);
     }
 
     function newThread(sessionId) {
@@ -653,8 +946,7 @@ export function useRelay() {
 
     function switchWorkspace(sessionId, folderPath) {
       const requestId = `swws-${Date.now()}-${Math.random().toString(36).slice(2, 7)}`;
-      send({ type: 'switch_workspace', session_id: sessionId, folder_path: folderPath, request_id: requestId });
-      return requestId;
+      return submitConfigControl(sessionId, 'workspace', 'file_access_scope', folderPath, { type: 'switch_workspace', folder_path: folderPath }, requestId);
     }
 
     function requestBranchList(sessionId) {
@@ -721,15 +1013,50 @@ export function useRelay() {
     }
 
     // Sends a user message with delivery tracking. Returns the clientMsgId.
-    function sendToSession(session, content) {
-      const cid = `cmsg-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
-      setDeliveryStates(prev => ({ ...prev, [cid]: 'queued' }));
-      setMessages(prev => ({
-        ...prev,
-        [session]: [...(prev[session] || []), { role: 'user', content, _cid: cid, _optimistic: true }],
-      }));
-      send({ type: 'send', session, content, client_message_id: cid });
+    function sendToSession(session, content, retryClientMessageId = '') {
+      const cid = retryClientMessageId || `cmsg-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+      setMessages(prev => {
+        const existing = prev[session] || [];
+        const hasRetryTarget = retryClientMessageId && existing.some(message => message._cid === cid);
+        return {
+          ...prev,
+          [session]: hasRetryTarget
+            ? existing.map(message => message._cid === cid
+              ? { ...message, content, _optimistic: true, _delivered: false, _agentStarted: false, _sendError: null }
+              : message)
+            : [...existing, { role: 'user', content, _cid: cid, _optimistic: true }],
+        };
+      });
+      if (wsRef.current?.readyState === WebSocket.OPEN) {
+        setTrackedDeliveryState(cid, 'queued');
+        armDeliveryTimeout(cid, 'queued', 'Timed out waiting for relay acceptance.');
+        send({ type: 'send', session, content, client_message_id: cid });
+      } else if (offlineSendQueue.current.length < 20) {
+        offlineSendQueue.current = [
+          ...offlineSendQueue.current.filter(item => item.cid !== cid),
+          { session, content, cid },
+        ];
+        clearDeliveryTimeout(cid);
+        setTrackedDeliveryState(cid, 'offline_queued');
+      } else {
+        setTrackedDeliveryState(cid, 'queued');
+        markDeliveryFailed(cid, 'Offline send queue is full. Reconnect or retry after another message sends.');
+      }
       return cid;
+    }
+
+    function flushOfflineSendQueue() {
+      const ws = wsRef.current;
+      if (!ws || ws.readyState !== WebSocket.OPEN || offlineSendQueue.current.length === 0) return;
+      const queued = offlineSendQueue.current;
+      offlineSendQueue.current = [];
+      queued.forEach(item => {
+        setTrackedDeliveryState(item.cid, 'queued');
+        armDeliveryTimeout(item.cid, 'queued', 'Timed out waiting for relay acceptance after reconnect.');
+        ws.send(JSON.stringify({
+          type: 'send', session: item.session, content: item.content, client_message_id: item.cid,
+        }));
+      });
     }
 
     function steerMessage(sessionId, clientMessageId, content, nativeIndex) {
@@ -743,6 +1070,8 @@ export function useRelay() {
     }
 
     function discardQueuedMessage(sessionId, clientMessageId) {
+      clearDeliveryTimeout(clientMessageId);
+      delete deliveryStatesRef.current[clientMessageId];
       send({ type: 'discard_queued', session_id: sessionId, client_message_id: clientMessageId });
       setQueuedMessages(prev => ({ ...prev, [sessionId]: (prev[sessionId] || []).filter(m => m.cid !== clientMessageId) }));
       setDeliveryStates(prev => { const next = { ...prev }; delete next[clientMessageId]; return next; });
@@ -771,8 +1100,20 @@ export function useRelay() {
     function handleRelayMessage(msg) {
       const t = msg.type;
 
+      if (t === 'heartbeat_ack') {
+        handleHeartbeatAck(msg);
+        return;
+      }
+      if (!startupReady.current && !msg.request_id && STARTUP_DEFERRED_RELAY_TYPES.has(t)) {
+        const id = msg.session || msg.session_id || 'global';
+        const source = t === 'history_chunk' ? (msg.source || 'native') : '';
+        startupDeferredMessages.current.set(`${t}:${id}:${source}`, msg);
+        return;
+      }
+
       // ── Session list (legacy) ───────────────────────────────────────────────
       if (t === 'session_list') {
+        clearRemovedSessionActivity(msg.sessions || []);
         setSessions(prev => sameSessionList(prev, msg.sessions || []) ? prev : (msg.sessions || []));
         mergeSessionMetadataActivity(msg.sessions || []);
         mergeSessionConfigHints(msg.sessions || []);
@@ -794,6 +1135,7 @@ export function useRelay() {
 
       // ── Session snapshot (v1) ───────────────────────────────────────────────
       if (t === 'session_snapshot' || t === 'proxy_session_snapshot') {
+        clearRemovedSessionActivity(msg.sessions || []);
         setSessions(prev => sameSessionList(prev, msg.sessions || []) ? prev : (msg.sessions || []));
         mergeSessionMetadataActivity(msg.sessions || []);
         mergeSessionConfigHints(msg.sessions || []);
@@ -815,6 +1157,10 @@ export function useRelay() {
 
       // ── connection_ack may include initial session list + health snapshot ────
       if (t === 'connection_ack') {
+        startRelayHeartbeat(msg);
+        flushOfflineSendQueue();
+        setDuplicateProxyAlarms(Array.isArray(msg.duplicate_proxy_alarms) ? msg.duplicate_proxy_alarms : []);
+        setNightlyValidationFailures(Array.isArray(msg.nightly_validation_failures) ? msg.nightly_validation_failures : []);
         if (msg.sessions && msg.sessions.length > 0) {
           setSessions(prev => sameSessionList(prev, msg.sessions) ? prev : msg.sessions);
           mergeSessionMetadataActivity(msg.sessions);
@@ -861,6 +1207,7 @@ export function useRelay() {
           });
           setErrorPrompts(restored);
         }
+        markStartupReadyAfterPaint();
         return;
       }
 
@@ -904,7 +1251,9 @@ export function useRelay() {
           const mergedRaw = shouldMergeTailSnapshot
             ? mergeHistoryTailSnapshot(prev[id], nextMessages)
             : nextMessages;
-          const merged = removeSupersededCliTranscriptPlaceholders(mergedRaw);
+          const merged = removeSupersededCliTranscriptPlaceholders(
+            preserveOptimisticMessagesAcrossHistory(mergedRaw, prev[id]),
+          );
           if (merged === prev[id]) return prev;
           return { ...prev, [id]: merged };
         });
@@ -987,7 +1336,10 @@ export function useRelay() {
         const estimatedLength = estimatedMessages.length;
         setMessages(prev => {
           const merged = removeSupersededCliTranscriptPlaceholders(
-            replaceTail ? incoming : mergeHistoryChunk(prev[id], incoming, mode)
+            preserveOptimisticMessagesAcrossHistory(
+              replaceTail ? incoming : mergeHistoryChunk(prev[id], incoming, mode),
+              prev[id],
+            )
           );
           if (merged === prev[id]) return prev;
           return { ...prev, [id]: merged };
@@ -1029,11 +1381,41 @@ export function useRelay() {
 
       if (t === 'history_delta') {
         const id      = msg.session || msg.session_id;
-        const newMsgs = msg.messages || msg.events || [];
-        if (id) setMessages(prev => ({
-          ...prev,
-          [id]: removeSupersededCliTranscriptPlaceholders([...(prev[id] || []), ...newMsgs]),
-        }));
+        if (!id) return;
+        if (
+          msg.request_id
+          && latestHistoryRequest.current[id]
+          && latestHistoryRequest.current[id] !== msg.request_id
+        ) return;
+        const rawDelta = Array.isArray(msg.messages) ? msg.messages : (Array.isArray(msg.events) ? msg.events : []);
+        const newMsgs = rawDelta.map(event => event?.message || event).filter(Boolean);
+        const estimated = mergeHistoryChunk(messages[id], newMsgs, 'tail');
+        setMessages(prev => {
+          const merged = removeSupersededCliTranscriptPlaceholders(mergeHistoryChunk(prev[id], newMsgs, 'tail'));
+          if (merged === prev[id]) return prev;
+          return { ...prev, [id]: merged };
+        });
+        setHistoryMeta(prev => {
+          const prior = prev[id] || {};
+          const loaded = Math.max(Number(prior.loaded || 0), estimated.length);
+          const total = Math.max(Number(msg.total_messages || 0), Number(prior.total || 0), loaded);
+          return {
+            ...prev,
+            [id]: {
+              ...prior,
+              loaded,
+              total,
+              last_sequence: Number(msg.last_sequence || prior.last_sequence || 0),
+              mode: prior.mode || 'chunked',
+            },
+          };
+        });
+        setHistoryLoading(prev => {
+          if (prev[id]?.requestId !== msg.request_id) return prev;
+          const next = { ...prev };
+          delete next[id];
+          return next;
+        });
         return;
       }
 
@@ -1067,6 +1449,14 @@ export function useRelay() {
           if (nextThinkingContent != null) {
             setThinkingContent(prev => Object.is(prev[id], nextThinkingContent) ? prev : ({ ...prev, [id]: nextThinkingContent }));
           }
+        } else if (activityKind === 'idle') {
+          clearTimeout(thinkingTimers.current[id]);
+          setThinking(prev => prev[id] === false ? prev : ({ ...prev, [id]: false }));
+          setActivities(prev => {
+            const nextActivity = msg.activity?.goal || msg.activity?.task_list ? activity : false;
+            return Object.is(prev[id], nextActivity) ? prev : ({ ...prev, [id]: nextActivity });
+          });
+          setThinkingContent(prev => prev[id] === '' ? prev : ({ ...prev, [id]: '' }));
         } else if (msg.activity?.goal || msg.activity?.task_list) {
           clearTimeout(thinkingTimers.current[id]);
           setThinking(prev => prev[id] === false ? prev : ({ ...prev, [id]: false }));
@@ -1139,6 +1529,16 @@ export function useRelay() {
         return;
       }
 
+      if (t === 'duplicate_proxy_alarm') {
+        setDuplicateProxyAlarms(Array.isArray(msg.duplicate_sessions) ? msg.duplicate_sessions : []);
+        return;
+      }
+
+      if (t === 'nightly_validation_status') {
+        setNightlyValidationFailures(Array.isArray(msg.failures) ? msg.failures : []);
+        return;
+      }
+
       // ── Skill list (Codex Desktop) ────────────────────────────────────────
       if (t === 'skill_list') {
         const sid = msg.session_id || msg.session;
@@ -1184,22 +1584,7 @@ export function useRelay() {
       if (t === 'agent_config') {
         const sid = msg.session_id || msg.session;
         if (!sid) return;
-        // Don't overwrite optimistic model change during grace period
-        if (modelChangeGrace.current[sid] && Date.now() < modelChangeGrace.current[sid]) {
-          // Merge but keep the optimistic model_id
-          setAgentConfigs(prev => {
-            const existing = prev[sid] || {};
-            const next = { ...existing, ...msg, model_id: existing.model_id || msg.model_id };
-            if ((!Array.isArray(msg.available_models) || msg.available_models.length === 0)
-                && Array.isArray(existing.available_models)
-                && existing.available_models.length > 0) {
-              next.available_models = existing.available_models;
-            }
-            return { ...prev, [sid]: next };
-          });
-          return;
-        }
-        delete modelChangeGrace.current[sid];
+        reconcileConfigControls(sid, msg);
         setAgentConfigs(prev => {
           const existing = prev[sid] || {};
           const next = { ...existing, ...msg };
@@ -1208,6 +1593,11 @@ export function useRelay() {
               && existing.available_models.length > 0) {
             next.available_models = existing.available_models;
           }
+          Object.values(configControlStatesRef.current).forEach(transaction => {
+            if (transaction.sessionId !== sid || !['pending', 'awaiting_config'].includes(transaction.status)) return;
+            next[transaction.configKey] = transaction.requestedValue;
+          });
+          agentConfigsRef.current = { ...agentConfigsRef.current, [sid]: next };
           return { ...prev, [sid]: next };
         });
         return;
@@ -1217,6 +1607,17 @@ export function useRelay() {
         const sid = msg.session_id || msg.session;
         if (msg.request_id) {
           setControlResults(prev => ({ ...prev, [msg.request_id]: { ...msg, received_at: Date.now() } }));
+          const pendingEntry = Object.entries(configControlStatesRef.current)
+            .find(([, transaction]) => transaction.requestId === msg.request_id);
+          if (pendingEntry) {
+            const [key, transaction] = pendingEntry;
+            if (msg.result === 'failed') {
+              rollbackConfigControl(key, msg.error?.message || msg.error || 'The agent rejected this setting.');
+            } else if (msg.result === 'ok') {
+              setConfigControlState(key, { ...transaction, status: 'awaiting_config' });
+              if (sid) requestAgentConfig(sid);
+            }
+          }
         }
         if (sid && msg.result === 'ok' && msg.command === 'new_thread') {
           // The proxy emits an authoritative history snapshot as part of a
@@ -1248,11 +1649,11 @@ export function useRelay() {
       if (t === 'message_accepted') {
         const cid = msg.client_message_id;
         // Don't overwrite busy_queued or steered — those are higher-priority states
-        if (cid) setDeliveryStates(prev => {
-          const cur = prev[cid];
-          if (cur === 'busy_queued' || cur === 'steered') return prev;
-          return { ...prev, [cid]: 'accepted' };
-        });
+        const current = cid ? deliveryStatesRef.current[cid] : null;
+        if (cid && !['busy_queued', 'steered', 'delivered', 'agent_started'].includes(current)) {
+          setTrackedDeliveryState(cid, 'accepted');
+          armDeliveryTimeout(cid, 'accepted', 'Relay accepted the message, but native delivery timed out.');
+        }
         if (cid) {
           setMessages(prev => {
             const next = { ...prev };
@@ -1267,20 +1668,51 @@ export function useRelay() {
         return;
       }
 
-      if (t === 'message_failed') {
+      if (t === 'message_delivered' || (t === 'proxy_send_result' && msg.result === 'delivered')) {
         const cid = msg.client_message_id;
-        if (cid) setDeliveryStates(prev => ({ ...prev, [cid]: 'failed' }));
+        if (cid && deliveryStatesRef.current[cid] !== 'agent_started') {
+          setTrackedDeliveryState(cid, 'delivered');
+          armDeliveryTimeout(cid, 'delivered', 'Message reached the agent, but agent activity did not start in time.');
+        }
         if (cid) {
-          const failureReason = msg.reason || msg.message || msg.error?.message || 'Send failed';
           setMessages(prev => {
             const next = { ...prev };
             Object.keys(next).forEach(sessionId => {
               next[sessionId] = (next[sessionId] || []).map(m => (
-                m._cid === cid ? { ...m, _sendError: failureReason } : m
+                m._cid === cid ? { ...m, _delivered: true, _sendError: null } : m
               ));
             });
             return next;
           });
+        }
+        return;
+      }
+
+      if (t === 'agent_started') {
+        const cid = msg.client_message_id;
+        if (cid) {
+          clearDeliveryTimeout(cid);
+          setTrackedDeliveryState(cid, 'agent_started');
+        }
+        if (cid) {
+          setMessages(prev => {
+            const next = { ...prev };
+            Object.keys(next).forEach(sessionId => {
+              next[sessionId] = (next[sessionId] || []).map(m => (
+                m._cid === cid ? { ...m, _delivered: true, _agentStarted: true, _sendError: null } : m
+              ));
+            });
+            return next;
+          });
+        }
+        return;
+      }
+
+      if (t === 'message_failed' || (t === 'proxy_send_result' && msg.result === 'failed')) {
+        const cid = msg.client_message_id;
+        if (cid) {
+          const failureReason = msg.reason || msg.message || msg.error?.message || 'Send failed';
+          markDeliveryFailed(cid, failureReason);
         }
         return;
       }
@@ -1290,7 +1722,8 @@ export function useRelay() {
         const cid = msg.client_message_id;
         const sid = msg.session_id || msg.session;
         if (cid) {
-          setDeliveryStates(prev => ({ ...prev, [cid]: 'busy_queued' }));
+          clearDeliveryTimeout(cid);
+          setTrackedDeliveryState(cid, 'busy_queued');
           if (sid) {
             setQueuedMessages(prev => ({
               ...prev,
@@ -1304,7 +1737,8 @@ export function useRelay() {
         const cid = msg.client_message_id;
         const sid = msg.session_id || msg.session;
         if (cid) {
-          setDeliveryStates(prev => ({ ...prev, [cid]: 'accepted' }));
+          setTrackedDeliveryState(cid, 'accepted');
+          armDeliveryTimeout(cid, 'accepted', 'Queued message left the relay, but native delivery timed out.');
           if (sid) setQueuedMessages(prev => ({ ...prev, [sid]: (prev[sid] || []).filter(m => m.cid !== cid) }));
         }
         return;
@@ -1313,7 +1747,12 @@ export function useRelay() {
         const cid = msg.client_message_id;
         const sid = msg.session_id || msg.session;
         if (cid) {
-          setDeliveryStates(prev => ({ ...prev, [cid]: msg.result === 'ok' ? 'steered' : 'failed' }));
+          if (msg.result === 'ok') {
+            setTrackedDeliveryState(cid, 'steered');
+            armDeliveryTimeout(cid, 'steered', 'Message was steered, but agent activity did not start in time.');
+          } else {
+            markDeliveryFailed(cid, msg.error?.message || msg.error || 'The desktop proxy rejected the message.');
+          }
           if (sid) setQueuedMessages(prev => ({ ...prev, [sid]: (prev[sid] || []).filter(m => m.cid !== cid) }));
         }
         return;
@@ -1465,7 +1904,7 @@ export function useRelay() {
     // where `sessions` / `messages` would be frozen at initial render values).
     handleRelayMessageRef.current = handleRelayMessage;
 
-    return { sessions, messages, historyMeta, historyLoading, connected, unread, setUnread, thinking, thinkingContent, activities, health, deliveryStates, launchStates, justLaunched, setJustLaunched, permissionPrompts, respondToPrompt, errorPrompts, respondToErrorPrompt, interruptSession, agentConfigs, requestAgentConfig, setAgentModel, setAgentEffort, setAgentPermissionMode, setAutoApprovePermissions, setAntigravityMode, setCodexConfig, newThread, openPanel, openNativeWindow, requestChatList, switchChat, newChat, chatLists, requestThreadList, switchThread, threadLists, switchWorkspace, requestTerminalOutput, sendTerminalInput, terminalOutputs, requestFileChanges, respondToFileChange, fileChanges, sendAttachment, send, sendToSession, steerMessage, discardQueuedMessage, editQueuedMessage, queuedMessages, launchSession, resumeSession, closeSession, activeSessionRef, workspaces, branchLists, requestBranchList, switchBranch, createBranch, skillLists, requestSkillList, automationViews, showCodexAutomation, controlResults, directoryListings, requestDirectoryListing, fileContents, requestFileContent, requestHistory, requestHistoryChunk };
+    return { sessions, messages, historyMeta, historyLoading, connected, connectionHealth, unread, setUnread, thinking, thinkingContent, activities, health, deliveryStates, launchStates, justLaunched, setJustLaunched, permissionPrompts, respondToPrompt, errorPrompts, respondToErrorPrompt, interruptSession, agentConfigs, configControlStates, requestAgentConfig, setAgentModel, setAgentEffort, setAgentPermissionMode, setAutoApprovePermissions, setAntigravityMode, setCodexConfig, newThread, openPanel, openNativeWindow, requestChatList, switchChat, newChat, chatLists, requestThreadList, switchThread, threadLists, switchWorkspace, requestTerminalOutput, sendTerminalInput, terminalOutputs, requestFileChanges, respondToFileChange, fileChanges, sendAttachment, send, sendToSession, steerMessage, discardQueuedMessage, editQueuedMessage, queuedMessages, launchSession, resumeSession, closeSession, activeSessionRef, workspaces, branchLists, requestBranchList, switchBranch, createBranch, skillLists, requestSkillList, automationViews, showCodexAutomation, controlResults, directoryListings, requestDirectoryListing, fileContents, requestFileContent, requestHistory, requestHistoryChunk, duplicateProxyAlarms, nightlyValidationFailures };
   }
 
 // (removed window.useRelay — now an ES module export)

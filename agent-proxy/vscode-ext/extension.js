@@ -152,7 +152,7 @@ function _resignLeader() {
 
 function getConfig() {
   const cfg = vscode.workspace.getConfiguration('remoteAgentProxy');
-  const cdpPortsRaw = cfg.get('cdpPorts', '9223,9226,9225');
+  const cdpPortsRaw = cfg.get('cdpPorts', '9223,9228,9225,9226,9227');
   const cdpPorts = cdpPortsRaw
     .split(',')
     .map(s => parseInt(s.trim(), 10))

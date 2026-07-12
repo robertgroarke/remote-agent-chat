@@ -4,6 +4,7 @@ const fs = require('fs');
 const os = require('os');
 const path = require('path');
 const { spawn, spawnSync } = require('child_process');
+const { normalizeNativeLaunchMode, backgroundNativeLaunchResult } = require('./native-launch-mode');
 
 let chokidar = null;
 try { chokidar = require('chokidar'); } catch {}
@@ -261,8 +262,10 @@ function extractTextFromMessage(message) {
   return '';
 }
 
-function buildToolCallBlock(completedEvent, startedEvent) {
-  const toolCall = completedEvent?.tool_call || startedEvent?.tool_call || {};
+function buildToolCallBlocks(completedEvent, startedEvent) {
+  const completedToolCall = completedEvent?.tool_call || {};
+  const startedToolCall = startedEvent?.tool_call || {};
+  const toolCall = Object.keys(completedToolCall).length > 0 ? completedToolCall : startedToolCall;
   const callId = String(completedEvent?.call_id || startedEvent?.call_id || '')
     .replace(/\s+/g, ' ')
     .trim();
@@ -296,7 +299,7 @@ function buildToolCallBlock(completedEvent, startedEvent) {
         ? (resultPayload.exitCode ?? resultPayload.exit_code)
         : (shell.exit_code ?? shell.exitCode ?? null));
 
-    return {
+    return [{
       type: 'terminal',
       title: shell.description || (argsRaw && argsRaw.description) || (command ? 'Command' : 'Shell'),
       command,
@@ -306,25 +309,42 @@ function buildToolCallBlock(completedEvent, startedEvent) {
       status: failure ? 'failed' : 'completed',
       collapsed: false,
       call_id: callId || undefined,
-    };
+    }];
   }
 
-  const toolType = Object.keys(toolCall).find(k => k !== 'call_id') || '';
-  const toolData = toolType ? (toolCall[toolType] || {}) : toolCall;
+  const toolType = Object.keys(completedToolCall).find(k => k !== 'call_id')
+    || Object.keys(startedToolCall).find(k => k !== 'call_id')
+    || '';
+  const startedData = toolType ? (startedToolCall[toolType] || {}) : startedToolCall;
+  const completedData = toolType ? (completedToolCall[toolType] || {}) : completedToolCall;
+  const toolData = { ...startedData, ...completedData };
   const description = toolData.description || toolType || 'Tool';
   const argsSection = toolData.args != null ? `arguments:\n${compactJson(toolData.args)}` : null;
-  const resultSection = toolData.result != null ? `result:\n${compactJson(toolData.result)}` : null;
-  const content = [argsSection, resultSection].filter(Boolean).join('\n\n');
-
-  return {
+  const callBlock = {
     type: 'tool_call',
     title: description,
-    content: content || compactJson(toolData),
+    content: argsSection || '(no arguments)',
     status: 'completed',
     collapsed: false,
     tool_name: toolType || undefined,
     call_id: callId || undefined,
   };
+  if (toolData.result == null) return [callBlock];
+
+  const failed = Boolean(
+    toolData.result
+    && typeof toolData.result === 'object'
+    && (toolData.result.failure != null || toolData.result.error != null || toolData.result.success === false)
+  );
+  return [callBlock, {
+    type: 'tool_result',
+    title: `Tool result: ${description}`,
+    content: compactJson(toolData.result),
+    status: failed ? 'failed' : 'completed',
+    collapsed: false,
+    tool_name: toolType || undefined,
+    call_id: callId || undefined,
+  }];
 }
 
 function createParseState(filePath) {
@@ -452,14 +472,16 @@ function applyEventToState(state, event) {
       const callId = String(event.call_id || '');
       const started = callId ? state.pendingToolCalls.get(callId) : null;
       if (callId) state.pendingToolCalls.delete(callId);
-      const block = buildToolCallBlock(event, started);
+      const blocks = buildToolCallBlocks(event, started);
       const ts = tsMs ? Math.floor(tsMs / 1000) : undefined;
-      pushDedup(state.messages, {
-        role: 'assistant',
-        content: `[${block.title || 'Tool'}]`,
-        content_blocks: [block],
-        ts,
-      });
+      for (const block of blocks) {
+        pushDedup(state.messages, {
+          role: 'assistant',
+          content: `[${block.title || 'Tool'}]`,
+          content_blocks: [block],
+          ts,
+        });
+      }
     }
     return;
   }
@@ -1001,7 +1023,10 @@ function buildNativeCursorWindowPowerShell({ cwd, launcherPath } = {}) {
   ].join(' ');
 }
 
-function startNativeCursorWindow({ workspacePath, cliSessionId, resume = false, model, permissionMode, sandbox, title } = {}) {
+function startNativeCursorWindow({ workspacePath, cliSessionId, resume = false, model, permissionMode, sandbox, title, launchMode = 'foreground' } = {}) {
+  if (normalizeNativeLaunchMode(launchMode) === 'background') {
+    return backgroundNativeLaunchResult('cursor_cli');
+  }
   const cwd = workspacePath || process.cwd();
   const resolved = resolveCursorCommand();
   const baseBin = resolved ? [resolved.command, ...resolved.argsPrefix] : ['agent'];
@@ -1050,8 +1075,8 @@ function startNativeCursorWindow({ workspacePath, cliSessionId, resume = false, 
   return { pid: Number(String(result.stdout || '').trim()) || null };
 }
 
-function watchSessions(onSummary, { onError, debounceMs = 120, summaryOptions = {} } = {}) {
-  const root = sessionsDir();
+function watchSessions(onSummary, { onError, debounceMs = 120, summaryOptions = {}, rootDir = sessionsDir() } = {}) {
+  const root = rootDir;
   if (!chokidar) return null;
   if (String(process.env.CURSOR_CLI_WATCH_SESSIONS || '').toLowerCase() === 'false') return null;
   if (!fs.existsSync(root)) return null;

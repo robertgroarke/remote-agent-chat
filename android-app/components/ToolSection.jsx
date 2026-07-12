@@ -9,18 +9,19 @@ import {
 //   input   — tool input object or string
 //   output  — tool result string (optional)
 //   isError — boolean
-export default function ToolSection({ name, input, output, isError }) {
-  const [open, setOpen] = useState(false);
+export default function ToolSection({ name, input, output, isError, defaultOpen = true, status = null, textTheme = null, light = false }) {
+  const [open, setOpen] = useState(defaultOpen);
 
   const preview = buildPreview(name, input);
   const inputStr  = typeof input  === 'string' ? input  : JSON.stringify(input,  null, 2);
   const outputStr = typeof output === 'string' ? output : (output != null ? JSON.stringify(output, null, 2) : null);
 
   return (
-    <View style={s.container}>
+    <View style={[s.container, light && s.containerLight]}>
       <TouchableOpacity style={s.header} onPress={() => setOpen(v => !v)} activeOpacity={0.7}>
         <Text style={s.icon}>{isError ? '✗' : '⚙'}</Text>
-        <Text style={s.name} numberOfLines={1}>{name}</Text>
+        <Text style={[s.name, textTheme?.body]}>{name}</Text>
+        {!!status && <Text style={[s.status, textTheme?.muted]}>{status}</Text>}
         {!!preview && !open && (
           <Text style={s.preview} numberOfLines={1}>{preview}</Text>
         )}
@@ -28,13 +29,17 @@ export default function ToolSection({ name, input, output, isError }) {
       </TouchableOpacity>
 
       {open && (
-        <View style={s.body}>
-          <Text style={s.sectionLabel}>Input</Text>
-          <Text style={s.code}>{inputStr}</Text>
+        <View style={[s.body, light && s.bodyLight]}>
+          {input != null && (
+            <>
+              <Text style={[s.sectionLabel, textTheme?.muted]}>Input</Text>
+              <Text style={[s.code, light && s.codeLight, textTheme?.code]}>{inputStr}</Text>
+            </>
+          )}
           {outputStr != null && (
             <>
-              <Text style={[s.sectionLabel, { marginTop: 8 }]}>Output</Text>
-              <Text style={[s.code, isError && s.codeError]}>{outputStr}</Text>
+              <Text style={[s.sectionLabel, textTheme?.muted, { marginTop: 8 }]}>Output</Text>
+              <Text style={[s.code, light && s.codeLight, textTheme?.code, isError && s.codeError]}>{outputStr}</Text>
             </>
           )}
         </View>
@@ -87,6 +92,15 @@ const s = StyleSheet.create({
     fontSize: 12,
     fontStyle: 'italic',
   },
+  containerLight: {
+    backgroundColor: '#f6f8fa',
+    borderColor: '#d0d7de',
+  },
+  status: {
+    color:         '#768390',
+    fontSize:      10,
+    textTransform: 'uppercase',
+  },
   chevron: {
     color:    '#444c56',
     fontSize: 10,
@@ -95,6 +109,9 @@ const s = StyleSheet.create({
     borderTopWidth: 1,
     borderTopColor: '#30363d',
     padding:        10,
+  },
+  bodyLight: {
+    borderTopColor: '#d0d7de',
   },
   sectionLabel: {
     color:        '#768390',
@@ -111,6 +128,12 @@ const s = StyleSheet.create({
     backgroundColor: '#0b0f14',
     borderRadius:    4,
     padding:         8,
+  },
+  codeLight: {
+    color:           '#24292f',
+    backgroundColor: '#ffffff',
+    borderWidth:     1,
+    borderColor:     '#d0d7de',
   },
   codeError: {
     color: '#f85149',

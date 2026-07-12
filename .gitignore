@@ -74,6 +74,8 @@ android-app/dist/
 __pycache__/
 
 # Runtime files
+data/nightly-validation-ledger.jsonl
+data/nightly-validation.lock
 agent-proxy/proxy-new.log
 agent-proxy/session-store.json
 agent-proxy/session-store.json.*.tmp

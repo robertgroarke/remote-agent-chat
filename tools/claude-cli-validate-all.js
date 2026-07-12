@@ -5,6 +5,11 @@ const { spawnSync } = require('child_process');
 const path = require('path');
 
 const root = path.join(__dirname, '..');
+const args = process.argv.slice(2);
+if (args.some(arg => arg !== '--read-only')) {
+  console.error('Claude CLI validate-all only supports --read-only.');
+  process.exit(2);
+}
 const claudeCommand = process.platform === 'win32'
   ? path.join(process.env.APPDATA || path.join(process.env.USERPROFILE || '', 'AppData', 'Roaming'), 'npm', 'node_modules', '@anthropic-ai', 'claude-code', 'bin', 'claude.exe')
   : 'claude';
@@ -36,3 +41,4 @@ for (const [label, command, args] of stages) {
 }
 
 console.log(`ALL CLAUDE CLI VALIDATION STAGES PASS (${stages.length}/${stages.length})`);
+console.log('READ-ONLY PASS (no chats, prompts, controls, or service restarts were performed)');

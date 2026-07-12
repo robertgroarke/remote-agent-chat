@@ -4,6 +4,12 @@
 import { getLang, isTextFile, sessionLabel } from './file-utils.js';
 import { MarkdownContent } from './markdown.js';
 import { shouldRefreshNativeCliPlaceholder, useRelay } from './hooks.jsx';
+import {
+  DEFAULT_GROUP_ALIASES,
+  GROUP_ALIAS_STORAGE_KEY,
+  groupSessionsByDirectory,
+  normalizeGroupAliases,
+} from './workspace-groups.js';
 
 const { useState, useRef, useEffect, useLayoutEffect } = React;
 
@@ -170,7 +176,11 @@ function normalizeContentBlocks(blocks) {
       }
       if (type === 'file_change') return { ...block, type: 'file_changes' };
       if (type === 'tool') return { ...block, type: 'tool_call' };
+      if (type === 'tool_output' || type === 'result') return { ...block, type: 'tool_result' };
       if (type === 'thought') return { ...block, type: 'thinking' };
+      if (type === 'task_list') return { ...block, type: 'plan' };
+      if (type === 'queue' || type === 'queued') return { ...block, type: 'queued_message' };
+      if (type === 'banner' || type === 'notification') return { ...block, type: 'notice' };
       if (type === 'worked' || type === 'activity') return { ...block, type: 'status' };
       return block;
     });
@@ -193,6 +203,14 @@ function contentBlockText(block) {
       file.removed != null ? `-${file.removed}` : '',
     ].filter(Boolean).join(' ')).filter(Boolean).join('\n');
     return [block.content || block.text || block.markdown || '', files].filter(Boolean).join('\n\n');
+  }
+  if (Array.isArray(block.tasks) && block.tasks.length > 0) {
+    const tasks = block.tasks.map(task => {
+      const text = safeString(task?.text || task?.step || task?.title).trim();
+      const state = safeString(task?.state || task?.status || 'pending').trim();
+      return text ? `[${state}] ${text}` : '';
+    }).filter(Boolean).join('\n');
+    return [block.content || '', tasks].filter(Boolean).join('\n');
   }
   return block.content || block.text || block.markdown || block.title || block.label || '';
 }
@@ -287,7 +305,7 @@ function ContentBlocks({ blocks, monospace, autoExpandLongCodeBlocks, onOpenPath
             </TranscriptDisclosure>
           );
         }
-        if (type === 'tool_call') {
+        if (type === 'tool_call' || type === 'tool_result') {
           // Cursor step-group headers ("Explored…", "Running…") are often body-less.
           const bodyIsTitleOnly = !body || safeString(body).replace(/\s+/g, ' ').trim() === title;
           if (isCursor && bodyIsTitleOnly) {
@@ -298,9 +316,9 @@ function ContentBlocks({ blocks, monospace, autoExpandLongCodeBlocks, onOpenPath
             );
           }
           return (
-            <TranscriptDisclosure key={index} className="content-block content-block-tool" summary={(
+            <TranscriptDisclosure key={index} className={`content-block content-block-${type === 'tool_result' ? 'tool-result' : 'tool'}`} summary={(
               <>
-                <span>{title || 'Tool'}</span>
+                <span>{title || (type === 'tool_result' ? 'Tool result' : 'Tool')}</span>
                 {block.status && <span className={`content-block-status ${safeString(block.status).toLowerCase()}`}>{block.status}</span>}
               </>
             )}>
@@ -356,6 +374,47 @@ function ContentBlocks({ blocks, monospace, autoExpandLongCodeBlocks, onOpenPath
             <div key={index} className="content-block content-block-artifact">
               <div className="content-block-title">{title || 'Artifact'}</div>
               {body && <MarkdownContent content={body} monospace={monospace} autoExpandLongCodeBlocks={autoExpandLongCodeBlocks} onOpenPath={onOpenPath} />}
+            </div>
+          );
+        }
+        if (type === 'plan') {
+          const tasks = Array.isArray(block.tasks) ? block.tasks : [];
+          return (
+            <div key={index} className="content-block content-block-plan">
+              <div className="content-block-title">{title || 'Plan'}</div>
+              {tasks.length > 0 && (
+                <ol className="content-block-plan-list">
+                  {tasks.map((task, taskIndex) => {
+                    const state = safeString(task?.state || task?.status || 'pending').toLowerCase();
+                    return (
+                      <li key={task.id || taskIndex} className={`content-block-plan-item ${state}`}>
+                        <span className="content-block-plan-marker" aria-hidden="true">
+                          {state === 'completed' ? '✓' : state === 'in_progress' ? '•' : '○'}
+                        </span>
+                        <span>{task.text || task.step || task.title || ''}</span>
+                      </li>
+                    );
+                  })}
+                </ol>
+              )}
+              {body && !tasks.length && <MarkdownContent content={body} monospace={monospace} autoExpandLongCodeBlocks={autoExpandLongCodeBlocks} onOpenPath={onOpenPath} />}
+            </div>
+          );
+        }
+        if (type === 'queued_message') {
+          return (
+            <div key={index} className="content-block content-block-queued-message">
+              <span className="content-block-queued-label">{title || 'Queued message'}</span>
+              {body && <span className="content-block-queued-body">{body}</span>}
+            </div>
+          );
+        }
+        if (type === 'notice') {
+          return (
+            <div key={index} className={`content-block content-block-notice ${safeString(block.tone || block.status || 'info').toLowerCase()}`}>
+              <div className="content-block-title">{title || 'Notice'}</div>
+              {body && <MarkdownContent content={body} monospace={monospace} autoExpandLongCodeBlocks={autoExpandLongCodeBlocks} onOpenPath={onOpenPath} />}
+              <ContentBlockActions actions={block.actions} />
             </div>
           );
         }
@@ -722,46 +781,6 @@ function workspaceCandidateFromSession(sessionOrId, agentConfig, knownWorkspaces
   return null;
 }
 
-function collectKnownWorkspaceCandidates(sessionList, agentConfigs = {}) {
-  const byLabel = new Map();
-  function remember(candidate) {
-    if (!candidate) return;
-    const labelKey = candidate.label.toLowerCase();
-    const existing = byLabel.get(labelKey);
-    if (!existing || (looksLikeAbsolutePath(candidate.key) && !looksLikeAbsolutePath(existing.key))) {
-      byLabel.set(labelKey, candidate);
-    }
-  }
-  for (const session of sessionList || []) {
-    const id = sessionIdOf(session);
-    const config = id ? agentConfigs[id] : null;
-    if (!session || typeof session !== 'object') continue;
-    [
-      pathWorkspaceCandidate(session.workspace_path),
-      vscodeWorkspaceCandidate(session.window_title),
-      vscodeWorkspaceCandidate(session.workspace_name),
-      isUserHomeWorkspaceName(session.workspace_name, session.workspace_path) ? null : namedWorkspaceCandidate(session.workspace_name),
-      pathWorkspaceCandidate(config?.file_access_scope),
-    ].forEach(remember);
-  }
-  return Array.from(byLabel.values());
-}
-
-function workspaceGroupCandidate(sessionOrId, agentConfig, knownWorkspaces = []) {
-  const candidate = workspaceCandidateFromSession(sessionOrId, agentConfig, knownWorkspaces);
-  if (candidate && !isLowSignalWorkspaceLabel(candidate.label)) return candidate;
-  return null;
-}
-
-function sidebarWorkspaceLabel(sessionOrId, agentConfig, knownWorkspaces = []) {
-  return workspaceGroupCandidate(sessionOrId, agentConfig, knownWorkspaces)?.label || 'Unscoped Sessions';
-}
-
-function sidebarWorkspaceKey(sessionOrId, agentConfig, knownWorkspaces = []) {
-  const candidate = workspaceGroupCandidate(sessionOrId, agentConfig, knownWorkspaces);
-  return candidate?.key || 'unscoped-sessions';
-}
-
 function compactSessionId(value) {
   const id = safeString(value).trim();
   if (!id) return '';
@@ -826,27 +845,6 @@ function sidebarChatTitle(sessionOrId, fallbackId, agentConfig, sessionMessages 
   const shortId = compactSessionId(id);
   if (shortId) return `${agent.name || 'Session'} ${shortId}`;
   return agent.name || 'Session';
-}
-
-function groupSessionsByWorkspace(sessionList, agentConfigs = {}) {
-  const groups = [];
-  const byKey = new Map();
-  const knownWorkspaces = collectKnownWorkspaceCandidates(sessionList, agentConfigs);
-  for (const session of sessionList || []) {
-    const id = sessionIdOf(session);
-    const config = id ? agentConfigs[id] : null;
-    const candidate = workspaceGroupCandidate(session, config, knownWorkspaces);
-    const label = candidate?.label || 'Unscoped Sessions';
-    const key = candidate?.key || 'unscoped-sessions';
-    let group = byKey.get(key);
-    if (!group) {
-      group = { key, label, sessions: [] };
-      byKey.set(key, group);
-      groups.push(group);
-    }
-    group.sessions.push(session);
-  }
-  return groups;
 }
 
 function workspaceKeyOf(sessionOrId) {
@@ -935,6 +933,15 @@ function agentTypeLabel(agentType) {
   return AGENT_CONFIG[agentType]?.name || agentType;
 }
 
+function sessionHostLabel(session) {
+  if (!session || typeof session !== 'object') return '';
+  return safeString(session.host_label || (
+    session.host_type === 'vscode' ? 'VS Code'
+      : session.host_type === 'antigravity_ide' ? 'Antigravity IDE'
+        : ''
+  ));
+}
+
 const HEALTH_COLOR = {
   healthy:      '#3fb950',
   degraded:     '#d29922',
@@ -957,12 +964,14 @@ const ACTIVITY_META = {
 //   _optimistic + queued   → pulsing dots (in-flight)
 //   _optimistic + accepted → ✓ (relay stored it)
 //   _optimistic + failed   → ✗ with error label
-//   _delivered             → ✓✓ (proxy echoed it back — confirmed in agent)
+//   delivered/_delivered   → ✓✓ (proxy injection or authoritative echo confirmed)
+//   agent_started          → ▶ (native activity observed after injection)
 //   (historical)           → ✓
 
-function DeliveryStatus({ msg, deliveryStates, onSteer }) {
+function DeliveryStatus({ msg, deliveryStates, onSteer, onRetry }) {
   if (msg._optimistic) {
     const status = deliveryStates[msg._cid] || 'queued';
+    if (status === 'offline_queued') return <span className="delivery offline-queued" title="Queued until relay reconnects">offline</span>;
     if (status === 'queued')   return <span className="delivery queued"   title="Sending…">···</span>;
     if (status === 'busy_queued') return (
       <span className="delivery busy-queued" title="Agent is busy — message queued">
@@ -972,8 +981,20 @@ function DeliveryStatus({ msg, deliveryStates, onSteer }) {
     );
     if (status === 'steered')  return <span className="delivery steered"  title="Injected into agent context">⤳</span>;
     if (status === 'accepted') return <span className="delivery accepted" title="Received by relay">✓</span>;
-    if (status === 'failed')   return <span className="delivery failed"   title={msg._sendError || "Failed — agent may be offline"}>✕</span>;
+    if (status === 'delivered') return <span className="delivery delivered" title="Delivered to agent">✓✓</span>;
+    if (status === 'agent_started') return <span className="delivery agent-started" title="Agent started working">▶</span>;
+    if (status === 'failed') return (
+      <span className="delivery failed" title={msg._sendError || "Failed — agent may be offline"}>
+        <span aria-hidden="true">✕</span>
+        {onRetry && (
+          <button type="button" className="delivery-retry" onClick={(event) => { event.stopPropagation(); onRetry(msg); }}>
+            Retry
+          </button>
+        )}
+      </span>
+    );
   }
+  if (msg._agentStarted) return <span className="delivery agent-started" title="Agent started working">▶</span>;
   if (msg._delivered) return <span className="delivery delivered" title="Delivered to agent">✓✓</span>;
   return <span className="delivery delivered" title="Sent">✓</span>;
 }
@@ -992,6 +1013,7 @@ function TranscriptMessage({
   onClosePreview,
   deliveryState,
   onSteer,
+  onRetry,
 }) {
   const normalizedContent = normalizeMessageContent(msg.content) || contentBlocksFallback(msg.content_blocks);
   const renderableUserContent = recoverUploadedImageMarkdown(msg.content);
@@ -1000,7 +1022,10 @@ function TranscriptMessage({
   if (msg.role === 'user') {
     const deliveryStatesForMessage = msg._cid ? { [msg._cid]: deliveryState } : {};
     return (
-      <div className={`message user${msg._optimistic && deliveryState === 'failed' ? ' failed' : ''}`}>
+      <div
+        className={`message user transcript-virtual-row${msg._optimistic && deliveryState === 'failed' ? ' failed' : ''}`}
+        data-message-key={messageKey}
+      >
         <div className="user-gutter">
           <div className="user-glyph" />
         </div>
@@ -1008,7 +1033,7 @@ function TranscriptMessage({
           <div className="message-role">
             <span>You</span>
             {timestampLabel && <span className="message-timestamp">{timestampLabel}</span>}
-            <DeliveryStatus msg={msg} deliveryStates={deliveryStatesForMessage} onSteer={onSteer} />
+            <DeliveryStatus msg={msg} deliveryStates={deliveryStatesForMessage} onSteer={onSteer} onRetry={onRetry} />
           </div>
           {/!\[[^\]]*\]\((?:data:|\/uploads\/)/.test(renderableUserContent) ? (
             <div className="user-text"><MarkdownContent content={renderableUserContent} /></div>
@@ -1020,7 +1045,10 @@ function TranscriptMessage({
     );
   }
   return (
-    <div className={`message assistant${assistantMonospace ? ' monospace' : ''}`}>
+    <div
+      className={`message assistant transcript-virtual-row${assistantMonospace ? ' monospace' : ''}`}
+      data-message-key={messageKey}
+    >
       <div className="assistant-gutter">
         <div
           className="agent-badge transcript-agent-badge"
@@ -1082,7 +1110,8 @@ function areTranscriptMessagePropsEqual(prev, next) {
     && activeAgentKey(prev.activeAgent) === activeAgentKey(next.activeAgent)
     && transcriptPreviewKey(prev.preview) === transcriptPreviewKey(next.preview)
     && prev.fileContents === next.fileContents
-    && prev.deliveryState === next.deliveryState;
+    && prev.deliveryState === next.deliveryState
+    && prev.onRetry === next.onRetry;
 }
 
 const MemoTranscriptMessage = React.memo(TranscriptMessage, areTranscriptMessagePropsEqual);
@@ -1156,7 +1185,7 @@ function QueuedItem({ qm, onSteer, onDiscard, onEdit }) {
 // Each card shows: colored agent badge, agent name, window label, health dot,
 // and either a thinking spinner or an unread count badge.
 
-function SessionCard({ session, health, unread, isThinking, isActive, agentConfig, activity, sessionMessages, hasBlockingPrompt, blockingPromptLabel, onSelect, onClose, onAutomations, showAutomationsActive, onSkills, showSkillsActive }) {
+function SessionCard({ session, health, unread, isThinking, isActive, agentConfig, activity, sessionMessages, hasBlockingPrompt, blockingPromptLabel, muted, onSelect, onClose, onManage, onAutomations, showAutomationsActive, onSkills, showSkillsActive }) {
   const sessionId = sessionIdOf(session);
   const agent    = sessionAgent(session, agentConfig);
   const winLabel = sessionSubLabel(session, sessionId, agentConfig);
@@ -1169,6 +1198,7 @@ function SessionCard({ session, health, unread, isThinking, isActive, agentConfi
   const isAntigravitySession = session?.agent_type === 'antigravity' || session?.agent_type === 'antigravity_panel';
   const quotaSummary = isAntigravitySession ? formatAntigravityQuotaSummary(session?.antigravity_quota_models, 3) : '';
   const activityLabel = isThinking && activity?.label ? activity.label : null;
+  const hostLabel = sessionHostLabel(session);
 
   return (
     <div
@@ -1193,10 +1223,12 @@ function SessionCard({ session, health, unread, isThinking, isActive, agentConfi
             : isAntigravitySession && pctUsed != null ? `📊 ${pctUsed}% used${rateLimitedUntil && rateLimitedUntil !== 'unknown' ? ` · ${rateLimitedUntil}` : ''}`
             : pctUsed >= 80 ? `📊 ${pctUsed}% used`
             : activityLabel ? activityLabel
+            : hostLabel ? `${agent.name} · ${hostLabel}`
             : agent.name}
         </div>
       </div>
       <div className="session-card-right">
+        {muted && <span className="session-card-muted" title="Notifications muted">◌</span>}
         {hasBlockingPrompt && <div className="session-card-perm-badge" title={blockingPromptLabel || 'Action required'}>⚠</div>}
         {isThinking  && <div className="session-card-spinner" title={activityLabel || 'Thinking…'} />}
         {!isThinking && !hasBlockingPrompt && unread > 0 && (
@@ -1217,6 +1249,11 @@ function SessionCard({ session, health, unread, isThinking, isActive, agentConfi
           >⊞</button>
         )}
         <div className="session-card-health" style={{ background: dotColor }} title={health || 'unknown'} />
+        <button
+          className="session-card-manage"
+          title="Manage session"
+          onClick={e => { e.stopPropagation(); onManage && onManage(); }}
+        >⋯</button>
         <button
           className="session-card-close"
           title="Close session"
@@ -2039,20 +2076,338 @@ function permissionModeOptionsFor(agentType, config) {
   return PERMISSION_MODES[agentType] || [];
 }
 
-function AgentSettingsPanel({ session, config, onRequestRefresh, onSetModel, onSetEffort, onSetPermissionMode, onSetAutoApprovePermissions, onSetMode, onSetCodexConfig, onSwitchWorkspace, onClose }) {
-  const [pendingModel, setPendingModel] = React.useState(null);
-  const [modelOk, setModelOk]           = React.useState(null);
-  const [pendingPerm, setPendingPerm]   = React.useState(null);
-  const [permOk, setPermOk]             = React.useState(null);
-  const [pendingEffort, setPendingEffort] = React.useState(null);
-  const [effortOk, setEffortOk]           = React.useState(null);
-  const [pendingAutoApprove, setPendingAutoApprove] = React.useState(null);
-  const [autoApproveOk, setAutoApproveOk]           = React.useState(null);
-  const [pendingMode, setPendingMode]   = React.useState(null);
-  const [modeOk, setModeOk]             = React.useState(null);
-  const [codexOk, setCodexOk]           = React.useState(null);
+function applicationServerKeyBytes(value) {
+  const padding = '='.repeat((4 - value.length % 4) % 4);
+  const base64 = (value + padding).replace(/-/g, '+').replace(/_/g, '/');
+  const raw = atob(base64);
+  return Uint8Array.from([...raw].map(char => char.charCodeAt(0)));
+}
 
+function NotificationSettingsPanel({ onClose }) {
+  const defaults = {
+    permission_required: true,
+    agent_ready: true,
+    agent_error: true,
+    session_offline: true,
+    rate_limit_cleared: true,
+  };
+  const [preferences, setPreferences] = useState(defaults);
+  const [loading, setLoading] = useState(true);
+  const [saving, setSaving] = useState(null);
+  const [error, setError] = useState('');
+  const [webPushStatus, setWebPushStatus] = useState('checking');
+  const [webPushBusy, setWebPushBusy] = useState(false);
+
+  async function loadPreferences() {
+    setLoading(true);
+    setError('');
+    try {
+      const response = await fetch('/api/preferences/notifications', { credentials: 'same-origin' });
+      const body = await response.json().catch(() => ({}));
+      if (!response.ok) throw new Error(body.error || 'Unable to load notification settings.');
+      setPreferences({ ...defaults, ...(body.preferences || {}) });
+    } catch (err) {
+      setError(err.message || 'Unable to load notification settings.');
+    } finally {
+      setLoading(false);
+    }
+  }
+
+  async function loadWebPushState() {
+    if (!('serviceWorker' in navigator) || !('PushManager' in window) || !('Notification' in window)) {
+      setWebPushStatus('unsupported');
+      return;
+    }
+    try {
+      const registration = await navigator.serviceWorker.ready;
+      const subscription = await registration.pushManager.getSubscription();
+      setWebPushStatus(subscription ? 'enabled' : Notification.permission === 'denied' ? 'denied' : 'available');
+    } catch {
+      setWebPushStatus('error');
+    }
+  }
+
+  useEffect(() => {
+    loadPreferences();
+    loadWebPushState();
+  }, []);
+
+  async function enableWebPush() {
+    if (webPushBusy) return;
+    setWebPushBusy(true);
+    setError('');
+    try {
+      const permission = await Notification.requestPermission();
+      if (permission !== 'granted') {
+        setWebPushStatus(permission === 'denied' ? 'denied' : 'available');
+        return;
+      }
+      const configResponse = await fetch('/api/push/web-config', { credentials: 'same-origin' });
+      const config = await configResponse.json().catch(() => ({}));
+      if (!configResponse.ok || !config.public_key) throw new Error(config.error || 'Web Push is unavailable.');
+      const registration = await navigator.serviceWorker.ready;
+      let subscription = await registration.pushManager.getSubscription();
+      if (!subscription) {
+        subscription = await registration.pushManager.subscribe({
+          userVisibleOnly: true,
+          applicationServerKey: applicationServerKeyBytes(config.public_key),
+        });
+      }
+      const response = await fetch('/api/push/web-subscription', {
+        method: 'POST',
+        credentials: 'same-origin',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ subscription: subscription.toJSON() }),
+      });
+      const body = await response.json().catch(() => ({}));
+      if (!response.ok) throw new Error(body.error || 'Unable to register browser notifications.');
+      setWebPushStatus('enabled');
+    } catch (err) {
+      setWebPushStatus('error');
+      setError(err.message || 'Unable to enable browser notifications.');
+    } finally {
+      setWebPushBusy(false);
+    }
+  }
+
+  async function disableWebPush() {
+    if (webPushBusy) return;
+    setWebPushBusy(true);
+    setError('');
+    try {
+      const registration = await navigator.serviceWorker.ready;
+      const subscription = await registration.pushManager.getSubscription();
+      if (subscription) {
+        await fetch('/api/push/web-subscription', {
+          method: 'DELETE',
+          credentials: 'same-origin',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ endpoint: subscription.endpoint }),
+        });
+        await subscription.unsubscribe();
+      }
+      setWebPushStatus('available');
+    } catch (err) {
+      setWebPushStatus('error');
+      setError(err.message || 'Unable to disable browser notifications.');
+    } finally {
+      setWebPushBusy(false);
+    }
+  }
+
+  async function togglePreference(key) {
+    if (saving) return;
+    const previous = preferences;
+    const next = { ...preferences, [key]: !preferences[key] };
+    setPreferences(next);
+    setSaving(key);
+    setError('');
+    try {
+      const response = await fetch('/api/preferences/notifications', {
+        method: 'PUT',
+        credentials: 'same-origin',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ preferences: next }),
+      });
+      const body = await response.json().catch(() => ({}));
+      if (!response.ok) throw new Error(body.error || 'Unable to save notification settings.');
+      setPreferences({ ...defaults, ...(body.preferences || {}) });
+    } catch (err) {
+      setPreferences(previous);
+      setError(err.message || 'Unable to save notification settings.');
+    } finally {
+      setSaving(null);
+    }
+  }
+
+  return (
+    <div className="settings-panel notification-settings-panel">
+      <div className="settings-panel-header">
+        <span>Notifications</span>
+        <button className="settings-panel-close" onClick={onClose} title="Close">✕</button>
+      </div>
+      <div className="settings-panel-body">
+        <div className="notification-setting-row web-push-setting-row">
+          <span>
+            <strong>Browser notifications</strong>
+            <small>{webPushStatus === 'enabled' ? 'Enabled for this browser'
+              : webPushStatus === 'denied' ? 'Blocked in browser site settings'
+                : webPushStatus === 'unsupported' ? 'Not supported by this browser'
+                  : webPushStatus === 'checking' ? 'Checking browser support…'
+                    : 'Receive notifications when this PWA is closed'}</small>
+          </span>
+          {webPushStatus === 'enabled' ? (
+            <button type="button" disabled={webPushBusy} onClick={disableWebPush}>Disable</button>
+          ) : (
+            <button
+              type="button"
+              disabled={webPushBusy || webPushStatus === 'checking' || webPushStatus === 'unsupported' || webPushStatus === 'denied'}
+              onClick={enableWebPush}
+            >{webPushBusy ? 'Enabling…' : 'Enable'}</button>
+          )}
+        </div>
+        <label className="notification-setting-row">
+          <span><strong>Permission required</strong><small>When an agent needs approval to continue</small></span>
+          <input
+            type="checkbox"
+            checked={preferences.permission_required}
+            disabled={loading || !!saving}
+            onChange={() => togglePreference('permission_required')}
+          />
+        </label>
+        <label className="notification-setting-row">
+          <span><strong>Agent ready</strong><small>When an agent finishes and is waiting for input</small></span>
+          <input
+            type="checkbox"
+            checked={preferences.agent_ready}
+            disabled={loading || !!saving}
+            onChange={() => togglePreference('agent_ready')}
+          />
+        </label>
+        <label className="notification-setting-row">
+          <span><strong>Agent error or rate limit</strong><small>When an agent stops and needs attention</small></span>
+          <input
+            type="checkbox"
+            checked={preferences.agent_error}
+            disabled={loading || !!saving}
+            onChange={() => togglePreference('agent_error')}
+          />
+        </label>
+        <label className="notification-setting-row">
+          <span><strong>Session offline</strong><small>When an agent disconnects from the relay</small></span>
+          <input
+            type="checkbox"
+            checked={preferences.session_offline}
+            disabled={loading || !!saving}
+            onChange={() => togglePreference('session_offline')}
+          />
+        </label>
+        <label className="notification-setting-row">
+          <span><strong>Rate limit cleared</strong><small>When a model's rate limit expires</small></span>
+          <input
+            type="checkbox"
+            checked={preferences.rate_limit_cleared}
+            disabled={loading || !!saving}
+            onChange={() => togglePreference('rate_limit_cleared')}
+          />
+        </label>
+        {loading && <div className="settings-note">Loading relay preferences…</div>}
+        {!!error && (
+          <div className="notification-settings-error" role="alert">
+            <span>{error}</span>
+            <button type="button" onClick={loadPreferences}>Retry</button>
+          </div>
+        )}
+        <div className="settings-note">These preferences sync across web and Android.</div>
+      </div>
+    </div>
+  );
+}
+
+function SessionManagementPanel({ sessions, preferences, initialSessionId, onSave, onClose }) {
+  const firstId = initialSessionId || sessionIdOf(sessions[0]) || '';
+  const [selectedId, setSelectedId] = useState(firstId);
+  const [displayName, setDisplayName] = useState('');
+  const [saving, setSaving] = useState(false);
+  const [error, setError] = useState('');
+  const selected = sessions.find(session => sessionIdOf(session) === selectedId) || null;
+  const preference = preferences[selectedId] || { display_name: '', archived: false, muted: false };
+
+  useEffect(() => {
+    setDisplayName(preference.display_name || '');
+    setError('');
+  }, [selectedId, preference.display_name]);
+  useEffect(() => {
+    if (initialSessionId) setSelectedId(initialSessionId);
+  }, [initialSessionId]);
+
+  async function update(updates) {
+    if (!selectedId || saving) return;
+    setSaving(true);
+    setError('');
+    try {
+      await onSave(selectedId, updates);
+    } catch (err) {
+      setError(err.message || 'Unable to save session settings.');
+    } finally {
+      setSaving(false);
+    }
+  }
+
+  return (
+    <div className="settings-panel session-management-panel">
+      <div className="settings-panel-header">
+        <span>Manage sessions</span>
+        <button className="settings-panel-close" onClick={onClose} title="Close">✕</button>
+      </div>
+      <div className="settings-panel-body">
+        {sessions.length === 0 ? <div className="settings-note">No sessions available.</div> : <>
+          <label className="settings-row session-management-field">
+            <span className="settings-label">Session</span>
+            <select value={selectedId} onChange={event => setSelectedId(event.target.value)}>
+              {sessions.map(session => {
+                const id = sessionIdOf(session);
+                const pref = preferences[id] || {};
+                const label = pref.display_name || session?.display_name || session?.workspace_name || session?.name || id;
+                return <option key={id} value={id}>{pref.archived ? '[Hidden] ' : ''}{label}</option>;
+              })}
+            </select>
+          </label>
+          {selected && <>
+            <label className="settings-row session-management-field">
+              <span className="settings-label">Custom name</span>
+              <input
+                value={displayName}
+                maxLength={100}
+                placeholder={selected?.display_name || selected?.workspace_name || selected?.name || selectedId}
+                onChange={event => setDisplayName(event.target.value)}
+              />
+            </label>
+            <label className="notification-setting-row">
+              <span><strong>Mute notifications</strong><small>Suppress push notifications for this session</small></span>
+              <input
+                type="checkbox"
+                checked={!!preference.muted}
+                disabled={saving}
+                onChange={() => update({ muted: !preference.muted })}
+              />
+            </label>
+            <div className="session-management-actions">
+              <button disabled={saving} onClick={() => update({ display_name: displayName })}>Save name</button>
+              <button
+                className={preference.archived ? '' : 'danger'}
+                disabled={saving}
+                onClick={() => update({ archived: !preference.archived })}
+              >{preference.archived ? 'Restore to sidebar' : 'Hide from sidebar'}</button>
+            </div>
+          </>}
+        </>}
+        {!!error && <div className="settings-error" role="alert">{error}</div>}
+        <div className="settings-note">Names, hidden state, and mute settings sync across web and Android.</div>
+      </div>
+    </div>
+  );
+}
+
+function AgentSettingsPanel({ session, config, configControlStates, onRequestRefresh, onSetModel, onSetEffort, onSetPermissionMode, onSetAutoApprovePermissions, onSetMode, onSetCodexConfig, onSwitchWorkspace, onClose }) {
   const sessionId    = sessionIdOf(session);
+  const controlFor = field => configControlStates?.[`${sessionId}:${field}`] || null;
+  const isPendingControl = control => control && (control.status === 'pending' || control.status === 'awaiting_config');
+  const modelControl = controlFor('model');
+  const permissionControl = controlFor('permission_mode');
+  const effortControl = controlFor('effort');
+  const autoApproveControl = controlFor('auto_approve_permissions');
+  const modeControl = controlFor('mode');
+  const speedControl = controlFor('speed');
+  const accessControl = controlFor('access_mode');
+  const workspaceControl = controlFor('workspace');
+  const activeControl = [modelControl, permissionControl, effortControl, autoApproveControl, modeControl, speedControl, accessControl, workspaceControl]
+    .find(control => isPendingControl(control) || control?.status === 'failed');
+  const controlStatusLabel = activeControl
+    ? isPendingControl(activeControl)
+      ? `Saving ${activeControl.field.replace(/_/g, ' ')}…`
+      : activeControl.error
+    : null;
   const agentType    = (session && typeof session === 'object') ? session.agent_type : null;
   const caps         = config?.capabilities || {};
   const currentModel   = config?.model_id || 'unknown';
@@ -2086,79 +2441,28 @@ function AgentSettingsPanel({ session, config, onRequestRefresh, onSetModel, onS
 
   function handleModelChange(modelId) {
     if (!modelId || modelId === currentModel) return;
-    setModelOk(null);
-    setPendingModel(modelId);
     onSetModel(sessionId, modelId);
   }
 
   function handlePermModeChange(mode) {
     if (!mode || mode === permMode) return;
-    setPermOk(null);
-    setPendingPerm(mode);
     onSetPermissionMode(sessionId, mode);
   }
 
   function handleEffortChange(effort) {
     if (!effort || effort === effortLevel) return;
-    setEffortOk(null);
-    setPendingEffort(effort);
     onSetEffort && onSetEffort(sessionId, effort);
   }
 
   function handleModeChange(mode) {
     if (!mode || mode === currentMode) return;
-    setModeOk(null);
-    setPendingMode(mode);
     onSetMode && onSetMode(sessionId, mode);
   }
 
   function handleAutoApproveChange(enabled) {
     if (autoApproveEnabled === !!enabled) return;
-    setAutoApproveOk(null);
-    setPendingAutoApprove(!!enabled);
     onSetAutoApprovePermissions && onSetAutoApprovePermissions(sessionId, !!enabled);
   }
-
-  // Clear pending states when config updates confirm the change
-  React.useEffect(() => {
-    if (pendingModel && config?.model_id && config.model_id !== 'unknown') {
-      setModelOk(`Model set to ${config.model_id}`);
-      setPendingModel(null);
-      setTimeout(() => setModelOk(null), 3000);
-    }
-  }, [config?.model_id]);
-
-  React.useEffect(() => {
-    if (pendingPerm && config?.permission_mode && config.permission_mode === pendingPerm) {
-      setPermOk(`Saved`);
-      setPendingPerm(null);
-      setTimeout(() => setPermOk(null), 2000);
-    }
-  }, [config?.permission_mode]);
-
-  React.useEffect(() => {
-    if (pendingEffort && config?.effort && config.effort === pendingEffort) {
-      setEffortOk('Saved');
-      setPendingEffort(null);
-      setTimeout(() => setEffortOk(null), 2000);
-    }
-  }, [config?.effort]);
-
-  React.useEffect(() => {
-    if (pendingMode && ((config?.conversation_mode && config.conversation_mode === pendingMode) || (config?.mode && config.mode === pendingMode))) {
-      setModeOk('Saved');
-      setPendingMode(null);
-      setTimeout(() => setModeOk(null), 2000);
-    }
-  }, [config?.conversation_mode, config?.mode]);
-
-  React.useEffect(() => {
-    if (pendingAutoApprove != null && autoApproveEnabled === pendingAutoApprove) {
-      setAutoApproveOk('Saved');
-      setPendingAutoApprove(null);
-      setTimeout(() => setAutoApproveOk(null), 2000);
-    }
-  }, [autoApproveEnabled]);
 
   return (
     <div className="settings-panel">
@@ -2189,7 +2493,7 @@ function AgentSettingsPanel({ session, config, onRequestRefresh, onSetModel, onS
               <select
                 className="settings-perm-select"
                 value={currentModel}
-                disabled={!!pendingModel}
+                disabled={isPendingControl(modelControl)}
                 onChange={e => handleModelChange(e.target.value)}
               >
                 {modelOptions.map(m => (
@@ -2209,7 +2513,7 @@ function AgentSettingsPanel({ session, config, onRequestRefresh, onSetModel, onS
               >⚠</span>
             )}
           </div>
-          {modelOk && <span className="settings-inline-ok">{modelOk}</span>}
+          {modelControl?.status === 'ok' && <span className="settings-inline-ok">Saved</span>}
         </div>
 
         {(agentType === 'antigravity' || agentType === 'antigravity_panel') && antigravityQuotaModels.length > 0 && (
@@ -2254,14 +2558,14 @@ function AgentSettingsPanel({ session, config, onRequestRefresh, onSetModel, onS
             <select
               className="settings-perm-select"
               value={currentMode === 'unknown' ? 'Planning' : currentMode}
-              disabled={!!pendingMode}
+              disabled={isPendingControl(modeControl)}
               onChange={e => handleModeChange(e.target.value)}
             >
               {ANTIGRAVITY_MODES.map(m => (
                 <option key={m.id} value={m.id}>{m.label}</option>
               ))}
             </select>
-            {modeOk && <span className="settings-inline-ok">{modeOk}</span>}
+            {modeControl?.status === 'ok' && <span className="settings-inline-ok">Saved</span>}
           </div>
         )}
 
@@ -2272,7 +2576,7 @@ function AgentSettingsPanel({ session, config, onRequestRefresh, onSetModel, onS
             <select
               className="settings-perm-select"
               value={currentMode === 'unknown' ? modeOptions[0].id : currentMode}
-              disabled={!!pendingMode}
+              disabled={isPendingControl(modeControl)}
               onChange={e => handleModeChange(e.target.value)}
             >
               {modeOptions.map(m => (
@@ -2282,7 +2586,7 @@ function AgentSettingsPanel({ session, config, onRequestRefresh, onSetModel, onS
                 <option value={currentMode}>{currentMode}</option>
               )}
             </select>
-            {modeOk && <span className="settings-inline-ok">{modeOk}</span>}
+            {modeControl?.status === 'ok' && <span className="settings-inline-ok">Saved</span>}
           </div>
         )}
 
@@ -2293,7 +2597,7 @@ function AgentSettingsPanel({ session, config, onRequestRefresh, onSetModel, onS
               <select
                 className="settings-perm-select"
                 value={permMode === 'unknown' ? defaultPermissionModeFor(agentType) : permMode}
-                disabled={!!pendingPerm}
+                disabled={isPendingControl(permissionControl)}
                 onChange={e => handlePermModeChange(e.target.value)}
               >
                 {permModes.map(m => (
@@ -2306,7 +2610,7 @@ function AgentSettingsPanel({ session, config, onRequestRefresh, onSetModel, onS
             ) : (
               <span className={`settings-value${permMode === 'unknown' ? ' dim' : ''}`}>{permMode}</span>
             )}
-            {permOk && <span className="settings-inline-ok">{permOk}</span>}
+            {permissionControl?.status === 'ok' && <span className="settings-inline-ok">Saved</span>}
           </div>
         )}
 
@@ -2332,14 +2636,14 @@ function AgentSettingsPanel({ session, config, onRequestRefresh, onSetModel, onS
             <select
               className="settings-perm-select"
               value={effortLevel || 'medium'}
-              disabled={!!pendingEffort}
+              disabled={isPendingControl(effortControl)}
               onChange={e => handleEffortChange(e.target.value)}
             >
               {(config.available_efforts || []).map(m => (
                 <option key={m.id} value={m.id}>{m.label}</option>
               ))}
             </select>
-            {effortOk && <span className="settings-inline-ok">{effortOk}</span>}
+            {effortControl?.status === 'ok' && <span className="settings-inline-ok">Saved</span>}
           </div>
         )}
 
@@ -2351,7 +2655,8 @@ function AgentSettingsPanel({ session, config, onRequestRefresh, onSetModel, onS
               <select
                 className="settings-perm-select"
                 value={config?.model_id || 'unknown'}
-                onChange={e => { onSetCodexConfig && onSetCodexConfig({ model_id: e.target.value }); setCodexOk(agentType === 'codex-desktop' ? 'Saved' : 'Saved — restart Codex to apply'); setTimeout(() => setCodexOk(null), 3000); }}
+                disabled={isPendingControl(modelControl)}
+                onChange={e => { onSetCodexConfig && onSetCodexConfig({ model_id: e.target.value }); }}
               >
                 {(config?.available_models || []).map(m => (
                   <option key={m.id} value={m.id}>{m.label}</option>
@@ -2366,7 +2671,8 @@ function AgentSettingsPanel({ session, config, onRequestRefresh, onSetModel, onS
               <select
                 className="settings-perm-select"
                 value={config?.permission_mode || 'unknown'}
-                onChange={e => { onSetCodexConfig && onSetCodexConfig({ access_mode: e.target.value }); setCodexOk(agentType === 'codex-desktop' ? 'Saved' : 'Saved — restart Codex to apply'); setTimeout(() => setCodexOk(null), 3000); }}
+                disabled={isPendingControl(accessControl)}
+                onChange={e => { onSetCodexConfig && onSetCodexConfig({ access_mode: e.target.value }); }}
               >
                 {(config?.available_access || []).map(m => (
                   <option key={m.id} value={m.id}>{m.label}</option>
@@ -2381,7 +2687,8 @@ function AgentSettingsPanel({ session, config, onRequestRefresh, onSetModel, onS
               <select
                 className="settings-perm-select"
                 value={(config?.effort || 'unknown').toLowerCase()}
-                onChange={e => { onSetCodexConfig && onSetCodexConfig({ effort: e.target.value }); setCodexOk(agentType === 'codex-desktop' ? 'Saved' : 'Saved — restart Codex to apply'); setTimeout(() => setCodexOk(null), 3000); }}
+                disabled={isPendingControl(effortControl)}
+                onChange={e => { onSetCodexConfig && onSetCodexConfig({ effort: e.target.value }); }}
               >
                 {(config?.available_efforts || []).map(m => (
                   <option key={m.id} value={m.id}>{m.label}</option>
@@ -2393,7 +2700,8 @@ function AgentSettingsPanel({ session, config, onRequestRefresh, onSetModel, onS
               <select
                 className="settings-perm-select"
                 value={(config?.speed || 'standard').toLowerCase()}
-                onChange={e => { onSetCodexConfig && onSetCodexConfig({ speed: e.target.value }); setCodexOk(agentType === 'codex-desktop' ? 'Saved' : 'Saved — restart Codex to apply'); setTimeout(() => setCodexOk(null), 3000); }}
+                disabled={isPendingControl(speedControl)}
+                onChange={e => { onSetCodexConfig && onSetCodexConfig({ speed: e.target.value }); }}
               >
                 {(config?.available_speeds || []).map(m => (
                   <option key={m.id} value={m.id}>{m.label}</option>
@@ -2423,13 +2731,8 @@ function AgentSettingsPanel({ session, config, onRequestRefresh, onSetModel, onS
                 <select
                   className="settings-perm-select"
                   value={config?.file_access_scope || ''}
-                  onChange={e => {
-                    if (onSwitchWorkspace) {
-                      onSwitchWorkspace(sessionId, e.target.value);
-                      setCodexOk('Switching workspace…');
-                      setTimeout(() => setCodexOk(null), 5000);
-                    }
-                  }}
+                  disabled={isPendingControl(workspaceControl)}
+                  onChange={e => { if (onSwitchWorkspace) onSwitchWorkspace(sessionId, e.target.value); }}
                 >
                   {(config.available_workspaces || []).map(m => (
                     <option key={m.id} value={m.path || m.id}>{m.label}</option>
@@ -2437,7 +2740,7 @@ function AgentSettingsPanel({ session, config, onRequestRefresh, onSetModel, onS
                 </select>
               </div>
             )}
-            {codexOk && <div className="settings-row"><span className="settings-inline-ok">{codexOk}</span></div>}
+            {controlStatusLabel && <div className="settings-row"><span className={activeControl?.status === 'failed' ? 'settings-error' : 'settings-inline-ok'} role="status">{controlStatusLabel}</span></div>}
           </>
         )}
         {(agentType === 'codex' || agentType === 'codex-desktop') && !caps.set_codex_config && (
@@ -2462,12 +2765,12 @@ function AgentSettingsPanel({ session, config, onRequestRefresh, onSetModel, onS
               <input
                 type="checkbox"
                 checked={autoApproveEnabled}
-                disabled={pendingAutoApprove != null}
+                disabled={isPendingControl(autoApproveControl)}
                 onChange={e => handleAutoApproveChange(e.target.checked)}
               />
               <span>Auto-approve permission prompts</span>
             </label>
-            {autoApproveOk && <span className="settings-inline-ok">{autoApproveOk}</span>}
+            {autoApproveControl?.status === 'ok' && <span className="settings-inline-ok">Saved</span>}
           </div>
         )}
 
@@ -2490,6 +2793,12 @@ function AgentSettingsPanel({ session, config, onRequestRefresh, onSetModel, onS
             </div>
           );
         })()}
+
+        {controlStatusLabel && !(agentType === 'codex' || agentType === 'codex-desktop') && (
+          <div className={activeControl?.status === 'failed' ? 'settings-error' : 'settings-inline-ok'} role="status">
+            {controlStatusLabel}
+          </div>
+        )}
 
       </div>
       <div className="settings-panel-footer">
@@ -3685,7 +3994,7 @@ class AppErrorBoundary extends React.Component {
 }
 
 function App() {
-  const { sessions, messages, historyMeta, historyLoading, connected, unread, setUnread, thinking, thinkingContent, activities, health, deliveryStates, launchStates, justLaunched, setJustLaunched, permissionPrompts, respondToPrompt, errorPrompts, respondToErrorPrompt, interruptSession, agentConfigs, requestAgentConfig, setAgentModel, setAgentEffort, setAgentPermissionMode, setAutoApprovePermissions, setAntigravityMode, setCodexConfig, newThread, openPanel, openNativeWindow, requestChatList, switchChat, newChat, chatLists, requestThreadList, switchThread, threadLists, switchWorkspace, requestTerminalOutput, sendTerminalInput, terminalOutputs, requestFileChanges, respondToFileChange, fileChanges, sendAttachment, send, sendToSession, steerMessage, discardQueuedMessage, editQueuedMessage, queuedMessages, launchSession, resumeSession, closeSession, activeSessionRef, workspaces, branchLists, requestBranchList, switchBranch, createBranch, skillLists, requestSkillList, automationViews, showCodexAutomation, controlResults, directoryListings, requestDirectoryListing, fileContents, requestFileContent, requestHistory, requestHistoryChunk } = useRelay();
+  const { sessions, messages, historyMeta, historyLoading, connected, connectionHealth, unread, setUnread, thinking, thinkingContent, activities, health, deliveryStates, launchStates, justLaunched, setJustLaunched, permissionPrompts, respondToPrompt, errorPrompts, respondToErrorPrompt, interruptSession, agentConfigs, configControlStates, requestAgentConfig, setAgentModel, setAgentEffort, setAgentPermissionMode, setAutoApprovePermissions, setAntigravityMode, setCodexConfig, newThread, openPanel, openNativeWindow, requestChatList, switchChat, newChat, chatLists, requestThreadList, switchThread, threadLists, switchWorkspace, requestTerminalOutput, sendTerminalInput, terminalOutputs, requestFileChanges, respondToFileChange, fileChanges, sendAttachment, send, sendToSession, steerMessage, discardQueuedMessage, editQueuedMessage, queuedMessages, launchSession, resumeSession, closeSession, activeSessionRef, workspaces, branchLists, requestBranchList, switchBranch, createBranch, skillLists, requestSkillList, automationViews, showCodexAutomation, controlResults, directoryListings, requestDirectoryListing, fileContents, requestFileContent, requestHistory, requestHistoryChunk, duplicateProxyAlarms, nightlyValidationFailures } = useRelay();
   const [activeSession, setActiveSession] = useState(null);
   const [drafts, setDrafts]             = useState({});
   const [draftFiles, setDraftFiles]     = useState({});
@@ -3694,6 +4003,10 @@ function App() {
   const [uploading, setUploading]       = useState(false);
   const [showSlashMenu, setShowSlashMenu] = useState(false);
   const [showNewSession, setShowNewSession] = useState(false);
+  const [showNotificationSettings, setShowNotificationSettings] = useState(false);
+  const [showSessionManagement, setShowSessionManagement] = useState(false);
+  const [managedSessionId, setManagedSessionId] = useState('');
+  const [sessionPreferences, setSessionPreferences] = useState({});
   const [showSettings, setShowSettings]     = useState(false);
   const [showComposerSettings, setShowComposerSettings] = useState(false);
   const [stopPending, setStopPending]       = useState({});
@@ -3717,18 +4030,82 @@ function App() {
   const [theme, setTheme]                           = useState(() => {
     try { return localStorage.getItem('remote-agent-chat-theme') || 'dark'; } catch { return 'dark'; }
   });
+  const [collapsedSessionGroups, setCollapsedSessionGroups] = useState(() => {
+    try {
+      const stored = JSON.parse(localStorage.getItem('remote-agent-chat:collapsed-directories:v1') || '[]');
+      return Array.isArray(stored) ? Object.fromEntries(stored.map(key => [String(key), true])) : {};
+    } catch {
+      return {};
+    }
+  });
+  const [sessionGroupAliases] = useState(() => {
+    try {
+      const stored = JSON.parse(localStorage.getItem(GROUP_ALIAS_STORAGE_KEY) || '{}');
+      return normalizeGroupAliases(stored);
+    } catch {
+      return normalizeGroupAliases(DEFAULT_GROUP_ALIASES);
+    }
+  });
+  useEffect(() => {
+    try { localStorage.setItem(GROUP_ALIAS_STORAGE_KEY, JSON.stringify(sessionGroupAliases)); } catch {}
+  }, [sessionGroupAliases]);
+  useEffect(() => {
+    fetch('/api/preferences/sessions', { credentials: 'same-origin' })
+      .then(response => response.ok ? response.json() : Promise.reject(new Error('Session settings unavailable')))
+      .then(body => setSessionPreferences(body.preferences || {}))
+      .catch(() => {});
+  }, []);
+  async function saveSessionPreference(sessionId, updates) {
+    const response = await fetch(`/api/preferences/sessions/${encodeURIComponent(sessionId)}`, {
+      method: 'PUT',
+      credentials: 'same-origin',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ preference: updates }),
+    });
+    const body = await response.json().catch(() => ({}));
+    if (!response.ok) throw new Error(body.error || 'Unable to save session settings.');
+    setSessionPreferences(previous => ({ ...previous, [sessionId]: body.preference }));
+    if (body.preference?.archived && activeSession === sessionId) setActiveSession(null);
+    return body.preference;
+  }
+  useEffect(() => {
+    try {
+      const collapsed = Object.keys(collapsedSessionGroups).filter(key => collapsedSessionGroups[key]);
+      localStorage.setItem('remote-agent-chat:collapsed-directories:v1', JSON.stringify(collapsed));
+    } catch {}
+  }, [collapsedSessionGroups]);
+  const toggleSessionGroup = React.useCallback((key) => {
+    setCollapsedSessionGroups(previous => ({ ...previous, [key]: !previous[key] }));
+  }, []);
   const steerMessageRef = useRef(steerMessage);
   useEffect(() => { steerMessageRef.current = steerMessage; }, [steerMessage]);
   const handleTranscriptSteer = React.useCallback((cid, content) => {
     if (!activeSession) return;
     steerMessageRef.current(activeSession, cid, content);
   }, [activeSession]);
+  const sendToSessionRef = useRef(sendToSession);
+  useEffect(() => { sendToSessionRef.current = sendToSession; }, [sendToSession]);
+  const handleTranscriptRetry = React.useCallback((message) => {
+    if (!activeSession || !message?._cid) return;
+    sendToSessionRef.current(activeSession, message.content, message._cid);
+  }, [activeSession]);
   const requestFileContentRef = useRef(requestFileContent);
   useEffect(() => { requestFileContentRef.current = requestFileContent; }, [requestFileContent]);
-  const orderedSessions = React.useMemo(() => sortSessionsForDisplay(sessions), [sessions]);
+  const allManagedSessions = React.useMemo(() => sortSessionsForDisplay(sessions).map(session => {
+    const id = sessionIdOf(session);
+    const preference = sessionPreferences[id];
+    if (!preference?.display_name) return session;
+    return typeof session === 'object'
+      ? { ...session, display_name: preference.display_name }
+      : { session_id: id, display_name: preference.display_name };
+  }), [sessions, sessionPreferences]);
+  const orderedSessions = React.useMemo(
+    () => allManagedSessions.filter(session => !sessionPreferences[sessionIdOf(session)]?.archived),
+    [allManagedSessions, sessionPreferences],
+  );
   const sessionGroups = React.useMemo(
-    () => groupSessionsByWorkspace(orderedSessions, agentConfigs),
-    [orderedSessions, agentConfigs],
+    () => groupSessionsByDirectory(orderedSessions, agentConfigs, sessionGroupAliases),
+    [orderedSessions, agentConfigs, sessionGroupAliases],
   );
   const activeSessionMeta = React.useMemo(
     () => orderedSessions.find(s => sessionIdOf(s) === activeSession),
@@ -3780,6 +4157,7 @@ function App() {
   const userScrollIntentUntilRef = useRef(0);
   const programmaticScrollUntilRef = useRef(0);
   const pinnedToNewestUntilRef = useRef(0);
+  const requestOlderHistoryRef = useRef(null);
   const selectedSessionRef = useRef(activeSession);
   const scrollSnapshotRef = useRef({
     sessionId: null,
@@ -3856,11 +4234,30 @@ function App() {
   // Auto-select first session when list arrives
   useEffect(() => {
     if (!activeSession && orderedSessions.length > 0) {
-      const first = orderedSessions[0];
-      const id    = typeof first === 'string' ? first : first?.session_id;
-      if (id) selectSession(id, first);
+      const requestedId = new URLSearchParams(window.location.search).get('session');
+      const requested = requestedId
+        ? orderedSessions.find(session => sessionIdOf(session) === requestedId)
+        : null;
+      const selected = requested || orderedSessions[0];
+      const id = sessionIdOf(selected);
+      if (id) {
+        selectSession(id, selected);
+        if (requested) window.history.replaceState({}, '', window.location.pathname);
+      }
     }
   }, [orderedSessions, activeSession]);
+
+  useEffect(() => {
+    if (!('serviceWorker' in navigator)) return undefined;
+    const handlePushClick = event => {
+      if (event.data?.type !== 'push_notification_clicked') return;
+      const requestedId = event.data.data?.session_id;
+      const requested = orderedSessions.find(session => sessionIdOf(session) === requestedId);
+      if (requestedId && requested) selectSession(requestedId, requested);
+    };
+    navigator.serviceWorker.addEventListener('message', handlePushClick);
+    return () => navigator.serviceWorker.removeEventListener('message', handlePushClick);
+  }, [orderedSessions]);
 
   // Auto-select a just-launched session once it appears in the sessions list
   useEffect(() => {
@@ -3909,6 +4306,9 @@ function App() {
       } else if (userInitiated && !programmatic) {
         stickyToNewestRef.current = false;
         pinnedToNewestUntilRef.current = 0;
+      }
+      if (userInitiated && !programmatic && list.scrollTop < 160) {
+        requestOlderHistoryRef.current?.();
       }
       setShowJumpButton(!atBottom && !stickyToNewestRef.current);
       scrollSnapshotRef.current = {
@@ -4347,7 +4747,9 @@ async function uploadBinaryDraft(sessionId, base64, mimeType, filename) {
     : activeBlockingErrorPrompt
       ? safeString(activeBlockingErrorPrompt.title, 'Action required')
       : null;
-  const canSend         = !!(currentInput.trim() || attachedFiles.length > 0) && !!activeSession && connected && !uploading && !activeBlockingPrompt;
+  const canSend         = !!(currentInput.trim() || attachedFiles.length > 0) && !!activeSession && !uploading && !activeBlockingPrompt;
+  const relayHealthState = connected ? (connectionHealth?.state || 'connecting') : 'offline';
+  const relayRttText = connectionHealth?.rttMs != null ? ` · ${connectionHealth.rttMs} ms` : '';
   const unreadTotal     = Object.values(unread).reduce((a, b) => a + b, 0);
   const slashQuery      = currentInput.startsWith('/') ? currentInput.slice(1).trim().toLowerCase() : '';
   const filteredSlashCommands = currentInput.startsWith('/')
@@ -4356,6 +4758,11 @@ async function uploadBinaryDraft(sessionId, base64, mimeType, filename) {
 
   // Resolve display label for the active session
   const activeConfig = activeSession ? (agentConfigs[activeSession] || null) : null;
+  const activeConfigControls = activeSession
+    ? Object.values(configControlStates || {}).filter(control => control.sessionId === activeSession)
+    : [];
+  const activePendingConfigControl = activeConfigControls.find(control => control.status === 'pending' || control.status === 'awaiting_config') || null;
+  const activeFailedConfigControl = activeConfigControls.find(control => control.status === 'failed') || null;
   const activeHistoryMeta = activeSession ? (historyMeta[activeSession] || null) : null;
   const activeHistoryLoading = activeSession ? (historyLoading[activeSession] || null) : null;
 
@@ -4364,6 +4771,14 @@ async function uploadBinaryDraft(sessionId, base64, mimeType, filename) {
   // the native JSONL archive so refresh never has to hydrate a full transcript.
   useEffect(() => {
     if (!activeSession || !connected) return;
+    const existing = messages[activeSession] || [];
+    const lastSequence = existing.reduce((maximum, message) => (
+      Math.max(maximum, Number(message?.sequence || 0))
+    ), 0);
+    if (lastSequence > 0) {
+      requestHistory(activeSession, { afterSequence: lastSequence });
+      return;
+    }
     const tailOptions = historyRequestOptionsFor(activeSessionMeta);
     const chunkSource = (activeSessionMeta?.agent_type === 'codex_cli' || activeSessionMeta?.agent_type === 'cursor_cli') ? 'native' : 'relay_sqlite';
     requestHistoryChunk(activeSession, { ...tailOptions, mode: 'tail', source: chunkSource });
@@ -4432,7 +4847,7 @@ async function uploadBinaryDraft(sessionId, base64, mimeType, filename) {
       ? sessionGroups.find(group => group.sessions.some(session => sessionIdOf(session) === activeSession))
       : null
   ), [activeSession, sessionGroups]);
-  const activeGroupLabel = activeSessionGroup?.label && activeSessionGroup.label !== 'Unscoped Sessions'
+  const activeGroupLabel = activeSessionGroup?.label && activeSessionGroup.label !== 'Unscoped'
     ? activeSessionGroup.label
     : '';
   const activeLabel = activeSession
@@ -4472,6 +4887,7 @@ async function uploadBinaryDraft(sessionId, base64, mimeType, filename) {
   const activeMachine = activeSessionMeta && typeof activeSessionMeta === 'object'
     ? activeSessionMeta.machine_label
     : '';
+  const activeHostLabel = sessionHostLabel(activeSessionMeta);
   // Last user message — shown as sticky context banner at top of chat
   const lastUserMsg = React.useMemo(() => {
     for (let i = currentMessages.length - 1; i >= 0; i--) {
@@ -4532,7 +4948,7 @@ async function uploadBinaryDraft(sessionId, base64, mimeType, filename) {
     && lastUserText
     && !((activeSessionMeta?.agent_type === 'cline' || activeSessionMeta?.agent_type === 'roo_code') && activeContextCard)
   );
-  const assistantMonospace = activeSessionMeta?.agent_type === 'codex' || activeSessionMeta?.agent_type === 'codex_cli' || activeSessionMeta?.agent_type === 'cursor_cli';
+  const assistantMonospace = ['claude_cli', 'codex_cli', 'cursor_cli'].includes(activeSessionMeta?.agent_type);
   const lastAssistantMsg = React.useMemo(() => {
     for (let i = currentMessages.length - 1; i >= 0; i--) {
       if (currentMessages[i]?.role === 'assistant') return currentMessages[i];
@@ -4589,6 +5005,21 @@ async function uploadBinaryDraft(sessionId, base64, mimeType, filename) {
       ...historyRequestOptionsFor(activeSessionMeta),
     });
   }
+  useEffect(() => {
+    requestOlderHistoryRef.current = showPartialHistoryBanner && !activeHistoryLoading
+      ? loadOlderActiveHistory
+      : null;
+    return () => {
+      requestOlderHistoryRef.current = null;
+    };
+  }, [
+    activeSession,
+    activeSessionMeta?.agent_type,
+    activeHistoryLoading,
+    showPartialHistoryBanner,
+    activeHistoryMeta?.cursor?.next_before_offset,
+    activeHistoryMeta?.cursor?.next_before_id,
+  ]);
   function retryActiveHistory() {
     if (!activeSession) return;
     const chunkSource = (activeSessionMeta?.agent_type === 'codex_cli' || activeSessionMeta?.agent_type === 'cursor_cli') ? 'native' : 'relay_sqlite';
@@ -4625,6 +5056,7 @@ async function uploadBinaryDraft(sessionId, base64, mimeType, filename) {
           onClosePreview={closeTranscriptPreview}
           deliveryState={msg._cid ? deliveryStates[msg._cid] : null}
           onSteer={handleTranscriptSteer}
+          onRetry={handleTranscriptRetry}
         />
       );
     })
@@ -4641,6 +5073,7 @@ async function uploadBinaryDraft(sessionId, base64, mimeType, filename) {
     closeTranscriptPreview,
     deliveryStates,
     handleTranscriptSteer,
+    handleTranscriptRetry,
   ]);
   // Auto-fetch thread list for desktop sessions with no messages (e.g. Codex Desktop showing chat picker)
   const hasThreadCap = activeConfig?.capabilities?.thread_list;
@@ -4864,6 +5297,18 @@ async function uploadBinaryDraft(sessionId, base64, mimeType, filename) {
   return (
     <div className="app">
       <div className={`overlay ${sidebarOpen ? 'open' : ''}`} onClick={() => setSidebarOpen(false)} />
+      {(duplicateProxyAlarms.length > 0 || nightlyValidationFailures.length > 0) && (
+        <div className="duplicate-proxy-banner" role="alert">
+          {duplicateProxyAlarms.length > 0 && <>
+            <strong>Duplicate proxy detected.</strong>
+            <span>{duplicateProxyAlarms.length} session{duplicateProxyAlarms.length === 1 ? '' : 's'} claimed by multiple proxies. Stop the extra proxy to prevent conflicting controls.</span>
+          </>}
+          {nightlyValidationFailures.length > 0 && <>
+            <strong>Nightly validation failed.</strong>
+            <span>{nightlyValidationFailures.map(item => `${item.harness} (${item.app_version})`).join(', ')}. Check the validation ledger before using affected controls.</span>
+          </>}
+        </div>
+      )}
 
       {/* Sidebar */}
       <div className={`sidebar ${sidebarOpen ? 'open' : ''}`}>
@@ -4871,11 +5316,48 @@ async function uploadBinaryDraft(sessionId, base64, mimeType, filename) {
           <span className="logo">⌬</span>
           <span style={{ flex: 1 }}>Agent Sessions</span>
           <button
+            className={`new-session-btn notification-settings-btn${showNotificationSettings ? ' active' : ''}`}
+            title="Notification settings"
+            aria-label="Notification settings"
+            onClick={() => {
+              setShowNotificationSettings(open => !open);
+              setShowNewSession(false);
+              setShowSessionManagement(false);
+            }}
+          >♢</button>
+          <button
+            className={`new-session-btn notification-settings-btn${showSessionManagement ? ' active' : ''}`}
+            title="Manage sessions"
+            aria-label="Manage sessions"
+            onClick={() => {
+              setManagedSessionId(activeSession || sessionIdOf(allManagedSessions[0]) || '');
+              setShowSessionManagement(open => !open);
+              setShowNewSession(false);
+              setShowNotificationSettings(false);
+            }}
+          >⋯</button>
+          <button
             className={`new-session-btn${showNewSession ? ' active' : ''}`}
             title="New session"
-            onClick={() => setShowNewSession(o => !o)}
+            onClick={() => {
+              setShowNewSession(o => !o);
+              setShowNotificationSettings(false);
+              setShowSessionManagement(false);
+            }}
           >+</button>
         </div>
+        {showNotificationSettings && (
+          <NotificationSettingsPanel onClose={() => setShowNotificationSettings(false)} />
+        )}
+        {showSessionManagement && (
+          <SessionManagementPanel
+            sessions={allManagedSessions}
+            preferences={sessionPreferences}
+            initialSessionId={managedSessionId}
+            onSave={saveSessionPreference}
+            onClose={() => setShowSessionManagement(false)}
+          />
+        )}
         {showNewSession && (
           <NewSessionPanel
             launchStates={launchStates}
@@ -4889,12 +5371,38 @@ async function uploadBinaryDraft(sessionId, base64, mimeType, filename) {
           {orderedSessions.length === 0 && !showNewSession && (
             <div className="session-empty">No agents connected</div>
           )}
-          {sessionGroups.map(group => (
-            <div className="session-group" key={group.key}>
-              <div className="session-group-header" title={group.label}>
+          {sessionGroups.map(group => {
+            const collapsed = !!collapsedSessionGroups[group.key];
+            const summary = group.sessions.reduce((result, session) => {
+              const id = sessionIdOf(session);
+              const activity = activities[id];
+              const activityKind = String(activity?.kind || '').toLowerCase();
+              result.unread += unread[id] || 0;
+              result.hasPrompt = result.hasPrompt || !!permissionPrompts[id] || !!isBlockingErrorPrompt(errorPrompts[id]);
+              result.working = result.working || !!thinking[id] || !!activity?.generating
+                || (!!activity && !['', 'idle', 'waiting_for_user', 'completed', 'done'].includes(activityKind));
+              return result;
+            }, { unread: 0, hasPrompt: false, working: false });
+            return (
+            <div className={`session-group${collapsed ? ' collapsed' : ''}`} key={group.key}>
+              <button
+                type="button"
+                className="session-group-header"
+                title={`${collapsed ? 'Expand' : 'Collapse'} ${group.label}`}
+                aria-expanded={!collapsed}
+                onClick={() => toggleSessionGroup(group.key)}
+              >
+                <span className="session-group-caret" aria-hidden="true">{collapsed ? '>' : 'v'}</span>
                 <span className="session-group-name">{group.label}</span>
+                {summary.hasPrompt && <span className="session-group-alert" title="Action required">!</span>}
+                {summary.working && <span className="session-group-working" title="Session working" />}
+                {summary.unread > 0 && (
+                  <span className="session-group-unread" title={`${summary.unread} unread`}>{summary.unread > 99 ? '99+' : summary.unread}</span>
+                )}
                 <span className="session-group-count">{group.sessions.length}</span>
-              </div>
+              </button>
+              <div className="session-group-items" aria-hidden={collapsed}>
+                <div className="session-group-items-inner">
               {group.sessions.map(s => {
                 const id = typeof s === 'string' ? s : s?.session_id;
                 return (
@@ -4910,7 +5418,14 @@ async function uploadBinaryDraft(sessionId, base64, mimeType, filename) {
                     sessionMessages={messages[id] || []}
                     hasBlockingPrompt={!!permissionPrompts[id] || !!isBlockingErrorPrompt(errorPrompts[id])}
                     blockingPromptLabel={permissionPrompts[id] ? 'Permission required' : (errorPrompts[id]?.title || 'Action required')}
+                    muted={!!sessionPreferences[id]?.muted}
                     onSelect={() => selectSession(id, s)}
+                    onManage={() => {
+                      setManagedSessionId(id);
+                      setShowSessionManagement(true);
+                      setShowNotificationSettings(false);
+                      setShowNewSession(false);
+                    }}
                     onClose={() => {
                       const isDisconnected = health[id] === 'disconnected' || !health[id];
                       const msg = isDisconnected
@@ -4925,12 +5440,15 @@ async function uploadBinaryDraft(sessionId, base64, mimeType, filename) {
                   />
                 );
               })}
+                </div>
+              </div>
             </div>
-          ))}
+            );
+          })}
         </div>
         <div className="sidebar-footer">
-          <span className={`status-dot ${connected ? 'connected' : ''}`} />
-          {connected ? 'Relay connected' : 'Reconnecting…'}
+          <span className={`status-dot ${relayHealthState}`} />
+          {connected ? `Relay ${relayHealthState}${relayRttText}` : 'Reconnecting…'}
           <a href="/agent-chat.apk" download className="apk-download-link" title="Download Android APK">⬇ APK</a>
         </div>
       </div>
@@ -5022,6 +5540,9 @@ async function uploadBinaryDraft(sessionId, base64, mimeType, filename) {
                   </span>
                   {activeMachine && (
                     <span className="context-pill" title="Remote machine">{activeMachine}</span>
+                  )}
+                  {activeHostLabel && (
+                    <span className="context-pill" title="Native editor host">{activeHostLabel}</span>
                   )}
                   {activeSessionMeta?.agent_type === 'codex' && activeSessionMeta?.visible_pane_visible && (
                     <span
@@ -5281,7 +5802,12 @@ async function uploadBinaryDraft(sessionId, base64, mimeType, filename) {
             onClick={pinTranscriptToNewest}
           >↓ Jump to Newest</button>
         )}
-        <div className="messages" key={activeTranscriptRenderKey} ref={messagesListRef}>
+        <div
+          className={`messages harness-theme harness-theme-${safeString(activeSessionMeta?.agent_type || 'default').replace(/[^a-z0-9_-]/gi, '-')}`}
+          data-agent-type={activeSessionMeta?.agent_type || 'default'}
+          key={activeTranscriptRenderKey}
+          ref={messagesListRef}
+        >
           {shouldBottomAlignMessages && <div className="messages-flex-spacer" />}
           {activePrompt && (
             <PermissionOverlay
@@ -5454,6 +5980,7 @@ async function uploadBinaryDraft(sessionId, base64, mimeType, filename) {
           <AgentSettingsPanel
             session={activeSessionMeta || activeSession}
             config={activeConfig}
+            configControlStates={configControlStates}
             onRequestRefresh={requestAgentConfig}
             onSetModel={(sid, modelId) => setAgentModel(sid, modelId)}
             onSetEffort={(sid, effort) => setAgentEffort(sid, effort)}
@@ -5597,7 +6124,7 @@ async function uploadBinaryDraft(sessionId, base64, mimeType, filename) {
                   : activeSession
                     ? (window.innerWidth < 600 ? 'Enter message…' : 'Message… (/ for commands)')
                     : 'Select a session'}
-                disabled={!activeSession || !connected || !!activeBlockingPrompt}
+                disabled={!activeSession || !!activeBlockingPrompt}
                 rows={1}
               />
               <div className="textarea-btns">
@@ -5677,7 +6204,7 @@ async function uploadBinaryDraft(sessionId, base64, mimeType, filename) {
                     {isStopPending ? <span className="stop-btn-spinner" /> : '■'}
                   </button>
                 ) : (
-                  <button className="send-btn" onClick={sendMessage} disabled={!canSend} title="Send">
+                  <button className="send-btn" onClick={sendMessage} disabled={!canSend} title={connected ? 'Send' : 'Queue until reconnected'}>
                     {uploading ? '…' : '↑'}
                   </button>
                 )}
@@ -5713,6 +6240,13 @@ async function uploadBinaryDraft(sessionId, base64, mimeType, filename) {
             </div>
             {activeSession && (
               <div className={`composer-settings${showComposerSettings ? ' is-open' : ''}`}>
+                {(activePendingConfigControl || activeFailedConfigControl) && (
+                  <div className={`composer-control-state ${activeFailedConfigControl ? 'failed' : 'pending'}`} role="status">
+                    {activeFailedConfigControl
+                      ? activeFailedConfigControl.error
+                      : `Saving ${activePendingConfigControl.field.replace(/_/g, ' ')}…`}
+                  </div>
+                )}
                 {(activeConfig?.capabilities?.set_model || activeSessionMeta?.agent_type === 'antigravity' || activeSessionMeta?.agent_type === 'antigravity_panel') && (
                   <label className="composer-setting-label">
                     <span className="composer-setting-key">Model</span>

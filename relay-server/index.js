@@ -12,11 +12,26 @@ const crypto     = require('crypto');
 const jwt        = require('jsonwebtoken');
 const Database   = require('better-sqlite3');
 const admin      = require('firebase-admin');
+const webpush    = require('web-push');
 const {
   UNSOLICITED_HISTORY_TAIL_LIMIT,
   buildUnsolicitedHistoryPayload,
+  buildUnsolicitedHistoryChunkPayload,
+  isUnsolicitedHistoryMessage,
   canBroadcastHistoryToBrowser,
 } = require('./history-broadcast-policy');
+const { buildDuplicateProxyAlarms } = require('./duplicate-proxy-alarm');
+const { buildIncrementalHistoryPlan } = require('./history-sync-policy');
+const { SendLifecycleTracker } = require('./send-lifecycle');
+const { normalizeActivityTimeline } = require('./activity-timeline');
+const {
+  boundedString,
+  createPrincipalRateLimit,
+  validateQueueControlMessage,
+  validateWebPushEndpoint,
+  validateWebPushSubscription,
+  validateWorkspaceControlMessage,
+} = require('./request-security');
 
 // ── Config ────────────────────────────────────────────────────────────────────
 
@@ -31,6 +46,8 @@ const JWT_SECRET                = process.env.JWT_SECRET || null;
 const FIREBASE_SERVICE_ACCOUNT  = process.env.FIREBASE_SERVICE_ACCOUNT || null;
 const NOTIFY_EVEN_IF_CONNECTED  = process.env.NOTIFY_EVEN_IF_CONNECTED === 'true';
 const ALLOW_LAN_BYPASS          = process.env.ALLOW_LAN_BYPASS === 'true'; // SEC-03: opt-in only
+const ALLOW_LOOPBACK_BYPASS     = process.env.ALLOW_LOOPBACK_BYPASS === 'true'; // isolated local tests only
+const DATA_DIR                  = process.env.RAC_DATA_DIR || '/data';
 
 // Fail fast if SESSION_SECRET is missing or is a known placeholder
 if (!SESSION_SECRET || SESSION_SECRET === 'changeme') {
@@ -64,12 +81,14 @@ function log(level, tag, msg, extra = {}) {
 
 // ── Upload directory ──────────────────────────────────────────────────────────
 
-const UPLOAD_DIR = '/data/uploads';
+const UPLOAD_DIR = path.join(DATA_DIR, 'uploads');
 if (!fs.existsSync(UPLOAD_DIR)) fs.mkdirSync(UPLOAD_DIR, { recursive: true });
+const HISTORY_DB_PATH = path.join(DATA_DIR, 'messages.db');
+const HISTORY_BACKUP_DIR = path.join(DATA_DIR, 'backups');
 
 // ── SQLite ────────────────────────────────────────────────────────────────────
 
-const db = new Database('/data/messages.db');
+const db = new Database(HISTORY_DB_PATH);
 
 // Create table + the idx_session index (safe on old schema with no new columns)
 db.exec(`
@@ -102,7 +121,233 @@ db.exec(`
     platform   TEXT NOT NULL DEFAULT 'android',
     updated_at TEXT NOT NULL
   );
+  CREATE TABLE IF NOT EXISTS web_push_subscriptions (
+    id         INTEGER PRIMARY KEY AUTOINCREMENT,
+    email      TEXT NOT NULL,
+    endpoint   TEXT NOT NULL UNIQUE,
+    p256dh     TEXT NOT NULL,
+    auth       TEXT NOT NULL,
+    updated_at TEXT NOT NULL
+  );
+  CREATE INDEX IF NOT EXISTS idx_web_push_email_updated
+    ON web_push_subscriptions(email, updated_at);
+  CREATE TABLE IF NOT EXISTS relay_settings (
+    key        TEXT PRIMARY KEY,
+    value      TEXT NOT NULL
+  );
+  CREATE TABLE IF NOT EXISTS notification_preferences (
+    email              TEXT PRIMARY KEY,
+    permission_required INTEGER NOT NULL DEFAULT 1,
+    agent_ready        INTEGER NOT NULL DEFAULT 1,
+    agent_error        INTEGER NOT NULL DEFAULT 1,
+    session_offline    INTEGER NOT NULL DEFAULT 1,
+    rate_limit_cleared INTEGER NOT NULL DEFAULT 1,
+    updated_at         TEXT NOT NULL DEFAULT (datetime('now'))
+  );
+  CREATE TABLE IF NOT EXISTS session_preferences (
+    email        TEXT NOT NULL,
+    session_id   TEXT NOT NULL,
+    display_name TEXT,
+    archived     INTEGER NOT NULL DEFAULT 0,
+    muted        INTEGER NOT NULL DEFAULT 0,
+    updated_at   TEXT NOT NULL DEFAULT (datetime('now')),
+    PRIMARY KEY (email, session_id)
+  );
+  CREATE TABLE IF NOT EXISTS nightly_validation_status (
+    harness       TEXT PRIMARY KEY,
+    status        TEXT NOT NULL,
+    app_version   TEXT NOT NULL,
+    validator     TEXT NOT NULL,
+    run_id        TEXT NOT NULL,
+    duration_ms   INTEGER NOT NULL DEFAULT 0,
+    exit_code     INTEGER,
+    detail        TEXT NOT NULL DEFAULT '',
+    completed_at  TEXT NOT NULL,
+    updated_at    TEXT NOT NULL DEFAULT (datetime('now'))
+  );
 `);
+
+// Existing installs predate the complete notification category set.
+for (const column of ['permission_required', 'agent_error', 'session_offline']) {
+  if (!db.prepare('PRAGMA table_info(notification_preferences)').all().some(info => info.name === column)) {
+    db.exec(`ALTER TABLE notification_preferences ADD COLUMN ${column} INTEGER NOT NULL DEFAULT 1`);
+  }
+}
+
+function getOrCreateVapidKeys() {
+  const publicRow = db.prepare("SELECT value FROM relay_settings WHERE key = 'vapid_public_key'").get();
+  const privateRow = db.prepare("SELECT value FROM relay_settings WHERE key = 'vapid_private_key'").get();
+  if (publicRow?.value && privateRow?.value) {
+    return { publicKey: publicRow.value, privateKey: privateRow.value };
+  }
+  const generated = webpush.generateVAPIDKeys();
+  db.transaction(() => {
+    db.prepare('INSERT OR REPLACE INTO relay_settings (key, value) VALUES (?, ?)')
+      .run('vapid_public_key', generated.publicKey);
+    db.prepare('INSERT OR REPLACE INTO relay_settings (key, value) VALUES (?, ?)')
+      .run('vapid_private_key', generated.privateKey);
+  })();
+  return generated;
+}
+
+const vapidKeys = getOrCreateVapidKeys();
+webpush.setVapidDetails(
+  process.env.VAPID_SUBJECT || 'mailto:notifications@example.com',
+  vapidKeys.publicKey,
+  vapidKeys.privateKey,
+);
+
+const NIGHTLY_VALIDATION_HARNESSES = new Set([
+  'antigravity-v2', 'claude-cli', 'codex-cli', 'codex-desktop', 'cursor-cli', 'cursor',
+]);
+
+function nightlyValidationStatuses() {
+  return db.prepare(`
+    SELECT harness, status, app_version, validator, run_id, duration_ms,
+           exit_code, detail, completed_at
+    FROM nightly_validation_status
+    ORDER BY harness
+  `).all();
+}
+
+function saveNightlyValidationStatus(requested) {
+  const harness = String(requested?.harness || '').trim();
+  const status = String(requested?.status || '').trim();
+  const completedAt = String(requested?.completed_at || '').trim();
+  if (!NIGHTLY_VALIDATION_HARNESSES.has(harness)) throw new Error('Unknown validation harness');
+  if (!['pass', 'fail', 'timed_out'].includes(status)) throw new Error('Invalid validation status');
+  if (!completedAt || Number.isNaN(Date.parse(completedAt))) throw new Error('Invalid validation completion time');
+  const value = {
+    harness,
+    status,
+    app_version: String(requested?.app_version || 'unavailable').slice(0, 200),
+    validator: String(requested?.validator || '').slice(0, 300),
+    run_id: String(requested?.run_id || '').slice(0, 200),
+    duration_ms: Math.max(0, Math.min(Number(requested?.duration_ms) || 0, 24 * 60 * 60 * 1000)),
+    exit_code: Number.isInteger(requested?.exit_code) ? requested.exit_code : null,
+    detail: String(requested?.detail || '').slice(-4000),
+    completed_at: new Date(completedAt).toISOString(),
+  };
+  db.prepare(`
+    INSERT INTO nightly_validation_status
+      (harness, status, app_version, validator, run_id, duration_ms, exit_code, detail, completed_at, updated_at)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, datetime('now'))
+    ON CONFLICT(harness) DO UPDATE SET
+      status = excluded.status,
+      app_version = excluded.app_version,
+      validator = excluded.validator,
+      run_id = excluded.run_id,
+      duration_ms = excluded.duration_ms,
+      exit_code = excluded.exit_code,
+      detail = excluded.detail,
+      completed_at = excluded.completed_at,
+      updated_at = excluded.updated_at
+  `).run(
+    value.harness, value.status, value.app_version, value.validator, value.run_id,
+    value.duration_ms, value.exit_code, value.detail, value.completed_at,
+  );
+  return value;
+}
+
+const DEFAULT_NOTIFICATION_PREFERENCES = Object.freeze({
+  permission_required: true,
+  agent_ready: true,
+  agent_error: true,
+  session_offline: true,
+  rate_limit_cleared: true,
+});
+
+function notificationPreferencesForEmail(email) {
+  if (!email) return { ...DEFAULT_NOTIFICATION_PREFERENCES };
+  const row = db.prepare(`
+    SELECT permission_required, agent_ready, agent_error, session_offline, rate_limit_cleared
+    FROM notification_preferences
+    WHERE email = ?
+  `).get(email);
+  return {
+    permission_required: row ? !!row.permission_required : true,
+    agent_ready: row ? !!row.agent_ready : true,
+    agent_error: row ? !!row.agent_error : true,
+    session_offline: row ? !!row.session_offline : true,
+    rate_limit_cleared: row ? !!row.rate_limit_cleared : true,
+  };
+}
+
+function saveNotificationPreferences(email, requested) {
+  const current = notificationPreferencesForEmail(email);
+  const preferences = {
+    permission_required: typeof requested?.permission_required === 'boolean'
+      ? requested.permission_required : current.permission_required,
+    agent_ready: typeof requested?.agent_ready === 'boolean'
+      ? requested.agent_ready : current.agent_ready,
+    agent_error: typeof requested?.agent_error === 'boolean'
+      ? requested.agent_error : current.agent_error,
+    session_offline: typeof requested?.session_offline === 'boolean'
+      ? requested.session_offline : current.session_offline,
+    rate_limit_cleared: typeof requested?.rate_limit_cleared === 'boolean'
+      ? requested.rate_limit_cleared : current.rate_limit_cleared,
+  };
+  db.prepare(`
+    INSERT INTO notification_preferences
+      (email, permission_required, agent_ready, agent_error, session_offline, rate_limit_cleared, updated_at)
+    VALUES (?, ?, ?, ?, ?, ?, datetime('now'))
+    ON CONFLICT(email) DO UPDATE SET
+      permission_required = excluded.permission_required,
+      agent_ready = excluded.agent_ready,
+      agent_error = excluded.agent_error,
+      session_offline = excluded.session_offline,
+      rate_limit_cleared = excluded.rate_limit_cleared,
+      updated_at = excluded.updated_at
+  `).run(
+    email,
+    preferences.permission_required ? 1 : 0,
+    preferences.agent_ready ? 1 : 0,
+    preferences.agent_error ? 1 : 0,
+    preferences.session_offline ? 1 : 0,
+    preferences.rate_limit_cleared ? 1 : 0,
+  );
+  return preferences;
+}
+
+function sessionPreferencesForEmail(email) {
+  if (!email) return {};
+  const rows = db.prepare(`
+    SELECT session_id, display_name, archived, muted
+    FROM session_preferences
+    WHERE email = ?
+    ORDER BY updated_at DESC
+  `).all(email);
+  return Object.fromEntries(rows.map(row => [row.session_id, {
+    display_name: row.display_name || '',
+    archived: !!row.archived,
+    muted: !!row.muted,
+  }]));
+}
+
+function saveSessionPreference(email, sessionId, requested) {
+  const current = sessionPreferencesForEmail(email)[sessionId] || {
+    display_name: '', archived: false, muted: false,
+  };
+  const displayName = requested.display_name === undefined
+    ? current.display_name
+    : String(requested.display_name || '').trim().slice(0, 100);
+  const preference = {
+    display_name: displayName,
+    archived: typeof requested.archived === 'boolean' ? requested.archived : current.archived,
+    muted: typeof requested.muted === 'boolean' ? requested.muted : current.muted,
+  };
+  db.prepare(`
+    INSERT INTO session_preferences (email, session_id, display_name, archived, muted, updated_at)
+    VALUES (?, ?, ?, ?, ?, datetime('now'))
+    ON CONFLICT(email, session_id) DO UPDATE SET
+      display_name = excluded.display_name,
+      archived = excluded.archived,
+      muted = excluded.muted,
+      updated_at = excluded.updated_at
+  `).run(email, sessionId, preference.display_name || null,
+    preference.archived ? 1 : 0, preference.muted ? 1 : 0);
+  return preference;
+}
 
 // ── Automations table ────────────────────────────────────────────────────────
 
@@ -131,6 +376,7 @@ db.exec(`
   CREATE TABLE IF NOT EXISTS session_meta (
     session_id     TEXT PRIMARY KEY,
     workspace_path TEXT,
+    project_root   TEXT,
     workspace_name TEXT,
     agent_type     TEXT,
     updated_at     TEXT NOT NULL DEFAULT (datetime('now'))
@@ -140,6 +386,9 @@ try {
   const sessionMetaCols = new Set(db.pragma('table_info(session_meta)').map(r => r.name));
   if (!sessionMetaCols.has('cli_session_id')) {
     db.exec(`ALTER TABLE session_meta ADD COLUMN cli_session_id TEXT`);
+  }
+  if (!sessionMetaCols.has('project_root')) {
+    db.exec(`ALTER TABLE session_meta ADD COLUMN project_root TEXT`);
   }
 } catch {}
 
@@ -176,35 +425,59 @@ if (FIREBASE_SERVICE_ACCOUNT) {
   }
 }
 
-async function sendPushNotification(title, body, data = {}) {
-  if (!firebaseApp) return;
-  const rows = db.prepare('SELECT token FROM fcm_tokens').all();
-  if (rows.length === 0) return;
+const PUSH_TYPE_CONFIG = Object.freeze({
+  permission_required: { category: 'permission_required', channelId: 'permission-required' },
+  agent_idle:           { category: 'agent_ready',        channelId: 'agent-idle' },
+  agent_error:          { category: 'agent_error',        channelId: 'agent-error' },
+  rate_limit_active:    { category: 'agent_error',        channelId: 'agent-error' },
+  session_offline:      { category: 'session_offline',    channelId: 'session-offline' },
+  rate_limit_cleared:   { category: 'rate_limit_cleared', channelId: 'rate-limit' },
+});
 
+async function sendPushNotification(title, body, data = {}) {
   // FCM data payload values must be strings
   const strData = Object.fromEntries(Object.entries(data).map(([k, v]) => [k, String(v)]));
+  const pushConfig = PUSH_TYPE_CONFIG[data.type] || null;
+  const category = pushConfig?.category || null;
+  const sessionId = data.session_id || data.session || '';
+  const isAllowed = (email, transport) => {
+    const preferences = notificationPreferencesForEmail(email);
+    if (category && !preferences[category]) {
+      log('info', transport, 'Push skipped by notification preference', { type: data.type });
+      return false;
+    }
+    if (sessionId && sessionPreferencesForEmail(email)[sessionId]?.muted) {
+      log('info', transport, 'Push skipped because session is muted', { type: data.type, session_id: sessionId });
+      return false;
+    }
+    return true;
+  };
 
   const staleTokens = [];
-  for (const { token } of rows) {
-    try {
-      await admin.messaging().send({
-        token,
-        notification: { title, body },
-        data:         strData,
-        android: {
-          priority:     'high',
-          notification: { channel_id: data.type === 'agent_idle' ? 'agent_idle' : 'rate_limit' },
-        },
-      });
-      log('info', 'fcm', 'Push sent', { title, type: data.type });
-    } catch (e) {
-      if (
-        e.code === 'messaging/registration-token-not-registered' ||
-        e.code === 'messaging/invalid-registration-token'
-      ) {
-        staleTokens.push(token);
-      } else {
-        log('warn', 'fcm', 'Push send failed', { err: e.message });
+  if (firebaseApp) {
+    const rows = db.prepare('SELECT token, email FROM fcm_tokens').all();
+    for (const { token, email } of rows) {
+      if (!isAllowed(email, 'fcm')) continue;
+      try {
+        await admin.messaging().send({
+          token,
+          notification: { title, body },
+          data:         strData,
+          android: {
+            priority:     'high',
+            notification: { channel_id: pushConfig?.channelId || 'agent-idle' },
+          },
+        });
+        log('info', 'fcm', 'Push sent', { title, type: data.type });
+      } catch (e) {
+        if (
+          e.code === 'messaging/registration-token-not-registered' ||
+          e.code === 'messaging/invalid-registration-token'
+        ) {
+          staleTokens.push(token);
+        } else {
+          log('warn', 'fcm', 'Push send failed', { err: e.message });
+        }
       }
     }
   }
@@ -212,6 +485,29 @@ async function sendPushNotification(title, body, data = {}) {
   for (const token of staleTokens) {
     db.prepare('DELETE FROM fcm_tokens WHERE token = ?').run(token);
     log('info', 'fcm', 'Removed stale FCM token');
+  }
+
+  const staleEndpoints = [];
+  const webRows = db.prepare('SELECT email, endpoint, p256dh, auth FROM web_push_subscriptions').all();
+  for (const subscription of webRows) {
+    if (!isAllowed(subscription.email, 'web-push')) continue;
+    try {
+      await webpush.sendNotification({
+        endpoint: subscription.endpoint,
+        keys: { p256dh: subscription.p256dh, auth: subscription.auth },
+      }, JSON.stringify({ title, body, data }), { TTL: 300, urgency: 'high' });
+      log('info', 'web-push', 'Push sent', { title, type: data.type });
+    } catch (e) {
+      if (e.statusCode === 404 || e.statusCode === 410) {
+        staleEndpoints.push(subscription.endpoint);
+      } else {
+        log('warn', 'web-push', 'Push send failed', { status: e.statusCode, err: e.message });
+      }
+    }
+  }
+  for (const endpoint of staleEndpoints) {
+    db.prepare('DELETE FROM web_push_subscriptions WHERE endpoint = ?').run(endpoint);
+    log('info', 'web-push', 'Removed stale Web Push subscription');
   }
 }
 
@@ -252,6 +548,13 @@ function historiesMatch(existingRows, incomingRows) {
     }
   }
   return true;
+}
+
+function getIncrementalHistoryPlan(sessionId, incomingRows, existingCount, tailLimit = 50) {
+  if (!Array.isArray(incomingRows) || incomingRows.length < existingCount) return null;
+  const tailSize = Math.min(Math.max(0, existingCount), Math.max(1, tailLimit));
+  const existingTail = tailSize > 0 ? getHistoryRowsTail(sessionId, tailSize) : [];
+  return buildIncrementalHistoryPlan(existingCount, existingTail, incomingRows);
 }
 
 function historiesTailLikelyMatch(sessionId, incomingRows, tailLimit = 50) {
@@ -376,6 +679,7 @@ function insertMessageIdempotent(session, role, content, clientMsgId, status, se
   return stmtInsertIdempotent.run(session, role, content, clientMsgId, status, sequence, blocksJson);
 }
 const stmtDeleteSession  = db.prepare('DELETE FROM messages WHERE session = ?');
+const stmtDeleteSessionSuffix = db.prepare('DELETE FROM messages WHERE session = ? AND id >= ?');
 
 // ── Session history queries ─────────────────────────────────────────────────
 // Returns distinct sessions with their first user message, message count, and timestamps.
@@ -387,6 +691,7 @@ const stmtSessionHistory = db.prepare(`
     MIN(m.ts)               AS created_at,
     MAX(m.ts)               AS last_active_at,
     sm.workspace_path,
+    sm.project_root,
     sm.workspace_name,
     sm.agent_type,
     sm.cli_session_id
@@ -398,19 +703,53 @@ const stmtSessionHistory = db.prepare(`
   LIMIT ?
 `);
 const stmtUpsertSessionMeta = db.prepare(`
-  INSERT INTO session_meta (session_id, workspace_path, workspace_name, agent_type, cli_session_id, updated_at)
-  VALUES (?, ?, ?, ?, ?, datetime('now'))
+  INSERT INTO session_meta (session_id, workspace_path, project_root, workspace_name, agent_type, cli_session_id, updated_at)
+  VALUES (?, ?, ?, ?, ?, ?, datetime('now'))
   ON CONFLICT(session_id) DO UPDATE SET
     workspace_path = COALESCE(excluded.workspace_path, workspace_path),
+    project_root   = COALESCE(excluded.project_root, project_root),
     workspace_name = COALESCE(excluded.workspace_name, workspace_name),
     agent_type     = COALESCE(excluded.agent_type, agent_type),
     cli_session_id = COALESCE(excluded.cli_session_id, cli_session_id),
     updated_at     = datetime('now')
 `);
 const stmtGetSessionMeta = db.prepare(
-  `SELECT session_id, workspace_path, workspace_name, agent_type, cli_session_id, updated_at
+  `SELECT session_id, workspace_path, project_root, workspace_name, agent_type, cli_session_id, updated_at
    FROM session_meta WHERE session_id = ?`
 );
+const persistSessionMetaBatch = db.transaction((sessions) => {
+  let changed = 0;
+  for (const session of sessions) {
+    const id = typeof session === 'string' ? session : session?.session_id;
+    if (!id || !session || typeof session !== 'object') continue;
+    const next = {
+      workspace_path: session.workspace_path || null,
+      project_root: session.project_root || null,
+      workspace_name: session.workspace_name || null,
+      agent_type: session.agent_type || null,
+      cli_session_id: session.cli_session_id || null,
+    };
+    const existing = stmtGetSessionMeta.get(id);
+    if (
+      existing
+      && existing.workspace_path === next.workspace_path
+      && existing.project_root === next.project_root
+      && existing.workspace_name === next.workspace_name
+      && existing.agent_type === next.agent_type
+      && existing.cli_session_id === next.cli_session_id
+    ) continue;
+    stmtUpsertSessionMeta.run(
+      id,
+      next.workspace_path,
+      next.project_root,
+      next.workspace_name,
+      next.agent_type,
+      next.cli_session_id,
+    );
+    changed++;
+  }
+  return changed;
+});
 const stmtGetHistory     = db.prepare(
   'SELECT id, role, content, content_blocks, status, sequence, ts FROM messages WHERE session = ? ORDER BY id ASC'
 );
@@ -699,13 +1038,75 @@ app.post('/fcm-token', requireBearerToken, express.json(), (req, res) => {
   res.json({ ok: true });
 });
 
+const pushMutationRateLimit = createPrincipalRateLimit({
+  name: 'push subscription mutation', limit: 20,
+  principal: req => authenticatedEmail(req),
+});
+const preferenceMutationRateLimit = createPrincipalRateLimit({
+  name: 'preference mutation', limit: 60,
+  principal: req => authenticatedEmail(req),
+});
+const historyReadRateLimit = createPrincipalRateLimit({
+  name: 'history read', limit: 180,
+  principal: req => authenticatedEmail(req),
+});
+const MAX_WEB_PUSH_SUBSCRIPTIONS_PER_USER = 10;
+
+app.get('/api/push/web-config', requireAnyAuth, (req, res) => {
+  res.json({ enabled: true, public_key: vapidKeys.publicKey });
+});
+
+app.post('/api/push/web-subscription', requireAnyAuth, pushMutationRateLimit, (req, res) => {
+  const subscription = validateWebPushSubscription(req.body);
+  if (!subscription.ok) return res.status(400).json({ error: subscription.error });
+  const { endpoint, p256dh, auth } = subscription;
+  const email = authenticatedEmail(req);
+  const existing = db.prepare('SELECT email FROM web_push_subscriptions WHERE endpoint = ?').get(endpoint);
+  if (existing && existing.email !== email) {
+    return res.status(409).json({ error: 'Web Push endpoint is already registered' });
+  }
+  if (!existing) {
+    const count = db.prepare('SELECT COUNT(*) AS count FROM web_push_subscriptions WHERE email = ?').get(email).count;
+    if (count >= MAX_WEB_PUSH_SUBSCRIPTIONS_PER_USER) {
+      db.prepare(`
+        DELETE FROM web_push_subscriptions
+        WHERE id = (
+          SELECT id FROM web_push_subscriptions WHERE email = ? ORDER BY updated_at ASC, id ASC LIMIT 1
+        )
+      `).run(email);
+      log('info', 'web-push', 'Removed oldest subscription at per-user cap', { email });
+    }
+  }
+  db.prepare(`
+    INSERT INTO web_push_subscriptions (email, endpoint, p256dh, auth, updated_at)
+    VALUES (?, ?, ?, ?, ?)
+    ON CONFLICT(endpoint) DO UPDATE SET
+      email = excluded.email,
+      p256dh = excluded.p256dh,
+      auth = excluded.auth,
+      updated_at = excluded.updated_at
+  `).run(email, endpoint, p256dh, auth, new Date().toISOString());
+  log('info', 'web-push', 'Browser subscription registered', { email });
+  res.json({ ok: true });
+});
+
+app.delete('/api/push/web-subscription', requireAnyAuth, pushMutationRateLimit, (req, res) => {
+  const endpointResult = validateWebPushEndpoint(req.body?.endpoint);
+  if (!endpointResult.ok) return res.status(400).json({ error: endpointResult.error });
+  db.prepare('DELETE FROM web_push_subscriptions WHERE email = ? AND endpoint = ?')
+    .run(authenticatedEmail(req), endpointResult.endpoint);
+  res.json({ ok: true });
+});
+
 app.get('/auth/logout', (req, res) => req.logout(() => res.redirect('/auth/google')));
 
 // Auth gate middleware
 const LAN_PREFIXES = ['192.168.', '10.', '172.16.', '::ffff:192.168.', '::ffff:10.'];
+const LOOPBACK_PREFIXES = ['127.', '::1', '::ffff:127.'];
 function isLAN(req) {
   const ip = req.ip || req.connection?.remoteAddress || '';
-  return LAN_PREFIXES.some(p => ip.startsWith(p));
+  return LAN_PREFIXES.some(p => ip.startsWith(p))
+    || (ALLOW_LOOPBACK_BYPASS && LOOPBACK_PREFIXES.some(p => ip.startsWith(p)));
 }
 function requireAuth(req, res, next) {
   if ((ALLOW_LAN_BYPASS && isLAN(req)) || req.isAuthenticated()) return next(); // SEC-03: LAN bypass is opt-in
@@ -817,6 +1218,262 @@ function requireAnyAuth(req, res, next) {
   }
 }
 
+function authenticatedEmail(req) {
+  return req.appUser?.email || req.user?.email || ALLOWED_EMAIL || 'lan-user';
+}
+
+app.get('/api/preferences/notifications', requireAnyAuth, (req, res) => {
+  try {
+    res.json({ preferences: notificationPreferencesForEmail(authenticatedEmail(req)) });
+  } catch (e) {
+    log('error', 'preferences', 'Notification preference read failed', { err: e.message });
+    res.status(500).json({ error: 'Failed to load notification preferences' });
+  }
+});
+
+app.put('/api/preferences/notifications', requireAnyAuth, preferenceMutationRateLimit, (req, res) => {
+  const requested = req.body?.preferences || req.body || {};
+  if (
+    requested.permission_required !== undefined && typeof requested.permission_required !== 'boolean' ||
+    requested.agent_ready !== undefined && typeof requested.agent_ready !== 'boolean' ||
+    requested.agent_error !== undefined && typeof requested.agent_error !== 'boolean' ||
+    requested.session_offline !== undefined && typeof requested.session_offline !== 'boolean' ||
+    requested.rate_limit_cleared !== undefined && typeof requested.rate_limit_cleared !== 'boolean'
+  ) {
+    return res.status(400).json({ error: 'Notification preferences must be boolean values' });
+  }
+  try {
+    const preferences = saveNotificationPreferences(authenticatedEmail(req), requested);
+    res.json({ ok: true, preferences });
+  } catch (e) {
+    log('error', 'preferences', 'Notification preference update failed', { err: e.message });
+    res.status(500).json({ error: 'Failed to save notification preferences' });
+  }
+});
+
+app.get('/api/maintenance/validation', requireAnyAuth, (req, res) => {
+  try {
+    res.json({ validations: nightlyValidationStatuses() });
+  } catch (e) {
+    log('error', 'validation', 'Nightly validation status read failed', { err: e.message });
+    res.status(500).json({ error: 'Failed to read nightly validation status' });
+  }
+});
+
+app.put('/api/maintenance/validation', requireAnyAuth, (req, res) => {
+  try {
+    const validation = saveNightlyValidationStatus(req.body?.validation || req.body || {});
+    const validations = nightlyValidationStatuses();
+    const failures = validations.filter(item => item.status !== 'pass');
+    broadcastToBrowsers({
+      type: 'nightly_validation_status',
+      validations,
+      failures,
+      server_ts: new Date().toISOString(),
+    });
+    res.json({ ok: true, validation, failures });
+  } catch (e) {
+    log('warn', 'validation', 'Nightly validation status update rejected', { err: e.message });
+    res.status(400).json({ error: e.message });
+  }
+});
+
+app.get('/api/preferences/sessions', requireAnyAuth, (req, res) => {
+  try {
+    res.json({ preferences: sessionPreferencesForEmail(authenticatedEmail(req)) });
+  } catch (e) {
+    log('error', 'preferences', 'Session preference read failed', { err: e.message });
+    res.status(500).json({ error: 'Failed to load session preferences' });
+  }
+});
+
+app.put('/api/preferences/sessions/:sessionId', requireAnyAuth, preferenceMutationRateLimit, (req, res) => {
+  const sessionId = String(req.params.sessionId || '').trim();
+  const requested = req.body?.preference || req.body || {};
+  if (!sessionId || sessionId.length > 200) return res.status(400).json({ error: 'Invalid session id' });
+  if (
+    requested.display_name !== undefined && typeof requested.display_name !== 'string' ||
+    requested.archived !== undefined && typeof requested.archived !== 'boolean' ||
+    requested.muted !== undefined && typeof requested.muted !== 'boolean'
+  ) {
+    return res.status(400).json({ error: 'Invalid session preference values' });
+  }
+  try {
+    const preference = saveSessionPreference(authenticatedEmail(req), sessionId, requested);
+    res.json({ ok: true, session_id: sessionId, preference });
+  } catch (e) {
+    log('error', 'preferences', 'Session preference update failed', { err: e.message, session_id: sessionId });
+    res.status(500).json({ error: 'Failed to save session preference' });
+  }
+});
+
+app.delete('/api/preferences/sessions/:sessionId', requireAnyAuth, preferenceMutationRateLimit, (req, res) => {
+  const sessionId = String(req.params.sessionId || '').trim();
+  if (!sessionId || sessionId.length > 200) return res.status(400).json({ error: 'Invalid session id' });
+  try {
+    db.prepare('DELETE FROM session_preferences WHERE email = ? AND session_id = ?')
+      .run(authenticatedEmail(req), sessionId);
+    res.json({ ok: true, session_id: sessionId });
+  } catch (e) {
+    log('error', 'preferences', 'Session preference reset failed', { err: e.message, session_id: sessionId });
+    res.status(500).json({ error: 'Failed to reset session preference' });
+  }
+});
+
+function historyStoreStats(retentionDays = 90) {
+  const days = Math.max(1, Math.min(3650, Number(retentionDays) || 90));
+  const cutoff = Math.floor(Date.now() / 1000) - days * 86400;
+  const totals = db.prepare(`
+    SELECT COUNT(*) AS message_count, COUNT(DISTINCT session) AS session_count,
+           MIN(ts) AS oldest_ts, MAX(ts) AS newest_ts
+    FROM messages
+  `).get();
+  const inactiveRows = db.prepare(`
+    SELECT session, COUNT(*) AS message_count, MAX(ts) AS last_ts
+    FROM messages
+    GROUP BY session
+    HAVING MAX(ts) < ?
+    ORDER BY MAX(ts) ASC
+  `).all(cutoff).filter(row => !proxySockets.has(row.session));
+  const fileBytes = fs.existsSync(HISTORY_DB_PATH) ? fs.statSync(HISTORY_DB_PATH).size : 0;
+  const walPath = HISTORY_DB_PATH + '-wal';
+  const walBytes = fs.existsSync(walPath) ? fs.statSync(walPath).size : 0;
+  const backups = fs.existsSync(HISTORY_BACKUP_DIR)
+    ? fs.readdirSync(HISTORY_BACKUP_DIR)
+      .filter(name => /^messages-.+\.db$/.test(name))
+      .map(name => {
+        const backupPath = path.join(HISTORY_BACKUP_DIR, name);
+        const stat = fs.statSync(backupPath);
+        return { path: backupPath, bytes: stat.size, created_at: stat.mtime.toISOString() };
+      })
+      .sort((a, b) => b.created_at.localeCompare(a.created_at))
+    : [];
+  return {
+    db_bytes: fileBytes,
+    wal_bytes: walBytes,
+    message_count: totals.message_count || 0,
+    session_count: totals.session_count || 0,
+    oldest_ts: totals.oldest_ts || null,
+    newest_ts: totals.newest_ts || null,
+    retention_days: days,
+    inactive_candidate_sessions: inactiveRows.length,
+    inactive_candidate_messages: inactiveRows.reduce((sum, row) => sum + row.message_count, 0),
+    backup_count: backups.length,
+    latest_backup: backups[0] || null,
+    _candidate_ids: inactiveRows.map(row => row.session),
+  };
+}
+
+async function createHistoryBackup() {
+  fs.mkdirSync(HISTORY_BACKUP_DIR, { recursive: true });
+  const stamp = new Date().toISOString().replace(/[:.]/g, '-');
+  const destination = path.join(HISTORY_BACKUP_DIR, `messages-${stamp}.db`);
+  const partial = destination + '.partial';
+  await db.backup(partial);
+  fs.renameSync(partial, destination);
+  return {
+    path: destination,
+    bytes: fs.statSync(destination).size,
+    created_at: new Date().toISOString(),
+  };
+}
+
+let historyBackupJob = { status: 'idle' };
+function startHistoryBackupJob() {
+  if (historyBackupJob.status === 'running') return historyBackupJob;
+  historyBackupJob = { status: 'running', started_at: new Date().toISOString() };
+  createHistoryBackup().then(backup => {
+    historyBackupJob = { status: 'complete', started_at: historyBackupJob.started_at, completed_at: new Date().toISOString(), backup };
+    log('info', 'history-maintenance', 'History backup created', { bytes: backup.bytes });
+  }).catch(error => {
+    historyBackupJob = { status: 'failed', started_at: historyBackupJob.started_at, completed_at: new Date().toISOString(), error: error.message };
+    log('error', 'history-maintenance', 'History backup failed', { err: error.message });
+  });
+  return historyBackupJob;
+}
+
+app.get('/api/maintenance/history', requireAnyAuth, (req, res) => {
+  try {
+    const { _candidate_ids, ...stats } = historyStoreStats(req.query.retention_days);
+    res.json({ stats, policy: { default_retention_days: 90, prune_requires_backup: true } });
+  } catch (e) {
+    log('error', 'history-maintenance', 'History stats failed', { err: e.message });
+    res.status(500).json({ error: 'Failed to measure history store' });
+  }
+});
+
+app.post('/api/maintenance/history/backup', requireAnyAuth, (req, res) => {
+  if (historyBackupJob.status !== 'running' && req.body?.reuse_recent !== false) {
+    const { _candidate_ids, ...stats } = historyStoreStats();
+    const latest = stats.latest_backup;
+    const ageMs = latest ? Date.now() - Date.parse(latest.created_at) : Infinity;
+    if (latest && latest.bytes === stats.db_bytes && ageMs < 24 * 60 * 60 * 1000) {
+      historyBackupJob = {
+        status: 'complete',
+        completed_at: latest.created_at,
+        backup: latest,
+        reused: true,
+      };
+    }
+  }
+  if (historyBackupJob.status === 'complete' && historyBackupJob.reused) {
+    return res.json({ ok: true, job: historyBackupJob });
+  }
+  const job = startHistoryBackupJob();
+  res.status(job.status === 'complete' ? 200 : 202).json({ ok: true, job });
+});
+
+app.get('/api/maintenance/history/backup', requireAnyAuth, (req, res) => {
+  res.json({ job: historyBackupJob });
+});
+
+app.post('/api/maintenance/history/prune', requireAnyAuth, async (req, res) => {
+  const retentionDays = Math.max(1, Math.min(3650, Number(req.body?.retention_days) || 90));
+  if (req.body?.confirm !== 'PRUNE_INACTIVE_HISTORY') {
+    return res.status(400).json({ error: 'confirm must equal PRUNE_INACTIVE_HISTORY' });
+  }
+  try {
+    const before = historyStoreStats(retentionDays);
+    const backup = before.latest_backup;
+    const backupAgeMs = backup ? Date.now() - Date.parse(backup.created_at) : Infinity;
+    if (!backup || req.body?.backup_path !== backup.path || backupAgeMs > 24 * 60 * 60 * 1000) {
+      return res.status(409).json({
+        error: 'A completed backup from the last 24 hours must be confirmed by exact backup_path',
+        latest_backup: backup || null,
+      });
+    }
+    const deleteMessages = db.prepare('DELETE FROM messages WHERE session = ?');
+    const deleteMeta = db.prepare('DELETE FROM session_meta WHERE session_id = ?');
+    const prune = db.transaction(sessionIds => {
+      let deletedMessages = 0;
+      for (const sessionId of sessionIds) {
+        deletedMessages += deleteMessages.run(sessionId).changes;
+        deleteMeta.run(sessionId);
+      }
+      return deletedMessages;
+    });
+    const deletedMessages = prune(before._candidate_ids);
+    const { _candidate_ids, ...after } = historyStoreStats(retentionDays);
+    log('warn', 'history-maintenance', 'Inactive history pruned', {
+      retention_days: retentionDays,
+      sessions: before._candidate_ids.length,
+      messages: deletedMessages,
+      backup_bytes: backup.bytes,
+    });
+    res.json({
+      ok: true,
+      retention_days: retentionDays,
+      pruned_sessions: before._candidate_ids.length,
+      pruned_messages: deletedMessages,
+      backup,
+      stats: after,
+    });
+  } catch (e) {
+    log('error', 'history-maintenance', 'History prune failed', { err: e.message });
+    res.status(500).json({ error: 'Failed to prune history store' });
+  }
+});
+
 app.get('/api/automations', requireAnyAuth, (req, res) => {
   try {
     const rows = stmtListAutomations.all();
@@ -908,9 +1565,12 @@ app.post('/api/automations/:id/run', requireAnyAuth, (req, res) => {
 // Returns past sessions with preview text, message counts, and timestamps.
 // Used by the "Resume Session" UI in the web and Android apps.
 
-app.get('/api/sessions/history', requireAnyAuth, (req, res) => {
+app.get('/api/sessions/history', requireAnyAuth, historyReadRateLimit, (req, res) => {
   try {
-    const limit = Math.min(parseInt(req.query.limit) || 50, 200);
+    const parsedLimit = Number.parseInt(req.query.limit, 10);
+    const limit = Number.isFinite(parsedLimit) && parsedLimit > 0
+      ? Math.min(parsedLimit, 200)
+      : 50;
     const rows = stmtSessionHistory.all(limit);
     // Filter out sessions that are currently active (already in sidebar)
     const activeSessions = new Set(proxySockets.keys());
@@ -923,6 +1583,7 @@ app.get('/api/sessions/history', requireAnyAuth, (req, res) => {
         created_at:         r.created_at ? new Date(r.created_at * 1000).toISOString() : null,
         last_active_at:     r.last_active_at ? new Date(r.last_active_at * 1000).toISOString() : null,
         workspace_path:     r.workspace_path || null,
+        project_root:       r.project_root || null,
         workspace_name:     r.workspace_name || null,
         agent_type:         r.agent_type || null,
         cli_session_id:     r.cli_session_id || null,
@@ -934,11 +1595,21 @@ app.get('/api/sessions/history', requireAnyAuth, (req, res) => {
   }
 });
 
-app.get('/api/sessions/:sessionId/messages', requireAnyAuth, (req, res) => {
+app.get('/api/sessions/:sessionId/messages', requireAnyAuth, historyReadRateLimit, (req, res) => {
   try {
+    if (!boundedString(req.params.sessionId, { max: 200 })) {
+      return res.status(400).json({ error: 'Invalid session id' });
+    }
+    const hasLimitParameter = req.query.limit !== undefined
+      || req.query.tail_limit !== undefined
+      || req.query.history_limit !== undefined;
     const requestedLimit = req.query.full === 'true'
       ? 0
       : Number(req.query.limit || req.query.tail_limit || req.query.history_limit || 0);
+    if (req.query.full !== 'true' && hasLimitParameter
+      && (!Number.isFinite(requestedLimit) || requestedLimit <= 0)) {
+      return res.status(400).json({ error: 'History limit must be a positive number' });
+    }
     if (Number.isFinite(requestedLimit) && requestedLimit > 0) {
       const limit = Math.max(1, Math.min(1000, Math.floor(requestedLimit)));
       const result = getEffectiveHistoryTail(req.params.sessionId, limit);
@@ -982,7 +1653,9 @@ app.get('/manifest.json', (req, res) => {
   res.sendFile(path.join(PUBLIC_DIR, 'manifest.json'));
 });
 
-app.use('/', requireAuth, express.static(PUBLIC_DIR, {
+// Preserve browser OAuth redirects while allowing headless/native clients to
+// fetch the exact served app shell with a scoped, signed bearer JWT.
+app.use('/', requireBrowserOrBearerAuth, express.static(PUBLIC_DIR, {
   setHeaders: (res, filePath) => {
     const lower = String(filePath || '').toLowerCase();
     if (lower.endsWith(path.sep + 'index.html') || lower.endsWith('/index.html') || lower.endsWith('\\index.html')) {
@@ -1004,11 +1677,23 @@ app.use('/', requireAuth, express.static(PUBLIC_DIR, {
 const proxySockets    = new Map();  // sessionId → proxy WebSocket
 const sessionProxyId  = new Map();  // sessionId → proxy_id that owns it (A6-05)
 const proxyConnections = new Set(); // all live proxy WebSocket connections (for launch routing)
+const proxySessionClaims = new Map(); // proxy WebSocket -> { proxy_id, sessions }
 const browserClients  = new Set();  // all connected browser WebSockets
 const sessionMeta     = new Map();  // sessionId → latest proxy session metadata
 const sessionHealth   = new Map();  // sessionId → 'healthy'|'degraded'|'disconnected'
 const sessionLastSeen = new Map();  // sessionId → Date.now() of last activity
 const sessionActivity = new Map();  // sessionId → last known activity kind (A12-02)
+const sendLifecycle = new SendLifecycleTracker();
+
+function shouldSendPush() {
+  return NOTIFY_EVEN_IF_CONNECTED || browserClients.size === 0;
+}
+
+function notificationSessionName(sessionId) {
+  const meta = sessionMeta.get(sessionId) || {};
+  return meta.display_name || meta.name || meta.session_name || meta.workspace_name
+    || String(sessionId || 'Agent').slice(0, 32);
+}
 
 const cachedChatLists = new Map();  // sessionId -> latest chat_list payload
 
@@ -1053,7 +1738,7 @@ const statusBroadcastState = new Map();
 
 function broadcastToBrowsers(msg) {
   const data = JSON.stringify(msg);
-  const isHistoryBroadcast = msg?.type === 'history' || msg?.type === 'history_snapshot';
+  const isHistoryBroadcast = isUnsolicitedHistoryMessage(msg);
   for (const ws of browserClients) {
     if (ws.readyState !== WebSocket.OPEN) continue;
     // Unsolicited history is expendable live-tail state. Do not queue it in
@@ -1061,6 +1746,32 @@ function broadcastToBrowsers(msg) {
     if (isHistoryBroadcast && !canBroadcastHistoryToBrowser(ws)) continue;
     ws.send(data);
   }
+}
+
+let duplicateProxyAlarms = [];
+function refreshDuplicateProxyAlarms() {
+  const next = buildDuplicateProxyAlarms(proxySessionClaims, WebSocket.OPEN);
+  if (JSON.stringify(next) === JSON.stringify(duplicateProxyAlarms)) return;
+  duplicateProxyAlarms = next;
+  log(next.length ? 'warn' : 'info', 'proxy-ws',
+    next.length ? 'Duplicate proxy alarm active' : 'Duplicate proxy alarm cleared',
+    { duplicate_sessions: next.map(item => item.session_id) });
+  broadcastToBrowsers({
+    type: 'duplicate_proxy_alarm',
+    active: next.length > 0,
+    duplicate_sessions: next,
+    server_ts: new Date().toISOString(),
+  });
+}
+
+// Static app-shell requests are browser navigation unless the caller explicitly
+// presents a bearer/query token. Browsers need requireAuth's OAuth redirect;
+// native/headless clients need requireAnyAuth's JSON bearer-token errors.
+function requireBrowserOrBearerAuth(req, res, next) {
+  const header = req.headers['authorization'] || '';
+  const token = header.startsWith('Bearer ') ? header.slice(7) : (req.query.token || '');
+  if (!token) return requireAuth(req, res, next);
+  return requireAnyAuth(req, res, next);
 }
 
 function broadcastToBrowsersExcept(msg, excludedWs) {
@@ -1442,10 +2153,19 @@ function expirePrompt(sessionId, promptId) {
 // ── Session health management (A2-02) ────────────────────────────────────────
 
 function setHealth(sessionId, health) {
-  if (sessionHealth.get(sessionId) === health) return;
+  const previousHealth = sessionHealth.get(sessionId);
+  if (previousHealth === health) return;
   sessionHealth.set(sessionId, health);
   log('info', 'health', `${sessionId} → ${health}`);
   broadcastToBrowsers({ type: 'session_health', session: sessionId, health });
+  if (health === 'disconnected' && previousHealth && shouldSendPush()) {
+    const name = notificationSessionName(sessionId);
+    sendPushNotification(
+      `${name} went offline`,
+      'The agent session disconnected from the relay.',
+      { type: 'session_offline', activity_type: 'offline', session_id: sessionId, session_name: name },
+    ).catch(() => {});
+  }
 }
 
 function touchSession(sessionId) {
@@ -1616,6 +2336,7 @@ wss.on('connection', (ws, req) => {
 function handleProxyConnection(ws, req) {
   log('info', 'proxy-ws', 'Agent proxy connected');
   proxyConnections.add(ws);
+  proxySessionClaims.set(ws, { proxy_id: null, sessions: new Set() });
   startHeartbeat(ws, 'proxy');
   const proxySessions = new Set();
   let thisProxyId = null; // set when connection_hello arrives with proxy_id (A6-05)
@@ -1674,6 +2395,7 @@ function handleProxyConnection(ws, req) {
       if (helloTimeout) clearTimeout(helloTimeout);
 
       thisProxyId = msg.proxy_id || null;
+      proxySessionClaims.get(ws).proxy_id = thisProxyId;
       log('info', 'proxy-ws', 'Proxy hello received', {
         role:     msg.peer_role,
         version:  msg.protocol_version,
@@ -1710,6 +2432,7 @@ function handleProxyConnection(ws, req) {
       // This handles Antigravity IDE restarts: the proxy WS stays connected but CDP targets
       // change, so old session IDs pile up on top of new ones without this cleanup.
       const incomingIds = new Set(sessions.map(s => (typeof s === 'string' ? s : s?.session_id)).filter(Boolean));
+      proxySessionClaims.set(ws, { proxy_id: snapshotProxyId, sessions: incomingIds });
       const evictedResumeSessions = [];
       for (const [sid, sock] of proxySockets) {
         if (sock === ws && !incomingIds.has(sid)) {
@@ -1795,17 +2518,24 @@ function handleProxyConnection(ws, req) {
             ...s,
             session_id: id,
           });
-          // Persist workspace info for resume history
-          try { stmtUpsertSessionMeta.run(id, s.workspace_path || null, s.workspace_name || null, s.agent_type || null, s.cli_session_id || null); } catch {}
         }
         touchSession(id);
       });
+      let persistedSessionMeta = 0;
+      try { persistedSessionMeta = persistSessionMetaBatch(sessions); } catch (error) {
+        log('warn', 'proxy-ws', 'Session metadata batch persistence failed', { err: error.message });
+      }
       if (Array.isArray(msg.workspaces)) cachedWorkspaces = msg.workspaces;
-      log('info', 'proxy-ws', 'Sessions registered', { proxy_id: snapshotProxyId, sessions: Array.from(proxySessions) });
+      log('info', 'proxy-ws', 'Sessions registered', {
+        proxy_id: snapshotProxyId,
+        session_count: proxySessions.size,
+        metadata_rows_changed: persistedSessionMeta,
+      });
       // Notify the proxy about sessions it re-registered that were already owned by another proxy
       if (duplicateSessions.length > 0) {
         ws.send(JSON.stringify({ type: 'session_snapshot_ack', duplicate_sessions: duplicateSessions }));
       }
+      refreshDuplicateProxyAlarms();
       broadcastToBrowsers({ type: 'session_list', sessions: getSessionList(), workspaces: cachedWorkspaces });
 
     // ── Session meta backfill (populate workspace info for historical sessions)
@@ -1813,46 +2543,56 @@ function handleProxyConnection(ws, req) {
       const sessions = msg.sessions;
       if (Array.isArray(sessions)) {
         let count = 0;
-        for (const s of sessions) {
-          if (!s.session_id) continue;
-          try { stmtUpsertSessionMeta.run(s.session_id, s.workspace_path || null, s.workspace_name || null, s.agent_type || null, s.cli_session_id || null); count++; } catch {}
+        try { count = persistSessionMetaBatch(sessions); } catch (error) {
+          log('warn', 'proxy-ws', 'Session metadata backfill failed', { err: error.message });
         }
-        log('info', 'proxy-ws', `Backfilled session_meta for ${count} sessions`);
+        log('info', 'proxy-ws', `Backfilled session_meta for ${count} changed sessions`);
       }
 
     // ── Thinking / activity status ─────────────────────────────────────────
     } else if (t === 'status' || t === 'proxy_status') {
       const id = msg.session || msg.session_id;
       if (id) touchSession(id);
+      let broadcastActivity = msg.activity;
       if (id && msg.activity) {
+        const previousActivity = sessionMeta.get(id)?.activity || null;
+        broadcastActivity = normalizeActivityTimeline(
+          msg.activity,
+          previousActivity,
+          new Date().toISOString(),
+        );
         if (sessionMeta.has(id)) {
           sessionMeta.set(id, {
             ...sessionMeta.get(id),
-            activity: msg.activity,
+            activity: broadcastActivity,
             status: msg.status || sessionMeta.get(id).status,
             last_seen_at: new Date().toISOString(),
           });
         }
         // Track activity kind for idle-transition FCM (A12-02)
         const prevKind = sessionActivity.get(id);
-        const currKind = (typeof msg.activity === 'object' ? msg.activity?.kind : msg.activity) || null;
+        const currKind = (typeof broadcastActivity === 'object' ? broadcastActivity?.kind : broadcastActivity) || null;
         sessionActivity.set(id, currKind);
         if ((prevKind === 'generating' || prevKind === 'thinking') && currKind === 'idle') {
-          if (NOTIFY_EVEN_IF_CONNECTED || browserClients.size === 0) {
-            const meta = sessionMeta.get(id) || {};
-            const name = meta.name || meta.session_name || id.slice(0, 8);
+          if (shouldSendPush()) {
+            const name = notificationSessionName(id);
             sendPushNotification(
               `${name} is ready`,
               'Agent has finished and is waiting for input.',
-              { type: 'agent_idle', session_id: id }
+              { type: 'agent_idle', activity_type: 'idle', session_id: id, session_name: name }
             ).catch(() => {});
           }
         }
       }
       // Normalise to old shape so existing frontend still works
-      const statusMsg = { type: 'status', session: id || msg.session, thinking: msg.thinking, label: msg.label, activity: msg.activity };
+      const statusMsg = { type: 'status', session: id || msg.session, thinking: msg.thinking, label: msg.label, activity: broadcastActivity };
       if (msg.thinking_content) statusMsg.thinking_content = msg.thinking_content;
       if (shouldBroadcastStatus(id, statusMsg)) broadcastToBrowsers(statusMsg);
+      const agentStarted = sendLifecycle.consumeActivity({ ...msg, session_id: id, activity: broadcastActivity });
+      if (agentStarted) {
+        broadcastToBrowsers(agentStarted);
+        log('info', 'send', 'agent_started', { session: id, cid: agentStarted.client_message_id });
+      }
 
     // ── Incoming agent message ─────────────────────────────────────────────
     } else if (t === 'message' || t === 'proxy_message') {
@@ -2027,6 +2767,14 @@ function handleProxyConnection(ws, req) {
       const timer = setTimeout(() => expirePrompt(sessionId, promptId), timeoutMs);
       pendingPrompts.set(key, { prompt: msg, timer });
       broadcastToBrowsers(msg);
+      if (shouldSendPush()) {
+        const name = notificationSessionName(sessionId);
+        sendPushNotification(
+          `${name} needs permission`,
+          String(msg.title || msg.message || msg.description || 'Review the pending permission request.').slice(0, 180),
+          { type: 'permission_required', activity_type: 'permission', session_id: sessionId, session_name: name },
+        ).catch(() => {});
+      }
       log('info', 'prompt', 'Permission prompt received', { session: sessionId, prompt_id: promptId });
 
     // ── Permission prompt expired (proxy-originated dismiss) ──────────────
@@ -2055,8 +2803,17 @@ function handleProxyConnection(ws, req) {
       const promptId  = msg.prompt_id;
       if (!sessionId || !promptId) return;
       const key = `${sessionId}:${promptId}`;
+      const isNewPrompt = !pendingErrorPrompts.has(key);
       pendingErrorPrompts.set(key, { prompt: msg });
       broadcastToBrowsers(msg);
+      if (isNewPrompt && shouldSendPush()) {
+        const name = notificationSessionName(sessionId);
+        sendPushNotification(
+          `${name} needs attention`,
+          String(msg.title || msg.error || msg.message || 'The agent reported an error.').slice(0, 180),
+          { type: 'agent_error', activity_type: 'error', session_id: sessionId, session_name: name },
+        ).catch(() => {});
+      }
       log('info', 'prompt', 'Session error prompt received', { session: sessionId, prompt_id: promptId });
 
     } else if (t === 'session_error_prompt_cleared') {
@@ -2249,7 +3006,7 @@ function handleProxyConnection(ws, req) {
       if (targetWs && targetWs.readyState === WebSocket.OPEN) {
         targetWs.send(JSON.stringify(msg));
       } else {
-        broadcastToBrowsers(msg);
+        broadcastToBrowsers(buildUnsolicitedHistoryChunkPayload(msg));
       }
       log('info', 'history', 'Forwarded native history chunk', {
         session: msg.session_id || msg.session,
@@ -2280,7 +3037,31 @@ function handleProxyConnection(ws, req) {
       // list-view transitions intentionally send [] to clear the previous
       // conversation; ignoring that snapshot causes the next native turns to
       // be appended behind stale SQLite history and appear duplicated.
-      if (!alreadyMatches) {
+      const incrementalPlan = !alreadyMatches
+        ? getIncrementalHistoryPlan(id, messages, existingLength)
+        : null;
+      if (incrementalPlan && incrementalPlan.rows.length > 0) {
+        db.transaction((rows) => {
+          if (incrementalPlan.mode === 'replace_suffix') {
+            stmtDeleteSessionSuffix.run(id, incrementalPlan.delete_from_id);
+            sessionSeq.delete(id);
+          }
+          rows.forEach(m => insertMessage(id, m.role, m.content, null, 'delivered', nextSeq(id), m.ts, m.content_blocks));
+        })(incrementalPlan.rows);
+        log('info', 'history', `${incrementalPlan.mode === 'append' ? 'Appended' : 'Replaced suffix with'} ${incrementalPlan.rows.length} msgs`, {
+          session: id,
+          previous: incrementalPlan.existing_count,
+          prefix: incrementalPlan.prefix_count ?? incrementalPlan.existing_count,
+          total: messages.length,
+        });
+        scheduleHistoryBroadcast(id, () => {
+          const total = getHistoryCount(id);
+          const rows = total > UNSOLICITED_HISTORY_TAIL_LIMIT
+            ? getHistoryRowsTail(id, UNSOLICITED_HISTORY_TAIL_LIMIT)
+            : getHistoryRows(id);
+          return buildUnsolicitedHistoryPayload(id, rows, total);
+        });
+      } else if (!alreadyMatches) {
         if (!existing) existing = getHistoryRows(id);
         const resync = db.transaction((msgs) => {
           stmtDeleteSession.run(id);
@@ -2330,6 +3111,14 @@ function handleProxyConnection(ws, req) {
         });
       }
       broadcastToBrowsers(msg);
+      if (id && shouldSendPush()) {
+        const name = notificationSessionName(id);
+        sendPushNotification(
+          `${name} is rate limited`,
+          String(msg.retry_after_hint || 'The agent cannot continue until the limit clears.').slice(0, 180),
+          { type: 'rate_limit_active', activity_type: 'rate_limit', session_id: id, session_name: name },
+        ).catch(() => {});
+      }
       log('info', 'rate-limit', 'Rate limit active', { session: id, retry_after_hint: msg.retry_after_hint });
 
     } else if (t === 'rate_limit_cleared') {
@@ -2345,18 +3134,23 @@ function handleProxyConnection(ws, req) {
         });
       }
       broadcastToBrowsers(msg);
-      if (NOTIFY_EVEN_IF_CONNECTED || browserClients.size === 0) {
+      if (shouldSendPush()) {
         sendPushNotification(
           'Rate limit cleared',
           'Claude Code is no longer rate limited.',
-          { type: 'rate_limit_cleared', session_id: id || '' }
+          { type: 'rate_limit_cleared', activity_type: 'idle', session_id: id || '' }
         ).catch(() => {});
       }
       log('info', 'rate-limit', 'Rate limit cleared', { session: id });
 
     // ── Steer / queue messages (proxy → browser) ─────────────────────────
     } else if (t === 'message_queued' || t === 'queue_delivered' || t === 'steer_result' || t === 'proxy_send_result') {
+      const agentStarted = t === 'proxy_send_result' ? sendLifecycle.markProxyResult(msg) : null;
       broadcastToBrowsers(msg);
+      if (agentStarted) {
+        broadcastToBrowsers(agentStarted);
+        log('info', 'send', 'agent_started', { session: agentStarted.session_id, cid: agentStarted.client_message_id });
+      }
       log('info', 'send', `${t}`, { session: msg.session_id, cid: msg.client_message_id });
 
     // ── Native queue (Codex side-panel queue items) ─────────────────────────
@@ -2369,17 +3163,20 @@ function handleProxyConnection(ws, req) {
     if (helloTimeout) clearTimeout(helloTimeout);
     log('info', 'proxy-ws', 'Agent proxy disconnected', { proxy_id: thisProxyId });
     proxyConnections.delete(ws);
+    proxySessionClaims.delete(ws);
     proxySessions.forEach(s => {
       if (proxySockets.get(s) === ws) {
         proxySockets.delete(s);
         sessionProxyId.delete(s);
         sessionMeta.delete(s);
         sessionActivity.delete(s);
+        sendLifecycle.clearSession(s);
         cachedChatLists.delete(s);
         setHealth(s, 'disconnected');
       }
     });
     if (getProxySocket() === null) cachedWorkspaces = [];
+    refreshDuplicateProxyAlarms();
     broadcastToBrowsers({ type: 'session_list', sessions: getSessionList(), workspaces: cachedWorkspaces });
     // Cancel any in-flight launches if no proxy is left
     if (getProxySocket() === null && pendingLaunches.size > 0) {
@@ -2439,6 +3236,7 @@ function handleClientConnection(ws, req) {
   const openPromptList = Array.from(pendingPrompts.values()).map(e => e.prompt);
   const openErrorPromptList = Array.from(pendingErrorPrompts.values()).map(e => e.prompt);
   const agentConfigMap = getCompactAgentConfigsForAck();
+  const nightlyValidationFailures = nightlyValidationStatuses().filter(item => item.status !== 'pass');
   ws.send(JSON.stringify({
     type:                 'connection_ack',
     protocol_version:     PROTOCOL_VERSION,
@@ -2450,6 +3248,8 @@ function handleClientConnection(ws, req) {
     ...(openPromptList.length  > 0 ? { open_prompts:      openPromptList      } : {}),
     ...(openErrorPromptList.length > 0 ? { open_error_prompts: openErrorPromptList } : {}),
     ...(Object.keys(agentConfigMap).length > 0 ? { agent_configs: agentConfigMap } : {}),
+    ...(duplicateProxyAlarms.length > 0 ? { duplicate_proxy_alarms: duplicateProxyAlarms } : {}),
+    ...(nightlyValidationFailures.length > 0 ? { nightly_validation_failures: nightlyValidationFailures } : {}),
     ...(cachedWorkspaces.length > 0 ? { workspaces: cachedWorkspaces } : {}),
     ts:                   Date.now(),
   }));
@@ -2591,7 +3391,22 @@ function handleClientConnection(ws, req) {
       if (!id) return;
       if (sinceSeq != null && sinceSeq > 0) {
         const messages = getHistoryRowsFrom(id, sinceSeq);
-        ws.send(JSON.stringify({ type: 'history_delta', session: id, request_id: msg.request_id || null, since_sequence: sinceSeq, messages }));
+        const latestSequence = messages.reduce(
+          (maximum, message) => Math.max(maximum, Number(message.sequence || 0)),
+          Number(sinceSeq) || 0,
+        );
+        ws.send(JSON.stringify({
+          type: 'history_delta',
+          protocol_version: PROTOCOL_VERSION,
+          session: id,
+          session_id: id,
+          request_id: msg.request_id || null,
+          after_sequence: Number(sinceSeq),
+          last_sequence: latestSequence,
+          total_messages: getHistoryCount(id),
+          loaded_messages: messages.length,
+          messages,
+        }));
       } else {
         const requestedLimit = msg.full ? 0 : Number(msg.limit || msg.tail_limit || msg.history_limit || 0);
         if (Number.isFinite(requestedLimit) && requestedLimit > 0) {
@@ -2769,7 +3584,12 @@ function handleClientConnection(ws, req) {
 
     // ── Queue management (discard/edit queued messages) ───────────────────
     } else if (t === 'discard_queued' || t === 'edit_queued') {
-      const id = msg.session_id || msg.session;
+      const validation = validateQueueControlMessage(msg, MAX_CONTENT_BYTES);
+      if (!validation.ok) {
+        ws.send(JSON.stringify({ type: 'error', code: 'invalid_message', message: validation.error }));
+        return;
+      }
+      const id = validation.sessionId;
       const proxyWs = proxySockets.get(id);
       if (proxyWs && proxyWs.readyState === WebSocket.OPEN) proxyWs.send(JSON.stringify(msg));
 
@@ -3263,6 +4083,18 @@ function handleClientConnection(ws, req) {
     } else if (t === 'new_thread' || t === 'open_panel' || t === 'open_native_window' || t === 'chat_list' || t === 'switch_chat' || t === 'new_chat' || t === 'thread_list' || t === 'switch_thread' || t === 'switch_workspace' || t === 'terminal_output' || t === 'file_changes' || t === 'file_change_response' || t === 'send_attachment' || t === 'terminal_input' || t === 'branch_list' || t === 'switch_branch' || t === 'create_branch' || t === 'skill_list' || t === 'automation_view_action' || t === 'list_directory' || t === 'read_file') {
       const sessionId = msg.session_id || msg.session;
       const requestId = msg.request_id;
+      if (t === 'list_directory' || t === 'read_file') {
+        const validation = validateWorkspaceControlMessage(msg);
+        if (!validation.ok) {
+          ws.send(JSON.stringify({
+            type: 'agent_control_result', protocol_version: PROTOCOL_VERSION,
+            request_id: requestId, session_id: sessionId, command: t, result: 'failed',
+            error: { code: 'invalid_message', message: validation.error },
+            server_ts: new Date().toISOString(),
+          }));
+          return;
+        }
+      }
       const proxyWs   = proxySockets.get(sessionId);
       if (!proxyWs || proxyWs.readyState !== WebSocket.OPEN) {
         ws.send(JSON.stringify({
@@ -3295,6 +4127,9 @@ function handleClientConnection(ws, req) {
         ...(msg.text != null ? { text: msg.text } : {}),
         ...(msg.path != null ? { path: msg.path } : {}),
         ...(msg.max_size != null ? { max_size: msg.max_size } : {}),
+        ...(msg.data != null ? { data: msg.data } : {}),
+        ...(msg.mime_type != null ? { mime_type: msg.mime_type } : {}),
+        ...(msg.filename != null ? { filename: msg.filename } : {}),
         ...(msg.change_id != null ? { change_id: msg.change_id } : {}),
         ...(msg.action != null ? { action: msg.action } : {}),
       }));

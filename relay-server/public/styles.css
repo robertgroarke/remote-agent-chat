@@ -28,6 +28,17 @@
   --input-area-bg: #202124;
   --code-block-bg: #28292c;
   --code-header-bg: #303134;
+  --code-text: #e6edf3;
+  --terminal-bg: #0d1117;
+  --terminal-border: #21262d;
+  --terminal-text: #c9d1d9;
+  --terminal-command: #58a6ff;
+  --syntax-comment: #8b949e;
+  --syntax-keyword: #ff7b72;
+  --syntax-string: #a5d6ff;
+  --syntax-number: #79c0ff;
+  --syntax-title: #d2a8ff;
+  --syntax-variable: #ffa657;
 }
 
 :root[data-theme="light"] {
@@ -55,6 +66,17 @@
   --input-area-bg: #ffffff;
   --code-block-bg: #f8f9fa;
   --code-header-bg: #f1f3f4;
+  --code-text: #24292f;
+  --terminal-bg: #f6f8fa;
+  --terminal-border: #d0d7de;
+  --terminal-text: #24292f;
+  --terminal-command: #0550ae;
+  --syntax-comment: #57606a;
+  --syntax-keyword: #cf222e;
+  --syntax-string: #0a3069;
+  --syntax-number: #0550ae;
+  --syntax-title: #8250df;
+  --syntax-variable: #953800;
 }
 
 html, body, #root { height: 100%; }
@@ -175,15 +197,54 @@ body {
 }
 
 .session-group-header {
+  appearance: none;
+  background: transparent;
+  border: 0;
+  cursor: pointer;
   display: flex;
   align-items: center;
   gap: 8px;
+  width: 100%;
   padding: 8px 8px 5px;
   color: var(--text3);
+  font-family: inherit;
   font-size: 10px;
   font-weight: 700;
   text-transform: uppercase;
   letter-spacing: 0.08em;
+  text-align: left;
+  transition: color 140ms ease, background-color 140ms ease;
+}
+.duplicate-proxy-banner {
+  align-items: center;
+  background: #4b2e0b;
+  border-bottom: 1px solid #d29922;
+  color: #f0d49a;
+  display: flex;
+  flex-wrap: wrap;
+  font-size: 12px;
+  gap: 6px 12px;
+  left: 0;
+  padding: 8px 14px;
+  position: fixed;
+  right: 0;
+  top: 0;
+  z-index: 1000;
+}
+.duplicate-proxy-banner + .sidebar { padding-top: 48px; }
+
+.session-group-header:hover,
+.session-group-header:focus-visible {
+  background: color-mix(in srgb, var(--bg3) 70%, transparent);
+  color: var(--text2);
+  outline: none;
+}
+
+.session-group-caret {
+  flex: 0 0 9px;
+  font-family: ui-monospace, SFMono-Regular, Consolas, monospace;
+  font-size: 10px;
+  text-align: center;
 }
 
 .session-group-name {
@@ -203,6 +264,67 @@ body {
   min-width: 16px;
   padding: 2px 5px;
   text-align: center;
+}
+
+.session-group-working {
+  width: 7px;
+  height: 7px;
+  flex: 0 0 7px;
+  border-radius: 50%;
+  background: var(--accent);
+  box-shadow: 0 0 0 3px color-mix(in srgb, var(--accent) 18%, transparent);
+  animation: session-group-pulse 1.5s ease-in-out infinite;
+}
+
+@keyframes session-group-pulse {
+  0%, 100% { opacity: 0.55; }
+  50% { opacity: 1; }
+}
+
+.session-group-alert,
+.session-group-unread {
+  min-width: 16px;
+  height: 16px;
+  padding: 0 4px;
+  border-radius: 8px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  color: #fff;
+  font-size: 9px;
+  line-height: 1;
+}
+
+.session-group-alert {
+  background: var(--warning, #d29922);
+}
+
+.session-group-unread {
+  background: var(--accent);
+}
+
+.session-group-items {
+  display: grid;
+  grid-template-rows: 1fr;
+  opacity: 1;
+  transition: grid-template-rows 180ms ease, opacity 150ms ease;
+}
+
+.session-group-items-inner {
+  min-height: 0;
+  overflow: hidden;
+}
+
+.session-group.collapsed .session-group-items {
+  grid-template-rows: 0fr;
+  opacity: 0;
+  pointer-events: none;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .session-group-items {
+    transition: none;
+  }
 }
 
 .session-item {
@@ -297,7 +419,13 @@ body {
   background: var(--red);
   vertical-align: middle;
 }
-.status-dot.connected { background: var(--green); }
+.status-dot.connected,
+.status-dot.healthy { background: var(--green); }
+.status-dot.connecting,
+.status-dot.slow { background: var(--yellow); }
+.status-dot.poor,
+.status-dot.stale { background: var(--orange); }
+.status-dot.offline { background: var(--red); }
 
 /* ── Main chat area ────────────────────────────────────────── */
 .main {
@@ -1261,6 +1389,16 @@ body {
   contain: layout paint;
 }
 
+/* Browser-native viewport virtualization keeps every transcript row mounted,
+   in-order, and stateful while skipping layout/paint for offscreen message
+   subtrees. The `auto` intrinsic size caches each measured row height, so long
+   tool/code blocks do not collapse or reset disclosure state when revisited. */
+.message.transcript-virtual-row {
+  flex: 0 0 auto;
+  content-visibility: auto;
+  contain-intrinsic-block-size: auto 96px;
+}
+
 .message-role {
   display: flex;
   align-items: center;
@@ -1379,7 +1517,21 @@ body {
 }
 .delivery.accepted  { color: var(--text2); }
 .delivery.delivered { color: var(--green); }
-.delivery.failed    { color: var(--red); font-weight: 600; }
+.delivery.agent-started { color: var(--green); font-weight: 600; }
+.delivery.failed    { color: var(--red); font-weight: 600; display: inline-flex; align-items: center; gap: 5px; }
+.delivery-retry {
+  appearance: none;
+  border: 1px solid color-mix(in srgb, var(--red) 45%, transparent);
+  border-radius: 9px;
+  background: color-mix(in srgb, var(--red) 12%, transparent);
+  color: var(--red);
+  cursor: pointer;
+  font: 600 10px/1.35 inherit;
+  padding: 1px 7px;
+}
+.delivery.offline-queued { color: var(--yellow, #e2b714); font-weight: 600; }
+.delivery-retry:hover { background: color-mix(in srgb, var(--red) 22%, transparent); }
+.delivery-retry:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
 .delivery.busy-queued { color: var(--yellow, #e2b714); display: inline-flex; align-items: center; gap: 6px; }
 .delivery.steered   { color: var(--blue, #58a6ff); }
 .queued-label { font-size: 11px; opacity: 0.8; }
@@ -1688,6 +1840,8 @@ details.content-block {
 .content-block-file-change,
 .content-block-artifact,
 .content-block-prompt,
+.content-block-plan,
+.content-block-notice,
 .content-block-error {
   border-left: 2px solid rgba(143, 173, 214, 0.2);
   padding-left: 10px;
@@ -1695,6 +1849,75 @@ details.content-block {
 
 .content-block-error {
   border-left-color: rgba(248, 81, 73, 0.65);
+}
+
+.content-block-tool-result {
+  border-left-color: rgba(63, 185, 80, 0.42);
+}
+
+.content-block-plan {
+  border-left-color: rgba(88, 166, 255, 0.6);
+}
+
+.content-block-plan-list {
+  display: grid;
+  gap: 5px;
+  list-style: none;
+  margin: 6px 0 0;
+  color: var(--code-text);
+  padding: 0;
+}
+
+.content-block-plan-item {
+  display: grid;
+  grid-template-columns: 16px minmax(0, 1fr);
+  gap: 5px;
+  color: var(--text2);
+  font-size: 12px;
+  line-height: 1.5;
+}
+
+.content-block-plan-marker { color: #58a6ff; }
+.content-block-plan-item.completed { color: var(--text3); }
+.content-block-plan-item.completed .content-block-plan-marker { color: #3fb950; }
+.content-block-plan-item.completed > :last-child { text-decoration: line-through; }
+
+.content-block-queued-message {
+  display: grid;
+  gap: 2px;
+  align-self: flex-start;
+  max-width: min(620px, 100%);
+  border: 1px dashed var(--border2);
+  border-radius: 8px;
+  padding: 7px 9px;
+  color: var(--text3);
+  background: color-mix(in srgb, var(--bg3) 72%, transparent);
+}
+
+.content-block-queued-label {
+  font-size: 10px;
+  font-weight: 700;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+}
+
+.content-block-queued-body {
+  color: var(--text2);
+  font-size: 12px;
+  overflow-wrap: anywhere;
+}
+
+.content-block-notice {
+  border-left-color: rgba(219, 171, 9, 0.65);
+  background: rgba(219, 171, 9, 0.055);
+  padding-top: 5px;
+  padding-bottom: 5px;
+}
+
+.content-block-notice.error,
+.content-block-notice.critical {
+  border-left-color: rgba(248, 81, 73, 0.65);
+  background: rgba(248, 81, 73, 0.055);
 }
 
 .content-block-status {
@@ -2473,7 +2696,39 @@ mark.code-search-mark.current {
   font-family: 'SF Mono', 'Fira Code', 'Cascadia Code', 'Consolas', monospace;
   line-height: 1.6;
   tab-size: 2;
+  color: var(--code-text);
 }
+
+/* highlight.js ships as a dark CDN theme. These semantic token mappings are
+   deliberately selected for a light background instead of inverting/dimming
+   the dark palette. The higher-specificity theme selector wins after the CDN. */
+:root[data-theme="light"] .hljs { color: var(--code-text); background: var(--code-block-bg); }
+:root[data-theme="light"] .hljs-comment,
+:root[data-theme="light"] .hljs-quote { color: var(--syntax-comment); font-style: italic; }
+:root[data-theme="light"] .hljs-keyword,
+:root[data-theme="light"] .hljs-selector-tag,
+:root[data-theme="light"] .hljs-literal,
+:root[data-theme="light"] .hljs-section,
+:root[data-theme="light"] .hljs-link { color: var(--syntax-keyword); }
+:root[data-theme="light"] .hljs-string,
+:root[data-theme="light"] .hljs-doctag,
+:root[data-theme="light"] .hljs-regexp,
+:root[data-theme="light"] .hljs-template-tag,
+:root[data-theme="light"] .hljs-template-variable { color: var(--syntax-string); }
+:root[data-theme="light"] .hljs-number,
+:root[data-theme="light"] .hljs-symbol,
+:root[data-theme="light"] .hljs-bullet { color: var(--syntax-number); }
+:root[data-theme="light"] .hljs-title,
+:root[data-theme="light"] .hljs-title.class_,
+:root[data-theme="light"] .hljs-title.function_ { color: var(--syntax-title); }
+:root[data-theme="light"] .hljs-variable,
+:root[data-theme="light"] .hljs-attr,
+:root[data-theme="light"] .hljs-attribute { color: var(--syntax-variable); }
+:root[data-theme="light"] .hljs-built_in,
+:root[data-theme="light"] .hljs-type { color: #116329; }
+:root[data-theme="light"] .hljs-meta { color: #0550ae; }
+:root[data-theme="light"] .hljs-addition { color: #116329; background: #dafbe1; }
+:root[data-theme="light"] .hljs-deletion { color: #82071e; background: #ffebe9; }
 
 /* Override default pre/code inside code-block to avoid double-border */
 .message-body .code-block pre {
@@ -3570,6 +3825,8 @@ mark.code-search-mark.current {
 /* ── Session cards — IDE workbench style ──────────────────── */
 
 .session-card {
+  content-visibility: auto;
+  contain-intrinsic-block-size: auto 50px;
   display: flex;
   align-items: center;
   gap: 10px;
@@ -4676,7 +4933,7 @@ select.new-session-workspace option { background: var(--bg2); color: var(--text)
 
 /* ─── Terminal viewer (Epic 4) ──────────────────────────────────────────────── */
 .terminal-viewer {
-  background: #0d1117;
+  background: var(--terminal-bg);
   border-top: 1px solid var(--border);
   border-bottom: 1px solid var(--border);
   display: flex;
@@ -4725,13 +4982,13 @@ select.new-session-workspace option { background: var(--bg2); color: var(--text)
 }
 .terminal-entry {
   padding: 4px 12px;
-  border-bottom: 1px solid #21262d;
+  border-bottom: 1px solid var(--terminal-border);
 }
 .terminal-entry:last-child { border-bottom: none; }
 .terminal-command {
   font-family: 'SF Mono', 'Consolas', 'Monaco', monospace;
   font-size: 12px;
-  color: #58a6ff;
+  color: var(--terminal-command);
   padding: 4px 0 2px;
   font-weight: 600;
 }
@@ -4748,6 +5005,122 @@ select.new-session-workspace option { background: var(--bg2); color: var(--text)
   overflow-y: auto;
   line-height: 1.5;
 }
+.composer-control-state {
+  flex: 1 0 100%;
+  padding: 5px 8px;
+  border-radius: 6px;
+  font-size: 11px;
+  line-height: 1.35;
+}
+.composer-control-state.pending { color: var(--accent); background: color-mix(in srgb, var(--accent) 10%, transparent); }
+.composer-control-state.failed { color: var(--red); background: color-mix(in srgb, var(--red) 10%, transparent); }
+
+.notification-settings-btn {
+  font-size: 14px;
+}
+.notification-settings-panel {
+  max-height: none;
+}
+.notification-setting-row {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  color: var(--text);
+  cursor: pointer;
+  font-size: 12px;
+  justify-content: space-between;
+  padding: 4px 0;
+}
+.notification-setting-row span {
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+}
+.notification-setting-row strong {
+  font-size: 12px;
+  font-weight: 600;
+}
+.notification-setting-row small {
+  color: var(--text3);
+  font-size: 11px;
+  line-height: 1.35;
+}
+.notification-setting-row input {
+  accent-color: var(--accent);
+  flex-shrink: 0;
+}
+.web-push-setting-row {
+  border-bottom: 1px solid var(--border);
+  margin-bottom: 6px;
+  padding-bottom: 10px;
+}
+.web-push-setting-row button {
+  background: color-mix(in srgb, var(--accent) 14%, transparent);
+  border: 1px solid color-mix(in srgb, var(--accent) 45%, var(--border));
+  border-radius: 6px;
+  color: var(--accent);
+  cursor: pointer;
+  flex-shrink: 0;
+  font: inherit;
+  padding: 5px 9px;
+}
+.web-push-setting-row button:disabled {
+  cursor: default;
+  opacity: .5;
+}
+.notification-settings-error {
+  align-items: center;
+  color: var(--red);
+  display: flex;
+  font-size: 11px;
+  gap: 8px;
+  justify-content: space-between;
+}
+.notification-settings-error button {
+  background: none;
+  border: 0;
+  color: var(--accent);
+  cursor: pointer;
+  font: inherit;
+  padding: 2px;
+}
+.session-management-panel { max-height: min(390px, 70vh); }
+.session-management-field { align-items: center; }
+.session-management-field select,
+.session-management-field input {
+  background: var(--bg);
+  border: 1px solid var(--border2);
+  border-radius: 5px;
+  color: var(--text);
+  flex: 1;
+  font-size: 12px;
+  min-width: 0;
+  padding: 5px 7px;
+}
+.session-management-actions { display: flex; gap: 7px; }
+.session-management-actions button {
+  background: var(--bg);
+  border: 1px solid var(--border2);
+  border-radius: 5px;
+  color: var(--text2);
+  cursor: pointer;
+  font-size: 11px;
+  padding: 5px 8px;
+}
+.session-management-actions button:hover { color: var(--text); }
+.session-management-actions button.danger { color: var(--red); }
+.session-management-actions button:disabled { cursor: wait; opacity: 0.55; }
+.session-card-manage {
+  background: none;
+  border: 0;
+  color: var(--text3);
+  cursor: pointer;
+  font-size: 15px;
+  line-height: 1;
+  padding: 1px 2px;
+}
+.session-card-manage:hover { color: var(--text); }
+.session-card-muted { color: var(--text3); font-size: 12px; }
 .terminal-input-form {
   display: flex;
   flex-wrap: wrap;
@@ -5738,4 +6111,318 @@ select.new-session-workspace option { background: var(--bg2); color: var(--text)
 @media (max-width: 600px) {
   .skills-header { padding: 16px; }
   .skills-body { padding: 12px 16px 20px; }
+}
+
+/* ── Per-harness transcript typography and semantic tones ────────────────
+   App chrome stays unified. These tokens apply only below .messages and are
+   based on read-only getComputedStyle probes of the native transcript text. */
+.harness-theme {
+  --harness-body-font: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+  --harness-body-size: 13px;
+  --harness-body-weight: 400;
+  --harness-body-line: 1.55;
+  --harness-body-spacing: normal;
+  --harness-text: var(--text);
+  --harness-muted: var(--text3);
+  --harness-link: var(--accent);
+  --harness-user-bg: transparent;
+  --harness-user-border: rgba(104, 179, 255, 0.28);
+  --harness-user-radius: 0;
+  --harness-user-padding: 2px 0 3px 12px;
+  --harness-code-font: "Cascadia Code", "SF Mono", Consolas, monospace;
+  --harness-code-size: 12px;
+  --harness-code-line: 1.55;
+  --harness-code-bg: var(--code-block-bg);
+  --harness-code-border: var(--border2);
+  --harness-code-radius: 8px;
+  --harness-inline-code-bg: rgba(255, 255, 255, 0.05);
+  --harness-thinking: var(--text3);
+  --harness-tool: var(--text2);
+  --harness-error: #ff8a80;
+}
+
+.harness-theme-claude {
+  --harness-body-font: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+  --harness-body-size: 13px;
+  --harness-body-line: 19.5px;
+  --harness-user-bg: rgb(49, 49, 49);
+  --harness-user-border: transparent;
+  --harness-user-radius: 6px;
+  --harness-user-padding: 4px 6px;
+  --harness-code-bg: #1f1f1f;
+  --harness-code-border: #3c3c3c;
+  --harness-code-radius: 5px;
+  --harness-thinking: #9d9d9d;
+}
+
+.harness-theme-codex {
+  --harness-body-font: "Segoe WPC", "Segoe UI", sans-serif;
+  --harness-body-size: 13px;
+  --harness-body-line: 21px;
+  --harness-user-border: rgba(157, 157, 157, 0.28);
+  --harness-user-padding: 0 0 0 10px;
+  --harness-code-font: "Cascadia Code", "SF Mono", Consolas, monospace;
+  --harness-code-bg: #1e1e1e;
+  --harness-code-border: #3c3c3c;
+  --harness-code-radius: 4px;
+  --harness-thinking: #9d9d9d;
+}
+
+.harness-theme-codex-desktop {
+  --harness-body-font: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+  --harness-body-size: 14px;
+  --harness-body-weight: 445;
+  --harness-body-line: 22px;
+  --harness-user-border: rgba(26, 28, 31, 0.2);
+  --harness-code-font: ui-monospace, "SFMono-Regular", Menlo, Monaco, Consolas, monospace;
+  --harness-code-size: 13px;
+  --harness-code-bg: rgba(26, 28, 31, 0.06);
+  --harness-code-border: rgba(26, 28, 31, 0.14);
+  --harness-code-radius: 7.5px;
+  --harness-thinking: rgba(157, 157, 157, 0.9);
+}
+
+.harness-theme-cursor {
+  --harness-body-font: "Segoe WPC", "Segoe UI", sans-serif;
+  --harness-body-size: 14px;
+  --harness-body-line: 21px;
+  --harness-body-spacing: normal;
+  --harness-user-border: rgba(228, 228, 228, 0.2);
+  --harness-code-font: "Cascadia Code", "SF Mono", Consolas, monospace;
+  --harness-code-size: 14px;
+  --harness-code-line: 20px;
+  --harness-code-bg: rgb(24, 24, 24);
+  --harness-code-border: rgba(228, 228, 228, 0.12);
+  --harness-code-radius: 0;
+  --harness-inline-code-bg: rgba(122, 162, 247, 0.12);
+  --harness-thinking: rgba(228, 228, 228, 0.52);
+  --harness-tool: rgba(228, 228, 228, 0.68);
+}
+
+.harness-theme-continue,
+.harness-theme-continue_yolo {
+  --harness-body-font: system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Oxygen, Ubuntu, Cantarell, "Open Sans", "Helvetica Neue", sans-serif;
+  --harness-body-size: 14px;
+  --harness-body-weight: 400;
+  --harness-body-line: 21px;
+  --harness-body-spacing: normal;
+  --harness-user-border: rgba(204, 204, 204, 0.22);
+  --harness-user-padding: 2px 0 3px 10px;
+  --harness-code-font: "Cascadia Code", "SF Mono", Consolas, monospace;
+  --harness-code-size: 14px;
+  --harness-code-line: 21px;
+  --harness-code-bg: #1e1e1e;
+  --harness-code-border: #3c3c3c;
+  --harness-code-radius: 0;
+  --harness-inline-code-bg: rgba(204, 204, 204, 0.1);
+  --harness-thinking: rgba(204, 204, 204, 0.58);
+  --harness-tool: rgba(204, 204, 204, 0.82);
+}
+
+.harness-theme-antigravity-v2,
+.harness-theme-antigravity,
+.harness-theme-antigravity_panel {
+  --harness-body-font: ui-sans-serif, system-ui, sans-serif, "Apple Color Emoji", "Segoe UI Emoji";
+  --harness-body-size: 14px;
+  --harness-body-line: 22.75px;
+  --harness-user-border: rgba(204, 204, 204, 0.22);
+  --harness-code-font: ui-monospace, "SFMono-Regular", Menlo, Monaco, Consolas, monospace;
+  --harness-code-size: 14px;
+  --harness-code-line: 22.75px;
+  --harness-code-bg: transparent;
+  --harness-code-border: rgba(204, 204, 204, 0.18);
+  --harness-code-radius: 0;
+  --harness-thinking: rgba(204, 204, 204, 0.58);
+}
+
+.harness-theme-claude_cli,
+.harness-theme-codex_cli,
+.harness-theme-cursor_cli {
+  --harness-body-font: "Cascadia Mono", "Cascadia Code", Consolas, monospace;
+  --harness-body-size: 13px;
+  --harness-body-line: 1.55;
+  --harness-body-spacing: 0;
+  --harness-user-bg: rgba(12, 12, 12, 0.72);
+  --harness-user-border: #3b3b3b;
+  --harness-user-radius: 2px;
+  --harness-user-padding: 5px 8px;
+  --harness-code-font: "Cascadia Mono", "Cascadia Code", Consolas, monospace;
+  --harness-code-size: 12px;
+  --harness-code-line: 1.5;
+  --harness-code-bg: #0c0c0c;
+  --harness-code-border: #303030;
+  --harness-code-radius: 2px;
+  --harness-inline-code-bg: #1a1a1a;
+  --harness-thinking: #8b949e;
+  --harness-tool: #c9d1d9;
+  --harness-error: #f85149;
+}
+
+.harness-theme .message-body,
+.harness-theme .user-text,
+.harness-theme .content-block-markdown {
+  font-family: var(--harness-body-font);
+  font-size: var(--harness-body-size);
+  font-weight: var(--harness-body-weight);
+  line-height: var(--harness-body-line);
+  letter-spacing: var(--harness-body-spacing);
+  color: var(--harness-text);
+}
+
+.harness-theme .message.assistant.monospace .message-body,
+.harness-theme .message-body.monospace-body {
+  font-family: var(--harness-body-font);
+  font-size: var(--harness-body-size);
+  font-weight: var(--harness-body-weight);
+  line-height: var(--harness-body-line);
+  letter-spacing: var(--harness-body-spacing);
+}
+
+.harness-theme .user-text {
+  background: var(--harness-user-bg);
+  border-left-color: var(--harness-user-border);
+  border-radius: var(--harness-user-radius);
+  padding: var(--harness-user-padding);
+}
+
+.harness-theme-continue .user-text,
+.harness-theme-continue_yolo .user-text {
+  font-size: 14px;
+  line-height: 21px;
+}
+
+.harness-theme .message-body code,
+.harness-theme .content-block-markdown code {
+  font-family: var(--harness-code-font);
+  font-size: var(--harness-code-size);
+  background: var(--harness-inline-code-bg);
+}
+
+.harness-theme .message-body pre,
+.harness-theme .content-block-markdown pre,
+.harness-theme .content-block-pre {
+  font-family: var(--harness-code-font);
+  font-size: var(--harness-code-size);
+  line-height: var(--harness-code-line);
+  background: var(--harness-code-bg);
+  border-color: var(--harness-code-border);
+  border-radius: var(--harness-code-radius);
+  color: var(--harness-tool);
+}
+
+.harness-theme .message-body pre code,
+.harness-theme .content-block-markdown pre code {
+  font-family: inherit;
+  font-size: inherit;
+  line-height: inherit;
+}
+
+.harness-theme .message-body a,
+.harness-theme .content-block-markdown a { color: var(--harness-link); }
+.harness-theme .message-body blockquote,
+.harness-theme .content-block-markdown blockquote { color: var(--harness-muted); }
+.harness-theme .content-block-status-chip.thinking,
+.harness-theme details.content-block-thinking,
+.harness-theme .thinking-content { color: var(--harness-thinking); font-style: italic; }
+.harness-theme .content-block-status-chip.tool,
+.harness-theme .tool-section { color: var(--harness-tool); }
+.harness-theme .content-block-error { color: var(--harness-error); }
+
+.harness-theme-claude_cli .message.assistant .message-body,
+.harness-theme-codex_cli .message.assistant .message-body,
+.harness-theme-cursor_cli .message.assistant .message-body,
+.harness-theme-claude_cli .content-block-markdown,
+.harness-theme-codex_cli .content-block-markdown,
+.harness-theme-cursor_cli .content-block-markdown {
+  background: #0c0c0c;
+  border-left-color: #3b3b3b;
+  border-radius: 2px;
+  color: var(--terminal-text);
+}
+
+.harness-theme-claude_cli .message.assistant .message-body,
+.harness-theme-codex_cli .message.assistant .message-body,
+.harness-theme-cursor_cli .message.assistant .message-body {
+  padding: 7px 9px;
+}
+
+:root[data-theme="light"] .harness-theme-claude {
+  --harness-user-bg: #eeeeee;
+  --harness-code-bg: #f4f4f4;
+  --harness-code-border: #d6d6d6;
+  --harness-tool: #3b3b3b;
+  --harness-thinking: #666666;
+}
+:root[data-theme="light"] .harness-theme-codex {
+  --harness-code-bg: #f3f3f3;
+  --harness-code-border: #d4d4d4;
+  --harness-inline-code-bg: rgba(0, 0, 0, 0.06);
+  --harness-tool: #333333;
+  --harness-thinking: #616161;
+}
+:root[data-theme="light"] .harness-theme-codex-desktop {
+  --harness-code-bg: rgba(26, 28, 31, 0.055);
+  --harness-code-border: rgba(26, 28, 31, 0.16);
+  --harness-inline-code-bg: rgba(26, 28, 31, 0.065);
+  --harness-tool: #303238;
+  --harness-thinking: #656b73;
+}
+:root[data-theme="light"] .harness-theme-cursor,
+:root[data-theme="light"] .harness-theme-continue,
+:root[data-theme="light"] .harness-theme-continue_yolo,
+:root[data-theme="light"] .harness-theme-antigravity-v2,
+:root[data-theme="light"] .harness-theme-antigravity,
+:root[data-theme="light"] .harness-theme-antigravity_panel {
+  --harness-code-bg: #f5f5f5;
+  --harness-code-border: #d0d0d0;
+  --harness-inline-code-bg: rgba(0, 0, 0, 0.06);
+  --harness-user-bg: rgba(0, 0, 0, 0.035);
+  --harness-tool: #333333;
+  --harness-thinking: #666666;
+}
+:root[data-theme="light"] .harness-theme-claude_cli,
+:root[data-theme="light"] .harness-theme-codex_cli,
+:root[data-theme="light"] .harness-theme-cursor_cli {
+  --harness-text: #24292f;
+  --harness-user-bg: #eef1f4;
+  --harness-user-border: #d0d7de;
+  --harness-code-bg: #f6f8fa;
+  --harness-code-border: #d0d7de;
+  --harness-inline-code-bg: #eff1f3;
+  --harness-thinking: #57606a;
+  --harness-tool: #24292f;
+  --harness-error: #cf222e;
+}
+
+:root[data-theme="light"] .harness-theme-claude_cli .message.assistant .message-body,
+:root[data-theme="light"] .harness-theme-codex_cli .message.assistant .message-body,
+:root[data-theme="light"] .harness-theme-cursor_cli .message.assistant .message-body,
+:root[data-theme="light"] .harness-theme-claude_cli .content-block-markdown,
+:root[data-theme="light"] .harness-theme-codex_cli .content-block-markdown,
+:root[data-theme="light"] .harness-theme-cursor_cli .content-block-markdown {
+  background: var(--harness-code-bg);
+  border-left-color: var(--harness-code-border);
+  color: var(--harness-text);
+}
+
+:root[data-theme="light"] .harness-theme .tool-body,
+:root[data-theme="light"] .harness-theme .tool-io-block,
+:root[data-theme="light"] .harness-theme .code-block,
+:root[data-theme="light"] .harness-theme .code-block pre,
+:root[data-theme="light"] .harness-theme .content-block-pre {
+  background: var(--harness-code-bg);
+  border-color: var(--harness-code-border);
+  color: var(--harness-tool);
+}
+
+:root[data-theme="light"] .code-copy:hover,
+:root[data-theme="light"] .code-search-btn:hover,
+:root[data-theme="light"] .code-search-prev:hover,
+:root[data-theme="light"] .code-search-next:hover,
+:root[data-theme="light"] .code-search-close:hover {
+  background: rgba(0, 0, 0, 0.06);
+}
+
+:root[data-theme="light"] .code-search-input {
+  background: #ffffff;
 }

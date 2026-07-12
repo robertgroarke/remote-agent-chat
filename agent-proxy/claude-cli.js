@@ -4,6 +4,9 @@ const fs = require('fs');
 const os = require('os');
 const path = require('path');
 const { spawn, spawnSync } = require('child_process');
+const { normalizeNativeLaunchMode, backgroundNativeLaunchResult } = require('./native-launch-mode');
+let chokidar = null;
+try { chokidar = require('chokidar'); } catch {}
 
 const CLAUDE_CLI_MODELS = [
   { id: 'default', label: 'Default' },
@@ -80,6 +83,40 @@ function extractTextFromPart(part) {
   return '';
 }
 
+function watchSessions(onSummary, { onError, debounceMs = 120, rootDir = projectsDir() } = {}) {
+  if (!chokidar || !fs.existsSync(rootDir)) return null;
+  const timers = new Map();
+  const flush = filePath => {
+    if (!String(filePath || '').toLowerCase().endsWith('.jsonl')) return;
+    if (timers.has(filePath)) clearTimeout(timers.get(filePath));
+    timers.set(filePath, setTimeout(() => {
+      timers.delete(filePath);
+      try {
+        const summary = readSessionSummary(filePath);
+        if (summary && onSummary) onSummary(summary);
+      } catch (error) {
+        if (onError) onError(error);
+      }
+    }, debounceMs));
+  };
+  const watcher = chokidar.watch(rootDir, {
+    ignoreInitial: true,
+    persistent: true,
+    awaitWriteFinish: false,
+    depth: 3,
+  });
+  watcher.on('add', flush);
+  watcher.on('change', flush);
+  watcher.on('error', error => onError && onError(error));
+  const close = watcher.close.bind(watcher);
+  watcher.close = async () => {
+    for (const timer of timers.values()) clearTimeout(timer);
+    timers.clear();
+    return close();
+  };
+  return watcher;
+}
+
 function compactJson(value) {
   try {
     return JSON.stringify(value, null, 2);
@@ -150,6 +187,49 @@ function buildClaudeToolBlock(part, entry, resultRecord) {
   const status = resultRecord ? (failed ? 'failed' : 'completed') : 'running';
   const callId = part?.id || resultPart?.tool_use_id || undefined;
 
+  if (name === 'TodoWrite' && Array.isArray(input.todos) && input.todos.length > 0) {
+    return {
+      type: 'plan',
+      title: 'Tasks',
+      tasks: input.todos.map((todo, index) => ({
+        id: String(todo?.id || index + 1),
+        step: String(todo?.content || todo?.activeForm || `Task ${index + 1}`),
+        active_form: typeof todo?.activeForm === 'string' ? todo.activeForm : undefined,
+        status: String(todo?.status || 'pending'),
+      })),
+      status,
+      call_id: callId,
+      tool_name: name,
+      collapsed: false,
+    };
+  }
+
+  if (name === 'AskUserQuestion' && Array.isArray(input.questions) && input.questions.length > 0) {
+    const content = input.questions.map((question, index) => {
+      const heading = String(question?.header || `Question ${index + 1}`);
+      const prompt = String(question?.question || '').trim();
+      const options = Array.isArray(question?.options)
+        ? question.options.map(option => {
+          const label = String(option?.label || '').trim();
+          const description = String(option?.description || '').trim();
+          return `- ${label}${description ? ` — ${description}` : ''}`;
+        }).filter(line => line !== '- ')
+        : [];
+      return [`### ${heading}`, prompt, ...options].filter(Boolean).join('\n');
+    }).join('\n\n');
+    return {
+      type: 'prompt',
+      title: input.questions.length === 1
+        ? String(input.questions[0]?.header || 'Question')
+        : 'Questions',
+      content,
+      status,
+      call_id: callId,
+      tool_name: name,
+      collapsed: false,
+    };
+  }
+
   if (/^(bash|shell|powershell)$/i.test(name)) {
     const stdout = typeof structured.stdout === 'string'
       ? structured.stdout
@@ -174,7 +254,6 @@ function buildClaudeToolBlock(part, entry, resultRecord) {
 
   const sections = [];
   if (part?.input != null) sections.push(`input:\n${compactJson(part.input)}`);
-  if (resultRecord) sections.push(`result:\n${toolResultBody(resultPart, resultEntry)}`);
   return {
     type: 'tool_call',
     title: name,
@@ -224,12 +303,15 @@ function parseClaudeJsonl(filePath) {
   if (entries.length === 0) return [];
 
   const resultsByCallId = new Map();
+  const toolUsesByCallId = new Map();
   for (const entry of entries) {
-    if (entry?.isSidechain || entry?.type !== 'user') continue;
     const parts = Array.isArray(entry?.message?.content) ? entry.message.content : [];
     for (const part of parts) {
-      if (part?.type === 'tool_result' && part.tool_use_id) {
+      if (entry?.isSidechain) continue;
+      if (entry?.type === 'user' && part?.type === 'tool_result' && part.tool_use_id) {
         resultsByCallId.set(String(part.tool_use_id), { part, entry });
+      } else if (entry?.type === 'assistant' && part?.type === 'tool_use' && part.id) {
+        toolUsesByCallId.set(String(part.id), { part, entry });
       }
     }
   }
@@ -251,17 +333,23 @@ function parseClaudeJsonl(filePath) {
     for (const part of parts) {
       if (!part) continue;
       if (part.type === 'tool_result') {
-        if (part.tool_use_id && resultsByCallId.has(String(part.tool_use_id))) continue;
+        const toolUse = part.tool_use_id ? toolUsesByCallId.get(String(part.tool_use_id)) : null;
+        const toolName = String(toolUse?.part?.name || '').trim();
+        // Shell calls are represented by one canonical terminal block containing
+        // command, stdout, and stderr. Other tools keep their call and result as
+        // distinct protocol blocks, matching the shared schema contract.
+        if (/^(bash|shell|powershell)$/i.test(toolName)) continue;
         const content = toolResultBody(part, entry);
         messages.push({
           role: 'assistant',
           content: `[${part.is_error ? 'Tool error' : 'Tool result'}]`,
           content_blocks: [{
-            type: part.is_error ? 'error' : 'tool_call',
-            title: part.is_error ? 'Tool error' : 'Tool result',
+            type: 'tool_result',
+            title: `${part.is_error ? 'Tool error' : 'Tool result'}${toolName ? `: ${toolName}` : ''}`,
             content,
             status: part.is_error ? 'failed' : 'completed',
             call_id: part.tool_use_id || undefined,
+            tool_name: toolName || undefined,
             collapsed: false,
           }],
           ts,
@@ -494,7 +582,10 @@ function startInteractiveClaude({ workspacePath, cliSessionId, resume = true, mo
   });
 }
 
-function startNativeClaudeWindow({ workspacePath, cliSessionId, resume = true, model, effort, permissionMode, title } = {}) {
+function startNativeClaudeWindow({ workspacePath, cliSessionId, resume = true, model, effort, permissionMode, title, launchMode = 'foreground' } = {}) {
+  if (normalizeNativeLaunchMode(launchMode) === 'background') {
+    return backgroundNativeLaunchResult('claude_cli');
+  }
   const cwd = workspacePath || process.cwd();
   const useOllamaLaunch = isOllamaLaunchModel(model);
   // Remote Agent Chat does not expose Claude's Chrome browser integration as
@@ -664,6 +755,7 @@ module.exports = {
   findSessionByCliId,
   parseClaudeJsonl,
   readSessionSummary,
+  watchSessions,
   startClaudePrintSession,
   startInteractiveClaude,
   startNativeClaudeWindow,

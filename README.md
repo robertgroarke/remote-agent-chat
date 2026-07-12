@@ -35,13 +35,13 @@ Whether you are using Antigravity, VS Code, or standalone desktop apps, you can 
 ```
   YOUR WINDOWS MACHINE                       YOUR SERVER (Docker)
  ╔═══════════════════════════════╗          ╔══════════════════════════╗
- ║  Antigravity IDE              ║          ║  agent-relay container   ║
+ ║  Editor and desktop hosts     ║          ║  agent-relay container   ║
  ║  ┌─────────────────────────┐  ║          ║  ┌────────────────────┐  ║
- ║  │ Claude Code  :9223      │  ║          ║  │  relay server      │  ║
- ║  │ Codex        :9223      │  ║   WSS    ║  │  (Node.js)         │  ║
- ║  │ Gemini       :9223      │  ║  ──────► ║  │                    │  ║
- ║  │ Continue     :9223      │  ║  outbound║  │  · session registry│  ║
- ║  │ Roo Code     :9223      │  ║          ║  │  · SQLite history  │  ║
+ ║  │ VS Code      :9223      │  ║          ║  │  relay server      │  ║
+ ║  │ Antigravity  :9228      │  ║   WSS    ║  │  (Node.js)         │  ║
+ ║  │ Agent frames :both      │  ║  ──────► ║  │                    │  ║
+ ║  │ AG v2        :9226      │  ║  outbound║  │  · session registry│  ║
+ ║  │ Cursor       :9227      │  ║          ║  │  · SQLite history  │  ║
  ║  │ Codex Desktop  :9225    │  ║          ║  │                    │  ║
  ║  └──────────┬──────────────┘  ║          ║  │  · Google OAuth    │  ║
  ║             │ (DevTools       ║          ║  └────────┬───────────┘  ║
@@ -78,9 +78,9 @@ The WebUI groups active sessions by workspace directory in the sidebar and shows
 
 | Agent | Status |
 |---|---|
-| Claude Code (Antigravity extension) | Working |
+| Claude Code (VS Code / Antigravity IDE extension) | Working |
 | Claude Code CLI | Working - WebUI sessions, Ollama Cloud models, and native Windows terminal handoff |
-| OpenAI Codex (Antigravity extension) | Working - side-pane chat, task/completion summaries, tool output, files/changes panels, and retained transcript history |
+| OpenAI Codex (VS Code / Antigravity IDE extension) | Working - side-pane chat, task/completion summaries, tool output, files/changes panels, and retained transcript history |
 | OpenAI Codex CLI | Working - WebUI sessions, elevated native terminal handoff, active multi-session discovery, live JSONL tail streaming, full tool output, bottom live goal/working status, stable scroll anchoring, and newest-first chunked transcript hydration |
 | Gemini Code Assist (Antigravity extension) | Working |
 | Continue (Antigravity extension) | Working — local models via Ollama, etc. |
@@ -103,7 +103,10 @@ Transcript history hydrates newest-first across agent types. The WebUI shows the
 
 ## How it works
 
-1. **Antigravity IDE** is launched with `--remote-debugging-port=9223`, exposing each agent webview via Chrome DevTools Protocol (CDP). Optional standalone apps use separate ports: Codex Desktop on `9225`, Antigravity v2 Agent Manager on `9226`, Cursor IDE on `9227`.
+1. **Editor hosts** expose agent webviews via Chrome DevTools Protocol (CDP):
+   VS Code on `9223` and Antigravity IDE on `9228`. Optional standalone apps
+   use separate ports: Codex Desktop on `9225`, Antigravity v2 Agent Manager on
+   `9226`, and Cursor IDE on `9227`.
 2. **agent-proxy** connects to those webviews via CDP, polls for new messages, follows local CLI transcript files for Claude Code CLI and Codex CLI sessions, and relays them to the relay server over a persistent WebSocket.
 3. **relay-server** brokers messages between the proxy and browser clients, persists history in SQLite, and gates access via Google OAuth.
 4. **Cloudflare Tunnel** (running as a Docker sidecar) punches a secure HTTPS tunnel to your relay so it's reachable from anywhere — no domain, no VPS, no port forwarding needed.
@@ -227,17 +230,21 @@ Open `https://agents.yourdomain.com` in your browser — you should see the Goog
 
 ---
 
-### Step 6 — Launch Antigravity with CDP enabled
+### Step 6 — Launch editor hosts with CDP enabled
 
 The proxy needs Chrome DevTools Protocol access to the agent webviews. Run the launcher script in the project root:
 
 ```bat
-launch-antigravity-cdp.bat
+launch-antigravity-ide-cdp-9228.bat
 ```
 
-This kills any running Antigravity instance and relaunches it with `--remote-debugging-port=9223`.
+This starts Antigravity IDE with `--remote-debugging-port=9228`. It refuses to
+replace a running IDE; close Antigravity intentionally before launching. The
+compatibility alias `launch-antigravity-cdp.bat` calls the same safe launcher.
 
-Verify CDP is working by opening `http://localhost:9223/json/list` in your browser — you should see a list of targets including entries with `Anthropic.claude-code`, `openai.chatgpt`, `continue.continue-yolo`, or `saoudrizwan.claude-dev` in the URL.
+Verify Antigravity IDE at `http://localhost:9228/json/list`. VS Code remains on
+`http://localhost:9223/json/list`. Either host can expose iframe targets such as
+`Anthropic.claude-code` and `openai.chatgpt`.
 
 > **Note:** `argv.json` does NOT support `remote-debugging-port`. Always use the launcher script.
 
@@ -254,9 +261,19 @@ RELAY_URL=wss://agents.yourdomain.com/proxy-ws
 # Must match PROXY_SECRET in your relay .env
 PROXY_SECRET=<same value as relay>
 
-# CDP ports to scan (9223 = Antigravity IDE, 9225 = Codex Desktop, 9226 = Antigravity v2, 9227 = Cursor)
-CDP_PORTS=9223,9225,9226,9227
+# CDP ports (9223 VS Code, 9228 Antigravity IDE, 9225 Codex Desktop, 9226 Antigravity v2, 9227 Cursor)
+CDP_PORTS=9223,9228,9225,9226,9227
 ```
+
+If a VS Code instance uses an isolated `--user-data-dir`, list that profile root so
+the proxy can resolve its exact workspace instead of inheriting stale extension state:
+
+```env
+VSCODE_USER_DATA_DIRS=C:\\temp\\remote-agent-vscode-profile
+```
+
+Separate multiple profile roots with `;` on Windows. The normal `%APPDATA%\\Code`
+profile is always scanned automatically.
 
 ---
 
@@ -274,7 +291,7 @@ Install the proxy as an Antigravity/VS Code extension. No separate process, no s
 4. Open **Settings** (Ctrl+,) and search for `remoteAgentProxy`, then configure:
    - **Relay URL**: `wss://agents.yourdomain.com/proxy-ws`
    - **Proxy Secret**: same value as your relay's `PROXY_SECRET`
-    - **CDP Ports**: `9223` (add `,9225` Codex Desktop, `,9226` Antigravity v2, `,9227` Cursor IDE)
+   - **CDP Ports**: `9223,9228,9225,9226,9227`
 5. The proxy starts automatically. Look for `$(broadcast) Proxy (N)` in the status bar.
 
 Click the status bar item for a quick menu (Stop, Restart, Show Logs).
@@ -325,7 +342,7 @@ launch-codex-desktop-cdp.bat     # port 9225
 Add the port to `agent-proxy/.env`:
 
 ```env
-CDP_PORTS=9223,9225
+CDP_PORTS=9223,9228,9225
 ```
 
 Then restart the proxy.
@@ -343,7 +360,7 @@ Cursor is a VS Code fork. Enable CDP with a pinned taskbar shortcut (recommended
 Add the port to `agent-proxy/.env`:
 
 ```env
-CDP_PORTS=9223,9225,9226,9227
+CDP_PORTS=9223,9228,9225,9226,9227
 ```
 
 Verify at `http://localhost:9227/json/list` — you should see workbench `page` targets with `Cursor` in the title. One proxy session is registered per open workspace window. See `agent-proxy/cursor-cdp-notes.md` for DOM selectors and capability limits.
@@ -351,7 +368,8 @@ Verify at `http://localhost:9227/json/list` — you should see workbench `page` 
 **Validation (throwaway workspace recommended):** use a dedicated Cursor window (e.g. `C:\temp\cursor-test`) for CDP probes — never the Remote Agent Chat host window. Probes use `agent-proxy/cursor-probe-guard.js`.
 
 ```bash
-node tools/cursor-validate-all.js                      # all relay E2E harnesses
+node tools/cursor-validate-all.js --read-only          # safe smoke/capability validation
+node tools/cursor-validate-all.js --send-live          # all relay E2Es (throwaway only)
 node tools/cursor-live-e2e.js --send-live              # relay WebSocket send
 node tools/cursor-web-e2e.js                           # send + REST history verify
 node tools/cursor-permission-e2e.js                    # permission round-trip
@@ -388,7 +406,7 @@ The v1 IDE executable is normally:
 %LOCALAPPDATA%\Programs\Antigravity IDE\Antigravity.exe
 ```
 
-Keep both `9223` and `9226` in `CDP_PORTS` when you want Antigravity IDE and
+Keep both `9228` and `9226` in `CDP_PORTS` when you want Antigravity IDE and
 Antigravity v2 sessions to appear together.
 
 In the WebUI, Antigravity v2 exposes a conversation navigator for the standalone
@@ -547,7 +565,8 @@ root/
 ├── docker-compose.yml        # relay + cloudflared
 ├── .env.example              # Copy to .env and fill in
 ├── SELF_HOSTING.md           # Detailed self-hosting guide
-├── launch-antigravity-cdp.bat
+├── launch-antigravity-cdp.bat        # compatibility alias for the safe 9228 launcher
+├── launch-antigravity-ide-cdp-9228.bat
 ├── launch-antigravity-v2-cdp.bat
 ├── launch-codex-desktop-cdp.bat
 ├── restart-proxy.bat         # Infinite-loop runner for Scheduled Task
@@ -569,8 +588,9 @@ Check `docker compose logs cloudflared`. The token must match the tunnel configu
 The `PUBLIC_URL` in `.env` and the Authorized Redirect URI in Google Console must be identical, including `https://` and no trailing slash.
 
 **Proxy connects but no sessions appear**
-- Confirm Antigravity is running via `launch-antigravity-cdp.bat` (not launched normally)
-- Check `http://localhost:9223/json/list` — you should see iframe targets with agent extension IDs
+- Confirm Antigravity IDE was started via `launch-antigravity-ide-cdp-9228.bat`
+- Check `http://localhost:9228/json/list` for Antigravity IDE targets, or
+  `http://localhost:9223/json/list` for VS Code extension targets
 - Check `proxy.log` for connection errors
 - Make sure `PROXY_SECRET` matches in both `.env` files
 

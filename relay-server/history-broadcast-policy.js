@@ -22,6 +22,27 @@ function buildUnsolicitedHistoryPayload(sessionId, rows, totalMessages) {
   };
 }
 
+function isUnsolicitedHistoryMessage(msg) {
+  if (!msg || msg.request_id) return false;
+  return msg.type === 'history' || msg.type === 'history_snapshot' || msg.type === 'history_chunk';
+}
+
+function buildUnsolicitedHistoryChunkPayload(msg) {
+  const messages = Array.isArray(msg?.messages) ? msg.messages : [];
+  if (messages.length <= UNSOLICITED_HISTORY_TAIL_LIMIT) return msg;
+  const tail = messages.slice(-UNSOLICITED_HISTORY_TAIL_LIMIT);
+  const total = Math.max(messages.length, Number(msg.total_messages) || 0);
+  return {
+    ...msg,
+    messages: tail,
+    partial: true,
+    complete: false,
+    total_messages: total,
+    loaded_messages: tail.length,
+    limit: UNSOLICITED_HISTORY_TAIL_LIMIT,
+  };
+}
+
 function canBroadcastHistoryToBrowser(ws) {
   return Number(ws?.bufferedAmount || 0) <= MAX_BROWSER_HISTORY_BUFFER_BYTES;
 }
@@ -30,5 +51,7 @@ module.exports = {
   UNSOLICITED_HISTORY_TAIL_LIMIT,
   MAX_BROWSER_HISTORY_BUFFER_BYTES,
   buildUnsolicitedHistoryPayload,
+  buildUnsolicitedHistoryChunkPayload,
+  isUnsolicitedHistoryMessage,
   canBroadcastHistoryToBrowser,
 };

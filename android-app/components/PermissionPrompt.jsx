@@ -9,6 +9,7 @@ import {
 //   onChoice — (promptId, choiceId) => void
 export default function PermissionPrompt({ prompt, onChoice }) {
   if (!prompt) return null;
+  const submittingChoiceId = prompt.submitting_choice_id || null;
 
   return (
     <View style={s.container}>
@@ -17,25 +18,33 @@ export default function PermissionPrompt({ prompt, onChoice }) {
         <Text style={s.title} numberOfLines={2}>{prompt.title || 'Permission Required'}</Text>
       </View>
 
-      {!!prompt.description && (
+      {!!(prompt.description || prompt.prompt_text || prompt.message) && (
         <ScrollView style={s.descScroll} nestedScrollEnabled>
-          <Text style={s.desc}>{prompt.description}</Text>
+          <Text style={s.desc}>{prompt.description || prompt.prompt_text || prompt.message}</Text>
         </ScrollView>
       )}
 
+      {!!prompt.error && <Text style={s.error}>{prompt.error}</Text>}
+
       <View style={s.choices}>
-        {(prompt.choices || []).map(choice => (
-          <TouchableOpacity
-            key={choice.id}
-            style={[s.choiceBtn, choiceStyle(choice.style)]}
-            activeOpacity={0.75}
-            onPress={() => onChoice(prompt.prompt_id, choice.id)}
-          >
-            <Text style={[s.choiceText, choiceTextStyle(choice.style)]}>
-              {choice.label}
-            </Text>
-          </TouchableOpacity>
-        ))}
+        {(prompt.choices || []).map((choice, index) => {
+          const choiceId = choice.choice_id || choice.id || choice.value || `choice-${index}`;
+          const pending = submittingChoiceId === choiceId;
+          return (
+            <TouchableOpacity
+              key={choiceId}
+              style={[s.choiceBtn, choiceStyle(choice.style), pending && s.choicePending]}
+              activeOpacity={0.75}
+              disabled={!!submittingChoiceId}
+              onPress={() => onChoice(prompt.prompt_id, choiceId)}
+              accessibilityState={{ disabled: !!submittingChoiceId, busy: pending }}
+            >
+              <Text style={[s.choiceText, choiceTextStyle(choice.style)]}>
+                {choice.label || choice.title || choice.text || choiceId}{pending ? ' · Sending…' : ''}
+              </Text>
+            </TouchableOpacity>
+          );
+        })}
       </View>
     </View>
   );
@@ -87,6 +96,11 @@ const s = StyleSheet.create({
     color:    '#768390',
     fontSize: 13,
   },
+  error: {
+    color: '#ff7b72',
+    fontSize: 12,
+    marginBottom: 10,
+  },
   choices: {
     flexDirection: 'row',
     flexWrap:      'wrap',
@@ -97,6 +111,9 @@ const s = StyleSheet.create({
     paddingVertical:   10,
     paddingHorizontal: 16,
     borderWidth:     1,
+  },
+  choicePending: {
+    opacity: 0.65,
   },
   choicePrimary: {
     backgroundColor: '#1f4d8a',

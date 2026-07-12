@@ -5,16 +5,30 @@ import {
 } from 'react-native';
 import AsyncStorage from '@react-native-async-storage/async-storage';
 import Constants     from 'expo-constants';
-import { signOut }  from '../lib/auth';
+import { getStoredJwt, RELAY_URL, signOut } from '../lib/auth';
 
 // ── Preference keys ───────────────────────────────────────────────────────────
 
+const PREF_NOTIFY_PERMISSION  = 'pref_notify_permission_required';
 const PREF_NOTIFY_AGENT_IDLE  = 'pref_notify_agent_idle';
+const PREF_NOTIFY_AGENT_ERROR = 'pref_notify_agent_error';
+const PREF_NOTIFY_OFFLINE     = 'pref_notify_session_offline';
 const PREF_NOTIFY_RATE_LIMIT  = 'pref_notify_rate_limit';
 
 const DEFAULTS = {
+  [PREF_NOTIFY_PERMISSION]: true,
   [PREF_NOTIFY_AGENT_IDLE]: true,
+  [PREF_NOTIFY_AGENT_ERROR]: true,
+  [PREF_NOTIFY_OFFLINE]: true,
   [PREF_NOTIFY_RATE_LIMIT]: true,
+};
+
+const RELAY_KEYS = {
+  [PREF_NOTIFY_PERMISSION]: 'permission_required',
+  [PREF_NOTIFY_AGENT_IDLE]: 'agent_ready',
+  [PREF_NOTIFY_AGENT_ERROR]: 'agent_error',
+  [PREF_NOTIFY_OFFLINE]: 'session_offline',
+  [PREF_NOTIFY_RATE_LIMIT]: 'rate_limit_cleared',
 };
 
 export async function getNotificationPrefs() {
@@ -24,20 +38,87 @@ export async function getNotificationPrefs() {
   );
 }
 
+async function fetchRelayPreferences() {
+  const jwt = await getStoredJwt();
+  if (!jwt) throw new Error('Sign in again to sync notification settings.');
+  const response = await fetch(`${RELAY_URL}/api/preferences/notifications`, {
+    headers: { Authorization: `Bearer ${jwt}` },
+  });
+  const body = await response.json().catch(() => ({}));
+  if (!response.ok) throw new Error(body.error || 'Unable to load notification settings.');
+  return {
+    [PREF_NOTIFY_PERMISSION]: body.preferences?.permission_required !== false,
+    [PREF_NOTIFY_AGENT_IDLE]: body.preferences?.agent_ready !== false,
+    [PREF_NOTIFY_AGENT_ERROR]: body.preferences?.agent_error !== false,
+    [PREF_NOTIFY_OFFLINE]: body.preferences?.session_offline !== false,
+    [PREF_NOTIFY_RATE_LIMIT]: body.preferences?.rate_limit_cleared !== false,
+  };
+}
+
+async function saveRelayPreferences(prefs) {
+  const jwt = await getStoredJwt();
+  if (!jwt) throw new Error('Sign in again to sync notification settings.');
+  const preferences = Object.fromEntries(
+    Object.entries(RELAY_KEYS).map(([localKey, relayKey]) => [relayKey, !!prefs[localKey]])
+  );
+  const response = await fetch(`${RELAY_URL}/api/preferences/notifications`, {
+    method: 'PUT',
+    headers: {
+      Authorization: `Bearer ${jwt}`,
+      'Content-Type': 'application/json',
+    },
+    body: JSON.stringify({ preferences }),
+  });
+  const body = await response.json().catch(() => ({}));
+  if (!response.ok) throw new Error(body.error || 'Unable to save notification settings.');
+  return body.preferences;
+}
+
 // ── Screen ────────────────────────────────────────────────────────────────────
 
 export default function SettingsScreen({ navigation }) {
   const [prefs,   setPrefs]   = useState(DEFAULTS);
   const [loading, setLoading] = useState(true);
+  const [saving,  setSaving]  = useState(null);
+  const [error,   setError]   = useState('');
 
-  useEffect(() => {
-    getNotificationPrefs().then(p => { setPrefs(p); setLoading(false); });
-  }, []);
+  async function loadPreferences() {
+    setLoading(true);
+    setError('');
+    const cached = await getNotificationPrefs();
+    setPrefs(cached);
+    try {
+      const remote = await fetchRelayPreferences();
+      setPrefs(remote);
+      await AsyncStorage.multiSet(
+        Object.entries(remote).map(([key, value]) => [key, JSON.stringify(value)])
+      );
+    } catch (e) {
+      setError(e.message || 'Unable to sync notification settings.');
+    } finally {
+      setLoading(false);
+    }
+  }
+
+  useEffect(() => { loadPreferences(); }, []);
 
   async function toggle(key) {
+    if (saving) return;
+    const previous = prefs;
     const next = { ...prefs, [key]: !prefs[key] };
     setPrefs(next);
-    await AsyncStorage.setItem(key, JSON.stringify(next[key]));
+    setSaving(key);
+    setError('');
+    try {
+      await saveRelayPreferences(next);
+      await AsyncStorage.setItem(key, JSON.stringify(next[key]));
+    } catch (e) {
+      setPrefs(previous);
+      setError(e.message || 'Unable to save notification settings.');
+      Alert.alert('Settings not saved', e.message || 'Unable to save notification settings.');
+    } finally {
+      setSaving(null);
+    }
   }
 
   function handleSignOut() {
@@ -60,11 +141,35 @@ export default function SettingsScreen({ navigation }) {
       <Text style={s.sectionLabel}>Notifications</Text>
       <View style={s.group}>
         <SettingRow
+          label="Permission required"
+          description="When an agent needs approval to continue"
+          value={prefs[PREF_NOTIFY_PERMISSION]}
+          onToggle={() => toggle(PREF_NOTIFY_PERMISSION)}
+          disabled={loading || !!saving}
+        />
+        <View style={s.divider} />
+        <SettingRow
           label="Agent ready"
           description="When an agent finishes and is waiting for input"
           value={prefs[PREF_NOTIFY_AGENT_IDLE]}
           onToggle={() => toggle(PREF_NOTIFY_AGENT_IDLE)}
-          disabled={loading}
+          disabled={loading || !!saving}
+        />
+        <View style={s.divider} />
+        <SettingRow
+          label="Agent error or rate limit"
+          description="When an agent stops and needs attention"
+          value={prefs[PREF_NOTIFY_AGENT_ERROR]}
+          onToggle={() => toggle(PREF_NOTIFY_AGENT_ERROR)}
+          disabled={loading || !!saving}
+        />
+        <View style={s.divider} />
+        <SettingRow
+          label="Session offline"
+          description="When an agent disconnects from the relay"
+          value={prefs[PREF_NOTIFY_OFFLINE]}
+          onToggle={() => toggle(PREF_NOTIFY_OFFLINE)}
+          disabled={loading || !!saving}
         />
         <View style={s.divider} />
         <SettingRow
@@ -72,9 +177,18 @@ export default function SettingsScreen({ navigation }) {
           description="When a model's rate limit expires"
           value={prefs[PREF_NOTIFY_RATE_LIMIT]}
           onToggle={() => toggle(PREF_NOTIFY_RATE_LIMIT)}
-          disabled={loading}
+          disabled={loading || !!saving}
         />
       </View>
+      {!!error && (
+        <View style={s.syncError} accessibilityRole="alert">
+          <Text style={s.syncErrorText}>{error}</Text>
+          <TouchableOpacity onPress={loadPreferences} disabled={loading} accessibilityRole="button">
+            <Text style={s.retryText}>{loading ? 'Retrying…' : 'Retry'}</Text>
+          </TouchableOpacity>
+        </View>
+      )}
+      <Text style={s.syncNote}>These preferences sync across web and Android.</Text>
 
       <Text style={s.sectionLabel}>Account</Text>
       <View style={s.group}>
@@ -163,6 +277,28 @@ const s = StyleSheet.create({
   dangerText: {
     color:    '#f85149',
     fontSize: 15,
+  },
+  syncError: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: 12,
+    paddingHorizontal: 4,
+    paddingVertical: 6,
+  },
+  syncErrorText: {
+    color: '#f85149',
+    flex: 1,
+    fontSize: 12,
+  },
+  retryText: {
+    color: '#58a6ff',
+    fontSize: 12,
+    fontWeight: '600',
+  },
+  syncNote: {
+    color: '#768390',
+    fontSize: 12,
+    marginHorizontal: 4,
   },
   version: {
     color:     '#444c56',

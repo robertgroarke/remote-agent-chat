@@ -106,14 +106,15 @@ function _saveStore() {
 // parentId identifies the Antigravity window, and the webview id differentiates
 // multiple panels within that same window.
 
-function buildTargetSignature(targetUrl, windowTitle, agentType) {
+function buildTargetSignature(targetUrl, windowTitle, agentType, hostType = null) {
   const extMatch = targetUrl.match(/extensionId=([^&]+)/);
   const ext = extMatch ? extMatch[1] : 'unknown';
   const parentIdMatch = targetUrl.match(/[?&]parentId=([^&]+)/);
   const webviewIdMatch = targetUrl.match(/[?&]id=([^&]+)/);
   const parentId = parentIdMatch ? parentIdMatch[1] : 'unknown-parent';
   const webviewId = webviewIdMatch ? webviewIdMatch[1] : 'unknown-webview';
-  const raw = `${agentType}|${ext}|${windowTitle}|${parentId}|${webviewId}`;
+  const legacyRaw = `${agentType}|${ext}|${windowTitle}|${parentId}|${webviewId}`;
+  const raw = hostType ? `${hostType}|${legacyRaw}` : legacyRaw;
   return crypto.createHash('sha1').update(raw).digest('hex').substring(0, 16);
 }
 
@@ -167,18 +168,103 @@ function findCursorStableSession(sessions, { workspacePath, workspaceName, windo
   return matches[0] || null;
 }
 
+const SINGLETON_EXTENSION_AGENTS = new Set(['continue', 'gemini', 'roo_code']);
+
+function buildSingletonExtensionStableKey({ agentType, hostType, cdpPort, workbenchWindowId, workspacePath }) {
+  const normalizedPath = _normalizeCursorWorkspacePath(workspacePath);
+  if (!SINGLETON_EXTENSION_AGENTS.has(agentType) || !normalizedPath) return null;
+  return [
+    'singleton-extension',
+    String(hostType || 'unknown-host').toLowerCase(),
+    Number.isInteger(Number(cdpPort)) ? Number(cdpPort) : 'unknown-port',
+    String(workbenchWindowId || 'unknown-window').toLowerCase(),
+    agentType,
+    normalizedPath,
+  ].join('::');
+}
+
+function findSingletonExtensionSession(sessions, options) {
+  const stableKey = buildSingletonExtensionStableKey(options);
+  if (!stableKey) return null;
+  const normalizedPath = _normalizeCursorWorkspacePath(options.workspacePath);
+  const cdpPort = Number(options.cdpPort);
+  const workbenchWindowId = String(options.workbenchWindowId || '').toLowerCase();
+  const hostType = String(options.hostType || '').toLowerCase();
+  const matches = Object.entries(sessions || {}).filter(([, session]) => {
+    if (session?.agent_type !== options.agentType) return false;
+    if (_normalizeCursorWorkspacePath(session.workspace_path) !== normalizedPath) return false;
+    if (hostType && session.host_type && String(session.host_type).toLowerCase() !== hostType) return false;
+    if (Number.isInteger(cdpPort) && session.cdp_port != null && session.cdp_port !== '' && Number(session.cdp_port) !== cdpPort) return false;
+    if (workbenchWindowId && session.workbench_window_id && String(session.workbench_window_id).toLowerCase() !== workbenchWindowId) return false;
+    return true;
+  });
+  if (matches.length === 0) return null;
+
+  const canonical = matches.filter(([, session]) => (
+    session.stable_surface_key === stableKey
+    && session.stable_surface_version === 2
+    && !session.superseded_by
+  ));
+  const ranked = (canonical.length > 0 ? canonical : matches).slice().sort((a, b) => {
+    const createdDelta = Date.parse(a[1].created_at || 0) - Date.parse(b[1].created_at || 0);
+    if (createdDelta) return createdDelta;
+    return Date.parse(b[1].last_seen_at || 0) - Date.parse(a[1].last_seen_at || 0);
+  });
+  return { match: ranked[0], matches, stableKey };
+}
+
 // ─── Session resolution ───────────────────────────────────────────────────────
 //
 // Given a discovered CDP target, find or create the durable session record.
 // Returns the full session metadata object.
 
-function resolveSession({ target, windowTitle, agentType, workspaceName, workspacePath, sigOverride }) {
+function resolveSession({ target, windowTitle, agentType, workspaceName, workspacePath, hostType, hostLabel, sigOverride }) {
   const machineLabel = os.hostname();
   // sigOverride allows callers (e.g. Antigravity Manager pages) to supply a
   // pre-computed signature string instead of deriving it from the target URL.
   const targetSignature = sigOverride
     ? crypto.createHash('sha1').update(sigOverride).digest('hex').substring(0, 16)
-    : buildTargetSignature(target.url, windowTitle, agentType);
+    : buildTargetSignature(target.url, windowTitle, agentType, hostType);
+  const legacyTargetSignature = !sigOverride && hostType
+    ? buildTargetSignature(target.url, windowTitle, agentType)
+    : null;
+  const workbenchWindowId = ((String(target.url || '').match(/[?&]parentId=([^&]+)/i) || [])[1] || '').toLowerCase();
+  const applyHostIdentity = (sess) => {
+    if (hostType) sess.host_type = hostType;
+    if (hostLabel) sess.host_label = hostLabel;
+    if (Number.isInteger(target?._cdpPort)) sess.cdp_port = target._cdpPort;
+    if (workbenchWindowId) sess.workbench_window_id = workbenchWindowId;
+  };
+
+  const singletonMatch = findSingletonExtensionSession(_store.sessions, {
+    agentType,
+    hostType,
+    cdpPort: target?._cdpPort,
+    workbenchWindowId,
+    workspacePath,
+  });
+  if (singletonMatch) {
+    const [sid, sess] = singletonMatch.match;
+    sess.target_signature = targetSignature;
+    sess.target_id = target.id;
+    sess.last_seen_at = new Date().toISOString();
+    sess.status = 'healthy';
+    sess.stable_surface_key = singletonMatch.stableKey;
+    sess.stable_surface_version = 2;
+    delete sess.superseded_by;
+    if (windowTitle) sess.window_title = windowTitle;
+    if (workspaceName && !/^window-\d+$/.test(workspaceName)) sess.workspace_name = workspaceName;
+    if (workspacePath) sess.workspace_path = workspacePath;
+    applyHostIdentity(sess);
+    for (const [duplicateSid, duplicate] of singletonMatch.matches) {
+      if (duplicateSid === sid) continue;
+      duplicate.status = 'disconnected';
+      duplicate.superseded_by = sid;
+    }
+    _saveStore();
+    console.log(`[session-store] Matched ${sid} via stable singleton extension surface (${agentType})`);
+    return { ...sess, _matched_existing: true };
+  }
 
   // Cursor target IDs change on every full app restart. Resolve its stable
   // workspace identity before the generic signature/target matches so a short
@@ -196,6 +282,7 @@ function resolveSession({ target, windowTitle, agentType, workspaceName, workspa
     if (windowTitle) sess.window_title = windowTitle;
     if (workspaceName && !/^window-\d+$/.test(workspaceName)) sess.workspace_name = workspaceName;
     if (workspacePath) sess.workspace_path = workspacePath;
+    applyHostIdentity(sess);
     _saveStore();
     console.log(`[session-store] Matched ${sid} via stable Cursor workspace (sig migrated to ${targetSignature})`);
     return { ...sess, _matched_existing: true };
@@ -207,11 +294,33 @@ function resolveSession({ target, windowTitle, agentType, workspaceName, workspa
       sess.target_id    = target.id;
       sess.last_seen_at = new Date().toISOString();
       sess.status       = 'healthy';
+      if (windowTitle) sess.window_title = windowTitle;
       // Only overwrite workspace_name if the new value is meaningful (not a "window-N" placeholder)
       if (workspaceName && !/^window-\d+$/.test(workspaceName)) sess.workspace_name = workspaceName;
       if (workspacePath) sess.workspace_path = workspacePath;
+      applyHostIdentity(sess);
       _saveStore();
       console.log(`[session-store] Matched ${sid} via sig=${targetSignature}`);
+      return { ...sess, _matched_existing: true };
+    }
+  }
+
+  // One-time migration for extension sessions created before host identity was
+  // part of the signature. Keep the durable relay/sidebar ID while moving the
+  // record onto the collision-safe host-qualified signature.
+  if (legacyTargetSignature) {
+    for (const [sid, sess] of Object.entries(_store.sessions)) {
+      if (sess.target_signature !== legacyTargetSignature || sess.agent_type !== agentType) continue;
+      sess.target_signature = targetSignature;
+      sess.target_id = target.id;
+      sess.last_seen_at = new Date().toISOString();
+      sess.status = 'healthy';
+      if (windowTitle) sess.window_title = windowTitle;
+      if (workspaceName && !/^window-\d+$/.test(workspaceName)) sess.workspace_name = workspaceName;
+      if (workspacePath) sess.workspace_path = workspacePath;
+      applyHostIdentity(sess);
+      _saveStore();
+      console.log(`[session-store] Matched ${sid} via legacy signature (host migrated to ${hostType})`);
       return { ...sess, _matched_existing: true };
     }
   }
@@ -227,6 +336,7 @@ function resolveSession({ target, windowTitle, agentType, workspaceName, workspa
       if (windowTitle)   sess.window_title    = windowTitle;
       if (workspaceName && !/^window-\d+$/.test(workspaceName)) sess.workspace_name = workspaceName;
       if (workspacePath) sess.workspace_path  = workspacePath;
+      applyHostIdentity(sess);
       _saveStore();
       console.log(`[session-store] Matched ${sid} via target_id=${target.id} (sig updated)`);
       return { ...sess, _matched_existing: true };
@@ -245,9 +355,21 @@ function resolveSession({ target, windowTitle, agentType, workspaceName, workspa
     window_title:     windowTitle,
     workspace_name:   workspaceName || windowTitle,
     workspace_path:   workspacePath || null,
+    host_type:         hostType || null,
+    host_label:        hostLabel || null,
     machine_label:    machineLabel,
     target_signature: targetSignature,
     target_id:        target.id,
+    cdp_port:         Number.isInteger(target?._cdpPort) ? target._cdpPort : null,
+    workbench_window_id: workbenchWindowId || null,
+    stable_surface_key: buildSingletonExtensionStableKey({
+      agentType,
+      hostType,
+      cdpPort: target?._cdpPort,
+      workbenchWindowId,
+      workspacePath,
+    }),
+    stable_surface_version: SINGLETON_EXTENSION_AGENTS.has(agentType) ? 2 : null,
     created_at:       now,
     last_seen_at:     now,
     status:           'healthy',
@@ -423,8 +545,11 @@ function getAllSessions() {
 }
 
 module.exports = {
+  buildTargetSignature,
   buildCursorStableSignatureSource,
   findCursorStableSession,
+  buildSingletonExtensionStableKey,
+  findSingletonExtensionSession,
   resolveSession,
   resolveVirtualSession,
   updateSession,

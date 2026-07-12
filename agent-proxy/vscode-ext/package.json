@@ -52,8 +52,8 @@
         },
         "remoteAgentProxy.cdpPorts": {
           "type": "string",
-          "default": "9223,9226,9225",
-          "description": "Comma-separated CDP port numbers to scan (e.g. 9223,9226,9225 for Antigravity, Antigravity v2, and Codex Desktop)"
+          "default": "9223,9228,9225,9226,9227",
+          "description": "Comma-separated CDP ports (9223 VS Code, 9228 Antigravity IDE, 9225 Codex Desktop, 9226 Antigravity v2, 9227 Cursor)"
         },
         "remoteAgentProxy.machineLabel": {
           "type": "string",

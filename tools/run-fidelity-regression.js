@@ -24,7 +24,8 @@ try {
 } catch (_) {}
 
 const PORTS = {
-  antigravity: 9223,
+  vscode: 9223,
+  antigravity: 9228,
   antigravityV2: 9226,
   codexDesktop: 9225,
 };
@@ -227,7 +228,7 @@ async function listTargetsByPort() {
   const output = {};
   for (const [name, port] of Object.entries(PORTS)) {
     try {
-      output[name] = await CDP.List({ port });
+      output[name] = (await CDP.List({ port })).map(target => ({ ...target, _cdpPort: port, _hostKey: name }));
     } catch (error) {
       output[name] = { error: error.message };
     }
@@ -236,7 +237,7 @@ async function listTargetsByPort() {
 }
 
 async function withTarget(port, target, fn) {
-  const client = await CDP({ port, target: target.id });
+  const client = await CDP({ port: target._cdpPort || port, target: target.id });
   try {
     await client.Runtime.enable();
     return await fn(client.Runtime, client);
@@ -955,6 +956,10 @@ async function runFidelitySuite(options = {}) {
   const dbReader = createDbReader(relayDbPath);
   const targetsByPort = await listTargetsByPort();
   const sessions = listSessions();
+  const editorTargets = [
+    ...(Array.isArray(targetsByPort.vscode) ? targetsByPort.vscode : []),
+    ...(Array.isArray(targetsByPort.antigravity) ? targetsByPort.antigravity : []),
+  ];
 
   const meta = {
     relay_base_url: relayBaseUrl,
@@ -962,6 +967,7 @@ async function runFidelitySuite(options = {}) {
     relay_db_path: relayDbPath,
     relay_auth_mode: bearerToken ? 'bearer_jwt' : 'none',
     stored_sessions: sessions.length,
+    vscode_targets: Array.isArray(targetsByPort.vscode) ? targetsByPort.vscode.length : 0,
     antigravity_targets: Array.isArray(targetsByPort.antigravity) ? targetsByPort.antigravity.length : 0,
     antigravity_v2_targets: Array.isArray(targetsByPort.antigravityV2) ? targetsByPort.antigravityV2.length : 0,
     codex_desktop_targets: Array.isArray(targetsByPort.codexDesktop) ? targetsByPort.codexDesktop.length : 0,
@@ -1002,8 +1008,8 @@ async function runFidelitySuite(options = {}) {
       }
     }
 
-    if (Array.isArray(targetsByPort.antigravity)) {
-      if (options.surfaces.includes('antigravity_panel')) {
+    if (options.surfaces.includes('antigravity_panel')) {
+      if (Array.isArray(targetsByPort.antigravity)) {
         const workbench = findWorkbenchTarget(targetsByPort.antigravity);
         if (!workbench) {
           reporter.add({
@@ -1017,27 +1023,35 @@ async function runFidelitySuite(options = {}) {
           const mapped = matchSessionByTarget(sessions, 'antigravity_panel', workbench.id, ' / ');
           await runSurfaceComparison('antigravity_panel', workbench, mapped, { relayBaseUrl, relayBaseUrls, bearerToken, dbReader, options }, reporter);
         }
+      } else {
+        reporter.add({
+          surface: 'antigravity_panel',
+          test_id: 'antigravity_panel.fidelity.compare',
+          status: STATUS_SKIP,
+          detail: 'Antigravity IDE port 9228 is not available',
+          investigation_hint: 'Launch Antigravity IDE on port 9228 before running the fidelity regression',
+        });
       }
+    }
 
-      for (const surface of ['claude', 'codex', 'continue']) {
-        if (!options.surfaces.includes(surface)) continue;
-        const targets = surface === 'codex'
-          ? findMatchingTargets(targetsByPort.antigravity, PATTERNS[surface])
-          : [findFirstMatchingTarget(targetsByPort.antigravity, PATTERNS[surface])].filter(Boolean);
-        if (targets.length === 0) {
-          reporter.add({
-            surface,
-            test_id: `${surface}.fidelity.compare`,
-            status: STATUS_SKIP,
-            detail: `No ${surface} iframe target found`,
-            investigation_hint: `Open the ${surface} surface before running the fidelity regression`,
-          });
-          continue;
-        }
-        for (const target of targets) {
-          const mapped = matchSessionByTarget(sessions, surface, target.id, target.title || target.url || surface);
-          await runSurfaceComparison(surface, target, mapped, { relayBaseUrl, relayBaseUrls, bearerToken, dbReader, options }, reporter);
-        }
+    for (const surface of ['claude', 'codex', 'continue']) {
+      if (!options.surfaces.includes(surface)) continue;
+      const targets = surface === 'codex'
+        ? findMatchingTargets(editorTargets, PATTERNS[surface])
+        : [findFirstMatchingTarget(editorTargets, PATTERNS[surface])].filter(Boolean);
+      if (targets.length === 0) {
+        reporter.add({
+          surface,
+          test_id: `${surface}.fidelity.compare`,
+          status: STATUS_SKIP,
+          detail: `No ${surface} iframe target found on VS Code 9223 or Antigravity IDE 9228`,
+          investigation_hint: `Open the ${surface} surface in a configured editor host before running the fidelity regression`,
+        });
+        continue;
+      }
+      for (const target of targets) {
+        const mapped = matchSessionByTarget(sessions, surface, target.id, target.title || target.url || surface);
+        await runSurfaceComparison(surface, target, mapped, { relayBaseUrl, relayBaseUrls, bearerToken, dbReader, options }, reporter);
       }
     }
   } finally {
