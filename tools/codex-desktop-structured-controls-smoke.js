@@ -2,12 +2,17 @@
 'use strict';
 
 const assert = require('assert');
-const fs = require('fs');
-const path = require('path');
 const CDP = require('../agent-proxy/node_modules/chrome-remote-interface');
 const { ProxyEngine } = require('../agent-proxy/proxy-engine');
 const selectors = require('../agent-proxy/selectors');
+const codexCli = require('../agent-proxy/codex-cli');
+const {
+  codexDesktopCliSessionId,
+  codexDesktopArchiveMessages,
+  codexDesktopStructuredBlockCounts,
+} = require('../agent-proxy/codex-desktop-archive');
 const { withCodexDesktopCdpLock } = require('../agent-proxy/codex-desktop-cdp-lock');
+const { listCdpTargets, connectCdpTarget } = require('../agent-proxy/cdp-loopback');
 
 const PORT = Number(process.env.CODEX_DESKTOP_CDP_PORT || 9225);
 const TIMEOUT_MS = Number(process.env.CODEX_DESKTOP_STRUCTURED_TIMEOUT_MS || 30000);
@@ -23,13 +28,61 @@ function withTimeout(promise, label) {
 }
 
 async function main() {
-  const targets = await withTimeout(CDP.List({ port: PORT }), 'Codex Desktop target list');
+  const targets = await withTimeout(listCdpTargets(CDP, { port: PORT }), 'Codex Desktop target list');
   const target = targets.find(item => item.type === 'page' && item.url === 'app://-/index.html');
   assert(target, `Codex Desktop app target not found on port ${PORT}`);
-  const client = await withTimeout(CDP({ port: PORT, target: target.id }), 'Codex Desktop attach');
+  const client = await withTimeout(connectCdpTarget(CDP, {
+    port: PORT,
+    host: target._cdpHost,
+    target: target.id,
+  }), 'Codex Desktop attach');
 
+  let originalThreadId = '';
+  let validationThreadId = '';
   try {
     await client.Runtime.enable();
+    const initialThreads = await withTimeout(
+      selectors.readCodexThreadList(client.Runtime, true),
+      'initial native thread list',
+    );
+    const originalThread = initialThreads.find(thread => thread && thread.active) || null;
+    originalThreadId = String(originalThread?.id || '');
+    assert(originalThreadId, 'current native thread was not detected');
+
+    // The currently selected disposable thread may intentionally contain no
+    // commands or edits. Choose a native thread whose exact local archive has
+    // both structures, then restore the original selection in finally. The
+    // cross-process CDP lock keeps the production poller from observing this
+    // temporary read-only selection.
+    const orderedThreads = [
+      originalThread,
+      ...initialThreads.filter(thread => thread && thread.id !== originalThreadId),
+    ];
+    let validationThread = null;
+    let validationArchive = null;
+    for (const thread of orderedThreads) {
+      const cliSessionId = codexDesktopCliSessionId(thread?.id);
+      if (!cliSessionId) continue;
+      const archive = codexCli.findSessionByCliId(cliSessionId);
+      const normalized = codexDesktopArchiveMessages(archive?.messages);
+      const counts = codexDesktopStructuredBlockCounts(normalized);
+      if (Number(counts.terminal || 0) > 0 && Number(counts.file_changes || 0) > 0) {
+        validationThread = thread;
+        validationArchive = archive;
+        break;
+      }
+    }
+    assert(validationThread && validationArchive,
+      'no listed Codex Desktop thread has an exact archive with terminal and file-change blocks');
+    validationThreadId = String(validationThread.id || '');
+    if (validationThreadId !== originalThreadId) {
+      const switched = await withTimeout(
+        selectors.switchCodexThread(client.Runtime, validationThreadId, true),
+        'structured fixture thread switch',
+      );
+      assert.equal(switched?.ok, true, `structured fixture thread switch failed: ${JSON.stringify(switched)}`);
+    }
+
     const messageRaw = await withTimeout(
       selectors.readMessages(
         client.Runtime,
@@ -40,13 +93,25 @@ async function main() {
       'bounded native structured messages',
     );
     const recentMessages = JSON.parse(messageRaw || '[]');
-    const storePath = path.join(__dirname, '..', 'agent-proxy', 'session-store.json');
-    const store = JSON.parse(fs.readFileSync(storePath, 'utf8'));
-    const storedSession = Object.values(store.sessions || {})
-      .filter(session => session.agent_type === 'codex-desktop' && Array.isArray(session.accumulated_messages))
-      .sort((left, right) => String(right.last_seen_at || '').localeCompare(String(left.last_seen_at || '')))[0];
-    assert(storedSession, 'durable Codex Desktop accumulator not found');
-    const messages = storedSession.accumulated_messages;
+    const nativeThreads = await withTimeout(
+      selectors.readCodexThreadList(client.Runtime, true),
+      'current native thread list',
+    );
+    const nativeActiveThread = nativeThreads.find(thread => thread && thread.active) || null;
+    const nativeActiveThreadKey = String(nativeActiveThread?.id || '');
+    assert.equal(nativeActiveThreadKey, validationThreadId,
+      'native active thread differs from the selected structured fixture');
+    const engine = Object.create(ProxyEngine.prototype);
+    engine._log = () => {};
+    const messages = engine._maybeUseCodexDesktopArchive(
+      'structured-control-smoke',
+      {
+        agentType: 'codex-desktop',
+        _activeThreadKey: nativeActiveThreadKey,
+        _activeThreadTitle: nativeActiveThread?.title || '',
+      },
+      recentMessages,
+    );
     const nativeTerminalBlocks = [];
     const nativeChangeBlocks = [];
     for (const message of messages) {
@@ -57,9 +122,6 @@ async function main() {
     }
     assert(nativeTerminalBlocks.length > 0, 'live native transcript has no terminal blocks to validate');
     assert(nativeChangeBlocks.length > 0, 'live native transcript has no file-change blocks to validate');
-    const engine = Object.create(ProxyEngine.prototype);
-    assert.equal(engine._codexDesktopRestoreWindowMatches(messages, recentMessages), true,
-      'bounded live window must overlap the durable same-thread accumulator');
 
     const recentTerminalEntries = selectors.codexTerminalEntriesFromMessages(recentMessages);
     const recentChangeEntries = selectors.codexFileChangeEntriesFromMessages(recentMessages);
@@ -112,13 +174,24 @@ async function main() {
     assert.equal(capabilities.terminal_input, false,
       'Codex Desktop terminal input must stay gated without a native target');
 
+    const historyScope = validationArchive.messagesPartial
+      ? 'bounded exact-thread native JSONL tail'
+      : 'complete exact-thread native JSONL archive';
     console.log(
       `Codex Desktop structured controls smoke: PASS ` +
-      `(${terminalEntries.length} terminal, ${changeEntries.length} file-change blocks durable; ` +
+      `(${terminalEntries.length} terminal, ${changeEntries.length} file-change blocks from ${historyScope}; ` +
       `${recentTerminalEntries.length}/${recentChangeEntries.length} in current bounded window)`,
     );
   } finally {
-    await client.close();
+    try {
+      if (originalThreadId && validationThreadId && originalThreadId !== validationThreadId) {
+        const restored = await selectors.switchCodexThread(client.Runtime, originalThreadId, true);
+        assert.equal(restored?.ok, true,
+          `failed to restore original Codex Desktop thread ${originalThreadId}`);
+      }
+    } finally {
+      await client.close();
+    }
   }
 }
 

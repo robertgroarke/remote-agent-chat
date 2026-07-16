@@ -1,0 +1,29 @@
+{
+  "billingCycleStart": "1782399065000",
+  "billingCycleEnd": "1784991065000",
+  "planUsage": {
+    "totalSpend": 11063,
+    "includedSpend": 2000,
+    "bonusSpend": 9063,
+    "limit": 2000,
+    "remainingBonus": false,
+    "bonusTooltip": "Redacted provider disclosure",
+    "autoPercentUsed": 21.376666666666665,
+    "apiPercentUsed": 100,
+    "totalPercentUsed": 32.06666666666666
+  },
+  "spendLimitUsage": {
+    "limitType": "user"
+  },
+  "displayThreshold": 200,
+  "enabled": true,
+  "displayMessage": "Redacted provider message",
+  "autoModelSelectedDisplayMessage": "You've used 32% of your included total usage",
+  "namedModelSelectedDisplayMessage": "You've used 100% of your included API usage",
+  "autoBucketModels": [
+    "default",
+    "composer-2.5",
+    "vega",
+    "grok-4.5"
+  ]
+}

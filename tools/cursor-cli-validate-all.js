@@ -2,10 +2,10 @@
 'use strict';
 
 const assert = require('assert');
-const fs = require('fs');
 const path = require('path');
 const { spawnSync } = require('child_process');
 const { resolveCursorCommand } = require('../agent-proxy/cursor-cli');
+const { assertAssetPairsSynced } = require('./frontend-asset-sync');
 
 const root = path.join(__dirname, '..');
 const args = process.argv.slice(2);
@@ -22,6 +22,10 @@ const stages = [
   ['Protocol syntax', process.execPath, ['--check', 'agent-proxy/protocol.js']],
   ['Cursor CLI parser, lifecycle, and quoted-tool smoke', process.execPath,
     ['tools/cursor-cli-parser-smoke.js', ...(readOnly ? ['--read-only'] : [])]],
+  ['Cursor CLI retained native taxonomy drift gate', process.execPath,
+    ['tools/cursor-cli-native-taxonomy-smoke.js', '--read-only']],
+  ['Cursor CLI native error and style parity smoke', process.execPath,
+    ['tools/cursor-cli-native-error-smoke.js']],
   ['Cursor CLI controls and interrupt smoke', process.execPath, ['tools/cursor-cli-controls-smoke.js']],
   ['Frontend history reconnect smoke', process.execPath, ['tools/frontend-history-reconnect-smoke.js']],
   ['Frontend transcript fidelity smoke', process.execPath, ['tools/frontend-transcript-fidelity-smoke.js']],
@@ -49,13 +53,7 @@ const synchronizedAssets = [
   ['frontend/hooks.jsx', 'relay-server/public/hooks.jsx'],
   ['frontend/dist/bundle.js', 'relay-server/public/dist/bundle.js'],
 ];
-for (const [source, deployed] of synchronizedAssets) {
-  assert.deepStrictEqual(
-    fs.readFileSync(path.join(root, source)),
-    fs.readFileSync(path.join(root, deployed)),
-    `${deployed} must exactly match ${source}; run node frontend/build.js`,
-  );
-}
+assertAssetPairsSynced(root, synchronizedAssets);
 console.log('PASS Frontend source/build public asset synchronization');
 
 const cursor = resolveCursorCommand();

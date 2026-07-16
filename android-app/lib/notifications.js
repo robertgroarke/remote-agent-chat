@@ -1,8 +1,6 @@
 // lib/notifications.js — Expo push notification registration + channel setup
 //
-// Two notification channels:
-//   agent-idle  — agent finished a task and is waiting (HIGH importance)
-//   rate-limit  — a rate limit has cleared (DEFAULT importance)
+// Semantic lifecycle channels keep turn, completion, and attention distinct.
 //
 // The relay server targets these channelId values in its FCM payloads.
 
@@ -32,6 +30,36 @@ export async function configureNotificationChannels() {
     importance:       Notifications.AndroidImportance.HIGH,
     vibrationPattern: [0, 250, 250, 250],
     lightColor:       '#58a6ff',
+    sound:            true,
+    lockscreenVisibility: Notifications.AndroidNotificationVisibility.PUBLIC,
+  });
+
+  await Notifications.setNotificationChannelAsync('turn-ready', {
+    name:             'Turn Finished',
+    description:      'Notifies when an ordinary agent turn is waiting for input.',
+    importance:       Notifications.AndroidImportance.HIGH,
+    vibrationPattern: [0, 180],
+    lightColor:       '#58a6ff',
+    sound:            true,
+    lockscreenVisibility: Notifications.AndroidNotificationVisibility.PUBLIC,
+  });
+
+  await Notifications.setNotificationChannelAsync('goal-completed', {
+    name:             'Goal Completed',
+    description:      'Notifies only when a native goal reaches completed state.',
+    importance:       Notifications.AndroidImportance.HIGH,
+    vibrationPattern: [0, 180, 100, 180],
+    lightColor:       '#3fb950',
+    sound:            true,
+    lockscreenVisibility: Notifications.AndroidNotificationVisibility.PUBLIC,
+  });
+
+  await Notifications.setNotificationChannelAsync('goal-attention', {
+    name:             'Goal Needs Attention',
+    description:      'Notifies when a goal pauses, blocks, becomes limited, stops, or fails.',
+    importance:       Notifications.AndroidImportance.HIGH,
+    vibrationPattern: [0, 300, 150, 300],
+    lightColor:       '#d29922',
     sound:            true,
     lockscreenVisibility: Notifications.AndroidNotificationVisibility.PUBLIC,
   });

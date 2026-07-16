@@ -1,0 +1,63 @@
+{
+  "surface": "codex",
+  "host": "vscode",
+  "version": "26.707.91948",
+  "card": {
+    "class_marker": "request-card",
+    "question_count": 2,
+    "cancel_label": "Skip",
+    "acknowledgement": "request_card_disappeared",
+    "pages": [
+      {
+        "index": 0,
+        "counter": "1 of 2",
+        "question": "Choose a route.",
+        "choices": [
+          { "label": "Relay", "description": "Answer through RAC.", "selected": true, "role": "radio" },
+          { "label": "Native", "description": "Answer locally.", "selected": false, "role": "radio" }
+        ],
+        "previous_disabled": true,
+        "next_disabled": false
+      },
+      {
+        "index": 1,
+        "counter": "2 of 2",
+        "question": "Choose a pace.",
+        "choices": [
+          { "label": "Fast", "description": "Prefer speed.", "selected": true, "role": "radio" },
+          { "label": "Safe", "description": "Prefer caution.", "selected": false, "role": "radio" }
+        ],
+        "previous_disabled": false,
+        "next_disabled": true
+      }
+    ]
+  },
+  "request_questions": [
+    {
+      "id": "route",
+      "header": "Route",
+      "question": "Choose a route.",
+      "options": [
+        { "label": "Relay", "description": "Answer through RAC." },
+        { "label": "Native", "description": "Answer locally." }
+      ],
+      "isOther": true,
+      "isSecret": false
+    },
+    {
+      "id": "pace",
+      "header": "Pace",
+      "question": "Choose a pace.",
+      "options": [
+        { "label": "Fast", "description": "Prefer speed." },
+        { "label": "Safe", "description": "Prefer caution." }
+      ],
+      "isOther": true,
+      "isSecret": false
+    }
+  ],
+  "answer_sequence": [
+    { "question_id": "route", "label": "Relay", "from_page": 0, "to_page": 1 },
+    { "question_id": "pace", "label": "Safe", "from_page": 1, "to_page": null }
+  ]
+}

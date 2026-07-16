@@ -6,6 +6,11 @@ import * as Clipboard from 'expo-clipboard';
 import Markdown from 'react-native-markdown-display';
 import ToolSection from './ToolSection';
 import CollapsibleBlock from './CollapsibleBlock';
+import {
+  formatAbsoluteMessageTime,
+  formatVisibleMessageTime,
+  messageInstant,
+} from '../lib/message-time';
 const {
   normalizeMessageBlocks,
   terminalText,
@@ -23,7 +28,12 @@ export default function MessageBubble({ message, agentType, deliveryState }) {
   const blocks = normalizeMessageBlocks(message);
   const isLight = useColorScheme() === 'light';
   const transcriptTheme = themeForAgent(agentType, isLight);
+  const nativeLayout = nativeMessageLayout(agentType);
   const [showCopied, setShowCopied] = useState(false);
+  const instant = messageInstant(message);
+  const absoluteTimestamp = instant ? formatAbsoluteMessageTime(instant) : 'time unknown';
+  const visibleTimestamp = instant ? formatVisibleMessageTime(instant) : 'Time unknown';
+  const deliveryText = isUser ? deliveryLabel(message, deliveryState) : '';
 
   const handleLongPress = useCallback(() => {
     const plain = blocksToPlainText(blocks);
@@ -33,30 +43,62 @@ export default function MessageBubble({ message, agentType, deliveryState }) {
     setTimeout(() => setShowCopied(false), 1500);
   }, [blocks]);
 
+  const bubble = (
+    <Pressable
+      style={nativeLayout === 'codex-terminal' ? s.terminalContent : null}
+      onLongPress={handleLongPress}
+      delayLongPress={400}
+    >
+      <View style={[
+        s.bubble,
+        isUser ? s.bubbleUser : s.bubbleAssistant,
+        nativeLayout === 'claude-document' && s.bubbleDocument,
+        nativeLayout === 'codex-terminal' && s.bubbleTerminal,
+        nativeLayout === 'cursor-cards' && s.bubbleCursorCard,
+        nativeLayout === 'codex-thread' && !isUser && s.bubbleCodexAssistant,
+        nativeLayout === 'codex-thread' && isUser && s.bubbleCodexUser,
+        (nativeLayout === 'claude-document' || nativeLayout === 'codex-terminal' || (nativeLayout === 'codex-thread' && !isUser))
+          && { backgroundColor: 'transparent' },
+        nativeLayout === 'cursor-cards' && { backgroundColor: isLight ? '#f6f8fa' : '#161b22' },
+      ]}>
+        {blocks.map((block, i) => renderBlock(block, i, isUser, transcriptTheme))}
+        {showCopied && (
+          <View style={s.copiedToast}>
+            <Text style={s.copiedText}>Copied</Text>
+          </View>
+        )}
+      </View>
+    </Pressable>
+  );
+
   return (
-    <View style={[s.wrapper, isUser ? s.wrapperUser : s.wrapperAssistant]}>
-      <Pressable onLongPress={handleLongPress} delayLongPress={400}>
-        <View style={[s.bubble, isUser ? s.bubbleUser : s.bubbleAssistant]}>
-          {blocks.map((block, i) => renderBlock(block, i, isUser, transcriptTheme))}
-          {showCopied && (
-            <View style={s.copiedToast}>
-              <Text style={s.copiedText}>Copied</Text>
-            </View>
-          )}
+    <View style={[
+      s.wrapper,
+      isUser ? s.wrapperUser : s.wrapperAssistant,
+      nativeLayout !== 'unified-flow' && s.wrapperNativeFull,
+    ]}>
+      {nativeLayout === 'codex-terminal' ? (
+        <View style={s.terminalRow}>
+          <Text style={s.terminalGutter}>{isUser ? 'IN' : 'OUT'}</Text>
+          {bubble}
         </View>
-      </Pressable>
-      {(message.timestamp || isUser) && (
-        <View style={[s.metaRow, isUser && s.metaRowUser]}>
-          {!!message.timestamp && (
-            <Text style={[s.time, isUser && s.timeUser]}>{formatTime(message.timestamp)}</Text>
-          )}
+      ) : bubble}
+      <View style={[s.metaRow, isUser && s.metaRowUser]}>
+          <Text
+            style={[s.time, isLight && s.timeLight, isUser && s.timeUser]}
+            accessibilityLabel={`Sent ${absoluteTimestamp}`}
+          >
+            {visibleTimestamp}
+          </Text>
           {isUser && (
-            <Text style={[s.delivery, deliveryState === 'failed' && s.deliveryFailed]}>
-              {deliveryLabel(message, deliveryState)}
+            <Text
+              style={[s.delivery, deliveryState === 'failed' && s.deliveryFailed]}
+              accessibilityLabel={deliveryText.replace(/^[✓✕▶↗·\s]+/u, '') || deliveryText}
+            >
+              {deliveryText}
             </Text>
           )}
-        </View>
-      )}
+      </View>
     </View>
   );
 }
@@ -126,6 +168,12 @@ function renderBlock(block, i, isUser, theme) {
       );
 
     case 'terminal':
+      if (theme.nativeClaudeTerminal) {
+        return <ClaudeTerminalBlock key={i} block={block} light={theme.isLight} />;
+      }
+      if (theme.nativeDesktopTerminal) {
+        return <CodexDesktopTerminalBlock key={i} block={block} light={theme.isLight} />;
+      }
       return (
         <ToolSection
           key={i}
@@ -141,6 +189,9 @@ function renderBlock(block, i, isUser, theme) {
       );
 
     case 'file_changes':
+      if (theme.nativeCursorFileChangeSummary && isCursorFileChangeSummaryOnly(block)) {
+        return renderCursorFileChangeSummary(block, i, theme);
+      }
       return renderStructuredCard(block, i, 'File changes', 'file', theme.markdown);
 
     case 'artifact':
@@ -173,9 +224,26 @@ function renderBlock(block, i, isUser, theme) {
       return renderStructuredCard(block, i, 'Queued message', 'queued', theme.markdown);
 
     case 'notice':
+      if (theme.nativeInlineNotice) {
+        return renderCursorNativeNotice(block, i, theme);
+      }
+      if (theme.nativeDesktopNotice) {
+        return renderCodexDesktopNotice(block, i, theme);
+      }
       return renderStructuredCard(block, i, 'Notice', 'notice', theme.markdown);
 
     case 'error':
+      if (theme.nativeAntigravityError) {
+        return <AntigravityErrorBlock key={i} block={block} theme={theme} />;
+      }
+      if (theme.nativePlainError) {
+        return (
+          <Text key={i} style={[theme.markdown.body, s.cursorNativeError]} selectable accessibilityRole="alert">
+            <Text style={s.cursorNativeErrorLabel}>{block.label || block.title || 'Error'}: </Text>
+            {block.content || block.text || block.markdown || ''}
+          </Text>
+        );
+      }
       return renderStructuredCard(block, i, 'Error', 'error', theme.markdown);
 
     case 'status':
@@ -186,6 +254,24 @@ function renderBlock(block, i, isUser, theme) {
       );
 
     case 'thinking':
+      if (theme.nativePlainThinking) {
+        const content = block.content || block.thinking || block.text || '';
+        return content ? <Markdown key={i} style={theme.markdown}>{content}</Markdown> : null;
+      }
+      if (theme.nativeDesktopThinking) {
+        const label = block.label || block.title || 'Worked';
+        const content = block.content || block.thinking || block.text || '';
+        const bodyIsTitleOnly = !content || String(content).replace(/\s+/g, ' ').trim() === String(label).replace(/\s+/g, ' ').trim();
+        return (
+          <View key={i} style={s.codexDesktopThinking}>
+            <View style={s.codexDesktopThinkingHeader}>
+              <Text style={s.codexDesktopThinkingLabel}>{label}</Text>
+              <Text style={s.codexDesktopThinkingChevron} accessibilityElementsHidden>⌄</Text>
+            </View>
+            {!bodyIsTitleOnly && <Markdown style={theme.markdown}>{content}</Markdown>}
+          </View>
+        );
+      }
       return (
         <View key={i} style={s.thinkingBlock}>
           <Text style={s.thinkingLabel}>{block.label || block.title || 'Thinking'}</Text>
@@ -196,6 +282,108 @@ function renderBlock(block, i, isUser, theme) {
     default:
       return null;
   }
+}
+
+function ClaudeTerminalBlock({ block, light }) {
+  const title = String(block.label || block.title || 'Bash').trim();
+  const titleParts = title.match(/^(\S+)(?:\s+([\s\S]*))?$/);
+  const toolName = titleParts?.[1] || 'Bash';
+  const description = titleParts?.[2] || '';
+  const status = String(block.status || 'running').toLowerCase();
+  const failed = status === 'error' || status === 'failed';
+  const rows = [
+    block.command ? { label: 'IN', text: block.command, error: false } : null,
+    block.stdout ? { label: 'OUT', text: block.stdout, error: false } : null,
+    block.stderr ? { label: 'ERR', text: block.stderr, error: true } : null,
+  ].filter(Boolean);
+  return (
+    <View style={s.claudeTerminal} accessibilityLabel={title}>
+      <View style={s.claudeTerminalHeader}>
+        <View style={[
+          s.claudeTerminalDot,
+          status === 'completed' && s.claudeTerminalDotCompleted,
+          failed && s.claudeTerminalDotFailed,
+        ]} />
+        <Text style={[s.claudeTerminalName, light && s.claudeTerminalTextLight]}>{toolName}</Text>
+        {!!description && (
+          <Text style={[s.claudeTerminalDescription, light && s.claudeTerminalTextLight]}>{description}</Text>
+        )}
+      </View>
+      {rows.length > 0 && (
+        <View style={[s.claudeTerminalBody, light && s.claudeTerminalBodyLight]}>
+          {rows.map((row, index) => (
+            <View key={`${row.label}-${index}`} style={[
+              s.claudeTerminalRow,
+              index > 0 && s.claudeTerminalRowBorder,
+              index > 0 && light && s.claudeTerminalRowBorderLight,
+            ]}>
+              <Text style={[s.claudeTerminalRowLabel, light && s.claudeTerminalMutedLight]}>{row.label}</Text>
+              <Text style={[
+                s.claudeTerminalRowText,
+                light && s.claudeTerminalTextLight,
+                row.error && s.claudeTerminalRowError,
+              ]} selectable>{row.text}</Text>
+            </View>
+          ))}
+        </View>
+      )}
+    </View>
+  );
+}
+
+function CodexDesktopTerminalBlock({ block, light }) {
+  const [open, setOpen] = useState(true);
+  const body = terminalText(block);
+  return (
+    <View style={s.codexDesktopTerminal}>
+      <Pressable
+        style={s.codexDesktopTerminalHeader}
+        onPress={() => setOpen(value => !value)}
+        accessibilityRole="button"
+        accessibilityState={{ expanded: open }}
+      >
+        <Text style={[s.codexDesktopTerminalIcon, light && s.codexDesktopTerminalMutedLight]} accessibilityElementsHidden>▣</Text>
+        <Text style={[s.codexDesktopTerminalLabel, light && s.codexDesktopTerminalMutedLight]}>Ran commands</Text>
+        <Text style={[s.codexDesktopTerminalChevron, light && s.codexDesktopTerminalMutedLight]} accessibilityElementsHidden>{open ? '⌄' : '›'}</Text>
+      </Pressable>
+      {open && !!body && (
+        <Text style={[s.codexDesktopTerminalBody, light && s.codexDesktopTerminalBodyLight]} selectable>{body}</Text>
+      )}
+    </View>
+  );
+}
+
+function AntigravityErrorBlock({ block, theme }) {
+  const [open, setOpen] = useState(false);
+  const title = block.label || block.title || 'Error';
+  const body = block.content || block.text || block.markdown || '';
+  const actions = Array.isArray(block.actions) ? block.actions : [];
+  return (
+    <View style={s.antigravityError} accessibilityRole="alert">
+      <Pressable
+        style={s.antigravityErrorSummary}
+        onPress={() => setOpen(value => !value)}
+        accessibilityRole="button"
+        accessibilityState={{ expanded: open }}
+        accessibilityLabel={[title, body].filter(Boolean).join(' ')}
+      >
+        <Text style={[theme.markdown.body, s.antigravityErrorText]} selectable>
+          <Text style={s.antigravityErrorLabel}>{title}</Text>
+          {!!body && ` ${body}`}
+        </Text>
+        <Text style={s.antigravityErrorChevron} accessibilityElementsHidden>{open ? '\u2304' : '\u203A'}</Text>
+      </Pressable>
+      {open && actions.length > 0 && (
+        <View style={s.structuredActions}>
+          {actions.map((action, index) => (
+            <View key={action.id || index} style={s.structuredAction}>
+              <Text style={s.structuredActionText}>{action.label || action.id || 'Action'}</Text>
+            </View>
+          ))}
+        </View>
+      )}
+    </View>
+  );
 }
 
 function renderStructuredCard(block, key, fallbackTitle, tone, activeMarkdownStyles) {
@@ -218,6 +406,104 @@ function renderStructuredCard(block, key, fallbackTitle, tone, activeMarkdownSty
       )}
     </View>
   );
+}
+
+function cursorFileChangeSummaryParts(value) {
+  const match = String(value || '').trim().match(/^(Edited\s+\d+\s+files?)(?:\s+(\+\d+))?(?:\s+(-\d+))?$/i);
+  if (!match) return null;
+  return { label: match[1], additions: match[2] || '', deletions: match[3] || '' };
+}
+
+function isCursorFileChangeSummaryOnly(block) {
+  const title = block.label || block.title || block.summary || '';
+  return Boolean(
+    cursorFileChangeSummaryParts(title)
+    && !(block.content || block.text || block.markdown)
+    && (!Array.isArray(block.files) || block.files.length === 0)
+    && (!Array.isArray(block.actions) || block.actions.length === 0)
+  );
+}
+
+function renderCursorFileChangeSummary(block, key, theme) {
+  const title = block.label || block.title || block.summary || '';
+  const summary = cursorFileChangeSummaryParts(title);
+  return (
+    <Text
+      key={key}
+      style={[theme.markdown.body, s.cursorFileChangeSummary]}
+      selectable
+      accessibilityLabel={title}
+    >
+      {summary.label}
+      {!!summary.additions && <Text style={s.cursorFileChangeAdditions}>{` ${summary.additions}`}</Text>}
+      {!!summary.deletions && <Text style={s.cursorFileChangeDeletions}>{` ${summary.deletions}`}</Text>}
+    </Text>
+  );
+}
+
+function renderCursorNativeNotice(block, key, theme) {
+  const title = block.label || block.title || block.summary || '';
+  const body = block.content || block.text || block.markdown || '';
+  const actions = Array.isArray(block.actions) ? block.actions : [];
+  const text = [title, body].filter(Boolean).join(title && body ? ': ' : '');
+  return (
+    <View
+      key={key}
+      style={[s.cursorNativeNotice, theme.isLight && s.cursorNativeNoticeLight]}
+      accessibilityRole="alert"
+    >
+      <Text style={[s.cursorNativeNoticeIcon, theme.isLight && s.cursorNativeNoticeIconLight]} accessibilityElementsHidden>
+        {'\u24D8'}
+      </Text>
+      <View style={s.cursorNativeNoticeContent}>
+        <Text style={[theme.markdown.body, s.cursorNativeNoticeText]} selectable>{text || 'Notice'}</Text>
+        {actions.length > 0 && (
+          <View style={s.cursorNativeNoticeActions}>
+            {actions.map((action, index) => (
+              <View key={action.id || index} style={[s.structuredAction, s.cursorNativeNoticeAction]}>
+                <Text style={[s.structuredActionText, s.cursorNativeNoticeActionText]}>
+                  {action.label || action.id || 'Action'}
+                </Text>
+              </View>
+            ))}
+          </View>
+        )}
+      </View>
+    </View>
+  );
+}
+
+function renderCodexDesktopNotice(block, key, theme) {
+  const title = block.label || block.title || block.summary || 'Notice';
+  const body = block.content || block.text || block.markdown || '';
+  const actions = Array.isArray(block.actions) ? block.actions : [];
+  return (
+    <View key={key} style={s.codexDesktopNotice} accessibilityRole="alert">
+      <Text style={s.codexDesktopNoticeIcon} accessibilityElementsHidden>{'\u25F4'}</Text>
+      <View style={s.codexDesktopNoticeContent}>
+        <Text style={s.codexDesktopNoticeTitle} selectable>{title}</Text>
+        {!!body && <Markdown style={theme.markdown}>{body}</Markdown>}
+        {actions.length > 0 && (
+          <View style={s.codexDesktopNoticeActions}>
+            {actions.map((action, index) => (
+              <View key={action.id || index} style={s.codexDesktopNoticeAction}>
+                <Text style={s.codexDesktopNoticeActionText}>{action.label || action.id || 'Action'}</Text>
+              </View>
+            ))}
+          </View>
+        )}
+      </View>
+    </View>
+  );
+}
+
+function nativeMessageLayout(agentType) {
+  const type = String(agentType || '').toLowerCase();
+  if (type === 'claude' || type === 'claude_cli') return 'claude-document';
+  if (type === 'codex_cli') return 'codex-terminal';
+  if (type === 'cursor') return 'cursor-cards';
+  if (type === 'codex' || type === 'codex-desktop') return 'codex-thread';
+  return 'unified-flow';
 }
 
 // Split text at code fence boundaries and wrap each segment in a CollapsibleBlock.
@@ -298,11 +584,6 @@ function countLines(text) {
 const extractToolResultText = extractLegacyToolResult;
 
 // ── Time format ───────────────────────────────────────────────────────────────
-
-function formatTime(ts) {
-  const d = new Date(ts);
-  return d.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
-}
 
 // ── Markdown styles ──────────────────────────────────────────────────────────
 
@@ -403,10 +684,14 @@ function deliveryLabel(message, deliveryState) {
   if (deliveryState === 'busy_queued' || message._queued) return 'Queued';
   if (deliveryState === 'steered') return 'Steered';
   if (deliveryState === 'failed') return 'Failed';
+  if (deliveryState === 'launch_accepted') return '↗ Native launch accepted · receipt pending';
   if (deliveryState === 'delivered') return '✓✓ Delivered';
   if (deliveryState === 'agent_started' || message._agentStarted) return '▶ Agent started';
   if (message._delivered) return '✓✓ Delivered';
-  return '✓ Sent';
+  if (message.status === 'failed') return '✕ Failed';
+  if (message._launchAcceptedAt || message.launch_accepted_at) return '↗ Native launch accepted · receipt pending';
+  if (message.status === 'accepted') return '✓ Relay accepted';
+  return 'Recorded · receipt unknown';
 }
 
 const continueTranscriptTheme = {
@@ -494,7 +779,20 @@ function lightTranscriptTheme(darkTheme, agentType) {
 
 function themeForAgent(agentType, isLight = false) {
   const darkTheme = observedTranscriptThemes[agentType] || defaultTranscriptTheme;
-  return isLight ? lightTranscriptTheme(darkTheme, agentType) : { ...darkTheme, isLight: false };
+  const resolved = isLight ? lightTranscriptTheme(darkTheme, agentType) : { ...darkTheme, isLight: false };
+  const normalizedAgent = String(agentType || '').toLowerCase();
+  return {
+    ...resolved,
+    nativeAntigravityError: normalizedAgent === 'antigravity-v2',
+    nativePlainError: normalizedAgent === 'cursor',
+    nativeCursorFileChangeSummary: normalizedAgent === 'cursor',
+    nativeInlineNotice: normalizedAgent === 'cursor',
+    nativeDesktopNotice: normalizedAgent === 'codex-desktop' && isLight,
+    nativePlainThinking: normalizedAgent === 'codex',
+    nativeDesktopThinking: normalizedAgent === 'codex-desktop',
+    nativeClaudeTerminal: normalizedAgent === 'claude',
+    nativeDesktopTerminal: normalizedAgent === 'codex-desktop',
+  };
 }
 
 const s = StyleSheet.create({
@@ -507,6 +805,9 @@ const s = StyleSheet.create({
   },
   wrapperAssistant: {
     alignItems: 'flex-start',
+  },
+  wrapperNativeFull: {
+    alignItems: 'stretch',
   },
   bubble: {
     maxWidth:     '90%',
@@ -522,6 +823,65 @@ const s = StyleSheet.create({
     borderWidth:     1,
     borderColor:     '#30363d',
     borderBottomLeftRadius: 4,
+  },
+  bubbleDocument: {
+    width: '100%',
+    maxWidth: '100%',
+    borderWidth: 0,
+    borderRadius: 0,
+    paddingHorizontal: 4,
+    paddingVertical: 8,
+  },
+  terminalRow: {
+    width: '100%',
+    flexDirection: 'row',
+    alignItems: 'flex-start',
+    gap: 8,
+    borderBottomWidth: StyleSheet.hairlineWidth,
+    borderBottomColor: '#30363d',
+  },
+  terminalGutter: {
+    width: 30,
+    paddingTop: 12,
+    color: '#768390',
+    fontFamily: 'monospace',
+    fontSize: 9,
+    fontWeight: '700',
+    letterSpacing: 0.8,
+  },
+  terminalContent: {
+    flex: 1,
+  },
+  bubbleTerminal: {
+    width: '100%',
+    maxWidth: '100%',
+    borderWidth: 0,
+    borderRadius: 0,
+    paddingHorizontal: 0,
+    paddingVertical: 8,
+  },
+  bubbleCursorCard: {
+    width: '100%',
+    maxWidth: '100%',
+    borderWidth: 1,
+    borderColor: '#30363d',
+    borderRadius: 8,
+    padding: 10,
+  },
+  bubbleCodexAssistant: {
+    width: '100%',
+    maxWidth: '100%',
+    borderWidth: 0,
+    borderRadius: 0,
+    paddingHorizontal: 0,
+    paddingVertical: 8,
+  },
+  bubbleCodexUser: {
+    alignSelf: 'flex-end',
+    maxWidth: '88%',
+    borderRadius: 16,
+    borderWidth: 0,
+    backgroundColor: '#2b2b2b',
   },
   text: {
     color:      '#cdd9e5',
@@ -548,6 +908,149 @@ const s = StyleSheet.create({
     fontSize:   12,
     fontStyle:  'italic',
     lineHeight: 18,
+  },
+  codexDesktopThinking: {
+    alignSelf:    'stretch',
+    marginTop:    3,
+    marginBottom: 3,
+  },
+  codexDesktopThinkingHeader: {
+    flexDirection: 'row',
+    alignItems:    'center',
+    gap:           5,
+  },
+  codexDesktopThinkingLabel: {
+    color:      '#9d9d9d',
+    fontSize:   14,
+    lineHeight: 22,
+    fontWeight: '400',
+  },
+  codexDesktopThinkingChevron: {
+    color:      '#9d9d9d',
+    fontSize:   12,
+    lineHeight: 18,
+  },
+  claudeTerminal: {
+    alignSelf:    'stretch',
+    marginTop:    4,
+    marginBottom: 9,
+  },
+  claudeTerminalHeader: {
+    flexDirection: 'row',
+    alignItems:    'center',
+    gap:           7,
+    marginLeft:    8,
+    marginBottom:  8,
+  },
+  claudeTerminalDot: {
+    width:           7,
+    height:          7,
+    borderRadius:    4,
+    backgroundColor: '#858585',
+  },
+  claudeTerminalDotCompleted: {
+    backgroundColor: '#69c487',
+  },
+  claudeTerminalDotFailed: {
+    backgroundColor: '#d5534f',
+  },
+  claudeTerminalName: {
+    color:      '#cdd9e5',
+    fontSize:   13,
+    lineHeight: 20,
+    fontWeight: '700',
+  },
+  claudeTerminalDescription: {
+    flexShrink: 1,
+    color:      '#cdd9e5',
+    fontSize:   13,
+    lineHeight: 20,
+  },
+  claudeTerminalBody: {
+    overflow:        'hidden',
+    borderWidth:     1,
+    borderColor:     '#3c3c3c',
+    borderRadius:    5,
+    backgroundColor: '#1f1f1f',
+  },
+  claudeTerminalBodyLight: {
+    borderColor:     '#c8c8c8',
+    backgroundColor: '#ffffff',
+  },
+  claudeTerminalRow: {
+    flexDirection:  'row',
+    alignItems:     'flex-start',
+    paddingVertical: 7,
+    paddingHorizontal: 9,
+  },
+  claudeTerminalRowBorder: {
+    borderTopWidth: StyleSheet.hairlineWidth,
+    borderTopColor: '#3c3c3c',
+  },
+  claudeTerminalRowBorderLight: {
+    borderTopColor: '#c8c8c8',
+  },
+  claudeTerminalRowLabel: {
+    width:      38,
+    color:      '#9d9d9d',
+    fontFamily: 'monospace',
+    fontSize:   9,
+    lineHeight: 19,
+  },
+  claudeTerminalRowText: {
+    flex:       1,
+    color:      '#cdd9e5',
+    fontFamily: 'monospace',
+    fontSize:   12,
+    lineHeight: 19,
+  },
+  claudeTerminalRowError: {
+    color: '#ff8a80',
+  },
+  claudeTerminalTextLight: {
+    color: '#24292f',
+  },
+  claudeTerminalMutedLight: {
+    color: '#57606a',
+  },
+  codexDesktopTerminal: {
+    alignSelf:    'stretch',
+    marginTop:    3,
+    marginBottom: 3,
+  },
+  codexDesktopTerminalHeader: {
+    flexDirection: 'row',
+    alignItems:    'center',
+    gap:           6,
+  },
+  codexDesktopTerminalIcon: {
+    color:    '#9d9d9d',
+    fontSize: 11,
+  },
+  codexDesktopTerminalLabel: {
+    color:      '#9d9d9d',
+    fontSize:   14,
+    lineHeight: 22,
+    fontWeight: '400',
+  },
+  codexDesktopTerminalChevron: {
+    color:      '#9d9d9d',
+    fontSize:   12,
+    lineHeight: 18,
+  },
+  codexDesktopTerminalMutedLight: {
+    color: '#6e6e6e',
+  },
+  codexDesktopTerminalBody: {
+    marginTop:  5,
+    marginLeft: 21,
+    color:      '#a7a7a7',
+    fontFamily: 'monospace',
+    fontSize:   13,
+    lineHeight: 20,
+  },
+  codexDesktopTerminalBodyLight: {
+    color: '#5f5f5f',
   },
   statusChip: {
     alignSelf:         'flex-start',
@@ -577,6 +1080,150 @@ const s = StyleSheet.create({
   structuredCard_queued:   { borderLeftWidth: 3, borderLeftColor: '#8b949e' },
   structuredCard_notice:   { borderLeftWidth: 3, borderLeftColor: '#dbab09' },
   structuredCard_error:    { borderLeftWidth: 3, borderLeftColor: '#f85149' },
+  cursorFileChangeSummary: {
+    alignSelf: 'flex-start',
+    marginVertical: 3,
+    fontSize: 13,
+    lineHeight: 20,
+    fontWeight: '400',
+  },
+  cursorFileChangeAdditions: {
+    color: '#2a9d6f',
+  },
+  cursorFileChangeDeletions: {
+    color: '#e5484d',
+  },
+  cursorNativeError: {
+    marginVertical: 4,
+    fontWeight: '600',
+  },
+  cursorNativeErrorLabel: {
+    fontWeight: '700',
+  },
+  antigravityError: {
+    alignSelf: 'stretch',
+    marginVertical: 2,
+  },
+  antigravityErrorSummary: {
+    flexDirection: 'row',
+    alignItems: 'baseline',
+    alignSelf: 'flex-start',
+    maxWidth: '100%',
+  },
+  antigravityErrorText: {
+    flexShrink: 1,
+    fontSize: 12,
+    lineHeight: 20,
+  },
+  antigravityErrorLabel: {
+    fontWeight: '400',
+  },
+  antigravityErrorChevron: {
+    flexShrink: 0,
+    marginLeft: 4,
+    color: '#949494',
+    fontSize: 15,
+    lineHeight: 20,
+  },
+  cursorNativeNotice: {
+    flexDirection: 'row',
+    alignItems: 'flex-start',
+    alignSelf: 'stretch',
+    gap: 7,
+    marginVertical: 4,
+    paddingHorizontal: 8,
+    paddingVertical: 5,
+    borderWidth: 1,
+    borderColor: '#2d2d30',
+    borderRadius: 4,
+    backgroundColor: '#252526',
+  },
+  codexDesktopNotice: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    alignSelf: 'stretch',
+    gap: 8,
+    marginVertical: 4,
+    paddingHorizontal: 12,
+    paddingVertical: 11,
+    borderWidth: 1,
+    borderColor: '#e7e7e7',
+    borderRadius: 16,
+    backgroundColor: '#ffffff',
+  },
+  codexDesktopNoticeIcon: {
+    color: '#202124',
+    fontSize: 17,
+    lineHeight: 20,
+  },
+  codexDesktopNoticeContent: {
+    flex: 1,
+    gap: 2,
+  },
+  codexDesktopNoticeTitle: {
+    color: '#202124',
+    fontSize: 13,
+    fontWeight: '600',
+    lineHeight: 18,
+  },
+  codexDesktopNoticeActions: {
+    flexDirection: 'row',
+    flexWrap: 'wrap',
+    gap: 7,
+    marginTop: 5,
+  },
+  codexDesktopNoticeAction: {
+    alignSelf: 'flex-start',
+    borderWidth: 1,
+    borderColor: '#202124',
+    borderRadius: 999,
+    backgroundColor: '#202124',
+    paddingHorizontal: 11,
+    paddingVertical: 3,
+  },
+  codexDesktopNoticeActionText: {
+    color: '#ffffff',
+    fontSize: 11,
+    fontWeight: '600',
+    lineHeight: 16,
+  },
+  cursorNativeNoticeLight: {
+    borderColor: '#e1e1e1',
+    backgroundColor: '#f2f2f2',
+  },
+  cursorNativeNoticeIcon: {
+    color: '#75beff',
+    fontSize: 12,
+    lineHeight: 18,
+  },
+  cursorNativeNoticeIconLight: {
+    color: '#006ab1',
+  },
+  cursorNativeNoticeContent: {
+    flex: 1,
+    minWidth: 0,
+  },
+  cursorNativeNoticeText: {
+    marginTop: 0,
+    marginBottom: 0,
+    fontSize: 12,
+    lineHeight: 18,
+  },
+  cursorNativeNoticeActions: {
+    flexDirection: 'row',
+    flexWrap: 'wrap',
+    gap: 4,
+    marginTop: 3,
+  },
+  cursorNativeNoticeAction: {
+    borderRadius: 3,
+    paddingHorizontal: 5,
+    paddingVertical: 0,
+  },
+  cursorNativeNoticeActionText: {
+    fontSize: 11,
+    lineHeight: 16,
+  },
   structuredTitle: {
     color:        '#cdd9e5',
     fontSize:     13,
@@ -624,10 +1271,16 @@ const s = StyleSheet.create({
     fontSize: 10,
   },
   time: {
-    color:     '#444c56',
-    fontSize:  11,
+    color:     '#8b949e',
+    fontSize:  12,
+    lineHeight: 16,
+    minWidth:  68,
     marginTop: 3,
     marginHorizontal: 4,
+    fontVariant: ['tabular-nums'],
+  },
+  timeLight: {
+    color: '#5f6368',
   },
   timeUser: {
     textAlign: 'right',

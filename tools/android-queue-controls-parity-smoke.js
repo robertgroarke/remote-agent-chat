@@ -39,6 +39,9 @@ assert.match(chat, /delete next\[item\.cid\]/);
 assert.match(chat, /message\._cid !== item\.cid/);
 assert.match(chat, /pendingMsgId\.current\?\._id === cid/);
 assert.match(chat, /pending_action: null, error/);
+assert.match(chat, /block\?\.type === 'queued_message'/);
+assert.match(chat, /content_blocks: contentBlocks/);
+assert.match(chat, /content_blocks: \(queued\.content_blocks \|\| \[\]\)\.map/);
 
 for (const marker of [
   'accessibilityRole="summary"',

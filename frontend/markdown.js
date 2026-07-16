@@ -905,7 +905,9 @@ function parseFileChangesBlock(content) {
   if (!countMatch) return null;
 
   const totalsFromLine = (line) => {
-    const match = String(line || '').match(/\+(\d+)\s+(?:Â·|·|-|\s)\s*-?(\d+)/);
+    // encoding-input-only: older native summaries may contain the UTF-8-as-
+    // 1252 centered-dot sequence; accept it without placing that text in UI.
+    const match = String(line || '').match(/\+(\d+)\s+(?:\u00c2\u00b7|·|-|\s)\s*-?(\d+)/);
     return match ? { adds: Number(match[1]) || 0, dels: Number(match[2]) || 0 } : null;
   };
 
@@ -937,7 +939,7 @@ function parseFileChangesBlock(content) {
       lastConsumedIdx = ri;
       continue;
     }
-    const statsOnly = line.match(/^\+(\d+)\s+(?:Â·|·|-|\s)\s*-?(\d+)$/);
+    const statsOnly = line.match(/^\+(\d+)\s+(?:\u00c2\u00b7|·|-|\s)\s*-?(\d+)$/);
     if (statsOnly && pendingPath) {
       entries.push({
         filepath: pendingPath,
@@ -948,7 +950,7 @@ function parseFileChangesBlock(content) {
       lastConsumedIdx = ri;
       continue;
     }
-    const entry = line.match(/^(.+?)\s+\+(\d+)\s+(?:Â·|·|-|\s)\s*-?(\d+)(?:\s+.*)?$/);
+    const entry = line.match(/^(.+?)\s+\+(\d+)\s+(?:\u00c2\u00b7|·|-|\s)\s*-?(\d+)(?:\s+.*)?$/);
     if (!entry) {
       if (looksLikePath(line)) {
         pendingPath = line;
@@ -1315,14 +1317,110 @@ function _extractLastOpenBlock(text) {
   return { lang, code };
 }
 
-function MarkdownContent({ content, monospace = false, onOpenPath = null, autoExpandLongCodeBlocks = false }) {
+const richContentVisibilityCallbacks = new Map();
+let richContentVisibilityObserver = null;
+const richContentHtmlCache = new Map();
+let richContentHtmlCacheBytes = 0;
+const RICH_CONTENT_CACHE_MAX_ENTRIES = 256;
+const RICH_CONTENT_CACHE_MAX_BYTES = 8 * 1024 * 1024;
+
+function richContentHash(value) {
+  const text = String(value || '');
+  let hash = 2166136261;
+  for (let index = 0; index < text.length; index += 1) {
+    hash ^= text.charCodeAt(index);
+    hash = Math.imul(hash, 16777619);
+  }
+  return (hash >>> 0).toString(36);
+}
+
+function observeNearViewport(node, callback) {
+  const target = node?.closest?.('.message') || node;
+  if (!target || typeof IntersectionObserver === 'undefined') {
+    callback();
+    return () => {};
+  }
+  if (!richContentVisibilityObserver) {
+    richContentVisibilityObserver = new IntersectionObserver(entries => {
+      for (const entry of entries) {
+        if (!entry.isIntersecting) continue;
+        const callbacks = richContentVisibilityCallbacks.get(entry.target);
+        if (!callbacks) continue;
+        richContentVisibilityCallbacks.delete(entry.target);
+        richContentVisibilityObserver.unobserve(entry.target);
+        for (const activate of callbacks) activate();
+      }
+    }, { root: null, rootMargin: '35% 0px', threshold: 0 });
+  }
+  let callbacks = richContentVisibilityCallbacks.get(target);
+  if (!callbacks) {
+    callbacks = new Set();
+    richContentVisibilityCallbacks.set(target, callbacks);
+    richContentVisibilityObserver.observe(target);
+  }
+  callbacks.add(callback);
+  return () => {
+    const active = richContentVisibilityCallbacks.get(target);
+    if (!active) return;
+    active.delete(callback);
+    if (active.size > 0) return;
+    richContentVisibilityCallbacks.delete(target);
+    richContentVisibilityObserver?.unobserve(target);
+  };
+}
+
+function cachedRichContentHtml(content, cacheIdentity) {
+  const text = String(content || '');
+  const key = `${cacheIdentity || 'content'}\u0001${text.length}\u0001${richContentHash(text)}`;
+  const cached = richContentHtmlCache.get(key);
+  if (cached && cached.content === text) {
+    richContentHtmlCache.delete(key);
+    richContentHtmlCache.set(key, cached);
+    return cached.html;
+  }
+  const rendered = renderStructuredContent(text);
+  const html = typeof DOMPurify !== 'undefined'
+    ? DOMPurify.sanitize(rendered, { ADD_DATA_URI_TAGS: ['img'], ALLOW_DATA_ATTR: true })
+    : rendered;
+  const bytes = (text.length + html.length) * 2;
+  richContentHtmlCache.set(key, { content: text, html, bytes });
+  richContentHtmlCacheBytes += bytes;
+  while (richContentHtmlCache.size > RICH_CONTENT_CACHE_MAX_ENTRIES
+    || richContentHtmlCacheBytes > RICH_CONTENT_CACHE_MAX_BYTES) {
+    const oldestKey = richContentHtmlCache.keys().next().value;
+    const oldest = richContentHtmlCache.get(oldestKey);
+    richContentHtmlCache.delete(oldestKey);
+    richContentHtmlCacheBytes -= oldest?.bytes || 0;
+  }
+  return html;
+}
+
+function MarkdownContent({
+  content,
+  monospace = false,
+  onOpenPath = null,
+  autoExpandLongCodeBlocks = false,
+  deferUntilVisible = false,
+  cacheIdentity = '',
+}) {
   const ref          = React.useRef(null);
   const lastContent  = React.useRef(null);  // A11-11: skip re-render when content is identical
   const onOpenPathRef = React.useRef(onOpenPath);
+  const [richContentReady, setRichContentReady] = React.useState(!deferUntilVisible);
   onOpenPathRef.current = onOpenPath;
 
   React.useEffect(() => {
+    if (!deferUntilVisible) {
+      setRichContentReady(true);
+      return undefined;
+    }
+    if (richContentReady) return undefined;
+    return observeNearViewport(ref.current, () => setRichContentReady(true));
+  }, [deferUntilVisible, richContentReady]);
+
+  React.useEffect(() => {
     if (!ref.current) return;
+    if (!richContentReady) return;
     if (content === lastContent.current) return; // no-op: content unchanged
 
     // ── A11-11: Streaming fast-path ───────────────────────────────────────────
@@ -1383,10 +1481,7 @@ function MarkdownContent({ content, monospace = false, onOpenPath = null, autoEx
 
     lastContent.current = content;
     // SEC-08: Re-sanitize at final DOM insertion point as defense-in-depth
-    const rendered = renderStructuredContent(content || '');
-    ref.current.innerHTML = typeof DOMPurify !== 'undefined'
-      ? DOMPurify.sanitize(rendered, { ADD_DATA_URI_TAGS: ['img'], ALLOW_DATA_ATTR: true })
-      : rendered;
+    ref.current.innerHTML = cachedRichContentHtml(content, cacheIdentity);
 
     // Restore tool-section collapsed states
     ref.current.querySelectorAll('.tool-section[data-tool-index]').forEach(s => {
@@ -1723,8 +1818,14 @@ function MarkdownContent({ content, monospace = false, onOpenPath = null, autoEx
       }
     }
     return () => { if (cleanupObserver) cleanupObserver(); };
-  }, [content, autoExpandLongCodeBlocks]);
-  return <div className={`message-body${monospace ? ' monospace-body' : ''}`} ref={ref} />;
+  }, [content, autoExpandLongCodeBlocks, cacheIdentity, richContentReady]);
+  return (
+    <div
+      className={`message-body${monospace ? ' monospace-body' : ''}`}
+      ref={ref}
+      data-rich-content-ready={richContentReady ? 'true' : 'false'}
+    />
+  );
 }
 
 // ESM export (consumed by entry.jsx bundle)

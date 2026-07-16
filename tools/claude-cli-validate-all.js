@@ -18,6 +18,7 @@ const stages = [
   ['Proxy engine syntax', process.execPath, ['--check', 'agent-proxy/proxy-engine.js']],
   ['Session store syntax', process.execPath, ['--check', 'agent-proxy/session-store.js']],
   ['Claude parser smoke', process.execPath, ['tools/claude-cli-parser-smoke.js']],
+  ['Claude sparse archive performance', process.execPath, ['tools/claude-cli-sparse-archive-smoke.js']],
   ['Claude controls smoke', process.execPath, ['tools/claude-cli-controls-smoke.js']],
   ['Frontend history reconnect smoke', process.execPath, ['tools/frontend-history-reconnect-smoke.js']],
   ['Frontend transcript fidelity smoke', process.execPath, ['tools/frontend-transcript-fidelity-smoke.js']],

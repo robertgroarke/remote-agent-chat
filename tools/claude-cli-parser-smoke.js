@@ -26,6 +26,8 @@ try {
   fs.mkdirSync(encodedProjectDir, { recursive: true });
   fs.mkdirSync(exactWorkspace, { recursive: true });
   const lines = [
+    record({ type: 'queue-operation', operation: 'enqueue', content: 'Inspect the fixture.' }),
+    record({ type: 'queue-operation', operation: 'dequeue' }),
     record({
       type: 'user',
       uuid: 'user-1',
@@ -157,6 +159,143 @@ try {
     }),
     record({
       type: 'assistant',
+      uuid: 'assistant-task-create-1',
+      message: {
+        role: 'assistant',
+        model: 'claude-test-model',
+        content: [{
+          type: 'tool_use', id: 'tool-call-5', name: 'TaskCreate',
+          input: { subject: 'Read fixture', description: 'Read the fixture', activeForm: 'Reading fixture' },
+        }],
+      },
+    }),
+    record({
+      type: 'user',
+      uuid: 'tool-result-5',
+      toolUseResult: { task: { id: '1', subject: 'Read fixture' } },
+      message: {
+        role: 'user',
+        content: [{ type: 'tool_result', tool_use_id: 'tool-call-5', content: 'Task #1 created successfully: Read fixture' }],
+      },
+    }),
+    record({
+      type: 'assistant',
+      uuid: 'assistant-task-create-2',
+      message: {
+        role: 'assistant',
+        model: 'claude-test-model',
+        content: [{
+          type: 'tool_use', id: 'tool-call-6', name: 'TaskCreate',
+          input: { subject: 'Report token', description: 'Report the fixture token' },
+        }],
+      },
+    }),
+    record({
+      type: 'user',
+      uuid: 'tool-result-6',
+      toolUseResult: { task: { id: '2', subject: 'Report token' } },
+      message: {
+        role: 'user',
+        content: [{ type: 'tool_result', tool_use_id: 'tool-call-6', content: 'Task #2 created successfully: Report token' }],
+      },
+    }),
+    record({
+      type: 'assistant',
+      uuid: 'assistant-task-update-1',
+      message: {
+        role: 'assistant',
+        model: 'claude-test-model',
+        content: [{
+          type: 'tool_use', id: 'tool-call-7', name: 'TaskUpdate',
+          input: { taskId: '1', status: 'in_progress' },
+        }],
+      },
+    }),
+    record({
+      type: 'user',
+      uuid: 'tool-result-7',
+      toolUseResult: {
+        success: true, taskId: '1', updatedFields: ['status'],
+        statusChange: { from: 'pending', to: 'in_progress' },
+      },
+      message: {
+        role: 'user',
+        content: [{ type: 'tool_result', tool_use_id: 'tool-call-7', content: 'Updated task #1 status' }],
+      },
+    }),
+    record({
+      type: 'assistant',
+      uuid: 'assistant-task-list',
+      message: {
+        role: 'assistant',
+        model: 'claude-test-model',
+        content: [{ type: 'tool_use', id: 'tool-call-8', name: 'TaskList', input: {} }],
+      },
+    }),
+    record({
+      type: 'user',
+      uuid: 'tool-result-8',
+      toolUseResult: {
+        tasks: [
+          { id: '1', subject: 'Read fixture', status: 'in_progress', blockedBy: [] },
+          { id: '2', subject: 'Report token', status: 'pending', blockedBy: [] },
+        ],
+      },
+      message: {
+        role: 'user',
+        content: [{ type: 'tool_result', tool_use_id: 'tool-call-8', content: '#1 [in_progress] Read fixture\n#2 [pending] Report token' }],
+      },
+    }),
+    record({
+      type: 'assistant',
+      uuid: 'assistant-task-update-2',
+      message: {
+        role: 'assistant',
+        model: 'claude-test-model',
+        content: [{
+          type: 'tool_use', id: 'tool-call-9', name: 'TaskUpdate',
+          input: { taskId: '1', status: 'completed' },
+        }],
+      },
+    }),
+    record({
+      type: 'user',
+      uuid: 'tool-result-9',
+      toolUseResult: {
+        success: true, taskId: '1', updatedFields: ['status'],
+        statusChange: { from: 'in_progress', to: 'completed' },
+      },
+      message: {
+        role: 'user',
+        content: [{ type: 'tool_result', tool_use_id: 'tool-call-9', content: 'Updated task #1 status' }],
+      },
+    }),
+    record({
+      type: 'assistant',
+      uuid: 'assistant-task-update-3',
+      message: {
+        role: 'assistant',
+        model: 'claude-test-model',
+        content: [{
+          type: 'tool_use', id: 'tool-call-10', name: 'TaskUpdate',
+          input: { taskId: '2', status: 'completed' },
+        }],
+      },
+    }),
+    record({
+      type: 'user',
+      uuid: 'tool-result-10',
+      toolUseResult: {
+        success: true, taskId: '2', updatedFields: ['status'],
+        statusChange: { from: 'pending', to: 'completed' },
+      },
+      message: {
+        role: 'user',
+        content: [{ type: 'tool_result', tool_use_id: 'tool-call-10', content: 'Updated task #2 status' }],
+      },
+    }),
+    record({
+      type: 'assistant',
       uuid: 'assistant-final',
       message: {
         role: 'assistant',
@@ -168,7 +307,7 @@ try {
   fs.writeFileSync(transcriptPath, `${lines.join('\n')}\n`, 'utf8');
 
   const messages = claudeCli.parseClaudeJsonl(transcriptPath);
-  assert.strictEqual(messages.length, 10, 'terminal output stays combined while structured calls and results remain distinct');
+  assert.strictEqual(messages.length, 11, 'terminal output stays combined while current Task operations reduce to one plan');
   assert(messages.every(message => message.role === 'user' || message.role === 'assistant'));
 
   const thinking = messages[1].content_blocks?.[0];
@@ -225,7 +364,23 @@ try {
   assert.strictEqual(promptResult.type, 'tool_result');
   assert.strictEqual(promptResult.call_id, 'tool-call-4');
 
-  const markdown = messages[9].content_blocks?.[0];
+  const currentTaskPlan = messages[9].content_blocks?.[0];
+  assert.strictEqual(currentTaskPlan.type, 'plan');
+  assert.strictEqual(currentTaskPlan.title, '2 tasks (2 done, 0 open)');
+  assert.strictEqual(currentTaskPlan.tool_name, 'TaskUpdate');
+  assert.strictEqual(currentTaskPlan.call_id, 'tool-call-10');
+  assert.deepStrictEqual(currentTaskPlan.tasks.map(task => task.id), ['1', '2']);
+  assert.deepStrictEqual(currentTaskPlan.tasks.map(task => task.step), ['Read fixture', 'Report token']);
+  assert.deepStrictEqual(currentTaskPlan.tasks.map(task => task.status), ['completed', 'completed']);
+  assert.strictEqual(
+    messages.filter(message => message.content_blocks?.some(block =>
+      /^(?:TaskCreate|TaskGet|TaskUpdate|TaskList)$/.test(block.tool_name || '')
+      && (block.type === 'tool_call' || block.type === 'tool_result'))).length,
+    0,
+    'native Task operations must not fan out into generic tool cards',
+  );
+
+  const markdown = messages[10].content_blocks?.[0];
   assert.deepStrictEqual(markdown, { type: 'markdown', content: 'Fixture complete.' });
 
   const summary = claudeCli.readSessionSummary(transcriptPath);
@@ -236,7 +391,74 @@ try {
   assert.strictEqual(summary.isCliLike, true);
   assert.strictEqual(summary.title, 'Inspect the fixture.');
 
-  console.log('PASS claude-cli parser: exact cwd, canonical plan/prompt/tool-result blocks, terminal output, expanded defaults, and config metadata');
+  fs.appendFileSync(transcriptPath, `${record({
+    type: 'assistant',
+    uuid: 'assistant-synthetic-error',
+    isApiErrorMessage: true,
+    error: 'model_not_found',
+    message: {
+      role: 'assistant',
+      model: '<synthetic>',
+      content: [{ type: 'text', text: 'The selected model is unavailable.' }],
+    },
+  })}\n`, 'utf8');
+  const summaryAfterSyntheticError = claudeCli.readSessionSummary(transcriptPath);
+  assert.strictEqual(
+    summaryAfterSyntheticError.model_id,
+    'claude-test-model',
+    'synthetic local/error rows must not poison the persisted selectable model',
+  );
+  const syntheticError = summaryAfterSyntheticError.messages.at(-1).content_blocks?.[0];
+  assert.deepStrictEqual(syntheticError, {
+    type: 'error',
+    title: 'Model unavailable',
+    content: 'The selected model is unavailable.',
+    status: 'model_not_found',
+    collapsed: false,
+  });
+
+  fs.appendFileSync(transcriptPath, `${record({
+    type: 'assistant',
+    uuid: 'assistant-synthetic-notice',
+    isApiErrorMessage: false,
+    message: {
+      role: 'assistant',
+      model: '<synthetic>',
+      content: [{ type: 'text', text: 'No response requested.' }],
+    },
+  })}\n`, 'utf8');
+  const summaryAfterSyntheticNotice = claudeCli.readSessionSummary(transcriptPath);
+  assert.deepStrictEqual(summaryAfterSyntheticNotice.messages.at(-1).content_blocks?.[0], {
+    type: 'notice',
+    title: 'Claude CLI notice',
+    content: 'No response requested.',
+    collapsed: false,
+  });
+  assert(summaryAfterSyntheticNotice.messages.some(message =>
+    message.content_blocks?.some(block => block.type === 'markdown' && block.content === 'Fixture complete.')),
+  'ordinary Claude assistant rows must remain canonical Markdown');
+
+  fs.appendFileSync(transcriptPath, `${record({
+    type: 'queue-operation',
+    operation: 'enqueue',
+    content: 'Run the queued verification next.',
+  })}\n`, 'utf8');
+  const summaryWithPendingQueue = claudeCli.readSessionSummary(transcriptPath);
+  assert.deepStrictEqual(summaryWithPendingQueue.messages.at(-1).content_blocks?.[0], {
+    type: 'queued_message',
+    title: 'Queued message',
+    content: 'Run the queued verification next.',
+    status: 'pending',
+    collapsed: false,
+  });
+  assert.strictEqual(
+    summaryWithPendingQueue.messages.filter(message =>
+      message.content_blocks?.some(block => block.type === 'queued_message')).length,
+    1,
+    'paired historical queue operations must disappear while the unmatched pending item remains',
+  );
+
+  console.log('PASS claude-cli parser: exact cwd, legacy TodoWrite plus current Task* plans, canonical prompt/tool-result/error/notice/queue blocks, terminal output, expanded defaults, and synthetic-safe config metadata');
 } finally {
   fs.rmSync(tempRoot, { recursive: true, force: true });
 }

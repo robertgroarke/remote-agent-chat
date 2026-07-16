@@ -1,0 +1,35 @@
+{
+  "surface": "codex",
+  "host": "vscode",
+  "version": "26.707.91948",
+  "native_rollout_id": "019f6a64-61da-73e0-a877-0cc096791339",
+  "request": {
+    "request_id": "16",
+    "turn_id": "019f6a64-630e-7e20-9c4a-d0ec7072c9ca",
+    "autoResolutionMs": 60000,
+    "question": {
+      "id": "route",
+      "header": "Route",
+      "question": "Choose a route.",
+      "options": [
+        { "label": "Relay", "description": "Answer through RAC." },
+        { "label": "Native", "description": "Answer locally." }
+      ]
+    }
+  },
+  "card": {
+    "class_marker": "request-card",
+    "visible_countdown": false,
+    "dismiss_aria_label": "Dismiss",
+    "react_auto_resolution": {
+      "deadlineMs": 1784196486265
+    },
+    "cleanup": "native Skip"
+  },
+  "safety": {
+    "native_answer_clicks": 0,
+    "focus_actions": 0,
+    "visible_windows_opened": 0,
+    "protected_actions": 0
+  }
+}

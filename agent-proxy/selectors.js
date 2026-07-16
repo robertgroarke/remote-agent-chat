@@ -345,8 +345,10 @@ function _codexStructuredBlocksFromText(content, options = {}) {
         blocks.push(fileChanges);
       } else if (/^Worked for\s+|^Working for\s+/i.test(trimmed)) {
         blocks.push({ type: 'thinking', label: trimmed.split('\n')[0], content: trimmed, collapsed: true });
+      } else if (/^(?:(?:You\s+)?stopped\s+after\s+.+|Interrupted)[.!]?$/i.test(trimmed)) {
+        blocks.push({ type: 'status', label: trimmed.split('\n')[0], content: trimmed, status: 'stopped' });
       } else if (/^---\s*Context automatically compacted\s*---$/i.test(trimmed) || /^Context automatically compacted$/i.test(trimmed)) {
-        blocks.push({ type: 'prompt', label: 'Context compacted', content: trimmed });
+        blocks.push({ type: 'notice', label: 'Context compacted', content: trimmed, tone: 'info' });
       } else {
         const lastBlock = blocks[blocks.length - 1];
         if (lastBlock && lastBlock.type === 'markdown') {
@@ -593,7 +595,14 @@ const CODEX_DOM_SIG_EXPR = `
       var st = (shimmers[si].textContent || '').trim();
       if ((st === 'Thinking' || st === 'Generating') && visible(shimmers[si])) shimmerCount++;
     }
-    return '|a:' + (stopBtn ? '1' : '0') + ':' + shimmerCount;
+    var activeThreadRow = d.querySelector(
+      '[data-app-action-sidebar-thread-row][data-app-action-sidebar-thread-active="true"], ' +
+      '[data-app-action-sidebar-thread-row][aria-current="page"]'
+    );
+    var activeThreadSpinner = activeThreadRow
+      ? Array.from(activeThreadRow.querySelectorAll('[class*="animate-spin"]')).find(visible)
+      : null;
+    return '|a:' + (stopBtn ? '1' : '0') + ':' + shimmerCount + ':' + (activeThreadSpinner ? '1' : '0');
   }
   var activitySig = _codexActivitySig();
   // Prefer [data-content-search-unit-key] — newer Codex Desktop builds
@@ -1073,6 +1082,8 @@ async function detectThinking(Runtime, agentType) {
             if (lower === 'goal usage limited') return 'usageLimited';
             if (lower === 'goal limited') return 'budgetLimited';
             if (lower === 'goal achieved') return 'complete';
+            if (lower === 'goal cancelled' || lower === 'goal canceled' || lower === 'goal stopped') return 'cancelled';
+            if (lower === 'goal failed') return 'failed';
             return '';
           }
           function durationSeconds(text) {
@@ -1159,10 +1170,14 @@ async function detectThinking(Runtime, agentType) {
           var objective = candidates.length > 0 ? candidates[0].text : '';
           return {
             label: label,
+            text: objective,
+            state: goalStatus(label),
             status: goalStatus(label),
+            raw_state: label,
+            source: isDesktopApp ? 'codex_desktop_dom' : 'codex_extension_dom',
             objective: objective,
             time_used_seconds: seconds,
-            updated_at: new Date().toISOString(),
+            observed_at: new Date().toISOString(),
           };
         }
         var goalSurface = readGoalSurface();
@@ -1207,6 +1222,24 @@ async function detectThinking(Runtime, agentType) {
         // WebUI Codex Desktop session as thinking.
         var hasSpinnerSignal = false;
         if (isDesktopApp && !isThinking) {
+          // Background Codex tasks also retain sidebar spinners, so a global
+          // nav query is a false positive. The spinner inside the exact active
+          // thread row is different: it is the native task-state signal for
+          // the transcript currently controlled by this session.
+          var activeThreadRow = d.querySelector(
+            '[data-app-action-sidebar-thread-row][data-app-action-sidebar-thread-active="true"], ' +
+            '[data-app-action-sidebar-thread-row][aria-current="page"]'
+          );
+          var activeThreadSpinner = activeThreadRow
+            ? Array.from(activeThreadRow.querySelectorAll('[class*="animate-spin"]'))
+                .find(function(el) { return el.offsetParent !== null; })
+            : null;
+          if (activeThreadSpinner) {
+            isThinking = true;
+            hasSpinnerSignal = true;
+          }
+        }
+        if (isDesktopApp && !isThinking) {
           var spinnerRoot = d.querySelector('[data-thread-find-target="conversation"]') ||
             d.querySelector('main') ||
             d.body;
@@ -1249,6 +1282,7 @@ async function detectThinking(Runtime, agentType) {
         var label = 'Generating';
         var thinkingContent = '';
         var liveDraft = '';
+        var reasoningText = '';
         try {
           var bt = String.fromCharCode(96);
           var fence = bt + bt + bt;
@@ -1306,6 +1340,12 @@ async function detectThinking(Runtime, agentType) {
 
           function findVisibleAssistantDraft() {
             var convo = d.querySelector('[data-thread-find-target="conversation"]') || d.body;
+            var keyed = Array.from(convo.querySelectorAll('[data-content-search-unit-key]'));
+            if (keyed.length > 0) {
+              var lastKeyed = keyed[keyed.length - 1];
+              var lastKey = lastKeyed.getAttribute('data-content-search-unit-key') || '';
+              if (!/:assistant$/.test(lastKey)) return '';
+            }
             var selectors = [
               '[data-content-search-unit-key$=":assistant"]',
               '.overflow-x-auto',
@@ -1326,6 +1366,24 @@ async function detectThinking(Runtime, agentType) {
                 if (shouldIgnoreDraftText(txt)) continue;
                 return txt.substring(0, 4000);
               }
+            }
+            return '';
+          }
+
+          function findVisibleReasoningText() {
+            var convo = d.querySelector('[data-thread-find-target="conversation"]') || d.body;
+            var details = Array.from(convo.querySelectorAll('details[open]'));
+            for (var di = details.length - 1; di >= 0; di--) {
+              var detail = details[di];
+              if (!detail.offsetParent) continue;
+              var summary = detail.querySelector(':scope > summary');
+              var summaryText = (summary && (summary.innerText || summary.textContent) || '').trim();
+              if (!/^(Thinking|Thought|Reasoning)\\b/i.test(summaryText)) continue;
+              var clone = detail.cloneNode(true);
+              var cloneSummary = clone.querySelector(':scope > summary');
+              if (cloneSummary) cloneSummary.remove();
+              var text = (clone.innerText || clone.textContent || '').replace(/\\n{3,}/g, '\\n\\n').trim();
+              if (text) return text.substring(0, 4000);
             }
             return '';
           }
@@ -1394,7 +1452,9 @@ async function detectThinking(Runtime, agentType) {
               }
             }
           }
-          if (!isDesktopApp && !isCodexExtension) {
+          reasoningText = findVisibleReasoningText();
+          var activeToolLabel = /^(Running command|Reading|Writing|Editing|Searching|Creating|Applying|Tool:)/i.test(label);
+          if (!activeToolLabel) {
             liveDraft = findVisibleAssistantDraft();
             if (liveDraft && (!thinkingContent || liveDraft.length > thinkingContent.length + 40)) {
               thinkingContent = liveDraft;
@@ -1413,13 +1473,26 @@ async function detectThinking(Runtime, agentType) {
           }
         }
 
-        // Codex (Desktop + side pane): only show the label, no draft content
-        var finalContent = (isDesktopApp || isCodexExtension) ? '' : thinkingContent;
-        return JSON.stringify({ thinking: true, label: label, thinkingContent: finalContent, goal: goalSurface });
+        var toolCurrent = /^(Running command|Reading|Writing|Editing|Searching|Creating|Applying|Tool:)/i.test(label);
+        var current = toolCurrent
+          ? { kind: 'tool', label: label, partial: thinkingContent || '' }
+          : (liveDraft
+              ? { kind: 'answer', label: 'Answering', partial: liveDraft }
+              : null);
+        return JSON.stringify({
+          thinking: true,
+          label: label,
+          thinkingContent: (current && current.partial) || reasoningText || '',
+          reasoningText: reasoningText,
+          current: current,
+          goal: goalSurface,
+        });
       `);
-      try { return JSON.parse(raw); } catch { return { thinking: false, label: '' }; }
-    } catch {
-      return { thinking: false, label: '' };
+      try { return JSON.parse(raw); } catch (error) {
+        return { thinking: false, label: '', diagnostic: `invalid Codex thinking payload: ${error.message}` };
+      }
+    } catch (error) {
+      return { thinking: false, label: '', diagnostic: `Codex thinking probe failed: ${error.message}` };
     }
   }
   if (agentType !== 'claude' && agentType !== 'claude-desktop') return { thinking: false, label: '' };
@@ -1442,7 +1515,9 @@ async function detectThinking(Runtime, agentType) {
         if (/^(Bash|Read|Write|Edit|Edited|Update|Updated|Search|Searched|Find|Found|Glob pattern|Grep|LS|Cat|Kill|Launch|Rebuild|Inject|Poll|Check)\\b/i.test(txt)) return true;
         if (/^[A-Za-z]:\\\\/.test(txt)) return true;
         if (/^[/~.][\\\\/]/.test(txt)) return true;
-        if (/^[*._|~â€¢Â·â–Œ-]+$/.test(txt)) return true;
+        // encoding-input-only: tolerate legacy UTF-8-as-1252 bullet and bar
+        // sequences observed in native CDP text; this branch never renders.
+        if (/^(?:[*._|~-]|\u00e2\u20ac\u00a2|\u00c2\u00b7|\u00e2\u2013\u0152)+$/.test(txt)) return true;
         return false;
       }
 
@@ -1636,6 +1711,8 @@ function buildClaudeReadExpr(userClass, userText, userTextAlt) {
       return result;
     }
 
+    var claudeTerminalBlockFromParts = ${_claudeTerminalBlockFromParts.toString()};
+
     function nodeToText(node) {
       if (node.nodeType === 3) return node.textContent;
       if (node.nodeType !== 1) return '';
@@ -1770,6 +1847,14 @@ function buildClaudeReadExpr(userClass, userText, userTextAlt) {
       }
       if (!body && secondary) body = secondary;
 
+      var terminalBlock = claudeTerminalBlockFromParts(
+        toolName,
+        toolDesc,
+        compactToolBody(header, body),
+        secondary
+      );
+      if (terminalBlock) return terminalBlock;
+
       return {
         type: 'tool_call',
         title: header,
@@ -1876,6 +1961,63 @@ async function _expandOutputDetails(Runtime) {
 // No-op now: details stay open after expanding.  Kept for callsite compatibility.
 function _collapseOutputDetails() {}
 
+function canonicalizeClaudeMessageBlocks(raw) {
+  if (typeof raw !== 'string' || !raw.trim()) return raw;
+  try {
+    const messages = JSON.parse(raw);
+    if (!Array.isArray(messages)) return raw;
+    let changed = false;
+    for (const message of messages) {
+      if (!message || message.role !== 'assistant') continue;
+      if (Array.isArray(message.content_blocks) && message.content_blocks.length > 0) continue;
+      const content = typeof message.content === 'string' ? message.content.trim() : '';
+      if (!content) continue;
+      message.content_blocks = [{ type: 'markdown', content: message.content }];
+      changed = true;
+    }
+    return changed ? JSON.stringify(messages) : raw;
+  } catch {
+    return raw;
+  }
+}
+
+function _claudeTerminalBlockFromParts(toolName, toolDesc, body, secondary) {
+  var name = String(toolName || '').replace(/\s+/g, ' ').trim();
+  if (!/^(bash|shell|powershell)$/i.test(name)) return null;
+
+  var description = String(toolDesc || '').replace(/\s+/g, ' ').trim();
+  var title = (name + (description ? ' ' + description : '')).trim();
+  var content = String(body || '').replace(/\r\n/g, '\n').trim();
+  var lines = content ? content.split('\n') : [];
+  var inIndex = -1;
+  var outIndex = -1;
+  for (var i = 0; i < lines.length; i++) {
+    var label = String(lines[i] || '').trim().toUpperCase();
+    if (label === 'IN' && inIndex < 0) inIndex = i;
+    if (label === 'OUT' && outIndex < 0) outIndex = i;
+  }
+
+  var commandStart = inIndex >= 0 ? inIndex + 1 : 0;
+  var commandEnd = outIndex >= 0 ? outIndex : lines.length;
+  var command = lines.slice(commandStart, commandEnd).join('\n').trim();
+  var stdout = outIndex >= 0 ? lines.slice(outIndex + 1).join('\n').trim() : '';
+  var resultText = [stdout, secondary].filter(Boolean).join('\n');
+  var rejected = /\b(rejected|denied|cancelled|canceled|not approved|declined)\b/i.test(resultText);
+
+  return {
+    type: 'terminal',
+    title: title || name || 'Bash',
+    label: title || name || 'Bash',
+    command: command,
+    stdout: stdout,
+    stderr: '',
+    content: content,
+    exit_code: null,
+    status: outIndex < 0 ? 'running' : (rejected ? 'error' : 'completed'),
+    collapsed: false,
+  };
+}
+
 async function readClaudeMessages(Runtime, sessionId) {
   // Pre-flight: open lazy-rendered output <details> so their content is in the DOM.
   const expanded = await _expandOutputDetails(Runtime);
@@ -1890,7 +2032,7 @@ async function readClaudeMessages(Runtime, sessionId) {
     if (raw !== null) {
       resetReadFailures(sessionId);
       _collapseOutputDetails(Runtime);
-      return raw;
+      return canonicalizeClaudeMessageBlocks(raw);
     }
   } catch (e) {
     console.warn(`[${sessionId}] [sel] Claude primary read error: ${e.message}`);
@@ -1905,7 +2047,7 @@ async function readClaudeMessages(Runtime, sessionId) {
       console.log(`[${sessionId}] [sel] Claude fallback read succeeded`);
       resetReadFailures(sessionId);
       _collapseOutputDetails(Runtime);
-      return raw;
+      return canonicalizeClaudeMessageBlocks(raw);
     }
   } catch (e) {
     console.warn(`[${sessionId}] [sel] Claude fallback read error: ${e.message}`);
@@ -2829,6 +2971,9 @@ const CODEX_DESKTOP_READ_EXPR = `
   var _REMOTE_AGENT_RECENT_UNIT_LIMIT = (typeof __remoteAgentMaxRecentUnits === 'number' && __remoteAgentMaxRecentUnits > 0)
     ? Math.floor(__remoteAgentMaxRecentUnits)
     : 0;
+  var _REMOTE_AGENT_PRIME_COLLAPSED = (typeof __remoteAgentPrimeCollapsed === 'boolean')
+    ? __remoteAgentPrimeCollapsed
+    : true;
   var bt = String.fromCharCode(96);
   var fence = bt + bt + bt;
   var BLOCK_TAGS = { DIV:1, P:1, LI:1, TR:1, H1:1, H2:1, H3:1, H4:1, H5:1, H6:1, BLOCKQUOTE:1, SECTION:1, ARTICLE:1 };
@@ -3631,8 +3776,10 @@ const CODEX_DESKTOP_READ_EXPR = `
 
   // Prime caches for collapsed multi-command runs AND the per-turn
   // "Worked for X" reasoning trace before walking turns.
-  await _primeDesktopCollapsedRuns();
-  await _primeDesktopWorkedForTurns();
+  if (_REMOTE_AGENT_PRIME_COLLAPSED) {
+    await _primeDesktopCollapsedRuns();
+    await _primeDesktopWorkedForTurns();
+  }
 
   // Group ALL units by their turnId (the part before the first ':' in their
   // unit-key). Codex Desktop sometimes wraps turns in [data-turn-key] /
@@ -3853,17 +4000,22 @@ async function readCodexMessages(Runtime, sessionId, usePageEval, options = {}) 
   const maxRecentUnits = usePageEval
     ? Math.max(0, Math.min(500, Number(options.maxRecentUnits) || 0))
     : 0;
+  const primeCollapsed = options.primeCollapsed === true
+    || (options.primeCollapsed !== false && maxRecentTurns === 0 && maxRecentUnits === 0);
+  const bypassCache = options.bypassCache === true;
   const cache = _getCodexReadCache(sessionId);
   const evalFn = usePageEval ? evalInPage : evalInFrame;
   let preSig = null;
   try {
     preSig = await evalFn(Runtime, CODEX_DOM_SIG_EXPR);
     if (
+      !bypassCache &&
       preSig &&
       preSig === cache.sig &&
       cache.result !== null &&
       Number(cache.maxRecentTurns || 0) === maxRecentTurns &&
-      Number(cache.maxRecentUnits || 0) === maxRecentUnits
+      Number(cache.maxRecentUnits || 0) === maxRecentUnits &&
+      cache.primeCollapsed === primeCollapsed
     ) {
       cache.hits = (cache.hits || 0) + 1;
       const repaired = expandCodexMessagesRaw(cache.result, {
@@ -3879,8 +4031,8 @@ async function readCodexMessages(Runtime, sessionId, usePageEval, options = {}) 
 
   try {
     const desktopReadExpr = maxRecentTurns || maxRecentUnits
-      ? `var __remoteAgentMaxRecentTurns = ${maxRecentTurns};\nvar __remoteAgentMaxRecentUnits = ${maxRecentUnits};\n${CODEX_DESKTOP_READ_EXPR}`
-      : CODEX_DESKTOP_READ_EXPR;
+      ? `var __remoteAgentMaxRecentTurns = ${maxRecentTurns};\nvar __remoteAgentMaxRecentUnits = ${maxRecentUnits};\nvar __remoteAgentPrimeCollapsed = ${primeCollapsed};\n${CODEX_DESKTOP_READ_EXPR}`
+      : `var __remoteAgentPrimeCollapsed = ${primeCollapsed};\n${CODEX_DESKTOP_READ_EXPR}`;
     let raw = usePageEval
       ? await evalInPage(Runtime, desktopReadExpr, { awaitPromise: true })
       : await evalInFrame(Runtime, CODEX_DESKTOP_READ_EXPR, { awaitPromise: true });
@@ -3905,6 +4057,7 @@ async function readCodexMessages(Runtime, sessionId, usePageEval, options = {}) 
       cache.hits = 0;
       cache.maxRecentTurns = maxRecentTurns;
       cache.maxRecentUnits = maxRecentUnits;
+      cache.primeCollapsed = primeCollapsed;
       return result;
     }
   } catch (e) {
@@ -4419,9 +4572,11 @@ async function detectContinuePermissionDialogFromWorkbench(Runtime, webviewId) {
 async function sendContinuePrimary(Runtime, text) {
   // Set text in the main TipTap editor via execCommand
   console.log(`[continue-focus] send primary:start chars=${(text || '').length}`);
-  const set = await evalInFrame(Runtime, `
-    var input = d.querySelector('${CONTINUE_PRIMARY.input}');
-    if (!input) return 'no-input';
+  let set = 'no-input';
+  for (let attempt = 0; attempt < 20 && set === 'no-input'; attempt++) {
+    set = await evalInFrame(Runtime, `
+      var input = d.querySelector('${CONTINUE_PRIMARY.input}');
+      if (!input || input.offsetParent === null) return 'no-input';
     function escapeHtml(value) {
       return String(value || '')
         .replace(/&/g, '&amp;')
@@ -4479,8 +4634,10 @@ async function sendContinuePrimary(Runtime, text) {
         input.dispatchEvent(new Event('input', { bubbles: true }));
       }
     }
-    return (input.textContent || '').trim() ? 'ok' : 'empty';
-  `);
+      return (input.textContent || '').trim() ? 'ok' : 'empty';
+    `);
+    if (set === 'no-input') await new Promise(resolve => setTimeout(resolve, 100));
+  }
   if (set !== 'ok') return { ok: false, code: 'input_not_found', detail: set };
 
   // TipTap updates synchronously after the synthetic input event in current
@@ -4491,18 +4648,25 @@ async function sendContinuePrimary(Runtime, text) {
   // Click the last submit button (the main one)
   console.log('[continue-focus] send primary:click-submit');
   const click = await evalInFrame(Runtime, `
-    var btns = d.querySelectorAll('${CONTINUE_PRIMARY.sendBtn}');
-    if (!btns.length) {
-      // Fallback: get all submit-input-buttons and pick the last
-      btns = d.querySelectorAll('[data-testid="submit-input-button"]');
-    }
-    var btn = btns[btns.length - 1];
+    var input = d.querySelector('${CONTINUE_PRIMARY.input}');
+    var inputBox = input && input.closest('[data-testid^="continue-input-box-"]');
+    var btn = inputBox && inputBox.querySelector('[data-testid="submit-input-button"]');
     if (!btn) return 'no-btn';
     if (btn.disabled) return 'disabled';
     btn.click();
     return 'sent';
   `);
-  if (click === 'sent') return { ok: true };
+  if (click === 'sent') {
+    for (let attempt = 0; attempt < 20; attempt++) {
+      const committed = await evalInFrame(Runtime, `
+        var input = d.querySelector('${CONTINUE_PRIMARY.input}');
+        return !input || !(input.textContent || '').trim() ? 'cleared' : 'pending';
+      `);
+      if (committed === 'cleared') return { ok: true };
+      await new Promise(resolve => setTimeout(resolve, 100));
+    }
+    return { ok: false, code: 'send_not_committed', detail: 'main composer did not clear' };
+  }
   return { ok: false, code: 'send_button_failed', detail: click };
 }
 
@@ -4510,7 +4674,15 @@ async function sendContinueFallback(Runtime, text) {
   // Fallback: try broader selectors and Enter key dispatch
   console.log(`[continue-focus] send fallback:start chars=${(text || '').length}`);
   const result = await evalInFrame(Runtime, `
-    var input = d.querySelector('${CONTINUE_FALLBACK.input}');
+    var candidates = Array.from(d.querySelectorAll('${CONTINUE_FALLBACK.input}')).filter(function(editor) {
+      return editor.offsetParent !== null;
+    });
+    var input = candidates.find(function(editor) {
+      return editor.getAttribute('data-testid') === 'editor-input-main'
+        || /main/i.test(String(editor.closest('[data-testid^="continue-input-box-"]')?.getAttribute('data-testid') || ''));
+    }) || candidates.find(function(editor) {
+      return !editor.closest('${CONTINUE_PRIMARY.scrollContainer}');
+    }) || null;
     if (!input) return 'no-input';
     function escapeHtml(value) {
       return String(value || '')
@@ -4549,7 +4721,8 @@ async function sendContinueFallback(Runtime, text) {
       }
     }
     // Try click first
-    var btn = d.querySelector('${CONTINUE_FALLBACK.sendBtn}');
+    var inputBox = input.closest('[data-testid^="continue-input-box-"]');
+    var btn = inputBox && inputBox.querySelector('${CONTINUE_FALLBACK.sendBtn}');
     if (btn && !btn.disabled) {
       btn.click();
       return 'sent-btn';
@@ -6526,7 +6699,27 @@ async function readAntigravityConfig(Runtime, workspacePath) {
 
 // Antigravity v2 Agent Manager is a standalone React/Vite page target on CDP
 // port 9226. It is not a VS Code webview, so all selectors use evalInPage.
+function _buildAntigravityV2WorkedForEnvelope(label, executionBlocks) {
+  const normalizedLabel = String(label || '').replace(/\s+/g, ' ').trim();
+  if (!/^Worked for\s+/i.test(normalizedLabel)) return null;
+  const statusBlock = {
+    type: 'status',
+    label: normalizedLabel,
+    title: normalizedLabel,
+    content: normalizedLabel,
+    status: 'completed',
+    collapsed: true,
+  };
+  const children = Array.isArray(executionBlocks)
+    ? executionBlocks.filter(block => block && block.type)
+    : [];
+  return { type: 'execution', blocks: [statusBlock].concat(children) };
+}
+
+const ANTIGRAVITY_V2_WORKED_FOR_ENVELOPE_SOURCE = _buildAntigravityV2WorkedForEnvelope.toString();
+
 const ANTIGRAVITY_V2_READ_EXPR = `
+  var buildWorkedForEnvelope = (${ANTIGRAVITY_V2_WORKED_FOR_ENVELOPE_SOURCE});
   function norm(t) {
     return String(t || '').replace(/\\u00a0/g, ' ').replace(/[ \\t]+\\n/g, '\\n').replace(/\\n{3,}/g, '\\n\\n').trim();
   }
@@ -6722,7 +6915,7 @@ const ANTIGRAVITY_V2_READ_EXPR = `
     if (/^(?:Worked|Thought) for\\s+|^Working|^Thinking/i.test(text)) {
       if (/^Worked for\\s+/i.test(text)) {
         var workedBlocks = executionBlocks(el);
-        if (workedBlocks.length) return { type: 'execution', blocks: workedBlocks };
+        return buildWorkedForEnvelope(text.split('\\n')[0], workedBlocks);
       }
       var thinkingText = reactThinkingText(el);
       return {
@@ -7555,6 +7748,160 @@ async function sendCodexPrimary(Runtime, text, usePageEval) {
   return { ok: false, code: 'send_button_failed', detail: click };
 }
 
+function _countMatchingCodexUserMessages(raw, text) {
+  let messages;
+  try {
+    messages = typeof raw === 'string' ? JSON.parse(raw || '[]') : raw;
+  } catch {
+    return 0;
+  }
+  if (!Array.isArray(messages)) return 0;
+  const wanted = String(text || '').replace(/\s+/g, ' ').trim();
+  if (!wanted) return 0;
+  return messages.filter(message => {
+    if (message?.role !== 'user') return false;
+    const observed = String(message.content || '').replace(/\s+/g, ' ').trim();
+    return observed === wanted;
+  }).length;
+}
+
+async function sendCodexDesktopTrustedInput(cdpClient, Runtime, text, sessionId, options = {}) {
+  const Input = cdpClient && cdpClient.Input;
+  if (!Input || typeof Input.insertText !== 'function' || typeof Input.dispatchKeyEvent !== 'function') {
+    return { ok: false, code: 'not_supported', detail: 'CDP Input domain required for Codex Desktop send' };
+  }
+
+  const confirmationAttempts = Math.max(1, Number(options.codexConfirmationAttempts) || 40);
+  const confirmationIntervalMs = Math.max(0, Number(options.codexConfirmationIntervalMs) || 250);
+  const confirmationClientProvider = typeof options.codexConfirmationClientProvider === 'function'
+    ? options.codexConfirmationClientProvider
+    : null;
+  const confirmationSessionId = `codex-desktop-send-confirm:${sessionId}`;
+  const readRecent = (readOptions = {}) => {
+    let confirmationRuntime = Runtime;
+    if (confirmationClientProvider) {
+      try {
+        confirmationRuntime = confirmationClientProvider()?.Runtime || confirmationRuntime;
+      } catch {}
+    }
+    return readCodexMessages(confirmationRuntime, confirmationSessionId, true, {
+      maxRecentTurns: 8,
+      maxRecentUnits: 80,
+      primeCollapsed: false,
+      ...readOptions,
+    });
+  };
+
+  let baselineMatches = 0;
+  try {
+    baselineMatches = _countMatchingCodexUserMessages(await readRecent(), text);
+  } catch {}
+
+  const focusState = await evalInPage(Runtime, `
+    // __REMOTE_AGENT_CODEX_COMPOSER_FOCUS__
+    function visible(el) {
+      if (!el || !el.isConnected) return false;
+      var style = getComputedStyle(el);
+      var rect = el.getBoundingClientRect();
+      return style.display !== 'none' && style.visibility !== 'hidden' && rect.width > 0 && rect.height > 0;
+    }
+    var input = Array.from(d.querySelectorAll('.ProseMirror[data-codex-composer="true"], .ProseMirror')).find(visible);
+    if (!input) return 'no-input';
+    input.focus();
+    return (input.innerText || input.textContent || '').trim() ? 'draft-present' : 'ready';
+  `);
+  if (focusState !== 'ready' && focusState !== 'draft-present') {
+    return { ok: false, code: 'input_not_found', detail: focusState || 'no visible Codex composer' };
+  }
+
+  try {
+    if (focusState === 'draft-present') {
+      await Input.dispatchKeyEvent({ type: 'keyDown', key: 'Control', code: 'ControlLeft', windowsVirtualKeyCode: 17, nativeVirtualKeyCode: 17, modifiers: 2 });
+      await Input.dispatchKeyEvent({ type: 'keyDown', key: 'a', code: 'KeyA', windowsVirtualKeyCode: 65, nativeVirtualKeyCode: 65, modifiers: 2 });
+      await Input.dispatchKeyEvent({ type: 'keyUp', key: 'a', code: 'KeyA', windowsVirtualKeyCode: 65, nativeVirtualKeyCode: 65, modifiers: 2 });
+      await Input.dispatchKeyEvent({ type: 'keyUp', key: 'Control', code: 'ControlLeft', windowsVirtualKeyCode: 17, nativeVirtualKeyCode: 17, modifiers: 0 });
+      await Input.dispatchKeyEvent({ type: 'keyDown', key: 'Backspace', code: 'Backspace', windowsVirtualKeyCode: 8, nativeVirtualKeyCode: 8 });
+      await Input.dispatchKeyEvent({ type: 'keyUp', key: 'Backspace', code: 'Backspace', windowsVirtualKeyCode: 8, nativeVirtualKeyCode: 8 });
+    }
+    await Input.insertText({ text: String(text || '') });
+  } catch (error) {
+    return { ok: false, code: 'input_failed', detail: error.message || 'trusted input failed' };
+  }
+
+  await new Promise(resolve => setTimeout(resolve, 150));
+  const inputStateRaw = await evalInPage(Runtime, `
+    // __REMOTE_AGENT_CODEX_COMPOSER_VERIFY__
+    function norm(value) { return String(value || '').replace(/\\s+/g, ' ').trim(); }
+    function visible(el) {
+      if (!el || !el.isConnected) return false;
+      var rect = el.getBoundingClientRect();
+      return rect.width > 0 && rect.height > 0;
+    }
+    var wanted = ${JSON.stringify(String(text || '').replace(/\s+/g, ' ').trim())};
+    var input = Array.from(d.querySelectorAll('.ProseMirror[data-codex-composer="true"], .ProseMirror')).find(visible);
+    if (!input) return JSON.stringify({ ok: false, code: 'input_not_found' });
+    var root = input.closest('.composer-surface-chrome') || input.closest('[data-codex-composer-root]');
+    if (!root) return JSON.stringify({ ok: false, code: 'composer_root_not_found' });
+    var buttons = Array.from(root.querySelectorAll('button')).filter(visible);
+    var submit = buttons.filter(function(button) {
+      return !button.hasAttribute('data-composer-navigation-target')
+        && !button.hasAttribute('data-codex-intelligence-trigger')
+        && !button.hasAttribute('aria-haspopup');
+    }).pop();
+    if (!submit) return JSON.stringify({ ok: false, code: 'send_button_failed' });
+    if (submit.disabled || submit.getAttribute('aria-disabled') === 'true') {
+      return JSON.stringify({ ok: false, code: 'send_button_disabled' });
+    }
+    if (submit.querySelector('svg rect') || /stop/i.test(submit.getAttribute('aria-label') || '')) {
+      return JSON.stringify({ ok: false, code: 'agent_busy' });
+    }
+    var path = submit.querySelector('svg path');
+    var pathD = path ? (path.getAttribute('d') || '') : '';
+    var knownSend = !pathD || pathD.indexOf('M9.334') === 0 || pathD.indexOf('M4.5 ') === 0;
+    return JSON.stringify({
+      ok: norm(input.innerText || input.textContent || '') === wanted && knownSend,
+      code: norm(input.innerText || input.textContent || '') === wanted
+        ? (knownSend ? 'ready' : 'unknown_submit_control')
+        : 'input_verify_failed'
+    });
+  `);
+  let inputState;
+  try { inputState = JSON.parse(inputStateRaw || '{}'); } catch { inputState = {}; }
+  if (!inputState.ok) {
+    return { ok: false, code: inputState.code || 'input_verify_failed', detail: 'Codex Desktop composer did not reach a verified send-ready state' };
+  }
+
+  try {
+    await Input.dispatchKeyEvent({
+      type: 'keyDown', key: 'Enter', code: 'Enter', windowsVirtualKeyCode: 13, nativeVirtualKeyCode: 13,
+    });
+    await Input.dispatchKeyEvent({
+      type: 'keyUp', key: 'Enter', code: 'Enter', windowsVirtualKeyCode: 13, nativeVirtualKeyCode: 13,
+    });
+  } catch (error) {
+    return { ok: false, code: 'send_failed', detail: error.message || 'trusted Enter failed' };
+  }
+
+  for (let attempt = 0; attempt < confirmationAttempts; attempt += 1) {
+    if (confirmationIntervalMs > 0) await new Promise(resolve => setTimeout(resolve, confirmationIntervalMs));
+    try {
+      // A Codex Desktop target can rotate after trusted Enter while the native
+      // turn continues and persists. Re-resolve the live client above and force
+      // a bounded full read periodically so neither a dead socket nor a stale
+      // cheap signature can turn a delivered message into a false failure.
+      const bypassCache = attempt === 0 || (attempt + 1) % 4 === 0;
+      const observedMatches = _countMatchingCodexUserMessages(await readRecent({ bypassCache }), text);
+      if (observedMatches > baselineMatches) return { ok: true, method: 'cdp_input_enter_confirmed' };
+    } catch {}
+  }
+  return {
+    ok: false,
+    code: 'native_user_turn_not_observed',
+    detail: 'Trusted submit did not produce a new persisted Codex Desktop user turn',
+    baseline_matches: baselineMatches,
+  };
+}
+
 // Steer: inject text into Codex's ProseMirror input WITHOUT clicking send.
 // This triggers Codex's native steer UI when the agent is generating —
 // Codex detects user typing mid-generation and shows a "steer" prompt.
@@ -7936,12 +8283,36 @@ async function interruptAgent(Runtime, agentType, sessionId, cdpClient = null) {
 // expose its settings via in-DOM dropdowns (they use VS Code host APIs instead).
 
 const READ_CODEX_CONFIG_EXPR = `
-  var config = { model_id: null, effort: null, speed: null, access: null };
+  var config = {
+    model_id: null,
+    effort: null,
+    speed: null,
+    access: null,
+    permission_profile: null,
+    approval_policy: null,
+    approvals_reviewer: null,
+    conversation_scoped: false
+  };
   function visible(el) {
     return !!(el && (el.offsetWidth || el.offsetHeight || el.getClientRects().length));
   }
-  var btns = Array.from(d.querySelectorAll('button')).filter(visible);
-  var lastBtns = btns.slice(-25);
+  var allBtns = Array.from(d.querySelectorAll('button')).filter(visible);
+  // Codex Desktop 2026.712 can render a long Environment/Browser summary
+  // panel after the composer in DOM order. A global last-button slice then
+  // drops the still-visible access and combined model/effort controls. Scope
+  // to the native composer chrome when it exists; retain the bounded legacy
+  // fallback for VS Code/webview builds without that container.
+  var editor = d.querySelector('.ProseMirror');
+  // The VS Code extension treats composer changes on a blank draft as global
+  // defaults. A rendered conversation root is the native boundary that makes
+  // the same controls thread-scoped (update-thread-settings-for-next-turn).
+  // Surface this explicitly so callers can fail closed before clicking.
+  config.conversation_scoped = !!d.querySelector('[data-thread-find-target="conversation"]');
+  var composerRoot = editor && editor.closest ? editor.closest('.composer-surface-chrome') : null;
+  var composerBtns = composerRoot
+    ? Array.from(composerRoot.querySelectorAll('button')).filter(visible)
+    : [];
+  var lastBtns = composerBtns.length ? composerBtns : allBtns.slice(-25);
   function norm(t) {
     return String(t || '').replace(/\\s+/g, ' ').trim();
   }
@@ -7959,13 +8330,15 @@ const READ_CODEX_CONFIG_EXPR = `
   function comboPartsFromButton(b) {
     var full = norm(b.innerText || b.textContent || '');
     if (full) {
-      var effort = full.match(/(extra\\s*high|low|medium|high)$/i);
+      var effort = full.match(/(extra\\s*high|light|low|medium|high|ultra)$/i);
       if (effort) {
         var modelPart = norm(full.slice(0, effort.index));
         return [modelPart, norm(effort[1])].filter(Boolean);
       }
     }
-    var parts = Array.from(b.querySelectorAll('span')).filter(visible).map(function(span) {
+    // Current VS Code Codex keeps the selected reasoning effort in a
+    // visually-collapsed span inside the combined model trigger.
+    var parts = Array.from(b.querySelectorAll('span')).map(function(span) {
       return norm(span.innerText || span.textContent);
     }).filter(Boolean);
     return parts.length >= 2 ? parts : (full ? [full] : parts);
@@ -7978,9 +8351,18 @@ const READ_CODEX_CONFIG_EXPR = `
   });
   if (modelBtn) config.model_id = normalizeModelLabel(modelBtn.innerText || modelBtn.textContent) || norm(modelBtn.innerText || modelBtn.textContent);
 
-  // Effort level: Low / Medium / High / Extra High button
+  // Effort level: Light/Low / Medium / High / Extra High button. Current
+  // VS Code Codex can visually collapse the effort label while retaining the
+  // exact native value on the combined intelligence trigger.
+  var intelligenceBtn = lastBtns.find(function(b) {
+    return b.getAttribute('data-codex-intelligence-trigger') === 'true';
+  }) || null;
+  var intelligenceEffort = intelligenceBtn
+    ? norm(intelligenceBtn.getAttribute('data-selected-reasoning-effort'))
+    : '';
+  if (intelligenceEffort) config.effort = intelligenceEffort;
   var effortBtn = lastBtns.find(function(b) {
-    return /^(low|medium|high|extra\\s*high)$/i.test(norm(b.innerText || b.textContent || ''));
+    return /^(light|low|medium|high|extra\\s*high|ultra)$/i.test(norm(b.innerText || b.textContent || ''));
   });
   if (effortBtn) config.effort = norm(effortBtn.innerText || effortBtn.textContent);
 
@@ -7991,25 +8373,47 @@ const READ_CODEX_CONFIG_EXPR = `
       var parts = comboPartsFromButton(b);
       if (parts.length < 2) return false;
       var modelPart = parts.map(normalizeModelLabel).find(Boolean);
-      var effortPart = parts.find(function(part) { return /^(low|medium|high|extra\\s*high)$/i.test(part); });
+      var effortPart = parts.find(function(part) { return /^(light|low|medium|high|extra\\s*high|ultra)$/i.test(part); });
       return !!(modelPart && effortPart);
     });
     if (comboBtn) {
       var comboParts = comboPartsFromButton(comboBtn);
       var comboModel = comboParts.map(normalizeModelLabel).find(Boolean);
-      var comboEffort = comboParts.find(function(part) { return /^(low|medium|high|extra\\s*high)$/i.test(part); }) || null;
+      var comboEffort = comboParts.find(function(part) { return /^(light|low|medium|high|extra\\s*high|ultra)$/i.test(part); }) || null;
       if (!config.model_id && comboModel) config.model_id = comboModel;
       if (!config.effort && comboEffort) config.effort = comboEffort;
     }
   }
 
-  // Access mode: "Full access", "Read access", "Default permissions", etc.
+  // VS Code Codex exposes one conversation-scoped permissions profile. Map
+  // the native profile to separate sandbox and approval semantics; never infer
+  // bypass from a sandbox label alone.
   var accessBtn = lastBtns.find(function(b) {
     var t = norm(b.innerText || b.textContent || '');
     return (/access|restricted/i.test(t) && !/add|ide|file$/i.test(t) && t.length < 30) ||
-           /^default\\s+permissions$/i.test(t);
+           /^default\\s+permissions$/i.test(t) ||
+           /^(ask for approval|approve for me|custom(?:\\s*\\(config\\.toml\\))?)$/i.test(t);
   });
-  if (accessBtn) config.access = norm(accessBtn.innerText || accessBtn.textContent);
+  if (accessBtn) {
+    var accessLabel = norm(accessBtn.innerText || accessBtn.textContent);
+    var accessLower = accessLabel.toLowerCase();
+    config.access = accessLabel;
+    if (accessLower === 'full access') {
+      config.permission_profile = 'full-access';
+      config.approval_policy = 'never';
+      config.approvals_reviewer = 'user';
+    } else if (accessLower === 'ask for approval' || accessLower === 'default permissions') {
+      config.permission_profile = 'auto';
+      config.approval_policy = 'on-request';
+      config.approvals_reviewer = 'user';
+    } else if (accessLower === 'approve for me') {
+      config.permission_profile = 'guardian-approvals';
+      config.approval_policy = 'on-request';
+      config.approvals_reviewer = 'guardian_subagent';
+    } else if (/^custom(?:\\s*\\(config\\.toml\\))?$/i.test(accessLabel)) {
+      config.permission_profile = 'custom';
+    }
+  }
 
   // Speed is usually only visible while the combined model menu is open. If a
   // menu is already open, capture the checked Standard/Fast item without
@@ -8038,6 +8442,8 @@ const _CODEX_ACCESS_LABEL_TO_ID = {
   'workspace write':      'workspace-write',
   'read only':            'read-only',
   'default permissions':  'default',
+  'ask for approval':     'workspace-write',
+  'approve for me':       'workspace-write',
 };
 
 // Reverse map: config.toml value → display label (for CDP button clicking)
@@ -8051,6 +8457,7 @@ const _CODEX_ACCESS_ID_TO_LABEL = {
 function _normalizeCodexAccess(label) {
   if (!label) return label;
   const lower = label.toLowerCase().replace(/\s+/g, ' ').trim();
+  if (lower === 'custom' || lower === 'custom (config.toml)') return 'unknown';
   return _CODEX_ACCESS_LABEL_TO_ID[lower] || label;
 }
 
@@ -8058,7 +8465,10 @@ function _normalizeCodexAccess(label) {
 function _normalizeCodexEffort(label) {
   if (!label) return label;
   // "Low" → "low", "Medium" → "medium", "Extra High" → "extra-high"
-  return label.toLowerCase().replace(/\s+/g, '-').trim();
+  const normalized = label.toLowerCase().replace(/\s+/g, '-').trim();
+  if (normalized === 'light') return 'low';
+  if (normalized === 'xhigh') return 'extra-high';
+  return normalized;
 }
 
 async function readCodexConfig(Runtime, usePageEval) {
@@ -9438,6 +9848,11 @@ async function readAgentConfig(Runtime, agentType, workspacePath) {
     const result = {
       model_id:          cfg?.model_id  || 'unknown',
       permission_mode:   cfg?.access    || 'unknown',
+      permission_profile: cfg?.permission_profile || 'unknown',
+      approval_policy:   cfg?.approval_policy || null,
+      approvals_reviewer: cfg?.approvals_reviewer || null,
+      bypass_permissions_active: cfg?.access === 'danger-full-access' && cfg?.approval_policy === 'never',
+      conversation_scoped: cfg?.conversation_scoped === true,
       effort:            cfg?.effort    || 'unknown',
       speed:             cfg?.speed     || 'unknown',
       file_access_scope: workspacePath  || 'unknown',
@@ -10220,6 +10635,867 @@ async function setAgentPermissionMode(Runtime, agentType, mode, sessionId, Input
   }
 }
 
+const CODEX_DESKTOP_QUESTION_EXPR = `
+  function cdqVisible(el) {
+    if (!el || !el.isConnected) return false;
+    var style = getComputedStyle(el);
+    var rect = el.getBoundingClientRect();
+    return style.display !== 'none' && style.visibility !== 'hidden'
+      && style.opacity !== '0' && rect.width > 0 && rect.height > 0;
+  }
+  function cdqText(el) {
+    return String(el && (el.innerText || el.textContent) || '').replace(/\\s+/g, ' ').trim();
+  }
+  function cdqChoice(row, index) {
+    var label = String(row.getAttribute('aria-label') || '').trim();
+    var full = cdqText(row).replace(/^\\d+\\s+/, '');
+    if (!label) label = full.split(/\\s{2,}/)[0] || full;
+    var description = full;
+    if (label && description.toLowerCase().indexOf(label.toLowerCase()) === 0) {
+      description = description.substring(label.length).trim();
+    }
+    return {
+      choice_id: 'desktop-choice-' + (index + 1),
+      label: label.substring(0, 240),
+      description: description.substring(0, 1000),
+      selected: row.getAttribute('aria-checked') === 'true' || row.getAttribute('aria-selected') === 'true',
+      requires_text: false,
+      is_other: false,
+      native_role: row.getAttribute('role') || ''
+    };
+  }
+  var activeThreadRow = d.querySelector(
+    '[data-app-action-sidebar-thread-row][data-app-action-sidebar-thread-active="true"], '
+    + '[data-app-action-sidebar-thread-row][aria-current="page"]'
+  );
+  var nativeThreadId = activeThreadRow
+    ? String(activeThreadRow.getAttribute('data-app-action-sidebar-thread-id') || '').trim()
+    : '';
+  var cards = Array.from(d.querySelectorAll('[class*="request-card"]')).filter(function(card) {
+    if (!cdqVisible(card)) return false;
+    var rows = Array.from(card.querySelectorAll('[role="radio"], [role="checkbox"]')).filter(cdqVisible);
+    return rows.length > 0 && rows.every(function(row) {
+      return !row.disabled && row.getAttribute('aria-disabled') !== 'true';
+    });
+  });
+  if (cards.length === 0) return null;
+  if (!nativeThreadId) return JSON.stringify({ error: 'active_thread_missing' });
+  if (cards.length !== 1) return JSON.stringify({ error: 'ambiguous_request_cards', count: cards.length });
+  var card = cards[0];
+  var rows = Array.from(card.querySelectorAll('[role="radio"], [role="checkbox"]')).filter(cdqVisible);
+  var heading = Array.from(card.querySelectorAll('[class*="font-medium"], h1, h2, h3, h4')).find(function(el) {
+    var value = cdqText(el);
+    return cdqVisible(el) && value && !rows.some(function(row) { return row.contains(el); });
+  });
+  var questionText = cdqText(heading);
+  if (!questionText) {
+    var firstRowText = rows.length ? cdqText(rows[0]) : '';
+    var fullCardText = cdqText(card);
+    questionText = firstRowText ? fullCardText.split(firstRowText)[0].trim() : fullCardText;
+  }
+  if (!questionText) return JSON.stringify({ error: 'question_text_missing' });
+  var choices = rows.map(cdqChoice);
+  var otherInput = Array.from(card.querySelectorAll('textarea, input[type="text"]')).find(cdqVisible) || null;
+  var otherPlaceholder = otherInput ? String(otherInput.getAttribute('placeholder') || '').trim() : '';
+  if (otherInput) {
+    choices.push({
+      choice_id: 'desktop-choice-other',
+      label: 'Other',
+      description: otherPlaceholder.substring(0, 1000),
+      selected: false,
+      requires_text: true,
+      is_other: true,
+      native_role: 'text'
+    });
+  }
+  var skip = Array.from(card.querySelectorAll('button')).find(function(button) {
+    return cdqVisible(button) && /^skip$/i.test(cdqText(button));
+  }) || null;
+  var dismiss = Array.from(card.querySelectorAll('button[aria-label]')).find(function(button) {
+    return cdqVisible(button) && /^Dismiss(?:,|$)/i.test(button.getAttribute('aria-label') || '');
+  }) || null;
+  var remaining = dismiss
+    ? String(dismiss.getAttribute('aria-label') || '').match(/(\\d+)\\s+seconds?\\s+remaining/i)
+    : null;
+  var multi = rows.some(function(row) { return row.getAttribute('role') === 'checkbox'; });
+  var signature = JSON.stringify({
+    thread: nativeThreadId,
+    question: questionText,
+    choices: choices.map(function(choice) {
+      return [choice.label, choice.description, choice.native_role];
+    }),
+    cancel: !!skip
+  });
+  return JSON.stringify({
+    native_thread_id: nativeThreadId,
+    native_signature: signature,
+    title: questionText.substring(0, 240),
+    questions: [{
+      question_id: 'desktop-question-1',
+      header: questionText.substring(0, 120),
+      question: questionText.substring(0, 4000),
+      options: choices,
+      multi_select: multi,
+      allow_other: !!otherInput,
+      required: true,
+      secret: false
+    }],
+    cancel_supported: !!skip,
+    skip_label: skip ? cdqText(skip).substring(0, 120) : null,
+    auto_resolution_seconds_remaining: remaining ? Number(remaining[1]) : null,
+    auto_resolution_policy: remaining ? 'native' : null,
+    other_placeholder: otherPlaceholder.substring(0, 1000)
+  });
+`;
+
+async function detectCodexDesktopQuestion(Runtime) {
+  try {
+    const raw = await evalInPage(Runtime, CODEX_DESKTOP_QUESTION_EXPR);
+    if (!raw) return null;
+    const parsed = typeof raw === 'string' ? JSON.parse(raw) : raw;
+    if (parsed?.error) return parsed;
+    return parsed;
+  } catch (error) {
+    return { error: 'question_dom_exception', detail: error.message };
+  }
+}
+
+async function respondToCodexDesktopQuestion(Runtime, response, expected) {
+  if (!expected?.native_thread_id || !expected?.native_signature) {
+    return { ok: false, native_attempted: false, retryable: false, code: 'question_identity_missing', detail: 'Native question identity is missing' };
+  }
+  const current = await detectCodexDesktopQuestion(Runtime);
+  if (!current || current.error) {
+    return { ok: false, native_attempted: false, retryable: false, code: current?.error || 'native_question_missing', detail: 'The native Codex Desktop question is no longer open' };
+  }
+  if (current.native_thread_id !== expected.native_thread_id
+      || current.native_signature !== expected.native_signature) {
+    return { ok: false, native_attempted: false, retryable: false, code: 'stale_native_question', detail: 'The active native thread or question changed' };
+  }
+  const action = response?.action || 'answer';
+  let nativeAction;
+  if (action === 'cancel') {
+    if (!expected.prompt?.cancel_supported) {
+      return { ok: false, native_attempted: false, retryable: false, code: 'cancel_unsupported', detail: 'Native Desktop does not expose Skip for this question' };
+    }
+    nativeAction = { kind: 'cancel', label: expected.skip_label || 'Skip' };
+  } else {
+    const answers = Array.isArray(response?.answers) ? response.answers : [];
+    if (answers.length !== 1 || !Array.isArray(answers[0]?.choice_ids) || answers[0].choice_ids.length !== 1) {
+      return { ok: false, native_attempted: false, retryable: false, code: 'desktop_answer_shape_unsupported', detail: 'Installed Desktop fixture supports one single-choice answer' };
+    }
+    const question = expected.prompt?.questions?.[0];
+    const choice = question?.choices?.find(item => item.choice_id === answers[0].choice_ids[0]);
+    if (!choice) {
+      return { ok: false, native_attempted: false, retryable: false, code: 'choice_not_open', detail: 'The selected choice is not open' };
+    }
+    if (choice.requires_text || choice.is_other) {
+      return { ok: false, native_attempted: false, retryable: true, code: 'desktop_free_text_not_proved', detail: 'Answer free text in native Codex Desktop until its installed-version receipt is proved' };
+    }
+    nativeAction = { kind: 'choice', label: choice.label };
+  }
+
+  const clicked = await evalInPage(Runtime, `
+    var expectedThreadId = ${JSON.stringify(expected.native_thread_id)};
+    var expectedQuestion = ${JSON.stringify(expected.prompt?.questions?.[0]?.message || '')};
+    var nativeAction = ${JSON.stringify(nativeAction)};
+    function visible(el) {
+      if (!el || !el.isConnected) return false;
+      var style = getComputedStyle(el);
+      var rect = el.getBoundingClientRect();
+      return style.display !== 'none' && style.visibility !== 'hidden'
+        && style.opacity !== '0' && rect.width > 0 && rect.height > 0;
+    }
+    function text(el) { return String(el && (el.innerText || el.textContent) || '').replace(/\\s+/g, ' ').trim(); }
+    function press(el) {
+      var w = d.defaultView || window;
+      var rect = el.getBoundingClientRect();
+      var options = { bubbles: true, cancelable: true, view: w,
+        clientX: rect.x + rect.width / 2, clientY: rect.y + rect.height / 2, button: 0 };
+      if (w.PointerEvent) el.dispatchEvent(new w.PointerEvent('pointerdown', options));
+      el.dispatchEvent(new w.MouseEvent('mousedown', options));
+      if (w.PointerEvent) el.dispatchEvent(new w.PointerEvent('pointerup', options));
+      el.dispatchEvent(new w.MouseEvent('mouseup', options));
+      el.dispatchEvent(new w.MouseEvent('click', options));
+    }
+    var active = d.querySelector(
+      '[data-app-action-sidebar-thread-row][data-app-action-sidebar-thread-active="true"], '
+      + '[data-app-action-sidebar-thread-row][aria-current="page"]'
+    );
+    var activeId = active ? String(active.getAttribute('data-app-action-sidebar-thread-id') || '').trim() : '';
+    if (activeId !== expectedThreadId) return { ok: false, code: 'wrong-active-thread' };
+    var cards = Array.from(d.querySelectorAll('[class*="request-card"]')).filter(function(card) {
+      return visible(card) && text(card).indexOf(expectedQuestion) !== -1
+        && card.querySelectorAll('[role="radio"], [role="checkbox"]').length > 0;
+    });
+    if (cards.length !== 1) return { ok: false, code: 'active-card-count', count: cards.length };
+    var control;
+    if (nativeAction.kind === 'cancel') {
+      control = Array.from(cards[0].querySelectorAll('button')).find(function(button) {
+        return visible(button) && text(button) === nativeAction.label;
+      });
+    } else {
+      var matches = Array.from(cards[0].querySelectorAll('[role="radio"], [role="checkbox"]')).filter(function(row) {
+        return visible(row) && String(row.getAttribute('aria-label') || '').trim() === nativeAction.label;
+      });
+      if (matches.length === 1) control = matches[0];
+    }
+    if (!control || control.disabled || control.getAttribute('aria-disabled') === 'true') {
+      return { ok: false, code: 'native-control-missing' };
+    }
+    press(control);
+    return { ok: true, action: nativeAction.kind };
+  `);
+  if (!clicked?.ok) {
+    return { ok: false, native_attempted: false, retryable: false, code: clicked?.code || 'native_control_missing', detail: 'Exact native Desktop question control was not available' };
+  }
+  for (let attempt = 0; attempt < 60; attempt += 1) {
+    await new Promise(resolve => setTimeout(resolve, 50));
+    const followup = await detectCodexDesktopQuestion(Runtime);
+    if (!followup || (!followup.error && followup.native_signature !== expected.native_signature)) {
+      return {
+        ok: true,
+        native_attempted: true,
+        native_acknowledged: true,
+        lifecycle: action === 'cancel' ? 'cancelled' : 'answered',
+        native_receipt: {
+          surface: 'codex-desktop',
+          thread_unchanged: true,
+          request_card_disappeared: true
+        }
+      };
+    }
+  }
+  return { ok: false, native_attempted: true, retryable: false, code: 'native_question_not_acknowledged', detail: 'Native request card remained visible after the exact answer click' };
+}
+
+const CODEX_VSCODE_QUESTION_EXPR = `
+  function cvqVisible(el) {
+    if (!el || !el.isConnected || !el.getBoundingClientRect) return false;
+    var style = getComputedStyle(el);
+    var rect = el.getBoundingClientRect();
+    return style.display !== 'none' && style.visibility !== 'hidden'
+      && style.opacity !== '0' && rect.width > 0 && rect.height > 0;
+  }
+  function cvqText(el) {
+    return String(el && (el.innerText || el.textContent) || '').replace(/\\s+/g, ' ').trim();
+  }
+  function cvqFiberIdentity(el) {
+    var identity = { conversation_id: '', turn_id: '', request_id: '', questions: null, deadline_ms: null };
+    for (var node = el, nodeDepth = 0; node && nodeDepth < 14; node = node.parentElement, nodeDepth += 1) {
+      var fiberKey = Object.getOwnPropertyNames(node).find(function(key) {
+        return key.indexOf('__reactFiber$') === 0;
+      });
+      var fiber = fiberKey ? node[fiberKey] : null;
+      for (var fiberDepth = 0; fiber && fiberDepth < 20; fiber = fiber.return, fiberDepth += 1) {
+        var candidates = [fiber.pendingProps, fiber.memoizedProps];
+        for (var candidateIndex = 0; candidateIndex < candidates.length; candidateIndex += 1) {
+          var props = candidates[candidateIndex];
+          if (!props || typeof props !== 'object') continue;
+          var conversation = props.conversationId || props.browserConversationId || '';
+          if (!identity.conversation_id && typeof conversation === 'string') {
+            identity.conversation_id = conversation;
+          }
+          var request = props.request;
+          if (request && typeof request === 'object') {
+            if (!identity.request_id && request.requestId != null) identity.request_id = String(request.requestId);
+            if (!identity.turn_id && typeof request.turnId === 'string') identity.turn_id = request.turnId;
+            if (!identity.questions && Array.isArray(request.questions)) identity.questions = request.questions;
+          }
+          var autoResolution = props.autoResolution;
+          if (identity.deadline_ms == null && autoResolution && typeof autoResolution === 'object') {
+            var deadlineMs = Number(autoResolution.deadlineMs);
+            if (Number.isFinite(deadlineMs) && deadlineMs > 0) identity.deadline_ms = deadlineMs;
+          }
+        }
+      }
+    }
+    return identity;
+  }
+  function cvqChoice(row, index) {
+    var label = String(row.getAttribute('aria-label') || '').trim();
+    var full = cvqText(row).replace(/^\\d+\\s+/, '');
+    if (!label) label = full.split(/\\s{2,}/)[0] || full;
+    var description = String(row.getAttribute('aria-description') || '').trim();
+    if (!description) {
+      description = full;
+      if (label && description.toLowerCase().indexOf(label.toLowerCase()) === 0) {
+        description = description.substring(label.length).trim();
+      }
+    }
+    return {
+      choice_id: 'vscode-choice-' + (index + 1),
+      label: label.substring(0, 240),
+      description: description.substring(0, 1000),
+      selected: row.getAttribute('aria-checked') === 'true' || row.getAttribute('aria-selected') === 'true',
+      requires_text: false,
+      is_other: false,
+      native_role: row.getAttribute('role') || ''
+    };
+  }
+  var cards = Array.from(d.querySelectorAll('[class*="request-card"]')).filter(function(card) {
+    if (!cvqVisible(card)) return false;
+    return Array.from(card.querySelectorAll('[role="radio"], [role="checkbox"]')).some(cvqVisible);
+  });
+  if (cards.length === 0) return null;
+  if (cards.length !== 1) return JSON.stringify({ error: 'ambiguous_request_cards', count: cards.length });
+  var card = cards[0];
+  var identity = cvqFiberIdentity(card);
+  if (!identity.conversation_id || !identity.turn_id || !identity.request_id) {
+    return JSON.stringify({ error: 'native_question_identity_missing' });
+  }
+  if (!Array.isArray(identity.questions) || identity.questions.length < 1 || identity.questions.length > 3) {
+    return JSON.stringify({ error: 'native_question_count_invalid', count: Array.isArray(identity.questions) ? identity.questions.length : 0 });
+  }
+  var rows = Array.from(card.querySelectorAll('[role="radio"], [role="checkbox"]')).filter(cvqVisible);
+  var disabledRows = rows.filter(function(row) {
+    return row.disabled || row.getAttribute('aria-disabled') === 'true';
+  });
+  if (disabledRows.length > 0) {
+    return JSON.stringify({ error: 'native_question_controls_disabled', count: disabledRows.length });
+  }
+  var heading = Array.from(card.querySelectorAll('[class*="font-medium"], h1, h2, h3, h4, [role="heading"]'))
+    .find(function(el) {
+      var value = cvqText(el);
+      return cvqVisible(el) && value && !rows.some(function(row) { return row.contains(el); });
+    });
+  var questionText = cvqText(heading) || String(nativeQuestion.question || '').trim();
+  if (!questionText) {
+    var firstRowText = rows.length ? cvqText(rows[0]) : '';
+    var fullCardText = cvqText(card);
+    questionText = firstRowText ? fullCardText.split(firstRowText)[0].trim() : fullCardText;
+  }
+  if (!questionText) return JSON.stringify({ error: 'question_text_missing' });
+  var currentQuestionIndex = identity.questions.findIndex(function(question) {
+    return String(question && question.question || '').trim() === questionText;
+  });
+  if (currentQuestionIndex < 0) {
+    return JSON.stringify({ error: 'native_question_page_mismatch', question: questionText.substring(0, 240) });
+  }
+  var header = String((identity.questions[0] || {}).header || questionText).trim();
+  var otherInput = Array.from(card.querySelectorAll('textarea, input[type="text"], input:not([type])'))
+    .find(cvqVisible) || null;
+  var otherPlaceholder = otherInput ? String(otherInput.getAttribute('placeholder') || '').trim() : '';
+  var nativeOptions = Array.isArray(identity.questions[currentQuestionIndex].options)
+    ? identity.questions[currentQuestionIndex].options : [];
+  var visibleChoices = rows.map(cvqChoice);
+  if (nativeOptions.length !== visibleChoices.length || nativeOptions.some(function(option, index) {
+    return String(option && option.label || '').trim() !== visibleChoices[index].label;
+  })) {
+    return JSON.stringify({ error: 'native_question_options_mismatch', question_index: currentQuestionIndex });
+  }
+  var skip = Array.from(card.querySelectorAll('button')).find(function(button) {
+    return cvqVisible(button) && /^skip$/i.test(cvqText(button));
+  }) || null;
+  var dismiss = Array.from(card.querySelectorAll('button[aria-label]')).find(function(button) {
+    return cvqVisible(button) && /^Dismiss(?:,|$)/i.test(button.getAttribute('aria-label') || '');
+  }) || null;
+  var remaining = dismiss
+    ? String(dismiss.getAttribute('aria-label') || '').match(/(\\d+)\\s+seconds?\\s+remaining/i)
+    : null;
+  var questions = identity.questions.map(function(question, questionIndex) {
+    var options = Array.isArray(question && question.options) ? question.options : [];
+    var choices = options.map(function(option, optionIndex) {
+      var currentChoice = questionIndex === currentQuestionIndex ? visibleChoices[optionIndex] : null;
+      return {
+        choice_id: 'vscode-choice-' + (optionIndex + 1),
+        label: String(option && option.label || '').trim().substring(0, 240),
+        description: String(option && option.description || '').trim().substring(0, 1000),
+        selected: currentChoice ? currentChoice.selected : optionIndex === 0,
+        requires_text: false,
+        is_other: false,
+        native_role: currentChoice ? currentChoice.native_role : 'radio'
+      };
+    });
+    var allowOther = question && question.isOther === true;
+    if (allowOther) {
+      choices.push({
+        choice_id: 'vscode-choice-other',
+        label: 'Other',
+        description: (questionIndex === currentQuestionIndex && otherPlaceholder
+          ? otherPlaceholder : 'No, and tell ChatGPT what to do differently').substring(0, 1000),
+        selected: false,
+        requires_text: true,
+        is_other: true,
+        native_role: 'text'
+      });
+    }
+    return {
+      question_id: String(question && question.id || ('vscode-question-' + (questionIndex + 1))).substring(0, 120),
+      header: String(question && question.header || ('Question ' + (questionIndex + 1))).trim().substring(0, 120),
+      question: String(question && question.question || '').trim().substring(0, 4000),
+      options: choices,
+      multi_select: questionIndex === currentQuestionIndex
+        && rows.some(function(row) { return row.getAttribute('role') === 'checkbox'; }),
+      allow_other: allowOther,
+      required: true,
+      secret: question && question.isSecret === true
+    };
+  });
+  var signature = JSON.stringify({
+    conversation: identity.conversation_id,
+    turn: identity.turn_id,
+    request: identity.request_id,
+    questions: identity.questions.map(function(question) {
+      return {
+        id: String(question && question.id || ''),
+        header: String(question && question.header || ''),
+        question: String(question && question.question || ''),
+        options: Array.isArray(question && question.options) ? question.options.map(function(option) {
+          return [String(option && option.label || ''), String(option && option.description || '')];
+        }) : null,
+        other: question && question.isOther === true,
+        secret: question && question.isSecret === true
+      };
+    }),
+    cancel: !!skip,
+    deadline_ms: identity.deadline_ms,
+  });
+  var nativeDeadlineMs = Number(identity.deadline_ms);
+  var deadlineRemaining = Number.isFinite(nativeDeadlineMs)
+    ? Math.max(0, Math.ceil((nativeDeadlineMs - Date.now()) / 1000))
+    : null;
+  return JSON.stringify({
+    native_conversation_id: identity.conversation_id,
+    native_turn_id: identity.turn_id,
+    native_request_id: identity.request_id,
+    native_signature: signature,
+    native_question_index: currentQuestionIndex,
+    title: header.substring(0, 240),
+    questions: questions,
+    disabled_control_count: 0,
+    cancel_supported: !!skip,
+    skip_label: skip ? cvqText(skip).substring(0, 120) : null,
+    native_deadline_ms: Number.isFinite(nativeDeadlineMs) ? nativeDeadlineMs : null,
+    auto_resolution_seconds_remaining: deadlineRemaining == null
+      ? (remaining ? Number(remaining[1]) : null)
+      : deadlineRemaining,
+    auto_resolution_policy: deadlineRemaining != null || remaining ? 'native' : null,
+    other_placeholder: otherPlaceholder.substring(0, 1000)
+  });
+`;
+
+async function detectCodexVsCodeQuestion(Runtime) {
+  try {
+    const raw = await evalInFrame(Runtime, CODEX_VSCODE_QUESTION_EXPR);
+    if (!raw) return null;
+    const parsed = typeof raw === 'string' ? JSON.parse(raw) : raw;
+    return parsed;
+  } catch (error) {
+    return { error: 'question_dom_exception', detail: error.message };
+  }
+}
+
+async function detectCodexVsCodeQuestionReceipt(Runtime, expected) {
+  if (!expected?.native_conversation_id || !expected?.native_turn_id
+      || expected?.native_request_id == null || !Array.isArray(expected?.prompt?.questions)
+      || expected.prompt.questions.length < 1) {
+    return null;
+  }
+  const expectedQuestions = expected.prompt.questions.map(question => ({
+    id: String(question?.question_id || ''),
+    header: String(question?.header || ''),
+    question: String(question?.message || ''),
+  }));
+  const deadlineMs = Date.parse(expected.prompt.deadline_at || '');
+  try {
+    const raw = await evalInFrame(Runtime, `
+      var expectedConversationId = ${JSON.stringify(String(expected.native_conversation_id))};
+      var expectedTurnId = ${JSON.stringify(String(expected.native_turn_id))};
+      var expectedRequestId = ${JSON.stringify(String(expected.native_request_id))};
+      var expectedQuestions = ${JSON.stringify(expectedQuestions)};
+      var expectedDeadlineMs = ${Number.isFinite(deadlineMs) ? Math.round(deadlineMs) : 'null'};
+      function visible(el) {
+        if (!el || !el.isConnected || !el.getBoundingClientRect) return false;
+        var rect = el.getBoundingClientRect();
+        var style = getComputedStyle(el);
+        return rect.width > 0 && rect.height > 0 && style.display !== 'none'
+          && style.visibility !== 'hidden' && style.opacity !== '0';
+      }
+      function text(el) {
+        return String(el && (el.innerText || el.textContent) || '').replace(/\\s+/g, ' ').trim();
+      }
+      function responseItems(el) {
+        var output = [];
+        var seenFibers = new Set();
+        for (var node = el, elementDepth = 0; node && elementDepth < 16;
+          node = node.parentElement, elementDepth += 1) {
+          var key = Object.getOwnPropertyNames(node).find(function(name) {
+            return name.indexOf('__reactFiber$') === 0;
+          });
+          for (var fiber = key ? node[key] : null, fiberDepth = 0;
+            fiber && fiberDepth < 20; fiber = fiber.return, fiberDepth += 1) {
+            if (seenFibers.has(fiber)) continue;
+            seenFibers.add(fiber);
+            [fiber.pendingProps, fiber.memoizedProps].forEach(function(props) {
+              var item = props && props.item;
+              if (!item || item.type !== 'user-input-response') return;
+              output.push(item);
+            });
+          }
+        }
+        return output;
+      }
+      function normalizedQuestions(item) {
+        if (!Array.isArray(item && item.questionsAndAnswers)) return null;
+        return item.questionsAndAnswers.map(function(question) {
+          return {
+            id: String(question && question.id || ''),
+            header: String(question && question.header || ''),
+            question: String(question && question.question || ''),
+          };
+        });
+      }
+      var markerRoots = Array.from(d.querySelectorAll(
+        '[data-request-user-input-auto-resolution-conversation-id]'
+      )).filter(function(root) {
+        return String(root.getAttribute('data-request-user-input-auto-resolution-conversation-id') || '')
+          === expectedConversationId;
+      });
+      if (markerRoots.length !== 1) return null;
+      var turns = Array.from(markerRoots[0].querySelectorAll('[data-turn-key], [data-content-search-turn-key]'))
+        .filter(function(turn) {
+          return String(turn.getAttribute('data-turn-key')
+            || turn.getAttribute('data-content-search-turn-key') || '') === expectedTurnId;
+        });
+      if (turns.length !== 1) return null;
+      var emptyAnswerLabels = Array.from(turns[0].querySelectorAll('span, div, p')).filter(function(el) {
+        return visible(el) && text(el) === 'No answer provided';
+      });
+      var candidates = [];
+      emptyAnswerLabels.forEach(function(label) {
+        responseItems(label).forEach(function(item) {
+          if (String(item.turnId || '') !== expectedTurnId
+              || String(item.requestId == null ? '' : item.requestId) !== expectedRequestId) return;
+          var questions = normalizedQuestions(item);
+          if (JSON.stringify(questions) !== JSON.stringify(expectedQuestions)) return;
+          var answerCount = item.questionsAndAnswers.reduce(function(count, question) {
+            return count + (Array.isArray(question && question.answers) ? question.answers.length : 0);
+          }, 0);
+          candidates.push({
+            type: String(item.type || ''),
+            turn_id: expectedTurnId,
+            request_id: expectedRequestId,
+            question_count: questions.length,
+            answer_count: answerCount,
+          });
+        });
+      });
+      var unique = [];
+      var signatures = new Set();
+      candidates.forEach(function(candidate) {
+        var signature = JSON.stringify(candidate);
+        if (signatures.has(signature)) return;
+        signatures.add(signature);
+        unique.push(candidate);
+      });
+      if (unique.length !== 1) return null;
+      var receipt = unique[0];
+      var requestCardOpen = Array.from(d.querySelectorAll('[class*="request-card"]')).some(function(card) {
+        if (!visible(card)) return false;
+        var cardText = text(card);
+        if (!expectedQuestions.every(function(question) { return cardText.indexOf(question.question) !== -1; })) {
+          return false;
+        }
+        return Array.from(card.querySelectorAll('[role="radio"], [role="checkbox"]')).some(function(row) {
+          return visible(row) && !row.disabled && row.getAttribute('aria-disabled') !== 'true';
+        });
+      });
+      var lifecycle = receipt.answer_count > 0
+        ? 'answered'
+        : (expectedDeadlineMs != null && Date.now() >= expectedDeadlineMs - 2000
+          ? 'auto_resolved' : 'cancelled');
+      return JSON.stringify({
+        lifecycle: lifecycle,
+        native_acknowledged: true,
+        source: 'vscode_dom_user_input_response',
+        conversation_marker_matched: true,
+        turn_id: receipt.turn_id,
+        request_id: receipt.request_id,
+        question_count: receipt.question_count,
+        answer_count: receipt.answer_count,
+        request_card_disappeared: !requestCardOpen,
+      });
+    `);
+    if (!raw) return null;
+    return typeof raw === 'string' ? JSON.parse(raw) : raw;
+  } catch (error) {
+    return { error: 'question_receipt_dom_exception', detail: error.message };
+  }
+}
+
+async function readCodexVsCodeConversationId(Runtime) {
+  try {
+    return await evalInFrame(Runtime, `
+      function conversationId(el) {
+        for (var node = el, nodeDepth = 0; node && nodeDepth < 14; node = node.parentElement, nodeDepth += 1) {
+          var key = Object.getOwnPropertyNames(node).find(function(name) {
+            return name.indexOf('__reactFiber$') === 0;
+          });
+          var fiber = key ? node[key] : null;
+          for (var fiberDepth = 0; fiber && fiberDepth < 20; fiber = fiber.return, fiberDepth += 1) {
+            var props = fiber.pendingProps || fiber.memoizedProps;
+            var value = props && (props.conversationId || props.browserConversationId);
+            if (typeof value === 'string' && value) return value;
+          }
+        }
+        return '';
+      }
+      var editor = Array.from(d.querySelectorAll('.ProseMirror')).find(function(el) {
+        var rect = el.getBoundingClientRect();
+        return rect.width > 0 && rect.height > 0;
+      });
+      return conversationId(editor);
+    `);
+  } catch {
+    return '';
+  }
+}
+
+function codexVsCodeQuestionFollowupState(followup, expected) {
+  if (!followup) return 'disappeared';
+  if (followup.error) return 'uncertain';
+  if (followup.native_conversation_id !== expected.native_conversation_id
+      || followup.native_turn_id !== expected.native_turn_id
+      || followup.native_request_id !== expected.native_request_id
+      || followup.native_signature !== expected.native_signature) {
+    return 'replaced';
+  }
+  return 'still_open';
+}
+
+function codexVsCodeQuestionNativeAction(response, expected) {
+  const action = response?.action || 'answer';
+  if (action === 'cancel') {
+    if (!expected.prompt?.cancel_supported) {
+      return { ok: false, native_attempted: false, retryable: false, code: 'cancel_unsupported', detail: 'Native VS Code Codex does not expose Skip for this question' };
+    }
+    return { ok: true, action, nativeActions: [{ kind: 'cancel', label: expected.skip_label || 'Skip', question_index: expected.native_question_index || 0 }] };
+  }
+  const answers = Array.isArray(response?.answers) ? response.answers : [];
+  const questions = Array.isArray(expected.prompt?.questions) ? expected.prompt.questions : [];
+  if (answers.length !== questions.length || questions.length < 1) {
+    return { ok: false, native_attempted: false, retryable: false, code: 'vscode_answer_shape_unsupported', detail: 'The native VS Code response must answer every open question exactly once' };
+  }
+  const answersByQuestion = new Map(answers.map(answer => [answer?.question_id, answer]));
+  const nativeActions = [];
+  for (let questionIndex = 0; questionIndex < questions.length; questionIndex += 1) {
+    const question = questions[questionIndex];
+    const answer = answersByQuestion.get(question.question_id);
+    if (!answer || !Array.isArray(answer.choice_ids) || answer.choice_ids.length !== 1) {
+      return { ok: false, native_attempted: false, retryable: false, code: 'vscode_answer_shape_unsupported', detail: 'Installed VS Code questions require one exact choice per question' };
+    }
+    const choice = question.choices?.find(item => item.choice_id === answer.choice_ids[0]);
+    if (!choice) {
+      return { ok: false, native_attempted: false, retryable: false, code: 'choice_not_open', detail: 'The selected choice is not open' };
+    }
+    if (question?.secret === true) {
+      return { ok: false, native_attempted: false, retryable: false, code: 'vscode_secret_not_proved', detail: 'Answer secret input in native VS Code Codex until its installed-version receipt and redaction are proved' };
+    }
+    if (choice.requires_text || choice.is_other) {
+      const otherText = typeof answer.other_text === 'string' ? answer.other_text.trim() : '';
+      if (!otherText) {
+        return { ok: false, native_attempted: false, retryable: true, code: 'vscode_other_text_required', detail: 'Other requires non-empty text' };
+      }
+      nativeActions.push({ kind: 'other', text: otherText, question_index: questionIndex, question: question.message });
+    } else {
+      nativeActions.push({ kind: 'choice', label: choice.label, question_index: questionIndex, question: question.message });
+    }
+  }
+  return { ok: true, action, nativeActions };
+}
+
+async function respondToCodexVsCodeQuestion(Runtime, Input, response, expected) {
+  if (!expected?.native_conversation_id || !expected?.native_turn_id
+      || !expected?.native_request_id || !expected?.native_signature) {
+    return { ok: false, native_attempted: false, retryable: false, code: 'question_identity_missing', detail: 'Native VS Code question identity is missing' };
+  }
+  if (!Input?.dispatchMouseEvent) {
+    return { ok: false, native_attempted: false, retryable: false, code: 'cdp_input_unavailable', detail: 'Trusted CDP input is unavailable' };
+  }
+  const current = await detectCodexVsCodeQuestion(Runtime);
+  if (!current || current.error) {
+    return { ok: false, native_attempted: false, retryable: false, code: current?.error || 'native_question_missing', detail: 'The native VS Code Codex question is no longer open' };
+  }
+  if (current.native_conversation_id !== expected.native_conversation_id
+      || current.native_turn_id !== expected.native_turn_id
+      || current.native_request_id !== expected.native_request_id
+      || current.native_signature !== expected.native_signature) {
+    return { ok: false, native_attempted: false, retryable: false, code: 'stale_native_question', detail: 'The active native conversation, turn, request, or question changed' };
+  }
+
+  const actionResult = codexVsCodeQuestionNativeAction(response, expected);
+  if (!actionResult.ok) return actionResult;
+  const { action, nativeActions } = actionResult;
+  if (nativeActions.some(nativeAction => nativeAction.kind === 'other')
+      && (!Input?.insertText || !Input?.dispatchKeyEvent)) {
+    return { ok: false, native_attempted: false, retryable: false, code: 'cdp_text_input_unavailable', detail: 'Trusted CDP text input is unavailable' };
+  }
+
+  const dispatchNativeAction = async nativeAction => {
+    const target = await evalInFrame(Runtime, `
+    var expectedConversationId = ${JSON.stringify(expected.native_conversation_id)};
+    var expectedTurnId = ${JSON.stringify(expected.native_turn_id)};
+    var expectedRequestId = ${JSON.stringify(expected.native_request_id)};
+    var expectedQuestion = ${JSON.stringify(nativeAction.question || expected.prompt?.questions?.[nativeAction.question_index]?.message || '')};
+    var nativeAction = ${JSON.stringify(nativeAction)};
+    function visible(el) {
+      if (!el || !el.isConnected || !el.getBoundingClientRect) return false;
+      var style = getComputedStyle(el);
+      var rect = el.getBoundingClientRect();
+      return style.display !== 'none' && style.visibility !== 'hidden'
+        && style.opacity !== '0' && rect.width > 0 && rect.height > 0;
+    }
+    function text(el) { return String(el && (el.innerText || el.textContent) || '').replace(/\\s+/g, ' ').trim(); }
+    function identity(el) {
+      var result = { conversation: '', turn: '', request: '' };
+      for (var node = el, nd = 0; node && nd < 14; node = node.parentElement, nd += 1) {
+        var key = Object.getOwnPropertyNames(node).find(function(name) { return name.indexOf('__reactFiber$') === 0; });
+        var fiber = key ? node[key] : null;
+        for (var fd = 0; fiber && fd < 20; fiber = fiber.return, fd += 1) {
+          var props = fiber.pendingProps || fiber.memoizedProps;
+          if (!props || typeof props !== 'object') continue;
+          var conversation = props.conversationId || props.browserConversationId;
+          if (!result.conversation && typeof conversation === 'string') result.conversation = conversation;
+          var request = props.request;
+          if (request && typeof request === 'object') {
+            if (!result.turn && typeof request.turnId === 'string') result.turn = request.turnId;
+            if (!result.request && request.requestId != null) result.request = String(request.requestId);
+          }
+        }
+      }
+      return result;
+    }
+    var cards = Array.from(d.querySelectorAll('[class*="request-card"]')).filter(function(card) {
+      if (!visible(card) || text(card).indexOf(expectedQuestion) === -1) return false;
+      var current = identity(card);
+      return current.conversation === expectedConversationId
+        && current.turn === expectedTurnId && current.request === expectedRequestId;
+    });
+    if (cards.length !== 1) return { ok: false, code: 'active-card-count', count: cards.length };
+    var control = null;
+    if (nativeAction.kind === 'cancel') {
+      control = Array.from(cards[0].querySelectorAll('button')).find(function(button) {
+        return visible(button) && text(button) === nativeAction.label;
+      }) || null;
+    } else if (nativeAction.kind === 'other') {
+      var textControls = Array.from(cards[0].querySelectorAll('textarea, input[type="text"], input:not([type])'))
+        .filter(visible);
+      if (textControls.length !== 1) return { ok: false, code: 'native-text-control-count', count: textControls.length };
+      control = textControls[0];
+      if (String(control.value || '')) return { ok: false, code: 'native-text-present' };
+    } else {
+      var matches = Array.from(cards[0].querySelectorAll('[role="radio"], [role="checkbox"]')).filter(function(row) {
+        return visible(row) && String(row.getAttribute('aria-label') || '').trim() === nativeAction.label;
+      });
+      if (matches.length === 1) control = matches[0];
+    }
+    if (!control || control.disabled || control.getAttribute('aria-disabled') === 'true') {
+      return { ok: false, code: 'native-control-missing' };
+    }
+    var rect = control.getBoundingClientRect();
+    return {
+      ok: true,
+      action: nativeAction.kind,
+      bounds: { x: rect.x, y: rect.y, width: rect.width, height: rect.height }
+    };
+  `);
+  if (!target?.ok || !target.bounds?.width || !target.bounds?.height) {
+    return { ok: false, native_attempted: false, retryable: false, code: target?.code || 'native_control_missing', detail: 'Exact native VS Code question control was not available' };
+  }
+
+  const x = target.bounds.x + target.bounds.width / 2;
+  const y = target.bounds.y + target.bounds.height / 2;
+  try {
+    await Input.dispatchMouseEvent({ type: 'mouseMoved', x, y });
+    await Input.dispatchMouseEvent({ type: 'mousePressed', x, y, button: 'left', clickCount: 1 });
+    await new Promise(resolve => setTimeout(resolve, 60));
+    await Input.dispatchMouseEvent({ type: 'mouseReleased', x, y, button: 'left', clickCount: 1 });
+    if (nativeAction.kind === 'other') {
+      await Input.insertText({ text: nativeAction.text });
+      const textAccepted = await evalInFrame(Runtime, `
+        var expectedText = ${JSON.stringify(nativeAction.text)};
+        var controls = Array.from(d.querySelectorAll('[class*="request-card"] textarea, [class*="request-card"] input[type="text"], [class*="request-card"] input:not([type])'))
+          .filter(function(el) {
+            if (!el || !el.isConnected || !el.getBoundingClientRect) return false;
+            var rect = el.getBoundingClientRect();
+            var style = getComputedStyle(el);
+            return rect.width > 0 && rect.height > 0 && style.display !== 'none'
+              && style.visibility !== 'hidden' && style.opacity !== '0';
+          });
+        return controls.length === 1 && String(controls[0].value || '') === expectedText;
+      `);
+      if (textAccepted !== true) {
+        return { ok: false, native_attempted: true, retryable: false, code: 'native_text_not_acknowledged', detail: 'Native Other input did not acknowledge the exact text' };
+      }
+      await Input.dispatchKeyEvent({
+        type: 'keyDown', key: 'Enter', code: 'Enter', windowsVirtualKeyCode: 13,
+        nativeVirtualKeyCode: 13,
+      });
+      await Input.dispatchKeyEvent({
+        type: 'keyUp', key: 'Enter', code: 'Enter', windowsVirtualKeyCode: 13,
+        nativeVirtualKeyCode: 13,
+      });
+    }
+  } catch (error) {
+    return { ok: false, native_attempted: true, retryable: false, code: 'native_input_uncertain', detail: error.message };
+  }
+    return { ok: true };
+  };
+
+  for (let actionIndex = 0; actionIndex < nativeActions.length; actionIndex += 1) {
+    const dispatched = await dispatchNativeAction(nativeActions[actionIndex]);
+    if (!dispatched.ok) return dispatched;
+    if (actionIndex >= nativeActions.length - 1) continue;
+
+    const expectedNextIndex = nativeActions[actionIndex + 1].question_index;
+    let advanced = false;
+    for (let attempt = 0; attempt < 100; attempt += 1) {
+      await new Promise(resolve => setTimeout(resolve, 50));
+      const followup = await detectCodexVsCodeQuestion(Runtime);
+      const followupState = codexVsCodeQuestionFollowupState(followup, expected);
+      if (followupState === 'replaced' || followupState === 'disappeared') {
+        return { ok: false, native_attempted: true, retryable: false, code: 'native_question_replaced_before_navigation', detail: 'The native request changed before the next question page' };
+      }
+      if (followupState === 'still_open' && followup.native_question_index === expectedNextIndex) {
+        advanced = true;
+        break;
+      }
+    }
+    if (!advanced) {
+      return { ok: false, native_attempted: true, retryable: false, code: 'native_question_navigation_not_acknowledged', detail: 'Native VS Code did not advance to the exact next question page' };
+    }
+  }
+
+  for (let attempt = 0; attempt < 100; attempt += 1) {
+    await new Promise(resolve => setTimeout(resolve, 50));
+    const followup = await detectCodexVsCodeQuestion(Runtime);
+    const followupState = codexVsCodeQuestionFollowupState(followup, expected);
+    if (followupState === 'disappeared') {
+      const conversationId = await readCodexVsCodeConversationId(Runtime);
+      if (conversationId !== expected.native_conversation_id) {
+        return { ok: false, native_attempted: true, retryable: false, code: 'native_conversation_changed', detail: 'The native conversation changed before acknowledgement' };
+      }
+      return {
+        ok: true,
+        native_attempted: true,
+        native_acknowledged: true,
+        lifecycle: action === 'cancel' ? 'cancelled' : 'answered',
+        native_receipt: {
+          surface: 'codex',
+          conversation_unchanged: true,
+          turn_id: expected.native_turn_id,
+          request_card_disappeared: true
+        }
+      };
+    }
+    if (followupState === 'replaced') {
+      return { ok: false, native_attempted: true, retryable: false, code: 'native_question_replaced_before_ack', detail: 'The native request changed before exact card-disappearance acknowledgement' };
+    }
+  }
+  return { ok: false, native_attempted: true, retryable: false, code: 'native_question_not_acknowledged', detail: 'Native VS Code request card remained visible after the exact answer click' };
+}
+
 const PERMISSION_DIALOG_EXPR = `
   var dlg = null;
   var isClaudePermissionPrompt = false;
@@ -10263,16 +11539,127 @@ const PERMISSION_DIALOG_EXPR = `
 
   if (!dlg) return null;
 
-  // Extract the human-readable message
-  // For Claude Code permission prompts, prefer permissionRequestDescription or permissionRequestContent
-  var msgEl = dlg.querySelector('[class*="permissionRequestDescription"], [class*="permissionRequestContent"]')
+  // AskUserQuestion structured prompts. Options may be radio rows, checkbox rows, or
+  // role=option rows. Multiple questions are commonly rendered as tab/tabpanel groups.
+  function qSlug(value, fallback) {
+    return String(value || '').toLowerCase().replace(/[^a-z0-9]+/g, '_').replace(/^_+|_+$/g, '') || fallback;
+  }
+  function qText(el) {
+    return String(el && (el.innerText || el.textContent) || '').replace(/\\s+/g, ' ').trim();
+  }
+  function qFirstLine(el) {
+    return String(el && (el.innerText || el.textContent) || '').split(/\\r?\\n/)
+      .map(function(line) { return line.trim(); }).find(Boolean) || '';
+  }
+  var optRows = Array.from(dlg.querySelectorAll('[role="radio"], [role="checkbox"], [role="option"]'));
+  var tabs = Array.from(dlg.querySelectorAll('[role="tab"]'));
+  var questionMap = {};
+  var questions = [];
+  var flatChoices = [];
+  for (var ori = 0; ori < optRows.length; ori++) {
+    var optRow = optRows[ori];
+    var panel = optRow.closest('[role="tabpanel"], [data-question-id], [class*="questionContainer"], [class*="questionContent"]');
+    // Hidden tabpanels remain valid question sources; detached/stale rows do not.
+    if (optRow.offsetParent === null && !panel) continue;
+    var labelledBy = panel && panel.getAttribute('aria-labelledby');
+    var tab = labelledBy ? dlg.querySelector('#' + CSS.escape(labelledBy)) : null;
+    if (!tab && panel && panel.id) {
+      tab = tabs.find(function(candidate) { return candidate.getAttribute('aria-controls') === panel.id; }) || null;
+    }
+    if (!tab && tabs.length === 1) tab = tabs[0];
+    var heading = panel && panel.querySelector('h1, h2, h3, h4, [class*="questionTitle"], [class*="questionLabel"]');
+    var questionLabel = qText(heading) || qText(tab) || ('Question ' + (questions.length + 1));
+    var rawQid = (tab && (tab.getAttribute('data-value') || tab.id || qText(tab)))
+      || (panel && (panel.getAttribute('data-question-id') || panel.id || labelledBy))
+      || 'question_1';
+    var qid = qSlug(rawQid, 'question_' + (questions.length + 1));
+    var question = questionMap[qid];
+    if (!question) {
+      var multi = optRow.getAttribute('role') === 'checkbox'
+        || (panel && (panel.getAttribute('aria-multiselectable') === 'true' || panel.getAttribute('data-multiselect') === 'true'));
+      question = {
+        question_id: qid,
+        label: questionLabel.substring(0, 200),
+        message: qText(panel && panel.querySelector('[class*="questionDescription"], [class*="questionText"], p')).substring(0, 500),
+        multi_select: !!multi,
+        choices: []
+      };
+      questionMap[qid] = question;
+      questions.push(question);
+    }
+    if (optRow.getAttribute('role') === 'checkbox') question.multi_select = true;
+    var optLabEl = optRow.querySelector('[class*="optionLabel"]');
+    var optDescEl = optRow.querySelector('[class*="optionDescription"]');
+    var optLab = qText(optLabEl) || qFirstLine(optRow);
+    if (!optLab) continue;
+    var localCid = qSlug(optLab, 'option_' + ori);
+    var optCid = qid + '__' + localCid;
+    var optChoice = {
+      choice_id: optCid,
+      label: optLab.substring(0, 200),
+      question_id: qid,
+      multi_select: !!question.multi_select
+    };
+    var optDesc = qText(optDescEl);
+    if (optDesc) optChoice.description = optDesc.substring(0, 300);
+    var textInput = optRow.querySelector('input[type="text"], textarea')
+      || (panel && /^other\\b/i.test(optLab) ? panel.querySelector('input[type="text"], textarea') : null);
+    if (textInput || /^other\\b/i.test(optLab)) optChoice.requires_text = true;
+    question.choices.push(optChoice);
+    flatChoices.push(optChoice);
+  }
+  if (flatChoices.length >= 2) {
+    // Build prompt copy from a clone and exclude controls/chrome at the element level.
+    var clean = dlg.cloneNode(true);
+    Array.from(clean.querySelectorAll(
+      '[role="radio"], [role="checkbox"], [role="option"], [role="tablist"], button, kbd, footer, '
+      + '[class*="footer"], [class*="shortcut"], [class*="keybind"]'
+    )).forEach(function(node) { node.remove(); });
+    var qMsg = qText(clean).substring(0, 800);
+    if (!qMsg) qMsg = questions.map(function(question) { return question.label; }).join(' · ').substring(0, 800);
+    return JSON.stringify({
+      message: qMsg,
+      choices: flatChoices,
+      questions: questions,
+      kind: 'question',
+      submit_label: 'Submit answers'
+    });
+  }
+
+  // Extract the human-readable message. Claude Code keeps the native title,
+  // command, explanation, alternate-instruction placeholder, and cancel hint
+  // in distinct CSS-module rows. Preserve those fields instead of flattening
+  // the whole card into one concatenated string.
+  var nativeTitleEl = isClaudePermissionPrompt
+    ? dlg.querySelector('[class*="permissionRequestHeader"]') : null;
+  var nativeCommandEl = isClaudePermissionPrompt
+    ? dlg.querySelector('[class*="permissionRequestInput"]') : null;
+  var nativeDescriptionEl = isClaudePermissionPrompt
+    ? dlg.querySelector('[class*="permissionRequestDescription"]') : null;
+  var nativeAlternateEl = isClaudePermissionPrompt
+    ? dlg.querySelector('[class*="rejectMessageInput"] [contenteditable], [class*="rejectMessageInput"] textarea, [class*="rejectMessageInput"] input') : null;
+  var nativeAlternatePlaceholderEl = isClaudePermissionPrompt
+    ? dlg.querySelector('[class*="rejectMessageInput"] [class*="placeholder"]') : null;
+  var nativeCancelHintEl = isClaudePermissionPrompt
+    ? dlg.querySelector('[class*="keyboardHints"]') : null;
+  var nativeTitle = nativeTitleEl ? (nativeTitleEl.innerText || nativeTitleEl.textContent || '').trim() : '';
+  var nativeCommand = nativeCommandEl ? (nativeCommandEl.innerText || nativeCommandEl.textContent || '').trim() : '';
+  var nativeDescription = nativeDescriptionEl ? (nativeDescriptionEl.innerText || nativeDescriptionEl.textContent || '').trim() : '';
+  var nativeAlternatePlaceholder = nativeAlternatePlaceholderEl
+    ? (nativeAlternatePlaceholderEl.innerText || nativeAlternatePlaceholderEl.textContent || '').trim() : '';
+  var nativeCancelHint = nativeCancelHintEl
+    ? (nativeCancelHintEl.innerText || nativeCancelHintEl.textContent || '').trim() : '';
+  var msgEl = nativeDescriptionEl || dlg.querySelector('[class*="permissionRequestContent"]')
            || dlg.querySelector('[class*="Description"], [class*="message"], [class*="title"], [class*="body"], [class*="content"], p');
-  var rawMsg = (msgEl ? msgEl.textContent : dlg.textContent);
+  var rawMsg = (msgEl ? (msgEl.innerText || msgEl.textContent) : (dlg.innerText || dlg.textContent));
 
   // Also grab the tool input/command if present (e.g. the bash command being requested)
   var inputEl = dlg.querySelector('[class*="permissionRequestInput"] pre, [class*="permissionRequestInput"] code, [class*="inputJson"]');
-  var inputText = inputEl ? inputEl.textContent.trim() : '';
+  var inputText = nativeCommand || (inputEl ? inputEl.textContent.trim() : '');
   var msg = rawMsg.replace(/\\s+/g, ' ').trim();
+  if (isClaudePermissionPrompt && nativeTitle) {
+    msg = [nativeTitle, nativeCommand, nativeDescription].filter(Boolean).join('\\n');
+  }
   if (inputText && !msg.includes(inputText.substring(0, 40))) {
     msg = msg + '\\n' + inputText.substring(0, 500);
   }
@@ -10285,10 +11672,21 @@ const PERMISSION_DIALOG_EXPR = `
     var btn = btns[bi];
     var cls = btn.className || '';
     if (cls.includes('copyButton') || cls.includes('iconButton')) continue;
-    var label = (btn.textContent || btn.getAttribute('aria-label') || btn.getAttribute('title') || '').trim();
+    var label = (btn.innerText || btn.textContent || btn.getAttribute('aria-label') || btn.getAttribute('title') || '').trim();
     if (!label) continue;
     var cid = label.toLowerCase().replace(/[^a-z0-9]+/g, '_').replace(/^_+|_+$/g, '') || ('choice_' + bi);
-    choices.push({ choice_id: cid, label: label });
+    var shortcutEl = isClaudePermissionPrompt ? btn.querySelector('[class*="shortcutNum"]') : null;
+    var destinationEl = isClaudePermissionPrompt ? btn.querySelector('[class*="destinationLink"]') : null;
+    var shortcut = shortcutEl ? (shortcutEl.innerText || shortcutEl.textContent || '').trim() : '';
+    var destination = destinationEl ? (destinationEl.innerText || destinationEl.textContent || '').trim() : '';
+    var displayLabel = label;
+    if (shortcut) displayLabel = displayLabel.replace(new RegExp('^\\s*' + shortcut.replace(/[^0-9]/g, '') + '\\s*'), '').trim();
+    choices.push({
+      choice_id: cid,
+      label: displayLabel || label,
+      ...(shortcut ? { shortcut: shortcut } : {}),
+      ...(destination ? { destination: destination } : {})
+    });
   }
 
   if (choices.length === 0) return null;
@@ -10298,7 +11696,16 @@ const PERMISSION_DIALOG_EXPR = `
   });
   var hasPermissionText = /permission|approve|approval|allow|reject|run command\\??|edit file\\??|requires? input|requires? approval|tool call|terminal command|execute|write file|delete file|create file|access to|want to proceed/i.test(msg);
   if (!isClaudePermissionPrompt && !(hasRejectChoice || (hasActionChoice && hasPermissionText))) return null;
-  return JSON.stringify({ message: msg, choices: choices });
+  return JSON.stringify({
+    message: msg,
+    choices: choices,
+    ...(nativeTitle ? { title: nativeTitle } : {}),
+    ...(nativeCommand ? { command: nativeCommand } : {}),
+    ...(nativeDescription ? { description: nativeDescription } : {}),
+    ...(nativeAlternateEl ? { alternate_instruction_supported: true } : {}),
+    ...(nativeAlternatePlaceholder ? { alternate_instruction_placeholder: nativeAlternatePlaceholder } : {}),
+    ...(nativeCancelHint ? { cancel_hint: nativeCancelHint } : {})
+  });
 `;
 
 function _buildPermissionClickExpr(choiceId) {
@@ -10349,6 +11756,32 @@ function _buildPermissionClickExpr(choiceId) {
     if (!dlg) return 'no-dialog';
 
     var target = ${JSON.stringify(choiceId)};
+
+    // AskUserQuestion-style structured options: click the matching radio row, then the
+    // Submit button once the selection has registered.
+    var optRows = Array.from(dlg.querySelectorAll('[role="radio"], [role="option"]'));
+    for (var ori = 0; ori < optRows.length; ori++) {
+      var optRow = optRows[ori];
+      if (optRow.offsetParent === null) continue;
+      var optLabEl = optRow.querySelector('[class*="optionLabel"]');
+      var optLab = ((optLabEl ? optLabEl.textContent : '') || optRow.textContent || '').trim().split('\\n')[0].trim();
+      var optCid = optLab.toLowerCase().replace(/[^a-z0-9]+/g, '_').replace(/^_+|_+$/g, '');
+      if (optCid !== target) continue;
+      dispatchPress(optRow);
+      var w2 = d.defaultView || window;
+      w2.setTimeout(function () {
+        var sbtns = Array.from(dlg.querySelectorAll('button'));
+        for (var sbi = 0; sbi < sbtns.length; sbi++) {
+          var sl = (sbtns[sbi].textContent || '').trim();
+          if (/submit/i.test(sl) && !sbtns[sbi].disabled && sbtns[sbi].getAttribute('aria-disabled') !== 'true') {
+            dispatchPress(sbtns[sbi]);
+            return;
+          }
+        }
+      }, 250);
+      return 'clicked';
+    }
+
     var btns = Array.from(dlg.querySelectorAll('button'));
     var found = null;
     for (var bi = 0; bi < btns.length; bi++) {
@@ -10360,6 +11793,103 @@ function _buildPermissionClickExpr(choiceId) {
     if (!found) return 'no-match';
     if (found.disabled || found.getAttribute('aria-disabled') === 'true') return 'disabled';
     dispatchPress(found);
+    return 'clicked';
+  `;
+}
+
+function _buildQuestionAnswerExpr(answers) {
+  return `
+    var answers = ${JSON.stringify(answers || [])};
+    function slug(value, fallback) {
+      return String(value || '').toLowerCase().replace(/[^a-z0-9]+/g, '_').replace(/^_+|_+$/g, '') || fallback;
+    }
+  function text(el) {
+      return String(el && (el.innerText || el.textContent) || '').replace(/\\s+/g, ' ').trim();
+    }
+    function firstLine(el) {
+      return String(el && (el.innerText || el.textContent) || '').split(/\\r?\\n/)
+        .map(function(line) { return line.trim(); }).find(Boolean) || '';
+    }
+    function press(el) {
+      if (!el) return;
+      var w = d.defaultView || window;
+      var rect = el.getBoundingClientRect();
+      var opts = { bubbles: true, cancelable: true, view: w,
+        clientX: rect.x + rect.width / 2, clientY: rect.y + rect.height / 2, button: 0 };
+      if (w.PointerEvent) el.dispatchEvent(new w.PointerEvent('pointerdown', opts));
+      el.dispatchEvent(new w.MouseEvent('mousedown', opts));
+      if (w.PointerEvent) el.dispatchEvent(new w.PointerEvent('pointerup', opts));
+      el.dispatchEvent(new w.MouseEvent('mouseup', opts));
+      el.dispatchEvent(new w.MouseEvent('click', opts));
+    }
+    function setText(input, value) {
+      var inputWindow = input.ownerDocument.defaultView;
+      var proto = input.tagName === 'TEXTAREA'
+        ? inputWindow.HTMLTextAreaElement.prototype
+        : inputWindow.HTMLInputElement.prototype;
+      var setter = Object.getOwnPropertyDescriptor(proto, 'value')?.set;
+      if (setter) setter.call(input, value); else input.value = value;
+      input.dispatchEvent(new inputWindow.Event('input', { bubbles: true }));
+      input.dispatchEvent(new inputWindow.Event('change', { bubbles: true }));
+    }
+    function findDialog() {
+      var containers = Array.from(d.querySelectorAll('[class*="permissionRequestContainer"]'));
+      return containers.find(function(el) { return el.offsetParent !== null; })
+        || Array.from(d.querySelectorAll('[role="dialog"]')).find(function(el) { return el.offsetParent !== null; })
+        || null;
+    }
+    var dlg = findDialog();
+    if (!dlg) return 'no-dialog';
+    function rowId(row, index) {
+      var panel = row.closest('[role="tabpanel"], [data-question-id], [class*="questionContainer"], [class*="questionContent"]');
+      var labelledBy = panel && panel.getAttribute('aria-labelledby');
+      var css = d.defaultView.CSS || CSS;
+      var tab = labelledBy ? dlg.querySelector('#' + css.escape(labelledBy)) : null;
+      if (!tab && panel && panel.id) {
+        tab = Array.from(dlg.querySelectorAll('[role="tab"]')).find(function(candidate) {
+          return candidate.getAttribute('aria-controls') === panel.id;
+        }) || null;
+      }
+      var qid = slug((tab && (tab.getAttribute('data-value') || tab.id || text(tab)))
+        || (panel && (panel.getAttribute('data-question-id') || panel.id || labelledBy)) || 'question_1', 'question_1');
+      var labelEl = row.querySelector('[class*="optionLabel"]');
+      return qid + '__' + slug(text(labelEl) || firstLine(row), 'option_' + index);
+    }
+    for (var ai = 0; ai < answers.length; ai++) {
+      var answer = answers[ai] || {};
+      var qid = String(answer.question_id || '');
+      var tab = Array.from(dlg.querySelectorAll('[role="tab"]')).find(function(candidate) {
+        return slug(candidate.id || candidate.getAttribute('data-value') || text(candidate), '') === qid;
+      });
+      if (tab && tab.getAttribute('aria-selected') !== 'true') {
+        press(tab);
+        await new Promise(function(resolve) { setTimeout(resolve, 100); });
+        dlg = findDialog() || dlg;
+      }
+      var selected = Array.isArray(answer.choice_ids) ? answer.choice_ids : [];
+      for (var ci = 0; ci < selected.length; ci++) {
+        var wanted = selected[ci];
+        var rows = Array.from(dlg.querySelectorAll('[role="radio"], [role="checkbox"], [role="option"]'));
+        var row = rows.find(function(candidate, index) { return rowId(candidate, index) === wanted; });
+        if (!row) return 'no-match:' + wanted;
+        var checked = row.getAttribute('aria-checked') === 'true' || row.getAttribute('aria-selected') === 'true';
+        if (!checked) press(row);
+        var localId = String(wanted).split('__').pop();
+        if (answer.other_text && (/^other(?:_|$)/i.test(localId) || row.querySelector('input[type="text"], textarea'))) {
+          await new Promise(function(resolve) { setTimeout(resolve, 75); });
+          var input = row.querySelector('input[type="text"], textarea')
+            || dlg.querySelector('input[type="text"]:not([disabled]), textarea:not([disabled])');
+          if (!input) return 'no-other-input:' + wanted;
+          setText(input, String(answer.other_text).substring(0, 2000));
+        }
+      }
+    }
+    await new Promise(function(resolve) { setTimeout(resolve, 150); });
+    var submit = Array.from(dlg.querySelectorAll('button')).find(function(button) {
+      return /submit/i.test(text(button)) && !button.disabled && button.getAttribute('aria-disabled') !== 'true';
+    });
+    if (!submit) return 'submit-disabled';
+    press(submit);
     return 'clicked';
   `;
 }
@@ -11059,7 +12589,9 @@ async function detectSessionErrorPrompt(Runtime, agentType) {
         var root = roots[0] || null;
         if (!root) {
           var titleNode = Array.from(d.querySelectorAll('div, span, p, h1, h2, h3')).filter(function(el) {
-            return isVisible(el) && /^Our systems are thinking a bit more about this request before responding[.!â€¦]?$/i.test(norm(el.innerText || el.textContent));
+            // encoding-input-only: accept the historical corrupted ellipsis
+            // emitted by older native builds without ever echoing it to UI.
+            return isVisible(el) && /^Our systems are thinking a bit more about this request before responding(?:[.!]|\u00e2\u20ac\u00a6)?$/i.test(norm(el.innerText || el.textContent));
           }).sort(function(a, b) {
             return norm(a.textContent).length - norm(b.textContent).length;
           })[0];
@@ -11503,14 +13035,86 @@ async function respondToSessionErrorPrompt(Runtime, agentType, actionId, session
   }
 }
 
-// Clicks the button matching choiceId in the active permission dialog.
+function _buildClaudePermissionInstructionExpr(instruction) {
+  return `
+    var dlg = null;
+    var roots = d.querySelectorAll('[class*="permissionRequestContainer"]');
+    for (var ri = 0; ri < roots.length; ri++) {
+      if (roots[ri].offsetParent !== null && roots[ri].querySelectorAll('button').length >= 1) {
+        dlg = roots[ri];
+        break;
+      }
+    }
+    if (!dlg) return 'no-dialog';
+    var editor = dlg.querySelector(
+      '[class*="rejectMessageInput"] [contenteditable="plaintext-only"], '
+      + '[class*="rejectMessageInput"] [contenteditable="true"], '
+      + '[class*="rejectMessageInput"] textarea, '
+      + '[class*="rejectMessageInput"] input'
+    );
+    if (!editor || editor.offsetParent === null) return 'instruction-input-not-found';
+    var value = ${JSON.stringify(instruction)};
+    if (!value || !value.trim()) return 'instruction-empty';
+    if (typeof editor.focus === 'function') editor.focus();
+    if ('value' in editor) {
+      var proto = editor.tagName === 'TEXTAREA' ? HTMLTextAreaElement.prototype : HTMLInputElement.prototype;
+      var setter = Object.getOwnPropertyDescriptor(proto, 'value').set;
+      setter.call(editor, value);
+    } else {
+      editor.textContent = value;
+    }
+    var w = d.defaultView || window;
+    var inputEvent;
+    try {
+      inputEvent = new w.InputEvent('input', {
+        bubbles: true,
+        cancelable: false,
+        data: value,
+        inputType: 'insertText'
+      });
+    } catch (_) {
+      inputEvent = new w.Event('input', { bubbles: true });
+    }
+    editor.dispatchEvent(inputEvent);
+    editor.dispatchEvent(new w.Event('change', { bubbles: true }));
+    return new Promise(function(resolve) {
+      w.setTimeout(function() {
+        var keyOptions = {
+          key: 'Enter', code: 'Enter', keyCode: 13, which: 13,
+          bubbles: true, cancelable: true
+        };
+        editor.dispatchEvent(new w.KeyboardEvent('keydown', keyOptions));
+        editor.dispatchEvent(new w.KeyboardEvent('keypress', keyOptions));
+        editor.dispatchEvent(new w.KeyboardEvent('keyup', keyOptions));
+        resolve('submitted-instruction');
+      }, 80);
+    });
+  `;
+}
+
+// Clicks the button matching choiceId in the active permission dialog, or
+// submits Claude Code's native alternate-instruction field.
 // Returns { ok: true } or { ok: false, code, detail }.
-async function respondToPermissionDialog(Runtime, agentType, choiceId, sessionId, cdpClient = null) {
+async function respondToPermissionDialog(Runtime, agentType, choiceId, sessionId, cdpClient = null, response = null) {
   try {
     let r;
     let verifyAntigravityPanel = false;
     let verifyGenericPrompt = false;
-    if (isContinueAgentType(agentType)) {
+    let verifyClaudeInstruction = false;
+    const questionAnswers = Array.isArray(response?.answers) ? response.answers : [];
+    const instruction = String(response?.instruction || '').trim();
+    if (instruction) {
+      if (agentType !== 'claude') {
+        return { ok: false, code: 'instruction_unsupported', detail: 'Alternate permission instructions are only supported by Claude Code' };
+      }
+      r = await evalInFrame(Runtime, _buildClaudePermissionInstructionExpr(instruction), { awaitPromise: true });
+      verifyClaudeInstruction = (r === 'submitted-instruction');
+    } else if (questionAnswers.length > 0) {
+      const usePageEval = agentType === 'codex-desktop';
+      const evalFn = usePageEval ? evalInPage : evalInFrame;
+      r = await evalFn(Runtime, _buildQuestionAnswerExpr(questionAnswers), { awaitPromise: true });
+      verifyGenericPrompt = (r === 'clicked');
+    } else if (isContinueAgentType(agentType)) {
       // Continue uses data-testid for tool calls, while file-change prompts
       // expose visible Accept/Reject controls. Dispatch the full pointer+mouse
       // sequence so React handlers inside the iframe receive the action.
@@ -11648,8 +13252,18 @@ async function respondToPermissionDialog(Runtime, agentType, choiceId, sessionId
         return { ok: false, code: 'click_not_applied', detail: 'Prompt remained visible after click' };
       }
     }
+    if (verifyClaudeInstruction) {
+      await new Promise(resolve => setTimeout(resolve, 350));
+      const followup = await detectPermissionDialog(Runtime, 'claude');
+      if (followup) {
+        console.warn(`[${sessionId}] [perm] Claude alternate instruction did not dismiss the native prompt`);
+        return { ok: false, code: 'instruction_not_applied', detail: 'Prompt remained visible after alternate instruction' };
+      }
+      r = 'clicked';
+    }
     if (r === 'clicked') {
-      console.log(`[${sessionId}] [perm] Clicked choice '${choiceId}'`);
+      if (instruction) console.log(`[${sessionId}] [perm] Submitted alternate instruction`);
+      else console.log(`[${sessionId}] [perm] Clicked choice '${choiceId}'`);
       return { ok: true };
     }
     console.warn(`[${sessionId}] [perm] Click failed: ${r}`);
@@ -11685,12 +13299,16 @@ async function sendMessage(Runtime, agentType, text, sessionId, cdpClient = null
     }
   } else if (agentType === 'cursor') {
     result = await cursorSel.sendCursorMessage(Runtime, cdpClient, text, options);
-  } else if (agentType === 'codex' || agentType === 'codex-desktop') {
-    const usePageEval = agentType === 'codex-desktop';
-    result = await sendCodexPrimary(Runtime, text, usePageEval);
+  } else if (agentType === 'codex-desktop') {
+    // Desktop's ProseMirror/React state only accepts trusted CDP input reliably.
+    // A synthetic DOM click can clear the visible editor without persisting a
+    // native user turn, so never acknowledge delivery until that turn appears.
+    result = await sendCodexDesktopTrustedInput(cdpClient, Runtime, text, sessionId, options);
+  } else if (agentType === 'codex') {
+    result = await sendCodexPrimary(Runtime, text, false);
     if (!result.ok) {
       console.warn(`[${sessionId}] [sel] Codex primary send failed (${result.code}:${result.detail}), trying fallback`);
-      result = await sendCodexFallback(Runtime, text, usePageEval);
+      result = await sendCodexFallback(Runtime, text, false);
     }
   } else if (agentType === 'gemini') {
     result = await sendGeminiPrimary(Runtime, text);
@@ -11735,9 +13353,31 @@ async function sendMessage(Runtime, agentType, text, sessionId, cdpClient = null
 // by clicking the relevant toolbar buttons and selecting the desired option.
 // Operates on page-level DOM (usePageEval=true).
 
-async function setCodexDesktopConfig(Runtime, { model_id, effort, access_mode, speed }, usePageEval = true, InputDomain = null) {
+async function setCodexComposerConfig(Runtime, {
+  model_id,
+  effort,
+  access_mode,
+  permission_profile,
+  speed,
+  confirm_bypass = false,
+}, usePageEval = true, InputDomain = null) {
   const results = {};
   const evalFn = usePageEval ? evalInPage : evalInFrame;
+
+  // VS Code Codex routes composer settings on a blank draft to global
+  // defaults. Only an existing native conversation may be mutated. Codex
+  // Desktop retains its separate page-level/restart-scoped contract.
+  if (!usePageEval && (model_id || effort || access_mode || permission_profile || speed)) {
+    const before = await readCodexConfig(Runtime, false);
+    if (before?.conversation_scoped !== true) {
+      return {
+        ok: false,
+        code: 'conversation_required',
+        detail: 'Send the first message before changing VS Code Codex controls so the update is conversation-scoped.',
+        readback: before,
+      };
+    }
+  }
 
   function codexModelIdToLabel(id) {
     const raw = String(id || '').trim();
@@ -11747,6 +13387,24 @@ async function setCodexDesktopConfig(Runtime, { model_id, effort, access_mode, s
       ? ' ' + match[2].split('-').filter(Boolean).map(part => part.charAt(0).toUpperCase() + part.slice(1)).join(' ')
       : '';
     return `GPT-${match[1]}${suffix}`;
+  }
+
+  async function waitForVisibleMenuState(wantOpen, timeoutMs = 600) {
+    const deadline = Date.now() + timeoutMs;
+    do {
+      const raw = await evalFn(Runtime, `
+        return (function() {
+          function visible(el) {
+            return !!(el && (el.offsetWidth || el.offsetHeight || el.getClientRects().length));
+          }
+          return Array.from(d.querySelectorAll('[role="menuitem"],[role="option"],[role="listitem"]')).filter(visible).length;
+        })();
+      `);
+      const count = Number(raw || 0);
+      if ((wantOpen && count > 0) || (!wantOpen && count === 0)) return true;
+      await new Promise(r => setTimeout(r, 15));
+    } while (Date.now() < deadline);
+    return false;
   }
 
   async function closeMenus() {
@@ -11768,14 +13426,14 @@ async function setCodexDesktopConfig(Runtime, { model_id, effort, access_mode, s
           await InputDomain.dispatchKeyEvent({ type: 'keyUp', key: 'Escape', code: 'Escape' });
         } catch {}
       }
-      await new Promise(r => setTimeout(r, 120));
+      await waitForVisibleMenuState(false, 300);
     } catch {}
   }
 
   async function dispatchCdpClick(coords) {
     if (!InputDomain || !coords || !Number.isFinite(coords.x) || !Number.isFinite(coords.y)) return false;
     await InputDomain.dispatchMouseEvent({ type: 'mousePressed', x: coords.x, y: coords.y, button: 'left', clickCount: 1 });
-    await new Promise(r => setTimeout(r, 60));
+    await new Promise(r => setTimeout(r, 8));
     await InputDomain.dispatchMouseEvent({ type: 'mouseReleased', x: coords.x, y: coords.y, button: 'left', clickCount: 1 });
     return true;
   }
@@ -11807,21 +13465,22 @@ async function setCodexDesktopConfig(Runtime, { model_id, effort, access_mode, s
         function comboPartsFromButton(b) {
           var full = norm(b.innerText || b.textContent || '');
           if (full) {
-            var effort = full.match(/(extra\\s*high|low|medium|high)$/i);
+            var effort = full.match(/(extra\\s*high|low|medium|high|ultra)$/i);
             if (effort) {
               var modelPart = norm(full.slice(0, effort.index));
               return [modelPart, norm(effort[1])].filter(Boolean);
             }
           }
-          var parts = Array.from(b.querySelectorAll('span')).filter(visible).map(function(s) {
+          var parts = Array.from(b.querySelectorAll('span')).map(function(s) {
             return norm(s.innerText || s.textContent);
           }).filter(Boolean);
           return parts.length >= 2 ? parts : (full ? [full] : parts);
         }
         var trigger = btns.slice(-40).find(function(b) {
+          if (b.getAttribute('data-codex-intelligence-trigger') === 'true') return true;
           var parts = comboPartsFromButton(b);
           var hasModel = parts.some(isModelPart);
-          var hasEffort = parts.some(function(p) { return /^(low|medium|high|extra\\s*high)$/i.test(p); });
+          var hasEffort = parts.some(function(p) { return /^(light|low|medium|high|extra\\s*high|ultra)$/i.test(p); });
           return hasModel && hasEffort;
         });
         if (!trigger) return 'no-trigger';
@@ -11837,18 +13496,26 @@ async function setCodexDesktopConfig(Runtime, { model_id, effort, access_mode, s
       try {
         const coords = JSON.parse(triggerClicked);
         await dispatchCdpClick(coords);
-        return { ok: true, detail: 'cdp-clicked', selected: coords.label || null };
+        const opened = await waitForVisibleMenuState(true, 600);
+        return opened
+          ? { ok: true, detail: 'cdp-clicked', selected: coords.label || null }
+          : { ok: false, detail: 'menu-did-not-open' };
       } catch (e) {
         return { ok: false, detail: `cdp-trigger: ${e.message}` };
       }
     }
-    return triggerClicked === 'clicked' ? { ok: true, detail: triggerClicked } : { ok: false, detail: triggerClicked };
+    if (triggerClicked !== 'clicked') return { ok: false, detail: triggerClicked };
+    const opened = await waitForVisibleMenuState(true, 600);
+    return opened ? { ok: true, detail: triggerClicked } : { ok: false, detail: 'menu-did-not-open' };
   }
 
   async function clickVisibleMenuItem(optionText) {
     const optLower = optionText.toLowerCase();
     const optStr = JSON.stringify(optLower);
-    const optClicked = await evalFn(Runtime, `
+    const deadline = Date.now() + 600;
+    let optClicked = 'no-option';
+    do {
+      optClicked = await evalFn(Runtime, `
       return (function() {
         function norm(t) { return String(t || '').replace(/\\s+/g, ' ').trim(); }
         function press(el) {
@@ -11870,7 +13537,7 @@ async function setCodexDesktopConfig(Runtime, { model_id, effort, access_mode, s
           var firstLine = t.split(/\\n|\\r/)[0].trim();
           var firstCompact = firstLine.replace(/^gpt[-\\s.]*/i, '').replace(/[^a-z0-9.]+/g, '');
           return t === target || firstLine === target ||
-            t.indexOf(target + ' ') === 0 ||
+            t.indexOf(target) === 0 ||
             t.replace(/\\s+/g,'') === target.replace(/\\s+/g,'') ||
             firstCompact === targetCompact;
         });
@@ -11882,7 +13549,10 @@ async function setCodexDesktopConfig(Runtime, { model_id, effort, access_mode, s
         press(item);
         return 'clicked';
       })();
-    `);
+      `);
+      if (optClicked !== 'no-option') break;
+      await new Promise(r => setTimeout(r, 15));
+    } while (Date.now() < deadline);
     if (InputDomain && typeof optClicked === 'string' && optClicked.trim().startsWith('{')) {
       try {
         const coords = JSON.parse(optClicked);
@@ -11896,7 +13566,10 @@ async function setCodexDesktopConfig(Runtime, { model_id, effort, access_mode, s
   }
 
   async function clickAnyVisibleModelMenuItem() {
-    const optClicked = await evalFn(Runtime, `
+    const deadline = Date.now() + 600;
+    let optClicked = 'no-model-menuitem';
+    do {
+      optClicked = await evalFn(Runtime, `
       return (function() {
         function norm(t) { return String(t || '').replace(/\\s+/g, ' ').trim(); }
         function press(el) {
@@ -11909,7 +13582,12 @@ async function setCodexDesktopConfig(Runtime, { model_id, effort, access_mode, s
           el.dispatchEvent(new w.MouseEvent('mouseup', opts));
           el.dispatchEvent(new w.MouseEvent('click', opts));
         }
-        var candidates = Array.from(d.querySelectorAll('[role="menuitem"],button'));
+        var candidates = Array.from(d.querySelectorAll('[role="menuitem"],[role="option"]'));
+        if (candidates.length === 0) {
+          candidates = Array.from(d.querySelectorAll('button')).filter(function(button) {
+            return !!button.closest('[role="menu"],[role="listbox"]');
+          });
+        }
         var item = candidates.find(function(el) {
           if (!(el.offsetWidth || el.offsetHeight || el.getClientRects().length)) return false;
           return /^(?:GPT[-\\s.]?)?\\d+(?:\\.\\d+)*/i.test(norm(el.innerText || el.textContent || ''));
@@ -11922,7 +13600,10 @@ async function setCodexDesktopConfig(Runtime, { model_id, effort, access_mode, s
         press(item);
         return 'clicked';
       })();
-    `);
+      `);
+      if (optClicked !== 'no-model-menuitem') break;
+      await new Promise(r => setTimeout(r, 15));
+    } while (Date.now() < deadline);
     if (InputDomain && typeof optClicked === 'string' && optClicked.trim().startsWith('{')) {
       try {
         const coords = JSON.parse(optClicked);
@@ -11976,7 +13657,6 @@ async function setCodexDesktopConfig(Runtime, { model_id, effort, access_mode, s
     } else
     if (triggerClicked !== 'clicked') return { ok: false, detail: `trigger: ${triggerClicked}` };
 
-    await new Promise(r => setTimeout(r, 350));
     return clickVisibleMenuItem(optionText);
   }
 
@@ -11984,11 +13664,9 @@ async function setCodexDesktopConfig(Runtime, { model_id, effort, access_mode, s
     const label = codexModelIdToLabel(model_id);
     const combinedOpen = await clickOpenCombinedModelMenu();
     if (combinedOpen.ok) {
-      await new Promise(r => setTimeout(r, 350));
       // New Codex Desktop builds put GPT choices behind the current-model submenu.
       const currentModelMenu = await clickAnyVisibleModelMenuItem();
       if (currentModelMenu.ok) {
-        await new Promise(r => setTimeout(r, 250));
         results.model = await clickVisibleMenuItem(label);
       } else {
         results.model = currentModelMenu;
@@ -12004,15 +13682,15 @@ async function setCodexDesktopConfig(Runtime, { model_id, effort, access_mode, s
 
   if (effort) {
     const effortLabel = effort === 'extra-high' ? 'Extra High'
-      : effort.charAt(0).toUpperCase() + effort.slice(1);
+      : ['light', 'low'].includes(effort) ? 'Light'
+        : effort.charAt(0).toUpperCase() + effort.slice(1);
     const combinedOpen = await clickOpenCombinedModelMenu();
     if (combinedOpen.ok) {
-      await new Promise(r => setTimeout(r, 350));
       results.effort = await clickVisibleMenuItem(effortLabel);
       await closeMenus();
     } else {
       results.effort = await clickOption(
-        'function(t){ return /^(low|medium|high|extra\\s*high)$/i.test(t); }',
+        'function(t){ return /^(low|medium|high|extra\\s*high|ultra)$/i.test(t); }',
         effortLabel
       );
     }
@@ -12026,10 +13704,8 @@ async function setCodexDesktopConfig(Runtime, { model_id, effort, access_mode, s
     const speedLabel = speedLabels[String(speed).toLowerCase()] || speed;
     const combinedOpen = await clickOpenCombinedModelMenu();
     if (combinedOpen.ok) {
-      await new Promise(r => setTimeout(r, 350));
       const speedMenu = await clickVisibleMenuItem('Speed');
       if (speedMenu.ok) {
-        await new Promise(r => setTimeout(r, 250));
         results.speed = await clickVisibleMenuItem(speedLabel);
       } else {
         results.speed = speedMenu;
@@ -12051,13 +13727,50 @@ async function setCodexDesktopConfig(Runtime, { model_id, effort, access_mode, s
     };
     const accessLabel = accessLabels[access_mode] || access_mode;
     results.access = await clickOption(
-      'function(t){ return /access|restricted/i.test(t) && !/add|ide|file$/i.test(t) && t.length < 30; }',
+      'function(t){ return ((/access|restricted/i.test(t) && !/add|ide|file$/i.test(t) && t.length < 30) || /^(ask for approval|approve for me|custom(?:\\s*\\(config\\.toml\\))?)$/i.test(t)); }',
       accessLabel
     );
   }
 
+  if (permission_profile) {
+    const profileLabels = {
+      auto: 'Ask for approval',
+      'guardian-approvals': 'Approve for me',
+      'full-access': 'Full access',
+      custom: 'Custom (config.toml)',
+    };
+    const profileLabel = profileLabels[permission_profile];
+    if (!profileLabel) {
+      results.permissions = { ok: false, detail: 'unsupported-permission-profile' };
+    } else if (permission_profile === 'full-access' && confirm_bypass !== true) {
+      results.permissions = { ok: false, detail: 'confirmation-required' };
+    } else {
+      results.permissions = await clickOption(
+        'function(t){ return /^(ask for approval|approve for me|full access|custom(?:\\s*\\(config\\.toml\\))?)$/i.test(t); }',
+        profileLabel
+      );
+      if (results.permissions.ok && permission_profile === 'full-access') {
+        await new Promise(r => setTimeout(r, 30));
+        const readback = await readCodexConfig(Runtime, usePageEval);
+        if (!(readback?.access === 'danger-full-access' && readback?.approval_policy === 'never')) {
+          const confirmed = await clickVisibleMenuItem('Turn on full access');
+          results.permissions.confirmation = confirmed;
+          if (!confirmed.ok) {
+            results.permissions = { ...results.permissions, ok: false, detail: 'native-confirmation-failed' };
+          }
+        }
+      }
+      await closeMenus();
+    }
+  }
+
+  results.readback = await readCodexConfig(Runtime, usePageEval);
+
   return results;
 }
+
+// Existing Codex Desktop callers retain their distinct restart-scoped contract.
+const setCodexDesktopConfig = setCodexComposerConfig;
 
 // ─── Codex Desktop new thread ─────────────────────────────────────────────────
 //
@@ -12094,11 +13807,20 @@ async function newCodexThread(Runtime, usePageEval) {
 
   // Try to find and click a "New thread" button
   const res = await evalFn(Runtime, `
+    function visible(el) {
+      if (!el || !el.isConnected) return false;
+      var style = getComputedStyle(el);
+      var rect = el.getBoundingClientRect();
+      return style.display !== 'none' && style.visibility !== 'hidden'
+        && style.opacity !== '0' && rect.width > 0 && rect.height > 0;
+    }
+    function controlLabel(el) {
+      var label = (el.getAttribute('aria-label') || el.innerText || el.textContent || '')
+        .replace(/\\s+/g, ' ').trim();
+      return label.replace(/\\s+(?:Ctrl|Alt|Shift|Cmd|Meta)(?:\\+[A-Za-z]+)+$/i, '').trim().toLowerCase();
+    }
     function dispatchPress(el) {
       var w = d.defaultView || window;
-      if (typeof el.focus === 'function') {
-        try { el.focus(); } catch (_) {}
-      }
       var rect = el.getBoundingClientRect();
       var cx = rect.x + rect.width / 2;
       var cy = rect.y + rect.height / 2;
@@ -12113,9 +13835,11 @@ async function newCodexThread(Runtime, usePageEval) {
       el.dispatchEvent(new w.MouseEvent('mouseup', opts));
       el.dispatchEvent(new w.MouseEvent('click', opts));
     }
-    var allEls = Array.from(d.querySelectorAll('button, [role="button"], [role="menuitem"]'));
+    // Historical task rows are role=button divs and may themselves be titled
+    // "New task". Only an actual visible native button may create a draft.
+    var allEls = Array.from(d.querySelectorAll('button')).filter(visible);
     var btn = allEls.find(function(el) {
-      var t = (el.textContent || el.getAttribute('aria-label') || '').trim().toLowerCase();
+      var t = controlLabel(el);
       return t === 'new thread' || t === 'new chat' || t === 'new conversation' || t === 'new task';
     });
     if (btn) { dispatchPress(btn); return 'clicked'; }
@@ -12126,19 +13850,23 @@ async function newCodexThread(Runtime, usePageEval) {
   `);
 
   let attempted = res === 'clicked' || res === 'clicked-aria';
-  // Fallback: keyboard shortcut (Ctrl+Shift+N is common "new thread" action in Codex)
-  try {
-    const { Input } = Runtime._cdp || {};
-    if (Input) {
-      await Input.dispatchKeyEvent({ type: 'keyDown', key: 'Control', code: 'ControlLeft', windowsVirtualKeyCode: 17, nativeVirtualKeyCode: 17 });
-      await Input.dispatchKeyEvent({ type: 'keyDown', key: 'Shift', code: 'ShiftLeft', windowsVirtualKeyCode: 16, nativeVirtualKeyCode: 16 });
-      await Input.dispatchKeyEvent({ type: 'keyDown', key: 'N', code: 'KeyN', windowsVirtualKeyCode: 78, nativeVirtualKeyCode: 78, modifiers: 10 });
-      await Input.dispatchKeyEvent({ type: 'keyUp', key: 'N', code: 'KeyN', windowsVirtualKeyCode: 78, nativeVirtualKeyCode: 78, modifiers: 10 });
-      await Input.dispatchKeyEvent({ type: 'keyUp', key: 'Shift', code: 'ShiftLeft', windowsVirtualKeyCode: 16, nativeVirtualKeyCode: 16, modifiers: 2 });
-      await Input.dispatchKeyEvent({ type: 'keyUp', key: 'Control', code: 'ControlLeft', windowsVirtualKeyCode: 17, nativeVirtualKeyCode: 17 });
-      attempted = true;
-    }
-  } catch {}
+  // Fallback only: dispatching this after a successful native click performs
+  // two new-thread actions. Current Codex Desktop can then land on its empty
+  // home/list surface with no composer, even though the first click succeeded.
+  if (!attempted) {
+    try {
+      const { Input } = Runtime._cdp || {};
+      if (Input) {
+        await Input.dispatchKeyEvent({ type: 'keyDown', key: 'Control', code: 'ControlLeft', windowsVirtualKeyCode: 17, nativeVirtualKeyCode: 17 });
+        await Input.dispatchKeyEvent({ type: 'keyDown', key: 'Shift', code: 'ShiftLeft', windowsVirtualKeyCode: 16, nativeVirtualKeyCode: 16 });
+        await Input.dispatchKeyEvent({ type: 'keyDown', key: 'N', code: 'KeyN', windowsVirtualKeyCode: 78, nativeVirtualKeyCode: 78, modifiers: 10 });
+        await Input.dispatchKeyEvent({ type: 'keyUp', key: 'N', code: 'KeyN', windowsVirtualKeyCode: 78, nativeVirtualKeyCode: 78, modifiers: 10 });
+        await Input.dispatchKeyEvent({ type: 'keyUp', key: 'Shift', code: 'ShiftLeft', windowsVirtualKeyCode: 16, nativeVirtualKeyCode: 16, modifiers: 2 });
+        await Input.dispatchKeyEvent({ type: 'keyUp', key: 'Control', code: 'ControlLeft', windowsVirtualKeyCode: 17, nativeVirtualKeyCode: 17 });
+        attempted = true;
+      }
+    } catch {}
+  }
 
   if (!attempted) return false;
 
@@ -12159,16 +13887,6 @@ async function newCodexThread(Runtime, usePageEval) {
           blankComposer: (function() {
             var input = d.querySelector('.ProseMirror, [contenteditable="true"]');
             if (!input || d.querySelector('[data-content-search-turn-key], [data-turn-key], [data-testid="user-message"], [data-testid="assistant-message"]')) return false;
-            if ((input.innerText || input.textContent || '').trim()) {
-              input.focus();
-              var selection = (d.defaultView || window).getSelection();
-              var range = d.createRange();
-              range.selectNodeContents(input);
-              selection.removeAllRanges();
-              selection.addRange(range);
-              d.execCommand('delete', false, null);
-              input.dispatchEvent(new InputEvent('input', { bubbles: true, inputType: 'deleteContentBackward', data: null }));
-            }
             return !(input.innerText || input.textContent || '').trim();
           })()
         })
@@ -12477,9 +14195,6 @@ async function switchCodexThread(Runtime, threadId, usePageEval) {
       (function() {
         function dispatchPress(el) {
           var w = d.defaultView || window;
-          if (typeof el.focus === 'function') {
-            try { el.focus(); } catch (_) {}
-          }
           var rect = el.getBoundingClientRect();
           var cx = rect.x + rect.width / 2;
           var cy = rect.y + rect.height / 2;
@@ -14351,6 +16066,13 @@ async function closeSessionTab(Runtime, opts) {
 }
 
 module.exports = {
+  // Structured Claude AskUserQuestion fixtures/validators.
+  CODEX_DESKTOP_QUESTION_EXPR,
+  CODEX_VSCODE_QUESTION_EXPR,
+  PERMISSION_DIALOG_EXPR,
+  _claudeTerminalBlockFromParts,
+  _buildQuestionAnswerExpr,
+  _buildClaudePermissionInstructionExpr,
   detectAgentType,
   detectThinking,
   readMessages,
@@ -14361,10 +16083,19 @@ module.exports = {
   setAntigravityMode,
   interruptAgent,
   detectPermissionDialog,
+  detectCodexDesktopQuestion,
+  detectCodexVsCodeQuestion,
+  detectCodexVsCodeQuestionReceipt,
   detectSessionErrorPrompt,
   respondToPermissionDialog,
+  respondToCodexDesktopQuestion,
+  respondToCodexVsCodeQuestion,
+  codexVsCodeQuestionFollowupState,
+  codexVsCodeQuestionNativeAction,
+  readCodexVsCodeConversationId,
   respondToSessionErrorPrompt,
   sendMessage,
+  sendCodexDesktopTrustedInput,
   steerCodexInput,
   getSelectorFailures,
   getCodexReadCacheStats,
@@ -14394,6 +16125,7 @@ module.exports = {
   detectAntigravityPanelHasContent,
   readAntigravityV2ActiveConversation,
   readAntigravityV2ChatList,
+  _buildAntigravityV2WorkedForEnvelope,
   switchAntigravityV2Chat,
   newAntigravityV2Conversation,
   readCodexRateLimit,
@@ -14403,6 +16135,7 @@ module.exports = {
   refreshAntigravityModelQuota,
   readCodexNativeQueue,
   readCodexTaskList,
+  setCodexComposerConfig,
   setCodexDesktopConfig,
   newCodexThread,
   // Epic 2 — Thread history
@@ -14453,4 +16186,5 @@ module.exports = {
   detectContinuePermissionDialogFromWorkbench,
   evalInWorkbenchWebview,
   expandCodexMessagesRaw,
+  canonicalizeClaudeMessageBlocks,
 };

@@ -5,15 +5,87 @@ import { getLang, isTextFile, sessionLabel } from './file-utils.js';
 import { MarkdownContent } from './markdown.js';
 import { shouldRefreshNativeCliPlaceholder, useRelay } from './hooks.jsx';
 import {
+  resolveSessionChatTitle,
+  resolveSessionChatTitleProjection,
+  retainStrongerSessionChatTitleProjection,
+} from './session-title.js';
+import { partitionPinnedSessions } from './session-pins.js';
+import {
+  formatAbsoluteMessageTime,
+  formatVisibleMessageTime,
+  messageInstant,
+  parseMessageInstant,
+} from './message-time.js';
+import {
+  getTranscriptSnapshot,
+  subscribeCachedTranscript,
+} from './transcript-cache.js';
+import {
   DEFAULT_GROUP_ALIASES,
   GROUP_ALIAS_STORAGE_KEY,
+  createSidebarOrderLedger,
+  createSidebarWorkingLedger,
   groupSessionsByDirectory,
   normalizeGroupAliases,
+  partitionSidebarSessionsByWorking,
+  reconcileSidebarOrderLedger,
+  reconcileSidebarWorkingLedger,
+  sessionIsTestSession,
+  sortSidebarOrderLedger,
 } from './workspace-groups.js';
+import {
+  MAX_BROADCAST_CONTENT_CHARS,
+  MAX_BROADCAST_SESSIONS,
+  createBroadcastReceiptState,
+  normalizeBroadcastRequest,
+  sessionSupportsBroadcast,
+} from './broadcast-send-policy.js';
+import { FullTitleDisclosure } from './title-disclosure.jsx';
+import {
+  formatProviderCredits,
+  formatProviderPercent,
+  formatProviderUsageAge,
+  formatProviderUsageReset,
+  normalizeProviderUsage,
+  selectEstimatedCost,
+} from './provider-usage.js';
+import {
+  DEFAULT_ACTIVITY_FRESHNESS_MS,
+  classifyFleetActivity,
+  fleetActivityObservedAtMs,
+  fleetFreshnessLabel,
+  fleetStateIsWorking,
+  fleetStateLabel,
+} from './fleet-activity.js';
+import {
+  downsampleHostResourceSeries,
+  formatHostResourceAge,
+  formatHostResourceBytes,
+  formatHostResourcePercent,
+  formatHostResourceRate,
+  formatHostResourceTimestamp,
+  hostResourceIntervalStats,
+  hostResourceMetricValue,
+  normalizeHostResources,
+  selectHostResourceRange,
+} from './host-resources.js';
+import {
+  claimSemanticNotification,
+  recordSemanticNotificationStage,
+  semanticNotificationAllowed,
+} from './semantic-notifications.js';
+import fleetWorkContextPolicy from '../relay-server/fleet-work-context.js';
+
+const {
+  goalLifecycleSupported,
+  latestUserRequestFromMessages,
+  projectFleetWorkContext,
+} = fleetWorkContextPolicy;
 
 const { useState, useRef, useEffect, useLayoutEffect } = React;
 
 const DRAFT_STORAGE_KEY = 'remote-agent-chat:drafts:v1';
+const SHOW_TEST_SESSIONS_STORAGE_KEY = 'remote-agent-chat:show-test-sessions:v1';
 const DEFAULT_INITIAL_HISTORY_LIMIT = 120;
 const CODEX_INITIAL_HISTORY_LIMIT = 500;
 const CODEX_CLI_INITIAL_HISTORY_LIMIT = 160;
@@ -119,6 +191,8 @@ function stableContentHash(value) {
 function messageIdentityKey(msg, fallbackIndex = 0) {
   if (!msg || typeof msg !== 'object') return `empty:${fallbackIndex}`;
   if (msg._cid) return `cid:${msg._cid}`;
+  if (msg.source_message_id) return `source:${msg.source_message_id}`;
+  if (msg.native_source_id) return `native:${msg.native_source_id}`;
   if (msg.id != null) return `id:${msg.id}`;
   if (msg.server_message_id != null) return `server:${msg.server_message_id}`;
   if (msg.client_msg_id) return `client:${msg.client_msg_id}`;
@@ -131,6 +205,17 @@ function messageIdentityKey(msg, fallbackIndex = 0) {
     msg.ts || '',
     stableContentHash(`${content}\n${blocks}`),
   ].join(':');
+}
+
+function messageContentIdentityHash(msg) {
+  const content = normalizeMessageContent(msg?.content) || contentBlocksFallback(msg?.content_blocks);
+  const blocks = Array.isArray(msg?.content_blocks) ? JSON.stringify(msg.content_blocks) : '';
+  return stableContentHash(`${content}\n${blocks}`);
+}
+
+function topLevelMessageBlockType(msg) {
+  if (msg?.role === 'user') return 'user';
+  return normalizeContentBlocks(msg?.content_blocks)[0]?.type || 'markdown';
 }
 
 function scrollIdentityKeysForMessages(messages) {
@@ -247,13 +332,34 @@ function ContentBlockActions({ actions }) {
   );
 }
 
-function TranscriptDisclosure({ className, summary, children }) {
-  const [open, setOpen] = React.useState(true);
+const TRANSCRIPT_DISCLOSURE_CACHE_LIMIT = 512;
+const transcriptDisclosureState = new Map();
+
+function rememberTranscriptDisclosure(stateKey, open) {
+  if (!stateKey) return;
+  transcriptDisclosureState.delete(stateKey);
+  transcriptDisclosureState.set(stateKey, open);
+  while (transcriptDisclosureState.size > TRANSCRIPT_DISCLOSURE_CACHE_LIMIT) {
+    transcriptDisclosureState.delete(transcriptDisclosureState.keys().next().value);
+  }
+}
+
+function TranscriptDisclosure({ className, summary, children, stateKey = '', defaultOpen = true }) {
+  const [open, setOpen] = React.useState(() => (
+    stateKey && transcriptDisclosureState.has(stateKey)
+      ? transcriptDisclosureState.get(stateKey)
+      : defaultOpen
+  ));
+  const handleToggle = React.useCallback((event) => {
+    const nextOpen = event.currentTarget.open;
+    setOpen(nextOpen);
+    rememberTranscriptDisclosure(stateKey, nextOpen);
+  }, [stateKey]);
   return (
     <details
       className={className}
       open={open}
-      onToggle={(event) => setOpen(event.currentTarget.open)}
+      onToggle={handleToggle}
     >
       <summary>{summary}</summary>
       {children}
@@ -261,10 +367,28 @@ function TranscriptDisclosure({ className, summary, children }) {
   );
 }
 
-function ContentBlocks({ blocks, monospace, autoExpandLongCodeBlocks, onOpenPath, agentType }) {
+function cursorFileChangeSummaryParts(value) {
+  const match = safeString(value).trim().match(/^(Edited\s+\d+\s+files?)(?:\s+(\+\d+))?(?:\s+(-\d+))?$/i);
+  if (!match) return null;
+  return { label: match[1], additions: match[2] || '', deletions: match[3] || '' };
+}
+
+function ContentBlocks({
+  blocks,
+  monospace,
+  autoExpandLongCodeBlocks,
+  onOpenPath,
+  agentType,
+  richContentEager = true,
+  richContentCacheIdentity = '',
+}) {
   const normalized = normalizeContentBlocks(blocks);
   if (normalized.length === 0) return null;
   const isCursor = safeString(agentType).toLowerCase() === 'cursor';
+  const isClaude = safeString(agentType).toLowerCase() === 'claude';
+  const isCodex = safeString(agentType).toLowerCase() === 'codex';
+  const isCodexDesktop = safeString(agentType).toLowerCase() === 'codex-desktop';
+  const isAntigravityV2 = safeString(agentType).toLowerCase() === 'antigravity-v2';
   function blockBody(block) {
     const terminalParts = [
       block.workdir ? `cwd: ${block.workdir}` : null,
@@ -275,6 +399,18 @@ function ContentBlocks({ blocks, monospace, autoExpandLongCodeBlocks, onOpenPath
     ].filter(Boolean);
     if (terminalParts.length) return terminalParts.join('\n\n');
     return normalizeMessageContent(block.content || block.text || block.markdown || '');
+  }
+  function richMarkdown(value, blockIndex) {
+    return (
+      <MarkdownContent
+        content={value}
+        monospace={monospace}
+        autoExpandLongCodeBlocks={autoExpandLongCodeBlocks}
+        onOpenPath={onOpenPath}
+        deferUntilVisible={!richContentEager}
+        cacheIdentity={`${richContentCacheIdentity}:block:${blockIndex}`}
+      />
+    );
   }
   return (
     <div className={`content-blocks${isCursor ? ' content-blocks-cursor' : ''}`}>
@@ -292,6 +428,37 @@ function ContentBlocks({ blocks, monospace, autoExpandLongCodeBlocks, onOpenPath
         if (type === 'thinking') {
           // Cursor "Thought for Ns" chips are header-only; keep them compact like Agents.
           const bodyIsTitleOnly = !body || safeString(body).replace(/\s+/g, ' ').trim() === title;
+          // Codex renders intermediate commentary as ordinary transcript prose. It does not
+          // wrap settled reasoning in the shared labeled disclosure used by other harnesses.
+          if (isCodex) {
+            const nativeThinkingBody = body && !bodyIsTitleOnly
+              ? body
+              : (title && title.toLowerCase() !== 'thinking' ? title : '');
+            return nativeThinkingBody ? (
+              <div key={index} className="content-block content-block-thinking-native">
+                {richMarkdown(nativeThinkingBody, index)}
+              </div>
+            ) : null;
+          }
+          // Codex Desktop exposes settled reasoning as a flat "Worked for ..."
+          // row followed by ordinary transcript blocks. The parser preserves
+          // that native split, so a title-only thinking block must not become
+          // the shared italic, left-rail card or a fake empty disclosure.
+          if (isCodexDesktop && bodyIsTitleOnly) {
+            return (
+              <div key={index} className="content-block content-block-thinking-codex-desktop">
+                <span>{title || 'Worked'}</span>
+                <span className="content-block-thinking-codex-desktop-chevron" aria-hidden="true">⌄</span>
+              </div>
+            );
+          }
+          if (isCodexDesktop) {
+            return (
+              <TranscriptDisclosure key={index} stateKey={`${richContentCacheIdentity}:disclosure:${index}`} className="content-block content-block-thinking-codex-desktop" summary={title || 'Worked'}>
+                {richMarkdown(body, index)}
+              </TranscriptDisclosure>
+            );
+          }
           if (isCursor && bodyIsTitleOnly) {
             return (
               <div key={index} className="content-block content-block-status-chip thinking" title={title}>
@@ -300,8 +467,8 @@ function ContentBlocks({ blocks, monospace, autoExpandLongCodeBlocks, onOpenPath
             );
           }
           return (
-            <TranscriptDisclosure key={index} className="content-block content-block-thinking" summary={title || 'Thinking'}>
-              {body && !bodyIsTitleOnly && <MarkdownContent content={body} monospace={monospace} autoExpandLongCodeBlocks={autoExpandLongCodeBlocks} onOpenPath={onOpenPath} />}
+            <TranscriptDisclosure key={index} stateKey={`${richContentCacheIdentity}:disclosure:${index}`} className="content-block content-block-thinking" summary={title || 'Thinking'}>
+              {body && !bodyIsTitleOnly && richMarkdown(body, index)}
             </TranscriptDisclosure>
           );
         }
@@ -316,7 +483,7 @@ function ContentBlocks({ blocks, monospace, autoExpandLongCodeBlocks, onOpenPath
             );
           }
           return (
-            <TranscriptDisclosure key={index} className={`content-block content-block-${type === 'tool_result' ? 'tool-result' : 'tool'}`} summary={(
+            <TranscriptDisclosure key={index} stateKey={`${richContentCacheIdentity}:disclosure:${index}`} className={`content-block content-block-${type === 'tool_result' ? 'tool-result' : 'tool'}`} summary={(
               <>
                 <span>{title || (type === 'tool_result' ? 'Tool result' : 'Tool')}</span>
                 {block.status && <span className={`content-block-status ${safeString(block.status).toLowerCase()}`}>{block.status}</span>}
@@ -328,8 +495,54 @@ function ContentBlocks({ blocks, monospace, autoExpandLongCodeBlocks, onOpenPath
           );
         }
         if (type === 'terminal') {
+          if (isClaude) {
+            const titleParts = (title || 'Bash').match(/^(\S+)(?:\s+([\s\S]*))?$/);
+            const toolName = titleParts?.[1] || 'Bash';
+            const toolDescription = titleParts?.[2] || '';
+            const terminalStatus = safeString(block.status || 'running').toLowerCase();
+            return (
+              <div key={index} className="content-block content-block-terminal-claude" role="group" aria-label={title || 'Bash command'}>
+                <div className="content-block-terminal-claude-header">
+                  <span className={`content-block-terminal-claude-dot ${terminalStatus}`} aria-hidden="true" />
+                  <strong>{toolName}</strong>
+                  {toolDescription && <span>{toolDescription}</span>}
+                </div>
+                <div className="content-block-terminal-claude-body">
+                  {block.command && (
+                    <div className="content-block-terminal-claude-row">
+                      <span>IN</span>
+                      <pre>{block.command}</pre>
+                    </div>
+                  )}
+                  {block.stdout && (
+                    <div className="content-block-terminal-claude-row">
+                      <span>OUT</span>
+                      <pre>{block.stdout}</pre>
+                    </div>
+                  )}
+                  {block.stderr && (
+                    <div className="content-block-terminal-claude-row error">
+                      <span>ERR</span>
+                      <pre>{block.stderr}</pre>
+                    </div>
+                  )}
+                </div>
+                <ContentBlockActions actions={block.actions} />
+              </div>
+            );
+          }
+          if (isCodexDesktop) {
+            return (
+              <TranscriptDisclosure key={index} stateKey={`${richContentCacheIdentity}:disclosure:${index}`} className="content-block content-block-terminal-codex-desktop" summary={(
+                <span>Ran commands</span>
+              )}>
+                {body && <pre className="content-block-pre">{body}</pre>}
+                <ContentBlockActions actions={block.actions} />
+              </TranscriptDisclosure>
+            );
+          }
           return (
-            <TranscriptDisclosure key={index} className="content-block content-block-terminal" summary={(
+            <TranscriptDisclosure key={index} stateKey={`${richContentCacheIdentity}:disclosure:${index}`} className="content-block content-block-terminal" summary={(
               <>
                 <span>{title || 'Terminal'}</span>
                 {block.exit_code != null && <span className="content-block-status">exit {block.exit_code}</span>}
@@ -341,13 +554,30 @@ function ContentBlocks({ blocks, monospace, autoExpandLongCodeBlocks, onOpenPath
           );
         }
         if (type === 'file_changes') {
+          const cursorSummary = cursorFileChangeSummaryParts(title);
+          const isCursorSummaryOnly = Boolean(
+            isCursor
+            && cursorSummary
+            && !body
+            && (!Array.isArray(block.files) || block.files.length === 0)
+            && (!Array.isArray(block.actions) || block.actions.length === 0)
+          );
+          if (isCursorSummaryOnly) {
+            return (
+              <div key={index} className="content-block content-block-file-change content-block-file-change-cursor-summary">
+                <span>{cursorSummary.label}</span>
+                {cursorSummary.additions && <span className="content-block-add">{cursorSummary.additions}</span>}
+                {cursorSummary.deletions && <span className="content-block-del">{cursorSummary.deletions}</span>}
+              </div>
+            );
+          }
           const stats = [
             block.files_changed != null ? `${block.files_changed} files` : null,
             block.additions != null ? `+${block.additions}` : null,
             block.deletions != null ? `-${block.deletions}` : null,
           ].filter(Boolean).join(' ');
           return (
-            <TranscriptDisclosure key={index} className="content-block content-block-file-change" summary={(
+            <TranscriptDisclosure key={index} stateKey={`${richContentCacheIdentity}:disclosure:${index}`} className="content-block content-block-file-change" summary={(
               <>
                 <span>{title || 'File changes'}{stats ? ` ${stats}` : ''}</span>
                 {block.status && <span className={`content-block-status ${safeString(block.status).toLowerCase()}`}>{block.status}</span>}
@@ -364,7 +594,7 @@ function ContentBlocks({ blocks, monospace, autoExpandLongCodeBlocks, onOpenPath
                   ))}
                 </div>
               )}
-              {body && <MarkdownContent content={body} monospace={monospace} autoExpandLongCodeBlocks={autoExpandLongCodeBlocks} onOpenPath={onOpenPath} />}
+              {body && richMarkdown(body, index)}
               <ContentBlockActions actions={block.actions} />
             </TranscriptDisclosure>
           );
@@ -373,7 +603,7 @@ function ContentBlocks({ blocks, monospace, autoExpandLongCodeBlocks, onOpenPath
           return (
             <div key={index} className="content-block content-block-artifact">
               <div className="content-block-title">{title || 'Artifact'}</div>
-              {body && <MarkdownContent content={body} monospace={monospace} autoExpandLongCodeBlocks={autoExpandLongCodeBlocks} onOpenPath={onOpenPath} />}
+              {body && richMarkdown(body, index)}
             </div>
           );
         }
@@ -397,7 +627,7 @@ function ContentBlocks({ blocks, monospace, autoExpandLongCodeBlocks, onOpenPath
                   })}
                 </ol>
               )}
-              {body && !tasks.length && <MarkdownContent content={body} monospace={monospace} autoExpandLongCodeBlocks={autoExpandLongCodeBlocks} onOpenPath={onOpenPath} />}
+              {body && !tasks.length && richMarkdown(body, index)}
             </div>
           );
         }
@@ -413,23 +643,41 @@ function ContentBlocks({ blocks, monospace, autoExpandLongCodeBlocks, onOpenPath
           return (
             <div key={index} className={`content-block content-block-notice ${safeString(block.tone || block.status || 'info').toLowerCase()}`}>
               <div className="content-block-title">{title || 'Notice'}</div>
-              {body && <MarkdownContent content={body} monospace={monospace} autoExpandLongCodeBlocks={autoExpandLongCodeBlocks} onOpenPath={onOpenPath} />}
+              {body && richMarkdown(body, index)}
               <ContentBlockActions actions={block.actions} />
             </div>
+          );
+        }
+        if (type === 'error' && isAntigravityV2) {
+          return (
+            <TranscriptDisclosure
+              key={index}
+              stateKey={`${richContentCacheIdentity}:disclosure:${index}`}
+              className="content-block content-block-error content-block-error-antigravity-v2"
+              defaultOpen={false}
+              summary={(
+                <>
+                  <span className="content-block-error-antigravity-v2-label">{title || 'Error'}</span>
+                  {body && <span className="content-block-error-antigravity-v2-message">{body}</span>}
+                </>
+              )}
+            >
+              <ContentBlockActions actions={block.actions} />
+            </TranscriptDisclosure>
           );
         }
         if (type === 'prompt' || type === 'error') {
           return (
             <div key={index} className={`content-block content-block-${type}`}>
               <div className="content-block-title">{title || type}</div>
-              {body && <MarkdownContent content={body} monospace={monospace} autoExpandLongCodeBlocks={autoExpandLongCodeBlocks} onOpenPath={onOpenPath} />}
+              {body && richMarkdown(body, index)}
               <ContentBlockActions actions={block.actions} />
             </div>
           );
         }
         return (
           <div key={index} className="content-block content-block-markdown">
-            <MarkdownContent content={body || title} monospace={monospace} autoExpandLongCodeBlocks={autoExpandLongCodeBlocks} onOpenPath={onOpenPath} />
+            {richMarkdown(body || title, index)}
           </div>
         );
       })}
@@ -446,19 +694,32 @@ function hasSubstantiveLiveText(content) {
   return true;
 }
 
-function formatMessageTimestamp(ts) {
-  if (ts == null) return '';
-  const numeric = Number(ts);
-  if (!Number.isFinite(numeric)) return '';
-  const ms = numeric > 1e12 ? numeric : numeric * 1000;
-  const date = new Date(ms);
-  if (Number.isNaN(date.getTime())) return '';
-  const now = new Date();
-  const sameDay = date.toDateString() === now.toDateString();
-  if (sameDay) {
-    return date.toLocaleTimeString([], { hour: 'numeric', minute: '2-digit' });
+function MessageTimestamp({ message = null, instant = null }) {
+  const parsed = instant == null
+    ? messageInstant(message)
+    : parseMessageInstant(instant);
+  if (!parsed) {
+    return (
+      <span
+        className="message-timestamp message-timestamp-unknown"
+        aria-label="Sent time unknown"
+        title="Sent time unknown"
+      >
+        Time unknown
+      </span>
+    );
   }
-  return date.toLocaleString([], { month: 'short', day: 'numeric', hour: 'numeric', minute: '2-digit' });
+  const absolute = formatAbsoluteMessageTime(parsed);
+  return (
+    <time
+      className="message-timestamp"
+      dateTime={parsed.iso}
+      title={absolute}
+      aria-label={`Sent ${absolute}`}
+    >
+      {formatVisibleMessageTime(parsed)}
+    </time>
+  );
 }
 
 function isUuidLike(value) {
@@ -610,38 +871,6 @@ function parseVSCodeWindowParts(value) {
 
 const IMAGE_TITLE_RE = /\b(?:image|screenshot|screen\s*shot|capture)[\w .()[\]-]*\.(?:png|jpe?g|gif|webp|bmp|svg)(?:\b|[\s._-]*\d{2,}(?:\s*[x\u00d7]\s*\d{2,})?|[\s._-]*[a-z0-9]{3,})/i;
 const ABSOLUTE_PATH_TITLE_RE = /(?:[A-Za-z]:[\\/]|\\\\[^\\/\s]+[\\/]|\/(?:Users|home|mnt|var|tmp|etc|opt|workspace|workspaces)\/)[^\s"'`<>)]{2,}/i;
-const FILE_ACTION_TITLE_RE = /^(?:read|open|view|inspect|check|review|show|load|attach|attached|upload|uploaded|cat|get-content|select-string)\b/i;
-
-function stripTitleAttachmentNoise(value) {
-  return safeString(value)
-    .replace(/!\[[^\]]*\]\(\s*(?:data:image\/[^)]+|\/uploads\/[^)]+|[^)]*\.(?:png|jpe?g|gif|webp|bmp|svg)[^)]*)\)/gi, ' ')
-    .replace(/\[File:\s*[^\]]+\]/gi, ' ')
-    .replace(ABSOLUTE_PATH_TITLE_RE, ' ')
-    .replace(IMAGE_TITLE_RE, ' ')
-    .replace(/\b(?:image|screenshot|screen\s*shot|capture)[\w .()[\]-]*(?:\d{2,}\s*[x\u00d7]\s*\d{2,})\b/gi, ' ')
-    .replace(/\b(?:file|image|screenshot|attached|uploaded|read|open|view|inspect|check|review|show|load|get-content|select-string)\b/gi, ' ')
-    .replace(/[\s:;,.()[\]{}'"`/\\|-]+/g, ' ')
-    .trim();
-}
-
-function isLowSignalChatTitle(value) {
-  const text = safeString(value).trim();
-  if (!text) return false;
-  if (/^!\[[^\]]*\]\(\s*(?:data:image\/|\/uploads\/|[^)]*\.(?:png|jpe?g|gif|webp|bmp|svg))/i.test(text)) return true;
-  if (/^\[File:\s*[^\]]+\]/i.test(text)) return true;
-  if (/^(?:[A-Za-z]:[\\/]|\\\\|\/(?:Users|home|mnt|var|tmp|etc|opt|workspace|workspaces)\/)/i.test(text)) return true;
-
-  const hasImageName = IMAGE_TITLE_RE.test(text);
-  const hasPath = ABSOLUTE_PATH_TITLE_RE.test(text);
-  if (hasImageName && stripTitleAttachmentNoise(text).length < 12) return true;
-  if (hasPath && (FILE_ACTION_TITLE_RE.test(text) || stripTitleAttachmentNoise(text).length < 16)) return true;
-  if (/^(?:image|screenshot|screen\s*shot|capture)\b/i.test(text) && stripTitleAttachmentNoise(text).length < 16) return true;
-  if (/^!\[[^\]]*\]\(\s*data:image\//i.test(text)) return true;
-  if (/^\[File:\s*[^\\\]]+\.(png|jpe?g|gif|webp|bmp|svg)(?:\b|[0-9x×])/i.test(text)) return true;
-  if (/^(image|screenshot)[\w .-]*\.(png|jpe?g|gif|webp|bmp|svg)(?:\b|[0-9x×])/i.test(text)) return true;
-  if (/^(?:[A-Za-z]:\\|\/|\\\\).+\.(png|jpe?g|gif|webp|bmp|svg|md|js|jsx|ts|tsx|json|log|txt)\b/i.test(text)) return true;
-  return false;
-}
 
 const LOW_SIGNAL_WORKSPACE_LABELS = new Set([
   'agent',
@@ -781,13 +1010,6 @@ function workspaceCandidateFromSession(sessionOrId, agentConfig, knownWorkspaces
   return null;
 }
 
-function compactSessionId(value) {
-  const id = safeString(value).trim();
-  if (!id) return '';
-  if (id.length <= 10) return id;
-  return `${id.slice(0, 6)}...${id.slice(-4)}`;
-}
-
 function stripTitleNoise(content) {
   return normalizeMessageContent(content)
     .replace(/!\[[^\]]*\]\((?:data:image\/[^)]+|\/uploads\/[^)]+|[^)]*\.(?:png|jpe?g|gif|webp|bmp|svg))\)/gi, ' ')
@@ -803,48 +1025,12 @@ function stripTitleNoise(content) {
     .trim();
 }
 
-function titleFromMessageContent(content) {
-  const originalText = normalizeMessageContent(content);
-  if (isLowSignalChatTitle(originalText)) return '';
-  const text = stripTitleNoise(content);
-  if (!text || isLowSignalChatTitle(text)) return '';
-  if (/^(thinking|working|tool result|tool:|exit code|wall time)\b/i.test(text)) return '';
-  if (/^(?:read|open|view|inspect|check|review|show|load|attach|attached|uploaded|cat|get-content|select-string|file|image|screenshot|cli)$/i.test(text)) return '';
-  if (/^[^A-Za-z0-9]+$/.test(text)) return '';
-  return text.slice(0, 80).trim();
-}
-
-function titleFromSessionMessages(sessionMessages) {
-  const list = Array.isArray(sessionMessages) ? sessionMessages : [];
-  const sample = list.length > 80
-    ? [...list.slice(0, 40), ...list.slice(-40)]
-    : list;
-  const user = sample.find(msg => msg?.role === 'user' && titleFromMessageContent(msg.content));
-  if (user) return titleFromMessageContent(user.content);
-  const any = sample.find(msg => titleFromMessageContent(msg?.content || contentBlocksFallback(msg?.content_blocks)));
-  return any ? titleFromMessageContent(any.content || contentBlocksFallback(any.content_blocks)) : '';
-}
-
 function sidebarChatTitle(sessionOrId, fallbackId, agentConfig, sessionMessages = []) {
-  const agent = sessionAgent(sessionOrId, agentConfig);
-  if (sessionOrId && typeof sessionOrId === 'object') {
-    const explicit = safeString(
-      sessionOrId.chat_title
-      || sessionOrId.session_title
-      || sessionOrId.title
-      || sessionOrId.display_title
-    ).trim();
-    if (explicit && !isLowSignalChatTitle(explicit)) return explicit;
-
-    const messageTitle = titleFromSessionMessages(sessionMessages);
-    if (messageTitle) return messageTitle;
-    if (explicit) return explicit;
-  }
-  const id = fallbackId || sessionIdOf(sessionOrId);
-  if (typeof id === 'string' && id && !isUuidLike(id) && !/[\\/:]/.test(id) && id.length <= 48) return id;
-  const shortId = compactSessionId(id);
-  if (shortId) return `${agent.name || 'Session'} ${shortId}`;
-  return agent.name || 'Session';
+  return resolveSessionChatTitle(
+    sessionOrId,
+    sessionOrId && typeof sessionOrId === 'object' ? sessionOrId.custom_display_name : '',
+    sessionMessages,
+  );
 }
 
 function workspaceKeyOf(sessionOrId) {
@@ -877,17 +1063,114 @@ function formatPaneSummary(session) {
   ].filter(Boolean).join(' · ');
 }
 
-function sortSessionsForDisplay(sessionList) {
-  return [...(sessionList || [])].sort((left, right) => {
-    const a = typeof left === 'object' ? left : { session_id: left };
-    const b = typeof right === 'object' ? right : { session_id: right };
-    const aPanel = a.agent_type === 'antigravity_panel' ? 1 : 0;
-    const bPanel = b.agent_type === 'antigravity_panel' ? 1 : 0;
-    if (aPanel !== bPanel) return bPanel - aPanel;
-    const aSeen = safeString(a.last_seen_at || '');
-    const bSeen = safeString(b.last_seen_at || '');
-    return bSeen.localeCompare(aSeen);
-  });
+function projectSidebarOrder(groups, snapshot) {
+  const groupPositions = new Map((snapshot?.groupOrder || []).map((key, index) => [key, index]));
+  const sessionPositions = new Map((snapshot?.sessionOrder || []).map((id, index) => [id, index]));
+  return [...(groups || [])].sort((left, right) => (
+    (groupPositions.get(left.key) ?? Number.MAX_SAFE_INTEGER) - (groupPositions.get(right.key) ?? Number.MAX_SAFE_INTEGER)
+  )).map(group => ({
+    ...group,
+    sessions: [...(group.sessions || [])].sort((left, right) => (
+      (sessionPositions.get(sessionIdOf(left)) ?? Number.MAX_SAFE_INTEGER)
+      - (sessionPositions.get(sessionIdOf(right)) ?? Number.MAX_SAFE_INTEGER)
+    )),
+  }));
+}
+
+function harnessLayoutForAgentType(agentType) {
+  if (agentType === 'claude') return 'claude-document';
+  if (agentType === 'codex_cli') return 'codex-terminal';
+  if (agentType === 'cursor') return 'cursor-cards';
+  if (agentType === 'codex-desktop' || agentType === 'codex') return 'codex-thread';
+  return 'unified-flow';
+}
+
+function composerSkinForAgentType(agentType) {
+  if (agentType === 'codex_cli') return 'codex-cli';
+  if (agentType === 'codex' || agentType === 'codex-desktop') return 'codex';
+  if (agentType === 'claude' || agentType === 'claude_cli') return 'claude';
+  if (agentType === 'cursor' || agentType === 'cursor_cli') return 'cursor';
+  return 'default';
+}
+
+function fuzzySessionMatchScore(value, query) {
+  const text = safeString(value).toLowerCase().replace(/\s+/g, ' ').trim();
+  const needle = safeString(query).toLowerCase().replace(/\s+/g, ' ').trim();
+  if (!needle) return 0;
+  const directIndex = text.indexOf(needle);
+  if (directIndex >= 0) return 2000 - Math.min(directIndex, 500) - Math.max(0, text.length - needle.length) * 0.01;
+  let score = 0;
+  let cursor = 0;
+  let previous = -1;
+  for (const char of needle) {
+    if (char === ' ') continue;
+    const index = text.indexOf(char, cursor);
+    if (index < 0) return Number.NEGATIVE_INFINITY;
+    score += previous < 0 ? Math.max(0, 80 - index) : Math.max(1, 24 - (index - previous - 1) * 3);
+    if (index === 0 || /[\s/\\_.:-]/.test(text[index - 1])) score += 35;
+    previous = index;
+    cursor = index + 1;
+  }
+  return score;
+}
+
+function rankQuickSwitcherItems(items, query) {
+  const terms = safeString(query).toLowerCase().trim().split(/\s+/).filter(Boolean);
+  if (terms.length === 0) return [...items];
+  return items.map((item, sidebarIndex) => {
+    const score = terms.reduce((total, term) => {
+      const fields = Array.isArray(item.searchFields) && item.searchFields.length
+        ? item.searchFields
+        : [item.searchText];
+      const next = Math.max(...fields.map(field => fuzzySessionMatchScore(field, term)));
+      return Number.isFinite(total) && Number.isFinite(next) ? total + next : Number.NEGATIVE_INFINITY;
+    }, 0);
+    return { item, sidebarIndex, score };
+  }).filter(row => Number.isFinite(row.score))
+    .sort((left, right) => (
+      Number(!!right.item.working) - Number(!!left.item.working)
+      || right.score - left.score
+      || left.sidebarIndex - right.sidebarIndex
+    ))
+    .map(row => row.item);
+}
+
+function isEditableShortcutTarget(target) {
+  if (!(target instanceof Element)) return false;
+  return !!target.closest('input, textarea, select, [contenteditable="true"], [role="textbox"]');
+}
+
+function countTranscriptArrivalsSince(baseline, current) {
+  if (!baseline || !current || baseline.sessionId !== current.sessionId) return 0;
+  const settled = Math.max(0, Number(current.messageCount || 0) - Number(baseline.messageCount || 0));
+  const provisionalChanged = !!current.provisionalId && (
+    current.provisionalId !== baseline.provisionalId
+    || Number(current.provisionalLength || 0) > Number(baseline.provisionalLength || 0)
+  );
+  return settled + (provisionalChanged && settled === 0 ? 1 : 0);
+}
+
+function useStableSidebarGroups(groups, rankOptions, freezeStructure = false) {
+  const [ledger, setLedger] = React.useState(() => createSidebarOrderLedger(groups, rankOptions));
+  const projection = React.useMemo(() => reconcileSidebarOrderLedger(ledger, groups, {
+    ...rankOptions,
+    freezeStructure,
+  }), [ledger, groups, rankOptions, freezeStructure]);
+
+  React.useEffect(() => {
+    if (projection.ledger !== ledger) setLedger(projection.ledger);
+  }, [ledger, projection]);
+
+  const sortNow = React.useCallback(() => {
+    setLedger(previous => sortSidebarOrderLedger(previous, groups, rankOptions));
+  }, [groups, rankOptions]);
+
+  return {
+    groups: projection.groups,
+    orderChanged: projection.orderChanged,
+    sortNow,
+    revision: projection.ledger.revision,
+  };
 }
 
 function formatVisiblePaneSummary(session) {
@@ -933,6 +1216,63 @@ function agentTypeLabel(agentType) {
   return AGENT_CONFIG[agentType]?.name || agentType;
 }
 
+function usageSnapshotForSession(session, activityOverride = null) {
+  if (!session || typeof session !== 'object') {
+    return { hasSignal: false, percentUsed: null, remainingPercent: null, state: 'unknown', resetAt: null, quotaModels: [] };
+  }
+  const usage = activityOverride?.usage || session.activity?.usage || null;
+  const quotaModels = Array.isArray(session.antigravity_quota_models)
+    ? session.antigravity_quota_models
+      .map(entry => ({
+        model: safeString(entry?.model),
+        percent_used: Number.isFinite(Number(entry?.percent_used))
+          ? Math.max(0, Math.min(100, Number(entry.percent_used)))
+          : null,
+        refreshes_in: safeString(entry?.refreshes_in || entry?.resets_at),
+      }))
+      .filter(entry => entry.model && entry.percent_used != null)
+    : [];
+  const directPercent = [usage?.percent_used, session.percent_used]
+    .map(value => Number(value))
+    .find(Number.isFinite);
+  const quotaPercent = quotaModels.length > 0
+    ? Math.max(...quotaModels.map(entry => entry.percent_used))
+    : null;
+  const percentUsed = Number.isFinite(directPercent)
+    ? Math.max(0, Math.min(100, directPercent))
+    : quotaPercent;
+  const exhausted = !!session.rate_limit_active
+    || usage?.state === 'exhausted'
+    || usage?.rate_limited === true;
+  const state = exhausted ? 'exhausted'
+    : percentUsed != null && percentUsed >= 90 ? 'critical'
+      : percentUsed != null && percentUsed >= 80 ? 'warning'
+        : percentUsed != null ? 'ok'
+          : 'unknown';
+  const resetAt = safeString(
+    usage?.resets_at
+      || session.rate_limited_until
+      || quotaModels.find(entry => entry.refreshes_in)?.refreshes_in,
+  );
+  return {
+    hasSignal: exhausted || percentUsed != null || !!resetAt,
+    percentUsed,
+    remainingPercent: percentUsed == null ? null : Math.max(0, 100 - Math.round(percentUsed)),
+    state,
+    resetAt: resetAt && resetAt !== 'unknown' ? resetAt : null,
+    quotaModels,
+  };
+}
+
+function formatUsageResetLabel(value) {
+  const raw = safeString(value).trim();
+  if (!raw) return '';
+  if (!/^\d{4}-\d{2}-\d{2}T/.test(raw)) return raw;
+  const date = new Date(raw);
+  if (Number.isNaN(date.getTime())) return raw;
+  return date.toLocaleString([], { weekday: 'short', hour: 'numeric', minute: '2-digit' });
+}
+
 function sessionHostLabel(session) {
   if (!session || typeof session !== 'object') return '';
   return safeString(session.host_label || (
@@ -959,32 +1299,53 @@ const ACTIVITY_META = {
   working:        { icon: '•', tone: 'info' },
 };
 
+function NativeActivitySpinner({ agentType, compact = false, animate = true }) {
+  const type = String(agentType || 'default').toLowerCase();
+  const staticClass = animate ? '' : ' static';
+  if (type === 'claude' || type === 'claude_cli') {
+    return (
+      <span className={`native-activity-spinner claude${compact ? ' compact' : ''}${staticClass}`}>
+        {animate ? <ClaudeSpinner /> : <span className="claude-spinner-icon">{SPINNER_SYMBOLS[0]}</span>}
+      </span>
+    );
+  }
+  if (type === 'codex' || type === 'codex-desktop' || type === 'codex_cli') {
+    return <span className={`native-activity-spinner codex${compact ? ' compact' : ''}${staticClass}`} aria-label="Working">◌</span>;
+  }
+  if (type === 'cursor') {
+    return <span className={`native-activity-spinner cursor${compact ? ' compact' : ''}${staticClass}`} aria-label="Generating"><i /><i /><i /></span>;
+  }
+  return <span className={`native-activity-spinner generic${compact ? ' compact' : ''}${staticClass}`}><i /></span>;
+}
+
 // ─── DeliveryStatus ───────────────────────────────────────────────────────────
 // Shows the send lifecycle state for a user message bubble.
 //   _optimistic + queued   → pulsing dots (in-flight)
 //   _optimistic + accepted → ✓ (relay stored it)
+//   launch_accepted        → ↗ (native dispatch started; receipt pending)
 //   _optimistic + failed   → ✗ with error label
-//   delivered/_delivered   → ✓✓ (proxy injection or authoritative echo confirmed)
-//   agent_started          → ▶ (native activity observed after injection)
-//   (historical)           → ✓
+//   delivered/_delivered   → ✓✓ (exact native user turn observed)
+//   agent_started          → ▶ (later native activity observed for that turn)
+//   (historical without receipt provenance) → Recorded
 
 function DeliveryStatus({ msg, deliveryStates, onSteer, onRetry }) {
   if (msg._optimistic) {
     const status = deliveryStates[msg._cid] || 'queued';
-    if (status === 'offline_queued') return <span className="delivery offline-queued" title="Queued until relay reconnects">offline</span>;
-    if (status === 'queued')   return <span className="delivery queued"   title="Sending…">···</span>;
+    if (status === 'offline_queued') return <span className="delivery offline-queued" title="Queued until relay reconnects" aria-label="Queued offline">offline</span>;
+    if (status === 'queued')   return <span className="delivery queued" title="Sending…" aria-label="Sending to relay">···</span>;
     if (status === 'busy_queued') return (
-      <span className="delivery busy-queued" title="Agent is busy — message queued">
+      <span className="delivery busy-queued" title="Agent is busy — message queued" aria-label="Queued while agent is busy">
         <span className="queued-label">queued</span>
         {onSteer && <button className="steer-btn" onClick={(e) => { e.stopPropagation(); onSteer(msg._cid, msg.content); }} title="Inject into agent's context now">Steer ▸</button>}
       </span>
     );
-    if (status === 'steered')  return <span className="delivery steered"  title="Injected into agent context">⤳</span>;
-    if (status === 'accepted') return <span className="delivery accepted" title="Received by relay">✓</span>;
-    if (status === 'delivered') return <span className="delivery delivered" title="Delivered to agent">✓✓</span>;
-    if (status === 'agent_started') return <span className="delivery agent-started" title="Agent started working">▶</span>;
+    if (status === 'steered') return <span className="delivery steered" title="Injected into agent context" aria-label="Steered into agent context">⤳</span>;
+    if (status === 'accepted') return <span className="delivery accepted" title="Received by relay" aria-label="Relay accepted; native receipt pending">✓</span>;
+    if (status === 'launch_accepted') return <span className="delivery launch-accepted" title="Native launch accepted; user-turn receipt pending" aria-label="Native launch accepted; user-turn receipt pending">↗</span>;
+    if (status === 'delivered') return <span className="delivery delivered" title="Native user turn observed" aria-label="Native user turn delivered">✓✓</span>;
+    if (status === 'agent_started') return <span className="delivery agent-started" title="Agent started working" aria-label="Agent started working">▶</span>;
     if (status === 'failed') return (
-      <span className="delivery failed" title={msg._sendError || "Failed — agent may be offline"}>
+      <span className="delivery failed" title={msg._sendError || "Failed — agent may be offline"} aria-label={`Send failed: ${msg._sendError || 'agent may be offline'}`}>
         <span aria-hidden="true">✕</span>
         {onRetry && (
           <button type="button" className="delivery-retry" onClick={(event) => { event.stopPropagation(); onRetry(msg); }}>
@@ -994,9 +1355,97 @@ function DeliveryStatus({ msg, deliveryStates, onSteer, onRetry }) {
       </span>
     );
   }
-  if (msg._agentStarted) return <span className="delivery agent-started" title="Agent started working">▶</span>;
-  if (msg._delivered) return <span className="delivery delivered" title="Delivered to agent">✓✓</span>;
-  return <span className="delivery delivered" title="Sent">✓</span>;
+  if (msg._agentStarted || msg.status === 'agent_started') return <span className="delivery agent-started" title="Agent started working" aria-label="Agent started working">▶</span>;
+  if (msg._delivered || msg.status === 'delivered') return <span className="delivery delivered" title="Native user turn observed" aria-label="Native user turn delivered">✓✓</span>;
+  if (msg.status === 'failed') return <span className="delivery failed" title={msg.failure_code || 'Send failed'} aria-label={`Send failed: ${msg.failure_code || 'unknown failure'}`}>✕</span>;
+  if (msg._launchAcceptedAt || msg.launch_accepted_at) return <span className="delivery launch-accepted" title="Native launch accepted; user-turn receipt pending" aria-label="Native launch accepted; user-turn receipt pending">↗</span>;
+  if (msg.status === 'accepted') return <span className="delivery accepted" title="Received by relay; native receipt pending" aria-label="Relay accepted; native receipt pending">✓</span>;
+  return <span className="delivery recorded" title="Recorded — native delivery receipt unknown" aria-label="Recorded; native delivery receipt unknown">Recorded</span>;
+}
+
+function useStableWorkingSessions(sessions, freezeStructure = false) {
+  const [ledger, setLedger] = React.useState(() => createSidebarWorkingLedger(sessions));
+  const projection = React.useMemo(
+    () => reconcileSidebarWorkingLedger(ledger, sessions, { freezeStructure }),
+    [ledger, sessions, freezeStructure],
+  );
+
+  React.useEffect(() => {
+    if (projection.ledger !== ledger) setLedger(projection.ledger);
+  }, [ledger, projection]);
+
+  return {
+    sessions: projection.sessions,
+    revision: projection.ledger.revision,
+    deferred: projection.deferred,
+  };
+}
+
+function useSidebarFreshnessClock(activities, sessions) {
+  const [nowMs, setNowMs] = React.useState(Date.now());
+  React.useEffect(() => {
+    const now = Date.now();
+    const activityRows = [
+      ...Object.values(activities || {}),
+      ...(Array.isArray(sessions) ? sessions.map(session => session?.activity) : []),
+    ];
+    const nextDeadline = activityRows.reduce((next, activity) => {
+      const observedAt = fleetActivityObservedAtMs(activity);
+      const deadline = observedAt ? observedAt + DEFAULT_ACTIVITY_FRESHNESS_MS : 0;
+      if (deadline <= now) return next;
+      return next === 0 ? deadline : Math.min(next, deadline);
+    }, 0);
+    if (!nextDeadline) return undefined;
+    const timer = setTimeout(() => setNowMs(Date.now()), Math.max(25, nextDeadline - now + 25));
+    return () => clearTimeout(timer);
+  }, [activities, sessions, nowMs]);
+  return nowMs;
+}
+
+function ProvisionalStreamingBubble({ stream, activeAgent, monospace }) {
+  const textRef = useRef(null);
+  const renderedContentRef = useRef('');
+  useLayoutEffect(() => {
+    const node = textRef.current;
+    if (!node) return;
+    const next = String(stream?.content || '');
+    const previous = renderedContentRef.current;
+    if (next.startsWith(previous)) {
+      const append = next.slice(previous.length);
+      if (append) node.appendChild(document.createTextNode(append));
+    } else {
+      node.textContent = next;
+    }
+    renderedContentRef.current = next;
+  }, [stream?.content]);
+  return (
+    <div
+      className={`message assistant live-draft provisional-stream${monospace ? ' monospace' : ''}`}
+      data-message-id={stream?.messageId || 'awaiting-first-delta'}
+      data-message-role="assistant"
+      data-message-timestamp={parseMessageInstant(stream?.startedAtMs)?.iso || undefined}
+      data-stream-open={stream?.open ? 'true' : 'false'}
+    >
+      <div className="assistant-gutter">
+        <div
+          className="agent-badge transcript-agent-badge"
+          style={{ color: activeAgent.color, borderColor: activeAgent.color + '55', background: activeAgent.color + '18' }}
+        >
+          {activeAgent.logo
+            ? <img src={activeAgent.logo} alt={activeAgent.abbr} className="agent-badge-logo" />
+            : activeAgent.abbr}
+        </div>
+      </div>
+      <div className="assistant-content">
+        <div className="message-role">
+          <span className="message-role-label">{activeAgent.name}</span>
+          <MessageTimestamp instant={stream?.startedAtMs} />
+        </div>
+        <div className="provisional-stream-text" ref={textRef} />
+        {stream?.open && <span className="provisional-stream-caret" aria-label="Streaming response" />}
+      </div>
+    </div>
+  );
 }
 
 // Memoized transcript rows keep live status ticks from repainting Markdown/code blocks.
@@ -1014,29 +1463,46 @@ function TranscriptMessage({
   deliveryState,
   onSteer,
   onRetry,
+  richContentEager,
+  searchMatch = false,
 }) {
   const normalizedContent = normalizeMessageContent(msg.content) || contentBlocksFallback(msg.content_blocks);
   const renderableUserContent = recoverUploadedImageMarkdown(msg.content);
-  const timestampLabel = formatMessageTimestamp(msg.ts);
+  const instant = messageInstant(msg);
   const hasStructuredBlocks = msg.role !== 'user' && normalizeContentBlocks(msg.content_blocks).length > 0;
+  const sourceIdentity = msg.source_message_id || msg.native_source_id || '';
+  const contentIdentityHash = messageContentIdentityHash(msg);
+  const blockType = topLevelMessageBlockType(msg);
   if (msg.role === 'user') {
     const deliveryStatesForMessage = msg._cid ? { [msg._cid]: deliveryState } : {};
     return (
       <div
-        className={`message user transcript-virtual-row${msg._optimistic && deliveryState === 'failed' ? ' failed' : ''}`}
+        className={`message user transcript-virtual-row${msg._optimistic && deliveryState === 'failed' ? ' failed' : ''}${searchMatch ? ' search-match' : ''}`}
         data-message-key={messageKey}
+        data-message-id={msg.id || undefined}
+        data-message-role="user"
+        data-message-block-type={blockType}
+        data-message-content-hash={contentIdentityHash}
+        data-message-source-id={sourceIdentity || undefined}
+        data-message-timestamp={instant?.iso || 'unknown'}
       >
         <div className="user-gutter">
           <div className="user-glyph" />
         </div>
         <div className="user-content">
           <div className="message-role">
-            <span>You</span>
-            {timestampLabel && <span className="message-timestamp">{timestampLabel}</span>}
+            <span className="message-role-label">You</span>
+            <MessageTimestamp message={msg} />
             <DeliveryStatus msg={msg} deliveryStates={deliveryStatesForMessage} onSteer={onSteer} onRetry={onRetry} />
           </div>
           {/!\[[^\]]*\]\((?:data:|\/uploads\/)/.test(renderableUserContent) ? (
-            <div className="user-text"><MarkdownContent content={renderableUserContent} /></div>
+            <div className="user-text">
+              <MarkdownContent
+                content={renderableUserContent}
+                deferUntilVisible={!richContentEager}
+                cacheIdentity={`${messageKey}:user`}
+              />
+            </div>
           ) : (
             <div className="user-text">{normalizedContent}</div>
           )}
@@ -1046,8 +1512,14 @@ function TranscriptMessage({
   }
   return (
     <div
-      className={`message assistant transcript-virtual-row${assistantMonospace ? ' monospace' : ''}`}
+      className={`message assistant transcript-virtual-row${assistantMonospace ? ' monospace' : ''}${searchMatch ? ' search-match' : ''}`}
       data-message-key={messageKey}
+      data-message-id={msg.id || undefined}
+      data-message-role="assistant"
+      data-message-block-type={blockType}
+      data-message-content-hash={contentIdentityHash}
+      data-message-source-id={sourceIdentity || undefined}
+      data-message-timestamp={instant?.iso || 'unknown'}
     >
       <div className="assistant-gutter">
         <div
@@ -1061,8 +1533,8 @@ function TranscriptMessage({
       </div>
       <div className="assistant-content">
         <div className="message-role">
-          <span>{activeAgent.name}</span>
-          {timestampLabel && <span className="message-timestamp">{timestampLabel}</span>}
+          <span className="message-role-label">{activeAgent.name}</span>
+          <MessageTimestamp message={msg} />
         </div>
         {hasStructuredBlocks ? (
           <ContentBlocks
@@ -1071,6 +1543,8 @@ function TranscriptMessage({
             autoExpandLongCodeBlocks={autoExpandLongCodeBlocks}
             onOpenPath={(path) => onOpenPath(messageKey, path)}
             agentType={agentType}
+            richContentEager={richContentEager}
+            richContentCacheIdentity={messageKey}
           />
         ) : (
           <MarkdownContent
@@ -1078,6 +1552,8 @@ function TranscriptMessage({
             monospace={assistantMonospace}
             autoExpandLongCodeBlocks={autoExpandLongCodeBlocks}
             onOpenPath={(path) => onOpenPath(messageKey, path)}
+            deferUntilVisible={!richContentEager}
+            cacheIdentity={`${messageKey}:assistant`}
           />
         )}
         {preview && (
@@ -1111,10 +1587,449 @@ function areTranscriptMessagePropsEqual(prev, next) {
     && transcriptPreviewKey(prev.preview) === transcriptPreviewKey(next.preview)
     && prev.fileContents === next.fileContents
     && prev.deliveryState === next.deliveryState
-    && prev.onRetry === next.onRetry;
+    && prev.onRetry === next.onRetry
+    && prev.richContentEager === next.richContentEager
+    && prev.searchMatch === next.searchMatch;
 }
 
 const MemoTranscriptMessage = React.memo(TranscriptMessage, areTranscriptMessagePropsEqual);
+
+const TRANSCRIPT_WINDOW_THRESHOLD = 100;
+const TRANSCRIPT_WINDOW_OVERSCAN_PX = 1200;
+const TRANSCRIPT_WINDOW_FALLBACK_ROWS = 32;
+
+function estimatedTranscriptRowHeight(message) {
+  const content = normalizeMessageContent(message?.content) || contentBlocksFallback(message?.content_blocks);
+  const lineCount = Math.max(1, safeString(content).split('\n').length);
+  if (message?.role === 'user') return Math.min(180, 40 + Math.max(0, lineCount - 1) * 18);
+  const wrappedLines = Math.ceil(safeString(content).length / 100);
+  const structuredBonus = normalizeContentBlocks(message?.content_blocks).length * 28;
+  return Math.min(420, 68 + Math.max(lineCount, wrappedLines) * 18 + structuredBonus);
+}
+
+function transcriptPrefixIndex(prefix, offset) {
+  let low = 0;
+  let high = Math.max(0, prefix.length - 1);
+  while (low < high) {
+    const middle = Math.floor((low + high) / 2);
+    if (prefix[middle] <= offset) low = middle + 1;
+    else high = middle;
+  }
+  return Math.max(0, low - 1);
+}
+
+function VirtualTranscriptRow({ index, messageKey, onMeasure, children }) {
+  const rowRef = React.useRef(null);
+  React.useLayoutEffect(() => {
+    const node = rowRef.current;
+    if (!node) return undefined;
+    const measure = () => onMeasure(index, messageKey, node.getBoundingClientRect().height);
+    measure();
+    if (typeof ResizeObserver === 'undefined') return undefined;
+    const observer = new ResizeObserver(measure);
+    observer.observe(node);
+    return () => observer.disconnect();
+  }, [index, messageKey, onMeasure]);
+  return <div className="transcript-window-row" data-window-index={index} ref={rowRef}>{children}</div>;
+}
+
+function useTranscriptWindow({ messages, containerRef, sessionId, routeActive }) {
+  const enabled = routeActive && messages.length > TRANSCRIPT_WINDOW_THRESHOLD;
+  const enabledRef = React.useRef(enabled);
+  enabledRef.current = enabled;
+  const heightsRef = React.useRef(new Map());
+  const heightsSessionRef = React.useRef(sessionId);
+  if (heightsSessionRef.current !== sessionId) {
+    heightsRef.current.clear();
+    heightsSessionRef.current = sessionId;
+  }
+  const prefixRef = React.useRef([0]);
+  const viewportAnchorRef = React.useRef(null);
+  const pendingAnchorRestoreRef = React.useRef(null);
+  const anchorReleaseTimerRef = React.useRef(0);
+  const routeRestoreFrameRef = React.useRef(0);
+  const previousWindowRef = React.useRef({ sessionId: null, keys: [], prefix: [0] });
+  const measureFrameRef = React.useRef(0);
+  const scrollFrameRef = React.useRef(0);
+  const pinnedIndexRef = React.useRef(null);
+  const pinnedMessageKeyRef = React.useRef(null);
+  const pinReleaseTimerRef = React.useRef(0);
+  const pendingAnchorDeltaRef = React.useRef(0);
+  const [heightRevision, setHeightRevision] = React.useState(0);
+  const [range, setRange] = React.useState({ sessionId: null, start: 0, end: 0 });
+
+  const keys = React.useMemo(
+    () => messages.map((message, index) => `${sessionId || ''}\u0001${messageIdentityKey(message, index)}`),
+    [messages, sessionId],
+  );
+  const prefix = React.useMemo(() => {
+    const next = new Array(messages.length + 1);
+    next[0] = 0;
+    for (let index = 0; index < messages.length; index += 1) {
+      const measured = heightsRef.current.get(keys[index]);
+      next[index + 1] = next[index] + (measured || estimatedTranscriptRowHeight(messages[index]));
+    }
+    return next;
+  }, [messages, keys, heightRevision]);
+  prefixRef.current = prefix;
+
+  const captureViewportAnchor = React.useCallback(() => {
+    if (pendingAnchorRestoreRef.current) return;
+    const list = containerRef.current;
+    if (!enabled || !list) return;
+    const listRect = list.getBoundingClientRect();
+    const listTop = listRect.top;
+    const rows = Array.from(list.querySelectorAll('.transcript-window-row[data-window-index]'));
+    const anchorRow = rows.find(row => {
+      const rect = row.getBoundingClientRect();
+      return rect.top >= listTop && rect.top < listRect.bottom;
+    }) || rows.find(row => row.getBoundingClientRect().bottom > listTop) || rows[0];
+    if (!anchorRow) return;
+    const index = Number(anchorRow.dataset.windowIndex);
+    if (!Number.isInteger(index) || !keys[index]) return;
+    viewportAnchorRef.current = {
+      sessionId,
+      key: keys[index],
+      viewportOffset: anchorRow.getBoundingClientRect().top - listTop,
+    };
+  }, [containerRef, enabled, keys, sessionId]);
+
+  const releasePinnedIndex = React.useCallback(() => {
+    pinnedIndexRef.current = null;
+    pinnedMessageKeyRef.current = null;
+    if (pinReleaseTimerRef.current) clearTimeout(pinReleaseTimerRef.current);
+    pinReleaseTimerRef.current = 0;
+  }, []);
+
+  const updateRange = React.useCallback(() => {
+    const list = containerRef.current;
+    if (!enabled || !list) return;
+    const pendingAnchor = pendingAnchorRestoreRef.current;
+    if (pendingAnchor?.sessionId === sessionId) {
+      const pendingIndex = keys.indexOf(pendingAnchor.key);
+      if (pendingIndex >= 0) {
+        setRange(previous => (
+          previous.sessionId === sessionId
+            && previous.start === pendingIndex
+            && previous.end === Math.min(messages.length, pendingIndex + TRANSCRIPT_WINDOW_FALLBACK_ROWS)
+            ? previous
+            : {
+                sessionId,
+                start: pendingIndex,
+                end: Math.min(messages.length, pendingIndex + TRANSCRIPT_WINDOW_FALLBACK_ROWS),
+              }
+        ));
+        return;
+      }
+    }
+    captureViewportAnchor();
+    const activePrefix = prefixRef.current;
+    const startOffset = Math.max(0, list.scrollTop - TRANSCRIPT_WINDOW_OVERSCAN_PX);
+    const endOffset = list.scrollTop + list.clientHeight + TRANSCRIPT_WINDOW_OVERSCAN_PX;
+    const rawStart = Math.max(0, transcriptPrefixIndex(activePrefix, startOffset) - 1);
+    const rawEnd = Math.min(messages.length, transcriptPrefixIndex(activePrefix, endOffset) + 2);
+    let start = rawEnd >= messages.length
+      ? Math.max(0, messages.length - TRANSCRIPT_WINDOW_FALLBACK_ROWS)
+      : rawStart;
+    let end = rawEnd;
+    const pinnedKey = pinnedMessageKeyRef.current;
+    const resolvedPinnedIndex = pinnedKey ? keys.indexOf(pinnedKey) : pinnedIndexRef.current;
+    if (resolvedPinnedIndex >= 0) pinnedIndexRef.current = resolvedPinnedIndex;
+    const pinnedIndex = resolvedPinnedIndex;
+    if (Number.isInteger(pinnedIndex) && pinnedIndex >= 0 && pinnedIndex < messages.length) {
+      start = Math.min(start, Math.max(0, pinnedIndex - TRANSCRIPT_WINDOW_FALLBACK_ROWS));
+      end = Math.max(end, Math.min(messages.length, pinnedIndex + TRANSCRIPT_WINDOW_FALLBACK_ROWS + 1));
+    }
+    React.startTransition(() => {
+      setRange(previous => (
+        previous.sessionId === sessionId && previous.start === start && previous.end === end
+          ? previous
+          : { sessionId, start, end }
+      ));
+    });
+  }, [captureViewportAnchor, containerRef, enabled, keys, messages.length, sessionId]);
+
+  React.useLayoutEffect(() => {
+    const previous = previousWindowRef.current;
+    previousWindowRef.current = { sessionId, keys, prefix };
+    if (!enabled || previous.sessionId !== sessionId || !previous.keys.length) {
+      if (!pendingAnchorRestoreRef.current?.routeRestore) {
+        pendingAnchorRestoreRef.current = null;
+      }
+      if (anchorReleaseTimerRef.current) clearTimeout(anchorReleaseTimerRef.current);
+      anchorReleaseTimerRef.current = 0;
+      captureViewportAnchor();
+      return;
+    }
+    const anchor = viewportAnchorRef.current;
+    if (!anchor || anchor.sessionId !== sessionId || !anchor.key) return;
+    const previousIndex = previous.keys.indexOf(anchor.key);
+    const nextIndex = keys.indexOf(anchor.key);
+    if (previousIndex < 0 || nextIndex < 0 || previousIndex === nextIndex) return;
+    const list = containerRef.current;
+    if (!list) return;
+    const previousOffset = previous.prefix[previousIndex] || 0;
+    const nextOffset = prefix[nextIndex] || 0;
+    pendingAnchorRestoreRef.current = {
+      sessionId,
+      key: anchor.key,
+      viewportOffset: anchor.viewportOffset,
+    };
+    pinnedIndexRef.current = nextIndex;
+    pinnedMessageKeyRef.current = anchor.key;
+    if (anchorReleaseTimerRef.current) clearTimeout(anchorReleaseTimerRef.current);
+    anchorReleaseTimerRef.current = setTimeout(() => {
+      pendingAnchorRestoreRef.current = null;
+      anchorReleaseTimerRef.current = 0;
+      releasePinnedIndex();
+      captureViewportAnchor();
+    }, 1500);
+    setRange({
+      sessionId,
+      start: nextIndex,
+      end: Math.min(messages.length, nextIndex + TRANSCRIPT_WINDOW_FALLBACK_ROWS),
+    });
+    setScrollTopInstant(list, Math.max(0, list.scrollTop + nextOffset - previousOffset));
+  }, [captureViewportAnchor, containerRef, enabled, keys, messages.length, prefix, releasePinnedIndex, sessionId]);
+
+  React.useLayoutEffect(() => {
+    const pending = pendingAnchorRestoreRef.current;
+    if (!pending || pending.sessionId !== sessionId) return;
+    const index = keys.indexOf(pending.key);
+    if (index < range.start || index >= range.end) return;
+    const list = containerRef.current;
+    const row = list?.querySelector(`.transcript-window-row[data-window-index="${index}"]`);
+    if (!list || !row) return;
+    if (pending.atBottom) {
+      setScrollTopInstant(list, list.scrollHeight);
+      viewportAnchorRef.current = pending;
+      return;
+    }
+    const currentOffset = row.getBoundingClientRect().top - list.getBoundingClientRect().top;
+    const correction = currentOffset - pending.viewportOffset;
+    if (Math.abs(correction) >= 0.5) {
+      setScrollTopInstant(list, Math.max(0, list.scrollTop + correction));
+    }
+    viewportAnchorRef.current = pending;
+  }, [containerRef, enabled, keys, prefix, range, sessionId]);
+
+  React.useLayoutEffect(() => {
+    const pending = pendingAnchorRestoreRef.current;
+    if (!enabled || !pending?.routeRestore) return;
+    let active = true;
+    const restoreRouteAnchor = () => {
+      if (!active) return;
+      const current = pendingAnchorRestoreRef.current;
+      const list = containerRef.current;
+      if (!current?.routeRestore || current.sessionId !== sessionId || !list) return;
+      const index = keys.indexOf(current.key);
+      const row = index >= 0
+        ? list.querySelector(`.transcript-window-row[data-window-index="${index}"]`)
+        : null;
+      if (row) {
+        if (current.atBottom) {
+          setScrollTopInstant(list, list.scrollHeight);
+        } else {
+          const offset = row.getBoundingClientRect().top - list.getBoundingClientRect().top;
+          const correction = offset - current.viewportOffset;
+          if (Math.abs(correction) >= 0.5) {
+            setScrollTopInstant(list, Math.max(0, list.scrollTop + correction));
+          }
+        }
+      }
+      routeRestoreFrameRef.current = requestAnimationFrame(restoreRouteAnchor);
+    };
+    restoreRouteAnchor();
+    if (anchorReleaseTimerRef.current) clearTimeout(anchorReleaseTimerRef.current);
+    anchorReleaseTimerRef.current = setTimeout(() => {
+      pendingAnchorRestoreRef.current = null;
+      anchorReleaseTimerRef.current = 0;
+      if (routeRestoreFrameRef.current) cancelAnimationFrame(routeRestoreFrameRef.current);
+      routeRestoreFrameRef.current = 0;
+      releasePinnedIndex();
+      captureViewportAnchor();
+    }, 1500);
+    return () => {
+      active = false;
+      if (routeRestoreFrameRef.current) cancelAnimationFrame(routeRestoreFrameRef.current);
+      routeRestoreFrameRef.current = 0;
+    };
+  }, [captureViewportAnchor, containerRef, enabled, keys, releasePinnedIndex, sessionId]);
+
+  React.useLayoutEffect(() => {
+    if (!enabled) {
+      releasePinnedIndex();
+      return undefined;
+    }
+    const list = containerRef.current;
+    if (!list) return undefined;
+    updateRange();
+    const onScroll = () => {
+      captureViewportAnchor();
+      const pinnedKey = pinnedMessageKeyRef.current;
+      const resolvedPinnedIndex = pinnedKey ? keys.indexOf(pinnedKey) : pinnedIndexRef.current;
+      if (resolvedPinnedIndex >= 0) pinnedIndexRef.current = resolvedPinnedIndex;
+      const pinnedIndex = resolvedPinnedIndex;
+      const activePrefix = prefixRef.current;
+      if (Number.isInteger(pinnedIndex) && pinnedIndex >= 0 && pinnedIndex < messages.length) {
+        const pinnedStart = activePrefix[pinnedIndex] || 0;
+        const pinnedEnd = activePrefix[pinnedIndex + 1] || pinnedStart;
+        const viewportStart = list.scrollTop;
+        const viewportEnd = viewportStart + list.clientHeight;
+        if (pinnedEnd < viewportStart - TRANSCRIPT_WINDOW_OVERSCAN_PX
+          || pinnedStart > viewportEnd + TRANSCRIPT_WINDOW_OVERSCAN_PX) {
+          releasePinnedIndex();
+        }
+      }
+      if (scrollFrameRef.current) return;
+      scrollFrameRef.current = requestAnimationFrame(() => {
+        scrollFrameRef.current = 0;
+        updateRange();
+      });
+    };
+    list.addEventListener('scroll', onScroll, { passive: true });
+    return () => {
+      list.removeEventListener('scroll', onScroll);
+      if (scrollFrameRef.current) cancelAnimationFrame(scrollFrameRef.current);
+      scrollFrameRef.current = 0;
+    };
+  }, [captureViewportAnchor, enabled, routeActive, sessionId, keys, messages.length, updateRange, releasePinnedIndex]);
+
+  React.useLayoutEffect(() => {
+    if (!enabled) return;
+    updateRange();
+  }, [enabled, prefix, updateRange]);
+
+  const onMeasure = React.useCallback((index, key, rawHeight) => {
+    if (!enabledRef.current) return;
+    const nextHeight = Math.max(1, Math.ceil(rawHeight));
+    const previousHeight = heightsRef.current.get(key) || estimatedTranscriptRowHeight(messages[index]);
+    if (Math.abs(nextHeight - previousHeight) < 1) return;
+    heightsRef.current.set(key, nextHeight);
+    const list = containerRef.current;
+    const anchorIndex = list ? transcriptPrefixIndex(prefixRef.current, list.scrollTop) : 0;
+    if (index < anchorIndex) pendingAnchorDeltaRef.current += nextHeight - previousHeight;
+    if (measureFrameRef.current) return;
+    measureFrameRef.current = requestAnimationFrame(() => {
+      measureFrameRef.current = 0;
+      if (!enabledRef.current) {
+        pendingAnchorDeltaRef.current = 0;
+        return;
+      }
+      const activeList = containerRef.current;
+      const anchorDelta = pendingAnchorDeltaRef.current;
+      pendingAnchorDeltaRef.current = 0;
+      if (activeList && Math.abs(anchorDelta) >= 1) {
+        setScrollTopInstant(activeList, Math.max(0, activeList.scrollTop + anchorDelta));
+      }
+      setHeightRevision(revision => revision + 1);
+    });
+  }, [containerRef, messages]);
+
+  React.useLayoutEffect(() => {
+    if (enabled || !measureFrameRef.current) return;
+    cancelAnimationFrame(measureFrameRef.current);
+    measureFrameRef.current = 0;
+    pendingAnchorDeltaRef.current = 0;
+  }, [enabled]);
+
+  React.useEffect(() => () => {
+    if (measureFrameRef.current) cancelAnimationFrame(measureFrameRef.current);
+    if (scrollFrameRef.current) cancelAnimationFrame(scrollFrameRef.current);
+    if (pinReleaseTimerRef.current) clearTimeout(pinReleaseTimerRef.current);
+    if (anchorReleaseTimerRef.current) clearTimeout(anchorReleaseTimerRef.current);
+    if (routeRestoreFrameRef.current) cancelAnimationFrame(routeRestoreFrameRef.current);
+  }, []);
+
+  const scrollToIndex = React.useCallback((index, align = 'center') => {
+    const list = containerRef.current;
+    const activePrefix = prefixRef.current;
+    if (!list || index < 0 || index >= messages.length) return false;
+    pinnedIndexRef.current = index;
+    pinnedMessageKeyRef.current = keys[index] || null;
+    if (pinReleaseTimerRef.current) clearTimeout(pinReleaseTimerRef.current);
+    pinReleaseTimerRef.current = setTimeout(() => {
+      releasePinnedIndex();
+    }, 1500);
+    const rowStart = activePrefix[index] || 0;
+    const rowEnd = activePrefix[index + 1] || rowStart;
+    const target = align === 'start'
+      ? rowStart
+      : align === 'end'
+        ? rowEnd - list.clientHeight
+        : rowStart - Math.max(0, (list.clientHeight - (rowEnd - rowStart)) / 2);
+    setScrollTopInstant(list, Math.max(0, target));
+    const start = Math.max(0, index - TRANSCRIPT_WINDOW_FALLBACK_ROWS);
+    const end = Math.min(messages.length, index + TRANSCRIPT_WINDOW_FALLBACK_ROWS + 1);
+    setRange({ sessionId, start, end });
+    return true;
+  }, [containerRef, keys, messages.length, releasePinnedIndex, sessionId]);
+
+  const prepareForPrepend = React.useCallback(() => {
+    captureViewportAnchor();
+    const anchor = viewportAnchorRef.current;
+    if (!anchor || anchor.sessionId !== sessionId) return false;
+    const index = keys.indexOf(anchor.key);
+    if (index < 0) return false;
+    pinnedIndexRef.current = index;
+    pinnedMessageKeyRef.current = anchor.key;
+    return true;
+  }, [captureViewportAnchor, keys, sessionId]);
+
+  const prepareForRouteChange = React.useCallback(() => {
+    const list = containerRef.current;
+    if (!enabled || !list) return false;
+    captureViewportAnchor();
+    const anchor = viewportAnchorRef.current;
+    if (!anchor || anchor.sessionId !== sessionId || !anchor.key) return false;
+    const index = keys.indexOf(anchor.key);
+    if (index < 0) return false;
+    pendingAnchorRestoreRef.current = {
+      ...anchor,
+      routeRestore: true,
+      atBottom: list.scrollHeight - list.scrollTop - list.clientHeight < 80,
+    };
+    pinnedIndexRef.current = index;
+    pinnedMessageKeyRef.current = anchor.key;
+    return true;
+  }, [captureViewportAnchor, containerRef, enabled, keys, sessionId]);
+
+  const cancelRouteRestore = React.useCallback(() => {
+    if (!pendingAnchorRestoreRef.current?.routeRestore) return false;
+    pendingAnchorRestoreRef.current = null;
+    if (anchorReleaseTimerRef.current) clearTimeout(anchorReleaseTimerRef.current);
+    anchorReleaseTimerRef.current = 0;
+    if (routeRestoreFrameRef.current) cancelAnimationFrame(routeRestoreFrameRef.current);
+    routeRestoreFrameRef.current = 0;
+    releasePinnedIndex();
+    captureViewportAnchor();
+    return true;
+  }, [captureViewportAnchor, releasePinnedIndex]);
+
+  let start = 0;
+  let end = messages.length;
+  if (enabled) {
+    if (range.sessionId === sessionId && range.end > range.start) {
+      start = range.start;
+      end = range.end;
+    } else {
+      start = Math.max(0, messages.length - TRANSCRIPT_WINDOW_FALLBACK_ROWS);
+    }
+  }
+  return {
+    enabled,
+    start,
+    end,
+    totalHeight: prefix[prefix.length - 1] || 0,
+    topSpacerHeight: enabled ? prefix[start] || 0 : 0,
+    bottomSpacerHeight: enabled ? (prefix[prefix.length - 1] - (prefix[end] || 0)) : 0,
+    onMeasure,
+    scrollToIndex,
+    prepareForPrepend,
+    prepareForRouteChange,
+    cancelRouteRestore,
+  };
+}
 
 // ─── QueuedItem — queued message with Steer, trash, and ... menu ─────────────
 function QueuedItem({ qm, onSteer, onDiscard, onEdit }) {
@@ -1185,7 +2100,7 @@ function QueuedItem({ qm, onSteer, onDiscard, onEdit }) {
 // Each card shows: colored agent badge, agent name, window label, health dot,
 // and either a thinking spinner or an unread count badge.
 
-function SessionCard({ session, health, unread, isThinking, isActive, agentConfig, activity, sessionMessages, hasBlockingPrompt, blockingPromptLabel, muted, onSelect, onClose, onManage, onAutomations, showAutomationsActive, onSkills, showSkillsActive }) {
+function SessionCard({ session, health, unread, isThinking, isActive, agentConfig, activity, sessionMessages, hasBlockingPrompt, blockingPromptLabel, muted, pinned, workspaceLabel, menuOpen, onMenuToggle, onSelect, onClose, onManage, onPinChange, onAutomations, showAutomationsActive, onSkills, showSkillsActive }) {
   const sessionId = sessionIdOf(session);
   const agent    = sessionAgent(session, agentConfig);
   const winLabel = sessionSubLabel(session, sessionId, agentConfig);
@@ -1199,66 +2114,91 @@ function SessionCard({ session, health, unread, isThinking, isActive, agentConfi
   const quotaSummary = isAntigravitySession ? formatAntigravityQuotaSummary(session?.antigravity_quota_models, 3) : '';
   const activityLabel = isThinking && activity?.label ? activity.label : null;
   const hostLabel = sessionHostLabel(session);
+  const agentContext = workspaceLabel ? `${agent.name} / ${workspaceLabel}` : agent.name;
 
   return (
     <div
-      className={`session-card${isActive ? ' active' : ''}${isHardLimited ? ' rate-limited' : ''}`}
+      className={`session-card${isActive ? ' active' : ''}${isHardLimited ? ' rate-limited' : ''}${pinned ? ' pinned' : ''}`}
+      data-session-id={sessionId}
       onClick={onSelect}
+      onKeyDown={event => {
+        if (event.target !== event.currentTarget || !['Enter', ' '].includes(event.key)) return;
+        event.preventDefault();
+        onSelect();
+      }}
+      tabIndex={0}
+      aria-label={`${chatTitle}. ${winLabel || agent.name}`}
       title={cardTitle || sessionId}
     >
-      <div
-        className="agent-badge"
-        style={{ color: agent.color, borderColor: agent.color + '55', background: agent.color + '18' }}
-      >
-        {agent.logo
-          ? <img src={agent.logo} alt={agent.abbr} className="agent-badge-logo" />
-          : agent.abbr}
+      <div className="session-card-badge-wrap">
+        <div
+          className="agent-badge"
+          style={{ color: agent.color, borderColor: agent.color + '55', background: agent.color + '18' }}
+        >
+          {agent.logo
+            ? <img src={agent.logo} alt={agent.abbr} className="agent-badge-logo" />
+            : agent.abbr}
+        </div>
+        <div className="session-card-health" style={{ background: dotColor }} title={health || 'unknown'} />
+        {muted && <span className="session-card-muted" title="Notifications muted" aria-label="Notifications muted">M</span>}
+        {pinned && <button
+          type="button"
+          className="session-card-pin-toggle"
+          title={`Unpin ${chatTitle}`}
+          aria-label={`Unpin ${chatTitle}`}
+          aria-pressed="true"
+          onClick={event => {
+            event.preventDefault();
+            event.stopPropagation();
+            onPinChange?.(false);
+          }}
+        ><span aria-hidden="true">📌</span></button>}
+        <span className="session-card-attention-slot">
+          {hasBlockingPrompt && <span className="session-card-perm-badge" title={blockingPromptLabel || 'Action required'}>⚠</span>}
+          {!hasBlockingPrompt && isThinking && <span className="session-card-native-status" title={activityLabel || 'Thinking…'}><NativeActivitySpinner agentType={session?.agent_type} compact animate={false} /></span>}
+          {!isThinking && !hasBlockingPrompt && unread > 0 && (
+            <span className="session-card-badge">{unread > 99 ? '99+' : unread}</span>
+          )}
+        </span>
       </div>
       <div className="session-card-body">
-        <div className="session-card-name">{chatTitle}</div>
+        <FullTitleDisclosure
+          title={chatTitle}
+          disclosureKey={sessionId}
+          kind="session"
+          wrapperClassName="session-title-details"
+          triggerClassName="session-card-name"
+          disclosureClassName="session-title-disclosure"
+          triggerLabel={`Show full title: ${chatTitle}`}
+          triggerTag="div"
+        />
         <div className={`session-card-sub${hasBlockingPrompt ? ' perm-active' : ''}`}>
-          {hasBlockingPrompt ? (blockingPromptLabel || 'Action required')
-            : isHardLimited ? `⏳ Rate limited${rateLimitedUntil && rateLimitedUntil !== 'unknown' ? ` · ${rateLimitedUntil}` : ''}`
-            : quotaSummary ? quotaSummary
-            : isAntigravitySession && pctUsed != null ? `📊 ${pctUsed}% used${rateLimitedUntil && rateLimitedUntil !== 'unknown' ? ` · ${rateLimitedUntil}` : ''}`
-            : pctUsed >= 80 ? `📊 ${pctUsed}% used`
-            : activityLabel ? activityLabel
-            : hostLabel ? `${agent.name} · ${hostLabel}`
-            : agent.name}
+          {hasBlockingPrompt ? `${agentContext} · ${blockingPromptLabel || 'Action required'}`
+            : isHardLimited ? `${agentContext} · ⏳ Rate limited${rateLimitedUntil && rateLimitedUntil !== 'unknown' ? ` · ${rateLimitedUntil}` : ''}`
+            : quotaSummary ? `${agentContext} · ${quotaSummary}`
+            : isAntigravitySession && pctUsed != null ? `${agentContext} · 📊 ${pctUsed}% used${rateLimitedUntil && rateLimitedUntil !== 'unknown' ? ` · ${rateLimitedUntil}` : ''}`
+            : pctUsed >= 80 ? `${agentContext} · 📊 ${pctUsed}% used`
+            : activityLabel ? `${agentContext} · ${activityLabel}`
+            : hostLabel ? `${agentContext} · ${hostLabel}`
+            : agentContext}
         </div>
       </div>
       <div className="session-card-right">
-        {muted && <span className="session-card-muted" title="Notifications muted">◌</span>}
-        {hasBlockingPrompt && <div className="session-card-perm-badge" title={blockingPromptLabel || 'Action required'}>⚠</div>}
-        {isThinking  && <div className="session-card-spinner" title={activityLabel || 'Thinking…'} />}
-        {!isThinking && !hasBlockingPrompt && unread > 0 && (
-          <div className="session-card-badge">{unread > 99 ? '99+' : unread}</div>
-        )}
-        {onAutomations && (
-          <button
-            className={`session-card-automations${showAutomationsActive ? ' active' : ''}`}
-            title="Automations"
-            onClick={e => { e.stopPropagation(); onAutomations(); }}
-          >⚡</button>
-        )}
-        {onSkills && (
-          <button
-            className={`session-card-automations${showSkillsActive ? ' active' : ''}`}
-            title="Skills"
-            onClick={e => { e.stopPropagation(); onSkills(); }}
-          >⊞</button>
-        )}
-        <div className="session-card-health" style={{ background: dotColor }} title={health || 'unknown'} />
-        <button
-          className="session-card-manage"
-          title="Manage session"
-          onClick={e => { e.stopPropagation(); onManage && onManage(); }}
-        >⋯</button>
-        <button
-          className="session-card-close"
-          title="Close session"
-          onClick={e => { e.stopPropagation(); onClose && onClose(); }}
-        >✕</button>
+        <details
+          className="session-card-menu"
+          open={menuOpen}
+          onToggle={event => onMenuToggle?.(event.currentTarget.open)}
+          onClick={event => event.stopPropagation()}
+        >
+          <summary className="session-card-manage" title="Session actions" aria-label={`Session actions for ${chatTitle}`}>⋯</summary>
+          <div className="session-card-menu-popover" role="menu" aria-label={`Actions for ${chatTitle}`}>
+            <button role="menuitem" onClick={() => onPinChange?.(!pinned)}>{pinned ? 'Unpin chat' : 'Pin chat'}</button>
+            <button role="menuitem" onClick={() => onManage && onManage()}>Manage session</button>
+            {onAutomations && <button role="menuitem" className={showAutomationsActive ? 'active' : ''} onClick={() => onAutomations()}>Automations</button>}
+            {onSkills && <button role="menuitem" className={showSkillsActive ? 'active' : ''} onClick={() => onSkills()}>Skills</button>}
+            <button role="menuitem" className="danger" onClick={() => onClose && onClose()}>Close session</button>
+          </div>
+        </details>
       </div>
     </div>
   );
@@ -1306,6 +2246,10 @@ function areSessionCardPropsEqual(prev, next) {
     && prev.isActive === next.isActive
     && prev.hasBlockingPrompt === next.hasBlockingPrompt
     && prev.blockingPromptLabel === next.blockingPromptLabel
+    && prev.muted === next.muted
+    && prev.pinned === next.pinned
+    && prev.workspaceLabel === next.workspaceLabel
+    && prev.menuOpen === next.menuOpen
     && prev.showAutomationsActive === next.showAutomationsActive
     && prev.showSkillsActive === next.showSkillsActive
     && sessionCardAgentConfigKey(prev.agentConfig) === sessionCardAgentConfigKey(next.agentConfig)
@@ -1322,10 +2266,36 @@ const SPINNER_SYMBOLS = [...SPINNER_SYMBOLS_FWD, ...[...SPINNER_SYMBOLS_FWD].rev
 
 function ClaudeSpinner() {
   const [frame, setFrame] = React.useState(0);
+  const [reducedMotion, setReducedMotion] = React.useState(() => (
+    typeof window !== 'undefined'
+    && typeof window.matchMedia === 'function'
+    && window.matchMedia('(prefers-reduced-motion: reduce)').matches
+  ));
   React.useEffect(() => {
-    const id = setInterval(() => setFrame(f => (f + 1) % SPINNER_SYMBOLS.length), 120);
-    return () => clearInterval(id);
+    if (typeof window === 'undefined' || typeof window.matchMedia !== 'function') return undefined;
+    const query = window.matchMedia('(prefers-reduced-motion: reduce)');
+    const update = event => setReducedMotion(event.matches);
+    setReducedMotion(query.matches);
+    query.addEventListener?.('change', update);
+    return () => query.removeEventListener?.('change', update);
   }, []);
+  React.useEffect(() => {
+    if (reducedMotion) {
+      setFrame(0);
+      return undefined;
+    }
+    let remaining = SPINNER_SYMBOLS.length * 3;
+    const id = setInterval(() => {
+      remaining -= 1;
+      if (remaining <= 0) {
+        clearInterval(id);
+        setFrame(0);
+        return;
+      }
+      setFrame(f => (f + 1) % SPINNER_SYMBOLS.length);
+    }, 120);
+    return () => clearInterval(id);
+  }, [reducedMotion]);
   return <span className="claude-spinner-icon">{SPINNER_SYMBOLS[frame]}</span>;
 }
 
@@ -1344,89 +2314,128 @@ function formatClockDuration(totalSeconds, { includeSeconds = false } = {}) {
   if (minutes < 60) return includeSeconds ? `${minutes}m ${String(seconds).padStart(2, '0')}s` : `${minutes}m`;
   const hours = Math.floor(minutes / 60);
   const remMinutes = minutes % 60;
-  return `${hours}h ${String(remMinutes).padStart(2, '0')}m`;
+  if (hours >= 24) {
+    const days = Math.floor(hours / 24);
+    return `${days}d ${String(hours % 24).padStart(2, '0')}h ${String(remMinutes).padStart(2, '0')}m${includeSeconds ? ` ${String(seconds).padStart(2, '0')}s` : ''}`;
+  }
+  return `${hours}h ${String(remMinutes).padStart(2, '0')}m${includeSeconds ? ` ${String(seconds).padStart(2, '0')}s` : ''}`;
 }
 
-function formatGoalElapsed(goal, nowMs, activity) {
+function formatGoalElapsed(goal, nowMs) {
   if (!goal) return '';
   const base = Number(goal.time_used_seconds ?? goal.timeUsedSeconds ?? 0) || 0;
   const goalUpdated = goal.updated_at ? new Date(goal.updated_at).getTime() : 0;
-  const taskStarted = activity?.startedAt ? new Date(activity.startedAt).getTime() : 0;
-  const activityIsLive = activity?.kind && activity.kind !== 'idle';
-  const liveAnchor = Math.max(
-    Number.isFinite(goalUpdated) ? goalUpdated : 0,
-    Number.isFinite(taskStarted) ? taskStarted : 0,
-  );
-  const liveDelta = goal.status === 'active' && activityIsLive && liveAnchor > 0
-    ? Math.max(0, Math.floor((nowMs - liveAnchor) / 1000))
+  const liveDelta = (goal.state || goal.status) === 'active' && Number.isFinite(goalUpdated) && goalUpdated > 0
+    ? Math.max(0, Math.floor((nowMs - goalUpdated) / 1000))
     : 0;
-  return formatClockDuration(base + liveDelta);
+  return formatClockDuration(base + liveDelta, { includeSeconds: true });
 }
 
-function ActivityRow({ activity, thinkingText, isClaude, pinned = false, showGoal = true, showStatus = true, showCommand = true }) {
+function ActivityRow({ activity, thinkingText, agentType, pinned = false }) {
   const kind = activity?.kind || 'working';
   const meta = ACTIVITY_META[kind] || ACTIVITY_META.working;
   const goal = activity?.goal || null;
   const isActive = meta.tone === 'thinking' || meta.tone === 'info';
-  const goalActive = goal?.status === 'active';
+  const goalActive = (goal?.state || goal?.status) === 'active';
+  const hasCanonicalChannels = !!(activity?.thinking || activity?.current);
+  const legacyText = String(thinkingText || activity?.thinkingContent || '').trim();
+  const isClaude = agentType === 'claude' || agentType === 'claude_cli';
+  const thinking = activity?.thinking || (!hasCanonicalChannels && (kind === 'thinking' || isClaude)
+    ? { text: legacyText, since: activity?.startedAt || activity?.updatedAt || null }
+    : null);
+  const current = activity?.current || (!hasCanonicalChannels && !thinking && isActive
+    ? {
+        kind: kind === 'running_command' ? 'tool' : 'answer',
+        label: activity?.label || (kind === 'running_command' ? 'Running command' : 'Working'),
+        partial: legacyText,
+        since: activity?.startedAt || activity?.updatedAt || null,
+      }
+    : null);
+  const step = activity?.step || null;
+  const usage = activity?.usage || null;
   const [nowMs, setNowMs] = React.useState(Date.now());
+  const thinkingTimerSource = thinking ? (thinking.since || activity?.startedAt || activity?.updatedAt) : null;
+  const currentTimerSource = current ? (current.since || activity?.startedAt || activity?.updatedAt) : null;
+  const hasTimestamp = value => Boolean(value) && Number.isFinite(new Date(value).getTime());
+  const hasLiveTimerSource = (goalActive && hasTimestamp(goal?.updated_at))
+    || hasTimestamp(thinkingTimerSource)
+    || hasTimestamp(currentTimerSource);
   React.useEffect(() => {
-    if (!isActive || !(activity?.startedAt || activity?.updatedAt)) return undefined;
+    if (!hasLiveTimerSource) return undefined;
     const id = setInterval(() => setNowMs(Date.now()), 1000);
     return () => clearInterval(id);
-  }, [isActive, activity?.startedAt, activity?.updatedAt, goalActive, goal?.updated_at]);
-  const rawLabel = activity?.label ?? '';
-  const baseLabel = rawLabel || (kind === 'idle' && goal ? '' : kind.replaceAll('_', ' '));
-  const elapsed = isActive ? formatActivityElapsed(activity?.startedAt || activity?.updatedAt, nowMs) : '';
+  }, [hasLiveTimerSource, goal?.updated_at, thinkingTimerSource, currentTimerSource]);
   const hint = activity?.interruptHint || activity?.interrupt_hint || '';
-  const labelDetail = [elapsed, hint].filter(Boolean).join(' • ');
-  const label = baseLabel && labelDetail ? `${baseLabel} (${labelDetail})` : baseLabel;
-  const goalElapsed = goal ? formatGoalElapsed(goal, nowMs, activity) : '';
-  const isThinkingKind = kind === 'thinking' || kind === 'generating';
-  const showBlob = isClaude && isThinkingKind;
-  const visibleThinkingText = showBlob ? '' : (thinkingText || activity?.thinkingContent || '').trim();
+  const goalElapsed = goal ? formatGoalElapsed(goal, nowMs) : '';
+  const goalText = String(goal?.text || goal?.objective || '').trim();
+  const thinkingElapsed = thinking ? formatActivityElapsed(thinkingTimerSource, nowMs) : '';
+  const currentElapsed = current ? formatActivityElapsed(currentTimerSource, nowMs) : '';
+  if (!goal && !thinking && !current && !step && !usage) return null;
 
   return (
-    <div className={`activity-row ${meta.tone}${isActive ? ' active' : ''}${showBlob ? ' claude-thinking' : ''}${pinned ? ' pinned' : ''}`}>
-      {!showBlob && (
-        <div className="activity-icon">
-          {isActive
-            ? <div className="activity-spinner" />
-            : meta.icon}
+    <div className={`live-status-stack${pinned ? ' pinned' : ''}`} data-testid="live-status-stack">
+      {current && (
+        <div className={`live-current-status ${current.kind || 'answer'}`} data-live-channel="current">
+          <div className="live-current-tool-heading">
+            {current.kind === 'tool'
+              ? <span className="live-status-icon">▶</span>
+              : <NativeActivitySpinner agentType={agentType} compact />}
+            <span className="live-status-label">{current.label || (current.kind === 'tool' ? 'Running tool' : 'Working')}</span>
+            <span className="live-status-meta">{[currentElapsed, hint].filter(Boolean).join(' · ')}</span>
+          </div>
+          {current.partial && (
+            current.kind === 'tool'
+              ? <pre className="live-current-output">{current.partial}</pre>
+              : <p className="live-current-narration">{current.partial}</p>
+          )}
         </div>
       )}
-      <div className="activity-copy">
-        {showGoal && goal && (
-          <div className="activity-goal" title={goal.objective || ''}>
-            <span className="activity-goal-label">{goal.label || 'Pursuing goal'}</span>
-            {goalElapsed && <span className="activity-goal-time">({goalElapsed})</span>}
-            {goal.objective && <span className="activity-goal-objective">{goal.objective}</span>}
+      {thinking && (
+        <div className="live-thinking-row" data-live-channel="thinking">
+          <div className="live-thinking-heading">
+            <NativeActivitySpinner agentType={agentType} />
+            <span className="live-status-label">{thinking.label || activity?.label || 'Thinking'}</span>
+            {thinkingElapsed && <span className="live-status-meta">{thinkingElapsed}</span>}
           </div>
-        )}
-        {showStatus && (label || showBlob) && (
-          <div className={`activity-label${showBlob ? ' inline-blob' : ''}`}>
-            {showBlob && <ClaudeSpinner />}
-            {label && <span>{label}</span>}
+          {thinking.text && <div className="live-thinking-text">{thinking.text}</div>}
+        </div>
+      )}
+      {step && (
+        <div className="live-step-wrap" data-live-channel="step">
+          <div className="live-step-chip" title={step.text || ''}>
+            {step.state === 'in_progress' ? <NativeActivitySpinner agentType={agentType} compact /> : <span>◌</span>}
+            <span>Step {step.current || 1} / {step.total || 1}</span>
+            {(step.added != null || step.deleted != null) && (
+              <span className="live-step-diff">· +{step.added || 0} −{step.deleted || 0}</span>
+            )}
           </div>
-        )}
-        {showCommand && isActive && visibleThinkingText && (
-          showBlob ? (
-            <div className="thinking-inline-text">
-              {visibleThinkingText}
-            </div>
-          ) : (
-            <div className="activity-command">
-              <code>{visibleThinkingText}</code>
-            </div>
-          )
-        )}
-      </div>
+        </div>
+      )}
+      {goal && (
+        <details className="live-goal-row" data-live-channel="goal">
+          <summary title={goalText}>
+            <span className="live-status-icon">⛳</span>
+            <span className="live-status-label">{goal.label || 'Pursuing goal'}</span>
+            <span className="live-goal-objective">{goalText || 'Active goal'}</span>
+            <span className="live-status-meta">{goalElapsed || goal.state || goal.status || 'active'}</span>
+          </summary>
+          {goalText && <div className="live-goal-expanded">{goalText}</div>}
+        </details>
+      )}
+      {usage && (
+        <div className="live-usage-banner" data-live-channel="usage" role="status">
+          <div className="live-usage-title">{usage.title || "You're out of Codex and Work usage"}</div>
+          <div className="live-usage-detail">{usage.detail || (usage.resets_at ? `Your rate limit resets at ${usage.resets_at}.` : 'Usage is currently exhausted.')}</div>
+        </div>
+      )}
     </div>
   );
 }
 
 function TaskList({ taskList, sessionId }) {
-  if (!taskList || !taskList.tasks || taskList.tasks.length === 0) return null;
+  const planBlock = taskList?.content_blocks?.find(block => block?.type === 'plan');
+  const typedTaskList = planBlock ? { ...taskList, ...planBlock } : taskList;
+  if (!typedTaskList || !typedTaskList.tasks || typedTaskList.tasks.length === 0) return null;
   const storageKey = sessionId ? `remote-agent-chat:task-list-collapsed:${sessionId}` : null;
   const defaultCollapsed = false;
   const [collapsed, setCollapsed] = React.useState(() => {
@@ -1454,7 +2463,7 @@ function TaskList({ taskList, sessionId }) {
 
   const stateIcon = { completed: '\u2713', in_progress: '\u25CC', pending: '\u25CB' };
   const stateCls = { completed: 'done', in_progress: 'active', pending: '' };
-  const activeTask = taskList.tasks.find(t => t.state === 'in_progress');
+  const activeTask = typedTaskList.tasks.find(t => t.state === 'in_progress');
   return (
     <div className={`codex-task-list${collapsed ? ' collapsed' : ''}`}>
       <button
@@ -1465,14 +2474,14 @@ function TaskList({ taskList, sessionId }) {
         title={collapsed ? 'Expand task list' : 'Collapse task list'}
       >
         <span className="codex-task-chevron">{collapsed ? '\u25B8' : '\u25BE'}</span>
-        <span className="codex-task-count">{taskList.completed}/{taskList.total} tasks</span>
+        <span className="codex-task-count">{typedTaskList.completed}/{typedTaskList.total} tasks</span>
         {collapsed && activeTask?.text && (
           <span className="codex-task-active-summary">{activeTask.text}</span>
         )}
       </button>
       {!collapsed && (
         <div className="codex-task-items">
-          {taskList.tasks.map((t, i) => (
+          {typedTaskList.tasks.map((t, i) => (
             <div key={i} className={`codex-task-item ${stateCls[t.state] || ''}`}>
               <span className="codex-task-icon">{stateIcon[t.state] || '\u25CB'}</span>
               <span className="codex-task-text">{t.text}</span>
@@ -1521,8 +2530,15 @@ function promptChoiceLabel(choice, index) {
   return choice?.label || choice?.title || choice?.text || choice?.name || promptChoiceId(choice, index);
 }
 
+function typedPromptBlock(prompt, acceptedTypes) {
+  const accepted = new Set(Array.isArray(acceptedTypes) ? acceptedTypes : [acceptedTypes]);
+  return (Array.isArray(prompt?.content_blocks) ? prompt.content_blocks : [])
+    .find(block => accepted.has(block?.type)) || null;
+}
+
 function promptBody(prompt) {
-  return prompt?.prompt_text || prompt?.message || prompt?.text || 'Agent requires permission to continue.';
+  return typedPromptBlock(prompt, 'prompt')?.content
+    || prompt?.prompt_text || prompt?.message || prompt?.text || 'Agent requires permission to continue.';
 }
 
 function formatPromptCountdown(msLeft) {
@@ -1532,13 +2548,26 @@ function formatPromptCountdown(msLeft) {
   return `${minutes}:${String(seconds).padStart(2, '0')}`;
 }
 
-function PermissionOverlay({ prompt, sessionId, onRespond }) {
+function PermissionOverlay({ prompt, sessionId, agentType, onRespond, onDismissFocus }) {
   const [now, setNow] = React.useState(Date.now());
+  const [questionSelections, setQuestionSelections] = React.useState({});
+  const [questionOtherText, setQuestionOtherText] = React.useState({});
+  const [alternateInstruction, setAlternateInstruction] = React.useState('');
+  const [keyboardChoiceId, setKeyboardChoiceId] = React.useState(null);
+  const [keyboardDismissed, setKeyboardDismissed] = React.useState(false);
 
   React.useEffect(() => {
     const timer = setInterval(() => setNow(Date.now()), 500);
     return () => clearInterval(timer);
   }, []);
+
+  React.useEffect(() => {
+    setQuestionSelections({});
+    setQuestionOtherText({});
+    setAlternateInstruction('');
+    setKeyboardChoiceId(null);
+    setKeyboardDismissed(false);
+  }, [prompt?.prompt_id]);
 
   const timeoutMs = Math.max(0, Number(prompt?.timeout_ms) || 0);
   const receivedAt = Number(prompt?.received_at) || Date.now();
@@ -1546,35 +2575,275 @@ function PermissionOverlay({ prompt, sessionId, onRespond }) {
   const choices = Array.isArray(prompt?.choices) ? prompt.choices : [];
   const submittingChoiceId = prompt?.submitting_choice_id || null;
   const defaultChoiceId = prompt?.default_choice || null;
+  const questions = prompt?.kind === 'question' && Array.isArray(prompt?.questions)
+    ? prompt.questions.filter(question => Array.isArray(question?.choices) && question.choices.length > 0)
+    : [];
+  const structuredQuestion = questions.length > 0;
+  const claudeActionPrompt = agentType === 'claude' && !structuredQuestion;
+  const claudeCommand = safeString(prompt?.command).trim();
+  const claudeTitle = safeString(prompt?.title).trim()
+    || (!claudeCommand ? promptBody(prompt) : 'Allow this action?');
+  const claudeDescription = safeString(prompt?.description).trim();
+  const alternateInstructionSupported = claudeActionPrompt && prompt?.alternate_instruction_supported === true;
+  const structuredKeyboardChoices = questions.flatMap(question => (
+    question.choices.map((choice, index) => ({
+      question,
+      choiceId: promptChoiceId(choice, index),
+    }))
+  )).slice(0, 9);
+
+  const toggleQuestionChoice = (question, choiceId) => {
+    setQuestionSelections(prev => {
+      const current = Array.isArray(prev[question.question_id]) ? prev[question.question_id] : [];
+      const next = question.multi_select
+        ? (current.includes(choiceId) ? current.filter(id => id !== choiceId) : [...current, choiceId])
+        : [choiceId];
+      return { ...prev, [question.question_id]: next };
+    });
+  };
+
+  const questionReady = questions.every(question => {
+    const selected = questionSelections[question.question_id] || [];
+    if (selected.length === 0) return false;
+    return selected.every(choiceId => {
+      const choice = question.choices.find((item, index) => promptChoiceId(item, index) === choiceId);
+      return !choice?.requires_text || safeString(questionOtherText[`${question.question_id}:${choiceId}`]).trim();
+    });
+  });
+
+  const submitQuestionAnswers = () => {
+    if (!questionReady || submittingChoiceId) return;
+    const answers = questions.map(question => {
+      const choiceIds = questionSelections[question.question_id] || [];
+      const otherChoice = question.choices.find((choice, index) => (
+        choice.requires_text && choiceIds.includes(promptChoiceId(choice, index))
+      ));
+      const otherChoiceIndex = otherChoice ? question.choices.indexOf(otherChoice) : -1;
+      const otherChoiceId = otherChoice ? promptChoiceId(otherChoice, otherChoiceIndex) : null;
+      return {
+        question_id: question.question_id,
+        choice_ids: choiceIds,
+        ...(otherChoiceId ? { other_text: safeString(questionOtherText[`${question.question_id}:${otherChoiceId}`]).trim() } : {}),
+      };
+    });
+    onRespond(sessionId, prompt.prompt_id, null, { answers });
+  };
+
+  React.useEffect(() => {
+    const handlePromptKey = event => {
+      if (event.key === 'Escape') {
+        event.preventDefault();
+        const claudeCancelChoice = claudeActionPrompt
+          ? choices.find((choice, index) => /^(?:reject|deny|cancel|block|not now|no)\b/i.test(
+            promptChoiceLabel(choice, index).replace(/^\d+\s+/, ''),
+          ))
+          : null;
+        if (claudeCancelChoice && !submittingChoiceId) {
+          onRespond(sessionId, prompt.prompt_id, promptChoiceId(claudeCancelChoice, choices.indexOf(claudeCancelChoice)));
+          return;
+        }
+        setKeyboardDismissed(true);
+        onDismissFocus?.();
+        return;
+      }
+      if (keyboardDismissed) return;
+      const editableTarget = isEditableShortcutTarget(event.target);
+      const otherTextSubmit = event.key === 'Enter' && event.target?.closest?.('.permission-other-input');
+      const alternateInstructionSubmit = event.key === 'Enter'
+        && !event.shiftKey
+        && event.target?.closest?.('.permission-alternate-input');
+      const composerTarget = event.target?.matches?.('.input-area textarea');
+      if (alternateInstructionSubmit) {
+        event.preventDefault();
+        const instruction = alternateInstruction.trim();
+        if (instruction && !submittingChoiceId) {
+          onRespond(sessionId, prompt.prompt_id, null, { instruction });
+        }
+        return;
+      }
+      if (submittingChoiceId || (editableTarget && !otherTextSubmit && !composerTarget)) return;
+      if (/^[1-9]$/.test(event.key)) {
+        const optionIndex = Number(event.key) - 1;
+        event.preventDefault();
+        if (structuredQuestion) {
+          const option = structuredKeyboardChoices[optionIndex];
+          if (option) toggleQuestionChoice(option.question, option.choiceId);
+        } else {
+          const choice = choices[optionIndex];
+          if (choice) setKeyboardChoiceId(promptChoiceId(choice, optionIndex));
+        }
+        return;
+      }
+      if (event.key !== 'Enter') return;
+      if (structuredQuestion) {
+        if (questionReady) {
+          event.preventDefault();
+          submitQuestionAnswers();
+        }
+        return;
+      }
+      const selectedChoiceId = keyboardChoiceId || defaultChoiceId;
+      if (selectedChoiceId && choices.some((choice, index) => promptChoiceId(choice, index) === selectedChoiceId)) {
+        event.preventDefault();
+        onRespond(sessionId, prompt.prompt_id, selectedChoiceId);
+      }
+    };
+    window.addEventListener('keydown', handlePromptKey);
+    return () => window.removeEventListener('keydown', handlePromptKey);
+  }, [
+    alternateInstruction,
+    choices,
+    claudeActionPrompt,
+    defaultChoiceId,
+    keyboardDismissed,
+    keyboardChoiceId,
+    onDismissFocus,
+    onRespond,
+    prompt?.prompt_id,
+    questionReady,
+    questionSelections,
+    questionOtherText,
+    sessionId,
+    structuredKeyboardChoices,
+    structuredQuestion,
+    submittingChoiceId,
+  ]);
 
   return (
     <div className="permission-overlay">
-      <div className="permission-card">
-        <div className="permission-eyebrow">Permission Required</div>
-        <div className="permission-title">Agent Paused In {sessionId ? sessionSubLabel(sessionId, sessionId) : 'Active Session'}</div>
-        <div className="permission-body">{promptBody(prompt)}</div>
-        <div className="permission-meta">
-          {timeoutMs > 0 && <span className="permission-timer">Auto-choice in {formatPromptCountdown(msLeft)}</span>}
-          {defaultChoiceId && <span className="permission-default">Default: {defaultChoiceId}</span>}
-        </div>
+      <div
+        className={`permission-card${claudeActionPrompt ? ' permission-card-claude' : ''}`}
+        role="dialog"
+        aria-modal="false"
+        aria-label={claudeActionPrompt ? 'Claude Code permission prompt' : 'Permission or question prompt'}
+        onPointerDown={() => setKeyboardDismissed(false)}
+      >
+        {claudeActionPrompt ? (
+          <>
+            <div className="permission-title permission-title-claude">{claudeTitle}</div>
+            {claudeCommand && <pre className="permission-command-claude">{claudeCommand}</pre>}
+            {claudeDescription && <div className="permission-body permission-body-claude">{claudeDescription}</div>}
+          </>
+        ) : (
+          <>
+            <div className="permission-eyebrow">Permission Required</div>
+            <div className="permission-title">Agent Paused In {sessionId ? sessionSubLabel(sessionId, sessionId) : 'Active Session'}</div>
+            <div className="permission-body">{promptBody(prompt)}</div>
+            <div className="permission-meta">
+              {timeoutMs > 0 && <span className="permission-timer">Auto-choice in {formatPromptCountdown(msLeft)}</span>}
+              {defaultChoiceId && <span className="permission-default">Default: {defaultChoiceId}</span>}
+            </div>
+          </>
+        )}
         {prompt?.error && <div className="permission-error">{prompt.error}</div>}
-        <div className="permission-actions">
-          {choices.map((choice, index) => {
+        <div className={`permission-actions${structuredQuestion ? ' permission-question-list' : ''}`}>
+          {structuredQuestion ? questions.map((question, questionIndex) => (
+            <fieldset className="permission-question" key={question.question_id || questionIndex}>
+              <legend>{safeString(question.label, `Question ${questionIndex + 1}`)}</legend>
+              {safeString(question.message).trim() && <div className="permission-question-message">{safeString(question.message)}</div>}
+              <div className="permission-question-options">
+                {question.choices.map((choice, index) => {
+                  const choiceId = promptChoiceId(choice, index);
+                  const selected = (questionSelections[question.question_id] || []).includes(choiceId);
+                  const otherKey = `${question.question_id}:${choiceId}`;
+                  return (
+                    <div className="permission-question-option" key={choiceId}>
+                      <button
+                        type="button"
+                        className={`permission-action${selected ? ' selected' : ''}`}
+                        role={question.multi_select ? 'checkbox' : 'radio'}
+                        aria-checked={selected}
+                        disabled={!!submittingChoiceId}
+                        aria-keyshortcuts={structuredKeyboardChoices.findIndex(option => option.question === question && option.choiceId === choiceId) >= 0
+                          ? String(structuredKeyboardChoices.findIndex(option => option.question === question && option.choiceId === choiceId) + 1)
+                          : undefined}
+                        onClick={() => toggleQuestionChoice(question, choiceId)}
+                      >
+                        {structuredKeyboardChoices.findIndex(option => option.question === question && option.choiceId === choiceId) >= 0 && (
+                          <kbd className="permission-key-hint">{structuredKeyboardChoices.findIndex(option => option.question === question && option.choiceId === choiceId) + 1}</kbd>
+                        )}
+                        <span className="permission-choice-marker" aria-hidden="true">{question.multi_select ? (selected ? '✓' : '□') : (selected ? '●' : '○')}</span>
+                        <span className="permission-choice-copy">
+                          <span>{promptChoiceLabel(choice, index)}</span>
+                          {safeString(choice?.description).trim() && <span className="permission-action-desc">{safeString(choice.description)}</span>}
+                        </span>
+                      </button>
+                      {selected && choice.requires_text && (
+                        <input
+                          className="permission-other-input"
+                          type="text"
+                          value={questionOtherText[otherKey] || ''}
+                          maxLength={2000}
+                          disabled={!!submittingChoiceId}
+                          placeholder="Enter another answer"
+                          aria-label={`${promptChoiceLabel(choice, index)} answer`}
+                          onChange={event => setQuestionOtherText(prev => ({ ...prev, [otherKey]: event.target.value }))}
+                        />
+                      )}
+                    </div>
+                  );
+                })}
+              </div>
+            </fieldset>
+          )) : choices.map((choice, index) => {
             const choiceId = promptChoiceId(choice, index);
             const isPending = submittingChoiceId === choiceId;
             const isDefault = defaultChoiceId && defaultChoiceId === choiceId;
+            const isSelected = keyboardChoiceId === choiceId;
+            const isNativeSelected = claudeActionPrompt && !keyboardChoiceId && !defaultChoiceId && index === 0;
+            const displayLabel = claudeActionPrompt
+              ? promptChoiceLabel(choice, index).replace(new RegExp(`^${index + 1}\\s+`), '')
+              : promptChoiceLabel(choice, index);
+            const destination = claudeActionPrompt ? safeString(choice?.destination).trim() : '';
+            const labelPrefix = destination && displayLabel.endsWith(destination)
+              ? displayLabel.slice(0, -destination.length)
+              : displayLabel;
             return (
               <button
                 key={choiceId}
-                className={`permission-action${isDefault ? ' default' : ''}${isPending ? ' pending' : ''}`}
+                className={`permission-action${isDefault ? ' default' : ''}${isSelected || isNativeSelected ? ' selected' : ''}${isPending ? ' pending' : ''}`}
                 disabled={!!submittingChoiceId}
+                aria-pressed={isSelected || isNativeSelected}
+                aria-keyshortcuts={index < 9 ? String(index + 1) : undefined}
                 onClick={() => onRespond(sessionId, prompt.prompt_id, choiceId)}
               >
-                <span>{promptChoiceLabel(choice, index)}</span>
+                {index < 9 && <kbd className="permission-key-hint">{safeString(choice?.shortcut, String(index + 1))}</kbd>}
+                <span>
+                  {labelPrefix}
+                  {destination && <span className="permission-choice-destination-claude">{destination}</span>}
+                </span>
+                {safeString(choice?.description).trim() && (
+                  <span className="permission-action-desc">{safeString(choice.description)}</span>
+                )}
                 {isPending && <span className="permission-action-state">Sending...</span>}
               </button>
             );
           })}
+        </div>
+        {alternateInstructionSupported && (
+          <textarea
+            className="permission-alternate-input"
+            rows="1"
+            maxLength={2000}
+            value={alternateInstruction}
+            disabled={!!submittingChoiceId}
+            placeholder={safeString(prompt?.alternate_instruction_placeholder, 'Tell Claude what to do instead')}
+            aria-label="Tell Claude what to do instead"
+            onChange={event => setAlternateInstruction(event.target.value)}
+          />
+        )}
+        {structuredQuestion && (
+          <button
+            type="button"
+            className="permission-question-submit"
+            disabled={!questionReady || !!submittingChoiceId}
+            onClick={submitQuestionAnswers}
+          >
+            {submittingChoiceId ? 'Sending...' : safeString(prompt.submit_label, 'Submit answers')}
+          </button>
+        )}
+        <div className="permission-keyboard-help">
+          {claudeActionPrompt ? safeString(prompt?.cancel_hint, 'Esc to cancel') : '1–9 select · Enter submit · Esc return to composer'}
         </div>
       </div>
     </div>
@@ -1590,16 +2859,17 @@ function isBlockingErrorPrompt(prompt) {
 }
 
 function ErrorPromptOverlay({ prompt, sessionId, onRespond }) {
-  const actions = Array.isArray(prompt?.actions) ? prompt.actions : [];
+  const block = typedPromptBlock(prompt, ['error', 'notice']);
+  const actions = Array.isArray(prompt?.actions) ? prompt.actions : (block?.actions || []);
   const submittingActionId = prompt?.submitting_action_id || null;
-  const errorOutput = safeString(prompt?.error_output).trim();
+  const errorOutput = safeString(prompt?.error_output || block?.error_output).trim();
 
   return (
     <div className="permission-overlay">
       <div className="permission-card error-prompt-card">
         <div className="permission-eyebrow error-prompt-eyebrow">Action Required</div>
-        <div className="permission-title">{safeString(prompt?.title, 'Error handling model response')}</div>
-        <div className="permission-body">{safeString(prompt?.message, 'There was an error handling the model response.')}</div>
+        <div className="permission-title">{safeString(block?.label || prompt?.title, 'Error handling model response')}</div>
+        <div className="permission-body">{safeString(block?.content || prompt?.message, 'There was an error handling the model response.')}</div>
         {errorOutput && (
           <div className="error-prompt-output-wrap">
             <div className="error-prompt-output-label">Error Output</div>
@@ -1630,15 +2900,16 @@ function ErrorPromptOverlay({ prompt, sessionId, onRespond }) {
 }
 
 function ErrorPromptInline({ prompt, sessionId, onRespond }) {
-  const actions = Array.isArray(prompt?.actions) ? prompt.actions : [];
+  const block = typedPromptBlock(prompt, ['error', 'notice']);
+  const actions = Array.isArray(prompt?.actions) ? prompt.actions : (block?.actions || []);
   const submittingActionId = prompt?.submitting_action_id || null;
-  const errorOutput = safeString(prompt?.error_output).trim();
+  const errorOutput = safeString(prompt?.error_output || block?.error_output).trim();
 
   return (
     <div className="inline-error-prompt">
       <div className="inline-error-prompt-body">
-        <div className="inline-error-prompt-title">{safeString(prompt?.title, 'Codex requires attention')}</div>
-        <div className="inline-error-prompt-message">{safeString(prompt?.message, 'There was an error handling the model response.')}</div>
+        <div className="inline-error-prompt-title">{safeString(block?.label || prompt?.title, 'Codex requires attention')}</div>
+        <div className="inline-error-prompt-message">{safeString(block?.content || prompt?.message, 'There was an error handling the model response.')}</div>
         {errorOutput && <pre className="inline-error-prompt-output">{errorOutput}</pre>}
         {prompt?.error && <div className="permission-error">{prompt.error}</div>}
       </div>
@@ -1667,7 +2938,7 @@ function ErrorPromptInline({ prompt, sessionId, onRespond }) {
 // Slide-in panel in the sidebar for launching a new agent session or resuming
 // a previous session from conversation history.
 
-function NewSessionPanel({ launchStates, onLaunch, onResume, onClose, workspaces }) {
+function NewSessionPanel({ launchStates, onLaunch, onResume, onClose, workspaces, showTestSessions = false }) {
   const [mode,        setMode]        = React.useState('new');   // 'new' | 'resume'
   const [agentType,   setAgentType]   = React.useState('claude');
   const [wsMode,      setWsMode]      = React.useState('');
@@ -1690,15 +2961,15 @@ function NewSessionPanel({ launchStates, onLaunch, onResume, onClose, workspaces
 
   // Fetch session history when switching to resume mode
   React.useEffect(() => {
-    if (mode === 'resume' && history.length === 0 && !historyLoading) {
+    if (mode === 'resume' && !historyLoading) {
       setHistoryLoading(true);
-      fetch('/api/sessions/history?limit=30', { credentials: 'same-origin' })
+      fetch(`/api/sessions/history?limit=30&include_test=${showTestSessions ? 'true' : 'false'}`, { credentials: 'same-origin' })
         .then(r => r.json())
         .then(data => setHistory(data.sessions || []))
         .catch(() => setHistory([]))
         .finally(() => setHistoryLoading(false));
     }
-  }, [mode]);
+  }, [mode, showTestSessions]);
 
   function handleSubmit(e) {
     e.preventDefault();
@@ -2083,14 +3354,70 @@ function applicationServerKeyBytes(value) {
   return Uint8Array.from([...raw].map(char => char.charCodeAt(0)));
 }
 
-function NotificationSettingsPanel({ onClose }) {
-  const defaults = {
-    permission_required: true,
-    agent_ready: true,
-    agent_error: true,
-    session_offline: true,
-    rate_limit_cleared: true,
-  };
+const NOTIFICATION_PREFERENCE_DEFAULTS = Object.freeze({
+  permission_required: true,
+  agent_ready: true,
+  turn_ready: false,
+  goal_completed: false,
+  goal_attention: true,
+  agent_error: true,
+  session_offline: true,
+  rate_limit_cleared: true,
+  completion_sound: false,
+  completion_haptic: false,
+});
+
+// Delivery policy is unknown until the authenticated relay has answered. Keep
+// every category disabled during startup so connection history cannot race a
+// persisted opt-out (or a per-session mute) and surface a stale notification.
+const NOTIFICATION_PREFERENCE_PENDING = Object.freeze(
+  Object.fromEntries(Object.keys(NOTIFICATION_PREFERENCE_DEFAULTS).map(key => [key, false])),
+);
+
+let attentionAudioContext = null;
+let lastAttentionSoundAt = 0;
+
+function primeAttentionAudio() {
+  if (typeof window === 'undefined') return null;
+  const AudioContextClass = window.AudioContext || window.webkitAudioContext;
+  if (!AudioContextClass) return null;
+  attentionAudioContext ||= new AudioContextClass();
+  if (attentionAudioContext.state === 'suspended') {
+    attentionAudioContext.resume().catch(() => {});
+  }
+  return attentionAudioContext;
+}
+
+function playAttentionSound(kind = 'completion') {
+  const wallNow = Date.now();
+  if (wallNow - lastAttentionSoundAt < 600) return false;
+  const context = primeAttentionAudio();
+  if (!context || context.state !== 'running') return false;
+  lastAttentionSoundAt = wallNow;
+  const oscillator = context.createOscillator();
+  const gain = context.createGain();
+  const now = context.currentTime;
+  oscillator.type = 'sine';
+  oscillator.frequency.setValueAtTime(kind === 'prompt' ? 740 : 620, now);
+  oscillator.frequency.exponentialRampToValueAtTime(kind === 'prompt' ? 880 : 760, now + 0.11);
+  gain.gain.setValueAtTime(0.0001, now);
+  gain.gain.exponentialRampToValueAtTime(0.035, now + 0.012);
+  gain.gain.exponentialRampToValueAtTime(0.0001, now + 0.14);
+  oscillator.connect(gain);
+  gain.connect(context.destination);
+  oscillator.start(now);
+  oscillator.stop(now + 0.15);
+  return true;
+}
+
+function attentionEventIsUnfocused(sessionId, activeSessionId) {
+  if (sessionId !== activeSessionId) return true;
+  if (typeof document === 'undefined') return false;
+  return document.visibilityState !== 'visible' || !document.hasFocus();
+}
+
+function NotificationSettingsPanel({ onClose, onPreferencesChange }) {
+  const defaults = NOTIFICATION_PREFERENCE_DEFAULTS;
   const [preferences, setPreferences] = useState(defaults);
   const [loading, setLoading] = useState(true);
   const [saving, setSaving] = useState(null);
@@ -2105,7 +3432,9 @@ function NotificationSettingsPanel({ onClose }) {
       const response = await fetch('/api/preferences/notifications', { credentials: 'same-origin' });
       const body = await response.json().catch(() => ({}));
       if (!response.ok) throw new Error(body.error || 'Unable to load notification settings.');
-      setPreferences({ ...defaults, ...(body.preferences || {}) });
+      const next = { ...defaults, ...(body.preferences || {}), turn_ready: false };
+      setPreferences(next);
+      onPreferencesChange?.(next);
     } catch (err) {
       setError(err.message || 'Unable to load notification settings.');
     } finally {
@@ -2196,9 +3525,10 @@ function NotificationSettingsPanel({ onClose }) {
   }
 
   async function togglePreference(key) {
-    if (saving) return;
+    if (saving || key === 'turn_ready') return;
     const previous = preferences;
     const next = { ...preferences, [key]: !preferences[key] };
+    if (key === 'completion_sound' && next.completion_sound) primeAttentionAudio();
     setPreferences(next);
     setSaving(key);
     setError('');
@@ -2211,7 +3541,9 @@ function NotificationSettingsPanel({ onClose }) {
       });
       const body = await response.json().catch(() => ({}));
       if (!response.ok) throw new Error(body.error || 'Unable to save notification settings.');
-      setPreferences({ ...defaults, ...(body.preferences || {}) });
+      const saved = { ...defaults, ...(body.preferences || {}) };
+      setPreferences(saved);
+      onPreferencesChange?.(saved);
     } catch (err) {
       setPreferences(previous);
       setError(err.message || 'Unable to save notification settings.');
@@ -2256,14 +3588,33 @@ function NotificationSettingsPanel({ onClose }) {
           />
         </label>
         <label className="notification-setting-row">
-          <span><strong>Agent ready</strong><small>When an agent finishes and is waiting for input</small></span>
+          <span><strong>Turn finished</strong><small>Unavailable until this harness supplies an authoritative native turn boundary</small></span>
           <input
             type="checkbox"
-            checked={preferences.agent_ready}
-            disabled={loading || !!saving}
-            onChange={() => togglePreference('agent_ready')}
+            checked={false}
+            disabled
+            onChange={() => togglePreference('turn_ready')}
           />
         </label>
+        <label className="notification-setting-row">
+          <span><strong>Goal completed</strong><small>Only when the native goal reaches its terminal completed state</small></span>
+          <input
+            type="checkbox"
+            checked={preferences.goal_completed}
+            disabled={loading || !!saving}
+            onChange={() => togglePreference('goal_completed')}
+          />
+        </label>
+        <label className="notification-setting-row">
+          <span><strong>Goal needs attention</strong><small>Paused, blocked, limited, cancelled, or failed goals</small></span>
+          <input
+            type="checkbox"
+            checked={preferences.goal_attention}
+            disabled={loading || !!saving}
+            onChange={() => togglePreference('goal_attention')}
+          />
+        </label>
+        <div className="settings-note">Active /goal loop checkpoints stay quiet between turns.</div>
         <label className="notification-setting-row">
           <span><strong>Agent error or rate limit</strong><small>When an agent stops and needs attention</small></span>
           <input
@@ -2291,6 +3642,15 @@ function NotificationSettingsPanel({ onClose }) {
             onChange={() => togglePreference('rate_limit_cleared')}
           />
         </label>
+        <label className="notification-setting-row">
+          <span><strong>Notification sound</strong><small>Subtle cue for allowed prompts and explicit goal lifecycle events</small></span>
+          <input
+            type="checkbox"
+            checked={preferences.completion_sound}
+            disabled={loading || !!saving}
+            onChange={() => togglePreference('completion_sound')}
+          />
+        </label>
         {loading && <div className="settings-note">Loading relay preferences…</div>}
         {!!error && (
           <div className="notification-settings-error" role="alert">
@@ -2304,14 +3664,15 @@ function NotificationSettingsPanel({ onClose }) {
   );
 }
 
-function SessionManagementPanel({ sessions, preferences, initialSessionId, onSave, onClose }) {
+function SessionManagementPanel({ sessions, preferences, initialSessionId, onSave, onExport, onClose }) {
   const firstId = initialSessionId || sessionIdOf(sessions[0]) || '';
   const [selectedId, setSelectedId] = useState(firstId);
   const [displayName, setDisplayName] = useState('');
   const [saving, setSaving] = useState(false);
+  const [exporting, setExporting] = useState('');
   const [error, setError] = useState('');
   const selected = sessions.find(session => sessionIdOf(session) === selectedId) || null;
-  const preference = preferences[selectedId] || { display_name: '', archived: false, muted: false };
+  const preference = preferences[selectedId] || { display_name: '', archived: false, muted: false, pinned: false, pin_order: 0 };
 
   useEffect(() => {
     setDisplayName(preference.display_name || '');
@@ -2331,6 +3692,19 @@ function SessionManagementPanel({ sessions, preferences, initialSessionId, onSav
       setError(err.message || 'Unable to save session settings.');
     } finally {
       setSaving(false);
+    }
+  }
+
+  async function downloadExport(format) {
+    if (!selectedId || exporting) return;
+    setExporting(format);
+    setError('');
+    try {
+      await onExport(selectedId, format);
+    } catch (err) {
+      setError(err.message || 'Unable to export session.');
+    } finally {
+      setExporting('');
     }
   }
 
@@ -2364,6 +3738,15 @@ function SessionManagementPanel({ sessions, preferences, initialSessionId, onSav
               />
             </label>
             <label className="notification-setting-row">
+              <span><strong>Pin chat</strong><small>Keep this chat in the operator-ordered pinned section</small></span>
+              <input
+                type="checkbox"
+                checked={!!preference.pinned}
+                disabled={saving}
+                onChange={() => update({ pinned: !preference.pinned })}
+              />
+            </label>
+            <label className="notification-setting-row">
               <span><strong>Mute notifications</strong><small>Suppress push notifications for this session</small></span>
               <input
                 type="checkbox"
@@ -2380,16 +3763,56 @@ function SessionManagementPanel({ sessions, preferences, initialSessionId, onSav
                 onClick={() => update({ archived: !preference.archived })}
               >{preference.archived ? 'Restore to sidebar' : 'Hide from sidebar'}</button>
             </div>
+            <div className="session-management-actions session-export-actions" aria-label="Export session">
+              <button disabled={!!exporting} onClick={() => downloadExport('markdown')}>{exporting === 'markdown' ? 'Preparing…' : 'Download Markdown'}</button>
+              <button disabled={!!exporting} onClick={() => downloadExport('json')}>{exporting === 'json' ? 'Preparing…' : 'Download JSON'}</button>
+            </div>
           </>}
         </>}
         {!!error && <div className="settings-error" role="alert">{error}</div>}
-        <div className="settings-note">Names, hidden state, and mute settings sync across web and Android.</div>
+        <div className="settings-note">Names, pinned order, hidden state, and mute settings sync across web and Android.</div>
       </div>
     </div>
   );
 }
 
+function ScheduledSendPanel({ sessionId, initialContent, jobs, onSchedule, onCancel, onCreated, onClose }) {
+  const [content, setContent] = useState(initialContent || '');
+  const [triggerKind, setTriggerKind] = useState('idle');
+  const [deliverAt, setDeliverAt] = useState(() => {
+    const date = new Date(Date.now() + 60 * 60 * 1000);
+    return new Date(date.getTime() - date.getTimezoneOffset() * 60_000).toISOString().slice(0, 16);
+  });
+  const [error, setError] = useState('');
+  const [saving, setSaving] = useState(false);
+  async function createJob(event) {
+    event.preventDefault();
+    setSaving(true); setError('');
+    try {
+      await onSchedule(sessionId, content, triggerKind, triggerKind === 'at' ? new Date(deliverAt).toISOString() : null);
+      onCreated?.();
+      setContent('');
+    } catch (err) { setError(err.message); } finally { setSaving(false); }
+  }
+  async function cancelJob(id) {
+    try { await onCancel(id); } catch (err) { setError(err.message); }
+  }
+  return <div className="settings-panel scheduled-send-panel" data-testid="scheduled-send-panel">
+    <div className="settings-panel-header"><span>Schedule message</span><button className="settings-panel-close" onClick={onClose} title="Close">×</button></div>
+    <form className="settings-panel-body" onSubmit={createJob}>
+      <label className="settings-row session-management-field"><span className="settings-label">Message</span><textarea value={content} maxLength={524288} onChange={event => setContent(event.target.value)} /></label>
+      <label className="settings-row session-management-field"><span className="settings-label">Deliver</span><select value={triggerKind} onChange={event => setTriggerKind(event.target.value)}><option value="idle">When session is next idle</option><option value="at">At a specific time</option></select></label>
+      {triggerKind === 'at' && <label className="settings-row session-management-field"><span className="settings-label">Local time</span><input type="datetime-local" value={deliverAt} onChange={event => setDeliverAt(event.target.value)} /></label>}
+      <div className="session-management-actions"><button type="submit" disabled={saving || !content.trim()}>{saving ? 'Scheduling…' : 'Schedule'}</button></div>
+      {!!error && <div className="settings-error" role="alert">{error}</div>}
+      {!!jobs.length && <div className="scheduled-send-list"><strong>Pending</strong>{jobs.map(job => <div className="scheduled-send-row" key={job.id}><span>{job.trigger_kind === 'idle' ? 'Next idle' : new Date(job.deliver_at).toLocaleString()} · {job.content}</span><button type="button" onClick={() => cancelJob(job.id)} disabled={job.state !== 'pending'}>{job.state === 'dispatching' ? 'Sending…' : 'Cancel'}</button></div>)}</div>}
+    </form>
+  </div>;
+}
+
 function AgentSettingsPanel({ session, config, configControlStates, onRequestRefresh, onSetModel, onSetEffort, onSetPermissionMode, onSetAutoApprovePermissions, onSetMode, onSetCodexConfig, onSwitchWorkspace, onClose }) {
+  const [showBypassConfirmation, setShowBypassConfirmation] = React.useState(false);
+  const [localBypassRestoreProfile, setLocalBypassRestoreProfile] = React.useState(null);
   const sessionId    = sessionIdOf(session);
   const controlFor = field => configControlStates?.[`${sessionId}:${field}`] || null;
   const isPendingControl = control => control && (control.status === 'pending' || control.status === 'awaiting_config');
@@ -2400,8 +3823,9 @@ function AgentSettingsPanel({ session, config, configControlStates, onRequestRef
   const modeControl = controlFor('mode');
   const speedControl = controlFor('speed');
   const accessControl = controlFor('access_mode');
+  const permissionProfileControl = controlFor('permission_profile');
   const workspaceControl = controlFor('workspace');
-  const activeControl = [modelControl, permissionControl, effortControl, autoApproveControl, modeControl, speedControl, accessControl, workspaceControl]
+  const activeControl = [modelControl, permissionControl, effortControl, autoApproveControl, modeControl, speedControl, accessControl, permissionProfileControl, workspaceControl]
     .find(control => isPendingControl(control) || control?.status === 'failed');
   const controlStatusLabel = activeControl
     ? isPendingControl(activeControl)
@@ -2410,7 +3834,11 @@ function AgentSettingsPanel({ session, config, configControlStates, onRequestRef
     : null;
   const agentType    = (session && typeof session === 'object') ? session.agent_type : null;
   const caps         = config?.capabilities || {};
+  const splitObservedConfig = agentType === 'codex_cli' && config?.config_semantics === 'observed_and_next_send';
+  const isVsCodeCodex = agentType === 'codex';
+  const codexControlsAvailable = !isVsCodeCodex || config?.controls_available !== false;
   const currentModel   = config?.model_id || 'unknown';
+  const nextSendModel = config?.next_send_model_id || '';
   const rateLimitedUntil = (session && typeof session === 'object') ? session.rate_limited_until || null : null;
   const antigravityQuotaModels = Array.isArray(session?.antigravity_quota_models) ? session.antigravity_quota_models : [];
   const activeQuotaModel = session?.active_quota_model || null;
@@ -2421,6 +3849,7 @@ function AgentSettingsPanel({ session, config, configControlStates, onRequestRef
     ? config.auto_approve_permissions
     : !!session?.auto_approve_permissions;
   const effortLevel    = config?.effort || null;
+  const nextSendEffort = config?.next_send_effort || '';
   const fileScope    = config?.file_access_scope || 'unknown';
   const permModes    = permissionModeOptionsFor(agentType, config);
   const modeOptions  = modeOptionsFor(agentType, config);
@@ -2440,7 +3869,7 @@ function AgentSettingsPanel({ session, config, configControlStates, onRequestRef
   }, [sessionId]);
 
   function handleModelChange(modelId) {
-    if (!modelId || modelId === currentModel) return;
+    if (!modelId || modelId === (splitObservedConfig ? nextSendModel : currentModel)) return;
     onSetModel(sessionId, modelId);
   }
 
@@ -2450,7 +3879,7 @@ function AgentSettingsPanel({ session, config, configControlStates, onRequestRef
   }
 
   function handleEffortChange(effort) {
-    if (!effort || effort === effortLevel) return;
+    if (!effort || effort === (splitObservedConfig ? nextSendEffort : effortLevel)) return;
     onSetEffort && onSetEffort(sessionId, effort);
   }
 
@@ -2462,6 +3891,26 @@ function AgentSettingsPanel({ session, config, configControlStates, onRequestRef
   function handleAutoApproveChange(enabled) {
     if (autoApproveEnabled === !!enabled) return;
     onSetAutoApprovePermissions && onSetAutoApprovePermissions(sessionId, !!enabled);
+  }
+
+  function handleCodexPermissionProfile(permissionProfile, confirmBypass = false) {
+    if (!permissionProfile || permissionProfile === config?.permission_profile) return;
+    if (permissionProfile === 'full-access' && !confirmBypass) {
+      setShowBypassConfirmation(true);
+      return;
+    }
+    if (permissionProfile === 'full-access') {
+      setLocalBypassRestoreProfile(
+        config?.permission_profile && config.permission_profile !== 'full-access'
+          ? config.permission_profile
+          : 'auto',
+      );
+    }
+    setShowBypassConfirmation(false);
+    onSetCodexConfig?.({
+      permission_profile: permissionProfile,
+      ...(confirmBypass ? { confirm_bypass: true } : {}),
+    });
   }
 
   return (
@@ -2487,9 +3936,13 @@ function AgentSettingsPanel({ session, config, configControlStates, onRequestRef
 
         {/* Model — dropdown for Claude, read-only for others */}
         <div className="settings-row">
-          <span className="settings-label">Model</span>
+          <span className="settings-label">{splitObservedConfig ? 'Observed model' : 'Model'}</span>
           <div className="settings-model-wrap">
-            {caps.set_model && modelOptions.length > 0 ? (
+            {splitObservedConfig ? (
+              <span className={`settings-value${currentModel === 'unknown' ? ' dim' : ''}`} title={config?.model_provenance?.source || 'No exact native metadata observed'}>
+                {currentModel}
+              </span>
+            ) : caps.set_model && modelOptions.length > 0 ? (
               <select
                 className="settings-perm-select"
                 value={currentModel}
@@ -2515,6 +3968,24 @@ function AgentSettingsPanel({ session, config, configControlStates, onRequestRef
           </div>
           {modelControl?.status === 'ok' && <span className="settings-inline-ok">Saved</span>}
         </div>
+
+        {splitObservedConfig && caps.set_model && modelOptions.length > 0 && (
+          <div className="settings-row">
+            <span className="settings-label">Next send model</span>
+            <select
+              className="settings-perm-select"
+              value={nextSendModel}
+              disabled={isPendingControl(modelControl)}
+              onChange={e => handleModelChange(e.target.value)}
+            >
+              <option value="" disabled>Choose model…</option>
+              {modelOptions.map(m => <option key={m.id} value={m.id}>{m.label}</option>)}
+            </select>
+            <span className={`settings-value small${config?.next_send_model_status === 'failed' ? ' error' : ''}`}>
+              {config?.next_send_model_status || 'unset'}
+            </span>
+          </div>
+        )}
 
         {(agentType === 'antigravity' || agentType === 'antigravity_panel') && antigravityQuotaModels.length > 0 && (
           <div className="settings-row" style={{ alignItems: 'flex-start' }}>
@@ -2632,31 +4103,56 @@ function AgentSettingsPanel({ session, config, configControlStates, onRequestRef
 
         {(agentType === 'claude_cli' || agentType === 'codex_cli' || agentType === 'cursor_cli') && caps.set_effort && (config?.available_efforts || []).length > 0 && (
           <div className="settings-row">
-            <span className="settings-label">Effort</span>
-            <select
-              className="settings-perm-select"
-              value={effortLevel || 'medium'}
-              disabled={isPendingControl(effortControl)}
-              onChange={e => handleEffortChange(e.target.value)}
-            >
-              {(config.available_efforts || []).map(m => (
-                <option key={m.id} value={m.id}>{m.label}</option>
-              ))}
-            </select>
+            <span className="settings-label">{splitObservedConfig ? 'Observed effort' : 'Effort'}</span>
+            {splitObservedConfig ? (
+              <span className={`settings-value${!effortLevel || effortLevel === 'unknown' ? ' dim' : ''}`} title={config?.effort_provenance?.source || 'No exact native metadata observed'}>
+                {effortLevel || 'unknown'}
+              </span>
+            ) : (
+              <select
+                className="settings-perm-select"
+                value={effortLevel || 'medium'}
+                disabled={isPendingControl(effortControl)}
+                onChange={e => handleEffortChange(e.target.value)}
+              >
+                {(config.available_efforts || []).map(m => (
+                  <option key={m.id} value={m.id}>{m.label}</option>
+                ))}
+              </select>
+            )}
             {effortControl?.status === 'ok' && <span className="settings-inline-ok">Saved</span>}
           </div>
         )}
 
-        {/* Codex-specific: model, access, effort dropdowns */}
+        {splitObservedConfig && caps.set_effort && (config?.available_efforts || []).length > 0 && (
+          <div className="settings-row">
+            <span className="settings-label">Next send effort</span>
+            <select
+              className="settings-perm-select"
+              value={nextSendEffort}
+              disabled={isPendingControl(effortControl)}
+              onChange={e => handleEffortChange(e.target.value)}
+            >
+              <option value="" disabled>Choose effort…</option>
+              {(config.available_efforts || []).map(m => <option key={m.id} value={m.id}>{m.label}</option>)}
+            </select>
+            <span className={`settings-value small${config?.next_send_effort_status === 'failed' ? ' error' : ''}`}>
+              {config?.next_send_effort_status || 'unset'}
+            </span>
+          </div>
+        )}
+
+        {/* Codex-specific controls. VS Code is native next-turn/thread scope;
+            Desktop retains its separate restart-scoped contract. */}
         {(agentType === 'codex' || agentType === 'codex-desktop') && caps.set_codex_config && (
           <>
-            <div className="settings-row">
-              <span className="settings-label">Model</span>
+            {caps.codex_model_change && (config?.available_models || []).length > 0 && <div className="settings-row">
+              <span className="settings-label">{isVsCodeCodex ? 'Next turn model' : 'Model'}</span>
               <select
                 className="settings-perm-select"
                 value={config?.model_id || 'unknown'}
-                disabled={isPendingControl(modelControl)}
-                onChange={e => { onSetCodexConfig && onSetCodexConfig({ model_id: e.target.value }); }}
+                disabled={isPendingControl(modelControl) || !codexControlsAvailable}
+                onChange={e => { onSetCodexConfig?.({ model_id: e.target.value }); }}
               >
                 {(config?.available_models || []).map(m => (
                   <option key={m.id} value={m.id}>{m.label}</option>
@@ -2665,52 +4161,88 @@ function AgentSettingsPanel({ session, config, configControlStates, onRequestRef
                   <option value={config.model_id}>{config.model_id}</option>
                 )}
               </select>
-            </div>
-            <div className="settings-row">
-              <span className="settings-label">Access</span>
-              <select
-                className="settings-perm-select"
-                value={config?.permission_mode || 'unknown'}
-                disabled={isPendingControl(accessControl)}
-                onChange={e => { onSetCodexConfig && onSetCodexConfig({ access_mode: e.target.value }); }}
-              >
-                {(config?.available_access || []).map(m => (
-                  <option key={m.id} value={m.id}>{m.label}</option>
-                ))}
-                {config?.permission_mode && !(config?.available_access || []).some(m => m.id === config.permission_mode) && config.permission_mode !== 'unknown' && (
-                  <option value={config.permission_mode}>{config.permission_mode}</option>
-                )}
-              </select>
-            </div>
-            <div className="settings-row">
-              <span className="settings-label">Effort</span>
+              {modelControl?.status === 'ok' && <span className="settings-inline-ok">Saved</span>}
+            </div>}
+            {caps.codex_effort_change && (config?.available_efforts || []).length > 0 && <div className="settings-row">
+              <span className="settings-label">{isVsCodeCodex ? 'Next turn effort' : 'Effort'}</span>
               <select
                 className="settings-perm-select"
                 value={(config?.effort || 'unknown').toLowerCase()}
-                disabled={isPendingControl(effortControl)}
-                onChange={e => { onSetCodexConfig && onSetCodexConfig({ effort: e.target.value }); }}
+                disabled={isPendingControl(effortControl) || !codexControlsAvailable}
+                onChange={e => { onSetCodexConfig?.({ effort: e.target.value }); }}
               >
                 {(config?.available_efforts || []).map(m => (
                   <option key={m.id} value={m.id}>{m.label}</option>
                 ))}
               </select>
-            </div>
-            <div className="settings-row">
+              {effortControl?.status === 'ok' && <span className="settings-inline-ok">Saved</span>}
+            </div>}
+            {caps.codex_permission_profile_change && (config?.available_permission_profiles || []).length > 0 && <div className="settings-row">
+              <span className="settings-label">Next turn permissions</span>
+              <select
+                className="settings-perm-select"
+                value={config?.permission_profile || 'unknown'}
+                disabled={isPendingControl(permissionProfileControl) || !codexControlsAvailable}
+                onChange={e => handleCodexPermissionProfile(e.target.value)}
+              >
+                {(config?.available_permission_profiles || []).map(profile => (
+                  <option key={profile.id} value={profile.id}>{profile.label}</option>
+                ))}
+              </select>
+              {permissionProfileControl?.status === 'ok' && <span className="settings-inline-ok">Saved</span>}
+            </div>}
+            {showBypassConfirmation && <div className="settings-bypass-confirmation" role="alert">
+              <strong>Enable Bypass permissions?</strong>
+              <span>Full access sets approval policy to Never and sandbox access to danger-full-access for this Codex conversation.</span>
+              <div className="settings-bypass-actions">
+                <button type="button" onClick={() => setShowBypassConfirmation(false)}>Cancel</button>
+                <button type="button" className="danger" onClick={() => handleCodexPermissionProfile('full-access', true)}>Enable Full access</button>
+              </div>
+            </div>}
+            {isVsCodeCodex && config?.bypass_permissions_active && (localBypassRestoreProfile || config?.bypass_restore_profile) && <div className="settings-row">
+              <span className="settings-label">Bypass permissions</span>
+              <button
+                type="button"
+                className="settings-restore-safe"
+                disabled={isPendingControl(permissionProfileControl)}
+                onClick={() => handleCodexPermissionProfile(localBypassRestoreProfile || config.bypass_restore_profile)}
+              >Restore previous safe permissions</button>
+            </div>}
+            {isVsCodeCodex && <>
+              <div className="settings-row">
+                <span className="settings-label">Approval policy</span>
+                <span className="settings-value">{config?.approval_policy || 'Native custom policy'}</span>
+              </div>
+              <div className="settings-row">
+                <span className="settings-label">Access / sandbox</span>
+                <span className="settings-value">{config?.permission_mode || 'Native custom access'}</span>
+              </div>
+              {!codexControlsAvailable && <div className="settings-control-unavailable" role="status">
+                {config?.controls_unavailable_reason || 'Codex controls are unavailable for this conversation.'}
+              </div>}
+            </>}
+            {caps.codex_access_change && (config?.available_access || []).length > 0 && <div className="settings-row">
+              <span className="settings-label">Access</span>
+              <select
+                className="settings-perm-select"
+                value={config?.permission_mode || 'unknown'}
+                disabled={isPendingControl(accessControl)}
+                onChange={e => { onSetCodexConfig?.({ access_mode: e.target.value }); }}
+              >
+                {(config?.available_access || []).map(m => <option key={m.id} value={m.id}>{m.label}</option>)}
+              </select>
+            </div>}
+            {caps.codex_speed_change && (config?.available_speeds || []).length > 0 && <div className="settings-row">
               <span className="settings-label">Speed</span>
               <select
                 className="settings-perm-select"
                 value={(config?.speed || 'standard').toLowerCase()}
                 disabled={isPendingControl(speedControl)}
-                onChange={e => { onSetCodexConfig && onSetCodexConfig({ speed: e.target.value }); }}
+                onChange={e => { onSetCodexConfig?.({ speed: e.target.value }); }}
               >
-                {(config?.available_speeds || []).map(m => (
-                  <option key={m.id} value={m.id}>{m.label}</option>
-                ))}
-                {config?.speed && !(config?.available_speeds || []).some(m => m.id === config.speed) && config.speed !== 'unknown' && (
-                  <option value={config.speed}>{config.speed}</option>
-                )}
+                {(config?.available_speeds || []).map(m => <option key={m.id} value={m.id}>{m.label}</option>)}
               </select>
-            </div>
+            </div>}
             {agentType === 'codex-desktop' && config?.branch && config.branch !== 'unknown' && (
               <div className="settings-row">
                 <span className="settings-label">Branch</span>
@@ -3888,6 +5420,1129 @@ function CodexAutomationPane({ view, onShow }) {
   );
 }
 
+function formatUsageTokens(value) {
+  return new Intl.NumberFormat([], { notation: 'compact', maximumFractionDigits: 1 }).format(Math.max(0, Number(value) || 0));
+}
+
+function UsageCostPanel({ cost, detailState, onRequestDetail }) {
+  const [days, setDays] = React.useState(1);
+  const [project, setProject] = React.useState('');
+  const localSelected = React.useMemo(() => selectEstimatedCost(cost, { days, project }), [cost, days, project]);
+  const detail = detailState?.status === 'ready' ? detailState.detail : null;
+  const detailMatches = !!detail
+    && Number(detail.query?.days) === days
+    && String(detail.query?.project || '') === project
+    && (!cost?.generatedAt || String(detail.generated_at || '') === cost.generatedAt);
+  const loadingInitialPageMatches = detailState?.status === 'loading'
+    && Number(detailState.query?.days) === days
+    && String(detailState.query?.project || '') === project
+    && String(detailState.query?.cursor || '0') === '0';
+  const readyInitialPageMatches = detailMatches
+    && String(detail.pagination?.cursor || '0') === '0';
+  const selected = detailMatches ? {
+    costUsd: Math.max(0, Number(detail.summary?.cost_usd) || 0),
+    records: Math.max(0, Number(detail.summary?.records) || 0),
+    tokens: {
+      input: Math.max(0, Number(detail.summary?.tokens?.input) || 0),
+      cached: Math.max(0, Number(detail.summary?.tokens?.cached) || 0),
+      output: Math.max(0, Number(detail.summary?.tokens?.output) || 0),
+    },
+    byModel: Array.isArray(detail.summary?.by_model) ? detail.summary.by_model : [],
+    byDay: Array.isArray(detail.summary?.by_day) ? detail.summary.by_day : [],
+  } : localSelected;
+  React.useEffect(() => {
+    if (!cost?.detail?.truncated || !onRequestDetail) return;
+    if (loadingInitialPageMatches || readyInitialPageMatches) return;
+    onRequestDetail({ days, project, cursor: '0', pageSize: cost.detail.pageSize || 256 });
+  }, [cost?.detail?.truncated, cost?.detail?.pageSize, cost?.generatedAt, days, project, onRequestDetail]);
+  if (!cost) return null;
+  const hasAuthoritativeTotals = (['ready', 'partial', 'stale'].includes(cost.status)
+    || (cost.status === 'scanning' && !!cost.lastGoodGeneratedAt))
+    && cost.costUsd != null && cost.records != null
+    && cost.tokens.input != null && cost.tokens.cached != null && cost.tokens.output != null;
+  const stateCopy = {
+    'not-started': ['Not scanned yet', 'The local cost scan has not completed.'],
+    idle: ['Not scanned yet', 'The local cost scan has not completed.'],
+    scanning: ['Scanning local history', 'Provider quota remains available while cost files are scanned.'],
+    error: ['Cost scan unavailable', 'The last cost payload failed its bounded structural contract. Provider quota is still current.'],
+    unavailable: ['Cost scan unavailable', 'Local cost sources are unavailable. Provider quota is still current.'],
+    cancelled: ['Cost scan cancelled', 'No zero total is reported because the scan did not complete.'],
+  }[cost.status] || ['Cost data pending', 'Waiting for an authoritative local cost scan.'];
+  if (!hasAuthoritativeTotals) return (
+    <section className="usage-cost-panel" aria-labelledby="usage-cost-heading">
+      <div className="usage-cost-heading">
+        <span>
+          <h3 id="usage-cost-heading">Local estimated API-equivalent cost</h3>
+          <small>Separate from subscription quota</small>
+        </span>
+        <span className={`usage-cost-status ${cost.status}`}>{cost.status}</span>
+      </div>
+      <div className="usage-cost-state" role="status">
+        <strong>{stateCopy[0]}</strong>
+        <span>{stateCopy[1]}</span>
+        {cost.reasonCode && <small>Reason: {cost.reasonCode}{cost.reasonPath ? ` (${cost.reasonPath})` : ''}</small>}
+      </div>
+      <div className="usage-cost-scan">{Number.isFinite(Number(cost.scan.files_complete))
+        ? `Incremental local JSONL scan - ${cost.scan.files_complete}/${cost.scan.files_total || 0} files`
+        : 'Incremental local JSONL scan has not reported file progress.'}</div>
+    </section>
+  );
+  const projects = [...new Set(cost.byProject.map(row => row.project).filter(Boolean))].sort();
+  const modelRows = [...(selected?.byModel || [])].sort((left, right) => right.cost_usd - left.cost_usd).slice(0, 12);
+  const dayRows = [...(selected?.byDay || [])].sort((left, right) => left.day.localeCompare(right.day));
+  const maximumDayCost = Math.max(0.000001, ...dayRows.map(row => Number(row.cost_usd) || 0));
+  return (
+    <section className="usage-cost-panel" aria-labelledby="usage-cost-heading">
+      <div className="usage-cost-heading">
+        <span>
+          <h3 id="usage-cost-heading">Local estimated API-equivalent cost</h3>
+          <small>Separate from subscription quota · pricing {cost.catalogVersion || 'unavailable'}</small>
+        </span>
+        <span className={`usage-cost-status ${cost.status}`}>{cost.status}</span>
+      </div>
+      <div className="usage-cost-controls">
+        <label>Range
+          <select value={days} onChange={event => setDays(Number(event.target.value))}>
+            {[1, 7, 30, 90, 365].map(value => <option key={value} value={value}>{value === 1 ? 'Today' : `${value} days`}</option>)}
+          </select>
+        </label>
+        <label>Project
+          <select value={project} onChange={event => setProject(event.target.value)}>
+            <option value="">All projects</option>
+            {projects.map(value => <option key={value} value={value}>{value}</option>)}
+          </select>
+        </label>
+      </div>
+      <div className="usage-cost-summary">
+        <span><strong>${(selected?.costUsd || 0).toFixed(2)}</strong><small>estimated cost</small></span>
+        <span><strong>{formatUsageTokens(selected?.tokens.input)}</strong><small>input tokens</small></span>
+        <span><strong>{formatUsageTokens(selected?.tokens.cached)}</strong><small>cached tokens</small></span>
+        <span><strong>{formatUsageTokens(selected?.tokens.output)}</strong><small>output tokens</small></span>
+      </div>
+      {cost.detail?.truncated && <div className="usage-cost-detail-state" role="status">
+        {detailMatches
+          ? `Showing detail rows ${Number(detail.pagination?.cursor || 0) + 1}-${Number(detail.pagination?.cursor || 0) + Number(detail.pagination?.returned_rows || 0)} of ${Number(detail.pagination?.total_rows || 0)}.`
+          : detailState?.status === 'error'
+            ? 'Cost detail is unavailable.'
+            : `Loading a bounded detail page for ${cost.detail.totalRows} cost-detail rows.`}
+      </div>}
+      <div className="usage-cost-chart" role="img" aria-label={`${days}-day estimated cost by day`}>
+        {(dayRows.length ? dayRows : [{ day: 'No data', cost_usd: 0 }]).map(row => (
+          <span key={row.day} title={`${row.day}: $${Number(row.cost_usd).toFixed(4)}`}>
+            <i style={{ height: `${Math.max(3, (Number(row.cost_usd) / maximumDayCost) * 100)}%` }} />
+            <small>{row.day.slice(5)}</small>
+          </span>
+        ))}
+      </div>
+      {cost.detail?.truncated && <details className="usage-cost-detail-table">
+        <summary>Cost detail rows</summary>
+        {detailState?.status === 'loading' && <div className="usage-cost-detail-state">Loading cost detail…</div>}
+        {detailState?.status === 'error' && <div className="usage-cost-detail-state">Cost detail unavailable: {detailState.error}</div>}
+        {detailMatches && <>
+          <div className="usage-cost-detail-pager" aria-label="Cost detail pagination">
+            <button type="button" disabled={Number(detail.pagination?.cursor || 0) <= 0} onClick={() => onRequestDetail({
+              days, project,
+              cursor: String(Math.max(0, Number(detail.pagination.cursor || 0) - Number(detail.pagination.page_size || 256))),
+              pageSize: detail.pagination.page_size || 256,
+            })}>Previous</button>
+            <span>{detail.pagination.returned_rows} rows · {detail.pagination.total_rows} total</span>
+            <button type="button" disabled={!detail.pagination?.next_cursor} onClick={() => onRequestDetail({
+              days, project, cursor: detail.pagination.next_cursor, pageSize: detail.pagination.page_size || 256,
+            })}>Next</button>
+          </div>
+          <div className="usage-cost-table-wrap">
+            <table className="usage-cost-table">
+              <caption>Paginated local cost detail</caption>
+              <thead><tr><th>Day</th><th>Provider / model</th><th>Project</th><th>Speed</th><th>Cost</th></tr></thead>
+              <tbody>{(detail.rows || []).map((row, index) => <tr key={`${detail.pagination.cursor}:${index}`}>
+                <td>{row.day}</td><th scope="row">{row.provider_id} · {row.model}</th><td>{row.project}</td>
+                <td>{row.speed}</td><td>${Number(row.cost_usd).toFixed(4)}</td>
+              </tr>)}</tbody>
+            </table>
+          </div>
+        </>}
+      </details>}
+      <div className="usage-cost-table-wrap">
+        <table className="usage-cost-table">
+          <caption>Estimated cost and tokens by provider model</caption>
+          <thead><tr><th>Provider / model</th><th>Input</th><th>Cached</th><th>Output</th><th>Cost</th></tr></thead>
+          <tbody>{modelRows.map(row => (
+            <tr key={`${row.provider_id}:${row.model}`}>
+              <th scope="row">{row.provider_id === 'openai-codex' ? 'Codex' : 'Claude'} · {row.model}</th>
+              <td>{formatUsageTokens(row.input)}</td><td>{formatUsageTokens(row.cached)}</td>
+              <td>{formatUsageTokens(row.output)}</td><td>${Number(row.cost_usd).toFixed(4)}</td>
+            </tr>
+          ))}</tbody>
+        </table>
+      </div>
+      {cost.unknownModels.length > 0 && (
+        <div className="usage-cost-fallbacks">
+          <strong>Fallback pricing</strong>
+          {cost.unknownModels.map(item => <span key={`${item.provider_id}:${item.model}`}>{item.model} → {item.fallback}</span>)}
+        </div>
+      )}
+      <div className="usage-cost-scan">Incremental local JSONL scan · {cost.scan.files_complete || 0}/{cost.scan.files_total || 0} files · {cost.records} deduplicated records</div>
+    </section>
+  );
+}
+
+function UsageDashboard({ usage, refreshReceipt, costDetail, onBack, onRefresh, onRequestCostDetail }) {
+  const normalized = React.useMemo(() => normalizeProviderUsage(usage), [usage]);
+  const [nowMs, setNowMs] = React.useState(Date.now());
+  React.useEffect(() => {
+    if (normalized.collectionState === 'not-started') onRefresh(false);
+    const timer = setInterval(() => setNowMs(Date.now()), 30000);
+    return () => clearInterval(timer);
+  }, [onRefresh, normalized.collectionState]);
+  const statusLabel = status => ({
+    fresh: 'Fresh', refreshing: 'Refreshing', stale: 'Stale', auth_required: 'Sign in required',
+    rate_limited: 'Refresh limited', unavailable: 'Unavailable',
+  })[status] || 'Unavailable';
+
+  return (
+    <div className="usage-dashboard" data-testid="usage-dashboard">
+      <div className="automations-header usage-dashboard-header">
+        <button className="automations-back" onClick={onBack} title="Back to sessions">←</button>
+        <div className="automations-header-text">
+          <h2>Usage & limits</h2>
+          <p>Provider-account quotas shared by connected harnesses. Warnings start at 80% used.</p>
+        </div>
+        <button
+          type="button"
+          className="usage-dashboard-refresh"
+          onClick={() => onRefresh(true)}
+          disabled={normalized.inFlight}
+          aria-label="Refresh provider usage"
+        >
+          {normalized.inFlight ? 'Refreshing…' : 'Refresh'}
+        </button>
+      </div>
+      {normalized.collectionState !== 'ready' && <div className={`usage-dashboard-collection-state ${normalized.collectionState}`} role="status">
+        <strong>{({
+          'not-started': 'Provider usage has not been collected yet',
+          refreshing: 'Refreshing provider usage',
+          partial: 'Some provider usage is unavailable',
+          stale: 'Showing last-good provider usage',
+          unavailable: 'Provider usage is unavailable',
+        })[normalized.collectionState] || 'Provider usage is pending'}</strong>
+        <span>Generation {normalized.generation}{normalized.generatedAt ? ` · ${formatProviderUsageAge(normalized.generatedAt, nowMs)}` : ''}</span>
+      </div>}
+      <div className="usage-dashboard-summary" aria-label="Usage summary">
+        <div><strong>{normalized.summaryAuthoritative ? normalized.summary.providers : '—'}</strong><span>providers</span></div>
+        <div><strong>{normalized.summaryAuthoritative ? normalized.summary.accounts : '—'}</strong><span>accounts</span></div>
+        <div><strong>{normalized.summaryAuthoritative ? normalized.summary.reporting : '—'}</strong><span>reporting</span></div>
+        <div className={normalized.summary.nearLimit > 0 ? 'warning' : ''}><strong>{normalized.summaryAuthoritative ? normalized.summary.nearLimit : '—'}</strong><span>near limit</span></div>
+        <div className={normalized.summary.exhausted > 0 ? 'critical' : ''}><strong>{normalized.summaryAuthoritative ? normalized.summary.exhausted : '—'}</strong><span>exhausted</span></div>
+      </div>
+      {refreshReceipt && <div className={`usage-refresh-receipt ${refreshReceipt.status}`} role="status">
+        Refresh {refreshReceipt.status}{refreshReceipt.generation != null ? ` · generation ${refreshReceipt.generation}` : ''}
+      </div>}
+      <UsageCostPanel cost={normalized.estimatedCost} detailState={costDetail} onRequestDetail={onRequestCostDetail} />
+      <div className="usage-dashboard-grid">
+        {normalized.entries.map(entry => {
+          const creditLabel = formatProviderCredits(entry.credits);
+          const creditReset = entry.credits?.resets_at
+            ? formatProviderUsageReset(entry.credits.resets_at, nowMs)
+            : '';
+          return (
+            <details
+              open
+              className={`usage-dashboard-card ${entry.tone}`}
+              key={entry.key}
+              data-provider-id={entry.providerId}
+              data-account-fingerprint={entry.accountFingerprint}
+            >
+              <summary className="usage-dashboard-card-summary">
+                <span className="usage-dashboard-provider-mark" aria-hidden="true">{entry.providerName.slice(0, 2).toUpperCase()}</span>
+                <span className="usage-dashboard-card-title">
+                  <strong>{entry.providerName}</strong>
+                  <span>{entry.accountLabel}{entry.plan ? ` · ${entry.plan}` : ''}</span>
+                </span>
+                <span className={`usage-dashboard-status ${entry.status}`}>{statusLabel(entry.status)}</span>
+              </summary>
+              <div className="usage-dashboard-card-body">
+                <div className="usage-dashboard-card-meta">
+                  <span>{entry.sessionCount} mapped session{entry.sessionCount === 1 ? '' : 's'}</span>
+                  <span>{entry.harnessTypes.length > 0 ? entry.harnessTypes.join(', ') : 'No mapped surfaces'}</span>
+                  <span>{formatProviderUsageAge(entry.capturedAt, nowMs)}</span>
+                </div>
+                {entry.windows.length > 0 ? (
+                  <div className="usage-dashboard-windows">
+                    {entry.windows.map(window => {
+                      const tone = window.tone;
+                      const reset = window.resetDescription || formatProviderUsageReset(window.resetsAt, nowMs);
+                      return (
+                        <div className={`usage-dashboard-window ${tone}`} key={window.id}>
+                          <div className="usage-dashboard-window-heading">
+                            <span>
+                              <strong>{window.label}</strong>
+                              {window.modelScope?.label ? <small>Model: {window.modelScope.label}</small>
+                                : window.scope && window.scope !== window.label ? <small>{window.scope}</small> : null}
+                            </span>
+                            <span>
+                              <strong>{window.remainingPercent == null ? 'Unavailable' : `${formatProviderPercent(window.remainingPercent)} left`}</strong>
+                              <small>{window.usedPercent == null ? 'No reported value' : `${formatProviderPercent(window.usedPercent)} used`}</small>
+                            </span>
+                          </div>
+                          {window.usedPercent != null && <div
+                            className="usage-dashboard-meter"
+                            role="progressbar"
+                            aria-label={`${entry.providerName} ${window.label}`}
+                            aria-valuetext={`${formatProviderPercent(window.usedPercent)} used`}
+                            aria-valuemin="0"
+                            aria-valuemax="100"
+                            aria-valuenow={Math.round(window.visualPercent)}
+                          ><span style={{ width: `${window.visualPercent}%` }} /></div>}
+                          <div className="usage-window-thresholds">
+                            Warning {formatProviderPercent(window.thresholds.warningPercent)} · Critical {formatProviderPercent(window.thresholds.criticalPercent)}
+                          </div>
+                          {window.pace && <div className={`usage-pace ${window.pace.category}`}>
+                            <div className="usage-pace-heading">
+                              <span className="usage-pace-category">{window.pace.category}</span>
+                              <span>Ideal {formatProviderPercent(window.pace.expectedUsedPercent)} · projected {formatProviderPercent(window.pace.projectedUsedPercent)}</span>
+                            </div>
+                            <div className="usage-pace-chart" role="img" aria-label={`${window.label} actual ${formatProviderPercent(window.usedPercent)}, ideal ${formatProviderPercent(window.pace.expectedUsedPercent)}, projected ${formatProviderPercent(window.pace.projectedUsedPercent)}`}>
+                              <span className="usage-pace-actual" style={{ width: `${window.visualPercent}%` }} />
+                              <i className="usage-pace-ideal" style={{ left: `${Math.min(100, window.pace.expectedUsedPercent)}%` }} />
+                              <i className="usage-pace-projected" style={{ left: `${Math.min(100, window.pace.projectedUsedPercent)}%` }} />
+                            </div>
+                            <div className="usage-pace-budgets">
+                              {Object.entries({ Now: 'now', '+1 hour': 'next_hour', '+5 hours': 'next_five_hours', Today: 'today' }).map(([label, key]) => (
+                                <span key={key}><small>{label}</small><strong>{formatProviderPercent(window.pace.budgets?.[key] || 0)}</strong></span>
+                              ))}
+                            </div>
+                            <div className="usage-pace-outcome">{window.usedPercent >= 100
+                              ? 'Quota is exhausted'
+                              : window.pace.willLastToReset
+                                ? 'Current pace lasts to reset'
+                                : `Projected exhaustion ${formatProviderUsageReset(window.pace.exhaustionAt, nowMs)}`}</div>
+                          </div>}
+                          {reset && <div className="usage-dashboard-reset">Resets {reset}</div>}
+                          <div className="usage-window-provenance">{window.source || entry.source}{window.provenance ? ` · ${window.provenance}` : ''}</div>
+                        </div>
+                      );
+                    })}
+                  </div>
+                ) : (
+                  <div className="usage-dashboard-unavailable">{entry.error?.message || 'This provider did not report quota windows.'}</div>
+                )}
+                {(creditLabel || entry.resetCredits) && (
+                  <div className="usage-dashboard-credit-row">
+                    {creditLabel && <span><strong>Credits</strong>{creditLabel}{creditReset && <small>Resets {creditReset}</small>}</span>}
+                    {entry.resetCredits && <span><strong>Rate-limit resets</strong>{entry.resetCredits.available_count || 0} available</span>}
+                  </div>
+                )}
+                {Array.isArray(entry.resetCredits?.details) && entry.resetCredits.details.length > 0 && (
+                  <div className="usage-dashboard-reset-credits">
+                    {entry.resetCredits.details.map((credit, index) => (
+                      <span key={`${credit.title || 'reset'}-${index}`}>
+                        <strong>{credit.title || `Reset credit ${index + 1}`}</strong>
+                        {credit.status && <small>{credit.status}</small>}
+                        {credit.expires_at && <small>Expires {formatProviderUsageReset(credit.expires_at, nowMs)}</small>}
+                      </span>
+                    ))}
+                  </div>
+                )}
+                {entry.error?.message && entry.windows.length > 0 && <div className="usage-dashboard-stale-error">Last refresh: {entry.error.message}</div>}
+                <div className="usage-dashboard-source-row">
+                  <span>Source: {entry.source ? entry.source.replace(/_/g, ' ') : 'not available'}{entry.latencyMs != null ? ` · ${entry.latencyMs} ms` : ''}</span>
+                  {entry.dashboardUrl && <a href={entry.dashboardUrl} target="_blank" rel="noreferrer">Open provider dashboard</a>}
+                </div>
+              </div>
+            </details>
+          );
+        })}
+        {normalized.entries.length === 0 && (
+          <div className="usage-dashboard-empty">
+            <strong>{normalized.collectionState === 'ready'
+              ? 'The completed scan found no provider usage.'
+              : 'Provider usage is not available yet.'}</strong>
+            <span>{normalized.collectionState === 'ready'
+              ? 'Connect a supported Codex, Claude Code, Antigravity, or Cursor session, then refresh.'
+              : 'Quota totals remain unknown until a provider collection completes.'}</span>
+          </div>
+        )}
+      </div>
+    </div>
+  );
+}
+
+const HOST_RESOURCE_CHART_WIDTH = 640;
+const HOST_RESOURCE_CHART_HEIGHT = 220;
+const HOST_RESOURCE_CHART_MARGIN = Object.freeze({ left: 54, right: 14, top: 12, bottom: 32 });
+
+function clampHostViewport(viewport) {
+  const width = Math.max(0.04, Math.min(1, Number(viewport?.end) - Number(viewport?.start) || 1));
+  const start = Math.max(0, Math.min(1 - width, Number(viewport?.start) || 0));
+  return { start, end: start + width };
+}
+
+function hostResourceChartPath(samples, valueField, xFor, yFor) {
+  let path = '';
+  let drawing = false;
+  samples.forEach(sample => {
+    const value = sample[valueField];
+    if (sample.gap || value == null || !Number.isFinite(value)) {
+      drawing = false;
+      return;
+    }
+    path += `${drawing ? 'L' : 'M'}${xFor(sample).toFixed(2)},${yFor(value).toFixed(2)} `;
+    drawing = true;
+  });
+  return path.trim();
+}
+
+function HostResourceChart({
+  title, description, frames, series, percentScale = false,
+  viewport, onViewportChange, crosshairSequence, onCrosshairChange,
+}) {
+  const chartRef = React.useRef(null);
+  const pointersRef = React.useRef(new Map());
+  const gestureRef = React.useRef(null);
+  const [hiddenSeries, setHiddenSeries] = React.useState({});
+  const [scale, setScale] = React.useState({ mode: 'auto', fixedMax: null });
+  const plotWidth = HOST_RESOURCE_CHART_WIDTH - HOST_RESOURCE_CHART_MARGIN.left - HOST_RESOURCE_CHART_MARGIN.right;
+  const plotHeight = HOST_RESOURCE_CHART_HEIGHT - HOST_RESOURCE_CHART_MARGIN.top - HOST_RESOURCE_CHART_MARGIN.bottom;
+  const orderedFrames = Array.isArray(frames) ? frames : [];
+  const boundedViewport = clampHostViewport(viewport);
+  const startIndex = Math.max(0, Math.floor((orderedFrames.length - 1) * boundedViewport.start));
+  const endIndex = Math.min(orderedFrames.length, Math.ceil((orderedFrames.length - 1) * boundedViewport.end) + 1);
+  const visibleFrames = orderedFrames.slice(startIndex, Math.max(startIndex + 1, endIndex));
+  const chartSeries = series.map(entry => {
+    const sourceFrames = entry.frames || visibleFrames;
+    const visibleSequences = new Set(visibleFrames.map(frame => frame.sample_sequence));
+    const boundedSource = entry.frames
+      ? sourceFrames.filter(frame => visibleSequences.has(frame.sample_sequence))
+      : sourceFrames;
+    return {
+      ...entry,
+      visibleFrames: boundedSource,
+      samples: downsampleHostResourceSeries(boundedSource, entry.metric, 180),
+    };
+  });
+  const activeSeries = chartSeries.filter(entry => !hiddenSeries[entry.key]);
+  const autoMaximum = Math.max(1, ...activeSeries.flatMap(entry => entry.samples.map(sample => sample.max || 0))) * 1.08;
+  const yMaximum = percentScale ? 100 : (scale.mode === 'fixed' && scale.fixedMax ? scale.fixedMax : autoMaximum);
+  const sequenceMinimum = visibleFrames[0]?.sample_sequence || 0;
+  const sequenceMaximum = visibleFrames.at(-1)?.sample_sequence || Math.max(1, sequenceMinimum);
+  const xFor = sample => HOST_RESOURCE_CHART_MARGIN.left
+    + ((sample.endSequence - sequenceMinimum) / Math.max(1, sequenceMaximum - sequenceMinimum)) * plotWidth;
+  const yFor = value => HOST_RESOURCE_CHART_MARGIN.top + plotHeight
+    - (Math.max(0, Math.min(yMaximum, value)) / Math.max(1, yMaximum)) * plotHeight;
+  const crosshairFrame = visibleFrames.find(frame => frame.sample_sequence === crosshairSequence) || visibleFrames.at(-1) || null;
+  const crosshairX = crosshairFrame
+    ? HOST_RESOURCE_CHART_MARGIN.left
+      + ((crosshairFrame.sample_sequence - sequenceMinimum) / Math.max(1, sequenceMaximum - sequenceMinimum)) * plotWidth
+    : null;
+  const formatValue = series[0]?.format || (value => String(value));
+
+  function clientFraction(event) {
+    const bounds = chartRef.current?.getBoundingClientRect();
+    if (!bounds?.width) return 0.5;
+    return Math.max(0, Math.min(1, (event.clientX - bounds.left) / bounds.width));
+  }
+
+  function sequenceAtFraction(fraction) {
+    if (!visibleFrames.length) return 0;
+    const index = Math.max(0, Math.min(visibleFrames.length - 1, Math.round(fraction * (visibleFrames.length - 1))));
+    return visibleFrames[index].sample_sequence;
+  }
+
+  function zoomAt(factor, fraction = 0.5) {
+    const current = clampHostViewport(viewport);
+    const width = Math.max(0.04, Math.min(1, (current.end - current.start) * factor));
+    const absoluteCenter = current.start + (current.end - current.start) * fraction;
+    onViewportChange(clampHostViewport({ start: absoluteCenter - width * fraction, end: absoluteCenter + width * (1 - fraction) }));
+  }
+
+  React.useEffect(() => {
+    const node = chartRef.current;
+    if (!node) return undefined;
+    const onWheel = event => {
+      event.preventDefault();
+      zoomAt(event.deltaY > 0 ? 1.2 : 0.8, clientFraction(event));
+    };
+    node.addEventListener('wheel', onWheel, { passive: false });
+    return () => node.removeEventListener('wheel', onWheel);
+  });
+
+  function onPointerDown(event) {
+    try { event.currentTarget.setPointerCapture?.(event.pointerId); } catch {}
+    pointersRef.current.set(event.pointerId, { x: event.clientX, y: event.clientY });
+    onCrosshairChange(sequenceAtFraction(clientFraction(event)));
+    if (pointersRef.current.size === 1) {
+      gestureRef.current = { mode: 'pan', pointerId: event.pointerId, startX: event.clientX, viewport: clampHostViewport(viewport) };
+    } else if (pointersRef.current.size === 2) {
+      const points = [...pointersRef.current.values()];
+      gestureRef.current = {
+        mode: 'pinch', distance: Math.max(1, Math.abs(points[1].x - points[0].x)),
+        center: (clientFraction({ clientX: points[0].x }) + clientFraction({ clientX: points[1].x })) / 2,
+        viewport: clampHostViewport(viewport),
+      };
+    }
+  }
+
+  function onPointerMove(event) {
+    if (!pointersRef.current.has(event.pointerId)) {
+      onCrosshairChange(sequenceAtFraction(clientFraction(event)));
+      return;
+    }
+    pointersRef.current.set(event.pointerId, { x: event.clientX, y: event.clientY });
+    const gesture = gestureRef.current;
+    if (gesture?.mode === 'pinch' && pointersRef.current.size >= 2) {
+      const points = [...pointersRef.current.values()];
+      const distance = Math.max(1, Math.abs(points[1].x - points[0].x));
+      const originalWidth = gesture.viewport.end - gesture.viewport.start;
+      const width = Math.max(0.04, Math.min(1, originalWidth * gesture.distance / distance));
+      const absoluteCenter = gesture.viewport.start + originalWidth * gesture.center;
+      onViewportChange(clampHostViewport({
+        start: absoluteCenter - width * gesture.center,
+        end: absoluteCenter + width * (1 - gesture.center),
+      }));
+      return;
+    }
+    if (gesture?.mode === 'pan' && gesture.pointerId === event.pointerId) {
+      const bounds = chartRef.current?.getBoundingClientRect();
+      const width = gesture.viewport.end - gesture.viewport.start;
+      const shift = bounds?.width ? -(event.clientX - gesture.startX) / bounds.width * width : 0;
+      onViewportChange(clampHostViewport({ start: gesture.viewport.start + shift, end: gesture.viewport.end + shift }));
+    }
+  }
+
+  function onPointerUp(event) {
+    pointersRef.current.delete(event.pointerId);
+    try { event.currentTarget.releasePointerCapture?.(event.pointerId); } catch {}
+    if (pointersRef.current.size === 0) gestureRef.current = null;
+  }
+
+  function onKeyDown(event) {
+    if (!visibleFrames.length) return;
+    const currentIndex = Math.max(0, visibleFrames.findIndex(frame => frame.sample_sequence === crosshairSequence));
+    if (event.key === 'ArrowLeft' || event.key === 'ArrowRight') {
+      event.preventDefault();
+      if (event.shiftKey) {
+        const width = boundedViewport.end - boundedViewport.start;
+        const shift = width * (event.key === 'ArrowLeft' ? -0.1 : 0.1);
+        onViewportChange(clampHostViewport({ start: boundedViewport.start + shift, end: boundedViewport.end + shift }));
+      } else {
+        const next = Math.max(0, Math.min(visibleFrames.length - 1, currentIndex + (event.key === 'ArrowLeft' ? -1 : 1)));
+        onCrosshairChange(visibleFrames[next].sample_sequence);
+      }
+    } else if (event.key === 'Home' || event.key === 'End') {
+      event.preventDefault();
+      onCrosshairChange((event.key === 'Home' ? visibleFrames[0] : visibleFrames.at(-1)).sample_sequence);
+    } else if (event.key === '+' || event.key === '=') {
+      event.preventDefault(); zoomAt(0.75);
+    } else if (event.key === '-') {
+      event.preventDefault(); zoomAt(1.25);
+    }
+  }
+
+  return (
+    <section className="host-resource-chart" aria-label={`${title} chart`}>
+      <div className="host-resource-chart-heading">
+        <span><strong>{title}</strong><small>{description}</small></span>
+        {!percentScale && (
+          <button type="button" onClick={() => setScale(previous => (
+            previous.mode === 'auto' ? { mode: 'fixed', fixedMax: autoMaximum } : { mode: 'auto', fixedMax: null }
+          ))}>{scale.mode === 'auto' ? 'Auto scale' : `Fixed ${formatValue(scale.fixedMax)}`}</button>
+        )}
+      </div>
+      <div className="host-resource-chart-legend" aria-label={`${title} series`}>
+        {chartSeries.map(entry => (
+          <button
+            type="button" key={entry.key} aria-pressed={!hiddenSeries[entry.key]}
+            onClick={() => setHiddenSeries(previous => ({ ...previous, [entry.key]: !previous[entry.key] }))}
+          ><i style={{ background: entry.color }} />{entry.label}</button>
+        ))}
+      </div>
+      <div
+        className="host-resource-chart-canvas" ref={chartRef} role="application" tabIndex="0"
+        aria-label={`${title}. Drag to pan, wheel or pinch to zoom, arrow keys move the synchronized crosshair, shift plus arrows pan, plus and minus zoom.`}
+        onPointerDown={onPointerDown} onPointerMove={onPointerMove} onPointerUp={onPointerUp} onPointerCancel={onPointerUp}
+        onKeyDown={onKeyDown}
+      >
+        <svg viewBox={`0 0 ${HOST_RESOURCE_CHART_WIDTH} ${HOST_RESOURCE_CHART_HEIGHT}`} aria-hidden="true">
+          {[0, 0.25, 0.5, 0.75, 1].map(fraction => {
+            const y = HOST_RESOURCE_CHART_MARGIN.top + plotHeight * fraction;
+            return <line key={fraction} className="host-resource-chart-grid" x1={HOST_RESOURCE_CHART_MARGIN.left} x2={HOST_RESOURCE_CHART_WIDTH - HOST_RESOURCE_CHART_MARGIN.right} y1={y} y2={y} />;
+          })}
+          <text x="4" y={HOST_RESOURCE_CHART_MARGIN.top + 4}>{formatValue(yMaximum)}</text>
+          <text x="4" y={HOST_RESOURCE_CHART_MARGIN.top + plotHeight + 4}>{formatValue(0)}</text>
+          {activeSeries.flatMap(entry => entry.samples.map(sample => (
+            sample.gap || sample.min == null || sample.max == null ? null : (
+              <line key={`${entry.key}-${sample.endSequence}`} className="host-resource-chart-range" stroke={entry.color}
+                x1={xFor(sample)} x2={xFor(sample)} y1={yFor(sample.min)} y2={yFor(sample.max)} />
+            )
+          )))}
+          {activeSeries.map(entry => (
+            <path key={entry.key} className="host-resource-chart-line" stroke={entry.color}
+              strokeDasharray={entry.dashed ? '6 4' : undefined}
+              d={hostResourceChartPath(entry.samples, 'average', xFor, yFor)} />
+          ))}
+          {crosshairX != null && <line className="host-resource-chart-crosshair" x1={crosshairX} x2={crosshairX} y1={HOST_RESOURCE_CHART_MARGIN.top} y2={HOST_RESOURCE_CHART_MARGIN.top + plotHeight} />}
+          <text x={HOST_RESOURCE_CHART_MARGIN.left} y={HOST_RESOURCE_CHART_HEIGHT - 7}>{formatHostResourceTimestamp(visibleFrames[0]?.captured_at)}</text>
+          <text textAnchor="end" x={HOST_RESOURCE_CHART_WIDTH - HOST_RESOURCE_CHART_MARGIN.right} y={HOST_RESOURCE_CHART_HEIGHT - 7}>{formatHostResourceTimestamp(visibleFrames.at(-1)?.captured_at)}</text>
+        </svg>
+        {crosshairFrame && (
+          <div className="host-resource-chart-tooltip" role="status">
+            <strong>{formatHostResourceTimestamp(crosshairFrame.captured_at)} / seq {crosshairFrame.sample_sequence}</strong>
+            {chartSeries.map(entry => (
+              <span key={entry.key}><i style={{ background: entry.color }} />{entry.label}: {entry.format(hostResourceMetricValue(
+                entry.visibleFrames.find(frame => frame.sample_sequence === crosshairFrame.sample_sequence), entry.metric,
+              ))}</span>
+            ))}
+          </div>
+        )}
+      </div>
+      <div className="host-resource-chart-stats">
+        {chartSeries.filter(entry => !hiddenSeries[entry.key]).map(entry => {
+          const stats = hostResourceIntervalStats(entry.visibleFrames, entry.metric);
+          const peakFrame = entry.visibleFrames.find(frame => frame.sample_sequence === stats.peakSequence);
+          return (
+            <span key={entry.key}><strong>{entry.label}</strong> current {entry.format(stats.current)} / min {entry.format(stats.min)} / avg {entry.format(stats.average)} / max {entry.format(stats.max)} / p95 {entry.format(stats.p95)}<small>Peak {formatHostResourceTimestamp(peakFrame?.captured_at)}</small></span>
+          );
+        })}
+      </div>
+      <details className="host-resource-chart-data">
+        <summary>Accessible data table</summary>
+        <div><table><caption>Latest {Math.min(120, visibleFrames.length)} of {visibleFrames.length} visible samples</caption><thead><tr><th>Time / sequence</th>{chartSeries.map(entry => <th key={entry.key}>{entry.label}</th>)}</tr></thead><tbody>
+          {visibleFrames.slice(-120).map(frame => <tr key={frame.sample_sequence}><th>{formatHostResourceTimestamp(frame.captured_at)} / {frame.sample_sequence}</th>{chartSeries.map(entry => <td key={entry.key}>{entry.format(hostResourceMetricValue(entry.visibleFrames.find(candidate => candidate.sample_sequence === frame.sample_sequence), entry.metric))}</td>)}</tr>)}
+        </tbody></table></div>
+      </details>
+    </section>
+  );
+}
+
+function hostResourceProcessRows(processes, search, filter, sort, expanded) {
+  const query = search.trim().toLowerCase();
+  const matches = process => (!query || [process.name, process.agentLabel, process.workspaceLabel, process.pid, process.attributionReason]
+    .some(value => String(value || '').toLowerCase().includes(query)))
+    && (filter === 'all' || process.attributionLevel === filter);
+  const candidates = processes.filter(matches);
+  const candidateKeys = new Set(candidates.map(process => process.stableKey));
+  const compare = (left, right) => {
+    if (sort === 'name') return (left.agentLabel || left.name).localeCompare(right.agentLabel || right.name) || left.pid - right.pid;
+    if (sort === 'memory') return right.memoryBytes - left.memoryBytes || left.pid - right.pid;
+    if (sort === 'read') return right.ioReadBps - left.ioReadBps || left.pid - right.pid;
+    if (sort === 'write') return right.ioWriteBps - left.ioWriteBps || left.pid - right.pid;
+    return right.cpuHostPercent - left.cpuHostPercent || left.pid - right.pid;
+  };
+  const children = new Map();
+  candidates.forEach(process => {
+    const parent = candidateKeys.has(process.parentKey) ? process.parentKey : '';
+    children.set(parent, [...(children.get(parent) || []), process]);
+  });
+  const rows = [];
+  function visit(parent, depth) {
+    (children.get(parent) || []).sort(compare).forEach(process => {
+      rows.push({ process, depth });
+      if (expanded[process.stableKey] !== false) visit(process.stableKey, depth + 1);
+    });
+  }
+  visit('', 0);
+  return rows;
+}
+
+function HostResourceDashboard({
+  snapshot, error, history, details, subscription,
+  onBack, onRefresh, onSubscribe, onUnsubscribe,
+}) {
+  const normalized = React.useMemo(() => normalizeHostResources(snapshot), [snapshot]);
+  const [nowMs, setNowMs] = React.useState(Date.now());
+  const [range, setRange] = React.useState('live');
+  const [pausedSequence, setPausedSequence] = React.useState(null);
+  const [viewport, setViewport] = React.useState({ start: 0, end: 1 });
+  const [crosshairSequence, setCrosshairSequence] = React.useState(0);
+  const [aggregateOnly, setAggregateOnly] = React.useState(false);
+  const [processSearch, setProcessSearch] = React.useState('');
+  const [processFilter, setProcessFilter] = React.useState('all');
+  const [processSort, setProcessSort] = React.useState('cpu');
+  const [expandedProcesses, setExpandedProcesses] = React.useState({});
+  const [selectedProcessKey, setSelectedProcessKey] = React.useState('');
+  React.useEffect(() => {
+    onSubscribe(aggregateOnly);
+    return () => onUnsubscribe();
+  }, [aggregateOnly, onSubscribe, onUnsubscribe]);
+  React.useEffect(() => {
+    const timer = setInterval(() => setNowMs(Date.now()), 1_000);
+    return () => clearInterval(timer);
+  }, []);
+  const liveHistory = React.useMemo(() => (
+    pausedSequence == null ? history : history.filter(frame => frame.sample_sequence <= pausedSequence)
+  ), [history, pausedSequence]);
+  const rangeFrames = React.useMemo(() => selectHostResourceRange(liveHistory, range), [liveHistory, range]);
+  React.useEffect(() => {
+    if (!crosshairSequence && rangeFrames.length) setCrosshairSequence(rangeFrames.at(-1).sample_sequence);
+  }, [crosshairSequence, rangeFrames]);
+  const system = normalized.system;
+  const diskRate = system ? system.disk.readBps + system.disk.writeBps : 0;
+  const networkRate = system ? system.network.receiveBps + system.network.sendBps : 0;
+  const processRows = React.useMemo(() => hostResourceProcessRows(
+    normalized.processes, processSearch, processFilter, processSort, expandedProcesses,
+  ), [normalized.processes, processSearch, processFilter, processSort, expandedProcesses]);
+  const selectedProcess = normalized.processes.find(process => process.stableKey === selectedProcessKey) || null;
+  const selectedProcessFrames = React.useMemo(() => (selectedProcessKey ? details.flatMap(detail => {
+    const process = (detail.processes || []).find(entry => entry.stable_key === selectedProcessKey);
+    if (!process) return [];
+    return [{
+      frame_kind: 'system', sample_sequence: detail.sample_sequence, captured_at: detail.captured_at,
+      sample_interval_ms: detail.sample_interval_ms, dropped_gap_count: detail.dropped_gap_count,
+      status: detail.status, cpu: { total_percent: process.cpu_host_percent },
+      disk: { read_bps: process.io_read_bps, write_bps: process.io_write_bps },
+    }];
+  }) : []), [details, selectedProcessKey]);
+  const percent = value => value == null ? '—' : formatHostResourcePercent(value);
+  const rate = value => value == null ? '—' : formatHostResourceRate(value);
+  const cpuSeries = [
+    { key: 'cpu-total', metric: 'cpu_total_percent', label: 'Total', color: '#58a6ff', format: percent },
+    { key: 'cpu-user', metric: 'cpu_user_percent', label: 'User', color: '#3fb950', format: percent },
+    { key: 'cpu-kernel', metric: 'cpu_privileged_percent', label: 'Kernel', color: '#d29922', format: percent },
+    ...(selectedProcessFrames.length ? [{ key: 'process-cpu', metric: 'cpu_total_percent', label: `${selectedProcess?.agentLabel || selectedProcess?.name || 'Process'} overlay`, color: '#f778ba', format: percent, frames: selectedProcessFrames, dashed: true }] : []),
+  ];
+  const diskSeries = [
+    { key: 'disk-read', metric: 'disk_read_bps', label: 'Read', color: '#58a6ff', format: rate },
+    { key: 'disk-write', metric: 'disk_write_bps', label: 'Write', color: '#f0883e', format: rate },
+    ...(selectedProcessFrames.length ? [
+      { key: 'process-read', metric: 'disk_read_bps', label: 'Process read overlay', color: '#bc8cff', format: rate, frames: selectedProcessFrames, dashed: true },
+      { key: 'process-write', metric: 'disk_write_bps', label: 'Process write overlay', color: '#f778ba', format: rate, frames: selectedProcessFrames, dashed: true },
+    ] : []),
+  ];
+  return (
+    <div className="host-resource-dashboard" data-testid="host-resource-dashboard">
+      <div className="automations-header host-resource-header">
+        <button className="automations-back" onClick={onBack} title="Back to sessions">&larr;</button>
+        <div className="automations-header-text">
+          <h2>Host resources</h2>
+          <p>Live, ephemeral Windows metrics. Process commands and executable paths never leave the proxy.</p>
+        </div>
+        <button type="button" className="usage-dashboard-refresh" onClick={() => onRefresh(true)} aria-label="Capture host resource detail now">Capture detail</button>
+      </div>
+      <div className="host-resource-meta">
+        <span className={`host-resource-status ${normalized.status}`}>{subscription?.status === 'reconnecting' ? 'Reconnecting' : normalized.available ? 'Live' : 'Unavailable'}</span>
+        <span>{aggregateOnly ? 'Aggregate-only' : normalized.machineLabel || 'Windows host'}</span>
+        <span>{formatHostResourceAge(normalized.capturedAt, nowMs)}</span>
+        <span>1s system / 5s detail / seq {normalized.sampleSequence || '—'}</span>
+      </div>
+      <div className="host-resource-controls" aria-label="Host resource timeline controls">
+        <div className="host-resource-range" role="group" aria-label="Time range">
+          {[['live', 'Live'], ['1m', '1m'], ['5m', '5m'], ['15m', '15m'], ['since_open', 'Since open']].map(([value, label]) => (
+            <button key={value} type="button" className={range === value ? 'active' : ''} aria-pressed={range === value}
+              onClick={() => { setRange(value); setViewport({ start: 0, end: 1 }); }}>{label}</button>
+          ))}
+        </div>
+        <button type="button" onClick={() => setPausedSequence(previous => previous == null ? history.at(-1)?.sample_sequence || 0 : null)}>{pausedSequence == null ? 'Pause' : 'Resume'}</button>
+        <button type="button" disabled={viewport.start === 0 && viewport.end === 1} onClick={() => setViewport({ start: 0, end: 1 })}>Reset zoom</button>
+        <label><input type="checkbox" checked={aggregateOnly} onChange={event => { setAggregateOnly(event.target.checked); setSelectedProcessKey(''); }} /> Aggregate-only privacy</label>
+        <span>{rangeFrames.length} samples{pausedSequence == null ? '' : ` / paused at ${pausedSequence}`}</span>
+      </div>
+      {(error || normalized.error) && <div className="host-resource-error" role="status">{error?.message || normalized.error?.message}</div>}
+      {system ? (
+        <>
+          <div className="host-resource-summary" aria-label="Host resource summary">
+            <div><strong>{Math.round(system.cpuPercent)}%</strong><span>CPU</span><small>{system.cpu.logicalCoreCount || '—'} logical / {system.cpu.physicalCoreCount || '—'} physical cores</small></div>
+            <div><strong>{Math.round(system.memory.usedPercent)}%</strong><span>memory</span><small>{formatHostResourceBytes(system.memory.usedBytes)} / {formatHostResourceBytes(system.memory.totalBytes)}; commit {Math.round(system.memory.commitPercent)}%</small></div>
+            <div><strong>{formatHostResourceRate(diskRate)}</strong><span>disk I/O</span><small>Read {formatHostResourceRate(system.disk.readBps)} / write {formatHostResourceRate(system.disk.writeBps)} / {Math.round(system.disk.busyPercent)}% busy</small></div>
+            <div><strong>{formatHostResourceRate(networkRate)}</strong><span>network I/O</span><small>Receive {formatHostResourceRate(system.network.receiveBps)} / send {formatHostResourceRate(system.network.sendBps)}</small></div>
+          </div>
+          <div className="host-resource-charts">
+            <HostResourceChart title="CPU" description="Host utilization (%)" frames={rangeFrames} series={cpuSeries} percentScale viewport={viewport} onViewportChange={setViewport} crosshairSequence={crosshairSequence} onCrosshairChange={setCrosshairSequence} />
+            <HostResourceChart title="Memory" description="Physical used and committed (%)" frames={rangeFrames} series={[
+              { key: 'memory-used', metric: 'memory_used_percent', label: 'Physical used', color: '#bc8cff', format: percent },
+              { key: 'memory-commit', metric: 'memory_commit_percent', label: 'Committed', color: '#f778ba', format: percent },
+            ]} percentScale viewport={viewport} onViewportChange={setViewport} crosshairSequence={crosshairSequence} onCrosshairChange={setCrosshairSequence} />
+            <HostResourceChart title="Disk" description="Aggregate throughput (IEC bytes/s)" frames={rangeFrames} series={diskSeries} viewport={viewport} onViewportChange={setViewport} crosshairSequence={crosshairSequence} onCrosshairChange={setCrosshairSequence} />
+            <HostResourceChart title="Network" description="Physical-default receive and send (IEC bytes/s)" frames={rangeFrames} series={[
+              { key: 'network-receive', metric: 'network_receive_bps', label: 'Receive', color: '#3fb950', format: rate },
+              { key: 'network-send', metric: 'network_send_bps', label: 'Send', color: '#d29922', format: rate },
+            ]} viewport={viewport} onViewportChange={setViewport} crosshairSequence={crosshairSequence} onCrosshairChange={setCrosshairSequence} />
+          </div>
+          {!aggregateOnly && (
+            <section className="host-resource-process-section" aria-labelledby="host-resource-process-heading">
+              <div className="host-resource-process-heading">
+                <span><strong id="host-resource-process-heading">Processes</strong><small>Union of owned, top CPU, memory, read, and write. Attribution never implies unproved per-session ownership.</small></span>
+                <span>{normalized.attributedProcesses.length} attributed / {normalized.processes.length} shown</span>
+              </div>
+              <div className="host-resource-process-controls">
+                <label>Search <input value={processSearch} onChange={event => setProcessSearch(event.target.value)} placeholder="Name, PID, agent, workspace" /></label>
+                <label>Attribution <select value={processFilter} onChange={event => setProcessFilter(event.target.value)}><option value="all">All</option><option value="owned">Owned</option><option value="runtime">Runtime match</option><option value="workspace-associated">Workspace-associated</option><option value="unattributed">Unattributed</option></select></label>
+                <label>Sort <select value={processSort} onChange={event => setProcessSort(event.target.value)}><option value="cpu">CPU</option><option value="memory">Memory</option><option value="read">Read</option><option value="write">Write</option><option value="name">Name</option></select></label>
+              </div>
+              {selectedProcess && (
+                <div className="host-resource-process-overlay" role="region" aria-label={`Process detail for ${selectedProcess.agentLabel || selectedProcess.name}`}>
+                  <div><strong>{selectedProcess.agentLabel || selectedProcess.name}</strong><span>{selectedProcess.name} / PID {selectedProcess.pid} / started {selectedProcess.startTime ? formatHostResourceTimestamp(selectedProcess.startTime) : 'unknown'}</span><small>{selectedProcess.attributionLevel}: {selectedProcess.attributionReason}. CPU and disk overlays use the same synchronized timebase.</small></div>
+                  <button type="button" onClick={() => setSelectedProcessKey('')}>Remove overlay</button>
+                  <dl><div><dt>Host CPU</dt><dd>{selectedProcess.cpuHostPercent.toFixed(1)}%</dd></div><div><dt>Core equivalent</dt><dd>{selectedProcess.cpuCoreEquivalent.toFixed(1)}%</dd></div><div><dt>Working set</dt><dd>{formatHostResourceBytes(selectedProcess.memoryBytes)}</dd></div><div><dt>Private / commit</dt><dd>{formatHostResourceBytes(selectedProcess.privateBytes)} / {formatHostResourceBytes(selectedProcess.commitBytes)}</dd></div><div><dt>Threads / handles</dt><dd>{selectedProcess.threadCount} / {selectedProcess.handleCount}</dd></div><div><dt>I/O operations</dt><dd>R {selectedProcess.ioReadOps} / W {selectedProcess.ioWriteOps}</dd></div><div><dt>64-bit byte counters</dt><dd>R {selectedProcess.counterTotals.ioReadBytes} / W {selectedProcess.counterTotals.ioWriteBytes}</dd></div><div><dt>Detail samples</dt><dd>{selectedProcessFrames.length} / 5s cadence</dd></div></dl>
+                </div>
+              )}
+              <div className="host-resource-process-scroll">
+                <table className="host-resource-process-table">
+                  <thead><tr><th scope="col">Agent / process tree</th><th scope="col">Confidence</th><th scope="col">CPU host / core</th><th scope="col">Memory</th><th scope="col">Read</th><th scope="col">Write</th></tr></thead>
+                  <tbody>
+                    {processRows.map(({ process, depth }) => (
+                      <tr key={process.stableKey} className={`${process.attributed ? 'attributed' : ''} ${selectedProcessKey === process.stableKey ? 'selected' : ''}`} data-agent-attributed={process.attributed ? 'true' : 'false'}>
+                        <td style={{ '--process-depth': depth }}>
+                          {process.childCount > 0 && <button className="host-resource-process-expand" type="button" aria-label={`${expandedProcesses[process.stableKey] === false ? 'Expand' : 'Collapse'} ${process.name}`} aria-expanded={expandedProcesses[process.stableKey] !== false} onClick={() => setExpandedProcesses(previous => ({ ...previous, [process.stableKey]: previous[process.stableKey] !== false ? false : true }))}>{expandedProcesses[process.stableKey] === false ? '+' : '-'}</button>}
+                          <button className="host-resource-process-select" type="button" onClick={() => setSelectedProcessKey(process.stableKey)}><strong>{process.agentLabel || process.name}</strong><span>{process.agentLabel ? `${process.name} / ` : ''}PID {process.pid}{process.workspaceLabel ? ` / ${process.workspaceLabel}` : ''}{process.parentKey ? ' / child process' : process.parentPid ? ` / parent PID ${process.parentPid} outside sample` : ''}</span></button>
+                        </td>
+                        <td data-label="Confidence"><strong>{process.attributionLevel}</strong><span title={process.attributionReason}>{process.attributionReason}</span></td>
+                        <td data-label="CPU host / core">{process.cpuHostPercent.toFixed(1)}% / {process.cpuCoreEquivalent.toFixed(1)}%</td>
+                        <td data-label="Memory">{formatHostResourceBytes(process.memoryBytes)}</td>
+                        <td data-label="Read">{formatHostResourceRate(process.ioReadBps)}</td>
+                        <td data-label="Write">{formatHostResourceRate(process.ioWriteBps)}</td>
+                      </tr>
+                    ))}
+                  </tbody>
+                </table>
+              </div>
+            </section>
+          )}
+          <div className="host-resource-privacy"><strong>Privacy boundary:</strong> sanitized metrics cross the authenticated relay only to this requester while this view is open. The relay does not cache, persist, log, or restore them. Process command lines and executable paths remain local and are never transmitted. Aggregate-only mode also removes machine, device, adapter, workspace, process, and PID labels.</div>
+        </>
+      ) : (
+        <div className="usage-dashboard-empty host-resource-empty"><strong>Waiting for the Windows proxy.</strong><span>The subscription is {subscription?.status || 'starting'}. Gaps remain visible; unavailable samples are not interpolated.</span></div>
+      )}
+    </div>
+  );
+}
+
+
+function fleetWorkContextProgress(context) {
+  const explicit = Number(context?.percent);
+  if (Number.isFinite(explicit)) return Math.max(0, Math.min(100, explicit));
+  const completed = Number(context?.completed);
+  const total = Number(context?.total);
+  return Number.isInteger(completed) && Number.isInteger(total) && total > 0
+    ? Math.max(0, Math.min(100, (completed / total) * 100))
+    : null;
+}
+
+function fleetSessionSnippet(session, sessionMessages) {
+  const direct = safeString(session?.last_snippet).trim();
+  if (direct) return direct.replace(/\s+/g, ' ').slice(0, 180);
+  const list = Array.isArray(sessionMessages) ? sessionMessages : [];
+  for (let index = list.length - 1; index >= 0; index -= 1) {
+    const text = stripTitleNoise(list[index]?.content || contentBlocksFallback(list[index]?.content_blocks));
+    if (text) return text.slice(0, 180);
+  }
+  return 'No recent message reported.';
+}
+
+function fleetElapsed(activity, nowMs) {
+  if (activity?.goal) return formatGoalElapsed(activity.goal, nowMs);
+  const startedAt = Date.parse(activity?.startedAt || activity?.started_at || activity?.since || '');
+  return Number.isFinite(startedAt)
+    ? formatClockDuration(Math.max(0, (nowMs - startedAt) / 1000), { includeSeconds: true })
+    : 'live';
+}
+
+function reconcileFleetSelection(previous, entryById, limit = MAX_BROADCAST_SESSIONS) {
+  const next = previous.filter(id => entryById[id]?.canReceiveBroadcast).slice(0, limit);
+  return next.length === previous.length && next.every((id, index) => id === previous[index])
+    ? previous : next;
+}
+
+function FleetView({ sessions, activities, thinking, permissionPrompts, errorPrompts, messages, agentConfigs, sessionAttention, health, connected, deliveryStates, onBroadcastSend, onBack, onSelectSession }) {
+  const [nowMs, setNowMs] = React.useState(Date.now());
+  const [showIdle, setShowIdle] = React.useState(false);
+  const [selectedIds, setSelectedIds] = React.useState([]);
+  const [broadcastPrompt, setBroadcastPrompt] = React.useState('');
+  const [broadcastConfirmation, setBroadcastConfirmation] = React.useState('');
+  const [broadcastError, setBroadcastError] = React.useState('');
+  const [broadcastReceipts, setBroadcastReceipts] = React.useState({});
+  React.useEffect(() => {
+    const timer = setInterval(() => setNowMs(Date.now()), 1000);
+    return () => clearInterval(timer);
+  }, []);
+  const allEntries = React.useMemo(() => (sessions || []).map(session => {
+    const id = sessionIdOf(session);
+    const hasLiveActivity = Object.prototype.hasOwnProperty.call(activities, id);
+    const activity = hasLiveActivity ? (activities[id] || { kind: 'idle', label: '' }) : (session?.activity || { kind: 'idle', label: '' });
+    const prompt = permissionPrompts[id] || (isBlockingErrorPrompt(errorPrompts[id]) ? errorPrompts[id] : null);
+    // Completion cues remain useful in the sidebar/toast, but they are not a
+    // blocking agent condition. Fleet reserves Needs attention for prompts,
+    // failures, and other actionable signals so a newly active session cannot
+    // be masked by an older completion notification.
+    const attentionSignal = sessionAttention[id] || null;
+    const attention = !!prompt || attentionSignal?.kind === 'goal_attention';
+    const config = agentConfigs[id] || {};
+    const agentType = session?.agent_type;
+    const goalCapable = goalLifecycleSupported(agentType, config.capabilities);
+    const capabilitySafeActivity = goalCapable ? activity : { ...activity, goal: null };
+    const activityForState = thinking[id] && !capabilitySafeActivity?.kind
+      ? { ...capabilitySafeActivity, kind: 'thinking' }
+      : capabilitySafeActivity;
+    const state = classifyFleetActivity(activityForState, attention, {
+      connected,
+      health: health[id],
+      nowMs,
+      requireFreshness: true,
+    });
+    const needsAttention = state === 'needs_attention';
+    const working = fleetStateIsWorking(state);
+    const agent = sessionAgent(session, config);
+    const workContext = projectFleetWorkContext({
+      agentType,
+      capabilities: config.capabilities,
+      activity: capabilitySafeActivity,
+      latestUserRequest: latestUserRequestFromMessages(messages[id] || []),
+    });
+    const goal = workContext.kind === 'goal' ? capabilitySafeActivity?.goal || null : null;
+    const activityKind = safeString(capabilitySafeActivity?.kind).replace(/_/g, ' ');
+    return {
+      id, session, agent, activity: capabilitySafeActivity, attention: needsAttention, working, state, goal, config,
+      title: sidebarChatTitle(session, id, config, messages[id] || []),
+      status: prompt ? (safeString(prompt.title).trim() || 'Action required')
+        : (safeString(activity?.label).trim()
+          || (state === 'idle' ? (goal ? 'Goal paused' : 'Idle') : (activityKind || (goal ? 'Goal active' : 'Working')))),
+      workContext,
+      progress: fleetWorkContextProgress(workContext),
+      snippet: fleetSessionSnippet(session, messages[id] || []),
+      health: health[id] || 'unknown',
+      canReceiveBroadcast: sessionSupportsBroadcast(session, agentConfigs[id], health[id] || 'unknown', connected),
+      freshness: fleetFreshnessLabel(activity),
+      activityLatencyMs: Number.isFinite(Number(activity?.transport?.latency_ms)) ? Math.round(Number(activity.transport.latency_ms)) : null,
+    };
+  }).filter(Boolean).sort((left, right) => (
+    Number(right.attention) - Number(left.attention)
+    || Number(right.working) - Number(left.working)
+    || left.title.localeCompare(right.title)
+  )), [sessions, activities, thinking, permissionPrompts, errorPrompts, messages, agentConfigs, sessionAttention, health, connected, nowMs]);
+  const entries = React.useMemo(() => allEntries.filter(entry => showIdle || entry.state !== 'idle' || entry.goal), [allEntries, showIdle]);
+  const attentionCount = allEntries.filter(entry => entry.state === 'needs_attention').length;
+  const workingCount = allEntries.filter(entry => entry.working).length;
+  const workingGoalCount = allEntries.filter(entry => entry.state === 'working_goal').length;
+  const idleCount = allEntries.filter(entry => entry.state === 'idle').length;
+  const entryById = React.useMemo(() => Object.fromEntries(entries.map(entry => [entry.id, entry])), [entries]);
+  const expectedConfirmation = `SEND TO ${selectedIds.length} SESSIONS`;
+  React.useEffect(() => {
+    if (selectedIds.length <= MAX_BROADCAST_SESSIONS
+      && selectedIds.every(id => entryById[id]?.canReceiveBroadcast)) return;
+    setSelectedIds(previous => reconcileFleetSelection(previous, entryById));
+  }, [entryById, selectedIds]);
+  React.useEffect(() => {
+    if (Object.keys(broadcastReceipts).length === 0) return;
+    setBroadcastReceipts(previous => {
+      let changed = false;
+      const next = {};
+      Object.entries(previous).forEach(([sessionId, receipt]) => {
+        const lifecycle = deliveryStates[receipt.clientMessageId] || receipt.status;
+        const status = ['offline_queued', 'busy_queued', 'steered'].includes(lifecycle) ? 'queued' : lifecycle;
+        const normalized = ['queued', 'accepted', 'launch_accepted', 'delivered', 'agent_started', 'failed'].includes(status) ? status : receipt.status;
+        next[sessionId] = normalized === receipt.status ? receipt : { ...receipt, status: normalized };
+        if (next[sessionId] !== receipt) changed = true;
+      });
+      return changed ? next : previous;
+    });
+  }, [deliveryStates]);
+
+  function toggleBroadcastSelection(sessionId) {
+    setBroadcastError('');
+    setSelectedIds(previous => previous.includes(sessionId)
+      ? previous.filter(id => id !== sessionId)
+      : previous.length < MAX_BROADCAST_SESSIONS ? [...previous, sessionId] : previous);
+  }
+
+  function submitBroadcast() {
+    const normalized = normalizeBroadcastRequest({
+      session_ids: selectedIds,
+      content: broadcastPrompt,
+      confirmation: broadcastConfirmation,
+    }, sessionId => !!entryById[sessionId]?.canReceiveBroadcast);
+    if (!normalized.ok) {
+      setBroadcastError(normalized.error);
+      return;
+    }
+    const initial = createBroadcastReceiptState(normalized.sessionIds);
+    const receipts = {};
+    normalized.sessionIds.forEach(sessionId => {
+      const clientMessageId = onBroadcastSend(sessionId, normalized.content);
+      receipts[sessionId] = {
+        ...initial[sessionId],
+        clientMessageId,
+        title: entryById[sessionId]?.title || sessionId,
+      };
+    });
+    setBroadcastReceipts(receipts);
+    setBroadcastPrompt('');
+    setBroadcastConfirmation('');
+    setBroadcastError('');
+  }
+
+  return (
+    <div className="fleet-view" data-testid="fleet-view">
+      <div className="automations-header fleet-view-header">
+        <button className="automations-back" onClick={onBack} title="Back to sessions">{'\u2190'}</button>
+        <div className="automations-header-text">
+          <h2>Fleet view</h2>
+          <p>Live monitoring across every active harness session.</p>
+        </div>
+      </div>
+      <div className="fleet-summary" aria-label="Fleet summary">
+        <div><strong>{allEntries.length}</strong><span>sessions</span></div>
+        <div className={workingCount ? 'working' : ''}><strong>{workingCount}</strong><span>working</span></div>
+        <div className={workingGoalCount ? 'working-goal' : ''}><strong>{workingGoalCount}</strong><span>on goal</span></div>
+        <div><strong>{idleCount}</strong><span>idle</span></div>
+        <div className={attentionCount ? 'attention' : ''}><strong>{attentionCount}</strong><span>need attention</span></div>
+      </div>
+      <div className="fleet-filter-row">
+        <span>{workingCount} working now</span>
+        <button type="button" onClick={() => setShowIdle(value => !value)} aria-pressed={showIdle}>
+          {showIdle ? 'Hide idle sessions' : `Show ${idleCount} idle session${idleCount === 1 ? '' : 's'}`}
+        </button>
+      </div>
+      <section className="fleet-broadcast" data-testid="broadcast-send">
+        <div className="fleet-broadcast-heading">
+          <div><strong>Broadcast prompt</strong><span>Select up to {MAX_BROADCAST_SESSIONS} capable sessions.</span></div>
+          <span>{selectedIds.length} selected</span>
+        </div>
+        <textarea
+          value={broadcastPrompt}
+          onChange={event => setBroadcastPrompt(event.target.value)}
+          maxLength={MAX_BROADCAST_CONTENT_CHARS}
+          placeholder="Prompt every selected session..."
+          aria-label="Broadcast prompt"
+        />
+        <div className="fleet-broadcast-confirm">
+          <label><span>Type <strong>{expectedConfirmation}</strong> to confirm</span><input value={broadcastConfirmation} onChange={event => setBroadcastConfirmation(event.target.value)} aria-label="Broadcast confirmation" /></label>
+          <button type="button" onClick={submitBroadcast} disabled={!connected || selectedIds.length === 0 || !broadcastPrompt.trim() || broadcastConfirmation !== expectedConfirmation}>Send to {selectedIds.length || 0}</button>
+        </div>
+        {broadcastError && <div className="fleet-broadcast-error" role="alert">{broadcastError}</div>}
+        {Object.keys(broadcastReceipts).length > 0 && (
+          <div className="fleet-broadcast-receipts" aria-label="Broadcast delivery receipts">
+            {Object.entries(broadcastReceipts).map(([sessionId, receipt]) => <span key={sessionId} className={`fleet-broadcast-receipt ${receipt.status}`} title={receipt.title}><strong>{receipt.title}</strong><em>{receipt.status.replace(/_/g, ' ')}</em></span>)}
+          </div>
+        )}
+      </section>
+      {entries.length === 0 ? (
+        <div className="fleet-empty"><strong>Fleet is idle</strong><span>{idleCount} connected session{idleCount === 1 ? ' is' : 's are'} idle. Show idle sessions to inspect them.</span></div>
+      ) : (
+        <div className="fleet-grid">
+          {entries.map(entry => (
+            <div role="button" tabIndex={0} className={`fleet-card state-${entry.state}${entry.attention ? ' attention' : ''}${selectedIds.includes(entry.id) ? ' selected' : ''}`} key={entry.id} data-session-id={entry.id} data-activity-state={entry.state} data-activity-lag-ms={entry.activityLatencyMs ?? ''} onClick={() => onSelectSession(entry.id, entry.session)} onKeyDown={event => { if (event.key === 'Enter' || event.key === ' ') onSelectSession(entry.id, entry.session); }}>
+              <span className="fleet-card-top">
+                <span className="agent-badge" style={{ color: entry.agent.color, borderColor: entry.agent.color + '55', background: entry.agent.color + '18' }}>
+                  {entry.agent.logo ? <img src={entry.agent.logo} alt="" className="agent-badge-logo" /> : entry.agent.abbr}
+                </span>
+                <span className="fleet-card-identity"><strong>{entry.title}</strong><span>{entry.agent.name}</span></span>
+                <span className={`fleet-health ${entry.health}`} title={entry.health} />
+                <label className={`fleet-select${entry.canReceiveBroadcast ? '' : ' unavailable'}`} onClick={event => event.stopPropagation()}>
+                  <input type="checkbox" checked={selectedIds.includes(entry.id)} disabled={!entry.canReceiveBroadcast} onChange={() => toggleBroadcastSelection(entry.id)} aria-label={`Select ${entry.title} for broadcast`} />
+                  <span>{entry.canReceiveBroadcast ? 'Select' : 'Unavailable'}</span>
+                </label>
+              </span>
+              <span className="fleet-card-status">
+                {entry.working && <NativeActivitySpinner agentType={entry.session?.agent_type} compact animate={false} />}
+                <span className={`fleet-state-badge ${entry.state}`}>{fleetStateLabel(entry.state)}</span>
+                <strong>{entry.status}</strong>
+                {entry.working && <time>{fleetElapsed(entry.activity, nowMs)}</time>}
+              </span>
+              <span className="fleet-freshness" title="Proxy-to-Fleet delivery time">Activity {entry.freshness}</span>
+              {entry.session?.agent_type === 'codex_cli' && entry.config?.config_semantics === 'observed_and_next_send' && (
+                <span className="fleet-freshness" title="Native observation and pending next-send override">
+                  Observed {entry.config.observed_model_id || 'unknown'} / {entry.config.observed_effort || 'unknown'}
+                  {' · '}Next {entry.config.next_send_model_id || 'unset'} / {entry.config.next_send_effort || 'unset'}
+                </span>
+              )}
+              <span
+                className={`fleet-work-context kind-${entry.workContext.kind}`}
+                aria-label={`${entry.workContext.label}: ${entry.workContext.text}`}
+                data-work-context-kind={entry.workContext.kind}
+                data-work-context-source={entry.workContext.source}
+              >
+                <strong>{entry.workContext.label}</strong>
+                <span>{entry.workContext.text}</span>
+                {Number.isInteger(entry.workContext.completed) && Number.isInteger(entry.workContext.total)
+                  ? <em>{entry.workContext.completed}/{entry.workContext.total}</em> : null}
+              </span>
+              {(entry.workContext.kind === 'goal' || entry.progress != null) && <span
+                className={`fleet-work-meter kind-${entry.workContext.kind}${entry.progress == null && entry.working ? ' indeterminate' : ''}${entry.working ? '' : ' inactive'}`}
+                aria-label={entry.progress == null
+                  ? `${entry.workContext.label} ${fleetStateLabel(entry.state).toLowerCase()}`
+                  : Number.isInteger(entry.workContext.completed) && Number.isInteger(entry.workContext.total)
+                    ? `${entry.workContext.label} ${entry.workContext.completed} of ${entry.workContext.total} complete`
+                    : `${entry.workContext.label} ${Math.round(entry.progress)}% complete`}
+              >
+                <span style={entry.progress == null ? undefined : { width: `${entry.progress}%` }} />
+              </span>}
+              <span className="fleet-snippet">{entry.snippet}</span>
+              <span className="fleet-jump" aria-label="Open session">Open session <span className="fleet-jump-chevron" aria-hidden="true">{'\u203A'}</span></span>
+            </div>
+          ))}
+        </div>
+      )}
+    </div>
+  );
+}
+
+function TranscriptSearchView({ onBack, onOpenResult }) {
+  const [query, setQuery] = React.useState('');
+  const [project, setProject] = React.useState('');
+  const [harness, setHarness] = React.useState('');
+  const [dateFrom, setDateFrom] = React.useState('');
+  const [dateTo, setDateTo] = React.useState('');
+  const [results, setResults] = React.useState([]);
+  const [indexReady, setIndexReady] = React.useState(true);
+  const [loading, setLoading] = React.useState(false);
+  const [error, setError] = React.useState('');
+
+  async function runSearch(event) {
+    event?.preventDefault();
+    if (query.trim().length < 2 || loading) return;
+    setLoading(true);
+    setError('');
+    try {
+      const params = new URLSearchParams({ q: query.trim(), limit: '50' });
+      if (project.trim()) params.set('project', project.trim());
+      if (harness.trim()) params.set('harness', harness.trim());
+      if (dateFrom) params.set('date_from', dateFrom);
+      if (dateTo) params.set('date_to', dateTo);
+      const response = await fetch(`/api/search/messages?${params.toString()}`, { credentials: 'same-origin' });
+      const body = await response.json().catch(() => ({}));
+      if (!response.ok) throw new Error(body.error || 'Transcript search failed.');
+      setResults(Array.isArray(body.results) ? body.results : []);
+      setIndexReady(body.index?.ready !== false);
+    } catch (searchError) {
+      setResults([]);
+      setError(searchError?.message || 'Transcript search failed.');
+    } finally {
+      setLoading(false);
+    }
+  }
+
+  return (
+    <div className="transcript-search-view" data-testid="transcript-search-view">
+      <div className="automations-header transcript-search-header">
+        <button className="skills-back" onClick={onBack} title="Back to sessions">←</button>
+        <div><h2>Transcript search</h2><p>Search every relay-backed message.</p></div>
+      </div>
+      <form className="transcript-search-form" onSubmit={runSearch}>
+        <label className="transcript-search-query"><span>Search text</span><input value={query} onChange={event => setQuery(event.target.value)} placeholder="Words from any conversation" maxLength={200} autoFocus /></label>
+        <div className="transcript-search-filters">
+          <label><span>Project</span><input value={project} onChange={event => setProject(event.target.value)} placeholder="Exact workspace or project" maxLength={300} /></label>
+          <label><span>Harness</span><input value={harness} onChange={event => setHarness(event.target.value)} placeholder="e.g. codex_cli" maxLength={80} /></label>
+          <label><span>From</span><input type="date" value={dateFrom} onChange={event => setDateFrom(event.target.value)} /></label>
+          <label><span>To</span><input type="date" value={dateTo} onChange={event => setDateTo(event.target.value)} /></label>
+        </div>
+        <button type="submit" className="transcript-search-submit" disabled={query.trim().length < 2 || loading}>{loading ? 'Searching…' : 'Search transcripts'}</button>
+      </form>
+      {!indexReady && <div className="transcript-search-indexing">Older history is still indexing; current results are partial.</div>}
+      {error && <div className="transcript-search-error" role="alert">{error}</div>}
+      {!loading && !error && results.length === 0 && query.trim().length >= 2 && <div className="fleet-empty"><strong>No matches</strong><span>Try fewer words or clear a filter.</span></div>}
+      <div className="transcript-search-results" aria-live="polite">
+        {results.map(result => (
+          <button type="button" className="transcript-search-result" key={`${result.session_id}:${result.message_id}`} onClick={() => onOpenResult(result)}>
+            <span className="transcript-search-result-top"><strong>{result.workspace_name || result.project_root || result.session_id}</strong><em>{result.agent_type || 'unknown'} · {result.role}</em></span>
+            <span className="transcript-search-snippet">{result.snippet || '(empty message)'}</span>
+            <span className="transcript-search-result-bottom"><time>{result.matched_at ? new Date(result.matched_at).toLocaleString() : ''}</time><span>Open match ›</span></span>
+          </button>
+        ))}
+      </div>
+    </div>
+  );
+}
+
+
 function SkillsView({ skills, onRefresh, onBack }) {
   const installed   = skills?.installed   || [];
   const recommended = skills?.recommended || [];
@@ -3994,23 +6649,54 @@ class AppErrorBoundary extends React.Component {
 }
 
 function App() {
-  const { sessions, messages, historyMeta, historyLoading, connected, connectionHealth, unread, setUnread, thinking, thinkingContent, activities, health, deliveryStates, launchStates, justLaunched, setJustLaunched, permissionPrompts, respondToPrompt, errorPrompts, respondToErrorPrompt, interruptSession, agentConfigs, configControlStates, requestAgentConfig, setAgentModel, setAgentEffort, setAgentPermissionMode, setAutoApprovePermissions, setAntigravityMode, setCodexConfig, newThread, openPanel, openNativeWindow, requestChatList, switchChat, newChat, chatLists, requestThreadList, switchThread, threadLists, switchWorkspace, requestTerminalOutput, sendTerminalInput, terminalOutputs, requestFileChanges, respondToFileChange, fileChanges, sendAttachment, send, sendToSession, steerMessage, discardQueuedMessage, editQueuedMessage, queuedMessages, launchSession, resumeSession, closeSession, activeSessionRef, workspaces, branchLists, requestBranchList, switchBranch, createBranch, skillLists, requestSkillList, automationViews, showCodexAutomation, controlResults, directoryListings, requestDirectoryListing, fileContents, requestFileContent, requestHistory, requestHistoryChunk, duplicateProxyAlarms, nightlyValidationFailures } = useRelay();
+  const { sessions, messages, provisionalStreams, historyMeta, historyLoading, connected, connectionHealth, unread, setUnread, thinking, thinkingContent, activities, health, deliveryStates, launchStates, justLaunched, setJustLaunched, permissionPrompts, respondToPrompt, errorPrompts, respondToErrorPrompt, interruptSession, agentConfigs, configControlStates, requestAgentConfig, setAgentModel, setAgentEffort, setAgentPermissionMode, setAutoApprovePermissions, setAntigravityMode, setCodexConfig, newThread, openPanel, openNativeWindow, requestChatList, switchChat, newChat, chatLists, requestThreadList, switchThread, threadLists, switchWorkspace, requestTerminalOutput, sendTerminalInput, terminalOutputs, requestFileChanges, respondToFileChange, fileChanges, sendAttachment, send, sendToSession, steerMessage, discardQueuedMessage, editQueuedMessage, queuedMessages, scheduledSends, scheduleSend, cancelScheduledSend, launchSession, resumeSession, closeSession, activeSessionRef, restoreCachedTranscript, setSessionSubscriptions, workspaces, branchLists, requestBranchList, switchBranch, createBranch, skillLists, requestSkillList, automationViews, showCodexAutomation, controlResults, directoryListings, requestDirectoryListing, fileContents, requestFileContent, requestHistory, requestHistoryChunk, duplicateProxyAlarms, nightlyValidationFailures, latestAppUpdateValidation, providerUsage, providerUsageRefreshReceipt, requestProviderUsageRefresh, providerUsageCostDetail, requestProviderUsageCostDetail, hostResources, hostResourceError, hostResourceHistory, hostResourceDetails, hostResourceSubscription, subscribeHostResources, unsubscribeHostResources, requestHostResourceRefresh, semanticNotifications } = useRelay();
   const [activeSession, setActiveSession] = useState(null);
+  const subscribeActiveTranscript = React.useCallback(
+    listener => subscribeCachedTranscript(activeSession, listener),
+    [activeSession],
+  );
+  const readActiveTranscript = React.useCallback(
+    () => getTranscriptSnapshot(activeSession),
+    [activeSession],
+  );
+  const activeTranscriptMessages = React.useSyncExternalStore(
+    subscribeActiveTranscript,
+    readActiveTranscript,
+    readActiveTranscript,
+  );
   const [drafts, setDrafts]             = useState({});
   const [draftFiles, setDraftFiles]     = useState({});
   const [sidebarOpen, setSidebarOpen]   = useState(false);
   const [toast, setToast]               = useState('');
+  const [attentionToast, setAttentionToast] = useState(null);
+  const [sessionAttention, setSessionAttention] = useState({});
+  const [attentionFeedbackPreferences, setAttentionFeedbackPreferences] = useState(NOTIFICATION_PREFERENCE_PENDING);
+  const [notificationPreferencesLoaded, setNotificationPreferencesLoaded] = useState(false);
+  const attentionToastTimerRef = useRef(null);
+  const previousPermissionPromptsRef = useRef({});
+  const promptSoundReadyRef = useRef(false);
   const [uploading, setUploading]       = useState(false);
   const [showSlashMenu, setShowSlashMenu] = useState(false);
   const [showNewSession, setShowNewSession] = useState(false);
   const [showNotificationSettings, setShowNotificationSettings] = useState(false);
   const [showSessionManagement, setShowSessionManagement] = useState(false);
+  const [showScheduledSend, setShowScheduledSend] = useState(false);
   const [managedSessionId, setManagedSessionId] = useState('');
   const [sessionPreferences, setSessionPreferences] = useState({});
+  const [sessionPreferencesLoaded, setSessionPreferencesLoaded] = useState(false);
+  const [openSidebarMenuId, setOpenSidebarMenuId] = useState('');
   const [showSettings, setShowSettings]     = useState(false);
   const [showComposerSettings, setShowComposerSettings] = useState(false);
+  const [quickSwitcherOpen, setQuickSwitcherOpen] = useState(false);
+  const [quickSwitcherQuery, setQuickSwitcherQuery] = useState('');
+  const [quickSwitcherIndex, setQuickSwitcherIndex] = useState(0);
+  const [shortcutHelpOpen, setShortcutHelpOpen] = useState(false);
   const [stopPending, setStopPending]       = useState({});
+  const [interruptConfirmSession, setInterruptConfirmSession] = useState(null);
+  const interruptConfirmRef = useRef({ sessionId: null, expiresAt: 0 });
+  const interruptConfirmTimerRef = useRef(null);
   const [showJumpButton, setShowJumpButton] = useState(false);
+  const [newMessagesBelow, setNewMessagesBelow] = useState(0);
   const [showChatList, setShowChatList]     = useState(false);
   const [agv2NavigatorOpen, setAgv2NavigatorOpen] = useState(true);
   const [optimisticV2ChatFocus, setOptimisticV2ChatFocus] = useState({});
@@ -4023,10 +6709,18 @@ function App() {
   const [showBranchSelector, setShowBranchSelector] = useState(false);
   const [showAutomations, setShowAutomations]       = useState(false);
   const [showSkills, setShowSkills]                 = useState(false);
+  const [showUsageDashboard, setShowUsageDashboard] = useState(false);
+  const [showHostResourceDashboard, setShowHostResourceDashboard] = useState(false);
+  const [showFleetView, setShowFleetView]           = useState(false);
+  const [showTranscriptSearch, setShowTranscriptSearch] = useState(false);
+  const [transcriptSearchTarget, setTranscriptSearchTarget] = useState(null);
   const [showFileBrowser, setShowFileBrowser]       = useState(false);
   const [fileBrowserPath, setFileBrowserPath]       = useState('.');
   const [viewingFile, setViewingFile]               = useState(null); // { path, content } when viewing a file
   const [transcriptPreview, setTranscriptPreview]   = useState(null);
+  const systemBannerRef = useRef(null);
+  const [systemBannerHeight, setSystemBannerHeight] = useState(0);
+  const quickSwitcherInputRef = useRef(null);
   const [theme, setTheme]                           = useState(() => {
     try { return localStorage.getItem('remote-agent-chat-theme') || 'dark'; } catch { return 'dark'; }
   });
@@ -4038,6 +6732,12 @@ function App() {
       return {};
     }
   });
+  const [showTestSessions, setShowTestSessions] = useState(() => {
+    try { return localStorage.getItem(SHOW_TEST_SESSIONS_STORAGE_KEY) === '1'; } catch { return false; }
+  });
+  useEffect(() => {
+    try { localStorage.setItem(SHOW_TEST_SESSIONS_STORAGE_KEY, showTestSessions ? '1' : '0'); } catch {}
+  }, [showTestSessions]);
   const [sessionGroupAliases] = useState(() => {
     try {
       const stored = JSON.parse(localStorage.getItem(GROUP_ALIAS_STORAGE_KEY) || '{}');
@@ -4052,9 +6752,39 @@ function App() {
   useEffect(() => {
     fetch('/api/preferences/sessions', { credentials: 'same-origin' })
       .then(response => response.ok ? response.json() : Promise.reject(new Error('Session settings unavailable')))
-      .then(body => setSessionPreferences(body.preferences || {}))
+      .then(body => {
+        setSessionPreferences(body.preferences || {});
+        setSessionPreferencesLoaded(true);
+      })
       .catch(() => {});
   }, []);
+  useEffect(() => {
+    let mounted = true;
+    fetch('/api/preferences/notifications', { credentials: 'same-origin' })
+      .then(response => response.ok ? response.json() : Promise.reject(new Error('Notification settings unavailable')))
+      .then(body => {
+        if (mounted) {
+          setAttentionFeedbackPreferences({
+            ...NOTIFICATION_PREFERENCE_DEFAULTS,
+            ...(body.preferences || {}),
+            turn_ready: false,
+          });
+          setNotificationPreferencesLoaded(true);
+        }
+      })
+      .catch(() => {});
+    return () => { mounted = false; };
+  }, []);
+  useEffect(() => {
+    if (!attentionFeedbackPreferences.completion_sound) return undefined;
+    const prime = () => primeAttentionAudio();
+    document.addEventListener('pointerdown', prime, { once: true });
+    document.addEventListener('keydown', prime, { once: true });
+    return () => {
+      document.removeEventListener('pointerdown', prime);
+      document.removeEventListener('keydown', prime);
+    };
+  }, [attentionFeedbackPreferences.completion_sound]);
   async function saveSessionPreference(sessionId, updates) {
     const response = await fetch(`/api/preferences/sessions/${encodeURIComponent(sessionId)}`, {
       method: 'PUT',
@@ -4067,6 +6797,30 @@ function App() {
     setSessionPreferences(previous => ({ ...previous, [sessionId]: body.preference }));
     if (body.preference?.archived && activeSession === sessionId) setActiveSession(null);
     return body.preference;
+  }
+  async function downloadSessionExport(sessionId, format) {
+    const response = await fetch(`/api/sessions/${encodeURIComponent(sessionId)}/export?format=${encodeURIComponent(format)}`, {
+      credentials: 'same-origin',
+    });
+    if (!response.ok) {
+      const body = await response.json().catch(() => ({}));
+      throw new Error(body.error || 'Unable to export session.');
+    }
+    const disposition = response.headers.get('Content-Disposition') || '';
+    const encodedName = disposition.match(/filename\*=UTF-8''([^;]+)/i)?.[1];
+    let filename = `session.${format === 'json' ? 'json' : 'md'}`;
+    if (encodedName) {
+      try { filename = decodeURIComponent(encodedName); } catch {}
+    }
+    const url = URL.createObjectURL(await response.blob());
+    const link = document.createElement('a');
+    link.href = url;
+    link.download = filename;
+    link.hidden = true;
+    document.body.appendChild(link);
+    link.click();
+    link.remove();
+    setTimeout(() => URL.revokeObjectURL(url), 1000);
   }
   useEffect(() => {
     try {
@@ -4091,29 +6845,332 @@ function App() {
   }, [activeSession]);
   const requestFileContentRef = useRef(requestFileContent);
   useEffect(() => { requestFileContentRef.current = requestFileContent; }, [requestFileContent]);
-  const allManagedSessions = React.useMemo(() => sortSessionsForDisplay(sessions).map(session => {
+  const allManagedSessions = React.useMemo(() => [...(sessions || [])].map(session => {
     const id = sessionIdOf(session);
     const preference = sessionPreferences[id];
     if (!preference?.display_name) return session;
     return typeof session === 'object'
-      ? { ...session, display_name: preference.display_name }
-      : { session_id: id, display_name: preference.display_name };
+      ? { ...session, custom_display_name: preference.display_name }
+      : { session_id: id, custom_display_name: preference.display_name };
   }), [sessions, sessionPreferences]);
+  const testSessionIds = React.useMemo(() => new Set(
+    allManagedSessions.filter(sessionIsTestSession).map(sessionIdOf),
+  ), [allManagedSessions]);
+  const operatorManagedSessions = React.useMemo(
+    () => allManagedSessions.filter(session => !sessionIsTestSession(session)),
+    [allManagedSessions],
+  );
+  const sidebarManagedSessions = showTestSessions ? allManagedSessions : operatorManagedSessions;
   const orderedSessions = React.useMemo(
-    () => allManagedSessions.filter(session => !sessionPreferences[sessionIdOf(session)]?.archived),
-    [allManagedSessions, sessionPreferences],
+    () => sidebarManagedSessions.filter(session => !sessionPreferences[sessionIdOf(session)]?.archived),
+    [sidebarManagedSessions, sessionPreferences],
   );
-  const sessionGroups = React.useMemo(
-    () => groupSessionsByDirectory(orderedSessions, agentConfigs, sessionGroupAliases),
-    [orderedSessions, agentConfigs, sessionGroupAliases],
+  const operatorOrderedSessions = React.useMemo(
+    () => operatorManagedSessions.filter(session => !sessionPreferences[sessionIdOf(session)]?.archived),
+    [operatorManagedSessions, sessionPreferences],
   );
+  const sidebarNowMs = useSidebarFreshnessClock(activities, orderedSessions);
+  const sidebarStateOptions = React.useMemo(() => ({
+    activities,
+    thinking,
+    pendingPrompts: permissionPrompts,
+    errorPrompts: Object.fromEntries(Object.entries(errorPrompts || {}).filter(([, prompt]) => isBlockingErrorPrompt(prompt))),
+    health,
+    connected,
+    nowMs: sidebarNowMs,
+    requireFreshness: true,
+  }), [activities, thinking, permissionPrompts, errorPrompts, health, connected, sidebarNowMs]);
+  const {
+    working: workingSessionCandidates,
+    states: sidebarStateBySessionId,
+  } = React.useMemo(
+    () => partitionSidebarSessionsByWorking(orderedSessions, sidebarStateOptions),
+    [orderedSessions, sidebarStateOptions],
+  );
+  const sidebarListRef = useRef(null);
+  const pendingSidebarSortAnchorRef = useRef(null);
+  const sidebarInteractionTimerRef = useRef(null);
+  const [sidebarStructureLocked, setSidebarStructureLocked] = useState(false);
+  const beginSidebarInteraction = React.useCallback(() => {
+    if (sidebarInteractionTimerRef.current) clearTimeout(sidebarInteractionTimerRef.current);
+    sidebarInteractionTimerRef.current = null;
+    setSidebarStructureLocked(true);
+  }, []);
+  const endSidebarInteraction = React.useCallback((delay = 0) => {
+    if (sidebarInteractionTimerRef.current) clearTimeout(sidebarInteractionTimerRef.current);
+    sidebarInteractionTimerRef.current = setTimeout(() => {
+      sidebarInteractionTimerRef.current = null;
+      setSidebarStructureLocked(false);
+    }, delay);
+  }, []);
+  React.useEffect(() => {
+    const releasePointer = () => endSidebarInteraction(80);
+    window.addEventListener('pointerup', releasePointer, true);
+    window.addEventListener('pointercancel', releasePointer, true);
+    return () => {
+      window.removeEventListener('pointerup', releasePointer, true);
+      window.removeEventListener('pointercancel', releasePointer, true);
+      if (sidebarInteractionTimerRef.current) clearTimeout(sidebarInteractionTimerRef.current);
+    };
+  }, [endSidebarInteraction]);
+  const {
+    sessions: workingSessions,
+    revision: workingOrderRevision,
+  } = useStableWorkingSessions(workingSessionCandidates, sidebarStructureLocked);
+  const workingSessionIds = React.useMemo(
+    () => new Set(workingSessions.map(sessionIdOf)),
+    [workingSessions],
+  );
+  const { pinned: allPinnedSessions, unpinned: allUnpinnedSessions } = React.useMemo(
+    () => partitionPinnedSessions(orderedSessions, sessionPreferences),
+    [orderedSessions, sessionPreferences],
+  );
+  const pinnedSessions = React.useMemo(
+    () => allPinnedSessions.filter(session => !workingSessionIds.has(sessionIdOf(session))),
+    [allPinnedSessions, workingSessionIds],
+  );
+  const rawSessionGroups = React.useMemo(
+    () => groupSessionsByDirectory(allUnpinnedSessions, agentConfigs, sessionGroupAliases),
+    [allUnpinnedSessions, agentConfigs, sessionGroupAliases],
+  );
+  const workspaceLabelBySessionId = React.useMemo(() => Object.fromEntries(
+    groupSessionsByDirectory(orderedSessions, agentConfigs, sessionGroupAliases).flatMap(group => (
+      group.sessions.map(session => [sessionIdOf(session), group.label])
+    )),
+  ), [orderedSessions, agentConfigs, sessionGroupAliases]);
+  const sidebarRankOptions = React.useMemo(() => ({
+    ...sidebarStateOptions,
+    messages,
+    rankWorking: false,
+  }), [sidebarStateOptions, messages]);
+  const {
+    groups: stableSessionGroups,
+    orderChanged: sidebarOrderChanged,
+    sortNow: sortSidebarNow,
+    revision: sidebarOrderRevision,
+  } = useStableSidebarGroups(rawSessionGroups, sidebarRankOptions, sidebarStructureLocked);
+  const sessionGroups = React.useMemo(() => stableSessionGroups.map(group => ({
+    ...group,
+    sessions: group.sessions.filter(session => !workingSessionIds.has(sessionIdOf(session))),
+  })).filter(group => group.sessions.length > 0), [stableSessionGroups, workingSessionIds]);
+  const applySidebarSortNow = React.useCallback(() => {
+    const list = sidebarListRef.current;
+    const selectedCard = activeSession
+      ? list?.querySelector(`[data-session-id="${CSS.escape(activeSession)}"]`)
+      : null;
+    pendingSidebarSortAnchorRef.current = selectedCard ? {
+      sessionId: activeSession,
+      top: selectedCard.getBoundingClientRect().top,
+    } : null;
+    sortSidebarNow();
+  }, [activeSession, sortSidebarNow]);
+  const sidebarDisplaySessions = React.useMemo(
+    () => [...workingSessions, ...pinnedSessions, ...sessionGroups.flatMap(group => group.sessions)],
+    [workingSessions, pinnedSessions, sessionGroups],
+  );
+  const summarizeSidebarSessions = React.useCallback(sessionList => sessionList.reduce((result, session) => {
+    const id = sessionIdOf(session);
+    result.unread += testSessionIds.has(id) ? 0 : unread[id] || 0;
+    result.hasPrompt = result.hasPrompt || !!permissionPrompts[id] || !!isBlockingErrorPrompt(errorPrompts[id]);
+    result.working = result.working || fleetStateIsWorking(sidebarStateBySessionId[id]);
+    return result;
+  }, { unread: 0, hasPrompt: false, working: false }), [
+    testSessionIds, unread, permissionPrompts, errorPrompts, sidebarStateBySessionId,
+  ]);
+  const workingSessionSummary = React.useMemo(
+    () => summarizeSidebarSessions(workingSessions),
+    [summarizeSidebarSessions, workingSessions],
+  );
+  const pinnedSessionSummary = React.useMemo(
+    () => summarizeSidebarSessions(pinnedSessions),
+    [summarizeSidebarSessions, pinnedSessions],
+  );
+  const quickSwitcherItems = React.useMemo(() => sidebarDisplaySessions.map(session => {
+      const id = sessionIdOf(session);
+      const agent = sessionAgent(session, agentConfigs[id]);
+      const title = sidebarChatTitle(session, id, agentConfigs[id], messages[id] || []);
+      const subtitle = sessionSubLabel(session, id, agentConfigs[id]);
+      const groupLabel = workspaceLabelBySessionId[id] || 'Unscoped';
+      const searchFields = [
+        title,
+        subtitle,
+        groupLabel,
+        sessionPreferences[id]?.pinned ? 'Pinned' : '',
+        agent.name,
+        session?.agent_type,
+        session?.workspace_name,
+        session?.workspace_path,
+        id,
+      ].filter(Boolean);
+      return {
+        id,
+        session,
+        groupLabel,
+        title,
+        subtitle,
+        agentName: agent.name,
+        agentColor: agent.color,
+        working: fleetStateIsWorking(sidebarStateBySessionId[id]),
+        searchFields,
+        searchText: searchFields.join(' '),
+      };
+    }), [sidebarDisplaySessions, workspaceLabelBySessionId, sessionPreferences, agentConfigs, messages, sidebarStateBySessionId]);
+  const quickSwitcherResults = React.useMemo(
+    () => rankQuickSwitcherItems(quickSwitcherItems, quickSwitcherQuery).slice(0, 60),
+    [quickSwitcherItems, quickSwitcherQuery],
+  );
+  useEffect(() => {
+    setQuickSwitcherIndex(index => Math.max(0, Math.min(index, quickSwitcherResults.length - 1)));
+  }, [quickSwitcherResults.length]);
+  useEffect(() => {
+    if (!quickSwitcherOpen) return undefined;
+    const frame = requestAnimationFrame(() => {
+      quickSwitcherInputRef.current?.focus();
+      quickSwitcherInputRef.current?.select();
+    });
+    return () => cancelAnimationFrame(frame);
+  }, [quickSwitcherOpen]);
+  useEffect(() => {
+    if (!quickSwitcherOpen) return;
+    document.getElementById(`quick-switcher-option-${quickSwitcherIndex}`)
+      ?.scrollIntoView({ block: 'nearest' });
+  }, [quickSwitcherIndex, quickSwitcherOpen]);
+  useEffect(() => {
+    const closeQuickSwitcher = () => {
+      setQuickSwitcherOpen(false);
+      setQuickSwitcherQuery('');
+      setQuickSwitcherIndex(0);
+      requestAnimationFrame(() => textareaRef.current?.focus());
+    };
+    const chooseItem = (item) => {
+      if (!item) return;
+      selectSession(item.id, item.session);
+      setSidebarOpen(false);
+      closeQuickSwitcher();
+    };
+    const onGlobalShortcut = (event) => {
+      const key = safeString(event.key).toLowerCase();
+      if ((event.metaKey || event.ctrlKey) && !event.altKey && key === 'p') {
+        event.preventDefault();
+        setShortcutHelpOpen(false);
+        setQuickSwitcherOpen(true);
+        return;
+      }
+      if (quickSwitcherOpen) {
+        if (event.key === 'Escape') {
+          event.preventDefault();
+          closeQuickSwitcher();
+        } else if (event.key === 'ArrowDown') {
+          event.preventDefault();
+          setQuickSwitcherIndex(index => quickSwitcherResults.length ? (index + 1) % quickSwitcherResults.length : 0);
+        } else if (event.key === 'ArrowUp') {
+          event.preventDefault();
+          setQuickSwitcherIndex(index => quickSwitcherResults.length ? (index - 1 + quickSwitcherResults.length) % quickSwitcherResults.length : 0);
+        } else if (event.key === 'Enter' && quickSwitcherResults.length > 0) {
+          event.preventDefault();
+          chooseItem(quickSwitcherResults[quickSwitcherIndex] || quickSwitcherResults[0]);
+        }
+        return;
+      }
+      if (shortcutHelpOpen) {
+        if (event.key === 'Escape' || (event.key === '?' && !isEditableShortcutTarget(event.target))) {
+          event.preventDefault();
+          setShortcutHelpOpen(false);
+          requestAnimationFrame(() => textareaRef.current?.focus());
+        }
+        return;
+      }
+      if (event.altKey && !event.ctrlKey && !event.metaKey && (event.key === 'ArrowUp' || event.key === 'ArrowDown')) {
+        if (quickSwitcherItems.length === 0) return;
+        event.preventDefault();
+        const currentIndex = quickSwitcherItems.findIndex(item => item.id === activeSession);
+        const direction = event.key === 'ArrowDown' ? 1 : -1;
+        const fallback = direction > 0 ? -1 : 0;
+        const nextIndex = (Math.max(currentIndex, fallback) + direction + quickSwitcherItems.length) % quickSwitcherItems.length;
+        chooseItem(quickSwitcherItems[nextIndex]);
+        return;
+      }
+      if (event.key === '?' && !event.altKey && !event.ctrlKey && !event.metaKey && !isEditableShortcutTarget(event.target)) {
+        event.preventDefault();
+        setShortcutHelpOpen(true);
+      }
+    };
+    window.addEventListener('keydown', onGlobalShortcut);
+    return () => window.removeEventListener('keydown', onGlobalShortcut);
+  }, [activeSession, quickSwitcherIndex, quickSwitcherItems, quickSwitcherOpen, quickSwitcherResults, shortcutHelpOpen]);
+  const sidebarAnchorRef = useRef(null);
+  useLayoutEffect(() => {
+    const list = sidebarListRef.current;
+    if (!list) {
+      sidebarAnchorRef.current = null;
+      return;
+    }
+
+    const explicitSortAnchor = pendingSidebarSortAnchorRef.current;
+    let restoredExplicitSort = false;
+    if (explicitSortAnchor?.sessionId) {
+      const card = Array.from(list.querySelectorAll('[data-session-id]'))
+        .find(node => node.dataset.sessionId === explicitSortAnchor.sessionId);
+      if (card) {
+        const delta = card.getBoundingClientRect().top - explicitSortAnchor.top;
+        if (Math.abs(delta) > 0.5) list.scrollTop += delta;
+        restoredExplicitSort = true;
+      }
+      pendingSidebarSortAnchorRef.current = null;
+    }
+
+    const restorePreviousAnchor = () => {
+      const previous = sidebarAnchorRef.current;
+      if (!previous?.sessionId) return;
+      const card = Array.from(list.querySelectorAll('[data-session-id]'))
+        .find(node => node.dataset.sessionId === previous.sessionId);
+      if (!card) return;
+      const delta = card.getBoundingClientRect().top - previous.top;
+      if (Math.abs(delta) > 0.5) list.scrollTop += delta;
+      if (previous.menuOpen) {
+        const menu = card.querySelector('details.session-card-menu');
+        if (menu) menu.open = true;
+      }
+      if (previous.focusTitle && !list.contains(document.activeElement)) {
+        const focusTarget = Array.from(card.querySelectorAll('button, [tabindex]'))
+          .find(node => node.getAttribute('title') === previous.focusTitle);
+        focusTarget?.focus({ preventScroll: true });
+      }
+    };
+    const captureAnchor = () => {
+      const listRect = list.getBoundingClientRect();
+      const cards = Array.from(list.querySelectorAll('[data-session-id]'));
+      const focusedCard = document.activeElement?.closest?.('[data-session-id]');
+      const visibleCard = cards.find(node => {
+        const rect = node.getBoundingClientRect();
+        return rect.bottom > listRect.top && rect.top < listRect.bottom;
+      });
+      const card = focusedCard || visibleCard || cards[0];
+      if (!card) return null;
+      return {
+        sessionId: card.dataset.sessionId,
+        top: card.getBoundingClientRect().top,
+        focusTitle: focusedCard ? document.activeElement?.getAttribute?.('title') || null : null,
+        menuOpen: !!card.querySelector('details.session-card-menu[open]'),
+      };
+    };
+
+    if (!restoredExplicitSort) restorePreviousAnchor();
+    sidebarAnchorRef.current = captureAnchor();
+    return () => {
+      sidebarAnchorRef.current = captureAnchor();
+    };
+  }, [activeSession, workingOrderRevision, sidebarOrderRevision]);
   const activeSessionMeta = React.useMemo(
     () => orderedSessions.find(s => sessionIdOf(s) === activeSession),
     [orderedSessions, activeSession],
   );
-  const activeMessagesForScroll = activeSession && messages[activeSession]
-    ? messages[activeSession]
-    : EMPTY_MESSAGES;
+  const activeUsageSnapshot = React.useMemo(
+    () => usageSnapshotForSession(activeSessionMeta, activeSession ? activities[activeSession] : null),
+    [activeSessionMeta, activeSession, activities],
+  );
+  const activeMessagesForScroll = activeSession ? activeTranscriptMessages : EMPTY_MESSAGES;
+  const activeProvisionalStream = activeSession ? (provisionalStreams[activeSession] || null) : null;
   const activeNativeCliPlaceholder = shouldRefreshNativeCliPlaceholder(activeSessionMeta, activeMessagesForScroll);
   const activeActivityForScroll = activeSession ? activities[activeSession] : null;
   const activeThinkingForScroll = activeSession ? (thinkingContent[activeSession] || '') : '';
@@ -4143,21 +7200,33 @@ function App() {
       tasks,
       activePermissionPromptForScroll?.id || activePermissionPromptForScroll?.request_id || '',
       activeErrorPromptForScroll?.id || activeErrorPromptForScroll?.request_id || '',
+      activeProvisionalStream?.messageId || '',
+      activeProvisionalStream?.content?.length || 0,
+      activeProvisionalStream?.open ? 'open' : 'closed',
     ].join('\u0001');
   }, [
     activeActivityForScroll,
     activeThinkingForScroll,
     activePermissionPromptForScroll,
     activeErrorPromptForScroll,
+    activeProvisionalStream,
   ]);
+  const activeTranscriptArrival = {
+    sessionId: activeSession,
+    messageCount: activeMessagesForScroll.length,
+    provisionalId: activeProvisionalStream?.messageId || '',
+    provisionalLength: activeProvisionalStream?.content?.length || 0,
+  };
   const messagesEndRef  = useRef(null);
   const messagesListRef = useRef(null);
   const isAtBottom      = useRef(true);   // updated by scroll listener before DOM changes
   const stickyToNewestRef = useRef(true); // false only after an intentional user scroll away from newest
   const userScrollIntentUntilRef = useRef(0);
   const programmaticScrollUntilRef = useRef(0);
+  const scrollPinGenerationRef = useRef(0);
   const pinnedToNewestUntilRef = useRef(0);
   const requestOlderHistoryRef = useRef(null);
+  const nonWindowedPrependAnchorRef = useRef(null);
   const selectedSessionRef = useRef(activeSession);
   const scrollSnapshotRef = useRef({
     sessionId: null,
@@ -4167,11 +7236,18 @@ function App() {
     clientHeight: 0,
     atBottom: true,
   });
+  const routeScrollSnapshotRef = useRef(null);
+  const routeScrollRestoreFrameRef = useRef(0);
   const textareaRef     = useRef(null);
   const fileInputRef    = useRef(null);
+  const transcriptArrivalRef = useRef(activeTranscriptArrival);
+  const jumpBaselineRef = useRef(activeTranscriptArrival);
+  const sendHistoryRef = useRef({});
+  const sendHistoryCursorRef = useRef({ sessionId: null, index: 0, scratch: '' });
   const prevConnected   = useRef(connected);
   const pendingAttachmentReqs = useRef({});
   const seenAttachmentResults = useRef({});
+  transcriptArrivalRef.current = activeTranscriptArrival;
 
   useLayoutEffect(() => {
     selectedSessionRef.current = activeSession;
@@ -4277,6 +7353,14 @@ function App() {
     let touchStartY = null;
     const markUserScrollAwayIntent = () => {
       userScrollIntentUntilRef.current = Date.now() + 1200;
+      // A real wheel/touch/scrollbar gesture must take precedence immediately,
+      // even if it lands during the short guard for our previous auto-scroll.
+      programmaticScrollUntilRef.current = 0;
+      scrollPinGenerationRef.current += 1;
+      if (stickyToNewestRef.current) {
+        jumpBaselineRef.current = transcriptArrivalRef.current;
+        setNewMessagesBelow(0);
+      }
     };
     const onWheel = (event) => {
       if (event.deltaY < -1) markUserScrollAwayIntent();
@@ -4333,18 +7417,24 @@ function App() {
       list.removeEventListener('pointerdown', onPointerDown);
       window.removeEventListener('keydown', onKeyDown);
     };
-  }, []);  // mount only — list ref is stable
+  }, [activeSession]); // the keyed transcript element is replaced on session switches
 
   function stickTranscriptToNewest(keys, frameCount = 2) {
     const sessionAtStart = activeSession;
+    const pinGeneration = scrollPinGenerationRef.current + 1;
+    scrollPinGenerationRef.current = pinGeneration;
     const apply = () => {
       const list = messagesListRef.current;
-      if (!list || selectedSessionRef.current !== sessionAtStart) return false;
+      if (!list
+        || selectedSessionRef.current !== sessionAtStart
+        || scrollPinGenerationRef.current !== pinGeneration) return false;
       programmaticScrollUntilRef.current = Date.now() + 800;
       stickyToNewestRef.current = true;
+      jumpBaselineRef.current = transcriptArrivalRef.current;
       setScrollTopInstant(list, list.scrollHeight);
       isAtBottom.current = true;
       setShowJumpButton(false);
+      setNewMessagesBelow(0);
       scrollSnapshotRef.current = {
         sessionId: sessionAtStart,
         keys,
@@ -4414,17 +7504,37 @@ function App() {
     } else if (!sameSession) {
       setTranscriptPreview(null);
       stickTranscriptToNewest(keys, 3);
+    } else if (olderPrepended) {
+      stickyToNewestRef.current = false;
+      pinnedToNewestUntilRef.current = 0;
+      if (list.dataset.transcriptWindowed !== 'true') {
+        const heightDelta = list.scrollHeight - (Number(prev.scrollHeight) || 0);
+        programmaticScrollUntilRef.current = Date.now() + 500;
+        setScrollTopInstant(list, Math.max(0, (Number(prev.scrollTop) || 0) + heightDelta));
+        const anchor = nonWindowedPrependAnchorRef.current;
+        const anchorRow = anchor
+          ? Array.from(list.querySelectorAll('.message[data-message-key]'))
+              .find(row => row.dataset.messageKey === anchor.messageKey)
+          : null;
+        if (anchorRow) {
+          const currentOffset = anchorRow.getBoundingClientRect().top - list.getBoundingClientRect().top;
+          const correction = currentOffset - anchor.viewportOffset;
+          if (Math.abs(correction) >= 0.5) {
+            setScrollTopInstant(list, Math.max(0, list.scrollTop + correction));
+          }
+        }
+        nonWindowedPrependAnchorRef.current = null;
+      }
     } else if (wasAtBottom) {
       stickTranscriptToNewest(keys, 3);
-    } else if (olderPrepended) {
-      const heightDelta = list.scrollHeight - (Number(prev.scrollHeight) || 0);
-      programmaticScrollUntilRef.current = Date.now() + 500;
-      setScrollTopInstant(list, Math.max(0, (Number(prev.scrollTop) || 0) + heightDelta));
     }
 
     const atBottom = list.scrollHeight - list.scrollTop - list.clientHeight < 80;
     isAtBottom.current = atBottom;
     setShowJumpButton(!atBottom && !stickyToNewestRef.current);
+    setNewMessagesBelow(atBottom || stickyToNewestRef.current
+      ? 0
+      : countTranscriptArrivalsSince(jumpBaselineRef.current, activeTranscriptArrival));
     scrollSnapshotRef.current = {
       sessionId: activeSession,
       keys,
@@ -4462,6 +7572,130 @@ function App() {
     setToast(msg);
     setTimeout(() => setToast(''), 3000);
   }
+
+  function attentionSessionLabel(sessionId) {
+    const session = orderedSessions.find(item => sessionIdOf(item) === sessionId);
+    return session
+      ? sidebarChatTitle(session, sessionId, agentConfigs[sessionId], messages[sessionId] || [])
+      : sessionId;
+  }
+
+  function showAttentionToast(sessionId, kind, title, detail = '') {
+    if (attentionToastTimerRef.current) clearTimeout(attentionToastTimerRef.current);
+    setAttentionToast({
+      sessionId,
+      kind,
+      title,
+      detail: detail || attentionSessionLabel(sessionId),
+    });
+    attentionToastTimerRef.current = setTimeout(() => {
+      attentionToastTimerRef.current = null;
+      setAttentionToast(null);
+    }, 8000);
+  }
+
+  function clearAttentionToast() {
+    if (attentionToastTimerRef.current) clearTimeout(attentionToastTimerRef.current);
+    attentionToastTimerRef.current = null;
+    setAttentionToast(null);
+  }
+
+  useEffect(() => () => {
+    if (attentionToastTimerRef.current) clearTimeout(attentionToastTimerRef.current);
+  }, []);
+
+  useEffect(() => {
+    const previous = previousPermissionPromptsRef.current;
+    const current = permissionPrompts || {};
+    const resolvedSessionIds = Object.keys(previous).filter(sessionId => !current[sessionId]);
+    if (resolvedSessionIds.length > 0) {
+      setSessionAttention(existing => {
+        const next = { ...existing };
+        resolvedSessionIds.forEach(sessionId => {
+          if (next[sessionId]?.kind === 'prompt') delete next[sessionId];
+        });
+        return next;
+      });
+      setAttentionToast(existing => (
+        existing?.kind === 'prompt' && resolvedSessionIds.includes(existing.sessionId) ? null : existing
+      ));
+    }
+    Object.entries(current).forEach(([sessionId, prompt]) => {
+      const promptId = prompt?.prompt_id || prompt?.request_id || prompt?.id || 'prompt';
+      const previousPrompt = previous[sessionId];
+      const previousPromptId = previousPrompt?.prompt_id || previousPrompt?.request_id || previousPrompt?.id || null;
+      if (promptId === previousPromptId) return;
+      if (
+        promptSoundReadyRef.current
+        && attentionFeedbackPreferences.completion_sound
+        && attentionEventIsUnfocused(sessionId, activeSession)
+      ) {
+        playAttentionSound('prompt');
+      }
+      if (sessionId === activeSession) return;
+      const title = prompt?.kind === 'question' ? 'Question needs an answer' : 'Permission needs attention';
+      setSessionAttention(existing => ({
+        ...existing,
+        [sessionId]: { kind: 'prompt', promptId },
+      }));
+      showAttentionToast(sessionId, 'prompt', title);
+    });
+    previousPermissionPromptsRef.current = current;
+    promptSoundReadyRef.current = true;
+  }, [permissionPrompts, activeSession, attentionFeedbackPreferences.completion_sound]);
+
+  useEffect(() => {
+    if (!notificationPreferencesLoaded || !sessionPreferencesLoaded) return undefined;
+    let cancelled = false;
+    async function processSemanticNotifications() {
+      for (const event of semanticNotifications || []) {
+        const sessionId = event.session_id || event.session;
+        if (!semanticNotificationAllowed(event, attentionFeedbackPreferences)) {
+          recordSemanticNotificationStage(event, 'suppressed', { reasonCode: 'client_preference' });
+          continue;
+        }
+        if (sessionPreferences[sessionId]?.muted) {
+          recordSemanticNotificationStage(event, 'suppressed', { reasonCode: 'session_muted' });
+          continue;
+        }
+        if (!attentionEventIsUnfocused(sessionId, activeSession)) {
+          recordSemanticNotificationStage(event, 'suppressed', { reasonCode: 'focused_session' });
+          continue;
+        }
+        const claimed = await claimSemanticNotification(event);
+        if (cancelled) continue;
+        if (!claimed) {
+          recordSemanticNotificationStage(event, 'suppressed', { reasonCode: 'client_duplicate' });
+          continue;
+        }
+        recordSemanticNotificationStage(event, 'claimed');
+        const kind = event.event_type;
+        if (attentionFeedbackPreferences.completion_sound) {
+          playAttentionSound(kind === 'goal_attention' ? 'prompt' : 'completion');
+        }
+        if (sessionId !== activeSession) {
+          setSessionAttention(existing => ({
+            ...existing,
+            [sessionId]: {
+              kind,
+              dedupeKey: event.dedupe_key,
+              createdAt: event.created_at || new Date().toISOString(),
+            },
+          }));
+        }
+        showAttentionToast(sessionId, kind, event.title, event.body);
+        const afterPaint = typeof requestAnimationFrame === 'function'
+          ? requestAnimationFrame
+          : callback => setTimeout(callback, 16);
+        afterPaint(() => {
+          if (!cancelled) recordSemanticNotificationStage(event, 'displayed');
+        });
+      }
+    }
+    processSemanticNotifications().catch(() => {});
+    return () => { cancelled = true; };
+  }, [semanticNotifications, activeSession, sessionPreferences, attentionFeedbackPreferences,
+    notificationPreferencesLoaded, sessionPreferencesLoaded]);
 
   function setDraftForSession(sessionId, value) {
     if (!sessionId) return;
@@ -4560,14 +7794,52 @@ async function uploadBinaryDraft(sessionId, base64, mimeType, filename) {
   }
 
   function selectSession(id, sessionMeta) {
+    const reselectingActiveSession = activeSessionRef.current === id;
+    restoreCachedTranscript(id);
     setActiveSession(id);
     activeSessionRef.current = id;
+    sendHistoryCursorRef.current = {
+      sessionId: id,
+      index: (sendHistoryRef.current[id] || []).length,
+      scratch: '',
+    };
     setUnread(prev => ({ ...prev, [id]: 0 }));
+    setSessionAttention(prev => {
+      if (!prev[id]) return prev;
+      const next = { ...prev };
+      delete next[id];
+      return next;
+    });
+    if (attentionToast?.sessionId === id) clearAttentionToast();
     setSidebarOpen(false);
     setShowSlashMenu(false);
     setShowChatList(false);
     setShowThreadList(false);
-    setTimeout(() => requestHistory(id, historyRequestOptionsFor(sessionMeta)), 120);
+    setShowTranscriptSearch(false);
+    // A changed activeSession reconciles in the effect below. Re-selecting the
+    // current card still needs an explicit refresh because React will not rerun it.
+    if (reselectingActiveSession) {
+      setTimeout(() => requestHistory(id, historyRequestOptionsFor(sessionMeta)), 0);
+    }
+  }
+
+  function openTranscriptSearchResult(result) {
+    const id = result?.session_id;
+    const messageId = Number(result?.message_id);
+    if (!id || !Number.isSafeInteger(messageId) || messageId <= 0) return;
+    const sessionMeta = orderedSessions.find(session => sessionIdOf(session) === id) || {
+      session_id: id,
+      workspace_path: result.workspace_path || null,
+      project_root: result.project_root || null,
+      workspace_name: result.workspace_name || null,
+      agent_type: result.agent_type || null,
+      status: 'history',
+    };
+    transcriptWindow.cancelRouteRestore();
+    routeScrollSnapshotRef.current = null;
+    setTranscriptSearchTarget({ sessionId: id, messageId });
+    selectSession(id, sessionMeta);
+    setShowTranscriptSearch(false);
   }
 
   // ── File attachment ───────────────────────────────────────────────────────
@@ -4664,6 +7936,7 @@ async function uploadBinaryDraft(sessionId, base64, mimeType, filename) {
   // ── Send ─────────────────────────────────────────────────────────────────
 
   function sendMessage() {
+    if (activeBlockingPrompt) return;
     const currentInput = activeSession ? (drafts[activeSession] || '') : '';
     const attachedFiles = activeSession ? (draftFiles[activeSession] || []) : [];
     const text = currentInput.trim();
@@ -4689,6 +7962,14 @@ async function uploadBinaryDraft(sessionId, base64, mimeType, filename) {
     }
 
     sendToSession(activeSession, content);
+    if (text) {
+      const previous = sendHistoryRef.current[activeSession] || [];
+      const next = previous[previous.length - 1] === text
+        ? previous
+        : [...previous, text].slice(-100);
+      sendHistoryRef.current[activeSession] = next;
+      sendHistoryCursorRef.current = { sessionId: activeSession, index: next.length, scratch: '' };
+    }
     setPendingDraftThreads(prev => ({ ...prev, [activeSession]: false }));
     setDraftMessageBaselines(prev => ({
       ...prev,
@@ -4700,6 +7981,50 @@ async function uploadBinaryDraft(sessionId, base64, mimeType, filename) {
     textareaRef.current?.focus();
   }
 
+  function clearInterruptConfirm() {
+    if (interruptConfirmTimerRef.current) clearTimeout(interruptConfirmTimerRef.current);
+    interruptConfirmTimerRef.current = null;
+    interruptConfirmRef.current = { sessionId: null, expiresAt: 0 };
+    setInterruptConfirmSession(null);
+  }
+
+  function armInterruptConfirm() {
+    if (!activeSession) return;
+    const expiresAt = Date.now() + 2500;
+    interruptConfirmRef.current = { sessionId: activeSession, expiresAt };
+    setInterruptConfirmSession(activeSession);
+    if (interruptConfirmTimerRef.current) clearTimeout(interruptConfirmTimerRef.current);
+    interruptConfirmTimerRef.current = setTimeout(() => {
+      if (interruptConfirmRef.current.sessionId === activeSession
+          && interruptConfirmRef.current.expiresAt === expiresAt) {
+        interruptConfirmRef.current = { sessionId: null, expiresAt: 0 };
+        interruptConfirmTimerRef.current = null;
+        setInterruptConfirmSession(null);
+      }
+    }, 2500);
+  }
+
+  function performInterrupt() {
+    if (!activeSession || !thinking[activeSession] || stopPending[activeSession]) {
+      clearInterruptConfirm();
+      return;
+    }
+    clearInterruptConfirm();
+    setStopPending(prev => ({ ...prev, [activeSession]: true }));
+    interruptSession(activeSession);
+  }
+
+  useEffect(() => () => {
+    if (interruptConfirmTimerRef.current) clearTimeout(interruptConfirmTimerRef.current);
+  }, []);
+
+  useEffect(() => {
+    if (interruptConfirmSession
+        && (interruptConfirmSession !== activeSession || !thinking[interruptConfirmSession])) {
+      clearInterruptConfirm();
+    }
+  }, [activeSession, thinking, interruptConfirmSession]);
+
   function onKeyDown(e) {
     if ((e.metaKey || e.ctrlKey) && e.key.toLowerCase() === 'k') {
       e.preventDefault();
@@ -4707,7 +8032,47 @@ async function uploadBinaryDraft(sessionId, base64, mimeType, filename) {
       return;
     }
     if (e.key === 'Escape') {
-      setShowSlashMenu(false);
+      if (showSlashMenu) {
+        setShowSlashMenu(false);
+        return;
+      }
+      if (activeBlockingPrompt) return;
+      if (isActiveThinking && !isStopPending) {
+        e.preventDefault();
+        const armed = interruptConfirmRef.current.sessionId === activeSession
+          && interruptConfirmRef.current.expiresAt >= Date.now();
+        if (armed) performInterrupt();
+        else armInterruptConfirm();
+      }
+      return;
+    }
+    if (e.key === 'Enter' && !e.shiftKey
+        && interruptConfirmRef.current.sessionId === activeSession
+        && interruptConfirmRef.current.expiresAt >= Date.now()) {
+      e.preventDefault();
+      performInterrupt();
+      return;
+    }
+    const history = activeSession ? (sendHistoryRef.current[activeSession] || []) : [];
+    const historyCursor = sendHistoryCursorRef.current;
+    const historyCursorActive = historyCursor.sessionId === activeSession
+      && historyCursor.index >= 0
+      && historyCursor.index < history.length;
+    if (e.key === 'ArrowUp' && history.length > 0 && (currentInput === '' || historyCursorActive)) {
+      e.preventDefault();
+      const cursor = historyCursor.sessionId === activeSession
+        ? historyCursor
+        : { sessionId: activeSession, index: history.length, scratch: currentInput };
+      cursor.index = Math.max(0, cursor.index - 1);
+      sendHistoryCursorRef.current = cursor;
+      setDraftForSession(activeSession, history[cursor.index]);
+      return;
+    }
+    if (e.key === 'ArrowDown' && historyCursorActive) {
+      e.preventDefault();
+      const nextIndex = Math.min(history.length, historyCursor.index + 1);
+      sendHistoryCursorRef.current = { ...historyCursor, index: nextIndex };
+      setDraftForSession(activeSession, nextIndex === history.length ? historyCursor.scratch : history[nextIndex]);
       return;
     }
     if (e.key === 'Tab' && showSlashMenu && filteredSlashCommands.length > 0) {
@@ -4724,6 +8089,22 @@ async function uploadBinaryDraft(sessionId, base64, mimeType, filename) {
   const isStopPending    = activeSession ? !!stopPending[activeSession] : false;
   const currentInput    = activeSession ? (drafts[activeSession] || '') : '';
   const attachedFiles   = activeSession ? (draftFiles[activeSession] || []) : [];
+  const resizeComposerTextarea = React.useCallback(() => {
+    const textarea = textareaRef.current;
+    if (!textarea) return;
+    const maximum = Math.max(42, Math.floor(window.innerHeight * 0.4));
+    textarea.style.height = 'auto';
+    const nextHeight = Math.max(42, Math.min(textarea.scrollHeight, maximum));
+    textarea.style.height = `${nextHeight}px`;
+    textarea.style.overflowY = textarea.scrollHeight > maximum ? 'auto' : 'hidden';
+  }, []);
+  useLayoutEffect(() => {
+    resizeComposerTextarea();
+  }, [activeSession, currentInput, resizeComposerTextarea]);
+  useEffect(() => {
+    window.addEventListener('resize', resizeComposerTextarea);
+    return () => window.removeEventListener('resize', resizeComposerTextarea);
+  }, [resizeComposerTextarea]);
   const rawCurrentMessages = activeMessagesForScroll;
   const draftBaseline = activeSession && pendingDraftThreads[activeSession]
     ? (draftMessageBaselines[activeSession] || 0)
@@ -4737,6 +8118,67 @@ async function uploadBinaryDraft(sessionId, base64, mimeType, filename) {
   const renderedMessages = React.useMemo(() => {
     return currentMessages.filter(msg => hasVisibleMessage(msg));
   }, [currentMessages]);
+  const chatRouteActive = !showAutomations
+    && !showSkills
+    && !showUsageDashboard
+    && !showHostResourceDashboard
+    && !showFleetView
+    && !showTranscriptSearch;
+  const transcriptWindow = useTranscriptWindow({
+    messages: renderedMessages,
+    containerRef: messagesListRef,
+    sessionId: activeSession,
+    routeActive: chatRouteActive,
+  });
+  const captureChatRouteScroll = React.useCallback(() => {
+    const list = messagesListRef.current;
+    if (!list) return;
+    const atBottom = list.scrollHeight - list.scrollTop - list.clientHeight < 80;
+    routeScrollSnapshotRef.current = {
+      sessionId: activeSession,
+      scrollTop: list.scrollTop,
+      scrollHeight: list.scrollHeight,
+      clientHeight: list.clientHeight,
+      atBottom,
+    };
+    transcriptWindow.prepareForRouteChange();
+  }, [activeSession, transcriptWindow.prepareForRouteChange]);
+  useLayoutEffect(() => {
+    if (!chatRouteActive || transcriptWindow.enabled) return undefined;
+    const pending = routeScrollSnapshotRef.current;
+    const list = messagesListRef.current;
+    if (!list || pending?.sessionId !== activeSession) return undefined;
+    const restore = () => {
+      const activeList = messagesListRef.current;
+      if (!activeList || pending.sessionId !== activeSession) return;
+      const target = pending.atBottom
+        ? activeList.scrollHeight
+        : Math.min(pending.scrollTop, Math.max(0, activeList.scrollHeight - activeList.clientHeight));
+      programmaticScrollUntilRef.current = Date.now() + 800;
+      setScrollTopInstant(activeList, target);
+    };
+    restore();
+    routeScrollRestoreFrameRef.current = requestAnimationFrame(() => {
+      routeScrollRestoreFrameRef.current = 0;
+      restore();
+    });
+    return () => {
+      if (routeScrollRestoreFrameRef.current) cancelAnimationFrame(routeScrollRestoreFrameRef.current);
+      routeScrollRestoreFrameRef.current = 0;
+    };
+  }, [activeSession, chatRouteActive, transcriptWindow.enabled]);
+  useEffect(() => {
+    if (!renderProfileEnabled) return undefined;
+    window.__RAC_TRANSCRIPT_WINDOW__ = {
+      total: renderedMessages.length,
+      scrollToIndex: transcriptWindow.scrollToIndex,
+    };
+    return () => {
+      if (window.__RAC_TRANSCRIPT_WINDOW__?.scrollToIndex === transcriptWindow.scrollToIndex) {
+        delete window.__RAC_TRANSCRIPT_WINDOW__;
+      }
+    };
+  }, [renderedMessages.length, transcriptWindow.scrollToIndex]);
   const activePrompt    = activeSession ? permissionPrompts[activeSession] || null : null;
   const activeErrorPrompt = activeSession ? errorPrompts[activeSession] || null : null;
   const activeBlockingErrorPrompt = isBlockingErrorPrompt(activeErrorPrompt) ? activeErrorPrompt : null;
@@ -4750,11 +8192,37 @@ async function uploadBinaryDraft(sessionId, base64, mimeType, filename) {
   const canSend         = !!(currentInput.trim() || attachedFiles.length > 0) && !!activeSession && !uploading && !activeBlockingPrompt;
   const relayHealthState = connected ? (connectionHealth?.state || 'connecting') : 'offline';
   const relayRttText = connectionHealth?.rttMs != null ? ` · ${connectionHealth.rttMs} ms` : '';
-  const unreadTotal     = Object.values(unread).reduce((a, b) => a + b, 0);
+  const unreadTotal     = Object.entries(unread).reduce((total, [sessionId, count]) => (
+    testSessionIds.has(sessionId) ? total : total + Number(count || 0)
+  ), 0);
+  const attentionTotal  = Object.keys(sessionAttention).filter(sessionId => sessionId !== activeSession && !testSessionIds.has(sessionId)).length;
+  const appUpdateValidationAgeMs = latestAppUpdateValidation?.completed_at
+    ? Date.now() - Date.parse(latestAppUpdateValidation.completed_at)
+    : Number.POSITIVE_INFINITY;
+  const recentAppUpdateValidation = appUpdateValidationAgeMs >= 0 && appUpdateValidationAgeMs <= 24 * 60 * 60 * 1000
+    ? latestAppUpdateValidation
+    : null;
+  const visibleNightlyValidationFailures = recentAppUpdateValidation
+    ? nightlyValidationFailures.filter(item => item.run_id !== recentAppUpdateValidation.run_id)
+    : nightlyValidationFailures;
+  const hasSystemBanner = duplicateProxyAlarms.length > 0 || visibleNightlyValidationFailures.length > 0 || !!recentAppUpdateValidation;
   const slashQuery      = currentInput.startsWith('/') ? currentInput.slice(1).trim().toLowerCase() : '';
   const filteredSlashCommands = currentInput.startsWith('/')
     ? SLASH_COMMANDS.filter(item => item.command.slice(1).includes(slashQuery))
     : [];
+  useLayoutEffect(() => {
+    const banner = systemBannerRef.current;
+    if (!hasSystemBanner || !banner) {
+      setSystemBannerHeight(0);
+      return undefined;
+    }
+    const updateHeight = () => setSystemBannerHeight(Math.ceil(banner.getBoundingClientRect().height));
+    updateHeight();
+    if (typeof ResizeObserver === 'undefined') return undefined;
+    const observer = new ResizeObserver(updateHeight);
+    observer.observe(banner);
+    return () => observer.disconnect();
+  }, [hasSystemBanner, duplicateProxyAlarms.length, visibleNightlyValidationFailures.length, recentAppUpdateValidation?.run_id]);
 
   // Resolve display label for the active session
   const activeConfig = activeSession ? (agentConfigs[activeSession] || null) : null;
@@ -4771,6 +8239,7 @@ async function uploadBinaryDraft(sessionId, base64, mimeType, filename) {
   // the native JSONL archive so refresh never has to hydrate a full transcript.
   useEffect(() => {
     if (!activeSession || !connected) return;
+    if (transcriptSearchTarget?.sessionId === activeSession) return;
     const existing = messages[activeSession] || [];
     const lastSequence = existing.reduce((maximum, message) => (
       Math.max(maximum, Number(message?.sequence || 0))
@@ -4782,7 +8251,62 @@ async function uploadBinaryDraft(sessionId, base64, mimeType, filename) {
     const tailOptions = historyRequestOptionsFor(activeSessionMeta);
     const chunkSource = (activeSessionMeta?.agent_type === 'codex_cli' || activeSessionMeta?.agent_type === 'cursor_cli') ? 'native' : 'relay_sqlite';
     requestHistoryChunk(activeSession, { ...tailOptions, mode: 'tail', source: chunkSource });
-  }, [activeSession, connected, activeSessionMeta?.agent_type]);
+  }, [activeSession, connected, activeSessionMeta?.agent_type, transcriptSearchTarget?.sessionId]);
+  useEffect(() => {
+    if (!connected || !transcriptSearchTarget || activeSession !== transcriptSearchTarget.sessionId) return;
+    const targetAlreadyLoaded = (messages[activeSession] || []).some(message => (
+      String(message?.id) === String(transcriptSearchTarget.messageId)
+    ));
+    if (targetAlreadyLoaded) return;
+    const requestAroundMatch = () => requestHistoryChunk(activeSession, {
+        mode: 'around',
+        source: 'relay_sqlite',
+        aroundId: transcriptSearchTarget.messageId,
+        limit: 200,
+        replace: true,
+        userInitiated: true,
+      });
+    requestAroundMatch();
+    const retryTimer = setTimeout(requestAroundMatch, 600);
+    return () => clearTimeout(retryTimer);
+  }, [connected, activeSession, transcriptSearchTarget?.sessionId, transcriptSearchTarget?.messageId, messages[activeSession]]);
+  useEffect(() => {
+    if (!transcriptSearchTarget || activeSession !== transcriptSearchTarget.sessionId) return undefined;
+    const selector = `[data-message-id="${transcriptSearchTarget.messageId}"]`;
+    const targetIndex = renderedMessages.findIndex(message => String(message?.id) === String(transcriptSearchTarget.messageId));
+    if (targetIndex >= 0) transcriptWindow.scrollToIndex(targetIndex, 'center');
+    let attempts = 0;
+    let clearHighlightTimer = null;
+    const timer = setInterval(() => {
+      attempts++;
+      const row = messagesListRef.current?.querySelector(selector);
+      if (row) {
+        clearInterval(timer);
+        row.scrollIntoView({ block: 'center', behavior: 'instant' });
+        clearHighlightTimer = setTimeout(() => {
+          setTranscriptSearchTarget(current => (
+            current?.sessionId === activeSession
+              && String(current?.messageId) === String(transcriptSearchTarget.messageId)
+              ? null
+              : current
+          ));
+        }, 5000);
+      } else if (attempts >= 40) {
+        clearInterval(timer);
+        setTranscriptSearchTarget(null);
+        showToast('Matched message could not be loaded');
+      }
+    }, 100);
+    return () => {
+      clearInterval(timer);
+      if (clearHighlightTimer) clearTimeout(clearHighlightTimer);
+    };
+  }, [activeSession, transcriptSearchTarget?.sessionId, transcriptSearchTarget?.messageId, messages[activeSession], renderedMessages, transcriptWindow.scrollToIndex]);
+  useEffect(() => {
+    // Full transcript traffic is selected-session only. Working background
+    // sessions stay live through session_summary without history hydration.
+    setSessionSubscriptions(activeSession ? [activeSession] : []);
+  }, [activeSession, setSessionSubscriptions]);
   useEffect(() => {
     if (!activeSession || !connected || !activeNativeCliPlaceholder) return;
     const tailOptions = historyRequestOptionsFor(activeSessionMeta);
@@ -4842,19 +8366,40 @@ async function uploadBinaryDraft(sessionId, base64, mimeType, filename) {
     && activeSessionMeta.visible_pane_agent !== 'codex'
   );
   const activeAgent = sessionAgent(activeSessionMeta || activeSession, activeConfig);
-  const activeSessionGroup = React.useMemo(() => (
-    activeSession
-      ? sessionGroups.find(group => group.sessions.some(session => sessionIdOf(session) === activeSession))
-      : null
-  ), [activeSession, sessionGroups]);
-  const activeGroupLabel = activeSessionGroup?.label && activeSessionGroup.label !== 'Unscoped'
-    ? activeSessionGroup.label
+  const activeWorkspaceLabel = activeSession ? workspaceLabelBySessionId[activeSession] : '';
+  const activeWorkspacePath = activeSessionMeta && typeof activeSessionMeta === 'object'
+    ? activeSessionMeta.workspace_path
     : '';
-  const activeLabel = activeSession
-    ? `${activeAgent.name}${activeGroupLabel ? ` — ${activeGroupLabel}` : ''}`
-    : 'Agent Chat';
+  const activeWorkspaceBasename = activeWorkspacePath
+    ? activeWorkspacePath.split(/[\\/]/).filter(Boolean).pop() || activeWorkspacePath
+    : '';
+  const activeWorkspaceContext = activeWorkspaceBasename
+    || (activeWorkspaceLabel && activeWorkspaceLabel !== 'Unscoped' ? activeWorkspaceLabel : '')
+    || safeString(activeSessionMeta?.workspace_name)
+    || 'Unscoped';
+  const activeTitleProjectionCacheRef = useRef(new Map());
+  const activeTitleSession = React.useMemo(() => (
+    isAntigravityV2 && optimisticV2Focus?.title
+      ? { ...(activeSessionMeta || {}), native_chat_title: optimisticV2Focus.title }
+      : activeSessionMeta
+  ), [activeSessionMeta, isAntigravityV2, optimisticV2Focus?.title]);
+  const activeChatTitleProjection = React.useMemo(() => {
+    if (!activeSession) return { title: 'Agent Chat', source: 'fallback', field: 'no_session' };
+    const next = resolveSessionChatTitleProjection(
+      activeTitleSession,
+      activeTitleSession?.custom_display_name || '',
+      activeMessagesForScroll,
+    );
+    const retained = retainStrongerSessionChatTitleProjection(
+      activeTitleProjectionCacheRef.current.get(activeSession),
+      next,
+    );
+    activeTitleProjectionCacheRef.current.set(activeSession, retained);
+    return retained;
+  }, [activeSession, activeTitleSession, activeMessagesForScroll]);
+  const activeChatTitle = activeChatTitleProjection.title;
   const activeAutomationView = activeSession ? automationViews[activeSession] : null;
-  const activeLooksLikeCodex = activeAgent?.name === 'Codex' || /^Codex\b/.test(activeLabel || '');
+  const activeLooksLikeCodex = activeAgent?.name === 'Codex';
   const showVisiblePaneBanner = !!(
     activeLooksLikeCodex
     && activeSessionMeta
@@ -4868,17 +8413,6 @@ async function uploadBinaryDraft(sessionId, base64, mimeType, filename) {
       )
     )
   );
-  let activeWindowLabel = activeSession ? sessionSubLabel(activeSessionMeta, activeSession) : '';
-  if (isAntigravityV2 && optimisticV2Focus?.title) {
-    const workspaceLabel = activeSessionMeta?.workspace_name || activeWorkspaceBasename || 'Antigravity v2';
-    activeWindowLabel = `${workspaceLabel} / ${optimisticV2Focus.title}`;
-  }
-  const activeWorkspacePath = activeSessionMeta && typeof activeSessionMeta === 'object'
-    ? activeSessionMeta.workspace_path
-    : '';
-  const activeWorkspaceBasename = activeWorkspacePath
-    ? activeWorkspacePath.split(/[\\/]/).filter(Boolean).pop() || activeWorkspacePath
-    : '';
   const canLaunchNewThread = !!activeConfig?.capabilities?.new_thread;
   const isCodexDesktop = activeSessionMeta?.agent_type === 'codex-desktop';
   const isCursor = activeSessionMeta?.agent_type === 'cursor';
@@ -4959,13 +8493,18 @@ async function uploadBinaryDraft(sessionId, base64, mimeType, filename) {
   const lastAssistantText = lastAssistantMsg ? normalizeMessageContent(lastAssistantMsg.content).trim() : '';
   const showPinnedThinkingRow = !!(
     activeActivity
+    && !activeActivity?.thinking
+    && !activeActivity?.current
     && !activeActivity?.task_list
     && hasSubstantiveLiveText(liveThinkingText)
   );
   const showLiveAssistantDraft = !!(
     activeSession
+    && !activeProvisionalStream
     && activeActivity
     && (activeActivity.kind === 'thinking' || activeActivity.kind === 'generating')
+    && !activeActivity?.thinking
+    && !activeActivity?.current
     && !showPinnedThinkingRow
     && hasSubstantiveLiveText(liveThinkingText)
     && (
@@ -4981,6 +8520,10 @@ async function uploadBinaryDraft(sessionId, base64, mimeType, filename) {
     activeActivity
     && (
       activeActivity?.goal
+      || activeActivity?.thinking
+      || activeActivity?.current
+      || activeActivity?.step
+      || activeActivity?.usage
       || activeActivity?.task_list
       || activeActivity.kind !== 'idle'
       || hasSubstantiveLiveText(liveThinkingText || activeActivity.thinkingContent || '')
@@ -4995,6 +8538,20 @@ async function uploadBinaryDraft(sessionId, base64, mimeType, filename) {
   const partialHistoryTotal = Number(activeHistoryMeta?.total || partialHistoryLoaded || 0);
   function loadOlderActiveHistory() {
     if (!activeSession) return;
+    if (!transcriptWindow.prepareForPrepend()) {
+      const list = messagesListRef.current;
+      const listRect = list?.getBoundingClientRect();
+      const listTop = listRect?.top || 0;
+      const rows = list ? Array.from(list.querySelectorAll('.message[data-message-key]')) : [];
+      const anchorRow = rows.find(row => {
+        const rect = row.getBoundingClientRect();
+        return rect.top >= listTop && rect.top < listRect.bottom;
+      }) || rows.find(row => row.getBoundingClientRect().bottom > listTop) || rows[0] || null;
+      nonWindowedPrependAnchorRef.current = anchorRow ? {
+        messageKey: anchorRow.dataset.messageKey,
+        viewportOffset: anchorRow.getBoundingClientRect().top - listTop,
+      } : null;
+    }
     const chunkSource = (activeSessionMeta?.agent_type === 'codex_cli' || activeSessionMeta?.agent_type === 'cursor_cli') ? 'native' : 'relay_sqlite';
     requestHistoryChunk(activeSession, {
       mode: activeHistoryMeta?.cursor ? 'older' : 'tail',
@@ -5032,16 +8589,27 @@ async function uploadBinaryDraft(sessionId, base64, mimeType, filename) {
   }
   const shouldBottomAlignMessages = !!(
     activeSession
-    && (currentMessages.length > 0 || showLiveAssistantDraft)
+    && (currentMessages.length > 0 || showLiveAssistantDraft || activeProvisionalStream)
   );
   const activeAgentMemoKey = activeAgentKey(activeAgent);
   const renderedMessageNodes = React.useMemo(() => (
-    renderedMessages.map((msg, i) => {
+    renderedMessages.slice(transcriptWindow.start, transcriptWindow.end).map((msg, windowIndex) => {
+      const i = transcriptWindow.start + windowIndex;
       const messageKey = messageIdentityKey(msg, i);
+      const searchMatch = !!(
+        transcriptSearchTarget?.sessionId === activeSession
+        && String(msg?.id) === String(transcriptSearchTarget?.messageId)
+      );
+      // Virtualization already bounds mounted transcript work to a small window.
+      // Rendering those rows as deferred empty shells changes their measured
+      // heights after every range swap and can make the window oscillate.
+      const richContentEager = transcriptWindow.enabled
+        || searchMatch
+        || i >= Math.max(0, renderedMessages.length - 48);
       const preview = transcriptPreview?.sessionId === activeSession && transcriptPreview?.messageKey === messageKey
         ? transcriptPreview
         : null;
-      return (
+      const messageNode = (
         <MemoTranscriptMessage
           key={messageKey}
           msg={msg}
@@ -5057,12 +8625,30 @@ async function uploadBinaryDraft(sessionId, base64, mimeType, filename) {
           deliveryState={msg._cid ? deliveryStates[msg._cid] : null}
           onSteer={handleTranscriptSteer}
           onRetry={handleTranscriptRetry}
+          richContentEager={richContentEager}
+          searchMatch={searchMatch}
         />
       );
+      return transcriptWindow.enabled ? (
+        <VirtualTranscriptRow
+          key={messageKey}
+          index={i}
+          messageKey={`${activeSession || ''}\u0001${messageKey}`}
+          onMeasure={transcriptWindow.onMeasure}
+        >
+          {messageNode}
+        </VirtualTranscriptRow>
+      ) : messageNode;
     })
   ), [
     renderedMessages,
+    transcriptWindow.start,
+    transcriptWindow.end,
+    transcriptWindow.enabled,
+    transcriptWindow.onMeasure,
     activeSession,
+    transcriptSearchTarget?.sessionId,
+    transcriptSearchTarget?.messageId,
     activeAgentMemoKey,
     assistantMonospace,
     autoExpandLongCodeBlocks,
@@ -5095,7 +8681,7 @@ async function uploadBinaryDraft(sessionId, base64, mimeType, filename) {
       const [activeThread] = list.splice(activeIndex, 1);
       list.unshift(activeThread);
     }
-    return list.slice(0, 8);
+    return list;
   }, [activeSession, threadLists, optimisticThreadFocus]);
   const activeTranscriptRenderKey = React.useMemo(() => {
     const focusedThreadId = optimisticThreadFocus[activeSession];
@@ -5150,24 +8736,14 @@ async function uploadBinaryDraft(sessionId, base64, mimeType, filename) {
     });
   }, [activeSession, isAntigravityV2, rawActiveChatList]);
   React.useEffect(() => {
-    if (!(activeSession && isDesktopAgent && noMessages) || hasNativeDraftThread) return undefined;
-    const tailOptions = historyRequestOptionsFor(activeSessionMeta);
-    requestHistory(activeSession, tailOptions);
-    const intervalId = setInterval(() => requestHistory(activeSession, tailOptions), 3000);
-    return () => clearInterval(intervalId);
-  }, [activeSession, activeSessionMeta?.agent_type, noMessages, hasNativeDraftThread]);
-  React.useEffect(() => {
-    if (!(activeSession && isDesktopAgent && hasThreadCap)) return undefined;
+    if (!(activeSession && hasThreadCap && (isDesktopAgent || showThreadList))) return undefined;
     requestThreadList(activeSession);
-    const intervalId = setInterval(() => requestThreadList(activeSession), 5000);
+    const intervalId = setInterval(
+      () => requestThreadList(activeSession),
+      showThreadList ? 3000 : 5000,
+    );
     return () => clearInterval(intervalId);
-  }, [activeSession, activeSessionMeta?.agent_type, hasThreadCap]);
-  React.useEffect(() => {
-    if (!(activeSession && hasThreadCap && showThreadList)) return undefined;
-    requestThreadList(activeSession);
-    const intervalId = setInterval(() => requestThreadList(activeSession), 3000);
-    return () => clearInterval(intervalId);
-  }, [activeSession, hasThreadCap, showThreadList]);
+  }, [activeSession, activeSessionMeta?.agent_type, hasThreadCap, showThreadList]);
   React.useEffect(() => {
     if (!activeSession) return;
     const baseline = draftMessageBaselines[activeSession] || 0;
@@ -5211,10 +8787,6 @@ async function uploadBinaryDraft(sessionId, base64, mimeType, filename) {
     }));
     setShowThreadList(false);
     newThread(sessionId);
-    if (agentConfigs[sessionId]?.capabilities?.thread_list) {
-      setTimeout(() => requestThreadList(sessionId), 400);
-      setTimeout(() => requestThreadList(sessionId), 1400);
-    }
   }
 
   function handleSwitchThread(sessionId, threadId) {
@@ -5223,8 +8795,6 @@ async function uploadBinaryDraft(sessionId, base64, mimeType, filename) {
     setOptimisticThreadFocus(prev => ({ ...prev, [sessionId]: threadId }));
     setDraftMessageBaselines(prev => ({ ...prev, [sessionId]: 0 }));
     switchThread(sessionId, threadId);
-    setTimeout(() => requestThreadList(sessionId), 300);
-    setTimeout(() => requestThreadList(sessionId), 1200);
   }
 
   function handleAntigravityV2New(sessionId = activeSession) {
@@ -5236,9 +8806,6 @@ async function uploadBinaryDraft(sessionId, base64, mimeType, filename) {
       [sessionId]: { id: '__agv2:new_conversation', title: 'New Conversation', kind: 'nav', at: Date.now() },
     }));
     newChat(sessionId);
-    setTimeout(() => requestHistory(sessionId, historyRequestOptionsForSessionId(sessionId)), 150);
-    setTimeout(() => requestChatList(sessionId), 500);
-    setTimeout(() => requestChatList(sessionId), 1400);
   }
 
   function handleAntigravityV2Navigate(itemId, sessionId = activeSession) {
@@ -5267,13 +8834,15 @@ async function uploadBinaryDraft(sessionId, base64, mimeType, filename) {
       return;
     }
     switchChat(sessionId, itemId);
-    setTimeout(() => requestHistory(sessionId, historyRequestOptionsForSessionId(sessionId)), 180);
-    setTimeout(() => requestChatList(sessionId), 450);
-    setTimeout(() => requestChatList(sessionId), 1200);
   }
 
   function updateInput(value) {
     if (!activeSession) return;
+    sendHistoryCursorRef.current = {
+      sessionId: activeSession,
+      index: (sendHistoryRef.current[activeSession] || []).length,
+      scratch: value,
+    };
     setDraftForSession(activeSession, value);
     setShowSlashMenu(value.startsWith('/'));
   }
@@ -5292,20 +8861,164 @@ async function uploadBinaryDraft(sessionId, base64, mimeType, filename) {
     requestAnimationFrame(() => textareaRef.current?.focus());
   }
 
+  function renderSidebarSessionCard(session, pinned = false, workspaceLabel = '') {
+    const id = sessionIdOf(session);
+    return (
+      <MemoSessionCard
+        key={id}
+        session={session}
+        health={health[id]}
+        unread={testSessionIds.has(id) ? 0 : unread[id] || 0}
+        isThinking={!!thinking[id]}
+        isActive={id === activeSession}
+        agentConfig={agentConfigs[id] || null}
+        activity={activities[id] || null}
+        sessionMessages={messages[id] || []}
+        hasBlockingPrompt={!!permissionPrompts[id] || !!isBlockingErrorPrompt(errorPrompts[id])}
+        blockingPromptLabel={permissionPrompts[id] ? 'Permission required' : (errorPrompts[id]?.title || 'Action required')}
+        muted={!!sessionPreferences[id]?.muted}
+        pinned={pinned}
+        workspaceLabel={workspaceLabel}
+        menuOpen={openSidebarMenuId === id}
+        onMenuToggle={open => setOpenSidebarMenuId(current => open ? id : (current === id ? '' : current))}
+        onPinChange={nextPinned => saveSessionPreference(id, { pinned: nextPinned }).catch(error => {
+          showToast(error?.message || `Unable to ${nextPinned ? 'pin' : 'unpin'} chat`);
+        })}
+        onSelect={() => selectSession(id, session)}
+        onManage={() => {
+          setManagedSessionId(id);
+          setShowSessionManagement(true);
+          setShowNotificationSettings(false);
+          setShowNewSession(false);
+        }}
+        onClose={() => {
+          const isDisconnected = health[id] === 'disconnected' || !health[id];
+          const msg = isDisconnected
+            ? 'Remove session from the list?'
+            : `Close session "${id}"?`;
+          if (window.confirm(msg)) closeSession(id, isDisconnected);
+        }}
+        onAutomations={(session?.agent_type === 'codex-desktop') ? () => { if (!showAutomations) captureChatRouteScroll(); setShowAutomations(open => !open); setShowSkills(false); setShowFleetView(false); setShowUsageDashboard(false); setShowHostResourceDashboard(false); setSidebarOpen(false); } : undefined}
+        showAutomationsActive={showAutomations}
+        onSkills={(session?.agent_type === 'codex-desktop') ? () => { if (!showSkills) captureChatRouteScroll(); setShowSkills(open => !open); setShowAutomations(false); setShowFleetView(false); setShowUsageDashboard(false); setShowHostResourceDashboard(false); setSidebarOpen(false); if (!skillLists[id]) requestSkillList(id); } : undefined}
+        showSkillsActive={showSkills}
+      />
+    );
+  }
+
   // ── Render ────────────────────────────────────────────────────────────────
 
   return (
-    <div className="app">
+    <div
+      className={`app${hasSystemBanner ? ' has-system-banner' : ''}`}
+      style={hasSystemBanner ? { '--system-banner-height': `${systemBannerHeight}px` } : undefined}
+    >
+      {quickSwitcherOpen && (
+        <div
+          className="quick-switcher-overlay"
+          onMouseDown={event => {
+            if (event.target !== event.currentTarget) return;
+            setQuickSwitcherOpen(false);
+            setQuickSwitcherQuery('');
+            setQuickSwitcherIndex(0);
+            requestAnimationFrame(() => textareaRef.current?.focus());
+          }}
+        >
+          <div className="quick-switcher" role="dialog" aria-modal="true" aria-label="Switch session">
+            <div className="quick-switcher-input-wrap">
+              <span aria-hidden="true">⌕</span>
+              <input
+                ref={quickSwitcherInputRef}
+                className="quick-switcher-input"
+                value={quickSwitcherQuery}
+                onChange={event => {
+                  setQuickSwitcherQuery(event.target.value);
+                  setQuickSwitcherIndex(0);
+                }}
+                placeholder="Search sessions, projects, or harnesses"
+                aria-label="Search sessions"
+                aria-controls="quick-switcher-results"
+                aria-activedescendant={quickSwitcherResults.length ? `quick-switcher-option-${quickSwitcherIndex}` : undefined}
+                autoComplete="off"
+                spellCheck="false"
+              />
+              <kbd>Esc</kbd>
+            </div>
+            <div className="quick-switcher-results" id="quick-switcher-results" role="listbox">
+              {quickSwitcherResults.length === 0 ? (
+                <div className="quick-switcher-empty">No matching sessions</div>
+              ) : quickSwitcherResults.map((item, index) => (
+                <button
+                  type="button"
+                  role="option"
+                  id={`quick-switcher-option-${index}`}
+                  aria-selected={index === quickSwitcherIndex}
+                  className={`quick-switcher-option${index === quickSwitcherIndex ? ' selected' : ''}${item.id === activeSession ? ' active' : ''}`}
+                  key={item.id}
+                  onMouseEnter={() => setQuickSwitcherIndex(index)}
+                  onClick={() => {
+                    selectSession(item.id, item.session);
+                    setSidebarOpen(false);
+                    setQuickSwitcherOpen(false);
+                    setQuickSwitcherQuery('');
+                    setQuickSwitcherIndex(0);
+                    requestAnimationFrame(() => textareaRef.current?.focus());
+                  }}
+                >
+                  <span className="quick-switcher-dot" style={{ background: item.agentColor }} />
+                  <span className="quick-switcher-copy">
+                    <span className="quick-switcher-title">{item.title}</span>
+                    <span className="quick-switcher-meta">{item.groupLabel} · {item.agentName}{item.subtitle ? ` · ${item.subtitle}` : ''}</span>
+                  </span>
+                  {item.id === activeSession && <span className="quick-switcher-current">Current</span>}
+                </button>
+              ))}
+            </div>
+            <div className="quick-switcher-footer">
+              <span><kbd>↑</kbd><kbd>↓</kbd> Navigate</span>
+              <span><kbd>Enter</kbd> Switch</span>
+              <span>{quickSwitcherResults.length} of {quickSwitcherItems.length}</span>
+            </div>
+          </div>
+        </div>
+      )}
+      {shortcutHelpOpen && (
+        <div
+          className="shortcut-help-overlay"
+          onMouseDown={event => {
+            if (event.target === event.currentTarget) setShortcutHelpOpen(false);
+          }}
+        >
+          <div className="shortcut-help" role="dialog" aria-modal="true" aria-label="Keyboard shortcuts">
+            <div className="shortcut-help-header">
+              <strong>Keyboard shortcuts</strong>
+              <button type="button" onClick={() => setShortcutHelpOpen(false)} aria-label="Close keyboard shortcuts">×</button>
+            </div>
+            <div className="shortcut-help-list">
+              <div><span>Switch session</span><kbd>Ctrl/Cmd P</kbd></div>
+              <div><span>Previous / next session</span><kbd>Alt ↑ / ↓</kbd></div>
+              <div><span>Focus composer</span><kbd>Ctrl/Cmd K</kbd></div>
+              <div><span>Send / newline</span><kbd>Enter / Shift Enter</kbd></div>
+              <div><span>Open / close this guide</span><kbd>?</kbd></div>
+            </div>
+            <div className="shortcut-help-note">Shortcuts never switch or submit while you are typing unless they include Ctrl/Cmd or Alt.</div>
+          </div>
+        </div>
+      )}
       <div className={`overlay ${sidebarOpen ? 'open' : ''}`} onClick={() => setSidebarOpen(false)} />
-      {(duplicateProxyAlarms.length > 0 || nightlyValidationFailures.length > 0) && (
-        <div className="duplicate-proxy-banner" role="alert">
+      {hasSystemBanner && (
+        <div className={`duplicate-proxy-banner${recentAppUpdateValidation?.status === 'pass' && duplicateProxyAlarms.length === 0 && visibleNightlyValidationFailures.length === 0 ? ' app-update-pass' : ''}`} role={recentAppUpdateValidation?.status === 'pass' && duplicateProxyAlarms.length === 0 && visibleNightlyValidationFailures.length === 0 ? 'status' : 'alert'} ref={systemBannerRef}>
           {duplicateProxyAlarms.length > 0 && <>
             <strong>Duplicate proxy detected.</strong>
             <span>{duplicateProxyAlarms.length} session{duplicateProxyAlarms.length === 1 ? '' : 's'} claimed by multiple proxies. Stop the extra proxy to prevent conflicting controls.</span>
           </>}
-          {nightlyValidationFailures.length > 0 && <>
+          {visibleNightlyValidationFailures.length > 0 && <>
             <strong>Nightly validation failed.</strong>
-            <span>{nightlyValidationFailures.map(item => `${item.harness} (${item.app_version})`).join(', ')}. Check the validation ledger before using affected controls.</span>
+            <span>{visibleNightlyValidationFailures.map(item => `${item.harness} (${item.app_version})`).join(', ')}. Check the validation ledger before using affected controls.</span>
+          </>}
+          {recentAppUpdateValidation && <>
+            <strong>{recentAppUpdateValidation.status === 'pass' ? 'App update validated.' : 'App update drift validation failed.'}</strong>
+            <span>{recentAppUpdateValidation.harness} {recentAppUpdateValidation.previous_app_version} -&gt; {recentAppUpdateValidation.app_version}. {recentAppUpdateValidation.status === 'pass' ? 'Harness controls remain available.' : 'A triage item was added to the maturity backlog.'}</span>
           </>}
         </div>
       )}
@@ -5315,6 +9028,15 @@ async function uploadBinaryDraft(sessionId, base64, mimeType, filename) {
         <div className="sidebar-header">
           <span className="logo">⌬</span>
           <span style={{ flex: 1 }}>Agent Sessions</span>
+          <button
+            className={`new-session-btn notification-settings-btn${shortcutHelpOpen ? ' active' : ''}`}
+            title="Keyboard shortcuts (?)"
+            aria-label="Keyboard shortcuts"
+            onClick={() => {
+              setShortcutHelpOpen(open => !open);
+              setQuickSwitcherOpen(false);
+            }}
+          >?</button>
           <button
             className={`new-session-btn notification-settings-btn${showNotificationSettings ? ' active' : ''}`}
             title="Notification settings"
@@ -5330,7 +9052,11 @@ async function uploadBinaryDraft(sessionId, base64, mimeType, filename) {
             title="Manage sessions"
             aria-label="Manage sessions"
             onClick={() => {
-              setManagedSessionId(activeSession || sessionIdOf(allManagedSessions[0]) || '');
+              setManagedSessionId(
+                activeSession && (showTestSessions || !testSessionIds.has(activeSession))
+                  ? activeSession
+                  : sessionIdOf(sidebarManagedSessions[0]) || '',
+              );
               setShowSessionManagement(open => !open);
               setShowNewSession(false);
               setShowNotificationSettings(false);
@@ -5346,15 +9072,35 @@ async function uploadBinaryDraft(sessionId, base64, mimeType, filename) {
             }}
           >+</button>
         </div>
+        <div
+          className={`sidebar-order-control${sidebarOrderChanged ? ' changed' : ''}`}
+          aria-hidden={!sidebarOrderChanged}
+          aria-live="polite"
+        >
+          <span>Order changed</span>
+          <button
+            type="button"
+            onClick={applySidebarSortNow}
+            disabled={!sidebarOrderChanged}
+            tabIndex={sidebarOrderChanged ? 0 : -1}
+          >Sort now</button>
+        </div>
         {showNotificationSettings && (
-          <NotificationSettingsPanel onClose={() => setShowNotificationSettings(false)} />
+          <NotificationSettingsPanel
+            onClose={() => setShowNotificationSettings(false)}
+            onPreferencesChange={next => {
+              setAttentionFeedbackPreferences({ ...next, turn_ready: false });
+              setNotificationPreferencesLoaded(true);
+            }}
+          />
         )}
         {showSessionManagement && (
           <SessionManagementPanel
-            sessions={allManagedSessions}
+            sessions={sidebarManagedSessions}
             preferences={sessionPreferences}
             initialSessionId={managedSessionId}
             onSave={saveSessionPreference}
+            onExport={downloadSessionExport}
             onClose={() => setShowSessionManagement(false)}
           />
         )}
@@ -5365,81 +9111,109 @@ async function uploadBinaryDraft(sessionId, base64, mimeType, filename) {
             onResume={(sourceSession, agentType, workspacePath, options) => resumeSession(sourceSession, agentType, workspacePath, options)}
             onClose={() => setShowNewSession(false)}
             workspaces={workspaces}
+            showTestSessions={showTestSessions}
           />
         )}
-        <div className="session-list">
+        <div
+          className="session-list"
+          ref={sidebarListRef}
+          onPointerDown={beginSidebarInteraction}
+          onPointerUp={() => endSidebarInteraction(80)}
+          onPointerCancel={() => endSidebarInteraction(80)}
+          onScroll={() => {
+            beginSidebarInteraction();
+            endSidebarInteraction(180);
+          }}
+        >
           {orderedSessions.length === 0 && !showNewSession && (
             <div className="session-empty">No agents connected</div>
           )}
+          {workingSessions.length > 0 && (
+            <section className="session-group working-session-group" aria-label="Working now">
+              <div className="session-group-header">
+                <span className="working-session-group-icon" aria-hidden="true">W</span>
+                <span className="session-group-name pinned-session-group-name">Working now</span>
+                <span className="session-group-status-slot">
+                  {workingSessionSummary.hasPrompt && <span className="session-group-alert" title="Action required">!</span>}
+                  <span className="session-group-working" title="Sessions working" />
+                  {workingSessionSummary.unread > 0 && (
+                    <span className="session-group-unread" title={`${workingSessionSummary.unread} unread`}>{workingSessionSummary.unread > 99 ? '99+' : workingSessionSummary.unread}</span>
+                  )}
+                  <span className="session-group-count">{workingSessions.length}</span>
+                </span>
+              </div>
+              <div className="session-group-items">
+                <div className="session-group-items-inner">
+                  {workingSessions.map(session => {
+                    const id = sessionIdOf(session);
+                    return renderSidebarSessionCard(
+                      session,
+                      !!sessionPreferences[id]?.pinned,
+                      workspaceLabelBySessionId[id] || 'Unscoped',
+                    );
+                  })}
+                </div>
+              </div>
+            </section>
+          )}
+          {pinnedSessions.length > 0 && (
+            <section className="session-group pinned-session-group" aria-label="Pinned chats">
+              <div className="session-group-header">
+                <span className="session-group-pin-icon" aria-hidden="true">📌</span>
+                <span className="session-group-name pinned-session-group-name">Pinned chats</span>
+                <span className="session-group-status-slot">
+                  {pinnedSessionSummary.hasPrompt && <span className="session-group-alert" title="Action required">!</span>}
+                  {pinnedSessionSummary.working && <span className="session-group-working" title="Session working" />}
+                  {pinnedSessionSummary.unread > 0 && (
+                    <span className="session-group-unread" title={`${pinnedSessionSummary.unread} unread`}>{pinnedSessionSummary.unread > 99 ? '99+' : pinnedSessionSummary.unread}</span>
+                  )}
+                  <span className="session-group-count">{pinnedSessions.length}</span>
+                </span>
+              </div>
+              <div className="session-group-items">
+                <div className="session-group-items-inner">
+                  {pinnedSessions.map(session => renderSidebarSessionCard(session, true))}
+                </div>
+              </div>
+            </section>
+          )}
           {sessionGroups.map(group => {
             const collapsed = !!collapsedSessionGroups[group.key];
-            const summary = group.sessions.reduce((result, session) => {
-              const id = sessionIdOf(session);
-              const activity = activities[id];
-              const activityKind = String(activity?.kind || '').toLowerCase();
-              result.unread += unread[id] || 0;
-              result.hasPrompt = result.hasPrompt || !!permissionPrompts[id] || !!isBlockingErrorPrompt(errorPrompts[id]);
-              result.working = result.working || !!thinking[id] || !!activity?.generating
-                || (!!activity && !['', 'idle', 'waiting_for_user', 'completed', 'done'].includes(activityKind));
-              return result;
-            }, { unread: 0, hasPrompt: false, working: false });
+            const summary = summarizeSidebarSessions(group.sessions);
             return (
             <div className={`session-group${collapsed ? ' collapsed' : ''}`} key={group.key}>
-              <button
-                type="button"
-                className="session-group-header"
-                title={`${collapsed ? 'Expand' : 'Collapse'} ${group.label}`}
-                aria-expanded={!collapsed}
-                onClick={() => toggleSessionGroup(group.key)}
-              >
-                <span className="session-group-caret" aria-hidden="true">{collapsed ? '>' : 'v'}</span>
-                <span className="session-group-name">{group.label}</span>
-                {summary.hasPrompt && <span className="session-group-alert" title="Action required">!</span>}
-                {summary.working && <span className="session-group-working" title="Session working" />}
-                {summary.unread > 0 && (
-                  <span className="session-group-unread" title={`${summary.unread} unread`}>{summary.unread > 99 ? '99+' : summary.unread}</span>
-                )}
-                <span className="session-group-count">{group.sessions.length}</span>
-              </button>
+              <div className="session-group-header">
+                <button
+                  type="button"
+                  className="session-group-toggle"
+                  title={`${collapsed ? 'Expand' : 'Collapse'} ${group.label}`}
+                  aria-label={`${collapsed ? 'Expand' : 'Collapse'} ${group.label}`}
+                  aria-expanded={!collapsed}
+                  onClick={() => toggleSessionGroup(group.key)}
+                >
+                  <span className="session-group-caret" aria-hidden="true">{collapsed ? '>' : 'v'}</span>
+                </button>
+                <FullTitleDisclosure
+                  title={group.label}
+                  disclosureKey={group.key}
+                  kind="group"
+                  wrapperClassName="session-group-title-details"
+                  triggerClassName="session-group-name"
+                  disclosureClassName="session-group-disclosure"
+                  triggerLabel={`Show full group name: ${group.label}`}
+                />
+                <span className="session-group-status-slot">
+                  {summary.hasPrompt && <span className="session-group-alert" title="Action required">!</span>}
+                  {summary.working && <span className="session-group-working" title="Session working" />}
+                  {summary.unread > 0 && (
+                    <span className="session-group-unread" title={`${summary.unread} unread`}>{summary.unread > 99 ? '99+' : summary.unread}</span>
+                  )}
+                  <span className="session-group-count">{group.sessions.length}</span>
+                </span>
+              </div>
               <div className="session-group-items" aria-hidden={collapsed}>
                 <div className="session-group-items-inner">
-              {group.sessions.map(s => {
-                const id = typeof s === 'string' ? s : s?.session_id;
-                return (
-                  <MemoSessionCard
-                    key={id}
-                    session={s}
-                    health={health[id]}
-                    unread={unread[id] || 0}
-                    isThinking={!!thinking[id]}
-                    isActive={id === activeSession}
-                    agentConfig={agentConfigs[id] || null}
-                    activity={activities[id] || null}
-                    sessionMessages={messages[id] || []}
-                    hasBlockingPrompt={!!permissionPrompts[id] || !!isBlockingErrorPrompt(errorPrompts[id])}
-                    blockingPromptLabel={permissionPrompts[id] ? 'Permission required' : (errorPrompts[id]?.title || 'Action required')}
-                    muted={!!sessionPreferences[id]?.muted}
-                    onSelect={() => selectSession(id, s)}
-                    onManage={() => {
-                      setManagedSessionId(id);
-                      setShowSessionManagement(true);
-                      setShowNotificationSettings(false);
-                      setShowNewSession(false);
-                    }}
-                    onClose={() => {
-                      const isDisconnected = health[id] === 'disconnected' || !health[id];
-                      const msg = isDisconnected
-                        ? `Remove session from the list?`
-                        : `Close session "${id}"?`;
-                      if (window.confirm(msg)) closeSession(id, isDisconnected);
-                    }}
-                    onAutomations={(s?.agent_type === 'codex-desktop') ? () => { setShowAutomations(o => !o); setShowSkills(false); setSidebarOpen(false); } : undefined}
-                    showAutomationsActive={showAutomations}
-                    onSkills={(s?.agent_type === 'codex-desktop') ? () => { setShowSkills(o => !o); setShowAutomations(false); setSidebarOpen(false); if (!skillLists[id]) requestSkillList(id); } : undefined}
-                    showSkillsActive={showSkills}
-                  />
-                );
-              })}
+              {group.sessions.map(session => renderSidebarSessionCard(session, false))}
                 </div>
               </div>
             </div>
@@ -5448,13 +9222,100 @@ async function uploadBinaryDraft(sessionId, base64, mimeType, filename) {
         </div>
         <div className="sidebar-footer">
           <span className={`status-dot ${relayHealthState}`} />
-          {connected ? `Relay ${relayHealthState}${relayRttText}` : 'Reconnecting…'}
+          <span className="sidebar-footer-health">
+            <span>{connected ? `Relay ${relayHealthState}` : 'Reconnecting…'}</span>
+            <span className="sidebar-footer-rtt">{connected ? (relayRttText.replace(/^\s*·\s*/, '') || '\u00a0') : '\u00a0'}</span>
+          </span>
+          <button
+            type="button"
+            className={`sidebar-footer-action test-session-toggle${showTestSessions ? ' active' : ''}`}
+            title={showTestSessions ? 'Hide test sessions' : `Show test sessions (${testSessionIds.size})`}
+            aria-label={showTestSessions ? 'Hide test sessions' : 'Show test sessions'}
+            aria-pressed={showTestSessions}
+            onClick={() => setShowTestSessions(value => !value)}
+          >T{testSessionIds.size > 99 ? '99+' : testSessionIds.size || ''}</button>
+          <button
+            type="button"
+            className={`sidebar-footer-action${showUsageDashboard ? ' active' : ''}`}
+            title="Usage and limits"
+            aria-label="Usage and limits"
+            onClick={() => {
+              if (!showUsageDashboard) captureChatRouteScroll();
+              setShowUsageDashboard(open => !open);
+              setShowHostResourceDashboard(false);
+              setShowAutomations(false);
+              setShowSkills(false);
+              setShowNewSession(false);
+              setShowNotificationSettings(false);
+              setShowSessionManagement(false);
+              setShowFleetView(false);
+              setShowTranscriptSearch(false);
+              setSidebarOpen(false);
+            }}
+          >◔</button>
+          <button
+            type="button"
+            className={`sidebar-footer-action host-resource-footer-action${showHostResourceDashboard ? ' active' : ''}`}
+            title="Host resources"
+            aria-label="Host resources"
+            onClick={() => {
+              if (!showHostResourceDashboard) captureChatRouteScroll();
+              setShowHostResourceDashboard(open => !open);
+              setShowUsageDashboard(false);
+              setShowFleetView(false);
+              setShowAutomations(false);
+              setShowSkills(false);
+              setShowNewSession(false);
+              setShowNotificationSettings(false);
+              setShowSessionManagement(false);
+              setShowTranscriptSearch(false);
+              setSidebarOpen(false);
+            }}
+          >R</button>
+          <button
+            type="button"
+            className={`sidebar-footer-action fleet-footer-action${showFleetView ? ' active' : ''}`}
+            title="Fleet view"
+            aria-label="Fleet view"
+            onClick={() => {
+              if (!showFleetView) captureChatRouteScroll();
+              setShowFleetView(open => !open);
+              setShowUsageDashboard(false);
+              setShowHostResourceDashboard(false);
+              setShowAutomations(false);
+              setShowSkills(false);
+              setShowNewSession(false);
+              setShowNotificationSettings(false);
+              setShowSessionManagement(false);
+              setShowTranscriptSearch(false);
+              setSidebarOpen(false);
+            }}
+          >▦</button>
+          <button
+            type="button"
+            className={`sidebar-footer-action transcript-search-footer-action${showTranscriptSearch ? ' active' : ''}`}
+            title="Search all transcripts"
+            aria-label="Search all transcripts"
+            onClick={() => {
+              if (!showTranscriptSearch) captureChatRouteScroll();
+              setShowTranscriptSearch(open => !open);
+              setShowFleetView(false);
+              setShowUsageDashboard(false);
+              setShowHostResourceDashboard(false);
+              setShowAutomations(false);
+              setShowSkills(false);
+              setShowNewSession(false);
+              setShowNotificationSettings(false);
+              setShowSessionManagement(false);
+              setSidebarOpen(false);
+            }}
+          >⌕</button>
           <a href="/agent-chat.apk" download className="apk-download-link" title="Download Android APK">⬇ APK</a>
         </div>
       </div>
 
       {/* Main panel */}
-      <div className={`main${showAutomations || showSkills ? ' automations-active' : ''}`}>
+      <div className={`main${showAutomations || showSkills || showUsageDashboard || showHostResourceDashboard || showFleetView || showTranscriptSearch ? ' automations-active' : ''}`}>
         {showAutomations && (
           <AutomationsView
             sessions={sessions}
@@ -5468,16 +9329,84 @@ async function uploadBinaryDraft(sessionId, base64, mimeType, filename) {
             onBack={() => setShowSkills(false)}
           />
         )}
-      {!showAutomations && !showSkills && (<>
+        {showScheduledSend && activeSession && (
+          <ScheduledSendPanel
+            sessionId={activeSession}
+            initialContent={currentInput}
+            jobs={scheduledSends.filter(job => job.session_id === activeSession)}
+            onSchedule={scheduleSend}
+            onCancel={cancelScheduledSend}
+            onCreated={() => setDraftForSession(activeSession, '')}
+            onClose={() => setShowScheduledSend(false)}
+          />
+        )}
+        {showUsageDashboard && (
+          <UsageDashboard
+            usage={providerUsage}
+            refreshReceipt={providerUsageRefreshReceipt}
+            costDetail={providerUsageCostDetail}
+            onBack={() => setShowUsageDashboard(false)}
+            onRefresh={requestProviderUsageRefresh}
+            onRequestCostDetail={requestProviderUsageCostDetail}
+          />
+        )}
+        {showHostResourceDashboard && (
+          <HostResourceDashboard
+            snapshot={hostResources}
+            error={hostResourceError}
+            history={hostResourceHistory}
+            details={hostResourceDetails}
+            subscription={hostResourceSubscription}
+            onBack={() => setShowHostResourceDashboard(false)}
+            onRefresh={requestHostResourceRefresh}
+            onSubscribe={subscribeHostResources}
+            onUnsubscribe={unsubscribeHostResources}
+          />
+        )}
+        {showFleetView && (
+          <FleetView
+            sessions={operatorOrderedSessions}
+            activities={activities}
+            thinking={thinking}
+            permissionPrompts={permissionPrompts}
+            errorPrompts={errorPrompts}
+            messages={messages}
+            agentConfigs={agentConfigs}
+            sessionAttention={sessionAttention}
+            health={health}
+            connected={connected}
+            deliveryStates={deliveryStates}
+            onBroadcastSend={sendToSession}
+            onBack={() => setShowFleetView(false)}
+            onSelectSession={(sessionId, session) => {
+              selectSession(sessionId, session);
+              setShowFleetView(false);
+            }}
+          />
+        )}
+        {showTranscriptSearch && (
+          <TranscriptSearchView
+            onBack={() => setShowTranscriptSearch(false)}
+            onOpenResult={openTranscriptSearchResult}
+          />
+        )}
+      {!showAutomations && !showSkills && !showUsageDashboard && !showHostResourceDashboard && !showFleetView && !showTranscriptSearch && (<>
         <div className="topbar">
           <button className="hamburger" onClick={() => setSidebarOpen(o => !o)}>
             ☰
             {unreadTotal > 0 && <span className="hamburger-badge">{unreadTotal}</span>}
+            {attentionTotal > 0 && (
+              <span className="hamburger-attention" title={`${attentionTotal} session${attentionTotal === 1 ? '' : 's'} need attention`} aria-label={`${attentionTotal} sessions need attention`}>!</span>
+            )}
           </button>
           <div className="topbar-context">
             {activeSession ? (
               <>
-                <div className="topbar-title-row">
+                <div
+                  className="topbar-title-row"
+                  role="group"
+                  aria-label={`${activeAgent.name} chat: ${activeChatTitle}`}
+                >
                   <div
                     className="agent-badge topbar-agent-badge"
                     style={{ color: activeAgent.color, borderColor: activeAgent.color + '55', background: activeAgent.color + '18' }}
@@ -5486,18 +9415,28 @@ async function uploadBinaryDraft(sessionId, base64, mimeType, filename) {
                       ? <img src={activeAgent.logo} alt={activeAgent.abbr} className="agent-badge-logo" />
                       : activeAgent.abbr}
                   </div>
-                  <div className="topbar-title-group">
-                    <div className="topbar-title" style={{ color: activeAgent.color }}>
-                      {activeLabel}
+                  <div className="topbar-title-group" style={{ color: activeAgent.color }}>
+                    <div
+                      className="topbar-title-projection"
+                      data-chat-title-source={activeChatTitleProjection.source}
+                      data-chat-title-field={activeChatTitleProjection.field}
+                    >
+                      <FullTitleDisclosure
+                        title={activeChatTitle}
+                        disclosureKey={`topbar-${activeSession}`}
+                        kind="chat"
+                        wrapperClassName="topbar-title-details"
+                        triggerClassName="topbar-title"
+                        disclosureClassName="topbar-title-disclosure"
+                        triggerLabel={`Show full chat title: ${activeChatTitle}`}
+                        triggerTag="div"
+                      />
                     </div>
                     <div
                       className="topbar-subtitle"
                       title={activeWorkspacePath || undefined}
                     >
-                      {activeWorkspaceBasename
-                        ? <><span className="topbar-workspace-icon">⌂</span>{activeWorkspaceBasename}</>
-                        : activeWindowLabel || (isUuidLike(activeSession) ? 'Connected session' : activeSession)
-                      }
+                      <span className="topbar-workspace-icon">⌂</span>{activeWorkspaceContext}
                       {activeConfig?.branch && activeConfig.branch !== 'unknown' && (
                         <button
                           className={`topbar-branch-btn${showBranchSelector ? ' active' : ''}`}
@@ -5526,7 +9465,7 @@ async function uploadBinaryDraft(sessionId, base64, mimeType, filename) {
                     {connected ? 'relay live' : 'reconnecting'}
                   </span>
                   <span
-                    className={`context-pill ${
+                    className={`context-pill topbar-proxy-health ${
                       activeHealth === 'healthy'      ? 'ok' :
                       activeHealth === 'degraded'     ? 'warn' :
                       activeHealth === 'disconnected' ? 'error' : ''
@@ -5543,6 +9482,18 @@ async function uploadBinaryDraft(sessionId, base64, mimeType, filename) {
                   )}
                   {activeHostLabel && (
                     <span className="context-pill" title="Native editor host">{activeHostLabel}</span>
+                  )}
+                  {activeUsageSnapshot.hasSignal && (
+                    <button
+                      type="button"
+                      className={`context-pill usage-context-pill ${activeUsageSnapshot.state}`}
+                      title={activeUsageSnapshot.resetAt ? `Usage resets ${activeUsageSnapshot.resetAt}` : 'Open usage and limits'}
+                      onClick={() => { captureChatRouteScroll(); setShowUsageDashboard(true); setShowHostResourceDashboard(false); setShowFleetView(false); }}
+                    >
+                      {activeUsageSnapshot.state === 'exhausted'
+                        ? 'limit reached'
+                        : `${activeUsageSnapshot.remainingPercent}% left`}
+                    </button>
                   )}
                   {activeSessionMeta?.agent_type === 'codex' && activeSessionMeta?.visible_pane_visible && (
                     <span
@@ -5800,11 +9751,16 @@ async function uploadBinaryDraft(sessionId, base64, mimeType, filename) {
           <button
             className="jump-to-newest"
             onClick={pinTranscriptToNewest}
-          >↓ Jump to Newest</button>
+          >{newMessagesBelow > 0 ? `↓ ${newMessagesBelow} new` : '↓ Jump to Newest'}</button>
         )}
         <div
           className={`messages harness-theme harness-theme-${safeString(activeSessionMeta?.agent_type || 'default').replace(/[^a-z0-9_-]/gi, '-')}`}
           data-agent-type={activeSessionMeta?.agent_type || 'default'}
+          data-layout={harnessLayoutForAgentType(activeSessionMeta?.agent_type)}
+          data-transcript-windowed={transcriptWindow.enabled ? 'true' : 'false'}
+          data-total-message-count={renderedMessages.length}
+          data-window-start={transcriptWindow.start}
+          data-window-end={transcriptWindow.end}
           key={activeTranscriptRenderKey}
           ref={messagesListRef}
         >
@@ -5813,7 +9769,9 @@ async function uploadBinaryDraft(sessionId, base64, mimeType, filename) {
             <PermissionOverlay
               prompt={activePrompt}
               sessionId={activeSession}
+              agentType={activeSessionMeta?.agent_type}
               onRespond={respondToPrompt}
+              onDismissFocus={() => textareaRef.current?.focus()}
             />
           )}
           {activeBlockingErrorPrompt && !activePrompt && (
@@ -5844,7 +9802,7 @@ async function uploadBinaryDraft(sessionId, base64, mimeType, filename) {
           )}
           {!activeSession ? (
             <div className="empty-state"><div className="icon">🤖</div><div>Select an agent session</div></div>
-          ) : currentMessages.length === 0 && hasThreadCap && activeSessionMeta?.is_list_view && (threadLists[activeSession]?.length > 0) && !pendingDraftThreads[activeSession] && !hasNativeDraftThread ? (
+          ) : currentMessages.length === 0 && !activeProvisionalStream && hasThreadCap && activeSessionMeta?.is_list_view && (threadLists[activeSession]?.length > 0) && !pendingDraftThreads[activeSession] && !hasNativeDraftThread ? (
             <div className="thread-picker-empty">
               <div className="thread-picker-header">Select a chat</div>
               <div className="thread-picker-list">
@@ -5867,7 +9825,7 @@ async function uploadBinaryDraft(sessionId, base64, mimeType, filename) {
                 onClick={() => handleNewThread(activeSession)}
               >+ New Thread</button>
             </div>
-          ) : currentMessages.length === 0 && isAntigravityV2 && activeSessionMeta?.is_list_view ? (
+          ) : currentMessages.length === 0 && !activeProvisionalStream && isAntigravityV2 && activeSessionMeta?.is_list_view ? (
             <div className="thread-picker-empty agv2-picker-empty">
               <div className="thread-picker-header">Choose a conversation or start a new one</div>
               {agv2NavigatorOpen ? null : (chatLists[activeSession]?.length > 0) ? (
@@ -5882,7 +9840,7 @@ async function uploadBinaryDraft(sessionId, base64, mimeType, filename) {
                 <button className="thread-picker-new" onClick={() => handleAntigravityV2New(activeSession)}>+ New Conversation</button>
               )}
             </div>
-          ) : currentMessages.length === 0 && isAntigravityV2 && chatLists[activeSession]?.length > 0 ? (
+          ) : currentMessages.length === 0 && !activeProvisionalStream && isAntigravityV2 && chatLists[activeSession]?.length > 0 ? (
             <div className="thread-picker-empty agv2-picker-empty">
               <div className="thread-picker-header">Select an Antigravity project or conversation</div>
               {!agv2NavigatorOpen && <AntigravityV2NavPanel
@@ -5893,7 +9851,7 @@ async function uploadBinaryDraft(sessionId, base64, mimeType, filename) {
                 onNew={() => handleAntigravityV2New(activeSession)}
               />}
             </div>
-          ) : currentMessages.length === 0 && activeSessionMeta?.is_list_view && chatLists[activeSession]?.length > 0 ? (
+          ) : currentMessages.length === 0 && !activeProvisionalStream && activeSessionMeta?.is_list_view && chatLists[activeSession]?.length > 0 ? (
             <div className="thread-picker-empty">
               <div className="thread-picker-header">Select a conversation or type a new message</div>
               <div className="thread-picker-list">
@@ -5909,22 +9867,51 @@ async function uploadBinaryDraft(sessionId, base64, mimeType, filename) {
                 ))}
               </div>
             </div>
-          ) : currentMessages.length === 0 && activeHistoryMeta?.error ? (
+          ) : currentMessages.length === 0 && !activeProvisionalStream && activeHistoryMeta?.error ? (
             <div className="empty-state history-error-state">
               <div className="icon">⚠</div>
               <div>{activeHistoryMeta.error}</div>
               <button type="button" className="thread-picker-new" onClick={retryActiveHistory}>Retry transcript</button>
             </div>
-          ) : currentMessages.length === 0 && activeHistoryLoading ? (
+          ) : currentMessages.length === 0 && !activeProvisionalStream && activeHistoryLoading ? (
             <div className="empty-state history-loading-state">
               <span className="new-session-spinner" />
               <div>{activeHistoryLoading.mode === 'older' ? 'Loading older messages...' : 'Loading latest messages...'}</div>
             </div>
-          ) : currentMessages.length === 0 ? (
+          ) : currentMessages.length === 0 && !activeProvisionalStream ? (
             <div className="empty-state"><div className="icon">💬</div><div>No messages yet</div></div>
-          ) : renderedMessageNodes}
+          ) : (
+            <>
+              {transcriptWindow.enabled && (
+                <div
+                  className="transcript-window-spacer top"
+                  data-testid="transcript-window-top-spacer"
+                  style={{ height: `${transcriptWindow.topSpacerHeight}px` }}
+                />
+              )}
+              {renderedMessageNodes}
+              {transcriptWindow.enabled && (
+                <div
+                  className="transcript-window-spacer bottom"
+                  data-testid="transcript-window-bottom-spacer"
+                  style={{ height: `${transcriptWindow.bottomSpacerHeight}px` }}
+                />
+              )}
+            </>
+          )}
+          {activeProvisionalStream && (
+            <ProvisionalStreamingBubble
+              stream={activeProvisionalStream}
+              activeAgent={activeAgent}
+              monospace={assistantMonospace}
+            />
+          )}
           {showLiveAssistantDraft && (
-            <div className={`message assistant live-draft${assistantMonospace ? ' monospace' : ''}`}>
+            <div
+              className={`message assistant live-draft${assistantMonospace ? ' monospace' : ''}`}
+              data-message-role="assistant"
+              data-message-timestamp={parseMessageInstant(activeActivity?.started_at || activeActivity?.updated_at)?.iso || 'unknown'}
+            >
               <div className="assistant-gutter">
                 <div
                   className="agent-badge transcript-agent-badge"
@@ -5936,7 +9923,10 @@ async function uploadBinaryDraft(sessionId, base64, mimeType, filename) {
                 </div>
               </div>
               <div className="assistant-content">
-                <div className="message-role"><span>{activeAgent.name}</span></div>
+                <div className="message-role">
+                  <span className="message-role-label">{activeAgent.name}</span>
+                  <MessageTimestamp instant={activeActivity?.started_at || activeActivity?.updated_at} />
+                </div>
                 <MarkdownContent content={liveThinkingText} monospace={assistantMonospace} autoExpandLongCodeBlocks={autoExpandLongCodeBlocks} onOpenPath={(path) => openTranscriptPreview('live-draft', path)} />
               </div>
             </div>
@@ -5958,7 +9948,7 @@ async function uploadBinaryDraft(sessionId, base64, mimeType, filename) {
 
         {(activeActivity?.task_list || showTranscriptFooterActivity) && !showFileBrowser && (
           <div className="transcript-live-footer" data-testid="transcript-live-footer">
-            {activeActivity?.task_list && (
+            {activeActivity?.task_list && !activeActivity?.step && (
               <div className="session-tasklist-strip">
                 <TaskList taskList={activeActivity.task_list} sessionId={activeSession} />
               </div>
@@ -5968,7 +9958,7 @@ async function uploadBinaryDraft(sessionId, base64, mimeType, filename) {
                 <ActivityRow
                   activity={activeActivity}
                   thinkingText={activeSession ? (thinkingContent[activeSession] || '') : ''}
-                  isClaude={activeSessionMeta?.agent_type === 'claude'}
+                  agentType={activeSessionMeta?.agent_type}
                   pinned
                 />
               </div>
@@ -6057,7 +10047,11 @@ async function uploadBinaryDraft(sessionId, base64, mimeType, filename) {
           />
         )}
 
-        <div className="input-area" style={showFileBrowser ? { display: 'none' } : undefined}>
+        <div
+          className={`input-area composer-skin-${composerSkinForAgentType(activeSessionMeta?.agent_type)}`}
+          data-composer-skin={composerSkinForAgentType(activeSessionMeta?.agent_type)}
+          style={showFileBrowser ? { display: 'none' } : undefined}
+        >
           <label className={`attach-btn ${!activeSession || !connected || !!activeBlockingPrompt ? 'disabled' : ''}`} title="Attach file">
             <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
               <path d="M21.44 11.05l-9.19 9.19a6 6 0 0 1-8.49-8.49l9.19-9.19a4 4 0 0 1 5.66 5.66l-9.2 9.19a2 2 0 0 1-2.83-2.83l8.49-8.48" />
@@ -6130,6 +10124,14 @@ async function uploadBinaryDraft(sessionId, base64, mimeType, filename) {
               <div className="textarea-btns">
                 {activeSession && (
                   <button
+                    className={`composer-gear-btn schedule-send-btn${showScheduledSend ? ' active' : ''}`}
+                    onClick={() => setShowScheduledSend(open => !open)}
+                    title="Schedule this message"
+                    aria-label="Schedule message"
+                  >◷</button>
+                )}
+                {activeSession && (
+                  <button
                     className={`composer-gear-btn${showComposerSettings ? ' active' : ''}`}
                     onClick={() => setShowComposerSettings(s => !s)}
                     title="Toggle settings"
@@ -6196,10 +10198,7 @@ async function uploadBinaryDraft(sessionId, base64, mimeType, filename) {
                     className={`stop-btn${isStopPending ? ' pending' : ''}`}
                     title={isStopPending ? 'Interrupting…' : 'Interrupt agent'}
                     disabled={isStopPending}
-                    onClick={() => {
-                      setStopPending(prev => ({ ...prev, [activeSession]: true }));
-                      interruptSession(activeSession);
-                    }}
+                    onClick={performInterrupt}
                   >
                     {isStopPending ? <span className="stop-btn-spinner" /> : '■'}
                   </button>
@@ -6211,11 +10210,22 @@ async function uploadBinaryDraft(sessionId, base64, mimeType, filename) {
               </div>
             </div>
             <div className="composer-meta">
+              {interruptConfirmSession === activeSession && isActiveThinking && !isStopPending && (
+                <span className="interrupt-confirm-inline" role="status" aria-live="polite">
+                  Press Esc again or Enter to interrupt
+                </span>
+              )}
               {(isContinueLikeAgentType(activeSessionMeta?.agent_type) || isClineLikeAgentType(activeSessionMeta?.agent_type)) && activeConfig?.mode && activeConfig.mode !== 'unknown' && (
                 <span className="composer-hint" style={{ color: '#d29922' }}>{activeConfig.mode}</span>
               )}
               {(isContinueLikeAgentType(activeSessionMeta?.agent_type) || isClineLikeAgentType(activeSessionMeta?.agent_type)) && activeConfig?.model_id && activeConfig.model_id !== 'unknown' && (
                 <span className="composer-hint" style={{ color: '#d29922' }}>{activeConfig.model_id}</span>
+              )}
+              {activeSessionMeta?.agent_type === 'codex_cli' && activeConfig?.config_semantics === 'observed_and_next_send' && (
+                <span className="composer-hint" style={{ color: '#8b949e' }}>
+                  Observed {activeConfig.observed_model_id || 'unknown'} / {activeConfig.observed_effort || 'unknown'}
+                  {' · '}Next {activeConfig.next_send_model_id || 'unset'} / {activeConfig.next_send_effort || 'unset'}
+                </span>
               )}
               {activeSessionMeta?.agent_type === 'antigravity-v2' && activeConfig?.model_id && activeConfig.model_id !== 'unknown' && (
                 <span className="composer-hint" style={{ color: '#8b949e' }}>{activeConfig.model_id}</span>
@@ -6248,24 +10258,42 @@ async function uploadBinaryDraft(sessionId, base64, mimeType, filename) {
                   </div>
                 )}
                 {(activeConfig?.capabilities?.set_model || activeSessionMeta?.agent_type === 'antigravity' || activeSessionMeta?.agent_type === 'antigravity_panel') && (
-                  <label className="composer-setting-label">
-                    <span className="composer-setting-key">Model</span>
-                    <select
-                      className="composer-setting-select"
-                      value={activeConfig?.model_id || 'default'}
-                      onChange={e => setAgentModel(activeSession, e.target.value)}
-                    >
-                      {composerModelOptionsFor(activeSessionMeta?.agent_type, activeConfig).map(m => (
-                        <option key={m.id} value={m.id}>{m.label}</option>
-                      ))}
-                      {!composerModelOptionsFor(activeSessionMeta?.agent_type, activeConfig).some(m => m.id === activeConfig.model_id) && activeConfig?.model_id && activeConfig.model_id !== 'unknown' && (
-                        <option value={activeConfig.model_id}>{activeConfig.model_id}</option>
+                  <>
+                    {activeSessionMeta?.agent_type === 'codex_cli' && activeConfig?.config_semantics === 'observed_and_next_send' && (
+                      <span className="composer-setting-label" data-control="observed-model">
+                        <span className="composer-setting-key">Observed model</span>
+                        <span className="composer-hint">{activeConfig.observed_model_id || 'unknown'}</span>
+                      </span>
+                    )}
+                    <label className="composer-setting-label" data-control="model">
+                      <span className="composer-setting-key">
+                        {activeSessionMeta?.agent_type === 'codex_cli' && activeConfig?.config_semantics === 'observed_and_next_send' ? 'Next model' : 'Model'}
+                      </span>
+                      <select
+                        className="composer-setting-select"
+                        value={activeSessionMeta?.agent_type === 'codex_cli' && activeConfig?.config_semantics === 'observed_and_next_send'
+                          ? (activeConfig.next_send_model_id || '')
+                          : (activeConfig?.model_id || 'default')}
+                        onChange={e => setAgentModel(activeSession, e.target.value)}
+                      >
+                        {activeSessionMeta?.agent_type === 'codex_cli' && activeConfig?.config_semantics === 'observed_and_next_send' && (
+                          <option value="" disabled>Choose model…</option>
+                        )}
+                        {composerModelOptionsFor(activeSessionMeta?.agent_type, activeConfig).map(m => (
+                          <option key={m.id} value={m.id}>{m.label}</option>
+                        ))}
+                        {!composerModelOptionsFor(activeSessionMeta?.agent_type, activeConfig).some(m => m.id === activeConfig.model_id) && activeConfig?.model_id && activeConfig.model_id !== 'unknown' && activeConfig?.config_semantics !== 'observed_and_next_send' && (
+                          <option value={activeConfig.model_id}>{activeConfig.model_id}</option>
+                        )}
+                      </select>
+                      {activeSessionMeta?.agent_type === 'codex_cli' && activeConfig?.config_semantics === 'observed_and_next_send' && (
+                        <span className="composer-hint">{activeConfig.next_send_model_status || 'unset'}</span>
                       )}
-                    </select>
-                  </label>
+                    </label>
+                  </>
                 )}
                 {(activeSessionMeta?.agent_type === 'antigravity' || activeSessionMeta?.agent_type === 'antigravity_panel') && (
-                  <label className="composer-setting-label">
+                  <label className="composer-setting-label" data-control="mode">
                     <span className="composer-setting-key">Mode</span>
                     <select
                       className="composer-setting-select"
@@ -6278,8 +10306,8 @@ async function uploadBinaryDraft(sessionId, base64, mimeType, filename) {
                     </select>
                   </label>
                 )}
-                {isClineLikeAgentType(activeSessionMeta?.agent_type) && activeConfig?.capabilities?.set_mode && modeOptionsFor(activeSessionMeta?.agent_type, activeConfig).length > 0 && (
-                  <label className="composer-setting-label">
+                {(isClineLikeAgentType(activeSessionMeta?.agent_type) || activeSessionMeta?.agent_type === 'cursor') && activeConfig?.capabilities?.set_mode && modeOptionsFor(activeSessionMeta?.agent_type, activeConfig).length > 0 && (
+                  <label className="composer-setting-label" data-control="mode">
                     <span className="composer-setting-key">Mode</span>
                     <select
                       className="composer-setting-select"
@@ -6296,31 +10324,55 @@ async function uploadBinaryDraft(sessionId, base64, mimeType, filename) {
                   </label>
                 )}
                 {activeConfig?.capabilities?.permission_mode_change && (
-                  <select
-                    className="composer-setting-select"
-                    value={activeConfig.permission_mode || defaultPermissionModeFor(activeSessionMeta?.agent_type)}
-                    onChange={e => setAgentPermissionMode(activeSession, e.target.value)}
-                    title="Permission mode"
-                  >
-                    {permissionModeOptionsFor(activeSessionMeta?.agent_type || 'claude', activeConfig).map(m => (
-                      <option key={m.value} value={m.value}>{m.label}</option>
-                    ))}
-                    {activeConfig.permission_mode && !permissionModeOptionsFor(activeSessionMeta?.agent_type, activeConfig).some(m => m.value === activeConfig.permission_mode) && activeConfig.permission_mode !== 'unknown' && (
-                      <option value={activeConfig.permission_mode}>{activeConfig.permission_mode}</option>
-                    )}
-                  </select>
+                  <label className="composer-setting-label" data-control="permission">
+                    <span className="composer-setting-key">{activeSessionMeta?.agent_type === 'codex_cli' ? 'Access' : 'Permission'}</span>
+                    <select
+                      className="composer-setting-select"
+                      value={activeConfig.permission_mode || defaultPermissionModeFor(activeSessionMeta?.agent_type)}
+                      onChange={e => setAgentPermissionMode(activeSession, e.target.value)}
+                      title="Permission mode"
+                    >
+                      {permissionModeOptionsFor(activeSessionMeta?.agent_type || 'claude', activeConfig).map(m => (
+                        <option key={m.value} value={m.value}>{m.label}</option>
+                      ))}
+                      {activeConfig.permission_mode && !permissionModeOptionsFor(activeSessionMeta?.agent_type, activeConfig).some(m => m.value === activeConfig.permission_mode) && activeConfig.permission_mode !== 'unknown' && (
+                        <option value={activeConfig.permission_mode}>{activeConfig.permission_mode}</option>
+                      )}
+                    </select>
+                  </label>
                 )}
                 {(activeSessionMeta?.agent_type === 'claude_cli' || activeSessionMeta?.agent_type === 'codex_cli' || activeSessionMeta?.agent_type === 'cursor_cli') && activeConfig?.capabilities?.set_effort && (activeConfig.available_efforts || []).length > 0 && (
-                  <select
-                    className="composer-setting-select"
-                    value={activeConfig.effort || 'medium'}
-                    onChange={e => setAgentEffort(activeSession, e.target.value)}
-                    title={`${activeSessionMeta?.agent_type === 'codex_cli' ? 'Codex' : activeSessionMeta?.agent_type === 'cursor_cli' ? 'Cursor' : 'Claude'} CLI effort`}
-                  >
-                    {(activeConfig.available_efforts || []).map(m => (
-                      <option key={m.id} value={m.id}>{m.label}</option>
-                    ))}
-                  </select>
+                  <>
+                    {activeSessionMeta?.agent_type === 'codex_cli' && activeConfig?.config_semantics === 'observed_and_next_send' && (
+                      <span className="composer-setting-label" data-control="observed-effort">
+                        <span className="composer-setting-key">Observed effort</span>
+                        <span className="composer-hint">{activeConfig.observed_effort || 'unknown'}</span>
+                      </span>
+                    )}
+                    <label className="composer-setting-label" data-control="effort">
+                      <span className="composer-setting-key">
+                        {activeSessionMeta?.agent_type === 'codex_cli' && activeConfig?.config_semantics === 'observed_and_next_send' ? 'Next effort' : 'Effort'}
+                      </span>
+                      <select
+                        className="composer-setting-select"
+                        value={activeSessionMeta?.agent_type === 'codex_cli' && activeConfig?.config_semantics === 'observed_and_next_send'
+                          ? (activeConfig.next_send_effort || '')
+                          : (activeConfig.effort || 'medium')}
+                        onChange={e => setAgentEffort(activeSession, e.target.value)}
+                        title={`${activeSessionMeta?.agent_type === 'codex_cli' ? 'Codex' : activeSessionMeta?.agent_type === 'cursor_cli' ? 'Cursor' : 'Claude'} CLI effort`}
+                      >
+                        {activeSessionMeta?.agent_type === 'codex_cli' && activeConfig?.config_semantics === 'observed_and_next_send' && (
+                          <option value="" disabled>Choose effort…</option>
+                        )}
+                        {(activeConfig.available_efforts || []).map(m => (
+                          <option key={m.id} value={m.id}>{m.label}</option>
+                        ))}
+                      </select>
+                      {activeSessionMeta?.agent_type === 'codex_cli' && activeConfig?.config_semantics === 'observed_and_next_send' && (
+                        <span className="composer-hint">{activeConfig.next_send_effort_status || 'unset'}</span>
+                      )}
+                    </label>
+                  </>
                 )}
                 {activeConfig?.capabilities?.auto_approve_permissions_toggle && (
                   <label className="composer-setting-toggle" title="Automatically approve permission prompts for this session">
@@ -6338,55 +10390,93 @@ async function uploadBinaryDraft(sessionId, base64, mimeType, filename) {
                 )}
                 {activeConfig?.capabilities?.set_codex_config && (
                   <>
-                    <select
-                      className="composer-setting-select"
-                      value={activeConfig.model_id || 'unknown'}
-                      onChange={e => setCodexConfig(activeSession, { model_id: e.target.value })}
-                      title="Codex model (restart required)"
-                    >
-                      {(activeConfig.available_models || []).map(m => (
-                        <option key={m.id} value={m.id}>{m.label}</option>
-                      ))}
-                      {activeConfig.model_id && !(activeConfig.available_models || []).some(m => m.id === activeConfig.model_id) && activeConfig.model_id !== 'unknown' && (
-                        <option value={activeConfig.model_id}>{activeConfig.model_id}</option>
-                      )}
-                    </select>
-                    <select
-                      className="composer-setting-select"
-                      value={(activeConfig.effort || 'unknown').toLowerCase()}
-                      onChange={e => setCodexConfig(activeSession, { effort: e.target.value })}
-                      title="Reasoning effort (restart required)"
-                    >
-                      {(activeConfig.available_efforts || []).map(m => (
-                        <option key={m.id} value={m.id}>{m.label}</option>
-                      ))}
-                    </select>
-                    <select
-                      className="composer-setting-select"
-                      value={(activeConfig.speed || 'standard').toLowerCase()}
-                      onChange={e => setCodexConfig(activeSession, { speed: e.target.value })}
-                      title="Speed"
-                    >
-                      {(activeConfig.available_speeds || []).map(m => (
-                        <option key={m.id} value={m.id}>{m.label}</option>
-                      ))}
-                      {activeConfig.speed && !(activeConfig.available_speeds || []).some(m => m.id === activeConfig.speed) && activeConfig.speed !== 'unknown' && (
-                        <option value={activeConfig.speed}>{activeConfig.speed}</option>
-                      )}
-                    </select>
-                    <select
-                      className="composer-setting-select"
-                      value={activeConfig.permission_mode || 'unknown'}
-                      onChange={e => setCodexConfig(activeSession, { access_mode: e.target.value })}
-                      title="Access mode (restart required)"
-                    >
-                      {(activeConfig.available_access || []).map(m => (
-                        <option key={m.id} value={m.id}>{m.label}</option>
-                      ))}
-                      {activeConfig.permission_mode && !(activeConfig.available_access || []).some(m => m.id === activeConfig.permission_mode) && activeConfig.permission_mode !== 'unknown' && (
-                        <option value={activeConfig.permission_mode}>{activeConfig.permission_mode}</option>
-                      )}
-                    </select>
+                    {activeConfig?.capabilities?.codex_model_change && <label className="composer-setting-label" data-control="model">
+                      <span className="composer-setting-key">{activeSessionMeta?.agent_type === 'codex' ? 'Next model' : 'Model'}</span>
+                      <select
+                        className="composer-setting-select"
+                        value={activeConfig.model_id || 'unknown'}
+                        disabled={(activeSessionMeta?.agent_type === 'codex' && activeConfig.controls_available === false)
+                          || ['pending', 'awaiting_config'].includes(configControlStates?.[`${activeSession}:model`]?.status)}
+                        onChange={e => setCodexConfig(activeSession, { model_id: e.target.value })}
+                        title={activeSessionMeta?.agent_type === 'codex' ? 'Next-turn Codex model' : 'Codex Desktop model'}
+                      >
+                        {(activeConfig.available_models || []).map(m => (
+                          <option key={m.id} value={m.id}>{m.label}</option>
+                        ))}
+                        {activeConfig.model_id && !(activeConfig.available_models || []).some(m => m.id === activeConfig.model_id) && activeConfig.model_id !== 'unknown' && (
+                          <option value={activeConfig.model_id}>{activeConfig.model_id}</option>
+                        )}
+                      </select>
+                    </label>}
+                    {activeConfig?.capabilities?.codex_effort_change && <label className="composer-setting-label" data-control="effort">
+                      <span className="composer-setting-key">{activeSessionMeta?.agent_type === 'codex' ? 'Next effort' : 'Effort'}</span>
+                      <select
+                        className="composer-setting-select"
+                        value={(activeConfig.effort || 'unknown').toLowerCase()}
+                        disabled={(activeSessionMeta?.agent_type === 'codex' && activeConfig.controls_available === false)
+                          || ['pending', 'awaiting_config'].includes(configControlStates?.[`${activeSession}:effort`]?.status)}
+                        onChange={e => setCodexConfig(activeSession, { effort: e.target.value })}
+                        title={activeSessionMeta?.agent_type === 'codex' ? 'Next-turn reasoning effort' : 'Codex Desktop reasoning effort'}
+                      >
+                        {(activeConfig.available_efforts || []).map(m => (
+                          <option key={m.id} value={m.id}>{m.label}</option>
+                        ))}
+                      </select>
+                    </label>}
+                    {activeConfig?.capabilities?.codex_permission_profile_change && <label className="composer-setting-label" data-control="permission-profile">
+                      <span className="composer-setting-key">Next permissions</span>
+                      <select
+                        className="composer-setting-select"
+                        value={activeConfig.permission_profile || 'unknown'}
+                        disabled={activeConfig.controls_available === false
+                          || ['pending', 'awaiting_config'].includes(configControlStates?.[`${activeSession}:permission_profile`]?.status)}
+                        onChange={e => setCodexConfig(activeSession, { permission_profile: e.target.value })}
+                        title="Next-turn native Codex permissions profile"
+                      >
+                        {activeConfig.permission_profile === 'full-access' && <option value="full-access" disabled>Full access</option>}
+                        {(activeConfig.available_permission_profiles || []).filter(profile => profile.id !== 'full-access').map(profile => (
+                          <option key={profile.id} value={profile.id}>{profile.label}</option>
+                        ))}
+                      </select>
+                    </label>}
+                    {activeConfig?.capabilities?.codex_bypass_permissions && <button
+                      type="button"
+                      className="composer-desktop-action composer-bypass-action"
+                      onClick={() => { setShowSettings(true); setShowComposerSettings(false); }}
+                      title="Review and confirm Full access in Session Settings"
+                    >{activeConfig.bypass_permissions_active ? 'Bypass active' : 'Bypass…'}</button>}
+                    {activeConfig?.capabilities?.codex_speed_change && <label className="composer-setting-label" data-control="speed">
+                      <span className="composer-setting-key">Speed</span>
+                      <select
+                        className="composer-setting-select"
+                        value={(activeConfig.speed || 'standard').toLowerCase()}
+                        onChange={e => setCodexConfig(activeSession, { speed: e.target.value })}
+                        title="Speed"
+                      >
+                        {(activeConfig.available_speeds || []).map(m => (
+                          <option key={m.id} value={m.id}>{m.label}</option>
+                        ))}
+                        {activeConfig.speed && !(activeConfig.available_speeds || []).some(m => m.id === activeConfig.speed) && activeConfig.speed !== 'unknown' && (
+                          <option value={activeConfig.speed}>{activeConfig.speed}</option>
+                        )}
+                      </select>
+                    </label>}
+                    {activeConfig?.capabilities?.codex_access_change && <label className="composer-setting-label" data-control="permission">
+                      <span className="composer-setting-key">Access</span>
+                      <select
+                        className="composer-setting-select"
+                        value={activeConfig.permission_mode || 'unknown'}
+                        onChange={e => setCodexConfig(activeSession, { access_mode: e.target.value })}
+                        title="Codex Desktop access mode"
+                      >
+                        {(activeConfig.available_access || []).map(m => (
+                          <option key={m.id} value={m.id}>{m.label}</option>
+                        ))}
+                        {activeConfig.permission_mode && !(activeConfig.available_access || []).some(m => m.id === activeConfig.permission_mode) && activeConfig.permission_mode !== 'unknown' && (
+                          <option value={activeConfig.permission_mode}>{activeConfig.permission_mode}</option>
+                        )}
+                      </select>
+                    </label>}
                     {activeSessionMeta?.agent_type === 'codex-desktop' && (activeConfig.available_workspaces || []).length > 0 && (
                       <select
                         className="composer-setting-select"
@@ -6406,7 +10496,15 @@ async function uploadBinaryDraft(sessionId, base64, mimeType, filename) {
                     ⌂ {activeWorkspaceBasename || activeWorkspacePath}
                   </span>
                 )}
+                <button
+                  className="composer-desktop-action"
+                  onClick={() => { setShowSettings(true); setShowComposerSettings(false); }}
+                >⚙ Session details</button>
                 <div className="composer-mobile-actions">
+                  <button
+                    className="composer-mobile-action"
+                    onClick={() => { setShowSettings(true); setShowComposerSettings(false); }}
+                  >⚙ Session details</button>
                   {canLaunchNewThread && (
                     <button className="composer-mobile-action" onClick={() => newThread(activeSession)}>✎ New thread</button>
                   )}
@@ -6440,6 +10538,25 @@ async function uploadBinaryDraft(sessionId, base64, mimeType, filename) {
       </>)}
       </div>
 
+      {attentionToast && (
+        <div className="attention-toast" role="status" aria-live="polite">
+          <span className={`attention-toast-icon ${attentionToast.kind}`} aria-hidden="true">
+            {attentionToast.kind === 'prompt' || attentionToast.kind === 'goal_attention' ? '!' : '✓'}
+          </span>
+          <span className="attention-toast-copy">
+            <strong>{attentionToast.title}</strong>
+            <span>{attentionToast.detail}</span>
+          </span>
+          <button
+            type="button"
+            onClick={() => {
+              const session = orderedSessions.find(item => sessionIdOf(item) === attentionToast.sessionId);
+              if (session) selectSession(attentionToast.sessionId, session);
+              clearAttentionToast();
+            }}
+          >Jump</button>
+        </div>
+      )}
       <div className={`toast ${toast ? 'visible' : ''}`}>{toast}</div>
     </div>
   );
@@ -6447,8 +10564,41 @@ async function uploadBinaryDraft(sessionId, base64, mimeType, filename) {
 
 export { App };
 
-ReactDOM.createRoot(document.getElementById('root')).render(
+const renderProfileEnabled = (() => {
+  try { return new URLSearchParams(window.location.search).get('render_profile') === '1'; }
+  catch { return false; }
+})();
+
+function recordRenderProfile(id, phase, actualDuration, baseDuration, startTime, commitTime) {
+  const entries = window.__RAC_RENDER_PROFILER__ || (window.__RAC_RENDER_PROFILER__ = []);
+  entries.push({
+    id,
+    phase,
+    route: document.querySelector('[data-testid="fleet-view"]')
+      ? 'fleet'
+      : document.querySelector('[data-testid="usage-dashboard"]')
+        ? 'usage'
+        : document.querySelector('[data-testid="host-resource-dashboard"]')
+          ? 'host-resources'
+          : document.querySelector('.messages')
+            ? 'chat'
+            : 'other',
+    actual_duration_ms: Number(actualDuration.toFixed(3)),
+    base_duration_ms: Number(baseDuration.toFixed(3)),
+    start_time_ms: Number(startTime.toFixed(3)),
+    commit_time_ms: Number(commitTime.toFixed(3)),
+  });
+  if (entries.length > 2000) entries.splice(0, entries.length - 2000);
+}
+
+const appRoot = (
   <AppErrorBoundary>
     <App />
   </AppErrorBoundary>
+);
+
+ReactDOM.createRoot(document.getElementById('root')).render(
+  renderProfileEnabled
+    ? <React.Profiler id="AgentChatRoot" onRender={recordRenderProfile}>{appRoot}</React.Profiler>
+    : appRoot
 );

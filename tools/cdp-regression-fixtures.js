@@ -190,7 +190,12 @@ const ANTIGRAVITY_V2_STRUCTURAL_FIXTURES = [
   {
     id: 'agv2_thinking',
     description: 'Collapsed thinking/work block.',
-    messages: [{ role: 'assistant', content_blocks: [{ type: 'thinking', label: 'Worked for 2m', content: 'Inspected the page and selected a plan.', collapsed: true }] }],
+    messages: [{ role: 'assistant', content_blocks: [{ type: 'thinking', label: 'Thought for 2m', content: 'Inspected the page and selected a plan.', collapsed: true }] }],
+  },
+  {
+    id: 'agv2_status',
+    description: 'Completed work-duration status chip.',
+    messages: [{ role: 'assistant', content_blocks: [{ type: 'status', label: 'Worked for 25s', content: 'Worked for 25s', status: 'completed', collapsed: true }] }],
   },
   {
     id: 'agv2_tool_running',
@@ -229,7 +234,7 @@ const ANTIGRAVITY_V2_STRUCTURAL_FIXTURES = [
   },
 ];
 
-const CANONICAL_BLOCK_TYPES = new Set(['markdown', 'thinking', 'tool_call', 'terminal', 'file_changes', 'artifact', 'prompt', 'error']);
+const CANONICAL_BLOCK_TYPES = new Set(['markdown', 'thinking', 'tool_call', 'terminal', 'file_changes', 'artifact', 'prompt', 'error', 'status']);
 
 function blockPlainText(block) {
   if (!block || typeof block !== 'object') return '';

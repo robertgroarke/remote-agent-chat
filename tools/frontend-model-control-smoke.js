@@ -38,7 +38,7 @@ assert(styleCacheIdentity, 'production stylesheet URL must carry a cache identit
 assert(bundleCacheIdentity, 'production bundle URL must carry a cache identity');
 assert.strictEqual(bundleCacheIdentity, styleCacheIdentity,
   'production stylesheet and bundle must carry the same current cache identity');
-assert.match(read('frontend/sw.js'), /const CACHE_NAME = 'agent-chat-v\d+';/,
+assert.match(read('frontend/sw.js'), /const CACHE_NAME = 'agent-chat-build-[a-f0-9]{16}';/,
   'service-worker cache must carry a versioned cache identity');
 assert.strictEqual(read('relay-server/public/dist/bundle.js'), read('frontend/dist/bundle.js'),
   'relay-served bundle is not synced with the frontend build');

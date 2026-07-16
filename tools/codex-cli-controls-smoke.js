@@ -114,9 +114,23 @@ assert.match(proxySource, /session\.codexCliFilePath \? \[\] : this\._codexCliPe
 assert.match(proxySource, /codex_cli_model_configured: true/);
 assert.match(proxySource, /codex_cli_permission_configured: true/);
 assert.match(proxySource, /codex_cli_effort_configured: true/);
-assert.match(proxySource, /session\.codexCliModelConfigured !== true && summary\.model_id/);
+assert.match(proxySource, /observedModelId = summary\.model_observation/);
 assert.match(proxySource, /session\.codexCliPermissionConfigured !== true && summary\.permission_mode/);
-assert.match(proxySource, /session\.codexCliEffortConfigured !== true && summary\.effort/);
+assert.match(proxySource, /observedEffort = summary\.effort_observation/);
+assert.match(proxySource, /nextSendModelStatus = 'pending'/);
+assert.match(proxySource, /nextSendEffortStatus = 'pending'/);
+assert.doesNotMatch(proxySource, /session\.codexCliModelConfigured !== true && summary\.model_id/,
+  'stored next-send model overrides must never suppress later native observations');
+assert.doesNotMatch(proxySource, /session\.codexCliEffortConfigured !== true && summary\.effort/,
+  'stored next-send effort overrides must never suppress later native observations');
+const codexSessionSource = proxySource.slice(
+  proxySource.indexOf('_buildCodexCliSessionFromSummary'),
+  proxySource.indexOf('_buildCursorCliSessionFromSummary'),
+);
+assert.doesNotMatch(codexSessionSource, /summary\.activity \|\| sessionMeta\.activity/,
+  'parsed terminal activity must not fall back to stale persisted activity during reconstruction');
+assert.doesNotMatch(codexSessionSource, /summary\.activity \|\| existing\.activity/,
+  'parsed terminal activity must clear stale existing activity during refresh');
 assert.doesNotMatch(proxySource, /startNativeCodexWindow\(\{[\s\S]*?elevated:\s*true/);
 assert.match(codexSource, /buildNativeCodexWindowPowerShell\(\{ cwd, launcherPath, elevated = false \}/);
 assert.match(codexSource, /'-ArgumentList', `\$\{quotePowerShellString\('\/k'\)\}, \$\{quotePowerShellString\(launcherPath\)\}`/);

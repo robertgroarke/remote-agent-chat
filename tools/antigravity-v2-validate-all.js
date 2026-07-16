@@ -93,7 +93,9 @@ function main(argv = process.argv.slice(2)) {
     { label: 'Antigravity v2 E2E syntax', command: node, args: ['--check', 'tools/antigravity-v2-live-e2e.js'] },
     { label: 'Antigravity v2 production E2E syntax', command: node, args: ['--check', 'tools/antigravity-v2-production-e2e.js'] },
     { label: 'Antigravity v2 accumulator syntax', command: node, args: ['--check', 'tools/antigravity-v2-accumulator-smoke.js'] },
+    { label: 'Antigravity v2 structured status syntax', command: node, args: ['--check', 'tools/antigravity-v2-structured-status-smoke.js'] },
     { label: 'Antigravity v2 accumulator finalization', command: node, args: ['tools/antigravity-v2-accumulator-smoke.js'] },
+    { label: 'Antigravity v2 structured status', command: node, args: ['tools/antigravity-v2-structured-status-smoke.js'] },
     { label: 'frontend reconnect fidelity', command: node, args: ['tools/frontend-history-reconnect-smoke.js'] },
     { label: 'frontend transcript fidelity', command: node, args: ['tools/frontend-transcript-fidelity-smoke.js'] },
     {

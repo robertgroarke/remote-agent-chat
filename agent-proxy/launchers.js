@@ -20,12 +20,14 @@ const fs     = require('fs');
 const path   = require('path');
 const { spawn } = require('child_process');
 const selectors = require('./selectors');
+const { hostCandidatesForPort } = require('./cdp-loopback');
+const { appendBoundedFileSync } = require('./bounded-file-log');
 
 const LAUNCH_LOG = path.join(__dirname, 'launch.log');
 function llog(msg) {
   const line = `${new Date().toISOString()} ${msg}\n`;
   console.log(`[launch] ${msg}`);
-  try { fs.appendFileSync(LAUNCH_LOG, line); } catch {}
+  try { appendBoundedFileSync(LAUNCH_LOG, line); } catch {}
 }
 
 const ANTIGRAVITY_EXE   = process.env.ANTIGRAVITY_EXE
@@ -272,16 +274,17 @@ function spawnCursor(port) {
 }
 
 // HTTP close via /json/close/:targetId (standard DevTools endpoint).
-function httpCloseTarget(port, targetId) {
+function httpCloseTarget(port, targetId, host = null) {
   return new Promise(resolve => {
-    const req = http.get(
-      `http://localhost:${port}/json/close/${targetId}`,
-      res => {
-        let body = '';
-        res.on('data', d => { body += d; });
-        res.on('end', () => resolve({ ok: true, body }));
-      }
-    );
+    const req = http.get({
+      host: host || 'localhost',
+      port,
+      path: `/json/close/${encodeURIComponent(targetId)}`,
+    }, res => {
+      let body = '';
+      res.on('data', d => { body += d; });
+      res.on('end', () => resolve({ ok: true, body }));
+    });
     req.on('error', err => resolve({ ok: false, error: err.message }));
     req.setTimeout(5000, () => { req.destroy(); resolve({ ok: false, error: 'timeout' }); });
   });
@@ -420,7 +423,7 @@ async function launchSession({ agentType, port, sessions, requestId, workspacePa
       }
     } else if (!launched) {
       onFailure(
-        'Could not open Continue YOLO â€” ensure Antigravity is running and the Continue YOLO extension is installed',
+        'Could not open Continue YOLO \u2014 ensure Antigravity is running and the Continue YOLO extension is installed',
         'agent_not_open',
         requestId
       );
@@ -530,15 +533,21 @@ async function launchSession({ agentType, port, sessions, requestId, workspacePa
  * Close a session via the DevTools HTTP close endpoint.
  * Returns { ok, error? }.
  */
-async function closeSession({ targetId, port }) {
+async function closeSession({ targetId, port, host = null }) {
   console.log(`[launch] Closing target ${targetId.substring(0, 8)} on port ${port}`);
-  try {
-    const result = await httpCloseTarget(port, targetId);
-    if (!result.ok) console.warn(`[launch] HTTP close failed: ${result.error}`);
-    return result;
-  } catch (e) {
-    return { ok: false, error: e.message };
+  const failures = [];
+  for (const candidateHost of hostCandidatesForPort(port, host)) {
+    try {
+      const result = await httpCloseTarget(port, targetId, candidateHost);
+      if (result.ok) return result;
+      failures.push(`${candidateHost || 'default'}: ${result.error}`);
+    } catch (e) {
+      failures.push(`${candidateHost || 'default'}: ${e.message}`);
+    }
   }
+  const error = failures.join(' | ') || 'unknown close failure';
+  console.warn(`[launch] HTTP close failed: ${error}`);
+  return { ok: false, error };
 }
 
 module.exports = { launchSession, closeSession, spawnAntigravity, spawnCursor };

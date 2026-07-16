@@ -124,8 +124,8 @@ assert.deepEqual(
   ]),
   {
     activities: {
-      'active-cli': { kind: 'generating', label: 'Working', updatedAt: null, startedAt: null, interruptHint: '', goal: null, task_list: null, context_card: null, thinkingContent: 'running' },
-      'idle-cli': { kind: 'idle', label: '', updatedAt: null, startedAt: null, interruptHint: '', goal: null, task_list: null, context_card: null, thinkingContent: '' },
+        'active-cli': { kind: 'generating', label: 'Working', updatedAt: null, startedAt: null, interruptHint: '', goal: null, thinking: null, current: null, step: null, usage: null, task_list: null, context_card: null, thinkingContent: 'running', transport: null },
+        'idle-cli': { kind: 'idle', label: '', updatedAt: null, startedAt: null, interruptHint: '', goal: null, thinking: null, current: null, step: null, usage: null, task_list: null, context_card: null, thinkingContent: '', transport: null },
     },
     thinkingContent: { 'active-cli': 'running', 'idle-cli': '' },
     thinking: { 'active-cli': 'Working', 'idle-cli': false },
@@ -236,16 +236,23 @@ const relay = moduleRecord.exports.useRelay();
 const firstSocket = FakeWebSocket.instances[0];
 firstSocket.open();
 relay.requestHistoryChunk('reconnect-session', { source: 'native' });
-assert.equal(firstSocket.sent.length, 1, 'initial history request should be sent');
+assert.equal(firstSocket.sent.filter(message => message.type === 'history_chunk_request').length, 1,
+  'initial history request should be sent alongside the subscription handshake');
+const historyLoadingStateIndex = states.findIndex(state => (
+  state && state['reconnect-session']?.kind === 'chunked'
+));
+assert(historyLoadingStateIndex >= 0, 'history request should expose a visible loading state');
 firstSocket.close();
-assert.deepEqual(states[3], {}, 'socket close should clear visible loading state');
+assert.deepEqual(states[historyLoadingStateIndex], {}, 'socket close should clear visible loading state');
 
 runTimer(250);
 const secondSocket = FakeWebSocket.instances[1];
 secondSocket.open();
 relay.requestHistoryChunk('reconnect-session', { source: 'native' });
-assert.equal(secondSocket.sent.length, 1, 'reconnected socket should be allowed to request history again');
-const reconnectRequest = secondSocket.sent[0];
+const reconnectHistoryRequests = secondSocket.sent.filter(message => message.type === 'history_chunk_request');
+assert.equal(reconnectHistoryRequests.length, 1,
+  'reconnected socket should be allowed to request history again alongside subscription replay');
+const reconnectRequest = reconnectHistoryRequests[0];
 assert.equal(reconnectRequest.replace, true, 'tail history requests should replace stale browser state by default');
 secondSocket.receive({
   type: 'history_chunk',
@@ -260,10 +267,10 @@ secondSocket.receive({
   partial: false,
   cursor: {},
 });
-assert.equal(states[1]['reconnect-session'][0].content, 'restored');
-assert.equal(states[3]['reconnect-session'], undefined, 'successful history should clear loading state');
+assert.equal(relay.messages['reconnect-session'][0].content, 'restored');
+assert.equal(states[historyLoadingStateIndex]['reconnect-session'], undefined, 'successful history should clear loading state');
 
-states[1]['delta-session'] = [
+relay.messages['delta-session'] = [
   { id: 1, sequence: 40, role: 'user', content: 'already loaded' },
   { id: 2, sequence: 41, role: 'assistant', content: 'existing reply' },
 ];
@@ -285,13 +292,13 @@ secondSocket.receive({
   ],
 });
 assert.deepEqual(
-  states[1]['delta-session'].map(message => message.content),
+  relay.messages['delta-session'].map(message => message.content),
   ['already loaded', 'existing reply', 'new delta reply'],
   'history deltas must append only unseen messages',
 );
-assert.equal(states[3]['delta-session'], undefined, 'delta completion must clear loading state');
+assert.equal(states[historyLoadingStateIndex]['delta-session'], undefined, 'delta completion must clear loading state');
 
-states[1]['replace-session'] = [
+relay.messages['replace-session'] = [
   { role: 'user', content: 'stale duplicated turn' },
   { role: 'assistant', content: 'stale duplicated reply' },
 ];
@@ -312,9 +319,63 @@ secondSocket.receive({
   cursor: {},
 });
 assert.deepEqual(
-  states[1]['replace-session'].map(message => message.content),
+  relay.messages['replace-session'].map(message => message.content),
   ['authoritative tail only'],
   'authoritative tail should remove a stale duplicated browser prefix instead of merging it',
+);
+
+relay.messages['native-short-session'] = [
+  { source_message_id: 'native-short-1', role: 'assistant', content: 'retained prose one' },
+  { source_message_id: 'native-short-2', role: 'assistant', content: 'retained prose two' },
+];
+relay.requestHistoryChunk('native-short-session', { source: 'native', limit: 2 });
+const nativeShortRequest = secondSocket.sent.find(message => message.session_id === 'native-short-session');
+secondSocket.receive({
+  type: 'history_chunk',
+  session_id: 'native-short-session',
+  request_id: nativeShortRequest.request_id,
+  mode: 'tail',
+  replace: true,
+  source: 'codex_cli_jsonl',
+  messages: [{ source_message_id: 'native-short-2', role: 'assistant', content: 'retained prose two' }],
+  loaded_messages: 1,
+  total_messages: 2,
+  partial: true,
+  cursor: { next_before_offset: 100 },
+});
+assert.deepEqual(
+  relay.messages['native-short-session'].map(message => message.content),
+  ['retained prose one', 'retained prose two'],
+  'an undersized native tail must not overwrite a larger transcript already held by the client',
+);
+
+relay.requestHistoryChunk('native-race-session', { source: 'native', limit: 2 });
+const nativeRaceRequest = secondSocket.sent.find(message => message.session_id === 'native-race-session');
+secondSocket.receive({
+  type: 'message',
+  session: 'native-race-session',
+  source_message_id: 'native-race-live',
+  role: 'assistant',
+  content: 'live prose appended during hydration',
+  ts: 2,
+});
+secondSocket.receive({
+  type: 'history_chunk',
+  session_id: 'native-race-session',
+  request_id: nativeRaceRequest.request_id,
+  mode: 'tail',
+  replace: true,
+  source: 'codex_cli_jsonl',
+  messages: [{ source_message_id: 'native-race-history', role: 'assistant', content: 'cold history prose', ts: 1 }],
+  loaded_messages: 1,
+  total_messages: 1,
+  partial: false,
+  cursor: {},
+});
+assert.deepEqual(
+  relay.messages['native-race-session'].map(message => message.content),
+  ['cold history prose', 'live prose appended during hydration'],
+  'a live append during initial history load must survive replacement reconciliation',
 );
 
 relay.requestHistoryChunk('stale-tail-session', { source: 'relay_sqlite' });
@@ -336,21 +397,25 @@ secondSocket.receive({
   cursor: {},
 });
 assert.equal(
-  states[1]['stale-tail-session'][0].content,
+  relay.messages['stale-tail-session'][0].content,
   'compatible earlier tail',
   'a compatible authoritative tail must not be discarded after the retry ID advances',
 );
-assert.equal(states[3]['stale-tail-session'], undefined, 'compatible tail should clear retry loading state');
+assert.equal(states[historyLoadingStateIndex]['stale-tail-session'], undefined, 'compatible tail should clear retry loading state');
 
 relay.requestHistoryChunk('timeout-session', { source: 'native' });
 assert.equal(secondSocket.sent.filter(message => message.session_id === 'timeout-session').length, 1);
 runTimer(15000);
 assert.equal(secondSocket.sent.filter(message => message.session_id === 'timeout-session').length, 2, 'first timeout should retry once');
 runTimer(15000);
-assert.equal(states[3]['timeout-session'], undefined, 'final timeout should clear loading state');
-assert.match(states[2]['timeout-session'].error, /timed out/i, 'final timeout should expose an actionable error');
+assert.equal(states[historyLoadingStateIndex]['timeout-session'], undefined, 'final timeout should clear loading state');
+assert.match(states[1]['timeout-session'].error, /timed out/i, 'final timeout should expose an actionable error');
 
 const appSource = fs.readFileSync(path.join(__dirname, '..', 'frontend', 'app.jsx'), 'utf8');
+assert(
+  !/return list\.slice\(0,\s*8\);/.test(appSource),
+  'desktop thread tabs must preserve the complete native thread inventory instead of hiding entries after the eighth tab',
+);
 assert.match(
   appSource,
   /const CODEX_CLI_INITIAL_HISTORY_CHUNK_BYTES = 256 \* 1024;/,

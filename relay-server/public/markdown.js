@@ -894,18 +894,20 @@ function renderIOBlock(io, index) {
 }
 
 function parseFileChangesBlock(content) {
-  const text = String(content || '').replace(/\r\n/g, '\n').trim();
-  if (!text) return null;
-  const lines = text.split('\n').map(line => line.trim()).filter(Boolean);
-  const headerIndex = lines.findIndex(line => /^\d+\s+file(?:\(s\)|s?)\s+changed/i.test(line));
-  if (headerIndex === -1) return null;
-
-  const header = lines[headerIndex];
-  const countMatch = header.match(/^(\d+)\s+file(?:\(s\)|s?)\s+changed(?:\s+in\s+this\s+conversation)?/i);
+  const text = String(content || '').replace(/\r\n/g, '\n');
+  if (!text.trim()) return null;
+  const rawLines = text.split('\n');
+  const headerRe = /^\s*(\d+)\s+file(?:\(s\)|s?)\s+changed(?:\s+in\s+this\s+conversation)?/i;
+  const headerLineIdx = rawLines.findIndex(line => headerRe.test(line));
+  if (headerLineIdx === -1) return null;
+  const header = rawLines[headerLineIdx].trim();
+  const countMatch = header.match(headerRe);
   if (!countMatch) return null;
 
   const totalsFromLine = (line) => {
-    const match = String(line || '').match(/\+(\d+)\s+(?:Â·|·|-|\s)\s*-?(\d+)/);
+    // encoding-input-only: older native summaries may contain the UTF-8-as-
+    // 1252 centered-dot sequence; accept it without placing that text in UI.
+    const match = String(line || '').match(/\+(\d+)\s+(?:\u00c2\u00b7|·|-|\s)\s*-?(\d+)/);
     return match ? { adds: Number(match[1]) || 0, dels: Number(match[2]) || 0 } : null;
   };
 
@@ -913,20 +915,31 @@ function parseFileChangesBlock(content) {
   let pendingAdds = null;
   const entries = [];
   let pendingPath = '';
-  for (const line of lines.slice(headerIndex + 1)) {
-    if (!totals) totals = totalsFromLine(line);
+  // Walk forward; record the last raw-line index that contributed to the
+  // block so we can keep surrounding prose intact (callers can render the
+  // text before/after as normal markdown).
+  let lastConsumedIdx = headerLineIdx;
+  for (let ri = headerLineIdx + 1; ri < rawLines.length; ri++) {
+    const line = rawLines[ri].trim();
+    if (!line) continue; // blank lines don't break the block
+    if (!totals) {
+      const t = totalsFromLine(line);
+      if (t) { totals = t; lastConsumedIdx = ri; continue; }
+    }
     const addsOnly = line.match(/^\+(\d+)$/);
     if (addsOnly) {
       pendingAdds = Number(addsOnly[1]) || 0;
+      lastConsumedIdx = ri;
       continue;
     }
     const delsOnly = line.match(/^-(\d+)$/);
     if (delsOnly && pendingAdds != null && !totals) {
       totals = { adds: pendingAdds, dels: Number(delsOnly[1]) || 0 };
       pendingAdds = null;
+      lastConsumedIdx = ri;
       continue;
     }
-    const statsOnly = line.match(/^\+(\d+)\s+(?:Â·|·|-|\s)\s*-?(\d+)$/);
+    const statsOnly = line.match(/^\+(\d+)\s+(?:\u00c2\u00b7|·|-|\s)\s*-?(\d+)$/);
     if (statsOnly && pendingPath) {
       entries.push({
         filepath: pendingPath,
@@ -934,37 +947,53 @@ function parseFileChangesBlock(content) {
         dels: Number(statsOnly[2]) || 0,
       });
       pendingPath = '';
+      lastConsumedIdx = ri;
       continue;
     }
-    const entry = line.match(/^(.+?)\s+\+(\d+)\s+(?:Â·|·|-|\s)\s*-?(\d+)(?:\s+.*)?$/);
+    const entry = line.match(/^(.+?)\s+\+(\d+)\s+(?:\u00c2\u00b7|·|-|\s)\s*-?(\d+)(?:\s+.*)?$/);
     if (!entry) {
-      if (looksLikePath(line)) pendingPath = line;
-      continue;
+      if (looksLikePath(line)) {
+        pendingPath = line;
+        lastConsumedIdx = ri;
+        continue;
+      }
+      // Non-matching, non-path line ends the block.
+      break;
     }
     const filepath = entry[1].trim();
-    if (!filepath || /^\+?\d+$/.test(filepath)) continue;
+    if (!filepath || /^\+?\d+$/.test(filepath)) {
+      break;
+    }
     entries.push({
       filepath,
       adds: Number(entry[2]) || 0,
       dels: Number(entry[3]) || 0,
     });
     pendingPath = '';
+    lastConsumedIdx = ri;
   }
+
+  // Require at least one parsed entry — otherwise treat as ordinary prose.
+  // (A bare "9 files changed" mention inside a paragraph should not collapse
+  // the whole assistant message into an empty card.)
+  if (entries.length === 0) return null;
 
   const adds = totals?.adds ?? entries.reduce((sum, entry) => sum + entry.adds, 0);
   const dels = totals?.dels ?? entries.reduce((sum, entry) => sum + entry.dels, 0);
+  const beforeText = rawLines.slice(0, headerLineIdx).join('\n').replace(/\s+$/g, '');
+  const afterText = rawLines.slice(lastConsumedIdx + 1).join('\n').replace(/^\s+/g, '');
   return {
     count: Number(countMatch[1]) || entries.length,
     title: header.replace(/\s+\+\d+.*$/, '').trim(),
     adds,
     dels,
     entries,
+    beforeText,
+    afterText,
   };
 }
 
-function renderFileChangesBlock(content, index) {
-  const parsed = parseFileChangesBlock(content);
-  if (!parsed) return null;
+function renderFileChangesBlockFromParsed(parsed, index) {
   const entryHtml = parsed.entries.map(entry => {
     const path = escapeHtml(entry.filepath);
     return `<div class="file-changes-item">
@@ -986,15 +1015,93 @@ function renderFileChangesBlock(content, index) {
   </section>`;
 }
 
+function renderSubagentsBlock(payload, index) {
+  let parsed;
+  try { parsed = JSON.parse(payload); } catch { return null; }
+  if (!parsed || !Array.isArray(parsed.items) || !parsed.items.length) return null;
+  const titleText = parsed.title || 'Subagents';
+  const items = parsed.items.map((it, i) => {
+    const status = String(it.status || 'unknown').toLowerCase();
+    const icon = status === 'running' ? '<span class="subagent-spinner" aria-hidden="true"></span>'
+      : status === 'done'   ? '<span class="subagent-icon subagent-icon-done" aria-hidden="true">&#10003;</span>'
+      : status === 'failed' ? '<span class="subagent-icon subagent-icon-fail" aria-hidden="true">&#10007;</span>'
+      :                       '<span class="subagent-icon subagent-icon-unknown" aria-hidden="true">&#9679;</span>';
+    const promptText = String(it.prompt || '').trim();
+    const stats = String(it.stats || '').trim();
+    const calls = Array.isArray(it.tool_calls) ? it.tool_calls.filter(Boolean) : [];
+    const callsHtml = calls.length
+      ? `<ul class="subagent-calls">${calls.map(c => `<li><code>${escapeHtml(c)}</code></li>`).join('')}</ul>`
+      : '';
+    return `<li class="subagent-item subagent-status-${escapeHtml(status)}">
+      <div class="subagent-row">${icon}<div class="subagent-prompt" title="${escapeHtml(promptText)}">${escapeHtml(promptText)}</div></div>
+      ${stats ? `<div class="subagent-stats">${escapeHtml(stats)}</div>` : ''}
+      ${callsHtml}
+    </li>`;
+  }).join('');
+  return `<section class="subagents-section" data-subagents-index="${index}">
+    <div class="subagents-header"><span class="subagents-icon" aria-hidden="true">&#9783;</span><span class="subagents-title">${escapeHtml(titleText)}</span></div>
+    <ul class="subagents-list">${items}</ul>
+  </section>`;
+}
+
+function extractTaskCompletedWrapper(content) {
+  // Cline/Roo emit "Task Completed\n\n<markdown body>" (sometimes with a
+  // trailing "HAS_CHANGES" sentinel). The IDE renders this as a green-bordered
+  // callout — we mirror that by extracting the body, rendering it as normal
+  // markdown, and wrapping the result.
+  const m = String(content || '').match(/^Task Completed\s*\n+([\s\S]*?)\s*$/);
+  if (!m) return { content, wrap: false };
+  let body = m[1].replace(/HAS_CHANGES\s*$/i, '').trimEnd();
+  return { content: body, wrap: true };
+}
+
+function wrapTaskCompletedHtml(innerHtml) {
+  return `<section class="task-completed-section">
+    <div class="task-completed-header">
+      <span class="task-completed-icon" aria-hidden="true">&#10003;</span>
+      <span class="task-completed-title">Task Completed</span>
+    </div>
+    <div class="task-completed-body">${innerHtml}</div>
+  </section>`;
+}
+
+function extractSubagentsBlocks(content) {
+  // Replace each ~~~subagents\n{json}\n~~~ block with a placeholder so the
+  // rest of the content can flow through the normal markdown pipeline. Returns
+  // { content, blocks } where blocks[i] is the rendered HTML for placeholder i.
+  const blocks = [];
+  const re = /^~~~subagents\s*\n([\s\S]*?)\n~~~\s*$/gm;
+  const replaced = String(content || '').replace(re, (_m, payload) => {
+    const html = renderSubagentsBlock(payload, blocks.length) || '';
+    blocks.push(html);
+    return ` SUBAGENTS_BLOCK_${blocks.length - 1} `;
+  });
+  return { content: replaced, blocks };
+}
+
 function renderStructuredContent(content) {
+  const { content: stripped, wrap: wrapTaskCompleted } = extractTaskCompletedWrapper(content);
+  content = stripped;
+  const { content: prepped, blocks: subagentBlocks } = extractSubagentsBlocks(content);
+  content = prepped;
   const html = parseToolSections(content).map((chunk, index) => {
     try {
       if (chunk.type === 'tool') return renderToolSection(chunk.name, chunk.content, index);
       // Detect compact IN/OUT block before falling through to full markdown rendering
       const io = parseIOBlock(chunk.content);
       if (io) return renderIOBlock(io, index);
-      const fileChanges = renderFileChangesBlock(chunk.content, index);
-      if (fileChanges) return fileChanges;
+      // File-changes summary may be embedded in surrounding prose (Codex Desktop
+      // emits "Implemented X.\n\nVerified: ...\n\n3 files changed +A -D\npath/a +A -D\n...\n\nWorked for 5m").
+      // Split the chunk so the prose either side renders as normal markdown and
+      // the summary card sits between them — otherwise the whole assistant turn
+      // would collapse to just the file list.
+      const fileChangesParsed = parseFileChangesBlock(chunk.content);
+      if (fileChangesParsed) {
+        const cardHtml = renderFileChangesBlockFromParsed(fileChangesParsed, index);
+        const beforeHtml = (fileChangesParsed.beforeText || '').trim() ? marked.parse(fileChangesParsed.beforeText) : '';
+        const afterHtml = (fileChangesParsed.afterText || '').trim() ? marked.parse(fileChangesParsed.afterText) : '';
+        return beforeHtml + cardHtml + afterHtml;
+      }
       // Skip empty/whitespace-only markdown chunks
       if (!(chunk.content || '').trim()) return '';
       return marked.parse(chunk.content || '');
@@ -1004,14 +1111,22 @@ function renderStructuredContent(content) {
     }
   }).join('');
 
+  // Substitute subagent placeholders back with rendered card HTML.
+  let htmlWithSubagents = html;
+  if (subagentBlocks.length) {
+    htmlWithSubagents = htmlWithSubagents.replace(/\s*SUBAGENTS_BLOCK_(\d+)\s*/g, (_m, i) => {
+      return subagentBlocks[Number(i)] || '';
+    });
+  }
+
   // ── Multi-file diff summary bar ───────────────────────────────────────────
   // Parse into a temporary element so we can query real DOM nodes — no regex.
   // Sanitize before touching the DOM to prevent XSS from agent-controlled content.
   const tmp = document.createElement('div');
   if (typeof DOMPurify !== 'undefined') {
-    tmp.innerHTML = DOMPurify.sanitize(html, { ADD_DATA_URI_TAGS: ['img'], ALLOW_DATA_ATTR: true });
+    tmp.innerHTML = DOMPurify.sanitize(htmlWithSubagents, { ADD_DATA_URI_TAGS: ['img'], ALLOW_DATA_ATTR: true });
   } else {
-    tmp.textContent = html; // safe fallback — no HTML rendering if DOMPurify unavailable
+    tmp.textContent = htmlWithSubagents; // safe fallback — no HTML rendering if DOMPurify unavailable
   }
 
   const diffBlocks = Array.from(tmp.querySelectorAll('.diff-block'));
@@ -1051,6 +1166,7 @@ function renderStructuredContent(content) {
     tmp.insertBefore(bar, tmp.firstChild);
   }
 
+  if (wrapTaskCompleted) return wrapTaskCompletedHtml(tmp.innerHTML);
   return tmp.innerHTML;
 }
 
@@ -1201,12 +1317,110 @@ function _extractLastOpenBlock(text) {
   return { lang, code };
 }
 
-function MarkdownContent({ content, monospace = false, onOpenPath = null, autoExpandLongCodeBlocks = false }) {
+const richContentVisibilityCallbacks = new Map();
+let richContentVisibilityObserver = null;
+const richContentHtmlCache = new Map();
+let richContentHtmlCacheBytes = 0;
+const RICH_CONTENT_CACHE_MAX_ENTRIES = 256;
+const RICH_CONTENT_CACHE_MAX_BYTES = 8 * 1024 * 1024;
+
+function richContentHash(value) {
+  const text = String(value || '');
+  let hash = 2166136261;
+  for (let index = 0; index < text.length; index += 1) {
+    hash ^= text.charCodeAt(index);
+    hash = Math.imul(hash, 16777619);
+  }
+  return (hash >>> 0).toString(36);
+}
+
+function observeNearViewport(node, callback) {
+  const target = node?.closest?.('.message') || node;
+  if (!target || typeof IntersectionObserver === 'undefined') {
+    callback();
+    return () => {};
+  }
+  if (!richContentVisibilityObserver) {
+    richContentVisibilityObserver = new IntersectionObserver(entries => {
+      for (const entry of entries) {
+        if (!entry.isIntersecting) continue;
+        const callbacks = richContentVisibilityCallbacks.get(entry.target);
+        if (!callbacks) continue;
+        richContentVisibilityCallbacks.delete(entry.target);
+        richContentVisibilityObserver.unobserve(entry.target);
+        for (const activate of callbacks) activate();
+      }
+    }, { root: null, rootMargin: '35% 0px', threshold: 0 });
+  }
+  let callbacks = richContentVisibilityCallbacks.get(target);
+  if (!callbacks) {
+    callbacks = new Set();
+    richContentVisibilityCallbacks.set(target, callbacks);
+    richContentVisibilityObserver.observe(target);
+  }
+  callbacks.add(callback);
+  return () => {
+    const active = richContentVisibilityCallbacks.get(target);
+    if (!active) return;
+    active.delete(callback);
+    if (active.size > 0) return;
+    richContentVisibilityCallbacks.delete(target);
+    richContentVisibilityObserver?.unobserve(target);
+  };
+}
+
+function cachedRichContentHtml(content, cacheIdentity) {
+  const text = String(content || '');
+  const key = `${cacheIdentity || 'content'}\u0001${text.length}\u0001${richContentHash(text)}`;
+  const cached = richContentHtmlCache.get(key);
+  if (cached && cached.content === text) {
+    richContentHtmlCache.delete(key);
+    richContentHtmlCache.set(key, cached);
+    return cached.html;
+  }
+  const rendered = renderStructuredContent(text);
+  const html = typeof DOMPurify !== 'undefined'
+    ? DOMPurify.sanitize(rendered, { ADD_DATA_URI_TAGS: ['img'], ALLOW_DATA_ATTR: true })
+    : rendered;
+  const bytes = (text.length + html.length) * 2;
+  richContentHtmlCache.set(key, { content: text, html, bytes });
+  richContentHtmlCacheBytes += bytes;
+  while (richContentHtmlCache.size > RICH_CONTENT_CACHE_MAX_ENTRIES
+    || richContentHtmlCacheBytes > RICH_CONTENT_CACHE_MAX_BYTES) {
+    const oldestKey = richContentHtmlCache.keys().next().value;
+    const oldest = richContentHtmlCache.get(oldestKey);
+    richContentHtmlCache.delete(oldestKey);
+    richContentHtmlCacheBytes -= oldest?.bytes || 0;
+  }
+  return html;
+}
+
+function MarkdownContent({
+  content,
+  monospace = false,
+  onOpenPath = null,
+  autoExpandLongCodeBlocks = false,
+  deferUntilVisible = false,
+  cacheIdentity = '',
+}) {
   const ref          = React.useRef(null);
   const lastContent  = React.useRef(null);  // A11-11: skip re-render when content is identical
+  const onOpenPathRef = React.useRef(onOpenPath);
+  const [richContentReady, setRichContentReady] = React.useState(!deferUntilVisible);
+  onOpenPathRef.current = onOpenPath;
+
+  React.useEffect(() => {
+    if (!deferUntilVisible) {
+      setRichContentReady(true);
+      return undefined;
+    }
+    if (richContentReady) return undefined;
+    return observeNearViewport(ref.current, () => setRichContentReady(true));
+  }, [deferUntilVisible, richContentReady]);
 
   React.useEffect(() => {
     if (!ref.current) return;
+    if (!richContentReady) return;
     if (content === lastContent.current) return; // no-op: content unchanged
 
     // ── A11-11: Streaming fast-path ───────────────────────────────────────────
@@ -1267,10 +1481,7 @@ function MarkdownContent({ content, monospace = false, onOpenPath = null, autoEx
 
     lastContent.current = content;
     // SEC-08: Re-sanitize at final DOM insertion point as defense-in-depth
-    const rendered = renderStructuredContent(content || '');
-    ref.current.innerHTML = typeof DOMPurify !== 'undefined'
-      ? DOMPurify.sanitize(rendered, { ADD_DATA_URI_TAGS: ['img'], ALLOW_DATA_ATTR: true })
-      : rendered;
+    ref.current.innerHTML = cachedRichContentHtml(content, cacheIdentity);
 
     // Restore tool-section collapsed states
     ref.current.querySelectorAll('.tool-section[data-tool-index]').forEach(s => {
@@ -1420,9 +1631,10 @@ function MarkdownContent({ content, monospace = false, onOpenPath = null, autoEx
       btn.onclick = (e) => {
         e.stopPropagation();
         const path = btn.dataset.openPath || btn.dataset.copyPath;
-        if (path && typeof onOpenPath === 'function') {
+        const openPath = onOpenPathRef.current;
+        if (path && typeof openPath === 'function') {
           e.preventDefault();
-          onOpenPath(path);
+          openPath(path);
           return;
         }
         if (!btn.dataset.copyPath) return;
@@ -1606,8 +1818,14 @@ function MarkdownContent({ content, monospace = false, onOpenPath = null, autoEx
       }
     }
     return () => { if (cleanupObserver) cleanupObserver(); };
-  }, [content, onOpenPath, autoExpandLongCodeBlocks]);
-  return <div className={`message-body${monospace ? ' monospace-body' : ''}`} ref={ref} />;
+  }, [content, autoExpandLongCodeBlocks, cacheIdentity, richContentReady]);
+  return (
+    <div
+      className={`message-body${monospace ? ' monospace-body' : ''}`}
+      ref={ref}
+      data-rich-content-ready={richContentReady ? 'true' : 'false'}
+    />
+  );
 }
 
 // ESM export (consumed by entry.jsx bundle)

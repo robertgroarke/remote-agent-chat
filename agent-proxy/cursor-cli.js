@@ -5,6 +5,7 @@ const os = require('os');
 const path = require('path');
 const { spawn, spawnSync } = require('child_process');
 const { normalizeNativeLaunchMode, backgroundNativeLaunchResult } = require('./native-launch-mode');
+const { setBoundedMap } = require('./bounded-map');
 
 let chokidar = null;
 try { chokidar = require('chokidar'); } catch {}
@@ -34,6 +35,7 @@ const CURSOR_CLI_SANDBOX_MODES = [
 ];
 
 const SUMMARY_CACHE = new Map();
+const TAIL_SUMMARY_CACHE = new Map();
 const MODELS_CACHE = { ts: 0, models: null };
 const JSONL_CHUNK_BYTES = 1024 * 1024;
 const JSONL_PARSE_ERROR = Symbol('jsonl_parse_error');
@@ -73,6 +75,23 @@ function sessionFilePath(cliSessionId, date) {
 
 function safeStat(filePath) {
   try { return fs.statSync(filePath); } catch { return null; }
+}
+
+function fileCursorAnchor(filePath, offset) {
+  const end = Math.max(0, Number(offset) || 0);
+  if (end === 0) return '';
+  let fd = null;
+  try {
+    fd = fs.openSync(filePath, 'r');
+    const length = Math.min(256, end);
+    const buffer = Buffer.allocUnsafe(length);
+    const read = fs.readSync(fd, buffer, 0, length, end - length);
+    return buffer.subarray(0, read).toString('base64');
+  } catch {
+    return null;
+  } finally {
+    if (fd != null) try { fs.closeSync(fd); } catch {}
+  }
 }
 
 function walkJsonlFiles(root, maxFiles) {
@@ -510,20 +529,39 @@ function parseCursorJsonlDetailed(filePath) {
   const prior = SUMMARY_CACHE.get(filePath);
   let state;
   let offset = 0;
-  const canTail = prior && stat.size >= prior.offset && stat.size >= prior.size;
+  const canTail = !!prior
+    && stat.size >= prior.offset
+    && stat.size >= prior.size
+    && prior.anchor === fileCursorAnchor(filePath, prior.offset)
+    && !(stat.size === prior.size && stat.mtimeMs !== prior.mtimeMs);
   if (canTail) {
     state = prior.state;
     offset = prior.offset;
   } else {
     state = createParseState(filePath);
   }
+  const scanStartOffset = offset;
   const scan = scanJsonlEntries(filePath, entry => applyEventToState(state, entry), {
     startOffset: offset,
-    processFinalLine: !canTail,
+    processFinalLine: true,
   });
-  const next = { state, size: stat.size, mtimeMs: stat.mtimeMs, offset: scan.offset };
-  SUMMARY_CACHE.set(filePath, next);
-  return { state, stat };
+  const next = {
+    state, size: stat.size, mtimeMs: stat.mtimeMs, offset: scan.offset,
+    anchor: fileCursorAnchor(filePath, scan.offset),
+  };
+  setBoundedMap(SUMMARY_CACHE, filePath, next, 32);
+  return {
+    state,
+    stat,
+    sourceCursor: {
+      mode: canTail ? (stat.size > prior.size ? 'append' : 'unchanged') : (prior ? 'recovery' : 'baseline'),
+      start_offset: scanStartOffset,
+      end_offset: scan.offset,
+      file_size: stat.size,
+      bytes_read: Math.max(0, stat.size - scanStartOffset),
+      events_read: scan.emitted,
+    },
+  };
 }
 
 function parseCursorJsonl(filePath) {
@@ -560,11 +598,54 @@ function createCursorChunkParseState(filePath) {
 function parseCursorJsonlTail(filePath, tailBytes = DEFAULT_HYDRATE_TAIL_BYTES) {
   const stat = safeStat(filePath);
   if (!stat) return null;
-  const state = createCursorChunkParseState(filePath);
-  const wantedStart = Math.max(0, stat.size - Math.max(1024 * 1024, Number(tailBytes) || DEFAULT_HYDRATE_TAIL_BYTES));
-  const startOffset = scanStartAlignedToLine(filePath, wantedStart);
-  scanJsonlEntries(filePath, entry => applyEventToState(state, entry), { startOffset, processFinalLine: true });
-  return { state, stat, startOffset };
+  const boundedTailBytes = Math.max(1024 * 1024, Number(tailBytes) || DEFAULT_HYDRATE_TAIL_BYTES);
+  const prior = TAIL_SUMMARY_CACHE.get(filePath);
+  const canTail = !!prior
+    && prior.tailBytes === boundedTailBytes
+    && stat.size >= prior.offset
+    && stat.size >= prior.size
+    && prior.anchor === fileCursorAnchor(filePath, prior.offset)
+    && !(stat.size === prior.size && stat.mtimeMs !== prior.mtimeMs);
+  let state;
+  let startOffset;
+  let scanStartOffset;
+  if (canTail) {
+    state = prior.state;
+    startOffset = prior.startOffset;
+    scanStartOffset = prior.offset;
+  } else {
+    state = createCursorChunkParseState(filePath);
+    const wantedStart = Math.max(0, stat.size - boundedTailBytes);
+    startOffset = scanStartAlignedToLine(filePath, wantedStart);
+    scanStartOffset = startOffset;
+  }
+  const scan = scanJsonlEntries(filePath, entry => applyEventToState(state, entry), {
+    startOffset: scanStartOffset,
+    processFinalLine: true,
+  });
+  setBoundedMap(TAIL_SUMMARY_CACHE, filePath, {
+    state,
+    startOffset,
+    offset: scan.offset,
+    size: stat.size,
+    mtimeMs: stat.mtimeMs,
+    tailBytes: boundedTailBytes,
+    anchor: fileCursorAnchor(filePath, scan.offset),
+  }, 32);
+  return {
+    state,
+    stat,
+    startOffset,
+    sourceCursor: {
+      mode: canTail ? (stat.size > prior.size ? 'append' : 'unchanged') : (prior ? 'recovery' : 'baseline_tail'),
+      start_offset: scanStartOffset,
+      end_offset: scan.offset,
+      file_size: stat.size,
+      bytes_read: Math.max(0, stat.size - scanStartOffset),
+      events_read: scan.emitted,
+      partial: startOffset > 0,
+    },
+  };
 }
 
 function parseCursorJsonlChunk(filePath, { beforeOffset = null, chunkBytes = DEFAULT_HYDRATE_TAIL_BYTES } = {}) {
@@ -674,6 +755,7 @@ function tailSessionSummary(filePath, stat, maxHydrateBytes, tailBytes, hydrateS
     messagesPartial: true,
     hydrateSkippedReason: tailHydrated ? hydrateSkippedReason : 'file_too_large',
     activity: tailState ? buildActivityFromState(tailState) : null,
+    sourceCursor: tail?.sourceCursor || null,
   };
 }
 
@@ -708,6 +790,7 @@ function readSessionSummary(filePath, { includeMessages = true, maxHydrateBytes 
     updatedAt: latestIso(stat.mtime),
     sizeBytes: stat.size,
     activity: buildActivityFromState(state),
+    sourceCursor: detailed.sourceCursor || null,
   };
 }
 

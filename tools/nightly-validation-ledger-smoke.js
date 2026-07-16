@@ -6,6 +6,7 @@ const fs = require('fs');
 const os = require('os');
 const path = require('path');
 const {
+  VALIDATOR_RUNTIME_BUDGET_MS,
   appendLedger,
   discoverValidators,
   parseArgs,
@@ -16,9 +17,14 @@ const { collectAppVersions } = require('./app-version-inventory');
 const root = path.resolve(__dirname, '..');
 const read = relative => fs.readFileSync(path.join(root, relative), 'utf8');
 const expectedAppHarnesses = [
-  'antigravity-v2', 'claude-cli', 'codex-cli', 'codex-desktop', 'cursor-cli', 'cursor',
+  'antigravity-v2', 'claude', 'claude-cli', 'codex', 'codex-cli', 'codex-desktop',
+  'cursor-cli', 'continue', 'cursor', 'gemini', 'roo_code',
 ];
-const expectedValidators = [...expectedAppHarnesses, 'visual-regression'];
+const expectedValidators = [
+  'antigravity-v2', 'claude-cli', 'claude', 'codex-cli', 'codex-desktop', 'codex', 'continue',
+  'cursor-cli', 'cursor', 'native-golden-approval', 'performance-budgets', 'production-block-inventory',
+  'production-overnight-runner', 'scheduled-send', 'visual-regression',
+];
 
 assert.deepEqual(discoverValidators().map(item => item.harness), expectedValidators);
 for (const { script } of discoverValidators()) {
@@ -44,12 +50,24 @@ const codexDesktopValidator = read('tools/codex-desktop-validate-all.js');
 assert(codexDesktopValidator.includes('if (!readOnly) {'));
 assert(codexDesktopValidator.includes("['notice, goal, queue, and action fixture'"));
 assert(codexDesktopValidator.includes("...(!readOnly ? ['--allow-active'] : [])"));
+const codexValidator = read('tools/codex-validate-all.js');
+assert(codexValidator.includes("['live updated extension passive probe'"));
+assert(codexValidator.includes("['tools/codex-vscode-readonly-update-e2e.js', '--read-only']"));
+const codexUpdateProbe = read('tools/codex-vscode-readonly-update-e2e.js');
+assert(codexUpdateProbe.includes('transcript_content_captured: false'));
+assert(codexUpdateProbe.includes('focus_actions: 0'));
 
 const parsed = parseArgs(['--no-publish', '--only', 'cursor,codex-cli', '--timeout-ms', '5000']);
 assert.equal(parsed.publish, false);
 assert.deepEqual(parsed.only, ['cursor', 'codex-cli']);
 assert.equal(parsed.timeoutMs, 5000);
+assert.equal(VALIDATOR_RUNTIME_BUDGET_MS, 60000);
+assert.equal(parseArgs([]).timeoutMs, VALIDATOR_RUNTIME_BUDGET_MS);
+assert.equal(parseArgs(['--timeout-ms', '120000']).timeoutMs, VALIDATOR_RUNTIME_BUDGET_MS,
+  'read-only validator budget must not be raised above 60 seconds');
 assert.equal(parseArgs(['--auth-only']).authOnly, true);
+assert(read('tools/nightly-validation-ledger.js').includes('runtime_budget_ms: timeoutMs'));
+assert(read('tools/nightly-validation-ledger.js').includes("budget_exhausted: status === 'timed_out'"));
 assert(read('tools/nightly-validation-ledger.js').includes('attempt <= 3'));
 
 const mockHeaders = location => ({ get: name => name.toLowerCase() === 'location' ? location : null });
@@ -78,6 +96,13 @@ for (const marker of [
   "type: 'nightly_validation_status'",
   'nightly_validation_failures: nightlyValidationFailures',
 ]) assert(relay.includes(marker), `missing relay marker: ${marker}`);
+const allowlistStart = relay.indexOf('const NIGHTLY_VALIDATION_HARNESSES = new Set([');
+const allowlistEnd = relay.indexOf(']);', allowlistStart);
+assert(allowlistStart >= 0 && allowlistEnd > allowlistStart, 'nightly validation allowlist not found');
+const allowlistSource = relay.slice(allowlistStart, allowlistEnd);
+const relayAllowlist = [...allowlistSource.matchAll(/'([^']+)'/g)].map(match => match[1]);
+assert.deepEqual(relayAllowlist, expectedValidators,
+  'relay nightly validation allowlist must exactly match discovered validators');
 
 const webHooks = read('frontend/hooks.jsx');
 const webApp = read('frontend/app.jsx');

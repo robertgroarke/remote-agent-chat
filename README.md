@@ -607,7 +607,7 @@ The `PUBLIC_URL` in `.env` and the Authorized Redirect URI in Google Console mus
 **Sessions flicker or disappear**
 Two proxy processes are running simultaneously. This happens when both the VSIX extension and the standalone proxy are active, or when two standalone processes are running. Fix:
 - **VSIX + standalone conflict:** Disable the `agent-proxy-task` Scheduled Task, or uninstall the VSIX extension. Only use one mode at a time.
-- **Two standalone processes:** Kill all `node.exe` processes and let the Scheduled Task restart one clean instance, or use `python proxy_restart_lock.py`.
+- **Two standalone processes:** Use `python proxy_restart_lock.py`; it stops only the owned proxy supervisor/worker and confirms the replacement reconnects. Never kill unrelated `node.exe` processes manually.
 
 **VSIX status bar shows "Proxy (standby)" in every window**
 The leader window crashed without cleaning up its lock file. The standby will auto-recover within 15 seconds. To force it, delete `%TEMP%\remote-agent-proxy.lock` and restart Antigravity.

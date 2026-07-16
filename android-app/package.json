@@ -1,7 +1,7 @@
 {
   "name": "agent-chat",
-  "version": "1.0.0",
-  "main": "node_modules/expo/AppEntry.js",
+  "version": "1.0.1",
+  "main": "index.js",
   "scripts": {
     "start": "expo start",
     "android": "expo run:android",
@@ -14,6 +14,7 @@
     "@react-navigation/native": "^6.1.18",
     "@react-navigation/native-stack": "^6.11.0",
     "expo": "~52.0.0",
+    "expo-asset": "~11.0.1",
     "expo-auth-session": "~6.0.3",
     "expo-clipboard": "~7.0.1",
     "expo-crypto": "~14.0.2",
@@ -35,6 +36,24 @@
   },
   "devDependencies": {
     "@babel/core": "^7.24.0",
-    "eas-cli": "^18.4.0"
+    "eas-cli": "^21.0.1"
+  },
+  "overrides": {
+    "eas-cli": {
+      "ajv": "^8.20.0",
+      "diff": "^8.0.3",
+      "joi": "^17.13.4",
+      "minimatch": "^10.2.4",
+      "ts-deepmerge": "^8.0.0",
+      "yaml": "^2.9.0"
+    },
+    "@expo/eas-json": {
+      "joi": "^17.13.4"
+    },
+    "@xmldom/xmldom": "^0.9.10",
+    "markdown-it": "^14.3.0",
+    "postcss": "^8.5.19",
+    "tar": "^7.5.20",
+    "uuid": "^11.1.1"
   }
 }

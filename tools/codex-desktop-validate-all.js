@@ -14,14 +14,23 @@ if (args.some(arg => arg !== '--read-only' && arg !== '--send-live') || (readOnl
 }
 const stepTimeoutMs = Number(process.env.CODEX_DESKTOP_VALIDATE_STEP_TIMEOUT_MS || 60000);
 const steps = [
+  ['loopback host compatibility regression', ['tools/codex-desktop-loopback-host-smoke.js']],
+  ['bounded transcript read regression', ['tools/codex-desktop-bounded-read-smoke.js']],
   ['proxy syntax', ['--check', 'agent-proxy/proxy-engine.js']],
   ['selector syntax', ['--check', 'agent-proxy/selectors.js']],
+  ['trusted send receipt and client-rotation regression', ['tools/codex-desktop-send-receipt-smoke.js']],
+  ['owned soak safety and hidden-capture regression', ['tools/codex-desktop-owned-soak-smoke.js']],
   ['protocol syntax', ['--check', 'agent-proxy/protocol.js']],
   ['relay syntax', ['--check', 'relay-server/index.js']],
   ['target discovery regression', ['tools/codex-desktop-target-discovery-smoke.js']],
+  ['first-paint-invisible restart regression', ['tools/codex-desktop-invisible-restart-smoke.js']],
   ['native thread list regression', ['tools/codex-desktop-thread-list-smoke.js']],
+  ['thread-switch receipt state regression', ['tools/codex-desktop-thread-switch-state-smoke.js']],
+  ['exact-archive structured recovery regression', ['tools/codex-desktop-archive-structured-smoke.js']],
   ['structured terminal and file-change regression', ['tools/codex-desktop-structured-controls-smoke.js']],
+  ['stopped status block regression', ['tools/codex-status-block-smoke.js']],
   ['relay/session discovery retry regression', ['tools/codex-desktop-readonly-retry-smoke.js']],
+  ['permission/send CDP transport race regression', ['tools/codex-desktop-transport-race-smoke.js']],
   ['read-only terminal and file-change relay E2E', ['tools/codex-desktop-readonly-controls-e2e.js']],
   ['active fidelity normalization regression', ['tools/codex-fidelity-normalization-smoke.js']],
   ['prompt reconnect regression', ['tools/proxy-prompt-reconnect-smoke.js']],

@@ -5,6 +5,7 @@ const assert = require('assert');
 const CDP = require('../agent-proxy/node_modules/chrome-remote-interface');
 const selectors = require('../agent-proxy/selectors');
 const { withCodexDesktopCdpLock } = require('../agent-proxy/codex-desktop-cdp-lock');
+const { listCdpTargets, connectCdpTarget } = require('../agent-proxy/cdp-loopback');
 
 const PORT = Number(process.env.CODEX_DESKTOP_CDP_PORT || 9225);
 const TIMEOUT_MS = Number(process.env.CODEX_DESKTOP_THREAD_SMOKE_TIMEOUT_MS || 15000);
@@ -20,12 +21,16 @@ function withTimeout(promise, label) {
 }
 
 async function main() {
-  const targets = await withTimeout(CDP.List({ port: PORT }), 'Codex Desktop target list');
+  const targets = await withTimeout(listCdpTargets(CDP, { port: PORT }), 'Codex Desktop target list');
   const target = targets.find(item => item.type === 'page' && item.url === 'app://-/index.html')
     || targets.find(item => item.type === 'page' && /^app:/.test(item.url || ''));
   assert(target, `Codex Desktop app target not found on port ${PORT}`);
 
-  const client = await withTimeout(CDP({ port: PORT, target: target.id }), 'Codex Desktop attach');
+  const client = await withTimeout(connectCdpTarget(CDP, {
+    port: PORT,
+    host: target._cdpHost,
+    target: target.id,
+  }), 'Codex Desktop attach');
   try {
     await client.Runtime.enable();
     const inventoryResult = await withTimeout(client.Runtime.evaluate({

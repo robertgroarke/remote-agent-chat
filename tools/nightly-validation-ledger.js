@@ -10,13 +10,13 @@ const { collectAppVersions } = require('./app-version-inventory');
 const root = path.resolve(__dirname, '..');
 const DEFAULT_LEDGER = path.join(root, 'data', 'nightly-validation-ledger.jsonl');
 const DEFAULT_LOCK = path.join(root, 'data', 'nightly-validation.lock');
-const DEFAULT_TIMEOUT_MS = 12 * 60 * 1000;
+const VALIDATOR_RUNTIME_BUDGET_MS = 60 * 1000;
 
 function parseArgs(argv) {
   const options = {
     ledger: DEFAULT_LEDGER,
     lock: DEFAULT_LOCK,
-    timeoutMs: DEFAULT_TIMEOUT_MS,
+    timeoutMs: VALIDATOR_RUNTIME_BUDGET_MS,
     relayOrigin: null,
     publish: true,
     only: null,
@@ -25,7 +25,12 @@ function parseArgs(argv) {
   for (let i = 0; i < argv.length; i += 1) {
     if (argv[i] === '--ledger' && argv[i + 1]) options.ledger = path.resolve(argv[++i]);
     else if (argv[i] === '--lock' && argv[i + 1]) options.lock = path.resolve(argv[++i]);
-    else if (argv[i] === '--timeout-ms' && argv[i + 1]) options.timeoutMs = Math.max(1000, Number(argv[++i]) || DEFAULT_TIMEOUT_MS);
+    else if (argv[i] === '--timeout-ms' && argv[i + 1]) {
+      options.timeoutMs = Math.min(
+        VALIDATOR_RUNTIME_BUDGET_MS,
+        Math.max(1000, Number(argv[++i]) || VALIDATOR_RUNTIME_BUDGET_MS),
+      );
+    }
     else if (argv[i] === '--relay-origin' && argv[i + 1]) options.relayOrigin = argv[++i].replace(/\/+$/, '');
     else if (argv[i] === '--no-publish') options.publish = false;
     else if (argv[i] === '--auth-only') options.authOnly = true;
@@ -150,6 +155,8 @@ function runValidator(validator, appVersion, timeoutMs, runId) {
     app_version: appVersion || 'unavailable',
     validator: `tools/${validator.script}`,
     read_only: true,
+    runtime_budget_ms: timeoutMs,
+    budget_exhausted: status === 'timed_out',
     duration_ms: Date.now() - started,
     exit_code: Number.isInteger(result.status) ? result.status : null,
     completed_at: new Date().toISOString(),
@@ -223,4 +230,14 @@ if (require.main === module) {
   });
 }
 
-module.exports = { appendLedger, discoverValidators, main, parseArgs, publishEntry, resolveRelay, runValidator, verifyRelayAuth };
+module.exports = {
+  VALIDATOR_RUNTIME_BUDGET_MS,
+  appendLedger,
+  discoverValidators,
+  main,
+  parseArgs,
+  publishEntry,
+  resolveRelay,
+  runValidator,
+  verifyRelayAuth,
+};

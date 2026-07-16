@@ -100,6 +100,63 @@ async function main() {
   assert.deepStrictEqual(runtime.removeBindingCalls, [{ name: '__racDomChanged' }]);
   assert.strictEqual(manager.getState('session-a'), null);
 
+  const disabledRuntime = fakeRuntime();
+  const disabledManager = new CdpDomPushManager({
+    disabled: true,
+    onDirty: async () => {},
+  });
+  const disabledAttach = await disabledManager.attach('disabled-session', { Runtime: disabledRuntime });
+  assert.deepStrictEqual(disabledAttach, { ok: false, reason: 'disabled' });
+  assert.strictEqual(disabledRuntime.addBindingCalls.length, 0,
+    'kill switch must not inject a binding or observer');
+  assert.strictEqual(disabledManager.getState('disabled-session').status, 'disabled');
+  disabledManager.notePoll('disabled-session', working, now);
+  assert.strictEqual(disabledManager.shouldRunFallback('disabled-session', working, now + 749), false);
+  assert.strictEqual(disabledManager.shouldRunFallback('disabled-session', working, now + 750), true,
+    'kill switch must retain the fast timer fallback');
+
+  const failingRuntime = fakeRuntime();
+  const guardLogs = [];
+  const guardedManager = new CdpDomPushManager({
+    policy: {
+      debounceMs: 1,
+      maxConsecutiveErrors: 3,
+      backoffBaseMs: 40,
+      backoffMaxMs: 40,
+    },
+    log: (level, message) => guardLogs.push({ level, message }),
+    onDirty: async () => { throw new Error('Execution context was destroyed'); },
+  });
+  await guardedManager.attach('guarded-session', { Runtime: failingRuntime }, { contextId: 7 });
+  const guardedToken = JSON.parse(
+    failingRuntime.evaluateCalls[0].expression.match(/token === ("[a-f0-9]+")/)[1],
+  );
+  for (let sequence = 1; sequence <= 3; sequence++) {
+    failingRuntime.emitBinding({
+      name: '__racDomChanged',
+      payload: JSON.stringify({ token: guardedToken, sequence, source_at: Date.now() }),
+    });
+    await wait(10);
+  }
+  const backoffState = guardedManager.getState('guarded-session');
+  assert.strictEqual(backoffState.status, 'backoff');
+  assert.strictEqual(backoffState.consecutiveErrors, 3);
+  assert(backoffState.backoffUntil > Date.now());
+  assert.strictEqual(failingRuntime.removeBindingCalls.length, 1,
+    'repeated context failures must auto-uninstall the binding');
+  assert.strictEqual(guardLogs.filter(entry => /auto-uninstalled/.test(entry.message)).length, 1,
+    'auto-uninstall must emit one bounded warning');
+  const addBindingCount = failingRuntime.addBindingCalls.length;
+  const backedOffAttach = await guardedManager.attach('guarded-session', { Runtime: failingRuntime });
+  assert.strictEqual(backedOffAttach.reason, 'backoff');
+  assert.strictEqual(failingRuntime.addBindingCalls.length, addBindingCount,
+    'backoff must prevent repeated reinjection attempts');
+  await wait(45);
+  const recoveredRuntime = fakeRuntime();
+  const recovered = await guardedManager.attach('guarded-session', { Runtime: recoveredRuntime });
+  assert.strictEqual(recovered.ok, true, 'observer should retry after bounded backoff');
+  await guardedManager.close();
+
   const proxySource = fs.readFileSync(path.join(__dirname, '..', 'agent-proxy', 'proxy-engine.js'), 'utf8');
   for (const marker of [
     'new CdpDomPushManager({',
@@ -118,6 +175,10 @@ async function main() {
     binding_unavailable_working_fallback_ms: 750,
     binding_unavailable_idle_fallback_ms: 5000,
     context_reinstall_verified: true,
+    kill_switch_fallback_verified: true,
+    context_error_auto_uninstall_threshold: 3,
+    reinjection_backoff_verified: true,
+    bounded_guardrail_warnings: true,
     proxy_engine_integrated: true,
   };
   const serialized = JSON.stringify(result, null, 2) + '\n';

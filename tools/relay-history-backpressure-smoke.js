@@ -7,10 +7,14 @@ const path = require('path');
 const {
   UNSOLICITED_HISTORY_TAIL_LIMIT,
   MAX_BROWSER_HISTORY_BUFFER_BYTES,
+  MAX_BROWSER_DELTA_BUFFER_BYTES,
+  PRIORITY_LIVE_HISTORY_MAX_BYTES,
   buildUnsolicitedHistoryPayload,
   buildUnsolicitedHistoryChunkPayload,
   isUnsolicitedHistoryMessage,
   canBroadcastHistoryToBrowser,
+  canBroadcastDeltaToBrowser,
+  isPriorityLiveHistoryUpdate,
 } = require('../relay-server/history-broadcast-policy');
 
 const smallRows = Array.from({ length: 9 }, (_, index) => ({
@@ -41,6 +45,32 @@ assert.equal(large.limit, UNSOLICITED_HISTORY_TAIL_LIMIT);
 assert.equal(canBroadcastHistoryToBrowser({ bufferedAmount: 0 }), true);
 assert.equal(canBroadcastHistoryToBrowser({ bufferedAmount: MAX_BROWSER_HISTORY_BUFFER_BYTES }), true);
 assert.equal(canBroadcastHistoryToBrowser({ bufferedAmount: MAX_BROWSER_HISTORY_BUFFER_BYTES + 1 }), false);
+assert.equal(canBroadcastDeltaToBrowser({ bufferedAmount: 0 }), true);
+assert.equal(canBroadcastDeltaToBrowser({ bufferedAmount: MAX_BROWSER_DELTA_BUFFER_BYTES }), true);
+assert.equal(canBroadcastDeltaToBrowser({ bufferedAmount: MAX_BROWSER_DELTA_BUFFER_BYTES + 1 }), false);
+assert.equal(isPriorityLiveHistoryUpdate({
+  type: 'history_snapshot',
+  live_update: 'assistant_completion',
+  messages: [{ role: 'assistant', content: 'live tail' }],
+}), true);
+assert.equal(isPriorityLiveHistoryUpdate({
+  type: 'history_snapshot',
+  live_update: 'assistant_completion',
+  messages: [{ role: 'assistant', content: 'x'.repeat(PRIORITY_LIVE_HISTORY_MAX_BYTES) }],
+}), false);
+assert.equal(isPriorityLiveHistoryUpdate({
+  type: 'history_snapshot',
+  messages: [{ role: 'assistant', content: 'ordinary history' }],
+}), false);
+assert.equal(isPriorityLiveHistoryUpdate({
+  type: 'history_snapshot',
+  session_id: 'long-live-session',
+  live_update: 'assistant_completion',
+  messages: [
+    ...Array.from({ length: 75 }, (_, index) => ({ role: 'user', content: 'x'.repeat(2048) + index })),
+    ...Array.from({ length: UNSOLICITED_HISTORY_TAIL_LIMIT }, (_, index) => ({ role: 'assistant', content: `tail-${index}` })),
+  ],
+}), true, 'priority eligibility must measure the bounded browser tail, not the larger inbound snapshot');
 
 const unsolicitedChunk = buildUnsolicitedHistoryChunkPayload({
   type: 'history_chunk',
@@ -64,11 +94,23 @@ const historyChunkBranch = relaySource.match(
 );
 assert(historyChunkBranch, 'relay history_chunk branch not found');
 assert(
-  historyChunkBranch[1].includes('broadcastToBrowsers(buildUnsolicitedHistoryChunkPayload(msg))'),
-  'unsolicited relay history_chunk broadcasts must pass through the bounded payload policy',
+  historyChunkBranch[1].includes("'Dropped requestless or orphaned native history chunk'"),
+  'requestless relay history_chunk traffic must be dropped instead of broadcast',
+);
+assert(
+  !historyChunkBranch[1].includes('broadcastToBrowsers(buildUnsolicitedHistoryChunkPayload(msg))'),
+  'requestless history chunks must never use the legacy bounded-tail broadcast path',
+);
+assert(
+  relaySource.includes('broadcastPersistedTranscriptRows(id, getHistoryRowsTail(id, incrementalPlan.rows.length))'),
+  'append-only legacy snapshots must become incremental persisted rows, not full snapshots',
+);
+assert(
+  relaySource.includes("reason: 'backpressure'"),
+  'slow transcript subscribers must receive a bounded gap/resync signal',
 );
 
 console.log(
   `relay history backpressure smoke: PASS ` +
-  `(tail=${UNSOLICITED_HISTORY_TAIL_LIMIT}, buffer=${MAX_BROWSER_HISTORY_BUFFER_BYTES})`,
+  `(tail=${UNSOLICITED_HISTORY_TAIL_LIMIT}, history_buffer=${MAX_BROWSER_HISTORY_BUFFER_BYTES}, delta_buffer=${MAX_BROWSER_DELTA_BUFFER_BYTES})`,
 );

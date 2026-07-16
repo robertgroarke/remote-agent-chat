@@ -1,7 +1,7 @@
 'use strict';
 
-const CACHE_NAME = 'agent-chat-v70';
-const ASSET_VERSION = '20260712-light-code-1';
+const CACHE_NAME = 'agent-chat-build-ac2831d69189275e';
+const ASSET_VERSION = 'build-ac2831d69189275e';
 
 const SHELL_ASSETS = [
   '/',
@@ -18,6 +18,85 @@ const SHELL_ASSETS = [
 ];
 
 const VERSIONED_SHELL_ASSETS = new Set(SHELL_ASSETS.filter(asset => asset.includes('?')));
+
+const PUSH_CATEGORY_BY_TYPE = Object.freeze({
+  permission_required: 'permission_required',
+  goal_completed: 'goal_completed',
+  goal_attention: 'goal_attention',
+  agent_error: 'agent_error',
+  rate_limit_active: 'agent_error',
+  proxy_watchdog_failed: 'agent_error',
+  app_update_fail: 'agent_error',
+  session_offline: 'session_offline',
+  proxy_offline: 'session_offline',
+  proxy_recovered: 'session_offline',
+  rate_limit_cleared: 'rate_limit_cleared',
+  rate_limit_resumed: 'rate_limit_cleared',
+  app_update_pass: 'agent_ready',
+});
+const semanticPushClaims = new Set();
+
+async function authoritativePushPolicy(data) {
+  const type = String(data?.type || '').trim();
+  const category = String(data?.category || PUSH_CATEGORY_BY_TYPE[type] || '').trim();
+  if (!category) return { allowed: true, reason: '' };
+  if (type === 'turn_ready' || category === 'turn_ready') {
+    return { allowed: false, reason: 'unsupported_turn_ready' };
+  }
+  if (['goal_completed', 'goal_attention'].includes(type) && category !== type) {
+    return { allowed: false, reason: 'invalid_category' };
+  }
+  try {
+    const [notificationResponse, sessionResponse] = await Promise.all([
+      fetch('/api/preferences/notifications', {
+        credentials: 'include',
+        cache: 'no-store',
+      }),
+      fetch('/api/preferences/sessions', {
+        credentials: 'include',
+        cache: 'no-store',
+      }),
+    ]);
+    if (!notificationResponse.ok || !sessionResponse.ok) {
+      return { allowed: false, reason: 'preferences_unavailable' };
+    }
+    const [notificationBody, sessionBody] = await Promise.all([
+      notificationResponse.json().catch(() => ({})),
+      sessionResponse.json().catch(() => ({})),
+    ]);
+    if (notificationBody.preferences?.[category] !== true) {
+      return { allowed: false, reason: 'client_preference' };
+    }
+    const sessionId = String(data?.session_id || data?.session || '').trim();
+    if (sessionId && sessionBody.preferences?.[sessionId]?.muted === true) {
+      return { allowed: false, reason: 'session_muted' };
+    }
+    return { allowed: true, reason: '' };
+  } catch {
+    return { allowed: false, reason: 'preferences_offline' };
+  }
+}
+
+async function recordSemanticStage(data, stage) {
+  if (!data?.dedupe_key || !['claimed', 'displayed', 'suppressed'].includes(stage)) return false;
+  try {
+    const response = await fetch('/api/notifications/semantic-receipts', {
+      method: 'POST',
+      credentials: 'include',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        dedupe_key: data.dedupe_key,
+        stage,
+        channel: 'web-service-worker',
+        client_id: 'service-worker',
+        ...(data.reason_code ? { reason_code: data.reason_code } : {}),
+      }),
+    });
+    return response.ok;
+  } catch {
+    return false;
+  }
+}
 
 // ── Install: cache shell assets ───────────────────────────────────────────────
 
@@ -51,14 +130,54 @@ self.addEventListener('push', event => {
     payload = { body: event.data ? event.data.text() : '' };
   }
   const data = payload.data || {};
-  event.waitUntil(self.registration.showNotification(payload.title || 'Remote Agent Chat', {
-    body: payload.body || 'An agent needs your attention.',
-    icon: '/icon.png',
-    badge: '/icon.png',
-    tag: `${data.type || 'agent-update'}:${data.session_id || ''}`,
-    renotify: true,
-    data,
-  }));
+  if (['agent_idle', 'turn_ready'].includes(String(data.type || '').trim())
+    || /session completed/i.test(`${payload.title || ''} ${payload.body || ''}`)) {
+    return;
+  }
+  const semanticType = ['goal_completed', 'goal_attention'].includes(data.type);
+  const notificationTag = semanticType && data.dedupe_key
+    ? `semantic:${data.dedupe_key}`
+    : `${data.type || 'agent-update'}:${data.session_id || ''}`;
+  event.waitUntil((async () => {
+    const policy = await authoritativePushPolicy(data);
+    if (!policy.allowed) {
+      if (semanticType) {
+        await recordSemanticStage({ ...data, reason_code: policy.reason }, 'suppressed');
+      }
+      return;
+    }
+    if (semanticType) {
+      if (semanticPushClaims.has(notificationTag)) {
+        await recordSemanticStage({ ...data, reason_code: 'client_duplicate' }, 'suppressed');
+        return;
+      }
+      semanticPushClaims.add(notificationTag);
+      if (typeof self.registration.getNotifications === 'function') {
+        const existing = await self.registration.getNotifications({ tag: notificationTag });
+        if (existing.length > 0) {
+          await recordSemanticStage({ ...data, reason_code: 'client_duplicate' }, 'suppressed');
+          return;
+        }
+      }
+    }
+    const claimedReceipt = semanticType ? recordSemanticStage(data, 'claimed') : Promise.resolve(false);
+    try {
+      await self.registration.showNotification(payload.title || 'Remote Agent Chat', {
+        body: payload.body || 'An agent needs your attention.',
+        icon: '/icon.png',
+        badge: '/icon.png',
+        tag: notificationTag,
+        renotify: !semanticType,
+        data,
+      });
+    } catch (error) {
+      if (semanticType) semanticPushClaims.delete(notificationTag);
+      throw error;
+    }
+    if (semanticType) {
+      await Promise.allSettled([claimedReceipt, recordSemanticStage(data, 'displayed')]);
+    }
+  })());
 });
 
 self.addEventListener('notificationclick', event => {
@@ -78,9 +197,10 @@ self.addEventListener('notificationclick', event => {
 self.addEventListener('fetch', event => {
   const url = new URL(event.request.url);
 
-  // Never intercept: WebSocket upgrades, auth routes, uploads, non-GET
+  // Never intercept: authenticated APIs, WebSocket upgrades, auth routes, uploads, non-GET
   if (
     event.request.method !== 'GET' ||
+    url.pathname.startsWith('/api/') ||
     url.pathname.startsWith('/auth') ||
     url.pathname.startsWith('/client-ws') ||
     url.pathname.startsWith('/proxy-ws') ||

@@ -49,6 +49,11 @@ for (const marker of [
 for (const marker of [
   "self.addEventListener('push'",
   'self.registration.showNotification',
+  'authoritativePushPolicy(data)',
+  "fetch('/api/preferences/notifications'",
+  "fetch('/api/preferences/sessions'",
+  "reason: 'preferences_offline'",
+  'semanticPushClaims.has(notificationTag)',
   "self.addEventListener('notificationclick'",
   "type: 'push_notification_clicked'",
 ]) assert(worker.includes(marker), `missing service-worker Web Push marker: ${marker}`);
@@ -63,6 +68,8 @@ const result = {
   relay_vapid_persistence: true,
   authenticated_subscription_api: true,
   shared_preference_and_session_mute_filtering: true,
+  service_worker_last_hop_preference_filtering: true,
+  service_worker_offline_fail_closed: true,
   pwa_subscription_ui: true,
   service_worker_push_and_click: true,
 };

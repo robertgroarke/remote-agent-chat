@@ -14,14 +14,22 @@ import AutomationsScreen  from './screens/AutomationsScreen';
 import SkillsScreen       from './screens/SkillsScreen';
 import { getStoredJwt }  from './lib/auth';
 import { configureNotificationChannels } from './lib/notifications';
+import { useReducedMotion } from './lib/reduced-motion';
+import {
+  processSemanticNotification,
+  refreshAuthoritativeSemanticNotificationPreferences,
+  semanticNotificationFromExpo,
+  semanticNotificationToBanner,
+  subscribeSemanticNotifications,
+} from './lib/semantic-notifications';
 
 // ── Foreground notification handler ───────────────────────────────────────────
 // Show an in-app banner instead of the system alert; the banner component below
 // handles display. We suppress the system alert when in-app.
 Notifications.setNotificationHandler({
-  handleNotification: async () => ({
+  handleNotification: async notification => ({
     shouldShowAlert: false,   // suppressed — we show our own banner
-    shouldPlaySound: true,
+    shouldPlaySound: !semanticNotificationFromExpo(notification),
     shouldSetBadge:  false,
   }),
 });
@@ -53,6 +61,9 @@ const LINKING = {
 // ── In-app notification banner ────────────────────────────────────────────────
 
 function NotificationBanner({ notification, onDismiss, onPress }) {
+  const reducedMotion = useReducedMotion();
+  const reducedMotionRef = useRef(reducedMotion);
+  reducedMotionRef.current = reducedMotion;
   const opacity    = useRef(new Animated.Value(0)).current;
   const translateY = useRef(new Animated.Value(-60)).current;
   const translateX = useRef(new Animated.Value(0)).current;
@@ -68,6 +79,9 @@ function NotificationBanner({ notification, onDismiss, onPress }) {
       onPanResponderRelease: (_, g) => {
         if (g.dy < -30 || Math.abs(g.dx) > 80) {
           dismiss();
+        } else if (reducedMotionRef.current) {
+          translateY.setValue(0);
+          translateX.setValue(0);
         } else {
           Animated.parallel([
             Animated.spring(translateY, { toValue: 0, useNativeDriver: true }),
@@ -81,17 +95,27 @@ function NotificationBanner({ notification, onDismiss, onPress }) {
   useEffect(() => {
     if (!notification) return;
     translateX.setValue(0);
-    // Slide in
-    Animated.parallel([
-      Animated.timing(opacity,    { toValue: 1, duration: 250, useNativeDriver: true }),
-      Animated.timing(translateY, { toValue: 0, duration: 250, useNativeDriver: true }),
-    ]).start();
+    if (reducedMotionRef.current) {
+      opacity.setValue(1);
+      translateY.setValue(0);
+    } else {
+      Animated.parallel([
+        Animated.timing(opacity,    { toValue: 1, duration: 250, useNativeDriver: true }),
+        Animated.timing(translateY, { toValue: 0, duration: 250, useNativeDriver: true }),
+      ]).start();
+    }
     // Auto-dismiss after 5s
     const timer = setTimeout(() => dismiss(), 5_000);
     return () => clearTimeout(timer);
-  }, [notification]);
+  }, [notification, reducedMotion]);
 
   function dismiss() {
+    if (reducedMotionRef.current) {
+      opacity.setValue(0);
+      translateY.setValue(-60);
+      onDismiss();
+      return;
+    }
     Animated.parallel([
       Animated.timing(opacity,    { toValue: 0, duration: 200, useNativeDriver: true }),
       Animated.timing(translateY, { toValue: -60, duration: 200, useNativeDriver: true }),
@@ -106,7 +130,8 @@ function NotificationBanner({ notification, onDismiss, onPress }) {
 
   const activityIcon = activityType === 'generating' ? '●'
     : activityType === 'rate_limit' ? '⏳'
-    : activityType === 'idle' ? '✓'
+    : activityType === 'idle' || activityType === 'goal_completed' ? '✓'
+    : activityType === 'goal_attention' || String(activityType || '').startsWith('goal_') ? '!'
     : '💬';
 
   return (
@@ -188,6 +213,7 @@ const bs = StyleSheet.create({
 // ── App ───────────────────────────────────────────────────────────────────────
 
 export default function App() {
+  const reducedMotion = useReducedMotion();
   const [initialRoute, setInitialRoute] = useState(null);
   const [banner,       setBanner]       = useState(null);
   const navigationRef = React.useRef(null);
@@ -197,17 +223,33 @@ export default function App() {
 
   // Determine start screen based on stored JWT validity
   useEffect(() => {
-    getStoredJwt().then(token => {
+    getStoredJwt().then(async token => {
+      if (token) {
+        await refreshAuthoritativeSemanticNotificationPreferences().catch(() => false);
+      }
       setInitialRoute(token ? 'SessionList' : 'Login');
     });
   }, []);
 
   // Foreground notification — show in-app banner
   useEffect(() => {
+    const semanticSub = subscribeSemanticNotifications(event => {
+      setBanner(semanticNotificationToBanner(event));
+    });
     const sub = Notifications.addNotificationReceivedListener(notification => {
+      const semantic = semanticNotificationFromExpo(notification);
+      if (semantic) {
+        const route = navigationRef.current?.getCurrentRoute?.();
+        const activeSessionId = route?.name === 'Chat' ? route.params?.sessionId : null;
+        processSemanticNotification(semantic, activeSessionId).catch(() => {});
+        return;
+      }
       setBanner(notification);
     });
-    return () => sub.remove();
+    return () => {
+      semanticSub.remove();
+      sub.remove();
+    };
   }, []);
 
   // Background / killed — notification tap → navigate to session
@@ -234,7 +276,10 @@ export default function App() {
     <View style={{ flex: 1 }}>
       <NavigationContainer ref={navigationRef} linking={LINKING}>
         <StatusBar style="light" />
-        <Stack.Navigator initialRouteName={initialRoute} screenOptions={SCREEN_OPTIONS}>
+        <Stack.Navigator
+          initialRouteName={initialRoute}
+          screenOptions={{ ...SCREEN_OPTIONS, animation: reducedMotion ? 'none' : SCREEN_OPTIONS.animation }}
+        >
           <Stack.Screen
             name="Login"
             component={LoginScreen}

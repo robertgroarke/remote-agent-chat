@@ -8,6 +8,8 @@
 
 'use strict';
 
+const { parseResetAt } = require('../relay-server/usage-resume');
+
 const { resolveProjectRoot } = require('./project-root');
 
 const PROTOCOL_VERSION = 1;
@@ -69,6 +71,22 @@ function sessionSnapshot(sessions, workspaces, proxyId) {
 // still works — but 'proxy_message' is the canonical v1 type.
 function proxyMessage(sessionId, role, content, extra = null) {
   const contentBlocks = Array.isArray(extra?.content_blocks) ? extra.content_blocks : null;
+  const sourceMessageId = typeof extra?.source_message_id === 'string' ? extra.source_message_id : null;
+  const sourceCursor = extra?.source_cursor && typeof extra.source_cursor === 'object' ? extra.source_cursor : null;
+  const parsedTimestamp = [extra?.created_at, extra?.timestamp, extra?.ts]
+    .map((value) => {
+      const numericTimestamp = Number(value);
+      return (typeof value === 'number'
+        || (typeof value === 'string' && /^\d+(?:\.\d+)?$/.test(value.trim())))
+        ? (Number.isFinite(numericTimestamp) && numericTimestamp > 0
+            ? new Date(numericTimestamp > 1e12 ? numericTimestamp : numericTimestamp * 1000)
+            : null)
+        : (value ? new Date(value) : null);
+    })
+    .find(date => date && Number.isFinite(date.getTime()) && date.getTime() > 0) || null;
+  const createdAt = parsedTimestamp && Number.isFinite(parsedTimestamp.getTime()) && parsedTimestamp.getTime() > 0
+    ? parsedTimestamp.toISOString()
+    : null;
   const msg = {
     type: 'proxy_message',
     protocol_version: PROTOCOL_VERSION,
@@ -76,17 +94,53 @@ function proxyMessage(sessionId, role, content, extra = null) {
     message: {
       role,
       content,
-      created_at: new Date().toISOString(),
     },
     // legacy compat: relay handles 'proxy_message' but older builds may check 'message'
     session: sessionId,
     role,
     content,
   };
+  if (createdAt) {
+    msg.message.created_at = createdAt;
+    msg.created_at = createdAt;
+    msg.ts = parsedTimestamp.getTime() / 1000;
+  }
   if (contentBlocks) {
     msg.message.content_blocks = contentBlocks;
     msg.content_blocks = contentBlocks;
   }
+  if (sourceMessageId) {
+    msg.source_message_id = sourceMessageId;
+    msg.message.source_message_id = sourceMessageId;
+  }
+  if (sourceCursor) {
+    msg.source_cursor = sourceCursor;
+    msg.message.source_cursor = sourceCursor;
+  }
+  if (extra?.source) {
+    msg.source = String(extra.source);
+    msg.message.source = String(extra.source);
+  }
+  return msg;
+}
+
+// Incremental in-flight transcript content. The settled proxyMessage remains the
+// authoritative persisted record and reconciles this ephemeral stream.
+function messageDelta(sessionId, messageId, blockIndex, seq, op, append = '', extra = null) {
+  const msg = {
+    type: 'message_delta',
+    protocol_version: PROTOCOL_VERSION,
+    session_id: sessionId,
+    session: sessionId,
+    message_id: messageId,
+    role: extra?.role || 'assistant',
+    block_index: blockIndex,
+    block_type: extra?.block_type || 'text',
+    seq,
+    op,
+  };
+  if (op === 'append') msg.append = append;
+  if (extra?.stream_trace) msg.stream_trace = extra.stream_trace;
   return msg;
 }
 
@@ -96,22 +150,35 @@ function proxyMessage(sessionId, role, content, extra = null) {
 // selectorFailures is optional — included when degrading so the relay/browser
 // can surface read/send failure counts for diagnostics (A3-05).
 function proxyStatus(sessionId, status, activity, selectorFailures) {
-  const thinking = activity?.kind === 'thinking' || activity?.kind === 'generating';
-  const label = activity?.label || '';
+  const taskList = activity?.task_list;
+  const typedTaskList = taskList && Array.isArray(taskList.tasks) ? {
+    ...taskList,
+    content_blocks: [{
+      type: 'plan',
+      label: 'Plan',
+      total: Number(taskList.total) || taskList.tasks.length,
+      completed: Number(taskList.completed) || 0,
+      tasks: taskList.tasks,
+    }],
+  } : taskList;
+  const typedActivity = taskList ? { ...activity, task_list: typedTaskList } : activity;
+  const thinking = typedActivity?.kind === 'thinking' || typedActivity?.kind === 'generating';
+  const label = typedActivity?.label || '';
   const msg = {
     type: 'proxy_status',
     protocol_version: PROTOCOL_VERSION,
     session_id: sessionId,
     status,
-    activity,
+    activity: typedActivity,
+    activity_trace: { proxy_emitted_at_ms: Date.now() },
     // legacy compat
     session: sessionId,
     thinking,
     label,
   };
   // Claude Code thinking content — passed through activity.thinkingContent
-  if (activity?.thinkingContent) {
-    msg.thinking_content = activity.thinkingContent;
+  if (typedActivity?.thinkingContent) {
+    msg.thinking_content = typedActivity.thinkingContent;
   }
   if (selectorFailures && (selectorFailures.readFails > 0 || selectorFailures.sendFails > 0)) {
     msg.selector_failures = {
@@ -133,22 +200,42 @@ function proxySendResult(sessionId, clientMessageId, result, extra) {
     client_message_id: clientMessageId,
     result,
   };
-  if (result === 'delivered') {
+  if (result === 'launch_accepted') {
+    msg.accepted_at = extra?.accepted_at || new Date().toISOString();
+  } else if (result === 'delivered') {
     msg.delivered_at = new Date().toISOString();
   } else {
     msg.failed_at = new Date().toISOString();
     if (extra?.error) msg.error = extra.error;
   }
+  if (extra?.lifecycle) msg.lifecycle = extra.lifecycle;
+  if (extra?.native_receipt) msg.native_receipt = extra.native_receipt;
+  if (extra?.process_epoch) msg.process_epoch = extra.process_epoch;
   return msg;
+}
+
+function agentStarted(sessionId, clientMessageId, nativeReceipt, nativeStart) {
+  return {
+    type: 'agent_started',
+    protocol_version: PROTOCOL_VERSION,
+    session_id: sessionId,
+    client_message_id: clientMessageId,
+    delivered_at: nativeReceipt?.observed_at || new Date().toISOString(),
+    started_at: nativeStart?.native_event_at || nativeStart?.observed_at || new Date().toISOString(),
+    native_receipt: nativeReceipt || null,
+    native_start: nativeStart || null,
+  };
 }
 
 // ─── History ──────────────────────────────────────────────────────────────────
 
 // Proxy sends initial history on session discovery.
 // Uses v1 'history_snapshot' type; includes legacy 'history' type field and
-// 'session' field so un-upgraded relay still handles it.
-function historySnapshot(sessionId, messages) {
-  return {
+// 'session' field so un-upgraded relay still handles it. Large snapshots may
+// omit the redundant legacy history array once the v1 messages array alone is
+// needed to stay inside the bounded relay frame budget.
+function historySnapshot(sessionId, messages, options = {}) {
+  const snapshot = {
     type: 'history_snapshot',
     protocol_version: PROTOCOL_VERSION,
     session_id: sessionId,
@@ -156,7 +243,28 @@ function historySnapshot(sessionId, messages) {
     messages,
     // legacy compat
     session: sessionId,
-    history: messages,
+  };
+  if (options.includeLegacyHistory !== false) snapshot.history = messages;
+  if (options.liveUpdate === 'assistant_completion') {
+    snapshot.live_update = 'assistant_completion';
+  }
+  if (options.resyncId) snapshot.resync_id = String(options.resyncId);
+  if (options.resyncReason) snapshot.resync_reason = String(options.resyncReason);
+  if (options.source) snapshot.source = String(options.source);
+  if (options.sourceCursor && typeof options.sourceCursor === 'object') snapshot.source_cursor = options.sourceCursor;
+  if (Number.isFinite(Number(options.sourceBytes))) snapshot.source_bytes = Number(options.sourceBytes);
+  if (Number.isFinite(Number(options.rateLimitMs))) snapshot.resync_rate_limit_ms = Number(options.rateLimitMs);
+  return snapshot;
+}
+
+// Ephemeral, requester-scoped Windows host telemetry. The relay must never
+// cache, persist, or broadcast this payload.
+function hostResourceSnapshot(requestId, snapshot) {
+  return {
+    type: 'host_resource_snapshot',
+    protocol_version: PROTOCOL_VERSION,
+    request_id: requestId || null,
+    snapshot,
   };
 }
 
@@ -203,7 +311,7 @@ function historyChunk(sessionId, options = {}) {
 
 // Sent by proxy to relay in response to a control command.
 // Relay routes back to the originating browser via request_id.
-function agentControlResult(sessionId, requestId, command, result, error) {
+function agentControlResult(sessionId, requestId, command, result, details) {
   const msg = {
     type: 'agent_control_result',
     protocol_version: PROTOCOL_VERSION,
@@ -213,7 +321,8 @@ function agentControlResult(sessionId, requestId, command, result, error) {
     result,
     server_ts: new Date().toISOString(),
   };
-  if (result === 'failed' && error) msg.error = error;
+  if (result === 'failed' && details) msg.error = details;
+  if (result === 'ok' && details) msg.details = details;
   return msg;
 }
 
@@ -221,7 +330,7 @@ function agentControlResult(sessionId, requestId, command, result, error) {
 
 // Emitted when rate limiting is first detected for a session.
 // retry_after_hint is a human-readable string (e.g. "3:00 PM", "March 15 at 3pm") or null.
-function rateLimitActive(sessionId, retryAfterHint, percentUsed) {
+function rateLimitActive(sessionId, retryAfterHint, percentUsed, hardLimited) {
   const msg = {
     type:             'rate_limit_active',
     protocol_version: PROTOCOL_VERSION,
@@ -229,7 +338,10 @@ function rateLimitActive(sessionId, retryAfterHint, percentUsed) {
     detected_at:      new Date().toISOString(),
   };
   if (retryAfterHint) msg.retry_after_hint = retryAfterHint;
+  const resetAt = parseResetAt(retryAfterHint);
+  if (resetAt) msg.reset_at = resetAt;
   if (percentUsed != null) msg.percent_used = percentUsed;
+  if (hardLimited != null) msg.hard_limited = hardLimited === true;
   return msg;
 }
 
@@ -257,14 +369,72 @@ function agentConfig(sessionId, config) {
   };
 }
 
+function canonicalPromptActions(items) {
+  return (Array.isArray(items) ? items : []).map((item, index) => ({
+    id: item?.choice_id || item?.action_id || item?.id || item?.value || `action-${index}`,
+    label: item?.label || item?.title || item?.text || 'Action',
+    ...(item?.style ? { style: item.style } : {}),
+  }));
+}
+
+function permissionPrompt(sessionId, prompt) {
+  const content = String(prompt?.prompt_text || prompt?.message || prompt?.description || 'Agent requires permission to continue.');
+  return {
+    ...prompt,
+    type: 'permission_prompt',
+    protocol_version: PROTOCOL_VERSION,
+    session_id: sessionId,
+    content_blocks: [{
+      type: 'prompt',
+      label: prompt?.title || (prompt?.kind === 'question' ? 'Question' : 'Permission required'),
+      content,
+      actions: canonicalPromptActions(prompt?.choices),
+    }],
+    detected_at: prompt?.detected_at || new Date().toISOString(),
+  };
+}
+
+function questionPrompt(sessionId, prompt) {
+  return {
+    ...prompt,
+    type: 'question_prompt',
+    protocol_version: PROTOCOL_VERSION,
+    session_id: sessionId,
+    detected_at: prompt?.observed_at || new Date().toISOString(),
+  };
+}
+
+function questionPromptState(sessionId, promptId, generation, lifecycle, details = {}) {
+  return {
+    type: 'question_prompt_state',
+    protocol_version: PROTOCOL_VERSION,
+    session_id: sessionId,
+    prompt_id: promptId,
+    generation,
+    lifecycle,
+    ...(details.error_code ? { error_code: details.error_code } : {}),
+    ...(details.error ? { error: details.error } : {}),
+    observed_at: new Date().toISOString(),
+  };
+}
+
 // Sent by proxy when a session shows a blocking error/action modal that the
 // browser should surface with controls.
 function sessionErrorPrompt(sessionId, prompt) {
+  const informational = prompt?.blocking === false || prompt?.display_mode === 'inline';
+  const blockType = prompt?.block_type || (informational ? 'notice' : 'error');
   return {
+    ...prompt,
     type: 'session_error_prompt',
     protocol_version: PROTOCOL_VERSION,
     session_id: sessionId,
-    ...prompt,
+    content_blocks: [{
+      type: blockType,
+      label: prompt?.title || (informational ? 'Attention' : 'Action required'),
+      content: String(prompt?.message || 'There was an error handling the model response.'),
+      actions: canonicalPromptActions(prompt?.actions),
+      ...(prompt?.error_output ? { error_output: String(prompt.error_output) } : {}),
+    }],
     detected_at: new Date().toISOString(),
   };
 }
@@ -407,6 +577,16 @@ function fileContent(sessionId, requestPath, content, truncated, requestId) {
 // ─── Message queue events ────────────────────────────────────────────────────
 
 // Sent when a message has been queued for delivery to the agent session.
+function queuedMessageBlock(content, clientMessageId, status = 'queued') {
+  return {
+    type: 'queued_message',
+    label: 'Queued message',
+    content: String(content || ''),
+    client_message_id: clientMessageId,
+    status,
+  };
+}
+
 function messageQueued(sessionId, clientMessageId, content) {
   return {
     type:              'message_queued',
@@ -414,6 +594,7 @@ function messageQueued(sessionId, clientMessageId, content) {
     session_id:        sessionId,
     client_message_id: clientMessageId,
     content,
+    content_blocks:    [queuedMessageBlock(content, clientMessageId)],
     queued_at:         new Date().toISOString(),
   };
 }
@@ -446,11 +627,18 @@ function steerResult(sessionId, clientMessageId, result, error) {
 // Sent when the native queue state changes (Codex side-panel queue items with Steer buttons).
 // These are messages queued by Codex itself (not our proxy) while the agent was busy.
 function nativeQueue(sessionId, items) {
+  const typedItems = (Array.isArray(items) ? items : []).map((item, index) => {
+    const nativeIndex = item?.index ?? index;
+    const clientMessageId = `native-${nativeIndex}`;
+    const contentBlocks = [queuedMessageBlock(item?.text, clientMessageId, item?.state || 'queued')];
+    return { ...item, index: nativeIndex, content_blocks: contentBlocks };
+  });
   return {
     type:             'native_queue',
     protocol_version: PROTOCOL_VERSION,
     session_id:       sessionId,
-    items,            // [{ text, index }]
+    items:            typedItems,
+    content_blocks:   typedItems.flatMap(item => item.content_blocks),
     detected_at:      new Date().toISOString(),
   };
 }
@@ -461,12 +649,18 @@ module.exports = {
   heartbeat,
   sessionSnapshot,
   proxyMessage,
+  messageDelta,
   proxyStatus,
+  hostResourceSnapshot,
   proxySendResult,
+  agentStarted,
   historySnapshot,
   historyChunk,
   agentControlResult,
   agentConfig,
+  permissionPrompt,
+  questionPrompt,
+  questionPromptState,
   sessionErrorPrompt,
   sessionErrorPromptCleared,
   rateLimitActive,

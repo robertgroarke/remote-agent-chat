@@ -6,29 +6,39 @@ import {
 import AsyncStorage from '@react-native-async-storage/async-storage';
 import Constants     from 'expo-constants';
 import { getStoredJwt, RELAY_URL, signOut } from '../lib/auth';
+import { PREF_ATTENTION_HAPTIC, setAttentionHapticPreference } from '../lib/attention-feedback';
+import { setAuthoritativeSemanticNotificationPreferences } from '../lib/semantic-notifications';
 
 // ── Preference keys ───────────────────────────────────────────────────────────
 
 const PREF_NOTIFY_PERMISSION  = 'pref_notify_permission_required';
-const PREF_NOTIFY_AGENT_IDLE  = 'pref_notify_agent_idle';
+const PREF_NOTIFY_TURN_READY  = 'pref_notify_turn_ready';
+const PREF_NOTIFY_GOAL_DONE   = 'pref_notify_goal_completed';
+const PREF_NOTIFY_GOAL_ALERT  = 'pref_notify_goal_attention';
 const PREF_NOTIFY_AGENT_ERROR = 'pref_notify_agent_error';
 const PREF_NOTIFY_OFFLINE     = 'pref_notify_session_offline';
 const PREF_NOTIFY_RATE_LIMIT  = 'pref_notify_rate_limit';
 
 const DEFAULTS = {
   [PREF_NOTIFY_PERMISSION]: true,
-  [PREF_NOTIFY_AGENT_IDLE]: true,
+  [PREF_NOTIFY_TURN_READY]: false,
+  [PREF_NOTIFY_GOAL_DONE]: false,
+  [PREF_NOTIFY_GOAL_ALERT]: true,
   [PREF_NOTIFY_AGENT_ERROR]: true,
   [PREF_NOTIFY_OFFLINE]: true,
   [PREF_NOTIFY_RATE_LIMIT]: true,
+  [PREF_ATTENTION_HAPTIC]: false,
 };
 
 const RELAY_KEYS = {
   [PREF_NOTIFY_PERMISSION]: 'permission_required',
-  [PREF_NOTIFY_AGENT_IDLE]: 'agent_ready',
+  [PREF_NOTIFY_TURN_READY]: 'turn_ready',
+  [PREF_NOTIFY_GOAL_DONE]: 'goal_completed',
+  [PREF_NOTIFY_GOAL_ALERT]: 'goal_attention',
   [PREF_NOTIFY_AGENT_ERROR]: 'agent_error',
   [PREF_NOTIFY_OFFLINE]: 'session_offline',
   [PREF_NOTIFY_RATE_LIMIT]: 'rate_limit_cleared',
+  [PREF_ATTENTION_HAPTIC]: 'completion_haptic',
 };
 
 export async function getNotificationPrefs() {
@@ -48,10 +58,13 @@ async function fetchRelayPreferences() {
   if (!response.ok) throw new Error(body.error || 'Unable to load notification settings.');
   return {
     [PREF_NOTIFY_PERMISSION]: body.preferences?.permission_required !== false,
-    [PREF_NOTIFY_AGENT_IDLE]: body.preferences?.agent_ready !== false,
+    [PREF_NOTIFY_TURN_READY]: false,
+    [PREF_NOTIFY_GOAL_DONE]: body.preferences?.goal_completed === true,
+    [PREF_NOTIFY_GOAL_ALERT]: body.preferences?.goal_attention !== false,
     [PREF_NOTIFY_AGENT_ERROR]: body.preferences?.agent_error !== false,
     [PREF_NOTIFY_OFFLINE]: body.preferences?.session_offline !== false,
     [PREF_NOTIFY_RATE_LIMIT]: body.preferences?.rate_limit_cleared !== false,
+    [PREF_ATTENTION_HAPTIC]: body.preferences?.completion_haptic === true,
   };
 }
 
@@ -87,9 +100,16 @@ export default function SettingsScreen({ navigation }) {
     setError('');
     const cached = await getNotificationPrefs();
     setPrefs(cached);
+    setAttentionHapticPreference(cached[PREF_ATTENTION_HAPTIC]);
     try {
       const remote = await fetchRelayPreferences();
+      setAuthoritativeSemanticNotificationPreferences({
+        goal_completed: remote[PREF_NOTIFY_GOAL_DONE],
+        goal_attention: remote[PREF_NOTIFY_GOAL_ALERT],
+        turn_ready: false,
+      });
       setPrefs(remote);
+      setAttentionHapticPreference(remote[PREF_ATTENTION_HAPTIC]);
       await AsyncStorage.multiSet(
         Object.entries(remote).map(([key, value]) => [key, JSON.stringify(value)])
       );
@@ -110,8 +130,10 @@ export default function SettingsScreen({ navigation }) {
     setSaving(key);
     setError('');
     try {
-      await saveRelayPreferences(next);
+      const saved = await saveRelayPreferences(next);
+      setAuthoritativeSemanticNotificationPreferences(saved);
       await AsyncStorage.setItem(key, JSON.stringify(next[key]));
+      if (key === PREF_ATTENTION_HAPTIC) setAttentionHapticPreference(next[key]);
     } catch (e) {
       setPrefs(previous);
       setError(e.message || 'Unable to save notification settings.');
@@ -149,12 +171,29 @@ export default function SettingsScreen({ navigation }) {
         />
         <View style={s.divider} />
         <SettingRow
-          label="Agent ready"
-          description="When an agent finishes and is waiting for input"
-          value={prefs[PREF_NOTIFY_AGENT_IDLE]}
-          onToggle={() => toggle(PREF_NOTIFY_AGENT_IDLE)}
+          label="Turn finished"
+          description="Unavailable until this harness supplies an authoritative native turn boundary"
+          value={false}
+          onToggle={() => toggle(PREF_NOTIFY_TURN_READY)}
+          disabled
+        />
+        <View style={s.divider} />
+        <SettingRow
+          label="Goal completed"
+          description="Only when the native goal reaches completed state"
+          value={prefs[PREF_NOTIFY_GOAL_DONE]}
+          onToggle={() => toggle(PREF_NOTIFY_GOAL_DONE)}
           disabled={loading || !!saving}
         />
+        <View style={s.divider} />
+        <SettingRow
+          label="Goal needs attention"
+          description="Paused, blocked, limited, cancelled, or failed goals"
+          value={prefs[PREF_NOTIFY_GOAL_ALERT]}
+          onToggle={() => toggle(PREF_NOTIFY_GOAL_ALERT)}
+          disabled={loading || !!saving}
+        />
+        <Text style={s.inlineNote}>Active /goal loop checkpoints stay quiet between turns.</Text>
         <View style={s.divider} />
         <SettingRow
           label="Agent error or rate limit"
@@ -177,6 +216,14 @@ export default function SettingsScreen({ navigation }) {
           description="When a model's rate limit expires"
           value={prefs[PREF_NOTIFY_RATE_LIMIT]}
           onToggle={() => toggle(PREF_NOTIFY_RATE_LIMIT)}
+          disabled={loading || !!saving}
+        />
+        <View style={s.divider} />
+        <SettingRow
+          label="Notification haptic"
+          description="Subtle vibration for allowed prompts and explicit goal lifecycle events"
+          value={prefs[PREF_ATTENTION_HAPTIC]}
+          onToggle={() => toggle(PREF_ATTENTION_HAPTIC)}
           disabled={loading || !!saving}
         />
       </View>
@@ -277,6 +324,13 @@ const s = StyleSheet.create({
   dangerText: {
     color:    '#f85149',
     fontSize: 15,
+  },
+  inlineNote: {
+    color: '#768390',
+    fontSize: 11,
+    lineHeight: 16,
+    paddingHorizontal: 16,
+    paddingVertical: 10,
   },
   syncError: {
     flexDirection: 'row',

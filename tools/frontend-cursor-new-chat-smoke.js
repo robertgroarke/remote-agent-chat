@@ -39,8 +39,8 @@ const handleSwitchThread = handleSwitchThreadStart >= 0 && handleSwitchThreadEnd
   : '';
 if (!handleSwitchThread.includes('switchThread(sessionId, threadId)')) throw new Error('handleSwitchThread no longer sends the control');
 if (handleSwitchThread.includes('requestHistory(')) throw new Error('handleSwitchThread must trust the proxy switch snapshot');
-if (!app.includes('hasNativeDraftThread') || !app.includes('|| hasNativeDraftThread) return undefined')) {
-  throw new Error('desktop empty-history polling must pause for a native draft thread');
+if (app.includes('setInterval(() => requestHistory(activeSession, tailOptions), 3000)')) {
+  throw new Error('removed desktop background history polling was reintroduced');
 }
 if (!app.includes('const activeTranscriptRenderKey = React.useMemo') || !app.includes('key={activeTranscriptRenderKey}')) {
   throw new Error('desktop thread switches must remount the transcript container');

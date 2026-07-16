@@ -28,6 +28,12 @@ export class RelayClient {
     this._heartbeatTimeoutMs = DEFAULT_HEARTBEAT_TIMEOUT_MS;
     this._heartbeatSequence = 0;
     this._heartbeatPending = new Map();
+    this._sessionSubscriptions = [];
+    this._subscriptionSequence = 0;
+    this._hostResourceDesired = { active: false, aggregateOnly: false };
+    this._hostResourceSubscriptionId = '';
+    this._hostResourceSubscribeRequestId = '';
+    this._hostResourceSequence = 0;
     this.stopped        = false;
   }
 
@@ -52,6 +58,18 @@ export class RelayClient {
       this.onMessage({ type: '_connection_health', state: 'connecting', rttMs: null, lastAckAt: null });
       // Ask for current session list and history on connect
       this._send({ type: 'connection_hello', last_sequence: 0 });
+      this._send({
+        type: 'subscribe',
+        protocol_version: 1,
+        request_id: `android-sub-${Date.now()}-${++this._subscriptionSequence}`,
+        sessions: this._sessionSubscriptions,
+      });
+      if (this._hostResourceDesired.active) {
+        this._sendHostResourceSubscribe(
+          this._hostResourceDesired.aggregateOnly,
+          this._hostResourceSubscriptionId,
+        );
+      }
     };
 
     this.ws.onmessage = (e) => {
@@ -66,6 +84,11 @@ export class RelayClient {
           this._startHeartbeat();
         } else if (msg.type === 'heartbeat_ack') {
           this._handleHeartbeatAck(msg);
+        } else if (msg.type === 'host_resource_subscription_ack'
+          && msg.request_id === this._hostResourceSubscribeRequestId
+          && typeof msg.subscription_id === 'string') {
+          this._hostResourceSubscriptionId = msg.subscription_id;
+          this._hostResourceSubscribeRequestId = '';
         }
         // Emit initial activity from session_list metadata so badges appear
         // immediately on connect (before the first 'status' event arrives)
@@ -104,12 +127,29 @@ export class RelayClient {
 
   // ── Send helpers ───────────────────────────────────────────────────────────
 
-  sendMessage(sessionId, content, clientMsgId) {
+  setSessionSubscriptions(sessionIds) {
+    const normalized = [...new Set((Array.isArray(sessionIds) ? sessionIds : [])
+      .filter(id => typeof id === 'string' && id.length > 0))]
+      .sort()
+      .slice(0, 128);
+    if (normalized.length === this._sessionSubscriptions.length
+      && normalized.every((id, index) => id === this._sessionSubscriptions[index])) return;
+    this._sessionSubscriptions = normalized;
+    this._send({
+      type: 'subscribe',
+      protocol_version: 1,
+      request_id: `android-sub-${Date.now()}-${++this._subscriptionSequence}`,
+      sessions: normalized,
+    });
+  }
+
+  sendMessage(sessionId, content, clientMsgId, createdAt = null) {
     this._send({
       type:              'send',
       session:           sessionId,
       content,
       client_message_id: clientMsgId || `${Date.now()}-${Math.random().toString(36).slice(2)}`,
+      ...(createdAt ? { created_at: createdAt } : {}),
     });
   }
 
@@ -134,7 +174,7 @@ export class RelayClient {
 
   requestHistoryChunk(sessionId, options = {}) {
     const requestId = `histchunk-${Date.now()}-${Math.random().toString(36).slice(2, 7)}`;
-    const mode = options.mode === 'older' ? 'older' : 'tail';
+    const mode = options.mode === 'older' ? 'older' : options.mode === 'around' ? 'around' : 'tail';
     const message = {
       type: 'history_chunk_request',
       session: sessionId,
@@ -142,10 +182,11 @@ export class RelayClient {
       request_id: requestId,
       mode,
       source: 'relay_sqlite',
-      replace: false,
+      replace: mode === 'around' || (mode === 'tail' && options.replace === true),
       limit: Math.max(1, Math.min(500, Number(options.limit) || 200)),
     };
     if (mode === 'older' && options.beforeId != null) message.before_id = options.beforeId;
+    if (mode === 'around' && options.aroundId != null) message.around_id = options.aroundId;
     this._send(message);
     return requestId;
   }
@@ -179,9 +220,16 @@ export class RelayClient {
     this._send({ type: 'agent_interrupt', session_id: sessionId });
   }
 
-  respondToPermission(sessionId, promptId, choiceId) {
+  respondToPermission(sessionId, promptId, choiceId, details = {}) {
     const requestId = `prompt-${Date.now()}-${Math.random().toString(36).slice(2, 7)}`;
-    this._send({ type: 'permission_response', session_id: sessionId, prompt_id: promptId, choice_id: choiceId, request_id: requestId });
+    this._send({
+      type: 'permission_response', session_id: sessionId, prompt_id: promptId,
+      ...(choiceId ? { choice_id: choiceId } : {}),
+      ...(Array.isArray(details.answers) ? { answers: details.answers } : {}),
+      ...(typeof details.instruction === 'string' && details.instruction.trim()
+        ? { instruction: details.instruction.trim() } : {}),
+      request_id: requestId,
+    });
     return requestId;
   }
 
@@ -293,6 +341,12 @@ export class RelayClient {
   openPanel(sessionId) {
     const requestId = `panel-${Date.now()}-${Math.random().toString(36).slice(2, 7)}`;
     this._send({ type: 'open_panel', session_id: sessionId, request_id: requestId });
+    return requestId;
+  }
+
+  setAgentEffort(sessionId, effort) {
+    const requestId = `effort-${Date.now()}-${Math.random().toString(36).slice(2, 7)}`;
+    this._send({ type: 'agent_set_effort', session_id: sessionId, effort, request_id: requestId });
     return requestId;
   }
 
@@ -413,6 +467,102 @@ export class RelayClient {
   }
 
   // ── Lifecycle ──────────────────────────────────────────────────────────────
+
+  requestProviderUsageRefresh(force = false) {
+    const requestId = `provider-usage-${Date.now()}-${Math.random().toString(36).slice(2, 7)}`;
+    this._send({
+      type: 'provider_usage_refresh',
+      protocol_version: 1,
+      force: force === true,
+      request_id: requestId,
+    });
+    return requestId;
+  }
+
+  requestProviderUsageCostDetail(options = {}) {
+    const requestId = `provider-cost-${Date.now()}-${Math.random().toString(36).slice(2, 7)}`;
+    this._send({
+      type: 'provider_usage_cost_detail_request',
+      protocol_version: 1,
+      request_id: requestId,
+      days: Math.max(1, Math.min(365, Number(options.days) || 365)),
+      provider_id: options.providerId || null,
+      project: options.project || null,
+      cursor: /^\d+$/.test(String(options.cursor ?? '0')) ? String(options.cursor ?? '0') : '0',
+      page_size: Math.max(1, Math.min(256, Number(options.pageSize) || 256)),
+    });
+    return requestId;
+  }
+
+  requestHostResourceRefresh(force = false) {
+    const requestId = `host-resource-${Date.now()}-${Math.random().toString(36).slice(2, 7)}`;
+    this._send({
+      type: 'host_resource_refresh',
+      protocol_version: 1,
+      force: force === true,
+      request_id: requestId,
+    });
+    return requestId;
+  }
+
+  _sendHostResourceSubscribe(aggregateOnly, resumeSubscriptionId = '') {
+    const requestId = `host-resource-subscribe-${Date.now()}-${++this._hostResourceSequence}`;
+    this._hostResourceSubscribeRequestId = requestId;
+    this._send({
+      type: 'host_resource_subscribe',
+      protocol_version: 1,
+      request_id: requestId,
+      ...(resumeSubscriptionId ? { resume_subscription_id: resumeSubscriptionId } : {}),
+      aggregate_only: aggregateOnly === true,
+    });
+    return requestId;
+  }
+
+  subscribeHostResources(aggregateOnly = false) {
+    const normalizedAggregateOnly = aggregateOnly === true;
+    if (this._hostResourceDesired.active
+      && this._hostResourceDesired.aggregateOnly === normalizedAggregateOnly
+      && this._hostResourceSubscriptionId) return this._hostResourceSubscriptionId;
+    if (this._hostResourceSubscriptionId
+      && this._hostResourceDesired.aggregateOnly !== normalizedAggregateOnly) {
+      this._send({
+        type: 'host_resource_unsubscribe', protocol_version: 1,
+        request_id: `host-resource-unsubscribe-${Date.now()}-${++this._hostResourceSequence}`,
+        subscription_id: this._hostResourceSubscriptionId,
+      });
+      this._hostResourceSubscriptionId = '';
+    }
+    this._hostResourceDesired = { active: true, aggregateOnly: normalizedAggregateOnly };
+    return this._sendHostResourceSubscribe(normalizedAggregateOnly, '');
+  }
+
+  requestHostResourceHistory(stream, afterSequence = 0) {
+    if (!this._hostResourceSubscriptionId) return null;
+    const normalizedStream = stream === 'detail' ? 'detail' : 'system';
+    const requestId = `host-resource-history-${normalizedStream}-${Date.now()}-${++this._hostResourceSequence}`;
+    this._send({
+      type: 'host_resource_history_request', protocol_version: 1,
+      request_id: requestId, subscription_id: this._hostResourceSubscriptionId,
+      stream: normalizedStream,
+      after_sequence: Math.max(0, Math.round(Number(afterSequence) || 0)),
+      max_points: normalizedStream === 'detail' ? 8 : 64,
+    });
+    return requestId;
+  }
+
+  unsubscribeHostResources() {
+    this._hostResourceDesired = { active: false, aggregateOnly: false };
+    const subscriptionId = this._hostResourceSubscriptionId;
+    this._hostResourceSubscriptionId = '';
+    this._hostResourceSubscribeRequestId = '';
+    if (!subscriptionId) return null;
+    const requestId = `host-resource-unsubscribe-${Date.now()}-${++this._hostResourceSequence}`;
+    this._send({
+      type: 'host_resource_unsubscribe', protocol_version: 1,
+      request_id: requestId, subscription_id: subscriptionId,
+    });
+    return requestId;
+  }
 
   disconnect() {
     this.stopped = true;

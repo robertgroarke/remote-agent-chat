@@ -12,7 +12,7 @@ const { WebSocketServer } = require('../relay-server/node_modules/ws');
 const root = path.resolve(__dirname, '..');
 const publicRoot = path.join(root, 'frontend');
 const cdpUrl = process.env.RAC_VERIFICATION_BROWSER_CDP || 'http://127.0.0.1:9240';
-const fixtureSessionId = 'connection-health-fixture';
+const fixtureSessionId = 'connection-health-live-check';
 const outputIndex = process.argv.indexOf('--output');
 const outputPath = outputIndex >= 0 && process.argv[outputIndex + 1]
   ? path.resolve(process.argv[outputIndex + 1])
@@ -84,8 +84,8 @@ async function main() {
     send({
       type: 'connection_ack', heartbeat_interval_ms: 1000, heartbeat_timeout_ms: 5000,
       sessions: [{
-        session_id: fixtureSessionId, title: 'Connection health fixture',
-        display_name: 'Connection health fixture', agent_type: 'continue', status: 'healthy',
+        session_id: fixtureSessionId, title: 'Connection health live check',
+        display_name: 'Connection health live check', agent_type: 'continue', status: 'healthy',
         workspace_path: root, project_root: root,
       }],
       workspaces: [],
@@ -136,7 +136,7 @@ async function main() {
     [page] = pages;
     originalUrl = page.url();
     await page.goto(`http://127.0.0.1:${port}/`, { waitUntil: 'domcontentloaded', timeout: 15000 });
-    await page.getByText('Connection health fixture', { exact: true }).first().click({ timeout: 5000 });
+    await page.locator(`.session-card[data-session-id="${fixtureSessionId}"]`).click({ timeout: 5000 });
     await page.getByText(/Relay healthy · \d+ ms/).waitFor({ state: 'visible', timeout: 5000 });
     const initialHealth = await page.getByText(/Relay healthy · \d+ ms/).innerText();
 

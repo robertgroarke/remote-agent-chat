@@ -81,6 +81,8 @@ for (const type of CANONICAL_BLOCK_TYPES) {
 assert.match(bubbleSource, /normalizeMessageBlocks\(message\)/);
 assert.match(bubbleSource, /case 'tool_call'[\s\S]*?defaultOpen/);
 assert.match(bubbleSource, /case 'terminal'[\s\S]*?defaultOpen/);
+assert.match(bubbleSource, /case 'terminal'[\s\S]*?nativeClaudeTerminal[\s\S]*?<ClaudeTerminalBlock/);
+assert.match(bubbleSource, /function ClaudeTerminalBlock\(/);
 assert.match(bubbleSource, /case 'tool_use'[\s\S]*?defaultOpen/);
 assert.match(bubbleSource, /case 'tool_result'[\s\S]*?defaultOpen/);
 const legacyTextCase = bubbleSource.match(/case 'text':[\s\S]*?case 'markdown':/)?.[0] || '';
@@ -105,6 +107,7 @@ for (const agentType of [
   assert(bubbleSource.includes(quoted), 'Android transcript theme map is missing ' + agentType);
 }
 assert.match(bubbleSource, /monospaceBody:\s*true/);
+assert.match(bubbleSource, /nativeClaudeTerminal:\s*normalizedAgent === 'claude'/);
 
 const toolSource = fs.readFileSync(path.join(__dirname, '..', 'android-app', 'components', 'ToolSection.jsx'), 'utf8');
 assert.match(toolSource, /defaultOpen = true/);

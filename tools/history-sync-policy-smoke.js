@@ -29,6 +29,18 @@ changedPrefix[history.length - 10].content = 'mutated-old-row';
 assert.equal(buildAppendOnlyHistoryPlan(history.length, tail, changedPrefix), null);
 assert.equal(buildAppendOnlyHistoryPlan(history.length, tail, history.slice(0, -1)), null);
 assert(historyRowsMatch(tail, history.slice(-50)));
+assert.strictEqual(historyRowsMatch(
+  [{ role: 'assistant', content: 'same', source_message_id: 'source:1' }],
+  [{ role: 'assistant', content: 'same', source_message_id: 'source:2' }],
+), false, 'stable source identity must distinguish identical semantic content rows');
+assert.strictEqual(historyRowsMatch(
+  [{ role: 'assistant', content: 'same', source_message_id: 'source:1', ts: 1783962002 }],
+  [{ role: 'assistant', content: 'same', source_message_id: 'source:1', ts: 1783962002.375 }],
+), false, 'fractional producer timestamp changes must trigger metadata reconciliation');
+assert.strictEqual(historyRowsMatch(
+  [{ role: 'assistant', content: 'same', source_message_id: 'source:1', ts: 1783962002.375, source: 'codex_cli_jsonl' }],
+  [{ role: 'assistant', content: 'same', source_message_id: 'source:1', ts: 1783962002.375, source: 'codex_cli_jsonl' }],
+), true, 'identical source identity, timestamp, and producer must remain idempotent');
 
 const changedTail = history.map(row => ({ ...row }));
 changedTail[changedTail.length - 1].content = 'updated-live-tail';

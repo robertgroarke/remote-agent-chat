@@ -1,0 +1,358 @@
+#!/usr/bin/env node
+'use strict';
+
+const fs = require('fs');
+const path = require('path');
+const {
+  appVersionEventWatchRoots,
+  collectAppVersions,
+} = require('./app-version-inventory');
+const {
+  appendLedger,
+  discoverValidators,
+  publishEntry,
+  resolveRelay,
+  runValidator,
+  VALIDATOR_RUNTIME_BUDGET_MS,
+} = require('./nightly-validation-ledger');
+const {
+  appendDriftTriage,
+  detectVersionChanges,
+  loadSentinelState,
+  saveSentinelState,
+  validatorForHarness,
+} = require('./app-update-drift');
+
+const root = path.resolve(__dirname, '..');
+const DEFAULT_STATE = path.join(root, 'data', 'app-update-drift-state.json');
+const DEFAULT_LEDGER = path.join(root, 'data', 'app-update-drift-ledger.jsonl');
+const DEFAULT_LOCK = path.join(root, 'data', 'app-update-drift-sentinel.lock');
+const DEFAULT_BACKLOG = path.join(root, 'HARNESS_MATURITY_PHASE2_BACKLOG.md');
+const DEFAULT_UNAVAILABLE_GRACE_MS = 90_000;
+
+function parseArgs(argv) {
+  const options = {
+    once: false,
+    publish: true,
+    pollMs: 60_000,
+    debounceMs: 2_000,
+    unavailableGraceMs: DEFAULT_UNAVAILABLE_GRACE_MS,
+    timeoutMs: VALIDATOR_RUNTIME_BUDGET_MS,
+    state: DEFAULT_STATE,
+    ledger: DEFAULT_LEDGER,
+    lock: DEFAULT_LOCK,
+    backlog: DEFAULT_BACKLOG,
+    versionsJson: null,
+    revalidate: null,
+  };
+  for (let index = 0; index < argv.length; index += 1) {
+    const arg = argv[index];
+    if (arg === '--once') options.once = true;
+    else if (arg === '--no-publish') options.publish = false;
+    else if (arg === '--poll-ms' && argv[index + 1]) options.pollMs = Math.max(5_000, Number(argv[++index]) || options.pollMs);
+    else if (arg === '--debounce-ms' && argv[index + 1]) options.debounceMs = Math.max(100, Number(argv[++index]) || options.debounceMs);
+    else if (arg === '--unavailable-grace-ms' && argv[index + 1]) options.unavailableGraceMs = Math.max(1_000, Number(argv[++index]) || options.unavailableGraceMs);
+    else if (arg === '--timeout-ms' && argv[index + 1]) options.timeoutMs = Math.min(VALIDATOR_RUNTIME_BUDGET_MS, Math.max(1_000, Number(argv[++index]) || options.timeoutMs));
+    else if (arg === '--state' && argv[index + 1]) options.state = path.resolve(argv[++index]);
+    else if (arg === '--ledger' && argv[index + 1]) options.ledger = path.resolve(argv[++index]);
+    else if (arg === '--lock' && argv[index + 1]) options.lock = path.resolve(argv[++index]);
+    else if (arg === '--backlog' && argv[index + 1]) options.backlog = path.resolve(argv[++index]);
+    else if (arg === '--versions-json' && argv[index + 1]) options.versionsJson = path.resolve(argv[++index]);
+    else if (arg === '--revalidate' && argv[index + 1]) {
+      options.revalidate = String(argv[++index]).trim();
+      options.once = true;
+    }
+    else throw new Error(`Unknown or incomplete argument: ${arg}`);
+  }
+  return options;
+}
+
+function acquireLock(lockPath) {
+  fs.mkdirSync(path.dirname(lockPath), { recursive: true });
+  let handle;
+  try {
+    handle = fs.openSync(lockPath, 'wx');
+  } catch (error) {
+    if (error.code !== 'EEXIST') throw error;
+    const stalePid = Number.parseInt(fs.readFileSync(lockPath, 'utf8').split(/\r?\n/, 1)[0], 10);
+    let stale = !Number.isInteger(stalePid) || stalePid <= 0;
+    if (!stale) {
+      try { process.kill(stalePid, 0); } catch (probeError) { stale = probeError.code === 'ESRCH'; }
+    }
+    if (!stale) throw new Error(`App-update drift sentinel is already running as PID ${stalePid}`);
+    fs.unlinkSync(lockPath);
+    handle = fs.openSync(lockPath, 'wx');
+  }
+  fs.writeFileSync(handle, `${process.pid}\n${new Date().toISOString()}\n`, 'utf8');
+  return () => {
+    try { fs.closeSync(handle); } catch {}
+    try { fs.unlinkSync(lockPath); } catch {}
+  };
+}
+
+function collectVersions(options) {
+  if (!options.versionsJson) return collectAppVersions();
+  return JSON.parse(fs.readFileSync(options.versionsJson, 'utf8'));
+}
+
+function revalidationPreviousVersion(options, priorState, harness, appVersion) {
+  if (fs.existsSync(options.ledger)) {
+    const ledgerEntries = fs.readFileSync(options.ledger, 'utf8').trim().split(/\r?\n/).reverse();
+    for (const line of ledgerEntries) {
+      if (!line) continue;
+      try {
+        const entry = JSON.parse(line);
+        if (entry?.harness === harness
+          && String(entry?.app_version) === appVersion
+          && entry?.previous_app_version != null
+          && String(entry.previous_app_version) !== appVersion) {
+          return String(entry.previous_app_version);
+        }
+      } catch {}
+    }
+  }
+  const priorChange = [...(priorState.last_changes || [])].reverse()
+    .find(change => change?.harness === harness
+      && change?.previous_app_version != null
+      && String(change.previous_app_version) !== appVersion);
+  return String(priorChange?.previous_app_version
+    || priorState.versions?.[harness]
+    || appVersion);
+}
+
+function missingValidatorEntry(change, runId) {
+  return {
+    schema_version: 1,
+    kind: 'app_update_validation',
+    run_id: runId,
+    harness: change.harness,
+    status: 'fail',
+    previous_app_version: change.previous_version,
+    app_version: change.app_version,
+    validator: 'unavailable',
+    read_only: true,
+    runtime_budget_ms: 0,
+    budget_exhausted: false,
+    duration_ms: 0,
+    exit_code: null,
+    completed_at: new Date().toISOString(),
+    detail: `No validate-all entry point exists for ${change.harness}.`,
+  };
+}
+
+function settleUnavailableChanges(changes, priorState, graceMs, nowMs = Date.now()) {
+  const ready = [];
+  const deferred = [];
+  const pendingUnavailable = {};
+  const previousPending = priorState?.pending_unavailable || {};
+  for (const change of changes) {
+    if (change.app_version !== 'unavailable' || change.previous_version === 'unavailable') {
+      ready.push(change);
+      continue;
+    }
+    const existing = previousPending[change.harness];
+    const existingMatches = existing
+      && String(existing.previous_version) === change.previous_version
+      && Number.isFinite(Date.parse(existing.first_seen_at));
+    const firstSeenAt = existingMatches
+      ? existing.first_seen_at
+      : new Date(nowMs).toISOString();
+    const ageMs = Math.max(0, nowMs - Date.parse(firstSeenAt));
+    const pending = {
+      previous_version: change.previous_version,
+      candidate_version: change.app_version,
+      first_seen_at: firstSeenAt,
+      last_seen_at: new Date(nowMs).toISOString(),
+      observations: existingMatches ? Number(existing.observations || 0) + 1 : 1,
+      grace_ms: graceMs,
+    };
+    if (ageMs < graceMs) {
+      pendingUnavailable[change.harness] = pending;
+      deferred.push({ ...change, ...pending, age_ms: ageMs });
+    } else {
+      ready.push(change);
+    }
+  }
+  return { changes: ready, deferred, pendingUnavailable };
+}
+
+async function scanForUpdates(options, dependencies = {}) {
+  const collect = dependencies.collectVersions || (() => collectVersions(options));
+  const validators = dependencies.validators || discoverValidators();
+  const executeValidator = dependencies.runValidator || runValidator;
+  const appendLedgerEntry = dependencies.appendLedger || appendLedger;
+  const publishValidation = dependencies.publishEntry || publishEntry;
+  const appendTriage = dependencies.appendDriftTriage || appendDriftTriage;
+  const currentVersions = collect();
+  const priorState = loadSentinelState(options.state);
+  if (!priorState && !options.revalidate) {
+    saveSentinelState(options.state, {
+      versions: currentVersions,
+      observed_at: new Date().toISOString(),
+      last_changes: [],
+    });
+    return { baseline: true, changes: [], failures: 0 };
+  }
+  if (!priorState) throw new Error('Targeted revalidation requires an existing sentinel state');
+  let changes = detectVersionChanges(priorState.versions, currentVersions);
+  let deferred = [];
+  let pendingUnavailable = {};
+  if (options.revalidate) {
+    if (!Object.prototype.hasOwnProperty.call(currentVersions, options.revalidate)) {
+      throw new Error(`Unknown revalidation harness: ${options.revalidate}`);
+    }
+    const appVersion = String(currentVersions[options.revalidate]);
+    changes = [{
+      harness: options.revalidate,
+      previous_version: revalidationPreviousVersion(
+        options, priorState, options.revalidate, appVersion),
+      app_version: appVersion,
+      revalidation: true,
+    }];
+  } else {
+    const settled = settleUnavailableChanges(
+      changes,
+      priorState,
+      options.unavailableGraceMs || DEFAULT_UNAVAILABLE_GRACE_MS,
+      dependencies.now ? dependencies.now() : Date.now(),
+    );
+    changes = settled.changes;
+    deferred = settled.deferred;
+    pendingUnavailable = settled.pendingUnavailable;
+  }
+  const relay = options.publish ? (dependencies.relay || resolveRelay(options)) : null;
+  const entries = [];
+  const publicationFailures = new Set();
+  let failures = 0;
+  for (const change of changes) {
+    const runId = `app-update-${change.harness}-${new Date().toISOString().replace(/[:.]/g, '-')}`;
+    const validator = validatorForHarness(validators, change.harness);
+    const result = validator
+      ? executeValidator(validator, change.app_version, options.timeoutMs, runId)
+      : missingValidatorEntry(change, runId);
+    const entry = {
+      ...result,
+      kind: 'app_update_validation',
+      previous_app_version: change.previous_version,
+      change_detected_at: new Date().toISOString(),
+      revalidation: change.revalidation === true,
+    };
+    if (options.publish) {
+      try {
+        await publishValidation(relay, entry);
+      } catch (error) {
+        entry.publication_error = String(error?.message || error).slice(0, 1000);
+        publicationFailures.add(change.harness);
+        failures += 1;
+      }
+    }
+    appendLedgerEntry(options.ledger, entry);
+    if (entry.status !== 'pass') {
+      failures += 1;
+      appendTriage(options.backlog, entry, path.relative(root, options.ledger));
+    }
+    entries.push(entry);
+  }
+  saveSentinelState(options.state, {
+    versions: Object.fromEntries(Object.entries(currentVersions).map(([harness, version]) => (
+      publicationFailures.has(harness) || pendingUnavailable[harness]
+        ? [harness, priorState.versions[harness]]
+        : [harness, version]
+    ))),
+    observed_at: new Date().toISOString(),
+    pending_unavailable: pendingUnavailable,
+    last_changes: entries.map(entry => ({
+      harness: entry.harness,
+      previous_app_version: entry.previous_app_version,
+      app_version: entry.app_version,
+      status: entry.status,
+      completed_at: entry.completed_at,
+      revalidation: entry.revalidation === true,
+    })),
+  });
+  return { baseline: false, changes: entries, deferred, failures };
+}
+
+async function main(argv = process.argv.slice(2)) {
+  const options = parseArgs(argv);
+  const releaseLock = acquireLock(options.lock);
+  let scanning = false;
+  let rescanRequested = false;
+  let debounceTimer = null;
+  const watchers = [];
+
+  const scan = async () => {
+    if (scanning) {
+      rescanRequested = true;
+      return null;
+    }
+    scanning = true;
+    try {
+      const result = await scanForUpdates(options);
+      for (const entry of result.changes) {
+        console.log(`${entry.status.toUpperCase()} ${entry.harness} ${entry.previous_app_version} -> ${entry.app_version} ${entry.duration_ms}ms`);
+      }
+      for (const entry of result.deferred || []) {
+        console.log(`DEFERRED ${entry.harness} ${entry.previous_version} -> unavailable ${entry.age_ms}/${entry.grace_ms}ms`);
+      }
+      return result;
+    } finally {
+      scanning = false;
+      if (rescanRequested) {
+        rescanRequested = false;
+        setImmediate(() => scan().catch(error => console.error(error.stack || error.message)));
+      }
+    }
+  };
+
+  try {
+    const initial = await scan();
+    if (options.once) {
+      process.exitCode = initial?.failures ? 1 : 0;
+      return;
+    }
+    const requestScan = () => {
+      clearTimeout(debounceTimer);
+      debounceTimer = setTimeout(() => scan().catch(error => console.error(error.stack || error.message)), options.debounceMs);
+    };
+    for (const watchRoot of appVersionEventWatchRoots()) {
+      try {
+        watchers.push(fs.watch(watchRoot, { recursive: false }, requestScan));
+      } catch (error) {
+        console.warn(`Unable to watch ${watchRoot}: ${error.message}`);
+      }
+    }
+    const pollTimer = setInterval(requestScan, options.pollMs);
+    console.log(`App-update drift sentinel watching ${watchers.length} roots; fallback poll ${options.pollMs} ms.`);
+    const shutdown = () => {
+      clearInterval(pollTimer);
+      clearTimeout(debounceTimer);
+      watchers.forEach(watcher => watcher.close());
+      releaseLock();
+      process.exit(0);
+    };
+    process.once('SIGINT', shutdown);
+    process.once('SIGTERM', shutdown);
+    await new Promise(() => {});
+  } finally {
+    releaseLock();
+  }
+}
+
+if (require.main === module) {
+  main().catch(error => {
+    console.error(error.stack || error.message);
+    process.exitCode = 1;
+  });
+}
+
+module.exports = {
+  acquireLock,
+  DEFAULT_UNAVAILABLE_GRACE_MS,
+  main,
+  missingValidatorEntry,
+  parseArgs,
+  revalidationPreviousVersion,
+  scanForUpdates,
+  settleUnavailableChanges,
+};

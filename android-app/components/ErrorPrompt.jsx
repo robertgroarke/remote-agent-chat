@@ -6,9 +6,11 @@ import {
 export default function ErrorPrompt({ prompt, blocking, onAction }) {
   if (!prompt) return null;
 
-  const actions = Array.isArray(prompt.actions) ? prompt.actions : [];
+  const block = (Array.isArray(prompt.content_blocks) ? prompt.content_blocks : [])
+    .find(item => item?.type === 'error' || item?.type === 'notice');
+  const actions = Array.isArray(prompt.actions) ? prompt.actions : (block?.actions || []);
   const submittingActionId = prompt.submitting_action_id || null;
-  const errorOutput = String(prompt.error_output || '').trim();
+  const errorOutput = String(prompt.error_output || block?.error_output || '').trim();
 
   return (
     <View
@@ -17,8 +19,8 @@ export default function ErrorPrompt({ prompt, blocking, onAction }) {
       accessibilityLiveRegion="assertive"
     >
       <Text style={s.eyebrow}>{blocking ? 'ACTION REQUIRED' : 'ATTENTION'}</Text>
-      <Text style={s.title}>{prompt.title || 'Error handling model response'}</Text>
-      <Text style={s.message}>{prompt.message || 'There was an error handling the model response.'}</Text>
+      <Text style={s.title}>{block?.label || prompt.title || 'Error handling model response'}</Text>
+      <Text style={s.message}>{block?.content || prompt.message || 'There was an error handling the model response.'}</Text>
 
       {!!errorOutput && (
         <ScrollView style={s.outputScroll} nestedScrollEnabled>

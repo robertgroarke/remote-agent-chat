@@ -45,15 +45,27 @@ assert(summary.messages.some(msg => msg.content_blocks?.some(block =>
   && block.collapsed === false
 )));
 assert(summary.messages.some(msg => msg.content_blocks?.some(block => block.type === 'file_changes' && block.files?.[0]?.path === 'agent-proxy/codex-cli.js')));
-assert(summary.messages.some(msg => msg.role === 'assistant' && msg.content.includes('Parser smoke complete.')));
+assert(summary.messages.some(msg => (
+  msg.role === 'assistant'
+  && msg.content.includes('Parser smoke complete.')
+  && msg.content_blocks?.some(block => block.type === 'markdown' && block.content === msg.content)
+)), 'event_msg agent_message answers must emit a canonical markdown block');
 assert(summary.activity, 'expected active Codex CLI activity');
 assert.strictEqual(summary.activity.kind, 'running_command');
 assert.strictEqual(summary.activity.label, 'Working');
 assert(summary.activity.started_at, 'expected activity start timestamp for timer rendering');
 assert(summary.activity.thinkingContent.includes('npm test -- --watch=false'));
+assert.strictEqual(summary.activity.current.kind, 'tool');
+assert.strictEqual(summary.activity.current.label, 'Running command');
+assert(summary.activity.current.partial.includes('npm test -- --watch=false'));
+assert.strictEqual(summary.activity.thinking.text, 'Preparing to run the active command.');
+assert(!summary.activity.thinking.text.includes('npm test -- --watch=false'), 'a running command must not be mislabeled as current reasoning');
 assert(summary.activity.task_list, 'expected update_plan task list on activity');
 assert.strictEqual(summary.activity.task_list.completed, 1);
 assert.strictEqual(summary.activity.task_list.tasks[1].state, 'in_progress');
+assert.strictEqual(summary.activity.step.current, 2);
+assert.strictEqual(summary.activity.step.total, 3);
+assert.strictEqual(summary.activity.step.state, 'in_progress');
 
 const liveLikeFixture = path.join(os.tmpdir(), `codex-cli-live-like-${Date.now()}.jsonl`);
 const now = Date.now();
@@ -66,6 +78,7 @@ fs.writeFileSync(liveLikeFixture, [
   ] } },
   { timestamp: iso(-299400), type: 'response_item', payload: { type: 'message', role: 'user', content: [{ type: 'input_text', text: '<codex_internal_context source="goal">\n<objective>Hidden objective transport</objective>\n</codex_internal_context>' }] } },
   { timestamp: iso(-299300), type: 'response_item', payload: { type: 'message', role: 'user', content: [{ type: 'input_text', text: '<goal_context>\n<objective>Legacy hidden objective transport</objective>\n</goal_context>' }] } },
+  { timestamp: iso(-299100), type: 'event_msg', payload: { type: 'turn_aborted', reason: 'interrupted', duration_ms: 15494 } },
   { timestamp: iso(-299000), type: 'turn_context', payload: { cwd: process.cwd(), model: 'gpt-5.5', effort: 'high', sandbox_policy: { type: 'danger-full-access' }, approval_policy: 'never' } },
   { timestamp: iso(-295000), type: 'event_msg', payload: { type: 'task_started' } },
   { timestamp: iso(-294500), type: 'event_msg', payload: { type: 'thread_name_updated', thread_name: 'Codex CLI fidelity smoke' } },
@@ -108,13 +121,17 @@ assert.strictEqual(liveLikeLightweight.title, 'Codex CLI fidelity smoke');
 assert.strictEqual(liveLikeLightweight.effort, 'high');
 assert.strictEqual(liveLikeLightweight.permission_mode, 'danger-full-access');
 assert.strictEqual(liveLikeLightweight.approval_policy, 'never');
-assert.strictEqual(liveLikeSummary.activity.kind, 'generating');
+assert.strictEqual(liveLikeSummary.activity.kind, 'thinking');
 assert.strictEqual(liveLikeSummary.activity.label, 'Working');
-assert.strictEqual(liveLikeSummary.activity.thinkingContent, 'Do live work');
+assert.strictEqual(liveLikeSummary.activity.thinkingContent, 'I am checking the live parser path.');
+assert.strictEqual(liveLikeSummary.activity.thinking.text, 'I am checking the live parser path.');
+assert(!liveLikeSummary.activity.current, 'a reasoning-only phase must not expose plan text as current output');
 assert.strictEqual(liveLikeSummary.activity.interrupt_hint, 'esc to interrupt');
 assert(liveLikeSummary.activity.started_at, 'expected active working start timestamp');
 assert(liveLikeSummary.activity.goal, 'expected active goal metadata');
 assert.strictEqual(liveLikeSummary.activity.goal.label, 'Pursuing goal');
+assert.strictEqual(liveLikeSummary.activity.goal.text, 'Keep proving live Codex CLI fidelity');
+assert.strictEqual(liveLikeSummary.activity.goal.state, 'active');
 assert.strictEqual(liveLikeSummary.activity.goal.time_used_seconds, 58);
 assert.strictEqual(liveLikeSummary.activity.goal.objective, 'Keep proving live Codex CLI fidelity');
 assert(liveLikeSummary.messages.some(msg => msg.content_blocks?.some(block =>
@@ -184,6 +201,12 @@ assert(liveLikeSummary.messages.some(msg => msg.content_blocks?.some(block =>
   && block.title === 'Thread rolled back'
   && block.content.includes('Rolled back 1 turn')
 )), 'expected thread rollback event to render explicitly');
+assert(liveLikeSummary.messages.some(msg => msg.content_blocks?.some(block =>
+  block.type === 'status'
+  && block.label === 'Interrupted'
+  && block.content === 'Interrupted'
+  && block.status === 'stopped'
+)), 'expected native interrupted turns to render as canonical stopped status blocks');
 assert(!liveLikeSummary.messages.some(msg =>
   msg.content === 'Reasoning'
   && msg.content_blocks?.some(block => block.type === 'thinking' && !String(block.content || '').trim())
@@ -199,6 +222,11 @@ fs.writeFileSync(canonicalIdFixture, [
   { timestamp: iso(-800), type: 'response_item', payload: { type: 'message', role: 'assistant', content: [{ type: 'output_text', text: 'Canonical id confirmed.' }] } },
 ].map(entry => JSON.stringify(entry)).join('\n') + '\n');
 assert.strictEqual(codexCli.readSessionSummary(canonicalIdFixture).cliSessionId, canonicalCliId);
+assert(codexCli.readSessionSummary(canonicalIdFixture).messages.some(msg => (
+  msg.role === 'assistant'
+  && msg.content === 'Canonical id confirmed.'
+  && msg.content_blocks?.some(block => block.type === 'markdown' && block.content === msg.content)
+)), 'response_item assistant answers must emit a canonical markdown block');
 assert.strictEqual(codexCli.readSessionSummary(canonicalIdFixture, { includeMessages: false }).cliSessionId, canonicalCliId);
 assert.strictEqual(codexCli.readSessionSummary(canonicalIdFixture, { maxHydrateBytes: 1 }).cliSessionId, canonicalCliId);
 assert.strictEqual(codexCli.parseCodexJsonlChunk(canonicalIdFixture, { chunkBytes: 256 * 1024 }).state.cliSessionId, canonicalCliId);
@@ -272,9 +300,40 @@ fs.writeFileSync(sameSecondFixture, [
 const sameSecondSummary = codexCli.readSessionSummary(sameSecondFixture);
 assert.strictEqual(sameSecondSummary.activity.kind, 'generating');
 assert.strictEqual(sameSecondSummary.activity.label, 'Working');
-assert.strictEqual(sameSecondSummary.activity.thinkingContent, 'Keep live timer anchored');
+assert(!sameSecondSummary.activity.thinkingContent, 'plan text must not masquerade as reasoning or current output');
+assert(!sameSecondSummary.activity.thinking);
+assert(!sameSecondSummary.activity.current);
+assert.strictEqual(sameSecondSummary.activity.task_list.tasks[0].text, 'Keep live timer anchored');
 assert.strictEqual(new Date(sameSecondSummary.activity.started_at).getTime(), new Date(sameSecondStartTs).getTime(), 'same-second task_started must win over prior task_complete timestamp');
 try { fs.unlinkSync(sameSecondFixture); } catch {}
+
+const completedWithoutAssistantFixture = path.join(os.tmpdir(), `codex-cli-complete-no-assistant-${Date.now()}.jsonl`);
+const completedWithoutAssistantBase = now - 120000;
+fs.writeFileSync(completedWithoutAssistantFixture, [
+  { timestamp: new Date(completedWithoutAssistantBase).toISOString(), type: 'session_meta', payload: { id: '00000000-0000-4000-8000-000000000104', cwd: process.cwd(), model: 'gpt-5.6-sol' } },
+  { timestamp: new Date(completedWithoutAssistantBase + 1000).toISOString(), type: 'event_msg', payload: { type: 'task_started', started_at: Math.floor((completedWithoutAssistantBase + 1000) / 1000) } },
+  { timestamp: new Date(completedWithoutAssistantBase + 1500).toISOString(), type: 'response_item', payload: { type: 'message', role: 'user', content: [{ type: 'input_text', text: 'A request that receives no assistant row' }] } },
+  { timestamp: new Date(completedWithoutAssistantBase + 2000).toISOString(), type: 'event_msg', payload: { type: 'token_count', info: { total_token_usage: {} }, rate_limits: { limit_id: 'premium', credits: { has_credits: false, balance: '0' } } } },
+  { timestamp: new Date(completedWithoutAssistantBase + 2500).toISOString(), type: 'event_msg', payload: { type: 'task_complete', completed_at: Math.floor((completedWithoutAssistantBase + 2500) / 1000), last_agent_message: null } },
+].map(entry => JSON.stringify(entry)).join('\n') + '\n');
+const completedWithoutAssistantSummary = codexCli.readSessionSummary(completedWithoutAssistantFixture);
+assert.strictEqual(completedWithoutAssistantSummary.activity, null, 'task_complete without an assistant row must clear generating activity');
+assert.strictEqual(completedWithoutAssistantSummary.messages.length, 1);
+assert.strictEqual(completedWithoutAssistantSummary.messages[0].role, 'user');
+try { fs.unlinkSync(completedWithoutAssistantFixture); } catch {}
+
+const usageFixture = path.join(os.tmpdir(), `codex-cli-usage-${Date.now()}.jsonl`);
+const usageReset = Math.floor((now + 3600000) / 1000);
+fs.writeFileSync(usageFixture, [
+  { timestamp: iso(-2000), type: 'session_meta', payload: { id: '00000000-0000-4000-8000-000000000105', cwd: process.cwd() } },
+  { timestamp: iso(-1000), type: 'event_msg', payload: { type: 'token_count', rate_limits: { primary: { used_percent: 100, resets_at: usageReset }, rate_limit_reached_type: 'primary' } } },
+].map(entry => JSON.stringify(entry)).join('\n') + '\n');
+const usageSummary = codexCli.readSessionSummary(usageFixture);
+assert.strictEqual(usageSummary.activity.kind, 'idle');
+assert.strictEqual(usageSummary.activity.usage.state, 'exhausted');
+assert.match(usageSummary.activity.usage.title, /out of Codex and Work usage/);
+assert.strictEqual(usageSummary.activity.usage.resets_at, new Date(usageReset * 1000).toISOString());
+try { fs.unlinkSync(usageFixture); } catch {}
 
 const partialFixture = path.join(os.tmpdir(), `codex-cli-partial-line-${Date.now()}.jsonl`);
 const partialMeta = { timestamp: iso(-1000), type: 'session_meta', payload: { id: '00000000-0000-4000-8000-000000000100', cwd: process.cwd() } };
@@ -298,18 +357,67 @@ assert(tailSummary.messagesHydrated, 'expected oversized transcript to hydrate f
 assert(!tailSummary.messages.some(msg => /too large to hydrate automatically/i.test(msg.content || '')));
 assert(tailSummary.messages.some(msg => msg.role === 'assistant' && msg.content.includes('Parser smoke complete.')));
 
+const largeGoalFixture = path.join(os.tmpdir(), `codex-cli-large-goal-${Date.now()}.jsonl`);
+const largeGoalEntries = [
+  { timestamp: iso(-5000), type: 'session_meta', payload: { id: '00000000-0000-4000-8000-000000000104', cwd: process.cwd(), model: 'gpt-5.5' } },
+  { timestamp: iso(-4900), type: 'event_msg', payload: { type: 'thread_goal_updated', goal: { objective: 'Recover the durable large-archive goal', status: 'active', timeUsedSeconds: 142200, createdAt: Math.floor((now - 142200000) / 1000), updatedAt: Math.floor((now - 5000) / 1000) } } },
+  { timestamp: iso(-4800), type: 'response_item', payload: { type: 'message', role: 'user', content: [{ type: 'input_text', text: `noise mentioning thread_goal_updated ${'x'.repeat(5 * 1024 * 1024)}` }] } },
+  { timestamp: iso(-1000), type: 'event_msg', payload: { type: 'task_started', started_at: Math.floor((now - 1000) / 1000) } },
+  { timestamp: iso(-500), type: 'event_msg', payload: { type: 'agent_reasoning', text: 'Reasoning remains separate from current output.' } },
+];
+fs.writeFileSync(largeGoalFixture, largeGoalEntries.map(entry => JSON.stringify(entry)).join('\n') + '\n');
+const largeGoalSummary = codexCli.readSessionSummary(largeGoalFixture, { maxHydrateBytes: 100 });
+assert.strictEqual(largeGoalSummary.messagesPartial, true);
+assert.strictEqual(largeGoalSummary.activity.goal.text, 'Recover the durable large-archive goal');
+assert.strictEqual(largeGoalSummary.activity.goal.time_used_seconds, 142200);
+assert.strictEqual(largeGoalSummary.activity.thinking.text, 'Reasoning remains separate from current output.');
+assert(!largeGoalSummary.activity.current);
+const appendedGoal = {
+  timestamp: iso(-300),
+  type: 'event_msg',
+  payload: {
+    type: 'thread_goal_updated',
+    goal: {
+      objective: 'Observe appended durable goal updates',
+      status: 'active',
+      timeUsedSeconds: 142500,
+      createdAt: Math.floor((now - 142500000) / 1000),
+      updatedAt: Math.floor((now - 300) / 1000),
+    },
+  },
+};
+const appendedGoalNoise = {
+  timestamp: iso(-200),
+  type: 'response_item',
+  payload: {
+    type: 'message',
+    role: 'user',
+    content: [{ type: 'input_text', text: `later tail noise ${'y'.repeat(5 * 1024 * 1024)}` }],
+  },
+};
+fs.appendFileSync(largeGoalFixture, `${JSON.stringify(appendedGoal)}\n${JSON.stringify(appendedGoalNoise)}\n`);
+const appendedGoalSummary = codexCli.readSessionSummary(largeGoalFixture, { maxHydrateBytes: 100 });
+assert.strictEqual(
+  appendedGoalSummary.activity.goal.text,
+  'Observe appended durable goal updates',
+  'large-archive goal recovery cache must inspect appended events',
+);
+assert.strictEqual(appendedGoalSummary.activity.goal.time_used_seconds, 142500);
+try { fs.unlinkSync(largeGoalFixture); } catch {}
+
 const chunkFixture = path.join(os.tmpdir(), `codex-cli-history-chunk-${Date.now()}.jsonl`);
 const chunkEntries = [
   { timestamp: iso(-800000), type: 'session_meta', payload: { id: '00000000-0000-4000-8000-000000000103', cwd: process.cwd(), model: 'gpt-5.5' } },
 ];
-for (let i = 0; i < 700; i++) {
+for (let i = 0; i < 240; i++) {
   chunkEntries.push({
     timestamp: iso(-700000 + i),
     type: 'response_item',
     payload: {
+      id: `chunk-message-${i}`,
       type: 'message',
       role: i % 2 === 0 ? 'user' : 'assistant',
-      content: [{ type: i % 2 === 0 ? 'input_text' : 'output_text', text: `Chunk message ${i} ${'x'.repeat(900)}` }],
+      content: [{ type: i % 2 === 0 ? 'input_text' : 'output_text', text: `Chunk message ${i} ${'x'.repeat(6000)}` }],
     },
   });
 }
@@ -317,7 +425,15 @@ fs.writeFileSync(chunkFixture, chunkEntries.map(entry => JSON.stringify(entry)).
 const tailChunk = codexCli.parseCodexJsonlChunk(chunkFixture, { chunkBytes: 256 * 1024 });
 assert(tailChunk, 'expected tail chunk');
 assert(tailChunk.nextBeforeOffset, 'expected tail chunk to expose an older cursor');
-assert(tailChunk.state.messages.some(msg => msg.content.includes('Chunk message 699')), 'tail chunk should contain the newest message');
+assert(tailChunk.state.messages.some(msg => msg.content.includes('Chunk message 239')), 'tail chunk should contain the newest message');
+const adaptiveTailChunk = codexCli.parseCodexJsonlChunk(chunkFixture, {
+  chunkBytes: 256 * 1024,
+  minimumMessages: 160,
+});
+assert(adaptiveTailChunk.state.messages.length >= 160, 'adaptive chunk should satisfy the requested semantic row count');
+assert(adaptiveTailChunk.bytesRead > 256 * 1024, 'adaptive chunk should expand beyond the undersized initial byte window');
+assert.strictEqual(adaptiveTailChunk.messageStartOffsets.length, adaptiveTailChunk.state.messages.length);
+assert(adaptiveTailChunk.state.messages.every(message => message.native_source_id), 'chunk rows should retain stable native source identity');
 const olderChunk = codexCli.parseCodexJsonlChunk(chunkFixture, {
   beforeOffset: tailChunk.nextBeforeOffset,
   chunkBytes: 256 * 1024,
@@ -325,7 +441,24 @@ const olderChunk = codexCli.parseCodexJsonlChunk(chunkFixture, {
 assert(olderChunk, 'expected older chunk');
 assert.strictEqual(olderChunk.endOffset, tailChunk.nextBeforeOffset, 'older chunk should end at the prior cursor');
 assert(olderChunk.state.messages.length > 0, 'older chunk should contain messages');
-assert(!olderChunk.state.messages.some(msg => msg.content.includes('Chunk message 699')), 'older chunk should not overlap the newest tail');
+assert(!olderChunk.state.messages.some(msg => msg.content.includes('Chunk message 239')), 'older chunk should not overlap the newest tail');
 try { fs.unlinkSync(chunkFixture); } catch {}
+
+const pairedMessageFixture = path.join(os.tmpdir(), `codex-cli-paired-message-${Date.now()}.jsonl`);
+fs.writeFileSync(pairedMessageFixture, [
+  { timestamp: iso(-4000), type: 'session_meta', payload: { id: '00000000-0000-4000-8000-000000000204', cwd: process.cwd(), model: 'gpt-5.5' } },
+  { timestamp: iso(-3000), type: 'response_item', payload: { id: 'assistant-answer-a', type: 'message', role: 'assistant', content: [{ type: 'output_text', text: 'An intentionally identical answer.' }] } },
+  { timestamp: iso(-2999), type: 'event_msg', payload: { type: 'agent_message', message: 'An intentionally identical answer.' } },
+  { timestamp: iso(-2000), type: 'response_item', payload: { id: 'assistant-answer-b', type: 'message', role: 'assistant', content: [{ type: 'output_text', text: 'An intentionally identical answer.' }] } },
+  { timestamp: iso(-1999), type: 'event_msg', payload: { type: 'agent_message', message: 'An intentionally identical answer.' } },
+].map(entry => JSON.stringify(entry)).join('\n') + '\n');
+const pairedSummary = codexCli.readSessionSummary(pairedMessageFixture);
+const pairedAnswers = pairedSummary.messages.filter(message => message.content === 'An intentionally identical answer.');
+assert.strictEqual(pairedAnswers.length, 2, 'paired Codex events must render once while distinct identical answers remain distinct');
+assert.deepStrictEqual(
+  pairedAnswers.map(message => message.native_source_id),
+  ['response_item.message:id:assistant-answer-a', 'response_item.message:id:assistant-answer-b'],
+);
+try { fs.unlinkSync(pairedMessageFixture); } catch {}
 
 console.log(`Codex CLI parser smoke passed (${summary.messages.length} messages, tail=${tailSummary.messages.length})`);

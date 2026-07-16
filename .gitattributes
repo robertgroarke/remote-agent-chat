@@ -1,3 +1,17 @@
 # Shell scripts must stay LF — Alpine ENTRYPOINT rejects CRLF shebangs.
 relay-server/entrypoint.sh text eol=lf
 *.sh text eol=lf
+
+# Frontend build inputs and their served copies are canonical LF text. This
+# keeps generated-asset diffs semantic on Windows and makes repeated builds
+# byte-identical across checkout autocrlf settings.
+frontend/*.html text eol=lf
+frontend/*.css text eol=lf
+frontend/*.js text eol=lf
+frontend/*.jsx text eol=lf
+frontend/dist/*.js text eol=lf
+relay-server/public/*.html text eol=lf
+relay-server/public/*.css text eol=lf
+relay-server/public/*.js text eol=lf
+relay-server/public/*.jsx text eol=lf
+relay-server/public/dist/*.js text eol=lf

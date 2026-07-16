@@ -5,6 +5,31 @@
 // Handles both protocol v1 messages (session metadata objects, proxy_message, etc.)
 // and the legacy wire format so the frontend works with both relay versions.
 
+import { createProvisionalStream, reduceMessageDeltaStream, shouldClearEmptyProvisionalOnTerminal } from './message-delta.js';
+import { messageInstant, normalizeMessageTimestamp } from './message-time.js';
+import { createStateSequenceGate } from './state-sequence.js';
+import {
+  createSessionRegistry,
+  patchSessionRegistry,
+  reconcileSessionRegistry,
+  sessionRegistryValueEqual,
+} from './session-registry.js';
+import {
+  getCachedTranscript,
+  transcriptStoreView,
+  updateTranscriptStore,
+} from './transcript-cache.js';
+import { normalizeFleetActivityTrace } from './fleet-activity.js';
+import { mergeSemanticNotifications } from './semantic-notifications.js';
+import { resolveDeliverySession, updateDeliveryMessage } from './delivery-tracking.js';
+import { sessionChatTitleMetadataPatch } from './session-title.js';
+import { createNavigationEpochGate } from './navigation-epoch.js';
+import {
+  HOST_RESOURCE_DETAIL_LIMIT,
+  HOST_RESOURCE_HISTORY_LIMIT,
+  mergeOrderedHostResourceFrames,
+} from './host-resources.js';
+
 const { useState, useEffect, useRef, useCallback } = React;
 
 const DEFAULT_HISTORY_TAIL_LIMIT = 120;
@@ -15,16 +40,29 @@ export const CONFIG_CONTROL_TIMEOUT_MS = 15000;
 export const DELIVERY_STAGE_TIMEOUT_MS = Object.freeze({
   queued: 10000,
   accepted: 30000,
+  launch_accepted: 30000,
   delivered: 30000,
   steered: 30000,
 });
 export const RELAY_RECONNECT_DELAYS_MS = [250, 500, 1000, 2000, 3000];
+export const CLIENT_RUNTIME_RECORD_LIMIT = 512;
 const STARTUP_DEFERRED_RELAY_TYPES = new Set([
   'history',
   'history_snapshot',
   'history_chunk',
+  'transcript_resync_required',
   'chat_list',
 ]);
+
+export function boundedRecordWith(previous, key, value, limit = CLIENT_RUNTIME_RECORD_LIMIT) {
+  const next = { ...(previous || {}) };
+  if (Object.prototype.hasOwnProperty.call(next, key)) delete next[key];
+  next[key] = value;
+  const keys = Object.keys(next);
+  const overflow = keys.length - Math.max(1, Number(limit) || CLIENT_RUNTIME_RECORD_LIMIT);
+  for (let index = 0; index < overflow; index += 1) delete next[keys[index]];
+  return next;
+}
 
 function shallowMapMerge(prev, next) {
   const entries = Object.entries(next || {});
@@ -33,21 +71,11 @@ function shallowMapMerge(prev, next) {
   const merged = { ...prev };
   entries.forEach(([key, value]) => {
     if (Object.is(prev[key], value)) return;
-    if (JSON.stringify(prev[key] ?? null) === JSON.stringify(value ?? null)) return;
+    if (sessionRegistryValueEqual(prev[key] ?? null, value ?? null)) return;
     merged[key] = value;
     changed = true;
   });
   return changed ? merged : prev;
-}
-
-function sameSessionList(a, b) {
-  const left = Array.isArray(a) ? a : [];
-  const right = Array.isArray(b) ? b : [];
-  if (left.length !== right.length) return false;
-  for (let i = 0; i < left.length; i++) {
-    if (JSON.stringify(left[i] ?? null) !== JSON.stringify(right[i] ?? null)) return false;
-  }
-  return true;
 }
 
 export function shouldMergeHistorySnapshot(type, msg, priorHistoryMeta) {
@@ -70,9 +98,12 @@ export function shouldMergeHistorySnapshot(type, msg, priorHistoryMeta) {
 
 function stableHistoryMessageId(msg) {
   if (!msg) return '';
+  if (msg.source_message_id) return `source\u0001${msg.source_message_id}`;
+  if (msg.native_source_id) return `native\u0001${msg.native_source_id}`;
   if (msg.id != null) return `id\u0001${msg.id}`;
   if (msg.server_message_id != null) return `server\u0001${msg.server_message_id}`;
   if (msg.sequence != null && msg.ts != null) return `seq\u0001${msg.sequence}\u0001${msg.ts}\u0001${msg.role || ''}`;
+  if (msg.client_message_id) return `client\u0001${msg.client_message_id}`;
   if (msg.client_msg_id) return `client\u0001${msg.client_msg_id}`;
   return '';
 }
@@ -102,13 +133,18 @@ export function preserveOptimisticMessagesAcrossHistory(authoritativeMessages, p
       )
     ));
     if (matchIndex >= 0) {
+      const authoritativeStatus = authoritative[matchIndex]?.status;
       authoritative[matchIndex] = {
         ...authoritative[matchIndex],
         _cid: optimistic._cid,
         _optimistic: true,
-        _delivered: optimistic._delivered || authoritative[matchIndex]._delivered,
-        _agentStarted: optimistic._agentStarted || authoritative[matchIndex]._agentStarted,
-        _sendError: optimistic._sendError || null,
+        _delivered: optimistic._delivered || authoritative[matchIndex]._delivered
+          || authoritativeStatus === 'delivered' || authoritativeStatus === 'agent_started',
+        _agentStarted: optimistic._agentStarted || authoritative[matchIndex]._agentStarted
+          || authoritativeStatus === 'agent_started',
+        _sendError: authoritativeStatus === 'failed'
+          ? (authoritative[matchIndex].failure_code || optimistic._sendError || 'Send failed')
+          : (optimistic._sendError || null),
       };
     } else {
       authoritative.push(optimistic);
@@ -176,11 +212,16 @@ export function sessionMetadataActivityMaps(sessionList) {
       startedAt: session.activity.started_at || null,
       interruptHint: session.activity.interrupt_hint || '',
       goal: session.activity.goal || null,
+      thinking: session.activity.thinking || null,
+      current: session.activity.current || null,
+      step: session.activity.step || null,
+      usage: session.activity.usage || null,
       task_list: session.activity.task_list || null,
       context_card: session.activity.context_card || null,
-      thinkingContent: session.activity.thinkingContent || '',
+      thinkingContent: session.activity.thinking?.text || session.activity.thinkingContent || '',
+      transport: session.activity.transport || null,
     };
-    thinkingContent[session.session_id] = session.activity.thinkingContent || '';
+    thinkingContent[session.session_id] = session.activity.thinking?.text || session.activity.thinkingContent || '';
     thinking[session.session_id] = ['thinking', 'generating', 'running_command', 'applying_patch', 'reading_files', 'working'].includes(kind)
       ? label
       : false;
@@ -189,8 +230,16 @@ export function sessionMetadataActivityMaps(sessionList) {
 }
 
 export function useRelay() {
-    const [sessions,        setSessions]        = useState([]);   // string IDs (legacy) or metadata objects (v1)
-    const [messages,        setMessages]        = useState({});   // sessionId -> [{role, content, _cid?, _optimistic?, _delivered?}]
+    const [sessionRegistry, setSessionRegistry] = useState(() => createSessionRegistry());
+    const sessions = sessionRegistry.list; // stable structural-sharing projection for existing consumers
+    const setSessions = useCallback(updater => {
+      setSessionRegistry(previous => {
+        const next = typeof updater === 'function' ? updater(previous.list) : updater;
+        return reconcileSessionRegistry(previous, next);
+      });
+    }, []);
+    const messages = transcriptStoreView; // external per-session LRU; not a top-level React state map
+    const setMessages = updateTranscriptStore;
     const [historyMeta,     setHistoryMeta]     = useState({});   // sessionId -> { partial, loaded, total, limit, mode }
     const [historyLoading,  setHistoryLoading]  = useState({});   // sessionId -> { mode, requestedAt, requestId }
     const [connected,       setConnected]       = useState(false);
@@ -202,6 +251,7 @@ export function useRelay() {
     const [health,          setHealth]          = useState({});   // sessionId -> 'healthy'|'degraded'|'disconnected'
     const [deliveryStates,  setDeliveryStates]  = useState({});   // includes offline_queued plus relay/native lifecycle states
     const [queuedMessages,  setQueuedMessages]  = useState({});   // sessionId -> [{ cid, content, queuedAt }]
+    const [scheduledSends,  setScheduledSends]  = useState([]);   // durable relay jobs owned by this operator
     const [launchStates,      setLaunchStates]      = useState({});   // requestId -> { status:'launching'|'failed', agentType, error? }
     const [justLaunched,      setJustLaunched]      = useState(null); // session_id of most recently launched session (for auto-select)
     const [permissionPrompts, setPermissionPrompts] = useState({});   // session_id -> prompt object (one active prompt per session)
@@ -221,14 +271,30 @@ export function useRelay() {
     const [fileContents,      setFileContents]      = useState({});  // sessionId:path -> { path, content, truncated }
     const [duplicateProxyAlarms, setDuplicateProxyAlarms] = useState([]);
     const [nightlyValidationFailures, setNightlyValidationFailures] = useState([]);
+    const [latestAppUpdateValidation, setLatestAppUpdateValidation] = useState(null);
+    const [providerUsage, setProviderUsage] = useState(null);
+    const [providerUsageRefreshReceipt, setProviderUsageRefreshReceipt] = useState(null);
+    const [providerUsageCostDetail, setProviderUsageCostDetail] = useState(null);
+    const [hostResources, setHostResources] = useState(null);
+    const [hostResourceError, setHostResourceError] = useState(null);
+    const [hostResourceHistory, setHostResourceHistory] = useState([]);
+    const [hostResourceDetails, setHostResourceDetails] = useState([]);
+    const [hostResourceSubscription, setHostResourceSubscription] = useState({
+      id: '', status: 'idle', aggregateOnly: false, resumed: false,
+    });
+    const [provisionalStreams, setProvisionalStreams] = useState({}); // sessionId -> ephemeral assistant stream
+    const [semanticNotifications, setSemanticNotifications] = useState([]);
 
     const thinkingTimers   = useRef({});
     const deliveryTimers   = useRef({});
     const deliveryStatesRef = useRef({});
+    const deliverySessionsRef = useRef({});
     const configControlStatesRef = useRef({});
     const configControlTimers = useRef({});
     const agentConfigsRef = useRef({});
     const wsRef            = useRef(null);
+    const sessionSubscriptionsRef = useRef([]);
+    const sessionSubscriptionSerial = useRef(0);
     const reconnectAttempt = useRef(0);
     const reconnectTimer   = useRef(null);
     const heartbeatTimer = useRef(null);
@@ -240,6 +306,8 @@ export function useRelay() {
     const offlineSendQueue = useRef([]);
     const activeSessionRef = useRef(null);
     const handleRelayMessageRef = useRef(null);
+    const stateSequenceGate = useRef(createStateSequenceGate());
+    const navigationEpochGate = useRef(createNavigationEpochGate());
     const historyRequestSerial = useRef(0);
     const latestHistoryRequest = useRef({});
     const historyChunkSerial = useRef(0);
@@ -251,6 +319,76 @@ export function useRelay() {
     const startupReady = useRef(false);
     const startupDeferredMessages = useRef(new Map());
     const startupDrainHandle = useRef(null);
+    const provisionalStreamsRef = useRef({});
+    const provisionalFlushHandle = useRef(null);
+    const provisionalPendingFlush = useRef(new Map());
+    // Host resource resume tokens are requester-scoped and deliberately kept
+    // only in memory. They are never written to storage, logs, or transcripts.
+    const hostResourceDesiredRef = useRef({ active: false, aggregateOnly: false });
+    const hostResourceSubscriptionRef = useRef('');
+    const hostResourceSubscribeRequestRef = useRef('');
+    const hostResourceRequestSerial = useRef(0);
+    const hostResourceHistoryRequestRef = useRef({ system: '', detail: '' });
+    const hostResourceHistoryCursorRef = useRef({ system: 0, detail: 0 });
+    const hostResourceLastLiveSequenceRef = useRef({ system: 0, detail: 0 });
+
+    function restoreCachedTranscript(sessionId) {
+      const cached = getCachedTranscript(sessionId);
+      if (!cached) return false;
+      return true;
+    }
+
+    function publishProvisionalStream(sessionId, stream, streamTrace = null) {
+      provisionalStreamsRef.current = { ...provisionalStreamsRef.current, [sessionId]: stream };
+      provisionalPendingFlush.current.set(sessionId, { stream, streamTrace });
+      if (provisionalFlushHandle.current != null) return;
+      const raf = typeof requestAnimationFrame === 'function'
+        ? requestAnimationFrame
+        : callback => setTimeout(callback, 16);
+      provisionalFlushHandle.current = raf(() => {
+        provisionalFlushHandle.current = null;
+        const pending = [...provisionalPendingFlush.current.entries()];
+        provisionalPendingFlush.current.clear();
+        if (!pending.length) return;
+        setProvisionalStreams(prev => {
+          const next = { ...prev };
+          pending.forEach(([id, item]) => { next[id] = item.stream; });
+          return next;
+        });
+        pending.forEach(([id, item]) => {
+          if (item.streamTrace) recordStreamTraceAfterPaint({ stream_trace: item.streamTrace }, id);
+        });
+      });
+    }
+
+    function openProvisionalStream(sessionId, clientMessageId = null) {
+      if (!sessionId) return;
+      const existing = provisionalStreamsRef.current[sessionId];
+      if (existing?.open) return;
+      const stream = createProvisionalStream(sessionId, clientMessageId);
+      provisionalStreamsRef.current = { ...provisionalStreamsRef.current, [sessionId]: stream };
+      setProvisionalStreams(prev => ({ ...prev, [sessionId]: stream }));
+    }
+
+    function clearProvisionalStream(sessionId) {
+      if (!sessionId || !provisionalStreamsRef.current[sessionId]) return;
+      const nextRef = { ...provisionalStreamsRef.current };
+      delete nextRef[sessionId];
+      provisionalStreamsRef.current = nextRef;
+      provisionalPendingFlush.current.delete(sessionId);
+      setProvisionalStreams(prev => {
+        if (!prev[sessionId]) return prev;
+        const next = { ...prev };
+        delete next[sessionId];
+        return next;
+      });
+    }
+
+    function clearAllProvisionalStreams() {
+      provisionalStreamsRef.current = {};
+      provisionalPendingFlush.current.clear();
+      setProvisionalStreams({});
+    }
 
     function cancelStartupDrain() {
       const pending = startupDrainHandle.current;
@@ -288,6 +426,151 @@ export function useRelay() {
     const send = useCallback((msg) => {
       if (wsRef.current?.readyState === WebSocket.OPEN) {
         wsRef.current.send(JSON.stringify(msg));
+      }
+    }, []);
+
+    const requestProviderUsageRefresh = useCallback((force = false) => {
+      const requestId = `provider-usage-${Date.now()}-${Math.random().toString(36).slice(2, 7)}`;
+      setProviderUsageRefreshReceipt({ requestId, status: 'requested' });
+      send({
+        type: 'provider_usage_refresh',
+        protocol_version: 1,
+        force: force === true,
+        request_id: requestId,
+      });
+      return requestId;
+    }, [send]);
+
+    const requestProviderUsageCostDetail = useCallback((options = {}) => {
+      const requestId = `provider-cost-${Date.now()}-${Math.random().toString(36).slice(2, 7)}`;
+      const query = {
+        days: Math.max(1, Math.min(365, Number(options.days) || 365)),
+        providerId: options.providerId ? String(options.providerId) : '',
+        project: options.project ? String(options.project) : '',
+        cursor: /^\d+$/.test(String(options.cursor ?? '0')) ? String(options.cursor ?? '0') : '0',
+        pageSize: Math.max(1, Math.min(256, Number(options.pageSize) || 256)),
+      };
+      setProviderUsageCostDetail({ requestId, status: 'loading', query, detail: null, error: null });
+      send({
+        type: 'provider_usage_cost_detail_request',
+        protocol_version: 1,
+        request_id: requestId,
+        days: query.days,
+        provider_id: query.providerId || null,
+        project: query.project || null,
+        cursor: query.cursor,
+        page_size: query.pageSize,
+      });
+      return requestId;
+    }, [send]);
+
+    const requestHostResourceRefresh = useCallback((force = false) => {
+      const requestId = `host-resource-${Date.now()}-${Math.random().toString(36).slice(2, 7)}`;
+      setHostResourceError(null);
+      send({
+        type: 'host_resource_refresh',
+        protocol_version: 1,
+        force: force === true,
+        request_id: requestId,
+      });
+      return requestId;
+    }, [send]);
+
+    const clearHostResources = useCallback(() => {
+      setHostResources(null);
+      setHostResourceError(null);
+      setHostResourceHistory([]);
+      setHostResourceDetails([]);
+      hostResourceHistoryCursorRef.current = { system: 0, detail: 0 };
+      hostResourceLastLiveSequenceRef.current = { system: 0, detail: 0 };
+    }, []);
+
+    const sendHostResourceSubscribe = useCallback((aggregateOnly, resumeSubscriptionId = '') => {
+      const requestId = `host-resource-subscribe-${Date.now()}-${++hostResourceRequestSerial.current}`;
+      hostResourceSubscribeRequestRef.current = requestId;
+      setHostResourceError(null);
+      setHostResourceSubscription(previous => ({
+        ...previous,
+        status: resumeSubscriptionId ? 'reconnecting' : 'subscribing',
+        aggregateOnly: aggregateOnly === true,
+      }));
+      send({
+        type: 'host_resource_subscribe',
+        protocol_version: 1,
+        request_id: requestId,
+        ...(resumeSubscriptionId ? { resume_subscription_id: resumeSubscriptionId } : {}),
+        aggregate_only: aggregateOnly === true,
+      });
+      return requestId;
+    }, [send]);
+
+    const requestHostResourceHistory = useCallback((stream, afterSequence = 0) => {
+      const normalizedStream = stream === 'detail' ? 'detail' : 'system';
+      const subscriptionId = hostResourceSubscriptionRef.current;
+      if (!subscriptionId) return null;
+      const requestId = `host-resource-history-${normalizedStream}-${Date.now()}-${++hostResourceRequestSerial.current}`;
+      hostResourceHistoryRequestRef.current[normalizedStream] = requestId;
+      send({
+        type: 'host_resource_history_request',
+        protocol_version: 1,
+        request_id: requestId,
+        subscription_id: subscriptionId,
+        stream: normalizedStream,
+        after_sequence: Math.max(0, Math.round(Number(afterSequence) || 0)),
+        max_points: normalizedStream === 'detail' ? 8 : 64,
+      });
+      return requestId;
+    }, [send]);
+
+    const subscribeHostResources = useCallback((aggregateOnly = false) => {
+      const normalizedAggregateOnly = aggregateOnly === true;
+      const previous = hostResourceDesiredRef.current;
+      const previousId = hostResourceSubscriptionRef.current;
+      if (previous.active && previous.aggregateOnly === normalizedAggregateOnly && previousId) return previousId;
+      if (previousId && previous.aggregateOnly !== normalizedAggregateOnly) {
+        send({
+          type: 'host_resource_unsubscribe', protocol_version: 1,
+          request_id: `host-resource-unsubscribe-${Date.now()}-${++hostResourceRequestSerial.current}`,
+          subscription_id: previousId,
+        });
+        hostResourceSubscriptionRef.current = '';
+      }
+      hostResourceDesiredRef.current = { active: true, aggregateOnly: normalizedAggregateOnly };
+      clearHostResources();
+      sendHostResourceSubscribe(normalizedAggregateOnly, '');
+      return null;
+    }, [clearHostResources, send, sendHostResourceSubscribe]);
+
+    const unsubscribeHostResources = useCallback(() => {
+      hostResourceDesiredRef.current = { active: false, aggregateOnly: false };
+      const subscriptionId = hostResourceSubscriptionRef.current;
+      hostResourceSubscriptionRef.current = '';
+      hostResourceSubscribeRequestRef.current = '';
+      hostResourceHistoryRequestRef.current = { system: '', detail: '' };
+      if (subscriptionId) send({
+        type: 'host_resource_unsubscribe', protocol_version: 1,
+        request_id: `host-resource-unsubscribe-${Date.now()}-${++hostResourceRequestSerial.current}`,
+        subscription_id: subscriptionId,
+      });
+      clearHostResources();
+      setHostResourceSubscription({ id: '', status: 'idle', aggregateOnly: false, resumed: false });
+    }, [clearHostResources, send]);
+
+    const setSessionSubscriptions = useCallback((sessionIds) => {
+      const normalized = [...new Set((Array.isArray(sessionIds) ? sessionIds : [])
+        .filter(id => typeof id === 'string' && id.length > 0))]
+        .sort()
+        .slice(0, 128);
+      if (normalized.length === sessionSubscriptionsRef.current.length
+        && normalized.every((id, index) => id === sessionSubscriptionsRef.current[index])) return;
+      sessionSubscriptionsRef.current = normalized;
+      if (wsRef.current?.readyState === WebSocket.OPEN) {
+        wsRef.current.send(JSON.stringify({
+          type: 'subscribe',
+          protocol_version: 1,
+          request_id: `web-sub-${Date.now()}-${++sessionSubscriptionSerial.current}`,
+          sessions: normalized,
+        }));
       }
     }, []);
 
@@ -347,24 +630,48 @@ export function useRelay() {
 
     function setTrackedDeliveryState(clientMessageId, state) {
       if (!clientMessageId) return;
-      deliveryStatesRef.current[clientMessageId] = state;
-      setDeliveryStates(prev => ({ ...prev, [clientMessageId]: state }));
+      if (!Object.prototype.hasOwnProperty.call(deliveryStatesRef.current, clientMessageId)
+        && Object.keys(deliveryStatesRef.current).length >= CLIENT_RUNTIME_RECORD_LIMIT) {
+        const oldest = Object.keys(deliveryStatesRef.current)[0];
+        clearDeliveryTimeout(oldest);
+        delete deliverySessionsRef.current[oldest];
+      }
+      deliveryStatesRef.current = boundedRecordWith(deliveryStatesRef.current, clientMessageId, state);
+      setDeliveryStates(prev => boundedRecordWith(prev, clientMessageId, state));
     }
 
-    function markDeliveryFailed(clientMessageId, reason) {
+    function trackDeliverySession(clientMessageId, sessionId) {
+      if (!clientMessageId || !sessionId) return;
+      deliverySessionsRef.current = boundedRecordWith(
+        deliverySessionsRef.current,
+        clientMessageId,
+        sessionId,
+      );
+    }
+
+    function updateTrackedDeliveryMessage(clientMessageId, sessionHint, updater) {
+      if (!clientMessageId) return;
+      setMessages(prev => {
+        const sessionId = resolveDeliverySession(
+          prev,
+          clientMessageId,
+          sessionHint || deliverySessionsRef.current[clientMessageId] || '',
+        );
+        if (!sessionId) return prev;
+        trackDeliverySession(clientMessageId, sessionId);
+        return updateDeliveryMessage(prev, clientMessageId, sessionId, updater);
+      });
+    }
+
+    function markDeliveryFailed(clientMessageId, reason, sessionId = '') {
       if (!clientMessageId) return;
       if (deliveryStatesRef.current[clientMessageId] === 'agent_started') return;
       clearDeliveryTimeout(clientMessageId);
       setTrackedDeliveryState(clientMessageId, 'failed');
-      setMessages(prev => {
-        const next = { ...prev };
-        Object.keys(next).forEach(sessionId => {
-          next[sessionId] = (next[sessionId] || []).map(message => (
-            message._cid === clientMessageId ? { ...message, _sendError: reason || 'Send failed' } : message
-          ));
-        });
-        return next;
-      });
+      updateTrackedDeliveryMessage(clientMessageId, sessionId, message => ({
+        ...message,
+        _sendError: reason || 'Send failed',
+      }));
     }
 
     function armDeliveryTimeout(clientMessageId, stage, reason) {
@@ -385,7 +692,11 @@ export function useRelay() {
     }
 
     function setConfigControlState(key, value) {
-      configControlStatesRef.current = { ...configControlStatesRef.current, [key]: value };
+      if (!Object.prototype.hasOwnProperty.call(configControlStatesRef.current, key)
+        && Object.keys(configControlStatesRef.current).length >= CLIENT_RUNTIME_RECORD_LIMIT) {
+        clearConfigControlTimer(Object.keys(configControlStatesRef.current)[0]);
+      }
+      configControlStatesRef.current = boundedRecordWith(configControlStatesRef.current, key, value);
       setConfigControlStates(configControlStatesRef.current);
     }
 
@@ -452,9 +763,26 @@ export function useRelay() {
         reconnectAttempt.current = 0;
         setConnected(true);
         setConnectionHealth({ state: 'connecting', rttMs: null, lastAckAt: null });
+        ws.send(JSON.stringify({
+          type: 'subscribe',
+          protocol_version: 1,
+          request_id: `web-sub-${Date.now()}-${++sessionSubscriptionSerial.current}`,
+          sessions: sessionSubscriptionsRef.current,
+        }));
+        if (hostResourceDesiredRef.current.active) {
+          sendHostResourceSubscribe(
+            hostResourceDesiredRef.current.aggregateOnly,
+            hostResourceSubscriptionRef.current,
+          );
+        }
       };
       ws.onclose = () => {
         clearRelayHeartbeat();
+        Object.entries(configControlStatesRef.current).forEach(([key, transaction]) => {
+          if (['pending', 'awaiting_config'].includes(transaction?.status)) {
+            rollbackConfigControl(key, 'Connection changed before the native setting was confirmed. Retry after reconnecting.');
+          }
+        });
         Object.values(historyChunkTimers.current).forEach(timer => clearTimeout(timer));
         historyChunkTimers.current = {};
         Object.keys(historyChunkState.current).forEach(id => {
@@ -464,8 +792,12 @@ export function useRelay() {
           };
         });
         setHistoryLoading({});
+        clearAllProvisionalStreams();
         setConnected(false);
         setConnectionHealth({ state: 'offline', rttMs: null, lastAckAt: null });
+        if (hostResourceDesiredRef.current.active) {
+          setHostResourceSubscription(previous => ({ ...previous, status: 'reconnecting' }));
+        }
         if (wsRef.current !== ws) return;
         const attempt = reconnectAttempt.current++;
         const delay = RELAY_RECONNECT_DELAYS_MS[Math.min(attempt, RELAY_RECONNECT_DELAYS_MS.length - 1)];
@@ -478,9 +810,12 @@ export function useRelay() {
       ws.onmessage = (e) => {
         let msg;
         try { msg = JSON.parse(e.data); } catch { return; }
+        if (msg.stream_trace && typeof msg.stream_trace === 'object') {
+          msg.stream_trace = { ...msg.stream_trace, browser_received_at_ms: Date.now() };
+        }
         handleRelayMessageRef.current(msg);
       };
-    }, [send]); // eslint-disable-line react-hooks/exhaustive-deps
+    }, [send, sendHostResourceSubscribe]); // eslint-disable-line react-hooks/exhaustive-deps
 
     useEffect(() => {
       connect();
@@ -492,6 +827,12 @@ export function useRelay() {
         Object.values(configControlTimers.current).forEach(timer => clearTimeout(timer));
         configControlTimers.current = {};
         cancelStartupDrain();
+        if (provisionalFlushHandle.current != null) {
+          if (typeof cancelAnimationFrame === 'function') cancelAnimationFrame(provisionalFlushHandle.current);
+          else clearTimeout(provisionalFlushHandle.current);
+          provisionalFlushHandle.current = null;
+        }
+        provisionalPendingFlush.current.clear();
         const current = wsRef.current;
         wsRef.current = null;
         try { current?.close(); } catch {}
@@ -524,9 +865,68 @@ export function useRelay() {
         clearTimeout(thinkingTimers.current[id]);
         delete thinkingTimers.current[id];
       });
+      [
+        latestHistoryRequest,
+        latestHistoryChunkRequest,
+        historyChunkState,
+        activeCursorThreadIdentity,
+        pendingCursorThreadHistoryReset,
+      ].forEach(ref => {
+        Object.keys(ref.current).forEach(id => {
+          if (!liveIds.has(id)) delete ref.current[id];
+        });
+      });
+      Object.keys(provisionalStreamsRef.current).forEach(id => {
+        if (!liveIds.has(id)) delete provisionalStreamsRef.current[id];
+      });
+      for (const id of provisionalPendingFlush.current.keys()) {
+        if (!liveIds.has(id)) provisionalPendingFlush.current.delete(id);
+      }
+      Object.keys(historyChunkTimers.current).forEach(id => {
+        if (liveIds.has(id)) return;
+        clearTimeout(historyChunkTimers.current[id]);
+        delete historyChunkTimers.current[id];
+      });
+      let configChanged = false;
+      Object.entries(configControlStatesRef.current).forEach(([key, transaction]) => {
+        if (liveIds.has(transaction?.sessionId)) return;
+        clearConfigControlTimer(key);
+        delete configControlStatesRef.current[key];
+        configChanged = true;
+      });
+      if (configChanged) setConfigControlStates({ ...configControlStatesRef.current });
       setActivities(retainLive);
       setThinkingContent(retainLive);
       setThinking(retainLive);
+      setHistoryMeta(retainLive);
+      setHistoryLoading(retainLive);
+      setUnread(retainLive);
+      setHealth(retainLive);
+      setQueuedMessages(retainLive);
+      setPermissionPrompts(retainLive);
+      setErrorPrompts(retainLive);
+      setAgentConfigs(retainLive);
+      setChatLists(retainLive);
+      setThreadLists(retainLive);
+      setTerminalOutputs(retainLive);
+      setFileChanges(retainLive);
+      setBranchLists(retainLive);
+      setSkillLists(retainLive);
+      setAutomationViews(retainLive);
+      setDirectoryListings(retainLive);
+      setProvisionalStreams(retainLive);
+      setFileContents(previous => {
+        let changed = false;
+        const next = { ...previous };
+        Object.keys(next).forEach(key => {
+          const separator = key.indexOf(':');
+          const sessionId = separator >= 0 ? key.slice(0, separator) : key;
+          if (liveIds.has(sessionId)) return;
+          delete next[key];
+          changed = true;
+        });
+        return changed ? next : previous;
+      });
     }
 
     function mergeSessionConfigHints(sessionList) {
@@ -542,7 +942,7 @@ export function useRelay() {
           const merged = { ...prev };
           Object.entries(next).forEach(([sid, hints]) => {
             const nextCfg = { ...(merged[sid] || {}), ...hints };
-            if (JSON.stringify(merged[sid] || {}) === JSON.stringify(nextCfg)) return;
+            if (sessionRegistryValueEqual(merged[sid] || {}, nextCfg)) return;
             merged[sid] = nextCfg;
             changed = true;
           });
@@ -602,15 +1002,18 @@ export function useRelay() {
       const id = typeof sessionOrId === 'string' ? sessionOrId : sessionOrId?.session_id;
       if (!id) return;
       if (wsRef.current?.readyState !== WebSocket.OPEN) return;
-      const mode = options.mode === 'older' ? 'older' : 'tail';
+      const mode = options.mode === 'older' ? 'older' : options.mode === 'around' ? 'around' : 'tail';
       const source = options.source || 'relay_sqlite';
-      const replace = mode === 'tail' && options.replace !== false;
+      const replace = mode === 'around' || (mode === 'tail' && options.replace !== false);
       const beforeOffset = options.beforeOffset ?? options.before_offset ?? null;
       const beforeId = options.beforeId ?? options.before_id ?? null;
-      const requestCursorSig = `${mode}\u0001${source}\u0001${beforeOffset ?? ''}\u0001${beforeId ?? ''}`;
+      const aroundId = options.aroundId ?? options.around_id ?? null;
+      const requestCursorSig = `${mode}\u0001${source}\u0001${beforeOffset ?? ''}\u0001${beforeId ?? ''}\u0001${aroundId ?? ''}`;
       const currentChunkState = historyChunkState.current[id] || {};
       const nowMs = Date.now();
-      if (currentChunkState.inFlight) return;
+      // An explicit search deep-link must supersede an automatic tail hydration;
+      // otherwise a large initial tail can strand the user at the newest row.
+      if (currentChunkState.inFlight && mode !== 'around') return;
       if (
         mode === 'older'
         && currentChunkState.lastRequestSig === requestCursorSig
@@ -620,9 +1023,25 @@ export function useRelay() {
       }
       const requestId = `histchunk-${Date.now()}-${++historyChunkSerial.current}`;
       const chunkBytes = Math.max(256 * 1024, Math.min(16 * 1024 * 1024, Number(options.chunkBytes || options.chunk_bytes || CODEX_CLI_HISTORY_CHUNK_BYTES) || CODEX_CLI_HISTORY_CHUNK_BYTES));
-      if (mode === 'tail') {
+      if (mode !== 'older') {
+        const retryBaselineKeys = Number(options.retryAttempt || 0) > 0
+          ? currentChunkState.baselineMessageKeys
+          : null;
+        const baselineMessageKeys = Array.isArray(retryBaselineKeys)
+          ? retryBaselineKeys
+          : (messages[id] || []).map(messageDedupeKey).filter(Boolean);
         clearTimeout(historyChunkTimers.current[id]);
-        historyChunkState.current[id] = { source, chunkBytes, limit: options.limit || null, inFlight: true, mode, replace, lastRequestSig: requestCursorSig, lastRequestAt: nowMs };
+        historyChunkState.current[id] = {
+          source,
+          chunkBytes,
+          limit: options.limit || null,
+          inFlight: true,
+          mode,
+          replace,
+          baselineMessageKeys,
+          lastRequestSig: requestCursorSig,
+          lastRequestAt: nowMs,
+        };
       } else {
         historyChunkState.current[id] = { ...(historyChunkState.current[id] || {}), source, chunkBytes, limit: options.limit || historyChunkState.current[id]?.limit || null, inFlight: true, mode, lastRequestSig: requestCursorSig, lastRequestAt: nowMs };
       }
@@ -652,6 +1071,7 @@ export function useRelay() {
       if (options.userInitiated || options.user_initiated) payload.user_initiated = true;
       if (mode === 'older' && beforeOffset != null) payload.before_offset = beforeOffset;
       if (mode === 'older' && beforeId != null) payload.before_id = beforeId;
+      if (mode === 'around' && aroundId != null) payload.around_id = aroundId;
       send(payload);
       historyChunkTimers.current[id] = setTimeout(() => {
         delete historyChunkTimers.current[id];
@@ -692,6 +1112,8 @@ export function useRelay() {
 
     function messageDedupeKey(msg) {
       if (!msg) return '';
+      if (msg.source_message_id) return `source\u0001${msg.source_message_id}`;
+      if (msg.native_source_id) return `native\u0001${msg.native_source_id}`;
       if (msg.id != null) return `id\u0001${msg.id}`;
       if (msg.server_message_id != null) return `server\u0001${msg.server_message_id}`;
       if (msg.sequence != null && msg.ts != null) return `seq\u0001${msg.sequence}\u0001${msg.ts}\u0001${msg.role || ''}`;
@@ -749,6 +1171,24 @@ export function useRelay() {
       return added ? merged : current;
     }
 
+    function reconcileHistoryTailReplacement(existing, incoming, chunkState, responseSource) {
+      const current = Array.isArray(existing) ? existing : [];
+      const nextIncoming = Array.isArray(incoming) ? incoming : [];
+      const baselineKeys = new Set(Array.isArray(chunkState?.baselineMessageKeys)
+        ? chunkState.baselineMessageKeys
+        : []);
+      const nativeSource = chunkState?.source === 'native'
+        || responseSource === 'codex_cli_jsonl'
+        || responseSource === 'cursor_cli_jsonl';
+      if (nativeSource && baselineKeys.size > nextIncoming.length) return current;
+      const arrivedAfterRequest = current.filter(message => {
+        const key = messageDedupeKey(message);
+        return key && !baselineKeys.has(key);
+      });
+      if (arrivedAfterRequest.length === 0) return nextIncoming;
+      return mergeHistoryChunk(nextIncoming, arrivedAfterRequest, 'tail');
+    }
+
     function shouldPreserveTranscriptInListView(session) {
       if (!session || typeof session !== 'object') return false;
       return ['codex', 'codex-desktop', 'cursor', 'codex_cli', 'cursor_cli', 'roo_code', 'cline'].includes(session.agent_type);
@@ -771,12 +1211,21 @@ export function useRelay() {
     }
 
     // Responds to a permission prompt.
-    function respondToPrompt(sessionId, promptId, choiceId) {
+    function respondToPrompt(sessionId, promptId, choiceId, details = {}) {
       const requestId = `prompt-${Date.now()}-${Math.random().toString(36).slice(2, 7)}`;
+      const instruction = typeof details.instruction === 'string' ? details.instruction.trim() : '';
+      const submittingChoiceId = choiceId || (Array.isArray(details.answers)
+        ? 'question_answers' : (instruction ? 'alternate_instruction' : null));
       setPermissionPrompts(prev => prev[sessionId]
-        ? { ...prev, [sessionId]: { ...prev[sessionId], submitting_choice_id: choiceId, request_id: requestId, error: null } }
+        ? { ...prev, [sessionId]: { ...prev[sessionId], submitting_choice_id: submittingChoiceId, request_id: requestId, error: null } }
         : prev);
-      send({ type: 'permission_response', session_id: sessionId, prompt_id: promptId, choice_id: choiceId, request_id: requestId });
+      send({
+        type: 'permission_response', session_id: sessionId, prompt_id: promptId,
+        ...(choiceId ? { choice_id: choiceId } : {}),
+        ...(Array.isArray(details.answers) ? { answers: details.answers } : {}),
+        ...(instruction ? { instruction } : {}),
+        request_id: requestId,
+      });
     }
 
     function respondToErrorPrompt(sessionId, promptId, actionId) {
@@ -800,12 +1249,16 @@ export function useRelay() {
 
     function setAgentModel(sessionId, modelId) {
       const requestId = `model-${Date.now()}-${Math.random().toString(36).slice(2, 7)}`;
-      return submitConfigControl(sessionId, 'model', 'model_id', modelId, { type: 'agent_set_model', model_id: modelId }, requestId);
+      const config = agentConfigsRef.current[sessionId] || {};
+      const configKey = config.config_semantics === 'observed_and_next_send' ? 'next_send_model_id' : 'model_id';
+      return submitConfigControl(sessionId, 'model', configKey, modelId, { type: 'agent_set_model', model_id: modelId }, requestId);
     }
 
     function setAgentEffort(sessionId, effort) {
       const requestId = `effort-${Date.now()}-${Math.random().toString(36).slice(2, 7)}`;
-      return submitConfigControl(sessionId, 'effort', 'effort', effort, { type: 'agent_set_effort', effort }, requestId);
+      const config = agentConfigsRef.current[sessionId] || {};
+      const configKey = config.config_semantics === 'observed_and_next_send' ? 'next_send_effort' : 'effort';
+      return submitConfigControl(sessionId, 'effort', configKey, effort, { type: 'agent_set_effort', effort }, requestId);
     }
 
     function setAgentPermissionMode(sessionId, mode) {
@@ -824,14 +1277,34 @@ export function useRelay() {
       return submitConfigControl(sessionId, 'mode', configKey, mode, { type: 'agent_set_mode', mode }, requestId);
     }
 
-    function setCodexConfig(sessionId, { model_id, effort, speed, access_mode, workspace_mode }) {
+    function setCodexConfig(sessionId, {
+      model_id,
+      effort,
+      speed,
+      access_mode,
+      permission_profile,
+      confirm_bypass,
+      workspace_mode,
+    }) {
       const requestId = `codex-cfg-${Date.now()}-${Math.random().toString(36).slice(2, 7)}`;
+      const config = agentConfigsRef.current[sessionId] || {};
       const options = [
         ['model', 'model_id', model_id], ['effort', 'effort', effort], ['speed', 'speed', speed],
         ['access_mode', 'permission_mode', access_mode], ['workspace_mode', 'workspace_mode', workspace_mode],
+        ['permission_profile', 'permission_profile', permission_profile],
       ];
       const [field, configKey, requestedValue] = options.find(([, , value]) => value != null) || ['codex_config', 'model_id', model_id];
-      return submitConfigControl(sessionId, field, configKey, requestedValue, { type: 'set_codex_config', model_id, effort, speed, access_mode, workspace_mode }, requestId);
+      return submitConfigControl(sessionId, field, configKey, requestedValue, {
+        type: 'set_codex_config',
+        model_id,
+        effort,
+        speed,
+        access_mode,
+        permission_profile,
+        confirm_bypass,
+        workspace_mode,
+        source_revision: config.source_revision,
+      }, requestId);
     }
 
     function newThread(sessionId) {
@@ -970,7 +1443,7 @@ export function useRelay() {
     // Launches a new agent session. Returns the requestId.
     function launchSession(agentType, workspacePath, options = {}) {
       const requestId = `launch-${Date.now()}-${Math.random().toString(36).slice(2, 7)}`;
-      setLaunchStates(prev => ({ ...prev, [requestId]: { status: 'launching', agentType } }));
+      setLaunchStates(prev => boundedRecordWith(prev, requestId, { status: 'launching', agentType }));
       send({
         type: 'launch_session',
         agent_type: agentType,
@@ -988,7 +1461,7 @@ export function useRelay() {
     // same native chat instead of creating a brand-new one.
     function resumeSession(sourceSession, agentType, workspacePath, options = {}) {
       const requestId = `resume-${Date.now()}-${Math.random().toString(36).slice(2, 7)}`;
-      setLaunchStates(prev => ({ ...prev, [requestId]: { status: 'launching', agentType } }));
+      setLaunchStates(prev => boundedRecordWith(prev, requestId, { status: 'launching', agentType }));
       send({
         type: 'resume_session',
         source_session: sourceSession,
@@ -1015,6 +1488,11 @@ export function useRelay() {
     // Sends a user message with delivery tracking. Returns the clientMsgId.
     function sendToSession(session, content, retryClientMessageId = '') {
       const cid = retryClientMessageId || `cmsg-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+      trackDeliverySession(cid, session);
+      const retryMessage = retryClientMessageId
+        ? (transcriptStoreView[session] || []).find(message => message._cid === cid)
+        : null;
+      const createdAt = messageInstant(retryMessage)?.iso || new Date().toISOString();
       setMessages(prev => {
         const existing = prev[session] || [];
         const hasRetryTarget = retryClientMessageId && existing.some(message => message._cid === cid);
@@ -1024,17 +1502,19 @@ export function useRelay() {
             ? existing.map(message => message._cid === cid
               ? { ...message, content, _optimistic: true, _delivered: false, _agentStarted: false, _sendError: null }
               : message)
-            : [...existing, { role: 'user', content, _cid: cid, _optimistic: true }],
+            : [...existing, normalizeMessageTimestamp({
+                role: 'user', content, _cid: cid, _optimistic: true, created_at: createdAt,
+              })],
         };
       });
       if (wsRef.current?.readyState === WebSocket.OPEN) {
         setTrackedDeliveryState(cid, 'queued');
         armDeliveryTimeout(cid, 'queued', 'Timed out waiting for relay acceptance.');
-        send({ type: 'send', session, content, client_message_id: cid });
+        send({ type: 'send', session, content, client_message_id: cid, created_at: createdAt });
       } else if (offlineSendQueue.current.length < 20) {
         offlineSendQueue.current = [
           ...offlineSendQueue.current.filter(item => item.cid !== cid),
-          { session, content, cid },
+          { session, content, cid, created_at: createdAt },
         ];
         clearDeliveryTimeout(cid);
         setTrackedDeliveryState(cid, 'offline_queued');
@@ -1051,10 +1531,12 @@ export function useRelay() {
       const queued = offlineSendQueue.current;
       offlineSendQueue.current = [];
       queued.forEach(item => {
+        trackDeliverySession(item.cid, item.session);
         setTrackedDeliveryState(item.cid, 'queued');
         armDeliveryTimeout(item.cid, 'queued', 'Timed out waiting for relay acceptance after reconnect.');
         ws.send(JSON.stringify({
           type: 'send', session: item.session, content: item.content, client_message_id: item.cid,
+          created_at: item.created_at,
         }));
       });
     }
@@ -1072,6 +1554,7 @@ export function useRelay() {
     function discardQueuedMessage(sessionId, clientMessageId) {
       clearDeliveryTimeout(clientMessageId);
       delete deliveryStatesRef.current[clientMessageId];
+      delete deliverySessionsRef.current[clientMessageId];
       send({ type: 'discard_queued', session_id: sessionId, client_message_id: clientMessageId });
       setQueuedMessages(prev => ({ ...prev, [sessionId]: (prev[sessionId] || []).filter(m => m.cid !== clientMessageId) }));
       setDeliveryStates(prev => { const next = { ...prev }; delete next[clientMessageId]; return next; });
@@ -1086,7 +1569,13 @@ export function useRelay() {
       // Update locally
       setQueuedMessages(prev => ({
         ...prev,
-        [sessionId]: (prev[sessionId] || []).map(m => m.cid === clientMessageId ? { ...m, content: newContent } : m),
+        [sessionId]: (prev[sessionId] || []).map(m => m.cid === clientMessageId ? {
+          ...m,
+          content: newContent,
+          content_blocks: (m.content_blocks || []).map(block => block?.type === 'queued_message'
+            ? { ...block, content: newContent }
+            : block),
+        } : m),
       }));
       // Update the optimistic message in chat
       setMessages(prev => {
@@ -1097,24 +1586,216 @@ export function useRelay() {
       send({ type: 'edit_queued', session_id: sessionId, client_message_id: clientMessageId, content: newContent });
     }
 
+    function mergeScheduledSend(job) {
+      if (!job?.id) return;
+      setScheduledSends(prev => {
+        const next = prev.filter(item => item.id !== job.id);
+        return ['completed', 'cancelled'].includes(job.state) ? next : [job, ...next];
+      });
+    }
+
+    async function refreshScheduledSends() {
+      const response = await fetch('/api/scheduled-sends', { credentials: 'same-origin' });
+      if (!response.ok) throw new Error(`Could not load scheduled sends (${response.status})`);
+      const body = await response.json();
+      setScheduledSends((body.scheduled_sends || []).filter(job => !['completed', 'cancelled'].includes(job.state)));
+      return body.scheduled_sends || [];
+    }
+
+    async function scheduleSend(sessionId, content, triggerKind, deliverAt = null) {
+      const response = await fetch('/api/scheduled-sends', {
+        method: 'POST', credentials: 'same-origin',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          session_id: sessionId, content, trigger_kind: triggerKind,
+          ...(triggerKind === 'at' ? { deliver_at: deliverAt } : {}),
+        }),
+      });
+      const body = await response.json().catch(() => ({}));
+      if (!response.ok) throw new Error(body.error || `Could not schedule message (${response.status})`);
+      mergeScheduledSend(body.scheduled_send);
+      return body.scheduled_send;
+    }
+
+    async function cancelScheduledSend(id) {
+      const response = await fetch(`/api/scheduled-sends/${encodeURIComponent(id)}`, {
+        method: 'DELETE', credentials: 'same-origin',
+      });
+      const body = await response.json().catch(() => ({}));
+      if (!response.ok) throw new Error(body.error || `Could not cancel scheduled message (${response.status})`);
+      mergeScheduledSend(body.scheduled_send);
+      return body.scheduled_send;
+    }
+
+    function recordStreamTraceAfterPaint(msg, sessionId) {
+      if (!msg?.stream_trace || typeof window === 'undefined') return;
+      const trace = { ...msg.stream_trace, session_id: sessionId || msg.session || msg.session_id || '' };
+      const raf = window.requestAnimationFrame || (callback => window.setTimeout(callback, 16));
+      raf(() => raf(() => {
+        const rows = Array.isArray(window.__RAC_STREAM_TRACES__) ? window.__RAC_STREAM_TRACES__ : [];
+        rows.push({ ...trace, browser_paint_at_ms: Date.now() });
+        if (rows.length > 500) rows.splice(0, rows.length - 500);
+        window.__RAC_STREAM_TRACES__ = rows;
+      }));
+    }
+
     function handleRelayMessage(msg) {
       const t = msg.type;
 
+      if (!navigationEpochGate.current.accept(msg)) return;
+      if (t === 'navigation_started') return;
+
+      if (t === 'connection_ack') stateSequenceGate.current.reset(msg.state_epoch);
+      const stateSessionId = msg.session || msg.session_id || '';
+      const stateKey = (t === 'session_list' || t === 'session_snapshot' || t === 'proxy_session_snapshot')
+        ? 'session_list'
+        : ((t === 'status' || t === 'proxy_status' || t === 'session_status' || t === 'session_summary' || t === 'session_patch') && stateSessionId)
+          ? `status:${stateSessionId}`
+          : '';
+      if (stateKey && !stateSequenceGate.current.accept(msg, stateKey)) return;
+
       if (t === 'heartbeat_ack') {
         handleHeartbeatAck(msg);
+        return;
+      }
+      if (t === 'provider_usage_snapshot') {
+        if (msg.snapshot && typeof msg.snapshot === 'object') setProviderUsage(msg.snapshot);
+        return;
+      }
+      if (t === 'provider_usage_refresh_receipt') {
+        setProviderUsageRefreshReceipt(previous => (
+          !previous || !msg.request_id || previous.requestId === msg.request_id
+            ? { requestId: msg.request_id || previous?.requestId || '', status: msg.status || 'error', ...msg }
+            : previous
+        ));
+        return;
+      }
+      if (t === 'provider_usage_cost_detail') {
+        setProviderUsageCostDetail(previous => (
+          previous?.requestId === msg.request_id
+            ? { ...previous, status: 'ready', detail: msg.detail, error: null }
+            : previous
+        ));
+        return;
+      }
+      if (t === 'provider_usage_cost_detail_error') {
+        setProviderUsageCostDetail(previous => (
+          previous?.requestId === msg.request_id
+            ? { ...previous, status: 'error', error: msg.code || 'cost_detail_failed' }
+            : previous
+        ));
+        return;
+      }
+      if (t === 'host_resource_snapshot') {
+        if (msg.snapshot && typeof msg.snapshot === 'object') {
+          setHostResources(msg.snapshot);
+          setHostResourceError(null);
+        }
+        return;
+      }
+      if (t === 'host_resource_subscription_ack') {
+        if (!hostResourceDesiredRef.current.active
+          || msg.request_id !== hostResourceSubscribeRequestRef.current
+          || typeof msg.subscription_id !== 'string') return;
+        const previousId = hostResourceSubscriptionRef.current;
+        const subscriptionId = msg.subscription_id;
+        const resumed = msg.resumed === true && previousId === subscriptionId;
+        hostResourceSubscriptionRef.current = subscriptionId;
+        hostResourceSubscribeRequestRef.current = '';
+        if (!resumed) {
+          setHostResourceHistory([]);
+          setHostResourceDetails([]);
+          setHostResources(null);
+          hostResourceHistoryCursorRef.current = { system: 0, detail: 0 };
+          hostResourceLastLiveSequenceRef.current = { system: 0, detail: 0 };
+        }
+        setHostResourceSubscription({
+          id: subscriptionId,
+          status: 'live',
+          aggregateOnly: msg.aggregate_only === true,
+          resumed,
+        });
+        requestHostResourceHistory('system', resumed ? hostResourceHistoryCursorRef.current.system : 0);
+        requestHostResourceHistory('detail', resumed ? hostResourceHistoryCursorRef.current.detail : 0);
+        return;
+      }
+      if (t === 'host_resource_history_chunk') {
+        const chunk = msg.chunk;
+        const stream = chunk?.stream === 'detail' ? 'detail' : chunk?.stream === 'system' ? 'system' : '';
+        if (!stream || msg.subscription_id !== hostResourceSubscriptionRef.current
+          || msg.request_id !== hostResourceHistoryRequestRef.current[stream]) return;
+        const points = Array.isArray(chunk.points) ? chunk.points : [];
+        if (stream === 'system') {
+          setHostResourceHistory(previous => mergeOrderedHostResourceFrames(previous, points, HOST_RESOURCE_HISTORY_LIMIT));
+        } else {
+          setHostResourceDetails(previous => mergeOrderedHostResourceFrames(previous, points, HOST_RESOURCE_DETAIL_LIMIT));
+          const latest = points.filter(point => point && typeof point === 'object')
+            .sort((left, right) => Number(left.sample_sequence || 0) - Number(right.sample_sequence || 0)).at(-1);
+          if (latest) setHostResources(latest);
+        }
+        const nextSequence = Math.max(
+          hostResourceHistoryCursorRef.current[stream],
+          Math.round(Number(chunk.next_sequence) || 0),
+        );
+        hostResourceHistoryCursorRef.current[stream] = nextSequence;
+        hostResourceHistoryRequestRef.current[stream] = '';
+        if (chunk.done !== true) requestHostResourceHistory(stream, nextSequence);
+        return;
+      }
+      if (t === 'host_resource_live') {
+        const point = msg.point;
+        const sequence = Number(point?.sample_sequence);
+        if (msg.subscription_id !== hostResourceSubscriptionRef.current
+          || !Number.isSafeInteger(sequence)
+          || sequence <= hostResourceLastLiveSequenceRef.current.system) return;
+        hostResourceLastLiveSequenceRef.current.system = sequence;
+        hostResourceHistoryCursorRef.current.system = Math.max(hostResourceHistoryCursorRef.current.system, sequence);
+        setHostResourceHistory(previous => mergeOrderedHostResourceFrames(previous, point, HOST_RESOURCE_HISTORY_LIMIT));
+        setHostResourceError(null);
+        return;
+      }
+      if (t === 'host_resource_detail') {
+        const snapshot = msg.snapshot;
+        const sequence = Number(snapshot?.sample_sequence);
+        if (msg.subscription_id !== hostResourceSubscriptionRef.current
+          || !Number.isSafeInteger(sequence)
+          || sequence <= hostResourceLastLiveSequenceRef.current.detail) return;
+        hostResourceLastLiveSequenceRef.current.detail = sequence;
+        hostResourceHistoryCursorRef.current.detail = Math.max(hostResourceHistoryCursorRef.current.detail, sequence);
+        setHostResourceDetails(previous => mergeOrderedHostResourceFrames(previous, snapshot, HOST_RESOURCE_DETAIL_LIMIT));
+        setHostResources(snapshot);
+        setHostResourceError(null);
+        return;
+      }
+      if (t === 'host_resource_unsubscribed') {
+        if (msg.subscription_id && msg.subscription_id !== hostResourceSubscriptionRef.current) return;
+        return;
+      }
+      if (t === 'host_resource_error') {
+        setHostResourceError({
+          code: msg.code || 'unavailable',
+          message: msg.message || 'Windows host metrics are unavailable.',
+        });
+        return;
+      }
+      if (t === 'semantic_notification') {
+        setSemanticNotifications(previous => mergeSemanticNotifications(previous, msg));
         return;
       }
       if (!startupReady.current && !msg.request_id && STARTUP_DEFERRED_RELAY_TYPES.has(t)) {
         const id = msg.session || msg.session_id || 'global';
         const source = t === 'history_chunk' ? (msg.source || 'native') : '';
         startupDeferredMessages.current.set(`${t}:${id}:${source}`, msg);
+        while (startupDeferredMessages.current.size > 256) {
+          startupDeferredMessages.current.delete(startupDeferredMessages.current.keys().next().value);
+        }
         return;
       }
 
       // ── Session list (legacy) ───────────────────────────────────────────────
       if (t === 'session_list') {
         clearRemovedSessionActivity(msg.sessions || []);
-        setSessions(prev => sameSessionList(prev, msg.sessions || []) ? prev : (msg.sessions || []));
+        setSessionRegistry(prev => reconcileSessionRegistry(prev, msg.sessions || []));
         mergeSessionMetadataActivity(msg.sessions || []);
         mergeSessionConfigHints(msg.sessions || []);
         mergeSessionChatLists(msg.sessions || []);
@@ -1129,14 +1810,14 @@ export function useRelay() {
             });
           }
         });
-        if (Array.isArray(msg.workspaces)) setWorkspaces(prev => sameSessionList(prev, msg.workspaces) ? prev : msg.workspaces);
+        if (Array.isArray(msg.workspaces)) setWorkspaces(prev => sessionRegistryValueEqual(prev, msg.workspaces) ? prev : msg.workspaces);
         return;
       }
 
       // ── Session snapshot (v1) ───────────────────────────────────────────────
       if (t === 'session_snapshot' || t === 'proxy_session_snapshot') {
         clearRemovedSessionActivity(msg.sessions || []);
-        setSessions(prev => sameSessionList(prev, msg.sessions || []) ? prev : (msg.sessions || []));
+        setSessionRegistry(prev => reconcileSessionRegistry(prev, msg.sessions || []));
         mergeSessionMetadataActivity(msg.sessions || []);
         mergeSessionConfigHints(msg.sessions || []);
         mergeSessionChatLists(msg.sessions || []);
@@ -1158,11 +1839,17 @@ export function useRelay() {
       // ── connection_ack may include initial session list + health snapshot ────
       if (t === 'connection_ack') {
         startRelayHeartbeat(msg);
+        if (Array.isArray(msg.semantic_notifications)) {
+          setSemanticNotifications(previous => mergeSemanticNotifications(previous, msg.semantic_notifications));
+        }
         flushOfflineSendQueue();
+        refreshScheduledSends().catch(() => {});
         setDuplicateProxyAlarms(Array.isArray(msg.duplicate_proxy_alarms) ? msg.duplicate_proxy_alarms : []);
         setNightlyValidationFailures(Array.isArray(msg.nightly_validation_failures) ? msg.nightly_validation_failures : []);
+        setLatestAppUpdateValidation(msg.latest_app_update_validation || null);
+        if (msg.provider_usage && typeof msg.provider_usage === 'object') setProviderUsage(msg.provider_usage);
         if (msg.sessions && msg.sessions.length > 0) {
-          setSessions(prev => sameSessionList(prev, msg.sessions) ? prev : msg.sessions);
+          setSessionRegistry(prev => reconcileSessionRegistry(prev, msg.sessions));
           mergeSessionMetadataActivity(msg.sessions);
           mergeSessionConfigHints(msg.sessions);
           mergeSessionChatLists(msg.sessions);
@@ -1178,7 +1865,7 @@ export function useRelay() {
             }
           });
         }
-        if (Array.isArray(msg.workspaces)) setWorkspaces(prev => sameSessionList(prev, msg.workspaces) ? prev : msg.workspaces);
+        if (Array.isArray(msg.workspaces)) setWorkspaces(prev => sessionRegistryValueEqual(prev, msg.workspaces) ? prev : msg.workspaces);
         if (msg.session_health) {
           const h = {};
           Object.entries(msg.session_health).forEach(([id, v]) => {
@@ -1211,10 +1898,89 @@ export function useRelay() {
         return;
       }
 
+      if (t === 'session_patch') {
+        const id = msg.session || msg.session_id;
+        if (!id) return;
+        setSessionRegistry(prev => patchSessionRegistry(prev, msg));
+        const patch = msg.patch && typeof msg.patch === 'object' ? msg.patch : {};
+        const projected = { session_id: id, ...patch };
+        if (patch.activity) mergeSessionMetadataActivity([projected]);
+        if (patch.model_id !== undefined || patch.permission_mode !== undefined || patch.capabilities !== undefined) {
+          mergeSessionConfigHints([projected]);
+        }
+        if (patch.chat_list) mergeSessionChatLists([projected]);
+        if (patch.status) mergeSessionHealth([projected]);
+        return;
+      }
+
       // ── Session health update ────────────────────────────────────────────────
       if (t === 'session_health') {
         const id = msg.session || msg.session_id;
         if (id) setHealth(prev => ({ ...prev, [id]: msg.health }));
+        return;
+      }
+
+      if (t === 'scheduled_send_status') {
+        mergeScheduledSend(msg.scheduled_send);
+        return;
+      }
+
+      if (t === 'session_summary') {
+        const id = msg.session || msg.session_id;
+        if (!id) return;
+        setSessions(prev => prev.map(session => {
+          const sessionId = typeof session === 'string' ? session : session?.session_id;
+          if (sessionId !== id) return session;
+          return {
+            ...(typeof session === 'object' ? session : {}),
+            session_id: id,
+            ...(msg.status ? { status: msg.status } : {}),
+            ...(msg.activity ? { activity: msg.activity } : {}),
+            ...(msg.goal ? { goal: msg.goal } : {}),
+            ...(msg.last_snippet != null ? { last_snippet: msg.last_snippet } : {}),
+            ...(msg.last_message_at != null ? { last_message_at: msg.last_message_at } : {}),
+            ...sessionChatTitleMetadataPatch(msg),
+          };
+        }));
+        if (msg.status) setHealth(prev => ({ ...prev, [id]: msg.status }));
+        if (msg.activity) {
+          const kind = String(msg.activity.kind || 'idle').toLowerCase();
+          handleRelayMessage({
+            type: 'status',
+            session: id,
+            activity: msg.activity,
+            activity_trace: msg.activity_trace,
+            thinking: ['thinking', 'generating', 'running_command', 'applying_patch', 'reading_files', 'working'].includes(kind),
+            label: msg.activity.label || '',
+          });
+        }
+        if (Number(msg.unread_delta) > 0 && id !== activeSessionRef.current) {
+          setUnread(prev => ({ ...prev, [id]: (prev[id] || 0) + Number(msg.unread_delta) }));
+        }
+        return;
+      }
+
+      if (t === 'message_delta') {
+        const id = msg.session_id || msg.session;
+        if (!id) return;
+        const reduced = reduceMessageDeltaStream(provisionalStreamsRef.current[id] || null, msg);
+        if (!reduced.accepted) return;
+        publishProvisionalStream(id, reduced.stream, msg.stream_trace || null);
+        return;
+      }
+
+      if (t === 'transcript_resync_required') {
+        const id = msg.session_id || msg.session;
+        if (!id || id !== activeSessionRef.current) return;
+        const currentChunkState = historyChunkState.current[id] || {};
+        historyChunkState.current[id] = { ...currentChunkState, inFlight: false };
+        clearTimeout(historyChunkTimers.current[id]);
+        delete historyChunkTimers.current[id];
+        requestHistoryChunk(id, {
+          mode: 'tail',
+          source: 'relay_sqlite',
+          replace: true,
+        });
         return;
       }
 
@@ -1241,6 +2007,7 @@ export function useRelay() {
           });
           return;
         }
+        if (!msg.partial && (!msg.mode || msg.mode === 'full')) clearProvisionalStream(id);
         const nextMessages = msg.messages || [];
         const priorHistoryMeta = historyMeta[id] || null;
         const forceCursorIdentityReplace = !!pendingCursorThreadHistoryReset.current[id]
@@ -1272,7 +2039,7 @@ export function useRelay() {
             limit: msg.limit || null,
             mode: shouldMergeTailSnapshot ? (prev[id]?.mode || 'chunked') : (msg.mode || (msg.partial ? 'tail' : 'full')),
           };
-          if (JSON.stringify(prev[id] || null) === JSON.stringify(nextMeta)) return prev;
+          if (sessionRegistryValueEqual(prev[id] || null, nextMeta)) return prev;
           return { ...prev, [id]: nextMeta };
         });
         setHistoryLoading(prev => {
@@ -1325,19 +2092,21 @@ export function useRelay() {
           }));
           return;
         }
-        const mode = msg.mode === 'older' ? 'older' : 'tail';
+        const mode = msg.mode === 'older' ? 'older' : msg.mode === 'around' ? 'around' : 'tail';
         const cursor = msg.cursor || {};
         const nextBeforeOffset = cursor.next_before_offset ?? null;
         const nextBeforeId = cursor.next_before_id ?? null;
         const hasMore = !!(msg.partial && (nextBeforeOffset != null || nextBeforeId != null));
         const incoming = Array.isArray(msg.messages) ? msg.messages : [];
-        const replaceTail = mode === 'tail' && msg.replace === true;
+        const replaceTail = mode === 'around' || (mode === 'tail' && msg.replace === true);
         const estimatedMessages = replaceTail ? incoming : mergeHistoryChunk(messages[id], incoming, mode);
         const estimatedLength = estimatedMessages.length;
         setMessages(prev => {
           const merged = removeSupersededCliTranscriptPlaceholders(
             preserveOptimisticMessagesAcrossHistory(
-              replaceTail ? incoming : mergeHistoryChunk(prev[id], incoming, mode),
+              replaceTail
+                ? reconcileHistoryTailReplacement(prev[id], incoming, currentChunkState, msg.source)
+                : mergeHistoryChunk(prev[id], incoming, mode),
               prev[id],
             )
           );
@@ -1359,7 +2128,7 @@ export function useRelay() {
             bytes_total: cursor.total_bytes || 0,
           };
           delete nextMeta.error;
-          if (JSON.stringify(prev[id] || null) === JSON.stringify(nextMeta)) return prev;
+          if (sessionRegistryValueEqual(prev[id] || null, nextMeta)) return prev;
           return { ...prev, [id]: nextMeta };
         });
         setHistoryLoading(prev => {
@@ -1426,6 +2195,11 @@ export function useRelay() {
         const activityKind = msg.activity?.kind || '';
         const isThinking = msg.thinking
           || ['thinking', 'generating', 'running_command', 'applying_patch', 'reading_files', 'working'].includes(activityKind);
+        if (shouldClearEmptyProvisionalOnTerminal(
+          provisionalStreamsRef.current[id],
+          msg.activity || (!isThinking ? { kind: 'idle' } : null),
+          isThinking,
+        )) clearProvisionalStream(id);
         const label = msg.label || msg.activity?.label || (activityKind === 'idle' ? '' : 'Thinking');
         const activity = isThinking || msg.activity
           ? {
@@ -1435,9 +2209,14 @@ export function useRelay() {
               startedAt: msg.activity?.started_at || null,
               interruptHint: msg.activity?.interrupt_hint || '',
               goal: msg.activity?.goal || null,
+              thinking: msg.activity?.thinking || null,
+              current: msg.activity?.current || null,
+              step: msg.activity?.step || null,
+              usage: msg.activity?.usage || null,
               task_list: msg.activity?.task_list || null,
               context_card: msg.activity?.context_card || null,
-              thinkingContent: msg.activity?.thinkingContent || '',
+              thinkingContent: msg.activity?.thinking?.text || msg.activity?.thinkingContent || '',
+              transport: normalizeFleetActivityTrace(msg.activity_trace),
             }
           : false;
         if (isThinking) {
@@ -1445,7 +2224,7 @@ export function useRelay() {
           setThinking(prev => Object.is(prev[id], label) ? prev : ({ ...prev, [id]: label }));
           setActivities(prev => shallowMapMerge(prev, { [id]: activity }));
           // Store Claude Code thinking content text
-          const nextThinkingContent = msg.thinking_content ?? msg.activity?.thinkingContent;
+          const nextThinkingContent = msg.activity?.thinking?.text ?? msg.thinking_content ?? msg.activity?.thinkingContent;
           if (nextThinkingContent != null) {
             setThinkingContent(prev => Object.is(prev[id], nextThinkingContent) ? prev : ({ ...prev, [id]: nextThinkingContent }));
           }
@@ -1453,11 +2232,11 @@ export function useRelay() {
           clearTimeout(thinkingTimers.current[id]);
           setThinking(prev => prev[id] === false ? prev : ({ ...prev, [id]: false }));
           setActivities(prev => {
-            const nextActivity = msg.activity?.goal || msg.activity?.task_list ? activity : false;
+            const nextActivity = activity;
             return Object.is(prev[id], nextActivity) ? prev : ({ ...prev, [id]: nextActivity });
           });
           setThinkingContent(prev => prev[id] === '' ? prev : ({ ...prev, [id]: '' }));
-        } else if (msg.activity?.goal || msg.activity?.task_list) {
+        } else if (msg.activity?.goal || msg.activity?.task_list || msg.activity?.step || msg.activity?.usage) {
           clearTimeout(thinkingTimers.current[id]);
           setThinking(prev => prev[id] === false ? prev : ({ ...prev, [id]: false }));
           setActivities(prev => shallowMapMerge(prev, { [id]: activity }));
@@ -1469,6 +2248,7 @@ export function useRelay() {
             setThinkingContent(prev => prev[id] === '' ? prev : ({ ...prev, [id]: '' }));
           }, 4000);
         }
+        recordStreamTraceAfterPaint(msg, id);
         return;
       }
 
@@ -1539,6 +2319,11 @@ export function useRelay() {
         return;
       }
 
+      if (t === 'app_update_validation_status') {
+        setLatestAppUpdateValidation(msg.validation || null);
+        return;
+      }
+
       // ── Skill list (Codex Desktop) ────────────────────────────────────────
       if (t === 'skill_list') {
         const sid = msg.session_id || msg.session;
@@ -1576,7 +2361,7 @@ export function useRelay() {
       // ── File content (file browser) ──────────────────────────────────────
       if (t === 'file_content') {
         const sid = msg.session_id || msg.session;
-        if (sid) setFileContents(prev => ({ ...prev, [`${sid}:${msg.path}`]: { path: msg.path, content: msg.content, truncated: msg.truncated } }));
+        if (sid) setFileContents(prev => boundedRecordWith(prev, `${sid}:${msg.path}`, { path: msg.path, content: msg.content, truncated: msg.truncated }));
         return;
       }
 
@@ -1606,9 +2391,11 @@ export function useRelay() {
       if (t === 'agent_control_result') {
         const sid = msg.session_id || msg.session;
         if (msg.request_id) {
-          setControlResults(prev => ({ ...prev, [msg.request_id]: { ...msg, received_at: Date.now() } }));
+          setControlResults(prev => boundedRecordWith(prev, msg.request_id, { ...msg, received_at: Date.now() }));
           const pendingEntry = Object.entries(configControlStatesRef.current)
-            .find(([, transaction]) => transaction.requestId === msg.request_id);
+            .find(([, transaction]) => transaction.requestId === msg.request_id
+              && transaction.sessionId === sid
+              && ['pending', 'awaiting_config'].includes(transaction.status));
           if (pendingEntry) {
             const [key, transaction] = pendingEntry;
             if (msg.result === 'failed') {
@@ -1624,6 +2411,12 @@ export function useRelay() {
           // successful same-session thread creation. Do not start a later
           // empty-store fetch that can leave the new draft stuck loading.
           clearSessionTranscript(sid);
+        }
+        if (sid && msg.result === 'ok' && ['new_thread', 'switch_thread'].includes(msg.command)) {
+          requestThreadList(sid);
+        }
+        if (sid && msg.result === 'ok' && msg.command === 'switch_chat') {
+          requestChatList(sid);
         }
         if (msg.command === 'permission_response' && sid) {
           if (msg.result === 'ok') {
@@ -1648,71 +2441,108 @@ export function useRelay() {
       // ── Delivery ack / failure ───────────────────────────────────────────────
       if (t === 'message_accepted') {
         const cid = msg.client_message_id;
+        const sid = msg.session_id || msg.session;
+        if (cid && sid) trackDeliverySession(cid, sid);
+        const storedStatus = ['accepted', 'delivered', 'agent_started', 'failed'].includes(msg.status)
+          ? msg.status
+          : 'accepted';
+        const persistedStatus = storedStatus === 'accepted' && msg.launch_accepted_at
+          ? 'launch_accepted'
+          : storedStatus;
+        if (cid && persistedStatus === 'failed') {
+          markDeliveryFailed(cid, msg.failure_code || 'Send failed', sid);
+          return;
+        }
         // Don't overwrite busy_queued or steered — those are higher-priority states
         const current = cid ? deliveryStatesRef.current[cid] : null;
-        if (cid && !['busy_queued', 'steered', 'delivered', 'agent_started'].includes(current)) {
-          setTrackedDeliveryState(cid, 'accepted');
-          armDeliveryTimeout(cid, 'accepted', 'Relay accepted the message, but native delivery timed out.');
+        if (cid && !['busy_queued', 'steered', 'launch_accepted', 'delivered', 'agent_started'].includes(current)) {
+          setTrackedDeliveryState(cid, persistedStatus);
+          if (persistedStatus === 'accepted') {
+            armDeliveryTimeout(cid, 'accepted', 'Relay accepted the message, but native delivery timed out.');
+          } else if (persistedStatus === 'launch_accepted') {
+            armDeliveryTimeout(cid, 'launch_accepted', 'The native launch was accepted, but no native user turn was observed.');
+          } else if (persistedStatus === 'delivered') {
+            armDeliveryTimeout(cid, 'delivered', 'Message reached the agent, but agent activity did not start in time.');
+          } else {
+            clearDeliveryTimeout(cid);
+          }
         }
         if (cid) {
-          setMessages(prev => {
-            const next = { ...prev };
-            Object.keys(next).forEach(sessionId => {
-              next[sessionId] = (next[sessionId] || []).map(m => (
-                m._cid === cid ? { ...m, ts: msg.ts || m.ts || Date.now(), _sendError: null } : m
-              ));
-            });
-            return next;
-          });
+          updateTrackedDeliveryMessage(cid, sid, message => normalizeMessageTimestamp({
+            ...message,
+            ...(msg.created_at != null ? { created_at: msg.created_at } : {}),
+            ...(msg.timestamp != null ? { timestamp: msg.timestamp } : {}),
+            ...(msg.ts != null ? { ts: msg.ts } : {}),
+            ...(msg.launch_accepted_at != null ? { _launchAcceptedAt: msg.launch_accepted_at } : {}),
+            _delivered: persistedStatus === 'delivered' || persistedStatus === 'agent_started',
+            _agentStarted: persistedStatus === 'agent_started',
+            _sendError: null,
+          }));
+        }
+        return;
+      }
+
+      if (t === 'proxy_send_result' && msg.result === 'launch_accepted') {
+        const cid = msg.client_message_id;
+        const sid = msg.session_id || msg.session;
+        if (cid && sid) trackDeliverySession(cid, sid);
+        if (cid && !['delivered', 'agent_started'].includes(deliveryStatesRef.current[cid])) {
+          setTrackedDeliveryState(cid, 'launch_accepted');
+          armDeliveryTimeout(cid, 'launch_accepted', 'The native launch was accepted, but no native user turn was observed.');
+          updateTrackedDeliveryMessage(cid, sid, message => ({
+            ...message,
+            _launchAcceptedAt: msg.accepted_at || new Date().toISOString(),
+            _sendError: null,
+          }));
         }
         return;
       }
 
       if (t === 'message_delivered' || (t === 'proxy_send_result' && msg.result === 'delivered')) {
         const cid = msg.client_message_id;
+        const sid = msg.session_id || msg.session;
+        if (cid && sid) trackDeliverySession(cid, sid);
         if (cid && deliveryStatesRef.current[cid] !== 'agent_started') {
           setTrackedDeliveryState(cid, 'delivered');
           armDeliveryTimeout(cid, 'delivered', 'Message reached the agent, but agent activity did not start in time.');
         }
         if (cid) {
-          setMessages(prev => {
-            const next = { ...prev };
-            Object.keys(next).forEach(sessionId => {
-              next[sessionId] = (next[sessionId] || []).map(m => (
-                m._cid === cid ? { ...m, _delivered: true, _sendError: null } : m
-              ));
-            });
-            return next;
-          });
+          updateTrackedDeliveryMessage(cid, sid, message => ({
+            ...message,
+            _delivered: true,
+            _sendError: null,
+          }));
         }
         return;
       }
 
       if (t === 'agent_started') {
         const cid = msg.client_message_id;
+        const sid = msg.session_id || msg.session;
+        if (cid && sid) trackDeliverySession(cid, sid);
         if (cid) {
           clearDeliveryTimeout(cid);
           setTrackedDeliveryState(cid, 'agent_started');
         }
+        if (sid) openProvisionalStream(sid, cid || null);
         if (cid) {
-          setMessages(prev => {
-            const next = { ...prev };
-            Object.keys(next).forEach(sessionId => {
-              next[sessionId] = (next[sessionId] || []).map(m => (
-                m._cid === cid ? { ...m, _delivered: true, _agentStarted: true, _sendError: null } : m
-              ));
-            });
-            return next;
-          });
+          updateTrackedDeliveryMessage(cid, sid, message => ({
+            ...message,
+            _delivered: true,
+            _agentStarted: true,
+            _sendError: null,
+          }));
         }
         return;
       }
 
       if (t === 'message_failed' || (t === 'proxy_send_result' && msg.result === 'failed')) {
         const cid = msg.client_message_id;
+        const sid = msg.session_id || msg.session;
+        if (sid) clearProvisionalStream(sid);
         if (cid) {
           const failureReason = msg.reason || msg.message || msg.error?.message || 'Send failed';
-          markDeliveryFailed(cid, failureReason);
+          markDeliveryFailed(cid, failureReason, sid);
         }
         return;
       }
@@ -1722,12 +2552,19 @@ export function useRelay() {
         const cid = msg.client_message_id;
         const sid = msg.session_id || msg.session;
         if (cid) {
+          const contentBlocks = Array.isArray(msg.content_blocks) ? msg.content_blocks : [];
+          const queuedBlock = contentBlocks.find(block => block?.type === 'queued_message');
           clearDeliveryTimeout(cid);
           setTrackedDeliveryState(cid, 'busy_queued');
           if (sid) {
             setQueuedMessages(prev => ({
               ...prev,
-              [sid]: [...(prev[sid] || []), { cid, content: msg.content, queuedAt: msg.queued_at }],
+              [sid]: [...(prev[sid] || []), {
+                cid,
+                content: queuedBlock?.content ?? msg.content,
+                content_blocks: contentBlocks,
+                queuedAt: msg.queued_at,
+              }],
             }));
           }
         }
@@ -1751,7 +2588,7 @@ export function useRelay() {
             setTrackedDeliveryState(cid, 'steered');
             armDeliveryTimeout(cid, 'steered', 'Message was steered, but agent activity did not start in time.');
           } else {
-            markDeliveryFailed(cid, msg.error?.message || msg.error || 'The desktop proxy rejected the message.');
+            markDeliveryFailed(cid, msg.error?.message || msg.error || 'The desktop proxy rejected the message.', sid);
           }
           if (sid) setQueuedMessages(prev => ({ ...prev, [sid]: (prev[sid] || []).filter(m => m.cid !== cid) }));
         }
@@ -1769,7 +2606,8 @@ export function useRelay() {
             const existing = (prev[sid] || []).filter(m => m.cid && m.cid.startsWith('cmsg-'));
             const native = items.map((item, i) => ({
               cid: `native-${i}`,
-              content: item.text,
+              content: item.content_blocks?.find(block => block?.type === 'queued_message')?.content ?? item.text,
+              content_blocks: Array.isArray(item.content_blocks) ? item.content_blocks : [],
               native: true,
               nativeIndex: item.index,
               status: item.state || 'queued',
@@ -1831,10 +2669,11 @@ export function useRelay() {
         const reqId = msg.request_id;
         const error = msg.reason || msg.error || 'Launch failed';
         if (reqId) {
-          setLaunchStates(prev => ({
-            ...prev,
-            [reqId]: { ...prev[reqId], status: 'failed', error },
-          }));
+          setLaunchStates(prev => boundedRecordWith(
+            prev,
+            reqId,
+            { ...prev[reqId], status: 'failed', error },
+          ));
         }
         return;
       }
@@ -1855,7 +2694,27 @@ export function useRelay() {
         const contentBlocks = Array.isArray(msg.content_blocks)
           ? msg.content_blocks
           : (Array.isArray(msg.message?.content_blocks) ? msg.message.content_blocks : null);
+        const clientMessageId = msg.client_message_id || msg.message?.client_message_id || null;
+        const deliveryStatus = msg.status || msg.message?.status || null;
+        const nativeDelivered = deliveryStatus === 'delivered' || deliveryStatus === 'agent_started';
         if (!id || !role || !content) return;
+        if (role === 'assistant') clearProvisionalStream(id);
+        const incomingMessage = normalizeMessageTimestamp({
+          role,
+          content,
+          ...(contentBlocks ? { content_blocks: contentBlocks } : {}),
+          ...(msg.source_message_id ? { source_message_id: msg.source_message_id } : {}),
+          ...(msg.native_source_id ? { native_source_id: msg.native_source_id } : {}),
+          ...(msg.source_cursor ? { source_cursor: msg.source_cursor } : {}),
+          ...(msg.source ? { source: msg.source } : {}),
+          ...(msg.server_message_id != null ? { server_message_id: msg.server_message_id } : {}),
+          ...(clientMessageId ? { client_message_id: clientMessageId } : {}),
+          ...(deliveryStatus ? { status: deliveryStatus } : {}),
+          ...(msg.sequence != null ? { sequence: msg.sequence } : {}),
+          ...(msg.created_at != null ? { created_at: msg.created_at } : {}),
+          ...(msg.timestamp != null ? { timestamp: msg.timestamp } : {}),
+          ...(msg.ts != null ? { ts: msg.ts } : {}),
+        });
 
         setMessages(prev => {
           const existing = prev[id] || [];
@@ -1863,31 +2722,55 @@ export function useRelay() {
             // Replace a matching optimistic message with the confirmed real one.
             // Preserve _cid and _optimistic so delivery state tracking (queued/steer)
             // continues to work after the relay echoes the message back.
-            const idx = existing.findIndex(m => m._optimistic && m.content === content);
+            const idx = existing.findIndex(m => m._optimistic && (
+              (clientMessageId && m._cid === clientMessageId)
+              || (!clientMessageId && m.content === content)
+            ));
             if (idx >= 0) {
               const updated = [...existing];
               const prev_msg = existing[idx];
-              updated[idx] = {
+              updated[idx] = normalizeMessageTimestamp({
+                ...prev_msg,
                 role,
                 content,
                 ...(contentBlocks ? { content_blocks: contentBlocks } : {}),
-                ts: msg.ts || prev_msg.ts || Date.now(),
-                _delivered: true,
+                ...(incomingMessage.source_message_id ? { source_message_id: incomingMessage.source_message_id } : {}),
+                ...(incomingMessage.native_source_id ? { native_source_id: incomingMessage.native_source_id } : {}),
+                ...(incomingMessage.source_cursor ? { source_cursor: incomingMessage.source_cursor } : {}),
+                ...(incomingMessage.source ? { source: incomingMessage.source } : {}),
+                ...(incomingMessage.server_message_id != null ? { server_message_id: incomingMessage.server_message_id } : {}),
+                ...(incomingMessage.client_message_id ? { client_message_id: incomingMessage.client_message_id } : {}),
+                ...(incomingMessage.status ? { status: incomingMessage.status } : {}),
+                ...(incomingMessage.sequence != null ? { sequence: incomingMessage.sequence } : {}),
+                ...(incomingMessage.created_at != null ? { created_at: incomingMessage.created_at } : {}),
+                ...(incomingMessage.timestamp != null ? { timestamp: incomingMessage.timestamp } : {}),
+                ...(incomingMessage.ts != null ? { ts: incomingMessage.ts } : {}),
+                _delivered: prev_msg._delivered || nativeDelivered,
+                _agentStarted: prev_msg._agentStarted || deliveryStatus === 'agent_started',
                 _cid: prev_msg._cid,
                 _optimistic: prev_msg._optimistic,
-              };
+              });
               return { ...prev, [id]: removeSupersededCliTranscriptPlaceholders(updated) };
             }
           }
-          // Deduplicate: skip if any existing message already has this exact role + content
-          if (existing.some(m => m.role === role && m.content === content)) {
+          const stableIncomingId = stableHistoryMessageId(incomingMessage);
+          if (existing.some(message => (
+            stableIncomingId
+              ? stableHistoryMessageId(message) === stableIncomingId
+              : message.role === role && message.content === content
+          ))) {
             return prev;
           }
           return {
             ...prev,
             [id]: removeSupersededCliTranscriptPlaceholders([
               ...existing,
-              { role, content, ...(contentBlocks ? { content_blocks: contentBlocks } : {}), ts: msg.ts || Date.now(), _delivered: role === 'user' },
+              {
+                ...incomingMessage,
+                ...(role === 'user' && clientMessageId ? { _cid: clientMessageId } : {}),
+                _delivered: role === 'user' && nativeDelivered,
+                _agentStarted: role === 'user' && deliveryStatus === 'agent_started',
+              },
             ]),
           };
         });
@@ -1904,7 +2787,7 @@ export function useRelay() {
     // where `sessions` / `messages` would be frozen at initial render values).
     handleRelayMessageRef.current = handleRelayMessage;
 
-    return { sessions, messages, historyMeta, historyLoading, connected, connectionHealth, unread, setUnread, thinking, thinkingContent, activities, health, deliveryStates, launchStates, justLaunched, setJustLaunched, permissionPrompts, respondToPrompt, errorPrompts, respondToErrorPrompt, interruptSession, agentConfigs, configControlStates, requestAgentConfig, setAgentModel, setAgentEffort, setAgentPermissionMode, setAutoApprovePermissions, setAntigravityMode, setCodexConfig, newThread, openPanel, openNativeWindow, requestChatList, switchChat, newChat, chatLists, requestThreadList, switchThread, threadLists, switchWorkspace, requestTerminalOutput, sendTerminalInput, terminalOutputs, requestFileChanges, respondToFileChange, fileChanges, sendAttachment, send, sendToSession, steerMessage, discardQueuedMessage, editQueuedMessage, queuedMessages, launchSession, resumeSession, closeSession, activeSessionRef, workspaces, branchLists, requestBranchList, switchBranch, createBranch, skillLists, requestSkillList, automationViews, showCodexAutomation, controlResults, directoryListings, requestDirectoryListing, fileContents, requestFileContent, requestHistory, requestHistoryChunk, duplicateProxyAlarms, nightlyValidationFailures };
+    return { sessions, messages, provisionalStreams, historyMeta, historyLoading, connected, connectionHealth, unread, setUnread, thinking, thinkingContent, activities, health, deliveryStates, launchStates, justLaunched, setJustLaunched, permissionPrompts, respondToPrompt, errorPrompts, respondToErrorPrompt, interruptSession, agentConfigs, configControlStates, requestAgentConfig, setAgentModel, setAgentEffort, setAgentPermissionMode, setAutoApprovePermissions, setAntigravityMode, setCodexConfig, newThread, openPanel, openNativeWindow, requestChatList, switchChat, newChat, chatLists, requestThreadList, switchThread, threadLists, switchWorkspace, requestTerminalOutput, sendTerminalInput, terminalOutputs, requestFileChanges, respondToFileChange, fileChanges, sendAttachment, send, sendToSession, steerMessage, discardQueuedMessage, editQueuedMessage, queuedMessages, scheduledSends, scheduleSend, cancelScheduledSend, refreshScheduledSends, launchSession, resumeSession, closeSession, activeSessionRef, restoreCachedTranscript, setSessionSubscriptions, workspaces, branchLists, requestBranchList, switchBranch, createBranch, skillLists, requestSkillList, automationViews, showCodexAutomation, controlResults, directoryListings, requestDirectoryListing, fileContents, requestFileContent, requestHistory, requestHistoryChunk, duplicateProxyAlarms, nightlyValidationFailures, latestAppUpdateValidation, providerUsage, providerUsageRefreshReceipt, requestProviderUsageRefresh, providerUsageCostDetail, requestProviderUsageCostDetail, hostResources, hostResourceError, hostResourceHistory, hostResourceDetails, hostResourceSubscription, subscribeHostResources, unsubscribeHostResources, requestHostResourceRefresh, clearHostResources, semanticNotifications };
   }
 
 // (removed window.useRelay — now an ES module export)

@@ -19,6 +19,7 @@ const stages = [
   ['Session store syntax', process.execPath, ['--check', 'agent-proxy/session-store.js']],
   ['Protocol syntax', process.execPath, ['--check', 'agent-proxy/protocol.js']],
   ['Codex CLI parser and status smoke', process.execPath, ['tools/codex-cli-parser-smoke.js']],
+  ['Canonical goal, thinking, and current-output timeline smoke', process.execPath, ['tools/live-activity-timeline-smoke.js']],
   ['Codex CLI controls and native launch smoke', process.execPath, ['tools/codex-cli-controls-smoke.js']],
   ['Frontend history reconnect smoke', process.execPath, ['tools/frontend-history-reconnect-smoke.js']],
   ['Frontend transcript fidelity smoke', process.execPath, ['tools/frontend-transcript-fidelity-smoke.js']],

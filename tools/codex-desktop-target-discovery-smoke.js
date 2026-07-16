@@ -2,10 +2,12 @@
 'use strict';
 
 const assert = require('assert');
+const { sessionNoiseMetadata } = require('../agent-proxy/session-noise-policy');
 const {
   codexDesktopThreadKeysMatch,
   isDesktopAppPage,
   isStoredDesktopTargetCanonical,
+  resolveCodexDesktopThreadMetadata,
   shouldRestoreCodexDesktopAccumulator,
 } = require('../agent-proxy/proxy-engine');
 
@@ -45,6 +47,36 @@ const stableThreadId = 'local:019f4b6a-f61c-7db3-ba89-284406bbeefe';
 const engine = Object.create(require('../agent-proxy/proxy-engine').ProxyEngine.prototype);
 assert.equal(codexDesktopThreadKeysMatch(`${stableThreadId}:Legacy normalized title`, stableThreadId), true);
 assert.equal(codexDesktopThreadKeysMatch('local:different-thread', stableThreadId), false);
+let lookedUpCliSessionId = '';
+const refreshedMetadata = resolveCodexDesktopThreadMetadata(
+  stableThreadId,
+  'goal Restore harness controls',
+  (cliSessionId, options) => {
+    lookedUpCliSessionId = cliSessionId;
+    assert.deepEqual(options, { includeMessages: false });
+    return {
+      workspacePath: 'C:\\Users\\Robert\\Documents\\Remote Agent Chat',
+      workspaceName: 'Remote Agent Chat',
+      title: 'archive title',
+    };
+  },
+);
+assert.equal(lookedUpCliSessionId, '019f4b6a-f61c-7db3-ba89-284406bbeefe');
+assert.deepEqual(refreshedMetadata, {
+  cliSessionId: '019f4b6a-f61c-7db3-ba89-284406bbeefe',
+  workspacePath: 'C:\\Users\\Robert\\Documents\\Remote Agent Chat',
+  workspaceName: 'Remote Agent Chat',
+  chatTitle: 'goal Restore harness controls',
+}, 'the active native thread must replace a stale persisted workspace with its exact JSONL metadata');
+assert.equal(
+  sessionNoiseMetadata({ workspace_path: refreshedMetadata.workspacePath }).is_test_session,
+  false,
+  'the refreshed Remote Agent Chat workspace must remain visible in the default operator session list',
+);
+assert.equal(
+  resolveCodexDesktopThreadMetadata('local:not-a-session-id', '', () => assert.fail('invalid keys must not scan sessions')),
+  null,
+);
 assert.equal(engine._codexDesktopRestoreWindowMatches(
   [
     { role: 'user', content: 'retained user turn' },

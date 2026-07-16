@@ -1,16 +1,17 @@
 import React, {
-  useCallback, useEffect, useLayoutEffect, useRef, useState,
+  useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState,
 } from 'react';
 import {
   View, FlatList, TextInput, TouchableOpacity,
   Text, StyleSheet, KeyboardAvoidingView, Platform,
-  ActivityIndicator, Keyboard, Image, Alert,
+  ActivityIndicator, Keyboard, Image, Alert, Share,
 } from 'react-native';
 import * as ImagePicker    from 'expo-image-picker';
 import * as DocumentPicker from 'expo-document-picker';
 import * as FileSystem     from 'expo-file-system';
 import AsyncStorage        from '@react-native-async-storage/async-storage';
 import { RelayClient }      from '../lib/relay';
+import { createStateSequenceGate } from '../lib/state-sequence';
 import { getStoredJwt, signOut, RELAY_URL } from '../lib/auth';
 import MessageBubble         from '../components/MessageBubble';
 import ActivityRow           from '../components/ActivityRow';
@@ -19,17 +20,41 @@ import ErrorPrompt           from '../components/ErrorPrompt';
 import QueuedMessageBar      from '../components/QueuedMessageBar';
 import FileBrowserSheet      from '../components/FileBrowserSheet';
 import AgentSettingsSheet    from '../components/AgentSettingsSheet';
+import ScheduledSendSheet    from '../components/ScheduledSendSheet';
 import ChatListSheet         from '../components/ChatListSheet';
 import ThreadHistorySheet    from '../components/ThreadHistorySheet';
 import TerminalViewer        from '../components/TerminalViewer';
 import DiffViewer            from '../components/DiffViewer';
 import BranchSelectorSheet   from '../components/BranchSelectorSheet';
+import { createProvisionalStream, reduceMessageDeltaStream, shouldClearEmptyProvisionalOnTerminal } from '../lib/message-delta';
+import {
+  formatAbsoluteMessageTime,
+  formatVisibleMessageTime,
+  messageInstant,
+  normalizeMessageTimestamp,
+  normalizeTranscriptTimestamps,
+  parseMessageInstant,
+} from '../lib/message-time';
+import { getCachedTranscript, setCachedTranscript, stableTranscriptMessageKey } from '../lib/transcript-cache';
+import {
+  clearPromptAttentionFeedback,
+  notePromptForAttentionFeedback,
+  refreshAttentionHapticPreference,
+  rememberPromptForAttentionFeedback,
+} from '../lib/attention-feedback';
+import { processSemanticNotification } from '../lib/semantic-notifications';
+import {
+  resolveSessionChatTitleProjection,
+  retainStrongerSessionChatTitleProjection,
+  sessionChatTitleMetadataPatch,
+} from '../lib/session-title';
 
 const DRAFT_STORAGE_PREFIX = 'remote-agent-chat:draft:v1:';
 const HISTORY_PAGE_SIZE = 200;
 const DELIVERY_STAGE_TIMEOUT_MS = Object.freeze({
   queued: 10000,
   accepted: 30000,
+  launch_accepted: 30000,
   delivered: 30000,
   steered: 30000,
 });
@@ -40,10 +65,42 @@ const SLASH_COMMANDS = [
   { command: '/summarize', detail: 'Summarize the current state and important changes.' },
 ];
 
-export default function ChatScreen({ route, navigation }) {
-  const { sessionId, title, agentType } = route.params;
+function routeTitleProjection(value) {
+  const title = typeof value === 'string' ? value.replace(/\s+/g, ' ').trim().slice(0, 80) : '';
+  return title
+    ? { title, source: 'route', field: 'route_param' }
+    : { title: 'New chat', source: 'fallback', field: 'new_chat' };
+}
 
-  const [messages,  setMessages]  = useState([]);
+function ProvisionalBubble({ stream }) {
+  const instant = parseMessageInstant(stream?.startedAtMs);
+  const absoluteTimestamp = instant ? formatAbsoluteMessageTime(instant) : 'time unknown';
+  return (
+    <View style={s.provisionalWrapper} accessibilityLabel="Streaming assistant response">
+      <View style={s.provisionalBubble}>
+        {!!stream?.content && <Text style={s.provisionalText} selectable>{stream.content}</Text>}
+        {stream?.open && <View style={s.provisionalCaret} />}
+      </View>
+      <Text style={s.provisionalTimestamp} accessibilityLabel={`Sent ${absoluteTimestamp}`}>
+        {instant ? formatVisibleMessageTime(instant) : 'Time unknown'}
+      </Text>
+    </View>
+  );
+}
+
+export default function ChatScreen({ route, navigation }) {
+  const { sessionId, title, agentType, searchMessageId, session: routeSession } = route.params;
+
+  const [messages,  setMessages]  = useState(() => getCachedTranscript(sessionId) || []);
+  const [sessionMeta, setSessionMeta] = useState(() => (
+    routeSession && typeof routeSession === 'object'
+      ? { ...routeSession, session_id: sessionId }
+      : { session_id: sessionId, agent_type: agentType }
+  ));
+  const [liveTitleState, setLiveTitleState] = useState(() => ({
+    sessionId,
+    projection: routeTitleProjection(title),
+  }));
   const [activity,  setActivity]  = useState(null);
   const [connected, setConnected] = useState(false);
   const [connectionHealth, setConnectionHealth] = useState({ state: 'connecting', rttMs: null });
@@ -60,6 +117,7 @@ export default function ChatScreen({ route, navigation }) {
   const [showJumpBtn,   setShowJumpBtn]   = useState(false); // show jump-to-bottom button
   const [agentConfig,   setAgentConfig]   = useState(null);  // per-session config from relay
   const [settingsOpen,  setSettingsOpen]  = useState(false); // agent settings sheet
+  const [scheduleOpen,  setScheduleOpen]  = useState(false); // scheduled message sheet
   const [attachment,    setAttachment]    = useState(null);  // { uri, name, mimeType, isText?, content? }
   const [uploading,     setUploading]     = useState(false); // file upload in progress
   const [chatListOpen,  setChatListOpen]  = useState(false); // chat list sheet visible
@@ -89,12 +147,26 @@ export default function ChatScreen({ route, navigation }) {
   const [historyLoadingOlder, setHistoryLoadingOlder] = useState(false);
   const [historyError, setHistoryError] = useState(null);
   const [controlResults, setControlResults] = useState({});
+  const [provisionalStream, setProvisionalStream] = useState(null);
+  const [highlightedSearchMessageId, setHighlightedSearchMessageId] = useState(
+    Number.isSafeInteger(Number(searchMessageId)) ? Number(searchMessageId) : null,
+  );
   const errorPromptIsBlocking = !!errorPrompt
     && errorPrompt.blocking !== false
     && errorPrompt.display_mode !== 'inline';
   const composerBlockedByPrompt = !!permPrompt || errorPromptIsBlocking;
+  const computedTitleProjection = useMemo(() => resolveSessionChatTitleProjection(
+    sessionMeta,
+    sessionMeta?.custom_display_name || '',
+    messages,
+  ), [sessionMeta, messages]);
+  const liveTitleProjection = liveTitleState.sessionId === sessionId
+    ? liveTitleState.projection
+    : routeTitleProjection(title);
+  const liveChatTitle = liveTitleProjection.title;
 
   const clientRef       = useRef(null);
+  const stateSequenceGateRef = useRef(createStateSequenceGate());
   const flatListRef     = useRef(null);
   const inputRef        = useRef(null);
   const sendTimer       = useRef(null);
@@ -102,7 +174,8 @@ export default function ChatScreen({ route, navigation }) {
   const deliveryRecords = useRef({});
   const deliveryStatesRef = useRef({});
   const isAtBottom      = useRef(true);
-  const seenSequences   = useRef(new Set());
+  const seenSequences   = useRef(new Set(messages.map(message => message?.sequence).filter(sequence => sequence != null)));
+  const messagesSessionIdRef = useRef(sessionId);
   const pendingMsgId    = useRef(null);   // { _id, _text } of in-flight message
   const failedMsgRef    = useRef(null);   // mirrors failedMsg state for use in callbacks
   const messageQueue    = useRef([]);     // offline queue: [{ text, clientMsgId }], max 5
@@ -112,6 +185,56 @@ export default function ChatScreen({ route, navigation }) {
   const historyUserScrolledRef = useRef(false);
   const historyLoadingRef = useRef(false);
   const historyRequestTimerRef = useRef(null);
+  const searchMessageIdRef = useRef(Number.isSafeInteger(Number(searchMessageId)) ? Number(searchMessageId) : null);
+  const provisionalStreamRef = useRef(null);
+  const provisionalFrameRef = useRef(null);
+  const provisionalPendingRef = useRef(null);
+
+  function publishProvisionalStream(stream) {
+    provisionalStreamRef.current = stream;
+    provisionalPendingRef.current = stream;
+    if (provisionalFrameRef.current != null) return;
+    provisionalFrameRef.current = requestAnimationFrame(() => {
+      provisionalFrameRef.current = null;
+      const pending = provisionalPendingRef.current;
+      provisionalPendingRef.current = null;
+      if (pending) setProvisionalStream(pending);
+    });
+  }
+
+  function clearProvisionalStream() {
+    provisionalStreamRef.current = null;
+    provisionalPendingRef.current = null;
+    setProvisionalStream(null);
+  }
+
+  const mergeSessionMetadata = useCallback((candidate) => {
+    if (!candidate || typeof candidate !== 'object') return;
+    const sid = candidate.session_id || candidate.session || candidate.id;
+    if (sid && sid !== sessionId) return;
+    setSessionMeta(previous => ({
+      ...(previous && typeof previous === 'object' ? previous : {}),
+      ...candidate,
+      session_id: sessionId,
+    }));
+  }, [sessionId]);
+
+  useEffect(() => {
+    setSessionMeta(routeSession && typeof routeSession === 'object'
+      ? { ...routeSession, session_id: sessionId }
+      : { session_id: sessionId, agent_type: agentType });
+    setLiveTitleState({ sessionId, projection: routeTitleProjection(title) });
+  }, [sessionId]);
+
+  useEffect(() => {
+    setLiveTitleState(previous => ({
+      sessionId,
+      projection: retainStrongerSessionChatTitleProjection(
+        previous.sessionId === sessionId ? previous.projection : routeTitleProjection(title),
+        computedTitleProjection,
+      ),
+    }));
+  }, [sessionId, title, computedTitleProjection]);
 
   // Keep ref in sync with state for use inside memoized callbacks
   function updateFailedMsg(val) {
@@ -191,7 +314,11 @@ export default function ChatScreen({ route, navigation }) {
     navigation.setOptions({
       headerTitle: () => (
         <View style={{ alignItems: 'center', maxWidth: 120 }}>
-          <Text style={{ color: '#fff', fontSize: 14, fontWeight: '600' }} numberOfLines={1}>{title}</Text>
+          <Text
+            style={{ color: '#fff', fontSize: 14, fontWeight: '600' }}
+            numberOfLines={1}
+            accessibilityLabel={liveChatTitle}
+          >{liveChatTitle}</Text>
           {activityLabel ? (
             <Text style={{ color: '#58a6ff', fontSize: 10, fontStyle: 'italic' }} numberOfLines={1}>{activityLabel}</Text>
           ) : null}
@@ -318,12 +445,20 @@ export default function ChatScreen({ route, navigation }) {
         </View>
       ),
     });
-  }, [navigation, sessionId, title, agentType, agentConfig, activityLabel]);
+  }, [navigation, sessionId, liveChatTitle, agentType, agentConfig, activityLabel]);
 
   // ── Message handler ─────────────────────────────────────────────────────────
 
   const handleMessage = useCallback((msg) => {
     console.log('[ChatScreen] msg type=', msg.type, 'session=', msg.session_id || msg.session || '');
+    if (msg.type === 'connection_ack') stateSequenceGateRef.current.reset(msg.state_epoch);
+    const stateSessionId = msg.session || msg.session_id || '';
+    const stateKey = msg.type === 'session_list'
+      ? 'session_list'
+      : ((msg.type === 'status' || msg.type === 'session_summary' || msg.type === 'session_patch') && stateSessionId)
+        ? `status:${stateSessionId}`
+        : '';
+    if (stateKey && !stateSequenceGateRef.current.accept(msg, stateKey)) return;
     switch (msg.type) {
       case '_connected':
         setConnected(true);
@@ -350,13 +485,14 @@ export default function ChatScreen({ route, navigation }) {
           // Remove queued placeholders from messages
           setMessages(prev => prev.filter(m => !m._queued));
           for (const item of queued) {
-            doSend(item.text, item.clientMsgId);
+            doSend(item.text, item.clientMsgId, item.createdAt);
           }
         }
         break;
 
       case '_disconnected':
         setConnected(false);
+        clearProvisionalStream();
         historyLoadingRef.current = false;
         clearTimeout(historyRequestTimerRef.current);
         setHistoryLoadingOlder(false);
@@ -378,36 +514,83 @@ export default function ChatScreen({ route, navigation }) {
         setConnectionHealth({ state: msg.state || 'connecting', rttMs: msg.rttMs ?? null });
         break;
 
+      case 'session_list': {
+        const match = (msg.sessions || []).find(item => (
+          typeof item === 'object' && (item.session_id || item.id) === sessionId
+        ));
+        if (match) mergeSessionMetadata(match);
+        break;
+      }
+
+      case 'session_patch': {
+        const sid = msg.session_id || msg.session;
+        if (sid === sessionId) mergeSessionMetadata(msg.patch || {});
+        break;
+      }
+
+      case 'session_summary': {
+        const sid = msg.session_id || msg.session;
+        if (sid === sessionId) mergeSessionMetadata(sessionChatTitleMetadataPatch(msg));
+        break;
+      }
+
+      case 'session_meta': {
+        const sid = msg.session_id || msg.session;
+        if (sid === sessionId) mergeSessionMetadata(msg);
+        break;
+      }
+
+      case 'message_delta': {
+        const sid = msg.session_id || msg.session;
+        if (sid !== sessionId) break;
+        const reduced = reduceMessageDeltaStream(provisionalStreamRef.current, msg);
+        if (reduced.accepted) publishProvisionalStream(reduced.stream);
+        break;
+      }
+
+      case 'transcript_resync_required': {
+        const sid = msg.session_id || msg.session;
+        if (sid !== sessionId) break;
+        historyLoadingRef.current = false;
+        clearTimeout(historyRequestTimerRef.current);
+        clientRef.current?.requestHistoryChunk(sessionId, {
+          mode: 'tail',
+          limit: HISTORY_PAGE_SIZE,
+          replace: true,
+        });
+        historyLoadingRef.current = true;
+        armHistoryTimeout();
+        break;
+      }
+
       case 'history': {
         if (msg.session !== sessionId) break;
-        const msgs = (msg.messages || []).filter(m => {
+        const msgs = normalizeTranscriptTimestamps((msg.messages || []).filter(m => {
           if (seenSequences.current.has(m.sequence)) return false;
           seenSequences.current.add(m.sequence);
           return true;
-        });
+        }));
         setMessages(prev => mergeSorted([...prev, ...msgs]));
         break;
       }
 
       case 'message': {
         if (msg.session !== sessionId) break;
+        if (msg.role === 'assistant') clearProvisionalStream();
         if (msg.sequence != null) {
           if (seenSequences.current.has(msg.sequence)) break;
           seenSequences.current.add(msg.sequence);
         }
         const clientMsgId = msg.client_message_id || msg.client_msg_id || null;
+        const nativeDelivered = msg.status === 'delivered' || msg.status === 'agent_started';
         const matchesPending = msg.role === 'user' && pendingMsgId.current &&
-          (clientMsgId === pendingMsgId.current._id || msg.content === pendingMsgId.current._text);
+          (clientMsgId === pendingMsgId.current._id || (!clientMsgId && msg.content === pendingMsgId.current._text));
         const matchedClientMsgId = matchesPending ? (clientMsgId || pendingMsgId.current._id) : clientMsgId;
         // Detect the authoritative proxy echo of our optimistic user message.
         if (matchesPending) {
           clearTimeout(sendTimer.current);
           setSendPending(false);
           pendingMsgId.current = null;
-          if (deliveryStatesRef.current[matchedClientMsgId] !== 'agent_started') {
-            setTrackedDeliveryState(matchedClientMsgId, 'delivered');
-            armDeliveryStageTimeout(matchedClientMsgId, 'delivered', 'Message reached the agent, but agent activity did not start in time.');
-          }
         }
         setMessages(prev => {
           const withoutOptimisticEcho = msg.role === 'user'
@@ -416,13 +599,21 @@ export default function ChatScreen({ route, navigation }) {
                 (matchesPending && item.content === msg.content)
               )))
             : prev;
-          return mergeSorted([...withoutOptimisticEcho, {
+          const previousOptimistic = matchesPending
+            ? prev.find(item => item._optimistic && (
+                (matchedClientMsgId && item._cid === matchedClientMsgId)
+                || item.content === msg.content
+              ))
+            : null;
+          return mergeSorted([...withoutOptimisticEcho, normalizeMessageTimestamp({
+            ...previousOptimistic,
             ...msg,
             ...(msg.role === 'user' ? {
-              _delivered: true,
+              _delivered: previousOptimistic?._delivered || nativeDelivered,
+              _agentStarted: previousOptimistic?._agentStarted || msg.status === 'agent_started',
               ...(matchedClientMsgId ? { _cid: matchedClientMsgId, _optimistic: true } : {}),
             } : {}),
-          }]);
+          })]);
         });
         break;
       }
@@ -437,13 +628,31 @@ export default function ChatScreen({ route, navigation }) {
           setHistoryError(msg.error?.message || msg.error || 'Transcript history could not be loaded.');
           break;
         }
-        const incoming = (msg.messages || []).filter(message => {
+        const authoritativeReplace = msg.mode === 'around' || (msg.mode === 'tail' && msg.replace === true);
+        const rawIncoming = normalizeTranscriptTimestamps(Array.isArray(msg.messages) ? msg.messages : []);
+        const incoming = authoritativeReplace ? rawIncoming : rawIncoming.filter(message => {
           if (message.sequence == null) return true;
           if (seenSequences.current.has(message.sequence)) return false;
           seenSequences.current.add(message.sequence);
           return true;
         });
-        setMessages(prev => mergeSorted([...prev, ...incoming]));
+        if (authoritativeReplace) {
+          seenSequences.current = new Set(incoming.map(message => message?.sequence).filter(sequence => sequence != null));
+          setMessages(incoming);
+          const targetId = searchMessageIdRef.current;
+          const targetIndex = targetId == null
+            ? -1
+            : incoming.findIndex(message => Number(message?.id) === Number(targetId));
+          if (targetIndex >= 0) {
+            requestAnimationFrame(() => {
+              flatListRef.current?.scrollToIndex({ index: targetIndex, animated: false, viewPosition: 0.5 });
+              setTimeout(() => setHighlightedSearchMessageId(null), 5000);
+            });
+          }
+          searchMessageIdRef.current = null;
+        } else {
+          setMessages(prev => mergeSorted([...prev, ...incoming]));
+        }
         const nextBeforeId = msg.cursor?.next_before_id ?? null;
         setHistoryCursor(nextBeforeId);
         setHasOlderHistory(!!msg.partial && nextBeforeId != null);
@@ -455,6 +664,11 @@ export default function ChatScreen({ route, navigation }) {
         // Preserve the canonical activity object. It carries the stable elapsed-time
         // anchor, granular tool label, interrupt hint, and live partial output.
         if (msg.session !== sessionId) break;
+        if (shouldClearEmptyProvisionalOnTerminal(
+          provisionalStreamRef.current,
+          msg.activity || (!msg.thinking ? { kind: 'idle' } : null),
+          !!msg.thinking,
+        )) clearProvisionalStream();
         if (msg.activity && typeof msg.activity === 'object') {
           const kind = msg.activity.kind || (msg.thinking ? 'thinking' : 'idle');
           setActivity({
@@ -486,13 +700,20 @@ export default function ChatScreen({ route, navigation }) {
       }
 
       case 'permission_prompt': {
-        if (msg.session_id !== sessionId) break;
+        notePromptForAttentionFeedback(msg, sessionId).catch(() => {});
+        if ((msg.session_id || msg.session) !== sessionId) break;
         setPermPrompt({ ...msg, received_at: Date.now() });
         break;
       }
 
+      case 'semantic_notification': {
+        processSemanticNotification(msg, sessionId).catch(() => {});
+        break;
+      }
+
       case 'permission_prompt_expired': {
-        if (msg.session_id !== sessionId) break;
+        clearPromptAttentionFeedback(msg);
+        if ((msg.session_id || msg.session) !== sessionId) break;
         setPermPrompt(prev => prev?.prompt_id === msg.prompt_id ? null : prev);
         break;
       }
@@ -513,15 +734,23 @@ export default function ChatScreen({ route, navigation }) {
 
       case 'connection_ack': {
         // Restore durable prompts and config from the initial handshake.
+        const session = (msg.sessions || []).find(item => (
+          typeof item === 'object' && (item.session_id || item.id) === sessionId
+        ));
+        if (session) mergeSessionMetadata(session);
         const openPermission = (msg.open_prompts || [])
           .find(prompt => (prompt.session_id || prompt.session) === sessionId);
         const openError = (msg.open_error_prompts || [])
           .find(prompt => (prompt.session_id || prompt.session) === sessionId);
+        if (openPermission) rememberPromptForAttentionFeedback(openPermission);
         setPermPrompt(openPermission ? { ...openPermission, received_at: Date.now() } : null);
         setErrorPrompt(openError ? { ...openError, received_at: Date.now() } : null);
         if (msg.agent_configs && msg.agent_configs[sessionId]) {
           setAgentConfig(msg.agent_configs[sessionId]);
         }
+        (msg.semantic_notifications || []).forEach(event => {
+          processSemanticNotification(event, sessionId).catch(() => {});
+        });
         break;
       }
 
@@ -544,6 +773,7 @@ export default function ChatScreen({ route, navigation }) {
         }
         if (msg.command === 'permission_response') {
           if (msg.result === 'ok') {
+            clearPromptAttentionFeedback(msg);
             setPermPrompt(null);
           } else if (msg.result === 'failed') {
             setPermPrompt(prev => prev
@@ -580,10 +810,41 @@ export default function ChatScreen({ route, navigation }) {
 
       case 'message_accepted': {
         const cid = msg.client_message_id;
+        const storedStatus = ['accepted', 'delivered', 'agent_started', 'failed'].includes(msg.status)
+          ? msg.status
+          : 'accepted';
+        const persistedStatus = storedStatus === 'accepted' && msg.launch_accepted_at
+          ? 'launch_accepted'
+          : storedStatus;
+        if (cid && persistedStatus === 'failed') {
+          failDelivery(cid, msg.failure_code || 'Send failed.');
+          break;
+        }
         const current = cid ? deliveryStatesRef.current[cid] : null;
-        if (cid && !['busy_queued', 'steered', 'delivered', 'agent_started'].includes(current)) {
-          setTrackedDeliveryState(cid, 'accepted');
-          armDeliveryStageTimeout(cid, 'accepted', 'Relay accepted the message, but native delivery timed out.');
+        if (cid && !['busy_queued', 'steered', 'launch_accepted', 'delivered', 'agent_started'].includes(current)) {
+          setTrackedDeliveryState(cid, persistedStatus);
+          if (persistedStatus === 'accepted') {
+            armDeliveryStageTimeout(cid, 'accepted', 'Relay accepted the message, but native delivery timed out.');
+          } else if (persistedStatus === 'launch_accepted') {
+            armDeliveryStageTimeout(cid, 'launch_accepted', 'The native launch was accepted, but no native user turn was observed.');
+          } else if (persistedStatus === 'delivered') {
+            armDeliveryStageTimeout(cid, 'delivered', 'Message reached the agent, but agent activity did not start in time.');
+          } else {
+            clearDeliveryStageTimeout(cid);
+          }
+        }
+        if (cid) {
+          setMessages(prev => prev.map(item => item._cid === cid
+            ? normalizeMessageTimestamp({
+                ...item,
+                ...(msg.created_at != null ? { created_at: msg.created_at } : {}),
+                ...(msg.timestamp != null ? { timestamp: msg.timestamp } : {}),
+                ...(msg.ts != null ? { ts: msg.ts } : {}),
+                ...(msg.launch_accepted_at != null ? { _launchAcceptedAt: msg.launch_accepted_at } : {}),
+                _delivered: persistedStatus === 'delivered' || persistedStatus === 'agent_started',
+                _agentStarted: persistedStatus === 'agent_started',
+              })
+            : item));
         }
         break;
       }
@@ -596,6 +857,17 @@ export default function ChatScreen({ route, navigation }) {
           failDelivery(cid, msg.reason || msg.message || msg.error?.message || 'The desktop proxy rejected the message.');
           break;
         }
+        if (msg.type === 'proxy_send_result' && msg.result === 'launch_accepted') {
+          if (!['delivered', 'agent_started'].includes(deliveryStatesRef.current[cid])) {
+            setTrackedDeliveryState(cid, 'launch_accepted');
+            armDeliveryStageTimeout(cid, 'launch_accepted', 'The native launch was accepted, but no native user turn was observed.');
+            setMessages(prev => prev.map(item => item._cid === cid
+              ? { ...item, _launchAcceptedAt: msg.accepted_at || new Date().toISOString() }
+              : item));
+          }
+          break;
+        }
+        if (msg.type === 'proxy_send_result' && msg.result !== 'delivered') break;
         if (deliveryStatesRef.current[cid] !== 'agent_started') {
           setTrackedDeliveryState(cid, 'delivered');
           armDeliveryStageTimeout(cid, 'delivered', 'Message reached the agent, but agent activity did not start in time.');
@@ -614,6 +886,10 @@ export default function ChatScreen({ route, navigation }) {
       case 'agent_started': {
         const cid = msg.client_message_id;
         if (!cid) break;
+        const sid = msg.session_id || msg.session;
+        if (!sid || sid === sessionId) {
+          publishProvisionalStream(createProvisionalStream(sessionId, cid));
+        }
         completeDelivery(cid);
         setTrackedDeliveryState(cid, 'agent_started');
         setMessages(prev => prev.map(item => item._cid === cid
@@ -625,6 +901,7 @@ export default function ChatScreen({ route, navigation }) {
       case 'message_failed': {
         const cid = msg.client_message_id;
         if (!cid) break;
+        clearProvisionalStream();
         failDelivery(cid, msg.reason || msg.message || msg.error?.message || 'Send failed.');
         break;
       }
@@ -634,6 +911,8 @@ export default function ChatScreen({ route, navigation }) {
         const sid = msg.session_id || msg.session;
         if (sid && sid !== sessionId) break;
         if (cid) {
+          const contentBlocks = Array.isArray(msg.content_blocks) ? msg.content_blocks : [];
+          const queuedBlock = contentBlocks.find(block => block?.type === 'queued_message');
           clearDeliveryStageTimeout(cid);
           setTrackedDeliveryState(cid, 'busy_queued');
           if (deliveryRecords.current[cid]) {
@@ -642,7 +921,8 @@ export default function ChatScreen({ route, navigation }) {
           setQueuedMessages(prev => {
             const next = {
               cid,
-              content: msg.content || prev.find(item => item.cid === cid)?.content || '',
+              content: queuedBlock?.content ?? msg.content ?? prev.find(item => item.cid === cid)?.content ?? '',
+              content_blocks: contentBlocks,
               queuedAt: msg.queued_at,
             };
             return [...prev.filter(item => item.cid !== cid), next];
@@ -695,7 +975,8 @@ export default function ChatScreen({ route, navigation }) {
         if (sid !== sessionId) break;
         const nativeItems = (msg.items || []).map((item, index) => ({
           cid: `native-${index}`,
-          content: item.text || '',
+          content: item.content_blocks?.find(block => block?.type === 'queued_message')?.content ?? item.text ?? '',
+          content_blocks: Array.isArray(item.content_blocks) ? item.content_blocks : [],
           native: true,
           nativeIndex: item.index,
           status: item.state || 'queued',
@@ -730,7 +1011,10 @@ export default function ChatScreen({ route, navigation }) {
       case 'chat_list': {
         const sid = msg.session_id || msg.session;
         if (sid === sessionId) {
-          setChatList(msg.chats || []);
+          const chats = msg.chats || [];
+          setChatList(chats);
+          const activeChat = chats.find(item => item?.active);
+          if (activeChat?.title) mergeSessionMetadata({ native_chat_title: activeChat.title });
           setChatListLoading(false);
         }
         break;
@@ -739,7 +1023,10 @@ export default function ChatScreen({ route, navigation }) {
       case 'thread_list': {
         const sid = msg.session_id || msg.session;
         if (sid === sessionId) {
-          setThreadList(msg.threads || []);
+          const threads = msg.threads || [];
+          setThreadList(threads);
+          const activeThread = threads.find(item => item?.active);
+          if (activeThread?.title) mergeSessionMetadata({ native_chat_title: activeThread.title });
           setThreadListLoading(false);
         }
         break;
@@ -776,7 +1063,7 @@ export default function ChatScreen({ route, navigation }) {
       default:
         break;
     }
-  }, [sessionId, navigation]);
+  }, [sessionId, navigation, mergeSessionMetadata]);
 
   // ── Connect on mount ────────────────────────────────────────────────────────
 
@@ -791,19 +1078,31 @@ export default function ChatScreen({ route, navigation }) {
     setDeliveryStates({});
     setControlResults({});
     updateFailedMsg(null);
-    setMessages([]);
-    seenSequences.current.clear();
+    clearProvisionalStream();
+    const cached = getCachedTranscript(sessionId) || [];
+    messagesSessionIdRef.current = sessionId;
+    setMessages(cached);
+    seenSequences.current = new Set(cached.map(message => message?.sequence).filter(sequence => sequence != null));
     setHistoryCursor(null);
     setHasOlderHistory(false);
     setHistoryLoadingOlder(false);
     setHistoryError(null);
     historyLoadingRef.current = false;
     historyUserScrolledRef.current = false;
+    searchMessageIdRef.current = Number.isSafeInteger(Number(searchMessageId)) ? Number(searchMessageId) : null;
+    setHighlightedSearchMessageId(searchMessageIdRef.current);
     clearTimeout(historyRequestTimerRef.current);
-  }, [sessionId]);
+  }, [sessionId, searchMessageId]);
 
   useEffect(() => {
+    if (messagesSessionIdRef.current !== sessionId) return;
+    setCachedTranscript(sessionId, messages);
+  }, [sessionId, messages]);
+
+  useEffect(() => {
+    refreshAttentionHapticPreference().catch(() => {});
     const client = new RelayClient(handleMessage);
+    client.setSessionSubscriptions([sessionId]);
     clientRef.current = client;
     client.connect();
     return () => {
@@ -815,6 +1114,9 @@ export default function ChatScreen({ route, navigation }) {
       deliveryRecords.current = {};
       clearTimeout(configRetryRef.current);
       clearTimeout(historyRequestTimerRef.current);
+      if (provisionalFrameRef.current != null) cancelAnimationFrame(provisionalFrameRef.current);
+      provisionalFrameRef.current = null;
+      provisionalPendingRef.current = null;
     };
   }, [handleMessage]);
 
@@ -871,8 +1173,12 @@ export default function ChatScreen({ route, navigation }) {
 
   // ── Send message ────────────────────────────────────────────────────────────
 
-  function doSend(text, clientMsgId) {
+  function doSend(text, clientMsgId, originalCreatedAt = null) {
     const id = clientMsgId || `${Date.now()}-${Math.random().toString(36).slice(2)}`;
+    const retryMessage = messages.find(item => item._cid === id);
+    const createdAt = parseMessageInstant(originalCreatedAt)?.iso
+      || messageInstant(retryMessage)?.iso
+      || new Date().toISOString();
     clearDeliveryStageTimeout(id);
     deliveryRecords.current[id] = { text, stage: 'queued' };
     pendingMsgId.current = { _id: id, _text: text };
@@ -882,15 +1188,15 @@ export default function ChatScreen({ route, navigation }) {
       ? prev.map(item => item._cid === id
         ? { ...item, content: text, _optimistic: true, _queued: false, _delivered: false, _agentStarted: false, _sendError: null }
         : item)
-      : [...prev, {
+      : [...prev, normalizeMessageTimestamp({
           role: 'user',
           content: text,
           _cid: id,
           _optimistic: true,
-          timestamp: new Date().toISOString(),
-        }]);
+          created_at: createdAt,
+        })]);
     updateFailedMsg(null);
-    clientRef.current.sendMessage(sessionId, text, id);
+    clientRef.current.sendMessage(sessionId, text, id, createdAt);
     armDeliveryStageTimeout(id, 'queued', 'Timed out waiting for relay acceptance.');
 
     // Bound the composer while the stage-specific lifecycle timer owns the retry state.
@@ -1016,13 +1322,14 @@ export default function ChatScreen({ route, navigation }) {
     if (!connected || sendPending) {
       if (messageQueue.current.length >= 5) return;
       const id = `${Date.now()}-${Math.random().toString(36).slice(2)}`;
-      messageQueue.current.push({ text: content, clientMsgId: id });
+      const createdAt = new Date().toISOString();
+      messageQueue.current.push({ text: content, clientMsgId: id, createdAt });
       setDeliveryStates(prev => ({ ...prev, [id]: connected ? 'busy_queued' : 'offline_queued' }));
-      setMessages(prev => [...prev, {
+      setMessages(prev => [...prev, normalizeMessageTimestamp({
         role: 'user', content, _queued: true, _cid: id, _optimistic: true,
         sequence: -(messageQueue.current.length),
-        timestamp: new Date().toISOString(),
-      }]);
+        created_at: createdAt,
+      })]);
       return;
     }
 
@@ -1035,11 +1342,12 @@ export default function ChatScreen({ route, navigation }) {
     doSend(text, clientMsgId);
   }
 
-  function handlePermChoice(promptId, choiceId) {
+  function handlePermChoice(promptId, choiceId, details = {}) {
+    const submittingChoiceId = choiceId || (Array.isArray(details.answers) ? 'question_answers' : null);
     setPermPrompt(prev => prev
-      ? { ...prev, submitting_choice_id: choiceId, error: null }
+      ? { ...prev, submitting_choice_id: submittingChoiceId, error: null }
       : null);
-    clientRef.current?.respondToPermission(sessionId, promptId, choiceId);
+    clientRef.current?.respondToPermission(sessionId, promptId, choiceId, details);
   }
 
   function handleErrorPromptAction(promptId, actionId) {
@@ -1070,7 +1378,13 @@ export default function ChatScreen({ route, navigation }) {
 
   function handleEditQueued(item, content) {
     setQueuedMessages(prev => prev.map(queued => queued.cid === item.cid
-      ? { ...queued, content }
+      ? {
+        ...queued,
+        content,
+        content_blocks: (queued.content_blocks || []).map(block => block?.type === 'queued_message'
+          ? { ...block, content }
+          : block),
+      }
       : queued));
     setMessages(prev => prev.map(message => message._cid === item.cid
       ? { ...message, content }
@@ -1101,6 +1415,28 @@ export default function ChatScreen({ route, navigation }) {
     else clientRef.current?.requestDirectoryListing(sessionId, directoryListing.path || '.');
   }
 
+  async function shareSessionExport(format) {
+    try {
+      const jwt = await getStoredJwt();
+      if (!jwt) throw new Error('Sign in again to export this session.');
+      const response = await fetch(`${RELAY_URL}/api/sessions/${encodeURIComponent(sessionId)}/export?format=${format}`, {
+        headers: { Authorization: `Bearer ${jwt}` },
+      });
+      const body = await response.text();
+      if (!response.ok) {
+        let message = '';
+        try { message = JSON.parse(body).error || ''; } catch {}
+        throw new Error(message || 'Unable to export this session.');
+      }
+      await Share.share({
+        title: `${title || 'Session'} export`,
+        message: body,
+      });
+    } catch (error) {
+      Alert.alert('Export failed', error?.message || 'Unable to export this session.');
+    }
+  }
+
   function loadOlderHistory() {
     if (!hasOlderHistory || historyLoadingRef.current || historyCursor == null || !connected) return;
     historyLoadingRef.current = true;
@@ -1122,7 +1458,10 @@ export default function ChatScreen({ route, navigation }) {
   function requestHistoryTail() {
     historyLoadingRef.current = true;
     setHistoryError(null);
-    clientRef.current?.requestHistoryChunk(sessionId, { mode: 'tail', limit: HISTORY_PAGE_SIZE });
+    const aroundId = searchMessageIdRef.current;
+    clientRef.current?.requestHistoryChunk(sessionId, aroundId
+      ? { mode: 'around', aroundId, limit: HISTORY_PAGE_SIZE }
+      : { mode: 'tail', limit: HISTORY_PAGE_SIZE });
     armHistoryTimeout();
   }
 
@@ -1181,13 +1520,23 @@ export default function ChatScreen({ route, navigation }) {
       <FlatList
         ref={flatListRef}
         data={messages}
-        keyExtractor={(item, i) => (item.sequence != null ? String(item.sequence) : String(i))}
+        keyExtractor={stableTranscriptMessageKey}
+        initialNumToRender={24}
+        maxToRenderPerBatch={24}
+        updateCellsBatchingPeriod={16}
+        windowSize={9}
+        onScrollToIndexFailed={({ index, averageItemLength }) => {
+          flatListRef.current?.scrollToOffset({ offset: Math.max(0, averageItemLength * index), animated: false });
+          setTimeout(() => flatListRef.current?.scrollToIndex({ index, animated: false, viewPosition: 0.5 }), 120);
+        }}
         renderItem={({ item }) => (
-          <MessageBubble
-            message={item}
-            agentType={agentType}
-            deliveryState={item._cid ? deliveryStates[item._cid] : null}
-          />
+          <View style={Number(item?.id) === Number(highlightedSearchMessageId) ? s.searchMatch : null}>
+            <MessageBubble
+              message={item}
+              agentType={agentType}
+              deliveryState={item._cid ? deliveryStates[item._cid] : null}
+            />
+          </View>
         )}
         contentContainerStyle={s.messageList}
         maintainVisibleContentPosition={{ minIndexForVisible: 0 }}
@@ -1213,6 +1562,7 @@ export default function ChatScreen({ route, navigation }) {
             )}
           </View>
         ) : null}
+        ListFooterComponent={provisionalStream ? <ProvisionalBubble stream={provisionalStream} /> : null}
         onScroll={e => {
           const { contentOffset, contentSize, layoutMeasurement } = e.nativeEvent;
           scrollMetrics.current = {
@@ -1248,11 +1598,11 @@ export default function ChatScreen({ route, navigation }) {
             }
           }
         }}
-        ListEmptyComponent={
+        ListEmptyComponent={provisionalStream ? null : (
           <View style={s.emptyList}>
             <Text style={s.emptyText}>No messages yet</Text>
           </View>
-        }
+        )}
       />
 
       {showJumpBtn && (
@@ -1273,8 +1623,8 @@ export default function ChatScreen({ route, navigation }) {
         </TouchableOpacity>
       )}
 
-      <ActivityRow activity={activity} />
-      <PermissionPrompt prompt={permPrompt} onChoice={handlePermChoice} />
+      <ActivityRow activity={activity} agentType={agentType} />
+      <PermissionPrompt prompt={permPrompt} agentType={agentType} onChoice={handlePermChoice} />
       <ErrorPrompt
         prompt={permPrompt ? null : errorPrompt}
         blocking={errorPromptIsBlocking}
@@ -1351,6 +1701,13 @@ export default function ChatScreen({ route, navigation }) {
           returnKeyType="default"
         />
         <TouchableOpacity
+          style={[s.attachBtn, !input.trim() && s.sendBtnDisabled]}
+          onPress={() => setScheduleOpen(true)}
+          disabled={!input.trim()}
+          accessibilityRole="button"
+          accessibilityLabel="Schedule message"
+        ><Text style={s.attachBtnText}>◷</Text></TouchableOpacity>
+        <TouchableOpacity
           style={[s.sendBtn, (!input.trim() && !attachment || sendPending || uploading || composerBlockedByPrompt) && s.sendBtnDisabled]}
           onPress={handleSend}
           disabled={(!input.trim() && !attachment) || sendPending || uploading || composerBlockedByPrompt}
@@ -1372,6 +1729,14 @@ export default function ChatScreen({ route, navigation }) {
         relay={clientRef.current}
         sessionId={sessionId}
         controlResults={controlResults}
+        onExport={shareSessionExport}
+      />
+      <ScheduledSendSheet
+        visible={scheduleOpen}
+        sessionId={sessionId}
+        initialContent={input}
+        onCreated={() => setInput('')}
+        onClose={() => setScheduleOpen(false)}
       />
 
       <TerminalViewer
@@ -1497,7 +1862,13 @@ function mergeSorted(msgs) {
   const seen = new Set();
   return msgs
     .filter(m => {
-      const key = m.sequence != null ? `seq:${m.sequence}` : `ts:${m.timestamp}:${m.role}:${String(m.content).slice(0, 20)}`;
+      const key = m.source_message_id ? `source:${m.source_message_id}`
+        : m.native_source_id ? `native:${m.native_source_id}`
+        : m.id != null ? `id:${m.id}`
+        : m.server_message_id != null ? `server:${m.server_message_id}`
+        : m.sequence != null ? `seq:${m.sequence}`
+        : m._cid ? `client:${m._cid}`
+        : `ts:${messageInstant(m)?.iso || 'unknown'}:${m.role}:${String(m.content)}`;
       if (seen.has(key)) return false;
       seen.add(key);
       return true;
@@ -1551,6 +1922,47 @@ const s = StyleSheet.create({
   messageList: {
     paddingVertical: 12,
     flexGrow:        1,
+  },
+  searchMatch: {
+    borderWidth: 2,
+    borderColor: '#d29922',
+    borderRadius: 10,
+    backgroundColor: '#d2992222',
+  },
+  provisionalWrapper: {
+    alignItems: 'flex-start',
+    paddingHorizontal: 12,
+    paddingVertical: 6,
+  },
+  provisionalBubble: {
+    maxWidth: '92%',
+    borderLeftWidth: 2,
+    borderLeftColor: 'rgba(88, 166, 255, 0.35)',
+    paddingLeft: 12,
+    paddingVertical: 4,
+  },
+  provisionalText: {
+    color: '#c9d1d9',
+    fontSize: 14,
+    lineHeight: 22,
+    fontFamily: Platform.OS === 'ios' ? 'Menlo' : 'monospace',
+  },
+  provisionalTimestamp: {
+    color: '#8b949e',
+    fontSize: 12,
+    lineHeight: 16,
+    minWidth: 68,
+    marginTop: 3,
+    marginLeft: 14,
+    fontVariant: ['tabular-nums'],
+  },
+  provisionalCaret: {
+    width: 7,
+    height: 16,
+    marginTop: 3,
+    borderRadius: 1,
+    backgroundColor: '#58a6ff',
+    opacity: 0.75,
   },
   historyHeader: {
     alignItems: 'center',

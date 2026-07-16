@@ -1,0 +1,43 @@
+{
+  "surface": "codex-desktop",
+  "version": "26.707.9981.0",
+  "route": "/index.html",
+  "document_visibility": "hidden",
+  "card": {
+    "class_marker": "request-card",
+    "question": "Choose the validation branch.",
+    "controls": [
+      { "tag": "button", "role": "radio", "aria_label": "Alpha", "aria_checked": true, "text": "1 Alpha First branch" },
+      { "tag": "button", "role": "radio", "aria_label": "Beta", "aria_checked": false, "text": "2 Beta Second branch" },
+      { "tag": "textarea", "placeholder": "No, and tell ChatGPT what to do differently" },
+      { "tag": "button", "text": "Skip" }
+    ],
+    "submit_button": null,
+    "acknowledgement": "request_card_disappeared"
+  },
+  "expected_observed": {
+    "native_thread_id": "local:client-new-thread:fixture",
+    "native_signature": "fixture-native-signature",
+    "title": "Choose the validation branch.",
+    "questions": [
+      {
+        "question_id": "desktop-question-1",
+        "header": "Choose the validation branch.",
+        "question": "Choose the validation branch.",
+        "options": [
+          { "choice_id": "desktop-choice-1", "label": "Alpha", "description": "First branch", "selected": true },
+          { "choice_id": "desktop-choice-2", "label": "Beta", "description": "Second branch", "selected": false },
+          { "choice_id": "desktop-choice-other", "label": "Other", "description": "No, and tell ChatGPT what to do differently", "selected": false, "requires_text": true, "is_other": true }
+        ],
+        "multi_select": false,
+        "allow_other": true,
+        "required": true,
+        "secret": false
+      }
+    ],
+    "cancel_supported": true,
+    "skip_label": "Skip",
+    "auto_resolution_seconds_remaining": null,
+    "auto_resolution_policy": null
+  }
+}

@@ -20,22 +20,24 @@ for (const marker of [
   "app.delete('/api/preferences/sessions/:sessionId', requireAnyAuth",
   'saveSessionPreference(email, sessionId, requested)',
   "sessionPreferencesForEmail(email)[sessionId]?.muted",
+  'pin_order', 'requested.pinned',
 ]) assert(relay.includes(marker), `missing relay session preference marker: ${marker}`);
 
 for (const marker of [
   'SessionManagementPanel', '/api/preferences/sessions',
   'Hide from sidebar', 'Restore to sidebar', 'Mute notifications',
-  'allManagedSessions.filter', 'session-card-muted',
+  'Pin chat', 'Pinned chats', 'partitionPinnedSessions',
+  'allManagedSessions.filter', 'session-card-muted', 'session-card-pin-toggle',
 ]) assert(web.includes(marker), `missing web session management marker: ${marker}`);
 
 for (const marker of [
   'SessionPreferencesSheet', '/api/preferences/sessions',
-  'visibleSessions', 'setShowSessionPreferences(true)', 'Hidden (',
+  'visibleSessions', 'partitionPinnedSessions', 'Pinned chats', 'setShowSessionPreferences(true)', 'Hidden (',
 ]) assert(androidList.includes(marker), `missing Android list marker: ${marker}`);
 
 for (const marker of [
-  'Hide from session list', 'Restore to session list', 'Mute notifications',
-  'Hidden sessions', 'Names, hidden state, and mute settings sync across web and Android.',
+  'Hide from session list', 'Restore to session list', 'Mute notifications', 'Pin chat',
+  'Hidden sessions', 'Names, pinned order, hidden state, and mute settings sync across web and Android.',
 ]) assert(androidSheet.includes(marker), `missing Android sheet marker: ${marker}`);
 
 assert(protocol.includes('## Relay Session Preferences API'));
@@ -46,6 +48,8 @@ const result = {
   custom_name: true,
   archive_hide_restore: true,
   per_session_push_mute: true,
+  stable_pinned_order: true,
+  one_action_unpin: true,
   web_surface: true,
   android_surface: true,
   cross_device_contract: true,

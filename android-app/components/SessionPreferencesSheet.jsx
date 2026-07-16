@@ -10,14 +10,15 @@ const baseName = session => typeof session === 'string'
   : (session?.display_name || session?.workspace_name || session?.name || sessionId(session));
 
 export default function SessionPreferencesSheet({
-  visible, sessions, preferences, initialSession, onSave, onClose,
+  visible, sessions, preferences, initialSession, onSave, onCloseSession, onAutomations, onSkills, onClose,
 }) {
   const [selected, setSelected] = useState(initialSession || null);
   const [displayName, setDisplayName] = useState('');
   const [saving, setSaving] = useState(false);
   const [error, setError] = useState('');
   const selectedId = sessionId(selected);
-  const preference = preferences[selectedId] || { display_name: '', archived: false, muted: false };
+  const selectedAgentType = typeof selected === 'object' ? selected?.agent_type : '';
+  const preference = preferences[selectedId] || { display_name: '', archived: false, muted: false, pinned: false, pin_order: 0 };
   const hiddenSessions = useMemo(
     () => sessions.filter(session => preferences[sessionId(session)]?.archived),
     [sessions, preferences],
@@ -80,6 +81,19 @@ export default function SessionPreferencesSheet({
               </TouchableOpacity>
               <View style={s.row}>
                 <View style={s.rowText}>
+                  <Text style={s.rowTitle}>Pin chat</Text>
+                  <Text style={s.rowDescription}>Keep this chat in the operator-ordered pinned section</Text>
+                </View>
+                <Switch
+                  value={!!preference.pinned}
+                  disabled={saving}
+                  onValueChange={() => update(selectedId, { pinned: !preference.pinned })}
+                  trackColor={{ false: '#30363d', true: '#1f4d8a' }}
+                  thumbColor={preference.pinned ? '#58a6ff' : '#444c56'}
+                />
+              </View>
+              <View style={s.row}>
+                <View style={s.rowText}>
                   <Text style={s.rowTitle}>Mute notifications</Text>
                   <Text style={s.rowDescription}>Suppress push notifications for this session</Text>
                 </View>
@@ -100,6 +114,25 @@ export default function SessionPreferencesSheet({
                 <Text style={[s.actionText, !preference.archived && s.dangerText]}>
                   {preference.archived ? 'Restore to session list' : 'Hide from session list'}
                 </Text>
+              </TouchableOpacity>
+              {selectedAgentType === 'codex-desktop' && (
+                <View style={s.productActions}>
+                  <TouchableOpacity style={s.actionButton} onPress={() => onAutomations?.()} accessibilityRole="button">
+                    <Text style={s.actionText}>Automations</Text>
+                  </TouchableOpacity>
+                  <TouchableOpacity style={s.actionButton} onPress={() => onSkills?.(selected)} accessibilityRole="button">
+                    <Text style={s.actionText}>Skills</Text>
+                  </TouchableOpacity>
+                </View>
+              )}
+              <TouchableOpacity
+                style={[s.actionButton, s.dangerButton]}
+                disabled={saving}
+                onPress={() => onCloseSession?.(selected)}
+                accessibilityRole="button"
+                accessibilityLabel={`Close ${preference.display_name || baseName(selected)}`}
+              >
+                <Text style={[s.actionText, s.dangerText]}>Close or dismiss session</Text>
               </TouchableOpacity>
             </View>
           )}
@@ -130,7 +163,7 @@ export default function SessionPreferencesSheet({
           </View>
           {!!error && <Text style={s.error} accessibilityRole="alert">{error}</Text>}
           {saving && <ActivityIndicator color="#58a6ff" />}
-          <Text style={s.note}>Names, hidden state, and mute settings sync across web and Android.</Text>
+          <Text style={s.note}>Names, pinned order, hidden state, and mute settings sync across web and Android.</Text>
         </ScrollView>
       </View>
     </Modal>
@@ -153,6 +186,7 @@ const s = StyleSheet.create({
   input: { backgroundColor: '#0d1117', borderColor: '#30363d', borderWidth: 1, borderRadius: 7, color: '#cdd9e5', padding: 10 },
   actionButton: { borderColor: '#30363d', borderWidth: 1, borderRadius: 7, padding: 10, alignItems: 'center' },
   actionText: { color: '#58a6ff', fontSize: 13, fontWeight: '600' },
+  productActions: { flexDirection: 'row', gap: 10 },
   dangerButton: { borderColor: 'rgba(248,81,73,0.45)' },
   dangerText: { color: '#f85149' },
   row: { flexDirection: 'row', alignItems: 'center', gap: 10 },

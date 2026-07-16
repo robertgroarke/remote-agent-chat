@@ -41,6 +41,18 @@
 const fs = require('fs');
 const path = require('path');
 
+const CURSOR_EDIT_SUMMARY_PATTERN = '^edited\\s+\\d+\\s+files?(?:\\s+\\+\\d+)?(?:\\s+-\\d+)?$';
+const CURSOR_TOOL_HEADER_PATTERN = 'explor|edit|search|ran |running|command|read |grep|glob|shell|creating|editing|monitored|background';
+
+function classifyCursorCollapsibleHeader(header) {
+  const normalized = String(header || '').replace(/\s+/g, ' ').trim();
+  if (/^worked\b/i.test(normalized) || /^taking longer\b/i.test(normalized)) return 'status';
+  if (/^thought\b|^thinking\b/i.test(normalized)) return 'thinking';
+  if (new RegExp(CURSOR_EDIT_SUMMARY_PATTERN, 'i').test(normalized)) return 'file_changes';
+  if (new RegExp(CURSOR_TOOL_HEADER_PATTERN, 'i').test(normalized)) return 'tool_call';
+  return 'status';
+}
+
 async function evalInPage(Runtime, code, options = {}) {
   const useAsync = !!options.awaitPromise;
   const result = await Runtime.evaluate({
@@ -155,6 +167,7 @@ const CURSOR_READ_EXPR = `
       var stepHdr = norm((node.querySelector('.ui-collapsible-header') || {}).innerText || '');
       // Step-group headers titled Thought/Thinking are thinking chips, not tools.
       if (/^thought\\b|^thinking\\b/i.test(stepHdr)) return 'thinking';
+      if (new RegExp(${JSON.stringify(CURSOR_EDIT_SUMMARY_PATTERN)}, 'i').test(stepHdr)) return 'file_changes';
       return 'tool_call';
     }
     if (/\\bui-collapsible\\b/.test(cls) && node.querySelector(':scope > .ui-collapsible-header')) {
@@ -162,7 +175,11 @@ const CURSOR_READ_EXPR = `
       // Cursor Agents shows "Worked for Xm" as a subtle status chip, not a tool card.
       if (/^worked\\b/i.test(hdr) || /^taking longer\\b/i.test(hdr)) return 'status';
       if (/^thought\\b|^thinking\\b/i.test(hdr)) return 'thinking';
-      if (/explor|edit|search|ran |running|command|read |grep|glob|shell|creating|editing|monitored|background/i.test(hdr)) return 'tool_call';
+      // Current Cursor Agents renders completed edit batches as a flat
+      // "Edited N files +A -D" summary. It is a file-change boundary, not a
+      // generic tool call; keep the broader edit/tool matcher below it.
+      if (new RegExp(${JSON.stringify(CURSOR_EDIT_SUMMARY_PATTERN)}, 'i').test(hdr)) return 'file_changes';
+      if (new RegExp(${JSON.stringify(CURSOR_TOOL_HEADER_PATTERN)}, 'i').test(hdr)) return 'tool_call';
       return 'status';
     }
     return null;
@@ -545,6 +562,45 @@ const CURSOR_AGENT_LIST_EXPR = `
       var ordinal = newestFirst ? same.length - position : position + 1;
       return ordinal > 1 ? base + '--' + ordinal : base;
     }
+    function reactFiberKey(el, predicate) {
+      if (!el) return '';
+      var property = Object.getOwnPropertyNames(el).find(function(key) {
+        return key.indexOf('__reactFiber$') === 0;
+      });
+      var fiber = property ? el[property] : null;
+      for (var depth = 0; fiber && depth < 40; depth++, fiber = fiber.return) {
+        var key = typeof fiber.key === 'string' ? fiber.key : '';
+        if (key && predicate(key)) return key;
+      }
+      return '';
+    }
+    function nativeAgentId(el) {
+      var key = reactFiberKey(el, function(candidate) {
+        return /^\\.\\$[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(candidate);
+      });
+      return key ? key.substring(2) : '';
+    }
+    function workspaceMeta(el) {
+      var section = el && el.closest ? el.closest('.glass-sidebar-workspace-section-root') : null;
+      if (!section) return { key: '', name: '', expanded: true };
+      var heading = section.querySelector('.glass-sidebar-section-drag-target, .ui-sidebar-section-head');
+      var clip = section.querySelector('.ui-sidebar-section-content-clip');
+      var key = reactFiberKey(section, function(candidate) { return candidate.indexOf('repo:') === 0; });
+      return {
+        key: key,
+        name: norm(heading ? heading.textContent : ''),
+        expanded: section.getAttribute('data-expanded') !== 'false'
+          && (!clip || clip.getAttribute('aria-hidden') !== 'true'),
+      };
+    }
+    function nativeStatus(el) {
+      var status = el && el.querySelector ? el.querySelector('.agent-status-dot') : null;
+      var value = norm(status ? (status.getAttribute('aria-label') || status.className || '') : '').toLowerCase();
+      return {
+        value: value,
+        working: /working|running|generating|thinking|in[-_ ]?progress|executing/.test(value),
+      };
+    }
     function titleOfCell(cell) {
       var textEl = cell.querySelector('.agent-sidebar-cell-text, .agent-sidebar-cell-content');
       return stripAge(textEl ? firstLine(textEl) : firstLine(cell));
@@ -612,26 +668,37 @@ const CURSOR_AGENT_LIST_EXPR = `
       glassBtns.forEach(function(btn, idx) {
         var title = agentTitleFromButton(btn);
         if (isNoiseTitle(title)) return;
-        var id = occurrenceId(glassBtns, idx, title, agentTitleFromButton, true);
+        var legacyId = occurrenceId(glassBtns, idx, title, agentTitleFromButton, true);
+        var nativeId = nativeAgentId(btn);
+        var id = nativeId || legacyId;
         if (!id) return;
         var item = btn.closest('.ui-sidebar-menu-item') || btn;
         var explicitlySelected = item.getAttribute('aria-selected') === 'true'
           || item.getAttribute('data-selected') === 'true'
           || btn.getAttribute('aria-selected') === 'true'
-          || btn.getAttribute('data-selected') === 'true';
+          || btn.getAttribute('data-selected') === 'true'
+          || btn.getAttribute('data-active') === 'true';
         var active = explicitlySelected;
         if (activeTitle && norm(title).toLowerCase() === norm(activeTitle).toLowerCase()) active = true;
         if (item.getAttribute('aria-selected') === 'true' || /selected|active|current/i.test(String(item.className || '') + ' ' + String(btn.className || ''))) {
           active = true;
         }
         if (explicitlySelected) explicitActiveId = id;
+        var workspace = workspaceMeta(btn);
+        var status = nativeStatus(btn);
         pushItem(items, seen, {
           id: id,
-          cache_key: resourceKeyForTitle(title),
+          cache_key: resourceKeyForTitle(title) || nativeId,
+          legacy_id: legacyId,
           title: title,
           active: active,
           index: idx,
           source: 'glass-sidebar',
+          workspace_key: workspace.key,
+          workspace_name: workspace.name,
+          workspace_expanded: workspace.expanded,
+          native_status: status.value,
+          native_working: status.working,
         });
       });
     }
@@ -891,7 +958,7 @@ const CURSOR_PERMISSION_EXPR = `
 
     var lastText = norm(permBubble.innerText || permBubble.textContent || '');
     var tail = lastText.slice(-500);
-    if (/pending command|pending (?:your )?approval|reply with (?:your )?approval|reply with approve\b|run command[?]|not in allowlist|awaiting (?:your )?approval|needs your approval|approve (?:this )?command|please approve(?:\s+(?:this|it))?(?:\s+and\s+(?:i['?]?ll\s+)?execute(?:\s+it)?)?/i.test(tail)) {
+    if (/pending command|pending (?:your )?approval|reply with (?:your )?approval|reply with approve\b|run command[?]|not in allowlist|awaiting (?:your )?approval|needs your approval|approve (?:this )?command|please approve(?:\s+(?:this|it))?(?:\s+and\s+(?:i['’]?ll\s+)?execute(?:\s+it)?)?/i.test(tail)) {
       return JSON.stringify({
         message: tail.substring(0, 300),
         choices: [
@@ -1563,6 +1630,24 @@ async function switchCursorAgent(Runtime, agentId) {
         );
         return stripAge(label ? firstLine(label) : firstLine(btn));
       }
+      function reactFiberKey(el, predicate) {
+        if (!el) return '';
+        var property = Object.getOwnPropertyNames(el).find(function(key) {
+          return key.indexOf('__reactFiber$') === 0;
+        });
+        var fiber = property ? el[property] : null;
+        for (var depth = 0; fiber && depth < 40; depth++, fiber = fiber.return) {
+          var key = typeof fiber.key === 'string' ? fiber.key : '';
+          if (key && predicate(key)) return key;
+        }
+        return '';
+      }
+      function nativeAgentId(el) {
+        var key = reactFiberKey(el, function(candidate) {
+          return /^\.\$[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(candidate);
+        });
+        return key ? key.substring(2) : '';
+      }
       function titleOfCell(cell) {
         var textEl = cell.querySelector('.agent-sidebar-cell-text, .agent-sidebar-cell-content');
         return stripAge(textEl ? firstLine(textEl) : firstLine(cell));
@@ -1579,7 +1664,8 @@ async function switchCursorAgent(Runtime, agentId) {
       var glassBtns = Array.from(d.querySelectorAll('.glass-sidebar-agent-menu-btn'));
       for (var g = 0; g < glassBtns.length; g++) {
         var gTitle = titleOfButton(glassBtns[g]);
-        if (occurrenceId(glassBtns, g, gTitle, titleOfButton, true) === targetId) {
+        var gId = nativeAgentId(glassBtns[g]) || occurrenceId(glassBtns, g, gTitle, titleOfButton, true);
+        if (gId === targetId) {
           glassBtns[g].click();
           return 'clicked-glass';
         }
@@ -1803,6 +1889,7 @@ const CURSOR_FILE_CHANGES_EXPR = `
     });
     var out = [];
     var seen = {};
+    var seenBars = [];
     keepBtns.forEach(function(keepBtn, sidx) {
       var bar = keepBtn.parentElement;
       for (var depth = 0; bar && depth < 8; depth++) {
@@ -1814,6 +1901,22 @@ const CURSOR_FILE_CHANGES_EXPR = `
         bar = bar.parentElement;
       }
       if (!bar || inConversations(bar)) return;
+      // The first matching ancestor can be only the action-button container.
+      // Prefer its compact header parent when that adds the native "1 File"
+      // identity, then deduplicate the nested Keep div/span matches by node.
+      var parent = bar.parentElement;
+      for (var promote = 0; parent && promote < 2; promote++, parent = parent.parentElement) {
+        var parentText = norm(parent.innerText || '');
+        if (/\\b\\d+\\s*files?\\b/i.test(parentText)
+            && /\\bundo\\b/i.test(parentText)
+            && /\\bkeep\\b/i.test(parentText)
+            && parentText.length < 120) {
+          bar = parent;
+          break;
+        }
+      }
+      if (seenBars.indexOf(bar) >= 0) return;
+      seenBars.push(bar);
       var barText = norm(bar.innerText || '');
       if (barText.length >= 120) return;
       var path = '';
@@ -1848,7 +1951,8 @@ async function readCursorFileChanges(Runtime) {
   }
 }
 
-async function respondCursorFileChange(Runtime, changeId, action) {
+async function respondCursorFileChange(Runtime, changeId, action, Input) {
+  const useTrustedClick = !!(Input && typeof Input.dispatchMouseEvent === 'function');
   const raw = await evalInPage(Runtime, `
     return (function() {
       function norm(t) { return String(t || '').replace(/\\s+/g, ' ').trim(); }
@@ -1863,6 +1967,10 @@ async function respondCursorFileChange(Runtime, changeId, action) {
       function labelOf(el) {
         return norm(el.innerText || el.textContent || el.getAttribute('aria-label') || '');
       }
+      function stableId(path) {
+        var base = String(path || 'pending').substring(0, 80);
+        return 'file-' + base.toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-+|-+$/g, '');
+      }
       var wanted = ${JSON.stringify(changeId)};
       var action = ${JSON.stringify(action)};
       var re = action === 'accept'
@@ -1874,8 +1982,8 @@ async function respondCursorFileChange(Runtime, changeId, action) {
           return isVisible(el) && !inConversations(el) && /^keep$/i.test(labelOf(el));
         });
         var bars = [];
-        var seen = {};
-        keeps.forEach(function(keepBtn) {
+        var seenBars = [];
+        keeps.forEach(function(keepBtn, sidx) {
           var bar = keepBtn.parentElement;
           for (var depth = 0; bar && depth < 8; depth++) {
             var text = norm(bar.innerText || '');
@@ -1883,9 +1991,28 @@ async function respondCursorFileChange(Runtime, changeId, action) {
             bar = bar.parentElement;
           }
           if (!bar || inConversations(bar) || norm(bar.innerText || '').length >= 120) return;
-          if (seen[bar]) return;
-          seen[bar] = true;
-          bars.push(bar);
+          var parent = bar.parentElement;
+          for (var promote = 0; parent && promote < 2; promote++, parent = parent.parentElement) {
+            var parentText = norm(parent.innerText || '');
+            if (/\\b\\d+\\s*files?\\b/i.test(parentText)
+                && /\\bundo\\b/i.test(parentText)
+                && /\\bkeep\\b/i.test(parentText)
+                && parentText.length < 120) {
+              bar = parent;
+              break;
+            }
+          }
+          if (seenBars.indexOf(bar) >= 0) return;
+          seenBars.push(bar);
+          var barText = norm(bar.innerText || '');
+          var path = '';
+          var fileMatch = barText.match(/([A-Za-z0-9_./\\\\-]+\\.[a-z0-9]{1,12})\\b/);
+          if (fileMatch) path = fileMatch[1];
+          if (!path) {
+            var fileCount = barText.match(/(\\d+)\\s*files?/i);
+            path = fileCount ? (fileCount[1] + '-files') : ('pending-' + sidx);
+          }
+          bars.push({ bar: bar, id: stableId(path) });
         });
         return bars;
       }
@@ -1893,38 +2020,98 @@ async function respondCursorFileChange(Runtime, changeId, action) {
       function pickBtn(root) {
         var found = null;
         Array.from(root.querySelectorAll('button, [role="button"], a, div, span')).forEach(function(b) {
-          if (found || !isVisible(b) || inConversations(b)) return;
-          if (re.test(labelOf(b))) found = b;
+          if (!isVisible(b) || inConversations(b) || !re.test(labelOf(b))) return;
+          if (!found || (b.getAttribute('data-click-ready') === 'true'
+              && found.getAttribute('data-click-ready') !== 'true')) found = b;
         });
         return found;
       }
 
+      function activate(btn, detail) {
+        if (!btn) return null;
+        btn.scrollIntoView({ block: 'nearest', inline: 'nearest' });
+        var rect = btn.getBoundingClientRect();
+        if (${JSON.stringify(useTrustedClick)}) {
+          return JSON.stringify({ status: 'point', detail: detail, x: rect.left + rect.width / 2, y: rect.top + rect.height / 2 });
+        }
+        var opts = { bubbles: true, cancelable: true, button: 0, view: window };
+        btn.dispatchEvent(new MouseEvent('mousedown', opts));
+        btn.dispatchEvent(new MouseEvent('mouseup', opts));
+        btn.dispatchEvent(new MouseEvent('click', opts));
+        return JSON.stringify({ status: 'clicked-dom', detail: detail });
+      }
+
       var bars = findCompactBars();
       for (var i = 0; i < bars.length; i++) {
-        var btn = pickBtn(bars[i]);
-        if (btn) { btn.click(); return 'clicked-live'; }
+        if (wanted && bars[i].id !== wanted) continue;
+        var btn = pickBtn(bars[i].bar);
+        var live = activate(btn, 'live:' + bars[i].id);
+        if (live) return live;
       }
 
       // Fallback: edit tool cards in transcript (older Cursor builds).
       var cards = Array.from(d.querySelectorAll('.ui-edit-tool-call'));
       for (var c = 0; c < cards.length; c++) {
         var cbtn = pickBtn(cards[c]);
-        if (cbtn) { cbtn.click(); return 'clicked-card'; }
+        var card = activate(cbtn, 'card:' + c);
+        if (card) return card;
       }
-      return 'no-btn';
+      return JSON.stringify({ status: 'no-btn', detail: wanted });
     })();
   `);
-  return raw === 'clicked-live' || raw === 'clicked-card';
+  let result;
+  try { result = raw ? JSON.parse(raw) : null; } catch { result = null; }
+  if (result?.status === 'point') {
+    await Input.dispatchMouseEvent({ type: 'mouseMoved', x: result.x, y: result.y });
+    await Input.dispatchMouseEvent({ type: 'mousePressed', x: result.x, y: result.y, button: 'left', clickCount: 1 });
+    await Input.dispatchMouseEvent({ type: 'mouseReleased', x: result.x, y: result.y, button: 'left', clickCount: 1 });
+    if (action === 'reject') {
+      // Cursor 3.5 intentionally turns Undo into a second-step
+      // "Confirm / Keep" bar. Do not acknowledge Reject until the native
+      // confirmation itself has received a trusted click.
+      let confirmPoint = null;
+      for (let attempt = 0; attempt < 20 && !confirmPoint; attempt++) {
+        await new Promise(resolve => setTimeout(resolve, 100));
+        const confirmRaw = await evalInPage(Runtime, `
+          function norm(t) { return String(t || '').replace(/\\s+/g, ' ').trim(); }
+          function isVisible(el) {
+            if (!el || !el.getBoundingClientRect) return false;
+            var r = el.getBoundingClientRect();
+            return r.width > 0 && r.height > 0;
+          }
+          var candidates = Array.from(d.querySelectorAll('[data-click-ready="true"], button, [role="button"]'));
+          for (var i = 0; i < candidates.length; i++) {
+            var el = candidates[i];
+            if (!isVisible(el) || (el.closest && el.closest('.conversations'))) continue;
+            if (!/^confirm$/i.test(norm(el.innerText || el.textContent || el.getAttribute('aria-label') || ''))) continue;
+            var parentText = norm(el.parentElement && el.parentElement.innerText || '');
+            if (!/\\bkeep\\b/i.test(parentText) || parentText.length >= 120) continue;
+            el.scrollIntoView({ block: 'nearest', inline: 'nearest' });
+            var rect = el.getBoundingClientRect();
+            return JSON.stringify({ x: rect.left + rect.width / 2, y: rect.top + rect.height / 2 });
+          }
+          return '';
+        `);
+        try { confirmPoint = confirmRaw ? JSON.parse(confirmRaw) : null; } catch { confirmPoint = null; }
+      }
+      if (!confirmPoint) return { ok: false, detail: 'undo-confirm-not-found' };
+      await Input.dispatchMouseEvent({ type: 'mouseMoved', x: confirmPoint.x, y: confirmPoint.y });
+      await Input.dispatchMouseEvent({ type: 'mousePressed', x: confirmPoint.x, y: confirmPoint.y, button: 'left', clickCount: 1 });
+      await Input.dispatchMouseEvent({ type: 'mouseReleased', x: confirmPoint.x, y: confirmPoint.y, button: 'left', clickCount: 1 });
+      return { ok: true, detail: `clicked-trusted-confirmed:${result.detail}` };
+    }
+    return { ok: true, detail: `clicked-trusted:${result.detail}` };
+  }
+  const ok = result?.status === 'clicked-dom';
+  return { ok, detail: ok ? result.detail : (result?.detail || result?.status || 'no-btn') };
 }
 
-async function acceptCursorFileChange(Runtime, changeId) {
-  const ok = await respondCursorFileChange(Runtime, changeId, 'accept');
-  return { ok, detail: ok ? 'clicked' : 'no-btn' };
+async function acceptCursorFileChange(Runtime, changeId, Input) {
+  return respondCursorFileChange(Runtime, changeId, 'accept', Input);
 }
 
-async function rejectCursorFileChange(Runtime, changeId) {
-  const ok = await respondCursorFileChange(Runtime, changeId, 'reject');
-  return { ok, detail: ok ? 'clicked' : 'no-btn' };
+async function rejectCursorFileChange(Runtime, changeId, Input) {
+  return respondCursorFileChange(Runtime, changeId, 'reject', Input);
 }
 
 const CURSOR_TERMINAL_READ_EXPR = `
@@ -2221,6 +2408,7 @@ async function detectCursorThinking(Runtime) {
 }
 
 module.exports = {
+  classifyCursorCollapsibleHeader,
   readCursorMessages,
   sendCursorMessage,
   steerCursorInput,

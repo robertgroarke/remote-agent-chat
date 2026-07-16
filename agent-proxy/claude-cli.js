@@ -5,8 +5,23 @@ const os = require('os');
 const path = require('path');
 const { spawn, spawnSync } = require('child_process');
 const { normalizeNativeLaunchMode, backgroundNativeLaunchResult } = require('./native-launch-mode');
+const { setBoundedMap } = require('./bounded-map');
 let chokidar = null;
 try { chokidar = require('chokidar'); } catch {}
+
+const CLAUDE_SUMMARY_CACHE = new Map();
+const CLAUDE_TAIL_SUMMARY_CACHE = new Map();
+const JSONL_CHUNK_BYTES = 256 * 1024;
+
+function envMb(name, fallback, min = 1) {
+  const parsed = parseInt(process.env[name] || '', 10);
+  const mb = Number.isFinite(parsed) && parsed > 0 ? parsed : fallback;
+  return Math.max(min, mb) * 1024 * 1024;
+}
+
+const JSONL_MAX_LINE_BYTES = envMb('CLAUDE_CLI_MAX_JSONL_LINE_MB', 8);
+const DEFAULT_HYDRATE_MAX_BYTES = envMb('CLAUDE_CLI_HYDRATE_MAX_MB', 75);
+const DEFAULT_HYDRATE_TAIL_BYTES = envMb('CLAUDE_CLI_HYDRATE_TAIL_MB', 4);
 
 const CLAUDE_CLI_MODELS = [
   { id: 'default', label: 'Default' },
@@ -48,6 +63,49 @@ function decodeProjectDirName(name) {
 
 function safeStat(filePath) {
   try { return fs.statSync(filePath); } catch { return null; }
+}
+
+function fileCursorAnchor(filePath, offset) {
+  const end = Math.max(0, Number(offset) || 0);
+  if (end === 0) return '';
+  let fd = null;
+  try {
+    fd = fs.openSync(filePath, 'r');
+    const length = Math.min(256, end);
+    const buffer = Buffer.allocUnsafe(length);
+    const read = fs.readSync(fd, buffer, 0, length, end - length);
+    return buffer.subarray(0, read).toString('base64');
+  } catch {
+    return null;
+  } finally {
+    if (fd != null) try { fs.closeSync(fd); } catch {}
+  }
+}
+
+function scanStartAlignedToLine(filePath, startOffset) {
+  if (!startOffset) return 0;
+  let fd = null;
+  try {
+    fd = fs.openSync(filePath, 'r');
+    const stat = fs.fstatSync(fd);
+    let position = Math.max(0, Math.min(Number(startOffset) || 0, stat.size));
+    const chunk = Buffer.allocUnsafe(64 * 1024);
+    while (position < stat.size) {
+      const bytesRead = fs.readSync(fd, chunk, 0, Math.min(chunk.length, stat.size - position), position);
+      if (!bytesRead) break;
+      for (let index = 0; index < bytesRead; index += 1) {
+        if (chunk[index] === 10) return position + index + 1;
+      }
+      position += bytesRead;
+    }
+  } catch {
+    return Math.max(0, Number(startOffset) || 0);
+  } finally {
+    if (fd != null) {
+      try { fs.closeSync(fd); } catch {}
+    }
+  }
+  return Math.max(0, Number(startOffset) || 0);
 }
 
 function walkJsonlFiles(root, maxFiles) {
@@ -265,18 +323,257 @@ function buildClaudeToolBlock(part, entry, resultRecord) {
   };
 }
 
-function readClaudeEntries(filePath) {
-  let lines = [];
+const CLAUDE_TASK_TOOLS = new Set(['TaskCreate', 'TaskGet', 'TaskUpdate', 'TaskList']);
+
+function isClaudeTaskTool(name) {
+  return CLAUDE_TASK_TOOLS.has(String(name || '').trim());
+}
+
+function normalizeClaudeTaskStatus(status) {
+  const value = String(status || 'pending').trim().toLowerCase();
+  return ['pending', 'in_progress', 'completed'].includes(value) ? value : 'pending';
+}
+
+function upsertClaudeTask(state, task, fallbackId) {
+  const id = String(task?.id || task?.taskId || fallbackId || '').trim();
+  if (!id) return null;
+  const existing = state.tasksById.get(id) || {};
+  const subject = String(task?.subject || task?.step || task?.text || existing.step || `Task ${id}`).trim();
+  const next = {
+    id,
+    step: subject || `Task ${id}`,
+    active_form: typeof task?.activeForm === 'string'
+      ? task.activeForm
+      : existing.active_form,
+    status: normalizeClaudeTaskStatus(task?.status || existing.status),
+  };
+  if (!state.tasksById.has(id)) state.taskOrder.push(id);
+  state.tasksById.set(id, next);
+  return next;
+}
+
+function removeClaudeTask(state, taskId) {
+  const id = String(taskId || '').trim();
+  if (!id || !state.tasksById.has(id)) return;
+  state.tasksById.delete(id);
+  state.taskOrder = state.taskOrder.filter(candidate => candidate !== id);
+}
+
+function remapClaudeTask(state, fromId, toId, task = {}) {
+  const source = String(fromId || '').trim();
+  const target = String(toId || '').trim();
+  if (!target) return null;
+  const existing = {
+    ...(state.tasksById.get(target) || {}),
+    ...(state.tasksById.get(source) || {}),
+  };
+  if (source && source !== target) {
+    const index = state.taskOrder.indexOf(source);
+    if (index >= 0) state.taskOrder[index] = target;
+    state.tasksById.delete(source);
+    state.taskOrder = Array.from(new Set(state.taskOrder));
+    state.tasksById.set(target, existing);
+  }
+  return upsertClaudeTask(state, { ...existing, ...task, id: target }, target);
+}
+
+function claudeTaskPlanBlock(state, { callId, toolName } = {}) {
+  const tasks = state.taskOrder.map(id => state.tasksById.get(id)).filter(Boolean);
+  const completed = tasks.filter(task => task.status === 'completed').length;
+  const total = tasks.length;
+  return {
+    type: 'plan',
+    title: `${total} ${total === 1 ? 'task' : 'tasks'} (${completed} done, ${total - completed} open)`,
+    tasks,
+    status: total > 0 && completed === total ? 'completed' : 'running',
+    call_id: callId || undefined,
+    tool_name: toolName || 'TaskList',
+    collapsed: false,
+  };
+}
+
+function refreshClaudeTaskPlan(state, entry, part) {
+  if (state.taskOrder.length === 0) return;
+  const block = claudeTaskPlanBlock(state, {
+    callId: part?.id || part?.tool_use_id,
+    toolName: part?.name,
+  });
+  const message = {
+    role: 'assistant',
+    content: '[Tasks]',
+    content_blocks: [block],
+    ts: timestampSeconds(entry),
+  };
+  if (Number.isInteger(state.taskPlanMessageIndex)) {
+    state.messages[state.taskPlanMessageIndex] = message;
+  } else {
+    state.taskPlanMessageIndex = state.messages.length;
+    state.messages.push(message);
+  }
+}
+
+function applyClaudeTaskUse(state, part, entry) {
+  const name = String(part?.name || '').trim();
+  const input = part?.input && typeof part.input === 'object' ? part.input : {};
+  const callId = String(part?.id || '').trim();
+  if (name === 'TaskCreate') {
+    const temporaryId = `pending:${callId || state.taskOrder.length + 1}`;
+    upsertClaudeTask(state, {
+      id: temporaryId,
+      subject: input.subject || input.description,
+      activeForm: input.activeForm,
+      status: 'pending',
+    }, temporaryId);
+    if (callId) state.pendingTaskCreates.set(callId, temporaryId);
+  } else if (name === 'TaskUpdate') {
+    if (String(input.status || '').trim().toLowerCase() === 'deleted') {
+      removeClaudeTask(state, input.taskId);
+    } else {
+      upsertClaudeTask(state, {
+        id: input.taskId,
+        subject: input.subject,
+        activeForm: input.activeForm,
+        status: input.status,
+      }, input.taskId);
+    }
+  }
+  refreshClaudeTaskPlan(state, entry, part);
+}
+
+function applyClaudeTaskResult(state, toolUse, resultPart, entry) {
+  const name = String(toolUse?.part?.name || '').trim();
+  const input = toolUse?.part?.input && typeof toolUse.part.input === 'object'
+    ? toolUse.part.input
+    : {};
+  const structured = entry?.toolUseResult && typeof entry.toolUseResult === 'object'
+    ? entry.toolUseResult
+    : {};
+  if (name === 'TaskCreate') {
+    const callId = String(toolUse?.part?.id || resultPart?.tool_use_id || '').trim();
+    const temporaryId = state.pendingTaskCreates.get(callId);
+    const created = structured.task && typeof structured.task === 'object' ? structured.task : {};
+    const taskId = created.id || structured.taskId;
+    if (taskId) {
+      remapClaudeTask(state, temporaryId, taskId, {
+        ...created,
+        subject: created.subject || input.subject || input.description,
+        activeForm: input.activeForm,
+        status: created.status || 'pending',
+      });
+    }
+    if (callId) state.pendingTaskCreates.delete(callId);
+  } else if (name === 'TaskUpdate') {
+    const taskId = structured.taskId || input.taskId;
+    if (String(input.status || '').trim().toLowerCase() === 'deleted') {
+      removeClaudeTask(state, taskId);
+    } else {
+      upsertClaudeTask(state, {
+        id: taskId,
+        subject: input.subject,
+        activeForm: input.activeForm,
+        status: structured.statusChange?.to || input.status,
+      }, taskId);
+    }
+  } else if (name === 'TaskList' && Array.isArray(structured.tasks)) {
+    for (const task of structured.tasks) upsertClaudeTask(state, task, task?.id);
+  } else if (name === 'TaskGet' && structured.task && typeof structured.task === 'object') {
+    upsertClaudeTask(state, structured.task, structured.task.id || input.taskId);
+  }
+  refreshClaudeTaskPlan(state, entry, {
+    ...toolUse?.part,
+    tool_use_id: resultPart?.tool_use_id,
+  });
+}
+
+function scanClaudeJsonlEntries(filePath, onEntry, { startOffset = 0 } = {}) {
+  let fd = null;
+  let stat = null;
+  let position = Math.max(0, Number(startOffset) || 0);
+  let lastCompleteOffset = position;
+  let lineBuffers = [];
+  let lineBytes = 0;
+  let lineTooLarge = false;
+  let emitted = 0;
   try {
-    lines = fs.readFileSync(filePath, 'utf8').split(/\r?\n/).filter(Boolean);
+    fd = fs.openSync(filePath, 'r');
+    stat = fs.fstatSync(fd);
+    if (position > stat.size) position = 0;
+    const scanStartOffset = position;
+    const chunk = Buffer.allocUnsafe(JSONL_CHUNK_BYTES);
+    while (position < stat.size) {
+      const bytesRead = fs.readSync(fd, chunk, 0, Math.min(chunk.length, stat.size - position), position);
+      if (!bytesRead) break;
+      let segmentStart = 0;
+      for (let index = 0; index < bytesRead; index += 1) {
+        if (chunk[index] !== 10) continue;
+        if (index > segmentStart && !lineTooLarge) {
+          const length = index - segmentStart;
+          if (lineBytes + length <= JSONL_MAX_LINE_BYTES) {
+            lineBuffers.push(Buffer.from(chunk.subarray(segmentStart, index)));
+            lineBytes += length;
+          } else {
+            lineTooLarge = true;
+            lineBuffers = [];
+          }
+        }
+        if (!lineTooLarge) {
+          let line = Buffer.concat(lineBuffers).toString('utf8');
+          if (line.endsWith('\r')) line = line.slice(0, -1);
+          if (line.trim()) {
+            try {
+              onEntry(JSON.parse(line));
+              emitted += 1;
+            } catch {}
+          }
+        }
+        lineBuffers = [];
+        lineBytes = 0;
+        lineTooLarge = false;
+        lastCompleteOffset = position + index + 1;
+        segmentStart = index + 1;
+      }
+      if (segmentStart < bytesRead && !lineTooLarge) {
+        const length = bytesRead - segmentStart;
+        if (lineBytes + length <= JSONL_MAX_LINE_BYTES) {
+          lineBuffers.push(Buffer.from(chunk.subarray(segmentStart, bytesRead)));
+          lineBytes += length;
+        } else {
+          lineTooLarge = true;
+          lineBuffers = [];
+          lineBytes = 0;
+        }
+      }
+      position += bytesRead;
+    }
+    if (!lineTooLarge && lineBuffers.length > 0) {
+      let line = Buffer.concat(lineBuffers).toString('utf8');
+      if (line.endsWith('\r')) line = line.slice(0, -1);
+      if (line.trim()) {
+        try {
+          onEntry(JSON.parse(line));
+          emitted += 1;
+          lastCompleteOffset = stat.size;
+        } catch {
+          // Retain the last complete-line cursor. The unfinished suffix is
+          // re-read with the next append and is never accepted twice.
+        }
+      } else {
+        lastCompleteOffset = stat.size;
+      }
+    }
+    return {
+      stat,
+      offset: lastCompleteOffset,
+      emitted,
+      bytesRead: Math.max(0, stat.size - scanStartOffset),
+    };
   } catch {
-    return [];
+    return { stat, offset: lastCompleteOffset, emitted, bytesRead: 0 };
+  } finally {
+    if (fd != null) {
+      try { fs.closeSync(fd); } catch {}
+    }
   }
-  const entries = [];
-  for (const line of lines) {
-    try { entries.push(JSON.parse(line)); } catch {}
-  }
-  return entries;
 }
 
 function messageContentToText(entry) {
@@ -298,49 +595,126 @@ function messageContentToText(entry) {
   return parts.filter(Boolean).join('\n\n');
 }
 
-function parseClaudeJsonl(filePath) {
-  const entries = readClaudeEntries(filePath);
-  if (entries.length === 0) return [];
-
-  const resultsByCallId = new Map();
-  const toolUsesByCallId = new Map();
-  for (const entry of entries) {
-    const parts = Array.isArray(entry?.message?.content) ? entry.message.content : [];
-    for (const part of parts) {
-      if (entry?.isSidechain) continue;
-      if (entry?.type === 'user' && part?.type === 'tool_result' && part.tool_use_id) {
-        resultsByCallId.set(String(part.tool_use_id), { part, entry });
-      } else if (entry?.type === 'assistant' && part?.type === 'tool_use' && part.id) {
-        toolUsesByCallId.set(String(part.id), { part, entry });
-      }
-    }
+function syntheticClaudeBlock(entry, content) {
+  const errorCode = String(entry?.error || '').trim().toLowerCase();
+  const apiStatus = Number(entry?.apiErrorStatus);
+  const isError = entry?.isApiErrorMessage === true || !!errorCode || (Number.isFinite(apiStatus) && apiStatus >= 400);
+  if (!isError) {
+    return {
+      type: 'notice',
+      title: 'Claude CLI notice',
+      content,
+      collapsed: false,
+    };
   }
 
-  const messages = [];
-  for (const entry of entries) {
-    if (entry.isSidechain) continue;
-    if (entry.type !== 'user' && entry.type !== 'assistant') continue;
-    const rawContent = entry?.message?.content;
-    const parts = Array.isArray(rawContent) ? rawContent : null;
-    const ts = timestampSeconds(entry);
+  let title = 'Claude CLI error';
+  if (errorCode === 'rate_limit' || apiStatus === 429) title = 'Rate limit reached';
+  else if (errorCode === 'authentication_failed' || apiStatus === 401) title = 'Authentication failed';
+  else if (errorCode === 'model_not_found' || apiStatus === 404) title = 'Model unavailable';
+  else if (entry?.message?.stop_reason === 'refusal') title = 'Request refused';
+  return {
+    type: 'error',
+    title,
+    content,
+    status: errorCode || (Number.isFinite(apiStatus) ? String(apiStatus) : 'error'),
+    collapsed: false,
+  };
+}
 
-    if (!parts) {
-      const content = messageContentToText(entry).trim();
-      if (content) messages.push({ role: entry.type, content, ts });
-      continue;
+function createClaudeParseState(filePath) {
+  return {
+    filePath,
+    messages: [],
+    pendingQueue: [],
+    resultsByCallId: new Map(),
+    toolUsesByCallId: new Map(),
+    tasksById: new Map(),
+    taskOrder: [],
+    pendingTaskCreates: new Map(),
+    taskPlanMessageIndex: null,
+    entrypoints: new Set(),
+    workspacePath: null,
+    modelId: null,
+    permissionMode: null,
+    effort: null,
+  };
+}
+
+function applyClaudeMetadata(state, entry) {
+  if (entry?.entrypoint) state.entrypoints.add(String(entry.entrypoint));
+  if (typeof entry?.cwd === 'string' && entry.cwd.trim()) state.workspacePath = entry.cwd.trim();
+  const candidateModel = typeof entry?.message?.model === 'string' ? entry.message.model.trim() : '';
+  if (candidateModel && !/^<synthetic>$/i.test(candidateModel)) state.modelId = candidateModel;
+  if (typeof entry?.permissionMode === 'string' && entry.permissionMode.trim()) state.permissionMode = entry.permissionMode.trim();
+  if (typeof entry?.effort === 'string' && entry.effort.trim()) state.effort = entry.effort.trim();
+}
+
+function refreshClaudeToolUse(state, callId) {
+  const toolUse = state.toolUsesByCallId.get(callId);
+  if (!toolUse || !Number.isInteger(toolUse.messageIndex)) return;
+  const result = state.resultsByCallId.get(callId) || null;
+  const previous = state.messages[toolUse.messageIndex];
+  if (!previous) return;
+  state.messages[toolUse.messageIndex] = {
+    ...previous,
+    content_blocks: [buildClaudeToolBlock(toolUse.part, toolUse.entry, result)],
+  };
+  if (result && Number.isInteger(result.messageIndex)) {
+    const resultMessage = state.messages[result.messageIndex];
+    const toolName = String(toolUse.part?.name || '').trim();
+    if (resultMessage?.content_blocks?.[0]) {
+      state.messages[result.messageIndex] = {
+        ...resultMessage,
+        content_blocks: [{
+          ...resultMessage.content_blocks[0],
+          title: `${result.part?.is_error ? 'Tool error' : 'Tool result'}${toolName ? `: ${toolName}` : ''}`,
+          tool_name: toolName || undefined,
+        }],
+      };
     }
+  }
+}
 
-    for (const part of parts) {
-      if (!part) continue;
-      if (part.type === 'tool_result') {
-        const toolUse = part.tool_use_id ? toolUsesByCallId.get(String(part.tool_use_id)) : null;
-        const toolName = String(toolUse?.part?.name || '').trim();
-        // Shell calls are represented by one canonical terminal block containing
-        // command, stdout, and stderr. Other tools keep their call and result as
-        // distinct protocol blocks, matching the shared schema contract.
-        if (/^(bash|shell|powershell)$/i.test(toolName)) continue;
+function applyClaudeEntryToState(state, entry) {
+  applyClaudeMetadata(state, entry);
+  if (entry?.type === 'queue-operation') {
+    const operation = String(entry.operation || '').trim().toLowerCase();
+    if (operation === 'enqueue') {
+      const content = typeof entry.content === 'string' ? entry.content.trim() : '';
+      if (content) state.pendingQueue.push({ content, ts: timestampSeconds(entry) });
+    } else if (operation === 'dequeue' && state.pendingQueue.length > 0) {
+      state.pendingQueue.shift();
+    }
+    return;
+  }
+  if (entry?.isSidechain || (entry?.type !== 'user' && entry?.type !== 'assistant')) return;
+
+  const rawContent = entry?.message?.content;
+  const parts = Array.isArray(rawContent) ? rawContent : null;
+  const ts = timestampSeconds(entry);
+  if (!parts) {
+    const content = messageContentToText(entry).trim();
+    if (content) state.messages.push({ role: entry.type, content, ts });
+    return;
+  }
+
+  for (const part of parts) {
+    if (!part) continue;
+    if (part.type === 'tool_result') {
+      const callId = part.tool_use_id ? String(part.tool_use_id) : '';
+      const toolUse = callId ? state.toolUsesByCallId.get(callId) : null;
+      const toolName = String(toolUse?.part?.name || '').trim();
+      const resultRecord = { part, entry, messageIndex: null };
+      if (callId) state.resultsByCallId.set(callId, resultRecord);
+      if (isClaudeTaskTool(toolName)) {
+        applyClaudeTaskResult(state, toolUse, part, entry);
+        continue;
+      }
+      if (!/^(bash|shell|powershell)$/i.test(toolName)) {
         const content = toolResultBody(part, entry);
-        messages.push({
+        resultRecord.messageIndex = state.messages.length;
+        state.messages.push({
           role: 'assistant',
           content: `[${part.is_error ? 'Tool error' : 'Tool result'}]`,
           content_blocks: [{
@@ -354,84 +728,200 @@ function parseClaudeJsonl(filePath) {
           }],
           ts,
         });
-        continue;
       }
-
-      if (part.type === 'tool_use') {
-        const result = part.id ? resultsByCallId.get(String(part.id)) : null;
-        const block = buildClaudeToolBlock(part, entry, result);
-        messages.push({
-          role: 'assistant',
-          content: `[Tool: ${part.name || 'tool'}]`,
-          content_blocks: [block],
-          ts,
-        });
-        continue;
-      }
-
-      if (part.type === 'thinking') {
-        const thinking = extractTextFromPart(part);
-        messages.push({
-          role: 'assistant',
-          content: thinking ? '[Thinking]' : 'Thinking',
-          content_blocks: [{
-            type: 'thinking',
-            title: 'Thinking',
-            content: thinking,
-            collapsed: false,
-          }],
-          ts,
-        });
-        continue;
-      }
-
-      const content = extractTextFromPart(part);
-      if (!content) continue;
-      if (entry.type === 'assistant') {
-        messages.push({
-          role: 'assistant',
-          content,
-          content_blocks: [{ type: 'markdown', content }],
-          ts,
-        });
-      } else {
-        messages.push({ role: 'user', content, ts });
-      }
+      if (callId) refreshClaudeToolUse(state, callId);
+      continue;
     }
+
+    if (part.type === 'tool_use') {
+      const callId = part.id ? String(part.id) : '';
+      const result = callId ? state.resultsByCallId.get(callId) : null;
+      if (isClaudeTaskTool(part.name)) {
+        if (callId) state.toolUsesByCallId.set(callId, { part, entry, messageIndex: null });
+        applyClaudeTaskUse(state, part, entry);
+        if (result) applyClaudeTaskResult(state, { part, entry, messageIndex: null }, result.part, result.entry);
+        continue;
+      }
+      const messageIndex = state.messages.length;
+      state.messages.push({
+        role: 'assistant',
+        content: `[Tool: ${part.name || 'tool'}]`,
+        content_blocks: [buildClaudeToolBlock(part, entry, result)],
+        ts,
+      });
+      if (callId) {
+        state.toolUsesByCallId.set(callId, { part, entry, messageIndex });
+        refreshClaudeToolUse(state, callId);
+      }
+      continue;
+    }
+
+    if (part.type === 'thinking') {
+      const thinking = extractTextFromPart(part);
+      state.messages.push({
+        role: 'assistant',
+        content: thinking ? '[Thinking]' : 'Thinking',
+        content_blocks: [{ type: 'thinking', title: 'Thinking', content: thinking, collapsed: false }],
+        ts,
+      });
+      continue;
+    }
+
+    const content = extractTextFromPart(part);
+    if (!content) continue;
+    if (entry.type === 'assistant') {
+      const isSynthetic = String(entry?.message?.model || '').trim() === '<synthetic>';
+      state.messages.push({
+        role: 'assistant',
+        content,
+        content_blocks: [isSynthetic ? syntheticClaudeBlock(entry, content) : { type: 'markdown', content }],
+        ts,
+      });
+    } else {
+      state.messages.push({ role: 'user', content, ts });
+    }
+  }
+}
+
+function claudeStateMessages(state) {
+  const messages = [...state.messages];
+  for (const queued of state.pendingQueue) {
+    messages.push({
+      role: 'assistant',
+      content: `[Queued message]\n\n${queued.content}`,
+      content_blocks: [{
+        type: 'queued_message', title: 'Queued message', content: queued.content,
+        status: 'pending', collapsed: false,
+      }],
+      ts: queued.ts,
+    });
   }
   return messages;
 }
 
-function readClaudeMetadata(filePath) {
-  const entries = readClaudeEntries(filePath);
-  const entrypoints = new Set();
-  let workspacePath = null;
-  let modelId = null;
-  let permissionMode = null;
-  let effort = null;
-  for (const entry of entries) {
-    if (entry?.entrypoint) entrypoints.add(String(entry.entrypoint));
-    if (typeof entry?.cwd === 'string' && entry.cwd.trim()) workspacePath = entry.cwd.trim();
-    if (typeof entry?.message?.model === 'string' && entry.message.model.trim()) modelId = entry.message.model.trim();
-    if (typeof entry?.permissionMode === 'string' && entry.permissionMode.trim()) permissionMode = entry.permissionMode.trim();
-    if (typeof entry?.effort === 'string' && entry.effort.trim()) effort = entry.effort.trim();
-  }
-  return { entries, entrypoints: Array.from(entrypoints), workspacePath, modelId, permissionMode, effort };
-}
-
-function readSessionSummary(filePath) {
+function parseClaudeJsonlDetailed(filePath) {
   const stat = safeStat(filePath);
   if (!stat) return null;
+  const prior = CLAUDE_SUMMARY_CACHE.get(filePath);
+  const canTail = !!prior
+    && stat.size >= prior.offset
+    && stat.size >= prior.size
+    && prior.anchor === fileCursorAnchor(filePath, prior.offset)
+    && !(stat.size === prior.size && stat.mtimeMs !== prior.mtimeMs);
+  const state = canTail ? prior.state : createClaudeParseState(filePath);
+  const scanStartOffset = canTail ? prior.offset : 0;
+  const scan = scanClaudeJsonlEntries(filePath, entry => applyClaudeEntryToState(state, entry), {
+    startOffset: scanStartOffset,
+  });
+  setBoundedMap(CLAUDE_SUMMARY_CACHE, filePath, {
+    state,
+    offset: scan.offset,
+    size: stat.size,
+    mtimeMs: stat.mtimeMs,
+    anchor: fileCursorAnchor(filePath, scan.offset),
+  }, 32);
+  return {
+    state,
+    stat,
+    sourceCursor: {
+      mode: canTail ? (stat.size > prior.size ? 'append' : 'unchanged') : (prior ? 'recovery' : 'baseline'),
+      start_offset: scanStartOffset,
+      end_offset: scan.offset,
+      file_size: stat.size,
+      bytes_read: scan.bytesRead,
+      events_read: scan.emitted,
+    },
+  };
+}
+
+function parseClaudeJsonlTail(filePath, tailBytes = DEFAULT_HYDRATE_TAIL_BYTES) {
+  const stat = safeStat(filePath);
+  if (!stat) return null;
+  const boundedTailBytes = Math.max(1024 * 1024, Number(tailBytes) || DEFAULT_HYDRATE_TAIL_BYTES);
+  const prior = CLAUDE_TAIL_SUMMARY_CACHE.get(filePath);
+  const canTail = !!prior
+    && prior.tailBytes === boundedTailBytes
+    && stat.size >= prior.offset
+    && stat.size >= prior.size
+    && prior.anchor === fileCursorAnchor(filePath, prior.offset)
+    && !(stat.size === prior.size && stat.mtimeMs !== prior.mtimeMs);
+  let state;
+  let startOffset;
+  let scanStartOffset;
+  let windowStartOffset;
+  if (canTail) {
+    state = prior.state;
+    startOffset = prior.startOffset;
+    scanStartOffset = prior.offset;
+    windowStartOffset = scanStartOffset;
+  } else {
+    state = createClaudeParseState(filePath);
+    const wantedStart = Math.max(0, stat.size - boundedTailBytes);
+    windowStartOffset = wantedStart;
+    startOffset = scanStartAlignedToLine(filePath, wantedStart);
+    scanStartOffset = startOffset;
+  }
+  const scan = scanClaudeJsonlEntries(filePath, entry => applyClaudeEntryToState(state, entry), {
+    startOffset: scanStartOffset,
+  });
+  setBoundedMap(CLAUDE_TAIL_SUMMARY_CACHE, filePath, {
+    state,
+    startOffset,
+    offset: scan.offset,
+    size: stat.size,
+    mtimeMs: stat.mtimeMs,
+    tailBytes: boundedTailBytes,
+    anchor: fileCursorAnchor(filePath, scan.offset),
+  }, 32);
+  return {
+    state,
+    stat,
+    sourceCursor: {
+      mode: canTail ? (stat.size > prior.size ? 'append' : 'unchanged') : (prior ? 'recovery' : 'baseline_tail'),
+      start_offset: scanStartOffset,
+      end_offset: scan.offset,
+      file_size: stat.size,
+      bytes_read: Math.max(0, stat.size - scanStartOffset),
+      bounded_window_bytes_read: Math.max(0, stat.size - windowStartOffset),
+      alignment_bytes_read: Math.max(0, scanStartOffset - windowStartOffset),
+      events_read: scan.emitted,
+      partial: startOffset > 0,
+    },
+  };
+}
+
+function parseClaudeJsonl(filePath) {
+  const detailed = parseClaudeJsonlDetailed(filePath);
+  return detailed ? claudeStateMessages(detailed.state) : [];
+}
+
+function readClaudeMetadata(filePath) {
+  const detailed = parseClaudeJsonlDetailed(filePath);
+  const state = detailed?.state;
+  return state ? {
+    entrypoints: Array.from(state.entrypoints),
+    workspacePath: state.workspacePath,
+    modelId: state.modelId,
+    permissionMode: state.permissionMode,
+    effort: state.effort,
+  } : { entrypoints: [], workspacePath: null, modelId: null, permissionMode: null, effort: null };
+}
+
+function buildClaudeSessionSummary(filePath, detailed, {
+  messagesPartial = false,
+  hydrateSkippedReason = null,
+} = {}) {
+  if (!detailed) return null;
+  const { stat, state } = detailed;
   const cliSessionId = path.basename(filePath, '.jsonl');
   const workspaceDirName = path.basename(path.dirname(filePath));
-  const metadata = readClaudeMetadata(filePath);
-  const workspacePath = metadata.workspacePath || decodeProjectDirName(workspaceDirName);
+  const workspacePath = state.workspacePath || decodeProjectDirName(workspaceDirName);
   const workspaceName = workspacePath ? path.basename(workspacePath) : workspaceDirName;
-  const messages = parseClaudeJsonl(filePath);
-  const entrypointList = metadata.entrypoints;
+  const messages = claudeStateMessages(state);
+  const entrypointList = Array.from(state.entrypoints);
   const isCliLike = entrypointList.length === 0
     || entrypointList.some(ep => !/vscode|ide|desktop/i.test(ep));
-  const firstUser = messages.find(m => m.role === 'user');
+  const firstUser = messages.find(message => message.role === 'user');
   const title = (firstUser?.content || '').replace(/\s+/g, ' ').trim().substring(0, 80) || 'Claude CLI session';
   return {
     cliSessionId,
@@ -441,13 +931,48 @@ function readSessionSummary(filePath) {
     title,
     messages,
     messageCount: messages.length,
+    messagesHydrated: true,
+    messagesPartial,
+    ...(hydrateSkippedReason ? { hydrateSkippedReason } : {}),
     updatedAt: stat.mtime.toISOString(),
+    sizeBytes: stat.size,
     entrypoints: entrypointList,
     isCliLike,
-    model_id: metadata.modelId || undefined,
-    permission_mode: metadata.permissionMode || undefined,
-    effort: metadata.effort || undefined,
+    model_id: state.modelId || undefined,
+    permission_mode: state.permissionMode || undefined,
+    effort: state.effort || undefined,
+    sourceCursor: detailed.sourceCursor,
   };
+}
+
+function readSessionSummary(filePath, {
+  includeMessages = true,
+  maxHydrateBytes = DEFAULT_HYDRATE_MAX_BYTES,
+  preferTailBytes = 0,
+} = {}) {
+  const stat = safeStat(filePath);
+  if (!stat) return null;
+  if (!includeMessages) {
+    const detailed = parseClaudeJsonlTail(filePath, DEFAULT_HYDRATE_TAIL_BYTES);
+    const summary = buildClaudeSessionSummary(filePath, detailed, {
+      messagesPartial: stat.size > DEFAULT_HYDRATE_TAIL_BYTES,
+      hydrateSkippedReason: 'metadata_only_tail',
+    });
+    return summary ? { ...summary, messages: [], messageCount: 0, messagesHydrated: false } : null;
+  }
+  if (Number(preferTailBytes) > 0 && stat.size > Number(preferTailBytes)) {
+    return buildClaudeSessionSummary(filePath, parseClaudeJsonlTail(filePath, preferTailBytes), {
+      messagesPartial: true,
+      hydrateSkippedReason: 'active_tail',
+    });
+  }
+  if (stat.size > maxHydrateBytes) {
+    return buildClaudeSessionSummary(filePath, parseClaudeJsonlTail(filePath, DEFAULT_HYDRATE_TAIL_BYTES), {
+      messagesPartial: true,
+      hydrateSkippedReason: 'file_too_large_tail',
+    });
+  }
+  return buildClaudeSessionSummary(filePath, parseClaudeJsonlDetailed(filePath));
 }
 
 function discoverSessions(limit = 40) {

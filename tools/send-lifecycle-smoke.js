@@ -46,6 +46,17 @@ tracker.markProxyResult({ session_id: 'sess-b', client_message_id: 'cid-b', resu
 tracker.markProxyResult({ session_id: 'sess-b', client_message_id: 'cid-b', result: 'failed' });
 assert.equal(tracker.consumeActivity({ session_id: 'sess-b', activity: { kind: 'working' } }), null);
 
+tracker.markProxyResult({
+  session_id: 'sess-native', client_message_id: 'cid-native', result: 'delivered',
+  lifecycle: 'native_user_turn_observed',
+  native_receipt: { content_sha256: '0'.repeat(64), content_utf8_bytes: 12 },
+});
+assert.equal(
+  tracker.consumeActivity({ session_id: 'sess-native', activity: { kind: 'generating' } }),
+  null,
+  'receipt-managed sends must wait for the proxy native agent_started event',
+);
+
 tracker.markProxyResult({ session_id: 'sess-c', client_message_id: 'cid-c', result: 'delivered' });
 now += 120001;
 assert.equal(tracker.consumeActivity({ session_id: 'sess-c', activity: { kind: 'generating' } }), null, 'expired correlation must fail closed');
@@ -68,4 +79,4 @@ assert(android.includes("case 'agent_started':"));
 assert(androidBubble.includes("deliveryState === 'agent_started'"));
 assert(protocol.includes('### `agent_started`'));
 
-console.log('send lifecycle smoke: PASS (delivered -> native activity -> one correlated agent_started receipt)');
+console.log('send lifecycle smoke: PASS (legacy relay derivation plus native-receipt-managed agent_started gating)');

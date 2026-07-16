@@ -4,6 +4,7 @@
 const CDP = require('../agent-proxy/node_modules/chrome-remote-interface');
 const selectors = require('../agent-proxy/selectors');
 const { withCodexDesktopCdpLock } = require('../agent-proxy/codex-desktop-cdp-lock');
+const { listCdpTargets, connectCdpTarget } = require('../agent-proxy/cdp-loopback');
 
 const PORT = 9225;
 const FIXTURE_ID = 'remote-agent-chat-codex-notice-fixture';
@@ -27,11 +28,15 @@ async function evaluate(Runtime, expression) {
 }
 
 async function main() {
-  const targets = await CDP.List({ port: PORT });
+  const targets = await listCdpTargets(CDP, { port: PORT });
   const target = targets.find(item => item.type === 'page' && String(item.url || '').startsWith('app://'));
   assert(!!target, 'Codex Desktop target is reachable on port 9225');
 
-  const client = await CDP({ port: PORT, target: target.id });
+  const client = await connectCdpTarget(CDP, {
+    port: PORT,
+    host: target._cdpHost,
+    target: target.id,
+  });
   try {
     await client.Runtime.enable();
     const baseline = await selectors.detectSessionErrorPrompt(client.Runtime, 'codex-desktop');

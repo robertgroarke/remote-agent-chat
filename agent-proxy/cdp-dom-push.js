@@ -11,6 +11,9 @@ const DEFAULT_POLICY = Object.freeze({
   observerIdleFallbackMs: 30000,
   unavailableWorkingFallbackMs: 750,
   unavailableIdleFallbackMs: 5000,
+  maxConsecutiveErrors: 3,
+  backoffBaseMs: 30000,
+  backoffMaxMs: 300000,
 });
 
 function observerExpression(bindingName, observerKey, token) {
@@ -50,25 +53,33 @@ function observerExpression(bindingName, observerKey, token) {
 }
 
 class CdpDomPushManager {
-  constructor({ onDirty, log = () => {}, policy = {} }) {
+  constructor({
+    onDirty,
+    log = () => {},
+    policy = {},
+    disabled = process.env.CDP_PUSH_DISABLED === '1',
+  }) {
     this.onDirty = onDirty;
     this.log = log;
     this.policy = { ...DEFAULT_POLICY, ...policy };
+    this.disabled = disabled;
     this.states = new Map();
     this.fallbackStates = new Map();
   }
 
   sessionIds() {
-    return this.states.keys();
+    return new Set([...this.states.keys(), ...this.fallbackStates.keys()]).keys();
   }
 
   getState(sessionId) {
-    const state = this.states.get(sessionId);
+    const state = this.states.get(sessionId) || this.fallbackStates.get(sessionId);
     if (!state) return null;
     return {
       status: state.status,
       lastPollAt: state.lastPollAt || 0,
       lastSignalAt: state.lastSignalAt || 0,
+      consecutiveErrors: state.consecutiveErrors || 0,
+      backoffUntil: state.backoffUntil || 0,
     };
   }
 
@@ -111,7 +122,77 @@ class CdpDomPushManager {
     });
     const value = result?.result?.value || { ok: false, reason: 'observer_result_missing' };
     state.status = value.ok ? 'active' : 'fallback';
+    if (value.ok) state.consecutiveErrors = 0;
     return value;
+  }
+
+  _isContextError(error) {
+    return /context|execution|exception|target closed|session closed|cannot find/i
+      .test(String(error?.message || error || ''));
+  }
+
+  _backoffDelay(backoffCount) {
+    return Math.min(
+      this.policy.backoffMaxMs,
+      this.policy.backoffBaseMs * (2 ** Math.max(0, backoffCount - 1)),
+    );
+  }
+
+  async _detachState(sessionId, fallback = null) {
+    const state = this.states.get(sessionId);
+    if (state) {
+      if (state.debounceTimer) clearTimeout(state.debounceTimer);
+      if (state.reinstallTimer) clearTimeout(state.reinstallTimer);
+      try { state.disposeBinding?.(); } catch {}
+      try { state.disposeContexts?.(); } catch {}
+      try {
+        const contextId = await this._resolveContextId(state.options);
+        await state.runtime.evaluate({
+          expression: `(() => { const entry = globalThis[${JSON.stringify(this.policy.observerKey)}]; try { entry?.observer?.disconnect(); } catch {} delete globalThis[${JSON.stringify(this.policy.observerKey)}]; return true; })()`,
+          returnByValue: true,
+          silent: true,
+          userGesture: false,
+          ...(Number.isInteger(contextId) ? { contextId } : {}),
+        });
+      } catch {}
+      try { await state.runtime.removeBinding?.({ name: this.policy.bindingName }); } catch {}
+      this.states.delete(sessionId);
+    }
+    if (fallback) this.fallbackStates.set(sessionId, fallback);
+    else this.fallbackStates.delete(sessionId);
+  }
+
+  async _recordRuntimeError(state, error, phase) {
+    if (this.states.get(state.sessionId) !== state) return;
+    const message = String(error?.message || error || 'unknown error');
+    if (!this._isContextError(error)) {
+      this.log('warn', `[${state.sessionId}] DOM push ${phase}: ${message}`);
+      return;
+    }
+    state.consecutiveErrors = Number(state.consecutiveErrors || 0) + 1;
+    if (state.consecutiveErrors < this.policy.maxConsecutiveErrors) {
+      this.log(
+        'warn',
+        `[${state.sessionId}] DOM push ${phase} context error ${state.consecutiveErrors}/${this.policy.maxConsecutiveErrors}: ${message}`,
+      );
+      return;
+    }
+    const backoffCount = Number(state.backoffCount || 0) + 1;
+    const backoffMs = this._backoffDelay(backoffCount);
+    const backoffUntil = Date.now() + backoffMs;
+    await this._detachState(state.sessionId, {
+      status: 'backoff',
+      lastPollAt: state.lastPollAt || 0,
+      lastActive: state.lastActive,
+      lastSignalAt: state.lastSignalAt || 0,
+      consecutiveErrors: state.consecutiveErrors,
+      backoffCount,
+      backoffUntil,
+    });
+    this.log(
+      'warn',
+      `[${state.sessionId}] DOM push auto-uninstalled after repeated ${phase} context errors; adaptive polling retained for ${backoffMs}ms`,
+    );
   }
 
   _queueDispatch(state, payload) {
@@ -120,12 +201,13 @@ class CdpDomPushManager {
     state.debounceTimer = setTimeout(() => {
       state.debounceTimer = null;
       this._dispatch(state).catch(error => {
-        this.log('warn', `[${state.sessionId}] DOM push dispatch: ${error.message}`);
+        this._recordRuntimeError(state, error, 'dispatch').catch(() => {});
       });
     }, this.policy.debounceMs);
   }
 
   async _dispatch(state) {
+    if (this.states.get(state.sessionId) !== state) return;
     if (state.inFlight) {
       state.queuedEvent = state.pendingEvent || state.queuedEvent;
       state.pendingEvent = null;
@@ -146,13 +228,27 @@ class CdpDomPushManager {
         receivedAt,
         bindingToProxyMs: Math.max(0, receivedAt - Number(payload.source_at || receivedAt)),
       });
+      state.consecutiveErrors = 0;
     } finally {
       state.inFlight = false;
-      if (state.queuedEvent || state.pendingEvent) await this._dispatch(state);
+      if (this.states.get(state.sessionId) === state && (state.queuedEvent || state.pendingEvent)) {
+        await this._dispatch(state);
+      }
     }
   }
 
   async attach(sessionId, client, options = {}) {
+    if (this.disabled) {
+      await this._detachState(sessionId, {
+        ...(this.fallbackStates.get(sessionId) || {}),
+        status: 'disabled',
+      });
+      return { ok: false, reason: 'disabled' };
+    }
+    const fallback = this.fallbackStates.get(sessionId);
+    if (Number(fallback?.backoffUntil || 0) > Date.now()) {
+      return { ok: false, reason: 'backoff', retryAt: fallback.backoffUntil };
+    }
     const runtime = client?.Runtime;
     if (!runtime?.addBinding || !runtime?.evaluate || !runtime?.bindingCalled) {
       this.fallbackStates.set(sessionId, this.fallbackStates.get(sessionId) || {});
@@ -177,6 +273,8 @@ class CdpDomPushManager {
       queuedEvent: null,
       disposeBinding: null,
       disposeContexts: null,
+      consecutiveErrors: 0,
+      backoffCount: Number(fallback?.backoffCount || 0),
     };
     this.fallbackStates.delete(sessionId);
     this.states.set(sessionId, state);
@@ -195,8 +293,7 @@ class CdpDomPushManager {
           state.reinstallTimer = setTimeout(() => {
             state.reinstallTimer = null;
             this._install(state).catch(error => {
-              state.status = 'fallback';
-              this.log('warn', `[${sessionId}] DOM observer reinstall: ${error.message}`);
+              this._recordRuntimeError(state, error, 'reinstall').catch(() => {});
             });
           }, this.policy.reinstallMs);
         });
@@ -205,32 +302,29 @@ class CdpDomPushManager {
       if (!installed.ok) throw new Error(installed.reason || 'observer injection failed');
       return installed;
     } catch (error) {
-      await this.detach(sessionId);
-      this.log('warn', `[${sessionId}] DOM push unavailable; adaptive polling retained: ${error.message}`);
+      const contextError = this._isContextError(error);
+      const consecutiveErrors = contextError ? Number(fallback?.consecutiveErrors || 0) + 1 : 0;
+      const backoffCount = Number(fallback?.backoffCount || 0)
+        + (consecutiveErrors >= this.policy.maxConsecutiveErrors ? 1 : 0);
+      const backoffMs = backoffCount > Number(fallback?.backoffCount || 0)
+        ? this._backoffDelay(backoffCount)
+        : 0;
+      await this._detachState(sessionId, {
+        status: backoffMs ? 'backoff' : 'fallback',
+        lastPollAt: state.lastPollAt || 0,
+        consecutiveErrors,
+        backoffCount,
+        backoffUntil: backoffMs ? Date.now() + backoffMs : 0,
+      });
+      if (consecutiveErrors <= 1 || backoffMs) {
+        this.log('warn', `[${sessionId}] DOM push unavailable; adaptive polling retained${backoffMs ? ` for ${backoffMs}ms` : ''}: ${error.message}`);
+      }
       return { ok: false, reason: error.message };
     }
   }
 
   async detach(sessionId) {
-    const state = this.states.get(sessionId);
-    if (!state) return;
-    if (state.debounceTimer) clearTimeout(state.debounceTimer);
-    if (state.reinstallTimer) clearTimeout(state.reinstallTimer);
-    try { state.disposeBinding?.(); } catch {}
-    try { state.disposeContexts?.(); } catch {}
-    try {
-      const contextId = await this._resolveContextId(state.options);
-      await state.runtime.evaluate({
-        expression: `(() => { const entry = globalThis[${JSON.stringify(this.policy.observerKey)}]; try { entry?.observer?.disconnect(); } catch {} delete globalThis[${JSON.stringify(this.policy.observerKey)}]; return true; })()`,
-        returnByValue: true,
-        silent: true,
-        userGesture: false,
-        ...(Number.isInteger(contextId) ? { contextId } : {}),
-      });
-    } catch {}
-    try { await state.runtime.removeBinding?.({ name: this.policy.bindingName }); } catch {}
-    this.states.delete(sessionId);
-    this.fallbackStates.delete(sessionId);
+    await this._detachState(sessionId);
   }
 
   async close() {

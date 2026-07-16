@@ -17,7 +17,7 @@
 const http = require('http');
 const WebSocket = require('ws');
 
-const CDP_PORT = parseInt(process.env.CDP_PORT || '9223', 10);
+const CDP_PORT = parseInt(process.env.CDP_PORT || '9228', 10);
 const RELOAD_DELAY_MS = parseInt(process.env.RELOAD_DELAY_MS || '5000', 10);
 const VERIFY_TIMEOUT_MS = parseInt(process.env.VERIFY_TIMEOUT_MS || '30000', 10);
 const SELF_WINDOW_HINT = process.env.SELF_WINDOW_HINT || 'Remote Agent Chat';

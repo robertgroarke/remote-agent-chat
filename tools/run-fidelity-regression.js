@@ -7,6 +7,7 @@ const path = require('path');
 const selectors = require('../agent-proxy/selectors');
 const sessionStore = require('../agent-proxy/session-store');
 const { withCodexDesktopCdpLock } = require('../agent-proxy/codex-desktop-cdp-lock');
+const { listCdpTargets, connectCdpTarget } = require('../agent-proxy/cdp-loopback');
 
 function requireFromLocalOr(dir, mod) {
   try {
@@ -228,7 +229,8 @@ async function listTargetsByPort() {
   const output = {};
   for (const [name, port] of Object.entries(PORTS)) {
     try {
-      output[name] = (await CDP.List({ port })).map(target => ({ ...target, _cdpPort: port, _hostKey: name }));
+      output[name] = (await listCdpTargets(CDP, { port }))
+        .map(target => ({ ...target, _cdpPort: port, _hostKey: name }));
     } catch (error) {
       output[name] = { error: error.message };
     }
@@ -237,7 +239,11 @@ async function listTargetsByPort() {
 }
 
 async function withTarget(port, target, fn) {
-  const client = await CDP({ port: target._cdpPort || port, target: target.id });
+  const client = await connectCdpTarget(CDP, {
+    port: target._cdpPort || port,
+    host: target._cdpHost,
+    target: target.id,
+  });
   try {
     await client.Runtime.enable();
     return await fn(client.Runtime, client);

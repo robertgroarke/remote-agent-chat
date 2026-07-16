@@ -1,0 +1,54 @@
+{
+  "surface": "codex",
+  "host_type": "vscode",
+  "version": "26.707.91948",
+  "route": "/index.html",
+  "document_visibility": "visible",
+  "request": {
+    "conversation_id": "019f6a16-39da-7c43-b744-2282021d026a",
+    "turn_id": "019f6a16-3b13-7ec3-95e1-e5428529e0ee",
+    "request_id": "2",
+    "header": "Route",
+    "question": "Choose a route."
+  },
+  "card": {
+    "class_marker": "request-card",
+    "controls": [
+      { "tag": "button", "role": "radio", "aria_label": "Relay", "aria_description": "Answer through RAC.", "aria_checked": true, "aria_disabled": false, "text": "1 Relay" },
+      { "tag": "button", "role": "radio", "aria_label": "Native", "aria_description": "Answer locally.", "aria_checked": false, "aria_disabled": false, "text": "2 Native" },
+      { "tag": "textarea", "placeholder": "No, and tell ChatGPT what to do differently" },
+      { "tag": "button", "text": "Skip" },
+      { "tag": "button", "aria_label": "Dismiss" }
+    ],
+    "submit_button": null,
+    "acknowledgement": "request_card_disappeared"
+  },
+  "expected_observed": {
+    "native_conversation_id": "019f6a16-39da-7c43-b744-2282021d026a",
+    "native_turn_id": "019f6a16-3b13-7ec3-95e1-e5428529e0ee",
+    "native_request_id": "2",
+    "native_signature": "fixture-native-signature",
+    "title": "Route",
+    "questions": [
+      {
+        "question_id": "route",
+        "header": "Route",
+        "question": "Choose a route.",
+        "options": [
+          { "choice_id": "vscode-choice-1", "label": "Relay", "description": "Answer through RAC.", "selected": true },
+          { "choice_id": "vscode-choice-2", "label": "Native", "description": "Answer locally.", "selected": false },
+          { "choice_id": "vscode-choice-other", "label": "Other", "description": "No, and tell ChatGPT what to do differently", "selected": false, "requires_text": true, "is_other": true }
+        ],
+        "multi_select": false,
+        "allow_other": true,
+        "required": true,
+        "secret": false
+      }
+    ],
+    "disabled_control_count": 0,
+    "cancel_supported": true,
+    "skip_label": "Skip",
+    "auto_resolution_seconds_remaining": null,
+    "auto_resolution_policy": null
+  }
+}

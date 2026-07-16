@@ -6,13 +6,21 @@ function historyRowsMatch(existingRows, incomingRows) {
   for (let index = 0; index < existingRows.length; index++) {
     const existing = existingRows[index] || {};
     const incoming = incomingRows[index] || {};
+    if (existing.source_message_id || incoming.source_message_id) {
+      if (existing.source_message_id !== incoming.source_message_id) return false;
+    }
     if (existing.role !== incoming.role || existing.content !== incoming.content) return false;
     const existingBlocks = JSON.stringify(existing.content_blocks || null);
     const incomingBlocks = JSON.stringify(Array.isArray(incoming.content_blocks) ? incoming.content_blocks : null);
     if (existingBlocks !== incomingBlocks) return false;
-    if (incoming.ts && Number.isFinite(incoming.ts) && existing.ts) {
-      if (Math.abs(existing.ts - incoming.ts) > 2) return false;
+    const incomingTimestamp = Number(incoming.ts);
+    if (Number.isFinite(incomingTimestamp) && incomingTimestamp > 0) {
+      const existingTimestamp = Number(existing.ts);
+      if (!Number.isFinite(existingTimestamp) || existingTimestamp <= 0 || existingTimestamp !== incomingTimestamp) {
+        return false;
+      }
     }
+    if (incoming.source && existing.source !== incoming.source) return false;
   }
   return true;
 }

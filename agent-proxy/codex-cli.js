@@ -1,39 +1,44 @@
 'use strict';
 
 const fs = require('fs');
+const crypto = require('crypto');
 const os = require('os');
 const path = require('path');
 const { spawn, spawnSync } = require('child_process');
 const { normalizeNativeLaunchMode, backgroundNativeLaunchResult } = require('./native-launch-mode');
+const { setBoundedMap } = require('./bounded-map');
+const { canonicalGoalRecord } = require('./goal-lifecycle');
 
 let chokidar = null;
 try { chokidar = require('chokidar'); } catch {}
 
-const CODEX_CLI_MODELS = [
-  { id: 'gpt-5.6',                     label: 'GPT-5.6' },
-  { id: 'gpt-5.6-sol',                 label: 'GPT-5.6 Sol' },
-  { id: 'gpt-5.6-terra',               label: 'GPT-5.6 Terra' },
-  { id: 'gpt-5.6-luna',                label: 'GPT-5.6 Luna' },
+const FALLBACK_CODEX_CLI_MODELS = [
   { id: 'gpt-5.5',                     label: 'GPT-5.5' },
+  { id: 'gpt-5.6-sol',                 label: 'GPT-5.6-Sol' },
+  { id: 'gpt-5.6-terra',               label: 'GPT-5.6-Terra' },
+  { id: 'gpt-5.6-luna',                label: 'GPT-5.6-Luna' },
   { id: 'gpt-5.4',                     label: 'GPT-5.4' },
   { id: 'gpt-5.4-mini',                label: 'GPT-5.4 Mini' },
   { id: 'gpt-5.3-codex-spark',         label: 'GPT-5.3 Codex Spark' },
-  { id: 'gpt-5.3-codex',               label: 'GPT-5.3 Codex' },
-  { id: 'gpt-5.2-codex',               label: 'GPT-5.2 Codex' },
-  { id: 'gpt-5.2',                     label: 'GPT-5.2' },
-  { id: 'gpt-5.1-codex',               label: 'GPT-5.1 Codex' },
-  { id: 'gpt-5.1',                     label: 'GPT-5.1' },
-  { id: 'gpt-5',                       label: 'GPT-5' },
   { id: 'ollama:deepseek-v4-pro:cloud', label: 'DeepSeek V4 Pro (Ollama Cloud)' },
   { id: 'ollama:kimi-k2.6:cloud',       label: 'Kimi K2.6 (Ollama Cloud)' },
 ];
 
-const CODEX_CLI_EFFORTS = [
+const FALLBACK_CODEX_CLI_EFFORTS = [
   { id: 'low',    label: 'Low' },
   { id: 'medium', label: 'Medium' },
   { id: 'high',   label: 'High' },
   { id: 'xhigh',  label: 'Extra High' },
 ];
+
+const CODEX_MODEL_ALIASES = Object.freeze({
+  sol: 'gpt-5.6-sol',
+  terra: 'gpt-5.6-terra',
+  luna: 'gpt-5.6-luna',
+  'gpt-5.6 sol': 'gpt-5.6-sol',
+  'gpt-5.6 terra': 'gpt-5.6-terra',
+  'gpt-5.6 luna': 'gpt-5.6-luna',
+});
 
 const CODEX_CLI_ACCESS_MODES = [
   { value: 'read-only',          label: 'Read only' },
@@ -42,6 +47,9 @@ const CODEX_CLI_ACCESS_MODES = [
 ];
 
 const SUMMARY_CACHE = new Map();
+const TAIL_SUMMARY_CACHE = new Map();
+const CONFIG_OBSERVATION_CACHE = new Map();
+const GOAL_RECOVERY_CACHE = new Map();
 const SESSION_INDEX_CACHE = { sig: '', map: new Map() };
 const CODEX_PROCESS_COUNT_CACHE = { ts: 0, count: 0 };
 const JSONL_CHUNK_BYTES = 1024 * 1024;
@@ -62,6 +70,7 @@ const DEFAULT_ACTIVE_HYDRATE_MAX_BYTES = envMb(
   4
 );
 const DEFAULT_ACTIVE_HYDRATE_TAIL_BYTES = envMb('CODEX_CLI_ACTIVE_HYDRATE_TAIL_MB', 4);
+const DEFAULT_CONFIG_OBSERVATION_TAIL_BYTES = envMb('CODEX_CLI_CONFIG_OBSERVATION_TAIL_MB', 64, 4);
 const DEFAULT_INTERACTIVE_HISTORY_HOURS = Math.max(1, parseInt(process.env.CODEX_CLI_INTERACTIVE_HISTORY_HOURS || '24', 10) || 24);
 const CODEX_CLI_ACTIVITY_STALE_MS = Math.max(60 * 1000, parseInt(process.env.CODEX_CLI_ACTIVITY_STALE_MS || '14400000', 10) || 14400000);
 
@@ -75,6 +84,92 @@ function sessionsDir() {
 
 function safeStat(filePath) {
   try { return fs.statSync(filePath); } catch { return null; }
+}
+
+function normalizeCodexModelAlias(value, models = null) {
+  const raw = String(value || '').trim();
+  if (!raw) return '';
+  const lowered = raw.toLowerCase().replace(/[_]+/g, '-').replace(/\s+/g, ' ').trim();
+  const explicitAlias = CODEX_MODEL_ALIASES[lowered];
+  if (explicitAlias) return explicitAlias;
+  const catalog = Array.isArray(models) ? models : [];
+  const compact = lowered.replace(/[\s-]+/g, '');
+  const match = catalog.find(model => {
+    const id = String(model?.id || '').toLowerCase();
+    const label = String(model?.label || '').toLowerCase();
+    return id === lowered
+      || label === lowered
+      || id.replace(/[\s-]+/g, '') === compact
+      || label.replace(/[\s-]+/g, '') === compact;
+  });
+  return match?.id || raw;
+}
+
+function effortLabel(effort) {
+  const value = String(effort || '').trim().toLowerCase();
+  if (value === 'xhigh') return 'Extra High';
+  if (!value) return '';
+  return value.charAt(0).toUpperCase() + value.slice(1);
+}
+
+function readCodexModelCatalog(cachePath = path.join(homeDir(), '.codex', 'models_cache.json')) {
+  let parsed = null;
+  try { parsed = JSON.parse(fs.readFileSync(cachePath, 'utf8')); } catch {}
+  const advertised = Array.isArray(parsed?.models)
+    ? parsed.models.filter(model => model?.visibility !== 'hide' && String(model?.slug || '').trim())
+    : [];
+  if (advertised.length === 0) {
+    return {
+      models: FALLBACK_CODEX_CLI_MODELS.map(model => ({ ...model })),
+      efforts: FALLBACK_CODEX_CLI_EFFORTS.map(effort => ({ ...effort })),
+      source: 'bundled_fallback',
+      fetched_at: null,
+      client_version: null,
+    };
+  }
+  const models = advertised.map(model => ({
+    id: String(model.slug),
+    label: String(model.display_name || model.slug),
+    default_effort: String(model.default_reasoning_level || '').trim() || null,
+    supported_efforts: Array.isArray(model.supported_reasoning_levels)
+      ? model.supported_reasoning_levels.map(level => String(level?.effort || level || '').trim()).filter(Boolean)
+      : [],
+  }));
+  const effortIds = [];
+  for (const model of models) {
+    for (const effort of model.supported_efforts) {
+      if (!effortIds.includes(effort)) effortIds.push(effort);
+    }
+  }
+  return {
+    models,
+    efforts: (effortIds.length > 0 ? effortIds : FALLBACK_CODEX_CLI_EFFORTS.map(item => item.id))
+      .map(id => ({ id, label: effortLabel(id) })),
+    source: 'codex_models_cache',
+    fetched_at: parsed?.fetched_at || null,
+    client_version: parsed?.client_version || null,
+  };
+}
+
+const CODEX_CLI_CATALOG = readCodexModelCatalog();
+const CODEX_CLI_MODELS = CODEX_CLI_CATALOG.models;
+const CODEX_CLI_EFFORTS = CODEX_CLI_CATALOG.efforts;
+
+function fileCursorAnchor(filePath, offset) {
+  const end = Math.max(0, Number(offset) || 0);
+  if (end === 0) return '';
+  let fd = null;
+  try {
+    fd = fs.openSync(filePath, 'r');
+    const length = Math.min(256, end);
+    const buffer = Buffer.allocUnsafe(length);
+    const read = fs.readSync(fd, buffer, 0, length, end - length);
+    return buffer.subarray(0, read).toString('base64');
+  } catch {
+    return null;
+  } finally {
+    if (fd != null) try { fs.closeSync(fd); } catch {}
+  }
 }
 
 function walkJsonlFiles(root, maxFiles) {
@@ -159,13 +254,68 @@ function functionOutputText(payload, knownCall = null) {
   return `[${label}]\n\n${toolResultBody(payload, knownCall) || '(no output)'}`;
 }
 
+const CODEX_NATIVE_CONTEXT = Symbol('codex_native_context');
+
+function codexNativePairFamily(kind, role) {
+  if (role === 'assistant' && (kind === 'response_item.message' || kind === 'event_msg.agent_message')) return 'assistant_message';
+  if (role === 'user' && (kind === 'response_item.message' || kind === 'event_msg.user_message')) return 'user_message';
+  if (role === 'assistant' && (kind === 'response_item.reasoning' || kind === 'event_msg.agent_reasoning')) return 'reasoning';
+  return '';
+}
+
+function stampNativeMessage(messages, next) {
+  const context = messages?.[CODEX_NATIVE_CONTEXT];
+  if (!context) return;
+  const identity = nativeEntryIdentity(context.entry, context.offsets);
+  if (!next.native_source_id) next.native_source_id = identity.id;
+  if (!next.native_source_kind) next.native_source_kind = identity.kind;
+  if (!next.source_message_id) {
+    const basis = `${context.state?.cliSessionId || context.state?.fileCliSessionId || ''}\u0000${next.native_source_id}`;
+    next.source_message_id = `codex_cli:${crypto.createHash('sha256').update(basis).digest('hex').substring(0, 32)}`;
+  }
+  const producerTime = new Date(context.entry?.timestamp || '').getTime();
+  if (Number.isFinite(producerTime)) next.created_at = new Date(producerTime).toISOString();
+  Object.defineProperty(next, '_native_start_offset', {
+    configurable: true,
+    enumerable: false,
+    value: Math.max(0, Number(context.offsets?.start_offset) || 0),
+  });
+  Object.defineProperty(next, '_native_end_offset', {
+    configurable: true,
+    enumerable: false,
+    value: Math.max(0, Number(context.offsets?.end_offset) || 0),
+  });
+}
+
 function pushDedup(messages, next) {
   if ((!next?.content || !next.content.trim()) && !Array.isArray(next?.content_blocks)) return;
   if (next.role === 'user' && isCodexContextNoise(next.content)) return;
+  stampNativeMessage(messages, next);
   const last = messages[messages.length - 1];
   const lastBlocks = last?.content_blocks ? compactJson(last.content_blocks) : '';
   const nextBlocks = next?.content_blocks ? compactJson(next.content_blocks) : '';
-  if (last && last.role === next.role && last.content === next.content && lastBlocks === nextBlocks) return;
+  const sameBody = last && last.role === next.role && last.content === next.content && lastBlocks === nextBlocks;
+  const lastFamily = codexNativePairFamily(last?.native_source_kind, last?.role);
+  const nextFamily = codexNativePairFamily(next?.native_source_kind, next?.role);
+  const explicitNativePair = sameBody
+    && !last?.native_source_paired
+    && !!lastFamily
+    && lastFamily === nextFamily
+    && last.native_source_kind !== next.native_source_kind;
+  if (explicitNativePair) {
+    if (next.native_source_kind.startsWith('response_item.')) {
+      last.native_source_id = next.native_source_id;
+      last.source_message_id = next.source_message_id;
+      last.native_source_kind = next.native_source_kind;
+      if (next.created_at) last.created_at = next.created_at;
+      if (next.ts != null) last.ts = next.ts;
+    }
+    last.native_source_paired = true;
+    delete next._preserve_identical;
+    return;
+  }
+  if (sameBody && next._preserve_identical !== true) return;
+  delete next._preserve_identical;
   messages.push(next);
 }
 
@@ -183,6 +333,7 @@ function scanJsonlLines(filePath, onLine, { startOffset = 0, endOffset = Infinit
   let lineBytes = 0;
   let lineTooLarge = false;
   let emitted = 0;
+  let lineStartOffset = position;
   try {
     fd = fs.openSync(filePath, 'r');
     stat = fs.fstatSync(fd);
@@ -218,13 +369,17 @@ function scanJsonlLines(filePath, onLine, { startOffset = 0, endOffset = Infinit
         lineBytes = 0;
         if (!lineTooLarge && line.trim()) {
           emitted++;
-          const keepGoing = onLine(line);
+          const keepGoing = onLine(line, {
+            start_offset: lineStartOffset,
+            end_offset: position + i + 1,
+          });
           if (keepGoing === false || (maxLines > 0 && emitted >= maxLines)) {
             return { stat, offset: position + i + 1, emitted };
           }
         }
         lineTooLarge = false;
         lastCompleteOffset = position + i + 1;
+        lineStartOffset = lastCompleteOffset;
         segmentStart = i + 1;
       }
       if (segmentStart < bytesRead && !lineTooLarge) {
@@ -245,7 +400,10 @@ function scanJsonlLines(filePath, onLine, { startOffset = 0, endOffset = Infinit
       if (line.endsWith('\r')) line = line.slice(0, -1);
       if (line.trim()) {
         emitted++;
-        const keepGoing = onLine(line);
+        const keepGoing = onLine(line, {
+          start_offset: lineStartOffset,
+          end_offset: stopOffset,
+        });
         if (keepGoing !== JSONL_PARSE_ERROR) lastCompleteOffset = stopOffset;
         if (keepGoing === false) return { stat, offset: lastCompleteOffset, emitted };
       } else {
@@ -263,8 +421,8 @@ function scanJsonlLines(filePath, onLine, { startOffset = 0, endOffset = Infinit
 }
 
 function scanJsonlEntries(filePath, onEntry, options = {}) {
-  return scanJsonlLines(filePath, line => {
-    try { return onEntry(JSON.parse(line)); } catch { return JSONL_PARSE_ERROR; }
+  return scanJsonlLines(filePath, (line, offsets) => {
+    try { return onEntry(JSON.parse(line), offsets); } catch { return JSONL_PARSE_ERROR; }
   }, options);
 }
 
@@ -469,6 +627,16 @@ function noticeBlock({ title, content, tone = 'info', status = null, actions = n
   return block;
 }
 
+function stoppedStatusBlock(label = 'Interrupted') {
+  const content = String(label || 'Interrupted').trim() || 'Interrupted';
+  return {
+    type: 'status',
+    label: content,
+    content,
+    status: 'stopped',
+  };
+}
+
 function planBlock(taskList, { title = 'Plan' } = {}) {
   return {
     type: 'plan',
@@ -598,31 +766,75 @@ function activePlanText(taskList) {
   return (taskList.tasks.find(t => t.state === 'in_progress') || taskList.tasks.find(t => t.state === 'pending') || taskList.tasks[0])?.text || '';
 }
 
-function normalizeThreadGoal(payload, tsMs = 0) {
+function normalizeThreadGoal(payload, tsMs = 0, {
+  previousGoal = null,
+  sessionKey = '',
+  sourceCursor = null,
+} = {}) {
   const goal = payload?.goal;
   if (!goal || typeof goal !== 'object') return null;
   const createdMs = msFromUnixSeconds(goal.createdAt);
   const updatedMs = msFromUnixSeconds(goal.updatedAt) || tsMs || 0;
-  return {
+  return canonicalGoalRecord({
     objective: String(goal.objective || '').trim(),
-    status: String(goal.status || '').trim() || 'active',
-    timeUsedSeconds: Math.max(0, Number(goal.timeUsedSeconds) || 0),
-    tokensUsed: Math.max(0, Number(goal.tokensUsed) || 0),
+    raw_state: String(goal.status || '').trim() || 'active',
+    time_used_seconds: Math.max(0, Number(goal.timeUsedSeconds) || 0),
+    tokens_used: Math.max(0, Number(goal.tokensUsed) || 0),
     created_at: createdMs ? isoFromMs(createdMs) : null,
-    updated_at: updatedMs ? isoFromMs(updatedMs) : null,
-  };
+    native_updated_at: updatedMs ? isoFromMs(updatedMs) : null,
+  }, {
+    previousGoal,
+    sessionKey,
+    source: 'codex_cli_jsonl',
+    sourceCursor,
+    nativeUpdatedAt: updatedMs ? isoFromMs(updatedMs) : null,
+    observedAt: tsMs ? isoFromMs(tsMs) : new Date().toISOString(),
+  });
 }
 
 function activityGoal(goal) {
-  if (!goal || goal.status !== 'active') return null;
+  if (!goal || typeof goal !== 'object') return null;
+  const state = String(goal.state || goal.status || 'unknown');
   return {
-    label: 'Pursuing goal',
+    ...goal,
+    label: goal.label || 'Goal',
+    text: goal.objective || '',
     objective: goal.objective || '',
-    status: goal.status,
-    time_used_seconds: goal.timeUsedSeconds || 0,
-    tokens_used: goal.tokensUsed || 0,
+    state,
+    status: state,
+    time_used_seconds: goal.time_used_seconds ?? goal.timeUsedSeconds ?? 0,
+    tokens_used: goal.tokens_used ?? goal.tokensUsed ?? 0,
+    started_at: goal.started_at || goal.created_at || null,
     created_at: goal.created_at || null,
     updated_at: goal.updated_at || null,
+  };
+}
+
+function activityStep(taskList) {
+  const tasks = Array.isArray(taskList?.tasks) ? taskList.tasks : [];
+  if (tasks.length === 0) return null;
+  let index = tasks.findIndex(task => task?.state === 'in_progress');
+  if (index < 0) index = tasks.findIndex(task => task?.state === 'pending');
+  if (index < 0) index = Math.max(0, tasks.length - 1);
+  return {
+    current: index + 1,
+    total: tasks.length,
+    state: tasks[index]?.state || 'pending',
+    text: tasks[index]?.text || '',
+  };
+}
+
+function activityUsage(state) {
+  if (!state?.rateLimitActive && !(Number(state?.percentUsed) >= 100)) return null;
+  const reset = state.rateLimitedUntil && state.rateLimitedUntil !== 'unknown'
+    ? state.rateLimitedUntil
+    : null;
+  return {
+    state: 'exhausted',
+    title: "You're out of Codex and Work usage",
+    detail: reset ? `Your rate limit resets at ${reset}.` : 'Your rate limit reset time is not available yet.',
+    resets_at: reset,
+    percent_used: Number(state.percentUsed) || 100,
   };
 }
 
@@ -656,35 +868,77 @@ function buildCodexCliActivity(state, { nowMs = Date.now() } = {}) {
   const assistantAt = state.lastAssistantAt || 0;
   const userAt = state.lastUserAt || 0;
   const reasoningActive = !stale && state.lastReasoningAt > 0 && state.lastReasoningAt >= assistantAt && (state.lastReasoningAt >= userAt || userAt > assistantAt);
-  const userAwaitingAssistant = !stale && userAt > 0 && userAt > assistantAt;
+  // A terminal task_complete is authoritative even when the provider exits
+  // without an assistant message (for example, exhausted model credits).
+  // Otherwise the last user row keeps a restarted proxy stuck in generating
+  // until the multi-hour stale timeout expires.
+  const userAwaitingAssistant = !stale && userAt > 0 && userAt > assistantAt && userAt > completedAt;
   const goal = activityGoal(state.activeGoal);
+  const step = activityStep(state.latestPlan);
+  const usage = activityUsage(state);
   if (!activeTool && !turnActive && !reasoningActive && !userAwaitingAssistant) {
-    if (state.latestPlan || goal) {
+    if (state.latestPlan || goal || usage) {
       return {
         kind: 'idle',
         label: '',
         updated_at: isoFromMs(state.lastEventAt),
         ...(state.latestPlan ? { task_list: state.latestPlan } : {}),
+        ...(step ? { step } : {}),
         ...(goal ? { goal } : {}),
+        ...(usage ? { usage } : {}),
       };
     }
     return null;
   }
   const isCommand = !!activeTool?.command || activeTool?.name === 'shell_command' || activeTool?.type === 'local_shell_call';
   const label = 'Working';
-  const thinkingContent = activeTool ? toolActivityText(activeTool) : activePlanText(state.latestPlan);
   const activeTurnStartedMs = state.taskStartedAt > completedAt ? state.taskStartedAt : 0;
   const activeStartedMs = activeTurnStartedMs || activeTool?.startedAtMs || updatedMs || nowMs;
+  const reasoningText = reasoningActive
+    ? String(state.lastReasoningText || '').trim()
+    : '';
+  const assistantActive = !activeTool
+    && turnActive
+    && state.lastAssistantAt > activeTurnStartedMs
+    && state.lastAssistantAt > completedAt
+    && !!String(state.lastAssistantText || '').trim();
+  const current = activeTool
+    ? {
+        kind: 'tool',
+        label: isCommand ? 'Running command' : `Tool: ${activeTool.name || activeTool.type || 'tool'}`,
+        partial: toolActivityText(activeTool),
+        since: isoFromMs(activeTool.startedAtMs || activeStartedMs),
+      }
+    : (assistantActive
+        ? {
+            kind: 'answer',
+            label: 'Answering',
+            partial: String(state.lastAssistantText || '').trim(),
+            since: isoFromMs(state.lastAssistantAt || activeStartedMs),
+          }
+        : null);
   const activity = {
-    kind: activeTool ? (isCommand ? 'running_command' : 'generating') : 'generating',
+    kind: activeTool ? (isCommand ? 'running_command' : 'generating') : (reasoningActive ? 'thinking' : 'generating'),
     label,
     updated_at: isoFromMs(updatedMs || nowMs),
     started_at: isoFromMs(activeStartedMs),
     interrupt_hint: 'esc to interrupt',
   };
-  if (thinkingContent) activity.thinkingContent = thinkingContent;
+  if (reasoningText) {
+    activity.thinking = {
+      text: reasoningText,
+      since: isoFromMs(state.lastReasoningAt || activeStartedMs),
+    };
+  }
+  if (current) activity.current = current;
+  // Legacy clients consumed one overloaded field. Keep it during the rollout,
+  // but canonical clients must use activity.thinking/activity.current.
+  const legacyLiveText = current?.partial || reasoningText;
+  if (legacyLiveText) activity.thinkingContent = legacyLiveText;
   if (state.latestPlan) activity.task_list = state.latestPlan;
+  if (step) activity.step = step;
   if (goal) activity.goal = goal;
+  if (usage) activity.usage = usage;
   return activity;
 }
 
@@ -703,6 +957,64 @@ function metadataSessionId(meta) {
 function applyMetadataSessionId(state, meta) {
   const metaId = metadataSessionId(meta);
   if (metaId && !state.fileCliSessionId) state.cliSessionId = metaId;
+}
+
+function nativeConfigFields(entry) {
+  const payload = entry?.payload || {};
+  const metadata = payload?.metadata && typeof payload.metadata === 'object' ? payload.metadata : {};
+  const rawModel = payload.model || payload.model_slug || metadata.model || metadata.model_slug || null;
+  const rawEffort = payload.effort
+    || payload.reasoning_effort
+    || payload.model_reasoning_effort
+    || metadata.effort
+    || metadata.reasoning_effort
+    || metadata.model_reasoning_effort
+    || null;
+  return {
+    rawModel: rawModel == null ? null : String(rawModel).trim() || null,
+    rawEffort: rawEffort == null ? null : String(rawEffort).trim() || null,
+  };
+}
+
+function nativeConfigSource(entry) {
+  if (entry?.type === 'session_meta') return 'session_meta';
+  if (entry?.type === 'turn_context') return 'turn_context';
+  if (entry?.type === 'response_item') return `response_item.${entry?.payload?.type || 'metadata'}`;
+  return String(entry?.type || 'native_metadata');
+}
+
+function applyNativeConfigObservation(state, entry, offsets = null) {
+  const { rawModel, rawEffort } = nativeConfigFields(entry);
+  if (!rawModel && !rawEffort) return false;
+  const observedAt = entry?.timestamp && !Number.isNaN(Date.parse(entry.timestamp))
+    ? new Date(entry.timestamp).toISOString()
+    : null;
+  const source = nativeConfigSource(entry);
+  const cursor = {
+    start_offset: Math.max(0, Number(offsets?.start_offset) || 0),
+    end_offset: Math.max(0, Number(offsets?.end_offset) || 0),
+  };
+  if (rawModel) {
+    state.model_id = normalizeCodexModelAlias(rawModel, CODEX_CLI_MODELS);
+    state.model_observation = {
+      raw_value: rawModel,
+      normalized_value: state.model_id,
+      source,
+      observed_at: observedAt,
+      cursor,
+    };
+  }
+  if (rawEffort) {
+    state.effort = rawEffort.toLowerCase();
+    state.effort_observation = {
+      raw_value: rawEffort,
+      normalized_value: state.effort,
+      source,
+      observed_at: observedAt,
+      cursor,
+    };
+  }
+  return true;
 }
 
 function createParseState(filePath) {
@@ -730,10 +1042,14 @@ function createParseState(filePath) {
     lastEventAt: 0,
     lastUserAt: 0,
     lastAssistantAt: 0,
+    lastAssistantText: '',
     lastReasoningAt: 0,
+    lastReasoningText: '',
     lastResponseItemAt: 0,
-    model_id: 'default',
-    effort: 'medium',
+    model_id: 'unknown',
+    effort: 'unknown',
+    model_observation: null,
+    effort_observation: null,
     permission_mode: 'workspace-write',
     approval_policy: null,
   };
@@ -772,18 +1088,15 @@ function applyEntryToState(state, entry) {
   const payload = entry?.payload || {};
   const ts = timestampSeconds(entry);
   const tsMs = timestampMs(entry);
+  const nativeContext = state.messages?.[CODEX_NATIVE_CONTEXT];
+  applyNativeConfigObservation(state, entry, nativeContext?.offsets || null);
   if (tsMs) state.lastEventAt = tsMs;
   if (entry.type === 'session_meta' && payload) {
     state.meta = { ...state.meta, ...payload };
     applyMetadataSessionId(state, payload);
-    if (payload.model || payload.model_slug) state.model_id = payload.model || payload.model_slug;
     return;
   }
   if (entry.type === 'turn_context' && payload) {
-    if (payload.model) state.model_id = payload.model;
-    if (payload.effort || payload.reasoning_effort || payload.model_reasoning_effort) {
-      state.effort = payload.effort || payload.reasoning_effort || payload.model_reasoning_effort;
-    }
     if (payload.sandbox_mode || payload.sandbox_policy?.mode || payload.sandbox_policy?.type) {
       state.permission_mode = payload.sandbox_mode || payload.sandbox_policy.mode || payload.sandbox_policy.type;
     }
@@ -807,17 +1120,31 @@ function applyEntryToState(state, entry) {
       const role = payload.role === 'user' ? 'user' : 'assistant';
       const content = responseMessageText(payload);
       if (role === 'user') state.lastUserAt = tsMs || state.lastUserAt;
-      else state.lastAssistantAt = tsMs || state.lastAssistantAt;
+      else {
+        state.lastAssistantAt = tsMs || state.lastAssistantAt;
+        if (content) state.lastAssistantText = content;
+      }
       if (role === 'user' && !state.firstUserText && !isCodexContextNoise(content)) state.firstUserText = content;
-      pushDedup(state.messages, { role, content, ts });
+      pushDedup(state.messages, {
+        role,
+        content,
+        ...(role === 'assistant' && content ? { content_blocks: [{ type: 'markdown', content }] } : {}),
+        ...(payload.id ? { native_source_id: `response_item.message:id:${String(payload.id)}` } : {}),
+        native_source_kind: 'response_item.message',
+        _preserve_identical: true,
+        ts,
+      });
     } else if (payload.type === 'reasoning') {
       state.lastReasoningAt = tsMs || state.lastReasoningAt;
       const text = reasoningText(payload);
       if (text) {
+        state.lastReasoningText = text;
         pushDedup(state.messages, {
           role: 'assistant',
           content: 'Reasoning',
           content_blocks: [{ type: 'thinking', title: 'Reasoning', content: text, collapsed: false }],
+          native_source_kind: 'response_item.reasoning',
+          _preserve_identical: true,
           ts,
         });
       }
@@ -878,10 +1205,25 @@ function applyEntryToState(state, entry) {
       const content = payload.message || payload.text || '';
       state.lastUserAt = tsMs || state.lastUserAt;
       if (!state.firstUserText && !isCodexContextNoise(content)) state.firstUserText = content;
-      pushDedup(state.messages, { role: 'user', content, ts });
+      pushDedup(state.messages, {
+        role: 'user',
+        content,
+        native_source_kind: 'event_msg.user_message',
+        _preserve_identical: true,
+        ts,
+      });
     } else if (payload.type === 'agent_message') {
       state.lastAssistantAt = tsMs || state.lastAssistantAt;
-      pushDedup(state.messages, { role: 'assistant', content: payload.message || payload.text || '', ts });
+      const content = payload.message || payload.text || '';
+      if (content) state.lastAssistantText = content;
+      pushDedup(state.messages, {
+        role: 'assistant',
+        content,
+        ...(content ? { content_blocks: [{ type: 'markdown', content }] } : {}),
+        native_source_kind: 'event_msg.agent_message',
+        _preserve_identical: true,
+        ts,
+      });
     } else if (payload.type === 'exec_command_end') {
       const block = execCommandBlock(payload);
       const output = block.stdout || block.stderr || '';
@@ -912,10 +1254,13 @@ function applyEntryToState(state, entry) {
       const text = payload.text || payload.message || '';
       if (text) {
         state.lastReasoningAt = tsMs || state.lastReasoningAt;
+        state.lastReasoningText = text;
         pushDedup(state.messages, {
           role: 'assistant',
           content: 'Reasoning',
           content_blocks: [{ type: 'thinking', title: 'Reasoning', content: text, collapsed: false }],
+          native_source_kind: 'event_msg.agent_reasoning',
+          _preserve_identical: true,
           ts,
         });
       }
@@ -930,7 +1275,11 @@ function applyEntryToState(state, entry) {
       });
       pushDedup(state.messages, { role: 'assistant', content: '[Tool result: web_search]', content_blocks: [block], ts });
     } else if (payload.type === 'thread_goal_updated') {
-      const goal = normalizeThreadGoal(payload, tsMs);
+      const goal = normalizeThreadGoal(payload, tsMs, {
+        previousGoal: state.activeGoal,
+        sessionKey: state.cliSessionId || state.fileCliSessionId || state.filePath,
+        sourceCursor: nativeContext?.offsets || null,
+      });
       state.activeGoal = goal || state.activeGoal;
       if (goal?.objective) {
         const key = `${goal.objective}\n${goal.status}`;
@@ -984,7 +1333,15 @@ function applyEntryToState(state, entry) {
     } else if (payload.type === 'turn_aborted') {
       state.taskCompletedAt = tsMs || state.taskCompletedAt;
       state.pendingToolCalls.clear();
-      pushDedup(state.messages, { role: 'assistant', content: '[Turn aborted]', ts });
+      const label = String(payload.reason || '').toLowerCase() === 'interrupted'
+        ? 'Interrupted'
+        : 'Turn aborted';
+      pushDedup(state.messages, {
+        role: 'assistant',
+        content: label,
+        content_blocks: [stoppedStatusBlock(label)],
+        ts,
+      });
     } else if (payload.type === 'error') {
       const content = payload.message || payload.text || payload.error || 'Codex CLI reported an error.';
       pushDedup(state.messages, {
@@ -1024,25 +1381,42 @@ function parseCodexJsonlDetailed(filePath) {
   const prior = SUMMARY_CACHE.get(filePath);
   let state;
   let offset = 0;
-  const canTail = prior && stat.size >= prior.offset && stat.size >= prior.size;
+  const canTail = !!prior
+    && stat.size >= prior.offset
+    && stat.size >= prior.size
+    && prior.anchor === fileCursorAnchor(filePath, prior.offset)
+    && !(stat.size === prior.size && stat.mtimeMs !== prior.mtimeMs);
   if (canTail) {
     state = prior.state;
     offset = prior.offset;
   } else {
     state = createParseState(filePath);
   }
-  const scan = scanJsonlEntries(filePath, entry => applyEntryToState(state, entry), {
+  const scanStartOffset = offset;
+  const scan = scanJsonlEntries(filePath, (entry, offsets) => applyScannedEntryToState(state, entry, offsets), {
     startOffset: offset,
-    processFinalLine: !canTail,
+    processFinalLine: true,
   });
   const next = {
     state,
     size: stat.size,
     mtimeMs: stat.mtimeMs,
     offset: scan.offset,
+    anchor: fileCursorAnchor(filePath, scan.offset),
   };
-  SUMMARY_CACHE.set(filePath, next);
-  return { state, stat };
+  setBoundedMap(SUMMARY_CACHE, filePath, next, 32);
+  return {
+    state,
+    stat,
+    sourceCursor: {
+      mode: canTail ? (stat.size > prior.size ? 'append' : 'unchanged') : (prior ? 'recovery' : 'baseline'),
+      start_offset: scanStartOffset,
+      end_offset: scan.offset,
+      file_size: stat.size,
+      bytes_read: Math.max(0, stat.size - scanStartOffset),
+      events_read: scan.emitted,
+    },
+  };
 }
 
 function parseCodexJsonl(filePath) {
@@ -1066,7 +1440,7 @@ function readSessionIndex() {
   if (SESSION_INDEX_CACHE.sig === sig) return SESSION_INDEX_CACHE.map;
   const map = new Map();
   scanJsonlEntries(filePath, entry => {
-    if (entry?.id) map.set(entry.id, entry);
+    if (entry?.id) setBoundedMap(map, entry.id, entry, 4096);
   }, { processFinalLine: true });
   SESSION_INDEX_CACHE.sig = sig;
   SESSION_INDEX_CACHE.map = map;
@@ -1169,6 +1543,75 @@ function readSessionMeta(filePath) {
     } catch {}
   }
   return meta;
+}
+
+function cloneConfigObservationState(filePath, source = null) {
+  const state = createParseState(filePath);
+  if (!source) return state;
+  state.model_id = source.model_id || 'unknown';
+  state.effort = source.effort || 'unknown';
+  state.model_observation = source.model_observation ? { ...source.model_observation } : null;
+  state.effort_observation = source.effort_observation ? { ...source.effort_observation } : null;
+  return state;
+}
+
+function readLatestNativeConfigObservation(filePath, tailBytes = DEFAULT_CONFIG_OBSERVATION_TAIL_BYTES) {
+  const stat = safeStat(filePath);
+  if (!stat) return {
+    model_id: 'unknown', effort: 'unknown', model_observation: null, effort_observation: null,
+    source_cursor: null,
+  };
+  const boundedTailBytes = Math.max(4 * 1024 * 1024, Number(tailBytes) || DEFAULT_CONFIG_OBSERVATION_TAIL_BYTES);
+  const prior = CONFIG_OBSERVATION_CACHE.get(filePath);
+  const canAppend = !!prior
+    && prior.tailBytes === boundedTailBytes
+    && stat.size >= prior.offset
+    && stat.size >= prior.size
+    && prior.anchor === fileCursorAnchor(filePath, prior.offset)
+    && !(stat.size === prior.size && stat.mtimeMs !== prior.mtimeMs);
+  if (canAppend && stat.size === prior.size && stat.mtimeMs === prior.mtimeMs) return prior.result;
+
+  let state;
+  let scanStartOffset;
+  let mode;
+  if (canAppend) {
+    state = cloneConfigObservationState(filePath, prior.state);
+    scanStartOffset = prior.offset;
+    mode = 'append';
+  } else {
+    state = createParseState(filePath);
+    scanJsonlEntries(filePath, (entry, offsets) => {
+      applyNativeConfigObservation(state, entry, offsets);
+    }, { maxLines: 80, processFinalLine: true });
+    scanStartOffset = scanStartAlignedToLine(filePath, Math.max(0, stat.size - boundedTailBytes));
+    mode = prior ? 'recovery' : 'bounded_tail';
+  }
+  const scan = scanJsonlEntries(filePath, (entry, offsets) => {
+    applyNativeConfigObservation(state, entry, offsets);
+  }, { startOffset: scanStartOffset, processFinalLine: true });
+  const result = {
+    model_id: state.model_observation ? state.model_id : 'unknown',
+    effort: state.effort_observation ? state.effort : 'unknown',
+    model_observation: state.model_observation,
+    effort_observation: state.effort_observation,
+    source_cursor: {
+      mode,
+      start_offset: scanStartOffset,
+      end_offset: scan.offset,
+      file_size: stat.size,
+      bounded_tail_bytes: boundedTailBytes,
+    },
+  };
+  setBoundedMap(CONFIG_OBSERVATION_CACHE, filePath, {
+    state,
+    result,
+    size: stat.size,
+    mtimeMs: stat.mtimeMs,
+    offset: scan.offset,
+    tailBytes: boundedTailBytes,
+    anchor: fileCursorAnchor(filePath, scan.offset),
+  }, 128);
+  return result;
 }
 
 function trimPathCandidate(raw) {
@@ -1326,6 +1769,7 @@ function readSessionCandidate(filePath, stat) {
 
 function readLightweightSessionSummary(filePath, stat) {
   const meta = readSessionMeta(filePath);
+  const configObservation = readLatestNativeConfigObservation(filePath);
   const candidate = readSessionCandidate(filePath, stat);
   const cliSessionId = candidate.cliSessionId || metadataSessionId(meta);
   const index = readSessionIndex().get(cliSessionId) || null;
@@ -1344,8 +1788,11 @@ function readLightweightSessionSummary(filePath, stat) {
     messages: [],
     messageCount: 0,
     messagesHydrated: false,
-    model_id: meta.model || meta.model_slug || 'default',
-    effort: meta.effort || 'medium',
+    model_id: configObservation.model_id,
+    effort: configObservation.effort,
+    model_observation: configObservation.model_observation,
+    effort_observation: configObservation.effort_observation,
+    config_source_cursor: configObservation.source_cursor,
     permission_mode: meta.sandbox_mode || 'workspace-write',
     approval_policy: meta.approval_policy || null,
     updatedAt: latestIso(index?.updated_at, stat.mtime),
@@ -1394,62 +1841,265 @@ function scanStartAlignedToLine(filePath, startOffset) {
   return Math.max(0, startOffset);
 }
 
+function readJsonlLineAtOffset(fd, statSize, offset, maxLineBytes = 1024 * 1024) {
+  const radius = Math.max(64 * 1024, maxLineBytes);
+  const start = Math.max(0, offset - radius);
+  const end = Math.min(statSize, offset + radius);
+  const buffer = Buffer.allocUnsafe(Math.max(0, end - start));
+  const bytes = fs.readSync(fd, buffer, 0, buffer.length, start);
+  const view = bytes === buffer.length ? buffer : buffer.subarray(0, bytes);
+  const local = offset - start;
+  const before = view.lastIndexOf(10, Math.max(0, local - 1));
+  const after = view.indexOf(10, Math.max(0, local));
+  const lineStart = before >= 0 ? start + before + 1 : start;
+  const lineEnd = after >= 0 ? start + after : end;
+  const bounded = (before >= 0 || start === 0)
+    && (after >= 0 || end === statSize)
+    && lineEnd - lineStart <= maxLineBytes;
+  if (!bounded) return { line: '', lineStart, lineEnd, tooLarge: true };
+  return {
+    line: view.subarray(lineStart - start, lineEnd - start).toString('utf8'),
+    lineStart,
+    lineEnd,
+    tooLarge: false,
+  };
+}
+
+function nativeEntryIdentity(entry, offsets = null) {
+  const payload = entry?.payload || {};
+  const kind = `${entry?.type || 'entry'}.${payload.type || 'unknown'}`;
+  const explicitId = payload.id || payload.item_id || payload.message_id || payload.call_id || '';
+  const locator = explicitId
+    ? `id:${String(explicitId)}`
+    : `offset:${Math.max(0, Number(offsets?.start_offset) || 0)}`;
+  return {
+    id: `${kind}:${locator}`,
+    kind,
+  };
+}
+
+function applyScannedEntryToState(state, entry, offsets = null) {
+  const before = state.messages.length;
+  state.messages[CODEX_NATIVE_CONTEXT] = { state, entry, offsets };
+  try {
+    applyEntryToState(state, entry);
+  } finally {
+    delete state.messages[CODEX_NATIVE_CONTEXT];
+  }
+  if (state.messages.length <= before) return;
+  const identity = nativeEntryIdentity(entry, offsets);
+  for (let index = before; index < state.messages.length; index++) {
+    const message = state.messages[index];
+    if (!message.native_source_id) {
+      message.native_source_id = state.messages.length - before > 1
+        ? `${identity.id}:row:${index - before}`
+        : identity.id;
+    }
+    if (!message.native_source_kind) message.native_source_kind = identity.kind;
+    if (!message.source_message_id) {
+      const basis = `${state.cliSessionId || state.fileCliSessionId || ''}\u0000${message.native_source_id}`;
+      message.source_message_id = `codex_cli:${crypto.createHash('sha256').update(basis).digest('hex').substring(0, 32)}`;
+    }
+    const producerTime = new Date(entry?.timestamp || '').getTime();
+    if (Number.isFinite(producerTime) && !message.created_at) message.created_at = new Date(producerTime).toISOString();
+    Object.defineProperty(message, '_native_start_offset', {
+      configurable: true,
+      enumerable: false,
+      value: Math.max(0, Number(offsets?.start_offset) || 0),
+    });
+    Object.defineProperty(message, '_native_end_offset', {
+      configurable: true,
+      enumerable: false,
+      value: Math.max(0, Number(offsets?.end_offset) || 0),
+    });
+  }
+}
+
+function recoverLatestGoalState(filePath, stat) {
+  const cached = GOAL_RECOVERY_CACHE.get(filePath);
+  if (cached && stat.size === cached.size) return cached.goal;
+  const marker = Buffer.from('thread_goal_updated', 'utf8');
+  const chunkBytes = 4 * 1024 * 1024;
+  // Once an oversized archive has been searched, only inspect bytes appended
+  // since that search. Keep a small overlap so a line that was incomplete at
+  // the prior stat boundary can become a valid goal event on the next read.
+  // A truncated/replaced archive must be searched from the end as new input.
+  const searchFloor = cached && stat.size > cached.size
+    ? Math.max(0, cached.size - 1024 * 1024)
+    : 0;
+  let fd = null;
+  let searchEnd = stat.size;
+  try {
+    fd = fs.openSync(filePath, 'r');
+    while (searchEnd > searchFloor) {
+      const start = Math.max(searchFloor, searchEnd - chunkBytes);
+      const buffer = Buffer.allocUnsafe(searchEnd - start);
+      const bytes = fs.readSync(fd, buffer, 0, buffer.length, start);
+      const view = bytes === buffer.length ? buffer : buffer.subarray(0, bytes);
+      let local = view.lastIndexOf(marker);
+      while (local >= 0) {
+        const absolute = start + local;
+        const candidate = readJsonlLineAtOffset(fd, stat.size, absolute);
+        if (!candidate.tooLarge && candidate.line) {
+          try {
+            const entry = JSON.parse(candidate.line);
+            if (entry?.type === 'event_msg' && entry?.payload?.type === 'thread_goal_updated') {
+              const goal = normalizeThreadGoal(entry.payload, timestampMs(entry), {
+                sessionKey: sessionIdFromFilePath(filePath) || fallbackSessionIdFromPath(filePath),
+                sourceCursor: {
+                  kind: 'codex_cli_jsonl',
+                  start_offset: candidate.lineStart,
+                  end_offset: candidate.lineEnd,
+                },
+              });
+              setBoundedMap(GOAL_RECOVERY_CACHE, filePath, { size: stat.size, goal }, 128);
+              return goal;
+            }
+          } catch {}
+        }
+        local = view.lastIndexOf(marker, local - 1);
+      }
+      if (start === searchFloor) break;
+      searchEnd = start + marker.length - 1;
+    }
+  } catch {
+    // Tail hydration remains usable if an archive is concurrently rotating.
+  } finally {
+    if (fd != null) {
+      try { fs.closeSync(fd); } catch {}
+    }
+  }
+  const goal = cached && stat.size > cached.size ? cached.goal : null;
+  setBoundedMap(GOAL_RECOVERY_CACHE, filePath, { size: stat.size, goal }, 128);
+  return goal;
+}
+
 function parseCodexJsonlTail(filePath, tailBytes = DEFAULT_HYDRATE_TAIL_BYTES) {
   const stat = safeStat(filePath);
   if (!stat) return null;
-  const meta = readSessionMeta(filePath);
-  const state = createParseState(filePath);
-  state.meta = { ...meta };
-  applyMetadataSessionId(state, meta);
-  if (meta.model || meta.model_slug) state.model_id = meta.model || meta.model_slug;
-  if (meta.effort) state.effort = meta.effort;
-  if (meta.sandbox_mode) state.permission_mode = meta.sandbox_mode;
-  if (meta.approval_policy) state.approval_policy = meta.approval_policy;
-  if (meta.thread_name) state.threadName = meta.thread_name;
-  const wantedStart = Math.max(0, stat.size - Math.max(1024 * 1024, Number(tailBytes) || DEFAULT_HYDRATE_TAIL_BYTES));
-  const startOffset = scanStartAlignedToLine(filePath, wantedStart);
-  scanJsonlEntries(filePath, entry => applyEntryToState(state, entry), {
-    startOffset,
+  const boundedTailBytes = Math.max(1024 * 1024, Number(tailBytes) || DEFAULT_HYDRATE_TAIL_BYTES);
+  const prior = TAIL_SUMMARY_CACHE.get(filePath);
+  const canTail = !!prior
+    && prior.tailBytes === boundedTailBytes
+    && stat.size >= prior.offset
+    && stat.size >= prior.size
+    && prior.anchor === fileCursorAnchor(filePath, prior.offset)
+    && !(stat.size === prior.size && stat.mtimeMs !== prior.mtimeMs);
+  let state;
+  let startOffset;
+  let scanStartOffset;
+  if (canTail) {
+    state = prior.state;
+    startOffset = prior.startOffset;
+    scanStartOffset = prior.offset;
+  } else {
+    const meta = readSessionMeta(filePath);
+    const configObservation = readLatestNativeConfigObservation(filePath, boundedTailBytes);
+    state = createParseState(filePath);
+    state.meta = { ...meta };
+    applyMetadataSessionId(state, meta);
+    state.model_id = configObservation.model_id;
+    state.effort = configObservation.effort;
+    state.model_observation = configObservation.model_observation;
+    state.effort_observation = configObservation.effort_observation;
+    if (meta.sandbox_mode) state.permission_mode = meta.sandbox_mode;
+    if (meta.approval_policy) state.approval_policy = meta.approval_policy;
+    if (meta.thread_name) state.threadName = meta.thread_name;
+    const wantedStart = Math.max(0, stat.size - boundedTailBytes);
+    startOffset = scanStartAlignedToLine(filePath, wantedStart);
+    scanStartOffset = startOffset;
+  }
+  const scan = scanJsonlEntries(filePath, (entry, offsets) => applyScannedEntryToState(state, entry, offsets), {
+    startOffset: scanStartOffset,
     processFinalLine: true,
   });
-  return { state, stat, startOffset };
+  setBoundedMap(TAIL_SUMMARY_CACHE, filePath, {
+    state,
+    startOffset,
+    offset: scan.offset,
+    size: stat.size,
+    mtimeMs: stat.mtimeMs,
+    tailBytes: boundedTailBytes,
+    anchor: fileCursorAnchor(filePath, scan.offset),
+  }, 32);
+  return {
+    state,
+    stat,
+    startOffset,
+    sourceCursor: {
+      mode: canTail ? (stat.size > prior.size ? 'append' : 'unchanged') : (prior ? 'recovery' : 'baseline_tail'),
+      start_offset: scanStartOffset,
+      end_offset: scan.offset,
+      file_size: stat.size,
+      bytes_read: Math.max(0, stat.size - scanStartOffset),
+      events_read: scan.emitted,
+      partial: startOffset > 0,
+    },
+  };
 }
 
 function createChunkParseState(filePath) {
   const meta = readSessionMeta(filePath);
+  const configObservation = readLatestNativeConfigObservation(filePath);
   const state = createParseState(filePath);
   state.meta = { ...meta };
   applyMetadataSessionId(state, meta);
-  if (meta.model || meta.model_slug) state.model_id = meta.model || meta.model_slug;
-  if (meta.effort) state.effort = meta.effort;
+  state.model_id = configObservation.model_id;
+  state.effort = configObservation.effort;
+  state.model_observation = configObservation.model_observation;
+  state.effort_observation = configObservation.effort_observation;
   if (meta.sandbox_mode) state.permission_mode = meta.sandbox_mode;
   if (meta.approval_policy) state.approval_policy = meta.approval_policy;
   if (meta.thread_name) state.threadName = meta.thread_name;
   return state;
 }
 
-function parseCodexJsonlChunk(filePath, { beforeOffset = null, chunkBytes = DEFAULT_HYDRATE_TAIL_BYTES } = {}) {
+function parseCodexJsonlChunk(filePath, {
+  beforeOffset = null,
+  chunkBytes = DEFAULT_HYDRATE_TAIL_BYTES,
+  minimumMessages = 0,
+  maxChunkBytes = 16 * 1024 * 1024,
+} = {}) {
   const stat = safeStat(filePath);
   if (!stat) return null;
   const rawBefore = Number(beforeOffset);
   const endOffset = Number.isFinite(rawBefore) && rawBefore > 0
     ? Math.max(0, Math.min(stat.size, rawBefore))
     : stat.size;
-  const bytes = Math.max(256 * 1024, Math.min(16 * 1024 * 1024, Number(chunkBytes) || DEFAULT_HYDRATE_TAIL_BYTES));
-  const wantedStart = Math.max(0, endOffset - bytes);
-  const startOffset = scanStartAlignedToLine(filePath, wantedStart);
-  const state = createChunkParseState(filePath);
-  scanJsonlEntries(filePath, entry => applyEntryToState(state, entry), {
-    startOffset,
-    endOffset,
-    processFinalLine: endOffset >= stat.size,
-  });
+  const targetMessages = Math.max(0, Math.min(1000, Math.floor(Number(minimumMessages) || 0)));
+  const maximumBytes = Math.max(
+    256 * 1024,
+    Math.min(16 * 1024 * 1024, Number(maxChunkBytes) || 16 * 1024 * 1024),
+  );
+  let bytes = Math.max(
+    256 * 1024,
+    Math.min(maximumBytes, Number(chunkBytes) || DEFAULT_HYDRATE_TAIL_BYTES),
+  );
+  let startOffset = endOffset;
+  let state = null;
+  let scan = null;
+  while (true) {
+    const wantedStart = Math.max(0, endOffset - bytes);
+    startOffset = scanStartAlignedToLine(filePath, wantedStart);
+    state = createChunkParseState(filePath);
+    scan = scanJsonlEntries(filePath, (entry, offsets) => applyScannedEntryToState(state, entry, offsets), {
+      startOffset,
+      endOffset,
+      processFinalLine: endOffset >= stat.size,
+    });
+    if (targetMessages <= 0 || state.messages.length >= targetMessages || startOffset <= 0 || bytes >= maximumBytes) break;
+    bytes = Math.min(maximumBytes, bytes * 2);
+  }
   return {
     state,
     stat,
     startOffset,
     endOffset,
     nextBeforeOffset: startOffset > 0 ? startOffset : null,
+    messageStartOffsets: state.messages.map(message => Math.max(0, Number(message._native_start_offset) || 0)),
+    bytesRead: Math.max(0, endOffset - startOffset),
+    eventsRead: scan?.emitted || 0,
+    requestedMinimumMessages: targetMessages,
   };
 }
 
@@ -1460,10 +2110,19 @@ function tailSessionSummary(filePath, stat, maxHydrateBytes, tailBytes, hydrateS
   const messages = tail?.state?.messages?.length ? tail.state.messages : fallbackMessages;
   const tailHydrated = messages !== fallbackMessages;
   const tailState = tail?.state || null;
+  if (tailState) {
+    if (tailState.activeGoal) {
+      setBoundedMap(GOAL_RECOVERY_CACHE, filePath, { size: stat.size, goal: tailState.activeGoal }, 128);
+    } else {
+      tailState.activeGoal = recoverLatestGoalState(filePath, stat);
+    }
+  }
   return {
     ...summary,
     ...(tailState?.model_id ? { model_id: tailState.model_id } : {}),
     ...(tailState?.effort ? { effort: tailState.effort } : {}),
+    ...(tailState?.model_observation ? { model_observation: tailState.model_observation } : {}),
+    ...(tailState?.effort_observation ? { effort_observation: tailState.effort_observation } : {}),
     ...(tailState?.permission_mode ? { permission_mode: tailState.permission_mode } : {}),
     ...(tailState?.approval_policy ? { approval_policy: tailState.approval_policy } : {}),
     ...(tailState?.tokenUsage ? { token_usage: tailState.tokenUsage } : {}),
@@ -1480,6 +2139,7 @@ function tailSessionSummary(filePath, stat, maxHydrateBytes, tailBytes, hydrateS
     messagesPartial: true,
     hydrateSkippedReason: tailHydrated ? hydrateSkippedReason : 'file_too_large',
     activity: tailState ? buildCodexCliActivity(tailState) : null,
+    sourceCursor: tail?.sourceCursor || null,
   };
 }
 
@@ -1513,8 +2173,10 @@ function readSessionSummary(filePath, { includeMessages = true, maxHydrateBytes 
     messages: state.messages,
     messageCount: state.messages.length,
     messagesHydrated: true,
-    model_id: state.model_id || meta.model || meta.model_slug || 'default',
-    effort: state.effort || 'medium',
+    model_id: state.model_observation ? state.model_id : 'unknown',
+    effort: state.effort_observation ? state.effort : 'unknown',
+    model_observation: state.model_observation,
+    effort_observation: state.effort_observation,
     permission_mode: state.permission_mode || 'workspace-write',
     approval_policy: state.approval_policy || null,
     token_usage: state.tokenUsage || null,
@@ -1525,6 +2187,7 @@ function readSessionSummary(filePath, { includeMessages = true, maxHydrateBytes 
     updatedAt: latestIso(index?.updated_at, stat.mtime),
     sizeBytes: stat.size,
     activity: buildCodexCliActivity(state),
+    sourceCursor: detailed.sourceCursor || null,
   };
   return summary;
 }
@@ -1564,11 +2227,171 @@ function findSessionByCliId(cliSessionId, options = {}) {
   if (!cliSessionId) return null;
   const root = sessionsDir();
   if (!fs.existsSync(root)) return null;
-  for (const item of walkJsonlFiles(root, 0)) {
+  const items = walkJsonlFiles(root, 0);
+  const exact = items.find(item => sessionIdFromFilePath(item.filePath) === cliSessionId);
+  if (exact) return readSessionSummary(exact.filePath, options);
+  for (const item of items) {
     const summary = readSessionSummary(item.filePath, options);
     if (summary?.cliSessionId === cliSessionId) return summary;
   }
   return null;
+}
+
+function questionIdentity(question, canonical = false) {
+  const options = canonical
+    ? (Array.isArray(question?.choices) ? question.choices : []).filter(choice => choice?.is_other !== true)
+    : (Array.isArray(question?.options) ? question.options : []);
+  return JSON.stringify({
+    id: String((canonical ? question?.question_id : question?.id) || ''),
+    header: String(question?.header || ''),
+    question: String((canonical ? question?.message : question?.question) || ''),
+    options: options.map(option => [String(option?.label || ''), String(option?.description || '')]),
+  });
+}
+
+function readCodexRequestUserInputResolution(cliSessionId, {
+  turnId = '',
+  questions = [],
+  deadlineMs = null,
+  rootDir = sessionsDir(),
+  maxTailBytes = 4 * 1024 * 1024,
+} = {}) {
+  if (!cliSessionId || !turnId || !Array.isArray(questions) || questions.length < 1) return null;
+  if (!fs.existsSync(rootDir)) return null;
+  const item = walkJsonlFiles(rootDir, 0)
+    .find(candidate => sessionIdFromFilePath(candidate.filePath) === cliSessionId);
+  if (!item?.filePath || !item.stat?.size) return null;
+  const bytes = Math.max(64 * 1024, Math.min(16 * 1024 * 1024, Number(maxTailBytes) || 0));
+  const start = Math.max(0, item.stat.size - bytes);
+  let fd = null;
+  let content = '';
+  try {
+    fd = fs.openSync(item.filePath, 'r');
+    const buffer = Buffer.allocUnsafe(item.stat.size - start);
+    const read = fs.readSync(fd, buffer, 0, buffer.length, start);
+    content = buffer.subarray(0, read).toString('utf8');
+  } catch {
+    return null;
+  } finally {
+    if (fd != null) try { fs.closeSync(fd); } catch {}
+  }
+  if (start > 0) content = content.substring(Math.max(0, content.indexOf('\n') + 1));
+  const records = content.split(/\r?\n/).filter(Boolean).map(line => {
+    try { return JSON.parse(line); } catch { return null; }
+  }).filter(Boolean);
+  let turnStart = -1;
+  for (let index = 0; index < records.length; index += 1) {
+    const record = records[index];
+    if (record.type === 'event_msg' && record.payload?.type === 'task_started'
+        && String(record.payload?.turn_id || '') === String(turnId)) {
+      turnStart = index;
+    }
+  }
+  if (turnStart < 0) return null;
+  const expectedQuestions = questions.map(question => questionIdentity(question, true));
+  let call = null;
+  let callIndex = -1;
+  for (let index = turnStart + 1; index < records.length; index += 1) {
+    const itemPayload = records[index]?.type === 'response_item' ? records[index].payload : null;
+    if (itemPayload?.type !== 'function_call' || itemPayload?.name !== 'request_user_input') continue;
+    let args = null;
+    try { args = JSON.parse(itemPayload.arguments); } catch { continue; }
+    const actualQuestions = Array.isArray(args?.questions)
+      ? args.questions.map(question => questionIdentity(question, false)) : [];
+    if (JSON.stringify(actualQuestions) !== JSON.stringify(expectedQuestions)) continue;
+    call = { payload: itemPayload, args };
+    callIndex = index;
+  }
+  if (!call?.payload?.call_id || callIndex < 0) return null;
+  const outputRecord = records.slice(callIndex + 1).find(record =>
+    record.type === 'response_item'
+      && record.payload?.type === 'function_call_output'
+      && record.payload?.call_id === call.payload.call_id);
+  if (!outputRecord) return null;
+  let output = null;
+  try { output = JSON.parse(outputRecord.payload.output); } catch { return null; }
+  if (!output?.answers || typeof output.answers !== 'object' || Array.isArray(output.answers)) return null;
+  const answerCount = Object.values(output.answers).reduce((count, answer) =>
+    count + (Array.isArray(answer?.answers) ? answer.answers.length : 0), 0);
+  const resolvedAtMs = Date.parse(outputRecord.timestamp || '');
+  if (!Number.isFinite(resolvedAtMs)) return null;
+  const exactDeadlineMs = Number(deadlineMs);
+  const deadlineDeltaMs = Number.isFinite(exactDeadlineMs) ? resolvedAtMs - exactDeadlineMs : null;
+  let lifecycle = null;
+  if (answerCount > 0) lifecycle = 'answered';
+  else if (Number.isFinite(deadlineDeltaMs) && call.args.autoResolutionMs != null
+      && deadlineDeltaMs >= -2000 && deadlineDeltaMs <= 5000) lifecycle = 'auto_resolved';
+  else if (Number.isFinite(deadlineDeltaMs) && deadlineDeltaMs < -2000) lifecycle = 'cancelled';
+  if (!lifecycle) return null;
+  return {
+    lifecycle,
+    native_acknowledged: true,
+    resolved_at: new Date(resolvedAtMs).toISOString(),
+    deadline_delta_ms: deadlineDeltaMs,
+    answer_count: answerCount,
+    call_id_hash: crypto.createHash('sha256').update(String(call.payload.call_id)).digest('hex').slice(0, 16),
+  };
+}
+
+function normalizedUserAnchor(value) {
+  return String(value || '').replace(/\s+/g, ' ').trim();
+}
+
+function findRecentSessionByUserAnchor(userContent, options = {}) {
+  const wanted = normalizedUserAnchor(userContent);
+  if (!wanted) return null;
+  const root = sessionsDir();
+  if (!fs.existsSync(root)) return null;
+  const sinceMs = Math.max(0, Number(options.sinceMs || 0));
+  const maxFiles = Math.max(1, Math.min(100, Number(options.maxFiles || 40)));
+  const items = walkJsonlFiles(root, 0)
+    // A provisional Desktop key can only belong to a newly created archive.
+    // Old operator sessions may still have a current mtime because background
+    // agents are appending to them, so creation time is the bounded identity
+    // window here; using mtime would hydrate unrelated multi-GB histories.
+    .filter(item => !sinceMs || Number(item.stat.birthtimeMs || 0) >= sinceMs)
+    .sort((a, b) => Number(b.stat.birthtimeMs || 0) - Number(a.stat.birthtimeMs || 0))
+    .slice(0, maxFiles);
+  for (const item of items) {
+    const candidate = readSessionCandidate(item.filePath, item.stat);
+    if (!candidate?.hasUser) continue;
+    const candidatePrefix = normalizedUserAnchor(candidate.title);
+    if (!candidatePrefix || !wanted.startsWith(candidatePrefix)) continue;
+    const summary = readSessionSummary(item.filePath, options.summaryOptions || {});
+    const firstUser = summary?.messages?.find(message => message?.role === 'user');
+    if (normalizedUserAnchor(firstUser?.content) === wanted) return summary;
+  }
+  return null;
+}
+
+function findRecentSessionByUserAnchors(userContents, options = {}) {
+  const wanted = Array.from(new Set((Array.isArray(userContents) ? userContents : [])
+    .map(normalizedUserAnchor)
+    .filter(Boolean)));
+  // A non-first user row is not a sufficient provisional-thread identity on
+  // its own. Require multiple exact anchors and refuse ambiguous archives.
+  if (wanted.length < 2) return null;
+  const root = sessionsDir();
+  if (!fs.existsSync(root)) return null;
+  const sinceMs = Math.max(0, Number(options.sinceMs || 0));
+  const maxFiles = Math.max(1, Math.min(100, Number(options.maxFiles || 40)));
+  const items = walkJsonlFiles(root, 0)
+    .filter(item => !sinceMs || Number(item.stat.birthtimeMs || 0) >= sinceMs)
+    .sort((a, b) => Number(b.stat.birthtimeMs || 0) - Number(a.stat.birthtimeMs || 0))
+    .slice(0, maxFiles);
+  let match = null;
+  for (const item of items) {
+    const summary = readSessionSummary(item.filePath, options.summaryOptions || {});
+    if (!summary?.hasUser && !Array.isArray(summary?.messages)) continue;
+    const observed = new Set((summary.messages || [])
+      .filter(message => message?.role === 'user')
+      .map(message => normalizedUserAnchor(message.content))
+      .filter(Boolean));
+    if (!wanted.every(anchor => observed.has(anchor))) continue;
+    if (match) return null;
+    match = summary;
+  }
+  return match;
 }
 
 function normPath(value) {
@@ -1627,13 +2450,299 @@ function findLatestSessionForTitle({ workspacePath, workspaceName, title, sinceM
   return bestScore >= 2 && best ? readSessionSummary(best.filePath, summaryOptions) : null;
 }
 
+function contentFingerprint(content) {
+  const text = String(content || '');
+  return {
+    sha256: crypto.createHash('sha256').update(text, 'utf8').digest('hex'),
+    utf8_bytes: Buffer.byteLength(text, 'utf8'),
+    characters: text.length,
+  };
+}
+
+function statFileIdentity(filePath, stat = safeStat(filePath)) {
+  if (!stat) return null;
+  return {
+    path: path.resolve(filePath),
+    dev: Number(stat.dev) || 0,
+    ino: Number(stat.ino) || 0,
+    birthtime_ms: Number(stat.birthtimeMs) || 0,
+  };
+}
+
+function sameFileIdentity(left, right) {
+  if (!left || !right) return false;
+  if (left.dev && left.ino && right.dev && right.ino) return left.dev === right.dev && left.ino === right.ino;
+  return String(left.path || '').toLowerCase() === String(right.path || '').toLowerCase()
+    && Number(left.birthtime_ms || 0) === Number(right.birthtime_ms || 0);
+}
+
+function captureCodexReceiptBaseline({ filePath = null, cliSessionId = null, workspacePath = null, content, clientMessageId = null, processEpoch = null } = {}) {
+  const stat = filePath ? safeStat(filePath) : null;
+  const fingerprint = contentFingerprint(content);
+  const capturedAt = new Date().toISOString();
+  return {
+    version: 1,
+    cli_session_id: cliSessionId || null,
+    workspace_path: workspacePath || null,
+    client_message_id: clientMessageId || null,
+    expected_content_sha256: fingerprint.sha256,
+    expected_content_utf8_bytes: fingerprint.utf8_bytes,
+    expected_content_characters: fingerprint.characters,
+    captured_at: capturedAt,
+    captured_at_ms: Date.parse(capturedAt),
+    process_epoch: processEpoch || crypto.randomUUID(),
+    file_path: stat ? path.resolve(filePath) : null,
+    file_identity: stat ? statFileIdentity(filePath, stat) : null,
+    file_size: stat ? stat.size : 0,
+    file_anchor: stat ? fileCursorAnchor(filePath, stat.size) : '',
+  };
+}
+
+function receiptUserText(entry) {
+  const payload = entry?.payload || {};
+  if (entry?.type === 'response_item' && payload.type === 'message' && payload.role === 'user') {
+    return { text: responseMessageText(payload), source: 'response_item.message' };
+  }
+  if (entry?.type === 'event_msg' && payload.type === 'user_message') {
+    return { text: payload.message || payload.text || '', source: 'event_msg.user_message' };
+  }
+  return null;
+}
+
+function isCodexAgentStartEntry(entry) {
+  const payload = entry?.payload || {};
+  if (entry?.type === 'response_item') {
+    if (payload.type === 'message') return payload.role === 'assistant';
+    return [
+      'reasoning', 'function_call', 'local_shell_call', 'custom_tool_call',
+      'web_search_call', 'tool_search_call', 'mcp_tool_call', 'computer_initialize_state',
+    ].includes(payload.type);
+  }
+  if (entry?.type !== 'event_msg') return false;
+  return [
+    'agent_reasoning', 'agent_message', 'exec_command_begin', 'patch_apply_begin',
+    'mcp_tool_call_begin', 'web_search_begin', 'view_image_tool_call',
+  ].includes(payload.type);
+}
+
+function receiptCandidateFiles(baseline) {
+  const candidates = [];
+  const seen = new Set();
+  const add = filePath => {
+    if (!filePath) return;
+    const resolved = path.resolve(filePath);
+    const key = resolved.toLowerCase();
+    if (seen.has(key) || !safeStat(resolved)) return;
+    seen.add(key);
+    candidates.push(resolved);
+  };
+  add(baseline?.file_path);
+  if (baseline?.cli_session_id) {
+    const root = sessionsDir();
+    if (fs.existsSync(root)) {
+      const exact = walkJsonlFiles(root, 0).find(item => sessionIdFromFilePath(item.filePath) === baseline.cli_session_id);
+      add(exact?.filePath);
+    }
+  }
+  if (candidates.length === 0) {
+    const root = sessionsDir();
+    if (fs.existsSync(root)) {
+      const floor = Math.max(0, Number(baseline?.captured_at_ms || 0) - 2000);
+      for (const item of walkJsonlFiles(root, 16)) {
+        if (Number(item.stat.mtimeMs || 0) >= floor || Number(item.stat.birthtimeMs || 0) >= floor) add(item.filePath);
+      }
+    }
+  }
+  return candidates;
+}
+
+function inspectCodexReceipt(baseline) {
+  if (!baseline?.expected_content_sha256) {
+    return { ok: false, code: 'receipt_baseline_invalid', detail: 'Missing expected content fingerprint' };
+  }
+  const candidates = receiptCandidateFiles(baseline);
+  if (candidates.length === 0) return { ok: false, pending: true, code: 'native_transcript_not_found' };
+  const matches = [];
+  let malformedLines = 0;
+  let wrongSessionObserved = false;
+  for (const filePath of candidates) {
+    const stat = safeStat(filePath);
+    if (!stat) continue;
+    const identity = statFileIdentity(filePath, stat);
+    const sameFile = sameFileIdentity(identity, baseline.file_identity);
+    const anchored = sameFile
+      && stat.size >= Number(baseline.file_size || 0)
+      && baseline.file_anchor === fileCursorAnchor(filePath, Number(baseline.file_size || 0));
+    const fileSessionId = sessionIdFromFilePath(filePath) || null;
+    if (baseline.cli_session_id && fileSessionId && fileSessionId !== baseline.cli_session_id) {
+      wrongSessionObserved = true;
+      continue;
+    }
+    const startOffset = anchored ? Number(baseline.file_size || 0) : 0;
+    const earliestMs = anchored ? 0 : Math.max(0, Number(baseline.captured_at_ms || 0) - 2000);
+    const parsed = [];
+    const scan = scanJsonlLines(filePath, (line, offsets) => {
+      try {
+        const entry = JSON.parse(line);
+        parsed.push({ entry, offsets });
+      } catch {
+        malformedLines++;
+      }
+    }, { startOffset, processFinalLine: false });
+    for (let index = 0; index < parsed.length; index++) {
+      const { entry, offsets } = parsed[index];
+      const eventMs = timestampMs(entry);
+      if (earliestMs && eventMs && eventMs < earliestMs) continue;
+      const user = receiptUserText(entry);
+      if (!user) continue;
+      const observed = contentFingerprint(user.text);
+      if (observed.sha256 !== baseline.expected_content_sha256
+          || observed.utf8_bytes !== Number(baseline.expected_content_utf8_bytes)) continue;
+      const later = parsed.slice(index + 1).find(candidate => (
+        Number(candidate.offsets?.start_offset || 0) >= Number(offsets?.end_offset || 0)
+        && isCodexAgentStartEntry(candidate.entry)
+      ));
+      matches.push({
+        filePath,
+        identity,
+        fileSessionId,
+        source: user.source,
+        entry,
+        offsets,
+        later,
+        scan,
+        rotated: !anchored && !!baseline.file_identity,
+      });
+    }
+  }
+  const canonical = matches.filter(match => match.source === 'response_item.message');
+  const usable = canonical.length > 0 ? canonical : matches;
+  if (usable.length === 0) {
+    return {
+      ok: false,
+      pending: true,
+      code: wrongSessionObserved ? 'native_receipt_wrong_session' : (malformedLines ? 'native_receipt_malformed_tail' : 'native_user_turn_not_observed'),
+      malformed_lines: malformedLines,
+    };
+  }
+  const unique = new Map();
+  for (const match of usable) {
+    const key = `${match.filePath.toLowerCase()}\u0000${match.offsets.start_offset}\u0000${match.offsets.end_offset}`;
+    unique.set(key, match);
+  }
+  if (unique.size !== 1) {
+    return { ok: false, code: 'native_receipt_ambiguous', detail: `${unique.size} exact post-baseline native user turns matched` };
+  }
+  const match = Array.from(unique.values())[0];
+  const receipt = {
+    session_id: baseline.cli_session_id || match.fileSessionId || null,
+    client_message_id: baseline.client_message_id || null,
+    content_sha256: baseline.expected_content_sha256,
+    content_utf8_bytes: baseline.expected_content_utf8_bytes,
+    content_characters: baseline.expected_content_characters,
+    process_epoch: baseline.process_epoch || null,
+    source: match.source,
+    post_baseline_occurrence: 1,
+    native_event_at: match.entry?.timestamp || null,
+    observed_at: new Date().toISOString(),
+    file_identity: match.identity ? {
+      dev: match.identity.dev,
+      ino: match.identity.ino,
+      birthtime_ms: match.identity.birthtime_ms,
+    } : null,
+    source_cursor: {
+      start_offset: match.offsets.start_offset,
+      end_offset: match.offsets.end_offset,
+      file_size: match.scan?.stat?.size || null,
+      rotated: match.rotated,
+    },
+  };
+  const agentStarted = match.later ? {
+    source: nativeConfigSource(match.later.entry),
+    native_event_at: match.later.entry?.timestamp || null,
+    observed_at: new Date().toISOString(),
+    source_cursor: {
+      start_offset: match.later.offsets.start_offset,
+      end_offset: match.later.offsets.end_offset,
+    },
+  } : null;
+  return { ok: true, receipt, agent_started: agentStarted };
+}
+
+function waitForCodexReceipt(baseline, {
+  timeoutMs = 30000,
+  pollMs = 75,
+  childState = null,
+} = {}) {
+  const started = Date.now();
+  return new Promise(resolve => {
+    let exitObservedAt = 0;
+    const poll = () => {
+      const inspected = inspectCodexReceipt(baseline);
+      if (inspected.ok || inspected.code === 'native_receipt_ambiguous') {
+        resolve(inspected);
+        return;
+      }
+      const child = typeof childState === 'function' ? childState() : null;
+      if (child?.exited) {
+        if (!exitObservedAt) exitObservedAt = Date.now();
+        if (child.code !== 0 || child.error) {
+          resolve({
+            ok: false,
+            code: classifyCodexSendFailure(child.code, child.stderr, child.error),
+            detail: child.error?.message || String(child.stderr || '').trim() || `Codex CLI exited with code ${child.code}`,
+          });
+          return;
+        }
+        if (Date.now() - exitObservedAt >= 1000) {
+          resolve({ ok: false, code: inspected.code || 'native_user_turn_not_observed', detail: 'Codex CLI exited 0 without an exact native user-turn append' });
+          return;
+        }
+      }
+      if (Date.now() - started >= Math.max(1000, Number(timeoutMs) || 30000)) {
+        resolve({ ok: false, code: 'native_receipt_timeout', detail: 'Timed out waiting for the exact native Codex user turn' });
+        return;
+      }
+      setTimeout(poll, Math.max(25, Number(pollMs) || 75));
+    };
+    poll();
+  });
+}
+
+function waitForCodexAgentStart(baseline, receipt, { timeoutMs = 120000, pollMs = 100 } = {}) {
+  const started = Date.now();
+  return new Promise(resolve => {
+    const poll = () => {
+      const inspected = inspectCodexReceipt(baseline);
+      if (inspected.ok && inspected.agent_started) {
+        resolve({ ok: true, agent_started: inspected.agent_started, receipt });
+        return;
+      }
+      if (Date.now() - started >= Math.max(1000, Number(timeoutMs) || 120000)) {
+        resolve({ ok: false, code: 'agent_start_timeout', detail: 'Native user turn arrived, but no later native Codex agent event was observed' });
+        return;
+      }
+      setTimeout(poll, Math.max(25, Number(pollMs) || 100));
+    };
+    poll();
+  });
+}
+
+function classifyCodexSendFailure(code, stderr, error = null) {
+  const text = `${error?.message || ''}\n${stderr || ''}`.toLowerCase();
+  if (/rate.?limit|usage limit|quota|too many requests|429/.test(text)) return 'codex_usage_or_rate_limited';
+  if (/auth|unauthorized|forbidden|login|credential|401|403/.test(text)) return 'codex_auth_failed';
+  if (Number(code) !== 0) return 'codex_cli_nonzero_exit';
+  return 'codex_cli_launch_failed';
+}
+
 function isOllamaModel(model) {
   const raw = String(model || '');
   return /^ollama:/i.test(raw) || /:cloud$/i.test(raw);
 }
 
 function normalizeModel(model) {
-  const raw = String(model || '').trim();
+  const raw = normalizeCodexModelAlias(model, CODEX_CLI_MODELS);
   return raw.replace(/^ollama:/i, '');
 }
 
@@ -1852,11 +2961,15 @@ function watchSessions({ onSummary, onError, debounceMs = 120, summaryOptions = 
 module.exports = {
   CODEX_CLI_MODELS,
   CODEX_CLI_EFFORTS,
+  CODEX_CLI_CATALOG,
   CODEX_CLI_ACCESS_MODES,
   CODEX_CLI_ACTIVE_HYDRATE_MAX_BYTES: DEFAULT_ACTIVE_HYDRATE_MAX_BYTES,
   CODEX_CLI_ACTIVE_HYDRATE_TAIL_BYTES: DEFAULT_ACTIVE_HYDRATE_TAIL_BYTES,
   discoverSessions,
   findSessionByCliId,
+  readCodexRequestUserInputResolution,
+  findRecentSessionByUserAnchor,
+  findRecentSessionByUserAnchors,
   findLatestSessionForWorkspace,
   findLatestSessionForTitle,
   parseCodexJsonl,
@@ -1866,6 +2979,15 @@ module.exports = {
   recentInteractiveSessionIds,
   recentActiveSessionSummaries,
   runningCodexCliProcessCount,
+  readCodexModelCatalog,
+  readLatestNativeConfigObservation,
+  normalizeCodexModelAlias,
+  contentFingerprint,
+  captureCodexReceiptBaseline,
+  inspectCodexReceipt,
+  waitForCodexReceipt,
+  waitForCodexAgentStart,
+  classifyCodexSendFailure,
   readSessionSummary,
   buildCodexArgs,
   resolveCodexCommand,

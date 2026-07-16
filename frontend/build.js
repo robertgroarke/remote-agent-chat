@@ -12,6 +12,7 @@
 'use strict';
 
 const esbuild = require('esbuild');
+const crypto = require('crypto');
 const fs = require('fs');
 const path = require('path');
 
@@ -20,11 +21,47 @@ const publicDir = path.join(__dirname, '..', 'relay-server', 'public');
 
 function copyFile(source, destination) {
   fs.mkdirSync(path.dirname(destination), { recursive: true });
-  fs.copyFileSync(source, destination);
+  fs.writeFileSync(destination, canonicalAssetBytes(fs.readFileSync(source)));
+}
+
+function canonicalAssetBytes(value) {
+  return Buffer.from(Buffer.from(value).toString('utf8').replace(/\r\n/g, '\n'), 'utf8');
+}
+
+function computeAssetVersion(styles, bundle) {
+  const digest = crypto.createHash('sha256')
+    .update(canonicalAssetBytes(styles))
+    .update(canonicalAssetBytes(bundle))
+    .digest('hex')
+    .slice(0, 16);
+  return `build-${digest}`;
+}
+
+function stampAssetIdentity() {
+  const stylesPath = path.join(__dirname, 'styles.css');
+  const bundlePath = path.join(__dirname, 'dist', 'bundle.js');
+  const assetVersion = computeAssetVersion(
+    fs.readFileSync(stylesPath),
+    fs.readFileSync(bundlePath),
+  );
+  const cacheName = `agent-chat-${assetVersion}`;
+
+  const indexPath = path.join(__dirname, 'index.html');
+  const nextIndex = fs.readFileSync(indexPath, 'utf8')
+    .replace(/\/styles\.css\?v=[^"']+/g, `/styles.css?v=${assetVersion}`)
+    .replace(/\/dist\/bundle\.js\?v=[^"']+/g, `/dist/bundle.js?v=${assetVersion}`);
+  fs.writeFileSync(indexPath, nextIndex, 'utf8');
+
+  const workerPath = path.join(__dirname, 'sw.js');
+  const nextWorker = fs.readFileSync(workerPath, 'utf8')
+    .replace(/const CACHE_NAME = '[^']+';/, `const CACHE_NAME = '${cacheName}';`)
+    .replace(/const ASSET_VERSION = '[^']+';/, `const ASSET_VERSION = '${assetVersion}';`);
+  fs.writeFileSync(workerPath, nextWorker, 'utf8');
+  console.log(`[build] Asset identity ${assetVersion}`);
 }
 
 function syncPublicAssets() {
-  const assets = ['index.html', 'styles.css', 'app.jsx', 'hooks.jsx', 'file-utils.js', 'workspace-groups.js', 'sw.js'];
+  const assets = ['index.html', 'styles.css', 'app.jsx', 'hooks.jsx', 'file-utils.js', 'fleet-activity.js', 'host-resources.js', 'markdown.js', 'message-delta.js', 'message-time.js', 'navigation-epoch.js', 'provider-usage.js', 'semantic-notifications.js', 'session-pins.js', 'session-registry.js', 'session-title.js', 'state-sequence.js', 'title-disclosure.jsx', 'transcript-cache.js', 'workspace-groups.js', 'broadcast-send-policy.js', 'sw.js'];
   for (const asset of assets) {
     copyFile(path.join(__dirname, asset), path.join(publicDir, asset));
   }
@@ -36,7 +73,10 @@ const syncPublicAssetsPlugin = {
   name: 'sync-public-assets',
   setup(build) {
     build.onEnd(result => {
-      if (result.errors.length === 0) syncPublicAssets();
+      if (result.errors.length === 0) {
+        stampAssetIdentity();
+        syncPublicAssets();
+      }
     });
   },
 };
@@ -71,7 +111,14 @@ async function main() {
   }
 }
 
-main().catch(err => {
-  console.error(err);
-  process.exit(1);
-});
+if (require.main === module) {
+  main().catch(err => {
+    console.error(err);
+    process.exit(1);
+  });
+}
+
+module.exports = {
+  canonicalAssetBytes,
+  computeAssetVersion,
+};

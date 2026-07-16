@@ -2,7 +2,11 @@
 'use strict';
 
 const assert = require('assert');
-const { ProxyEngine } = require('../agent-proxy/proxy-engine');
+const {
+  ProxyEngine,
+  shouldPreserveCursorPassiveRotation,
+} = require('../agent-proxy/proxy-engine');
+const sessionStore = require('../agent-proxy/session-store');
 const { accumulatedTailMatches } = require('./cursor-production-e2e');
 
 const engine = Object.create(ProxyEngine.prototype);
@@ -75,6 +79,83 @@ assert.deepEqual(cachedSession._cursorAgentHistories['agent-long'], gapped.messa
 cachedSession._accumulatedMessages = [];
 const restoredFromGap = engine._restoreCursorTranscriptForThread(cachedSession, 'agent-long', gappedWindow.slice(-5));
 assert.deepEqual(restoredFromGap, gapped.messages, 'returning to a virtualized Cursor agent must restore its full cache');
+
+// Cursor can rotate through multiple native resource UUIDs while one remote
+// turn is being delivered. Those passive identities inherit the same logical
+// transcript; an empty intermediate UUID must never become an authoritative
+// empty relay snapshot. Once the bounded settle window expires, an ordinary
+// idle native switch retains the existing per-agent replacement behavior.
+const rotationSession = {
+  agentType: 'cursor',
+  activity: { kind: 'generating' },
+  waitingForAssistant: true,
+  _activeThreadKey: 'agent-before-send',
+  _activeThreadTitle: 'Before send',
+  _accumulatedMessages: [...turn(1), ...turn(2)],
+  _cursorAgentHistories: {},
+  lastMessageCount: 4,
+  lastObservedCount: 4,
+  lastTranscriptSig: 'before',
+  pendingLast: null,
+};
+assert.equal(shouldPreserveCursorPassiveRotation(rotationSession, 1_000), true);
+assert.equal(rotationSession._cursorPassiveRotationGraceUntil, 31_000);
+rotationSession.waitingForAssistant = false;
+rotationSession.activity = { kind: 'idle' };
+assert.equal(shouldPreserveCursorPassiveRotation(rotationSession, 30_999), true);
+assert.equal(shouldPreserveCursorPassiveRotation(rotationSession, 31_001), false);
+
+const relayEvents = [];
+const storeUpdates = [];
+const originalUpdateSession = sessionStore.updateSession;
+sessionStore.updateSession = (sessionId, update) => storeUpdates.push({ sessionId, update });
+engine._sendToRelay = event => relayEvents.push(event);
+engine._log = () => {};
+try {
+  rotationSession.waitingForAssistant = true;
+  rotationSession.activity = { kind: 'generating' };
+  engine._applyCodexDesktopThreadList('cursor-rotation-fixture', rotationSession, [{
+    id: 'transient-control-id',
+    cache_key: 'agent-during-send',
+    title: 'During send',
+    active: true,
+  }]);
+  assert.equal(rotationSession._activeThreadKey, 'agent-during-send');
+  assert.deepEqual(rotationSession._accumulatedMessages, [...turn(1), ...turn(2)]);
+  assert.deepEqual(rotationSession._cursorAgentHistories['agent-before-send'], [...turn(1), ...turn(2)]);
+  assert.deepEqual(rotationSession._cursorAgentHistories['agent-during-send'], [...turn(1), ...turn(2)]);
+  assert.equal(rotationSession._forceHistoryResync, undefined,
+    'remote-turn UUID rotation must not queue an authoritative history replacement');
+
+  rotationSession.waitingForAssistant = false;
+  rotationSession.activity = { kind: 'idle' };
+  engine._applyCodexDesktopThreadList('cursor-rotation-fixture', rotationSession, [{
+    id: 'settled-control-id',
+    cache_key: 'agent-after-send',
+    title: 'After send',
+    active: true,
+  }]);
+  assert.equal(rotationSession._activeThreadKey, 'agent-after-send');
+  assert.deepEqual(rotationSession._accumulatedMessages, [...turn(1), ...turn(2)]);
+  assert.deepEqual(rotationSession._cursorAgentHistories['agent-after-send'], [...turn(1), ...turn(2)]);
+
+  rotationSession._cursorPassiveRotationGraceUntil = Date.now() - 1;
+  engine._applyCodexDesktopThreadList('cursor-rotation-fixture', rotationSession, [{
+    id: 'manual-control-id',
+    cache_key: 'manual-idle-agent',
+    title: 'Manual idle switch',
+    active: true,
+  }]);
+  assert.equal(rotationSession._activeThreadKey, 'manual-idle-agent');
+  assert.deepEqual(rotationSession._accumulatedMessages, []);
+  assert.equal(rotationSession._forceHistoryResync, 'cursor active agent change',
+    'idle native switches outside the grace window must remain authoritative');
+} finally {
+  sessionStore.updateSession = originalUpdateSession;
+}
+assert.equal(storeUpdates.length, 3);
+assert.equal(relayEvents.filter(event => event?.type === 'history_snapshot').length, 0,
+  'active-agent list processing itself must not publish an empty history frame');
 
 const relayWithVirtualizedTool = [toolUser, toolAssistant, ...turn(1), ...turn(2)];
 assert.equal(

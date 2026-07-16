@@ -6,10 +6,11 @@ const ACTIVE_ACTIVITY_KINDS = new Set([
 ]);
 
 class SendLifecycleTracker {
-  constructor({ now = () => Date.now(), maxPendingMs = 120000, preDeliveryWindowMs = 2000 } = {}) {
+  constructor({ now = () => Date.now(), maxPendingMs = 120000, preDeliveryWindowMs = 2000, maxSessions = 2048 } = {}) {
     this.now = now;
     this.maxPendingMs = maxPendingMs;
     this.preDeliveryWindowMs = preDeliveryWindowMs;
+    this.maxSessions = Math.max(16, Number(maxSessions) || 2048);
     this.pending = new Map();
     this.lastActive = new Map();
   }
@@ -19,11 +20,20 @@ class SendLifecycleTracker {
     const clientMessageId = message.client_message_id;
     if (!sessionId || !clientMessageId) return;
     if (message.result === 'delivered') {
+      // Native-receipt-managed producers emit their own agent_started event
+      // only after a later native event. Relay activity is not authoritative
+      // enough to derive that transition for those sends.
+      if (message.lifecycle === 'native_user_turn_observed' || message.native_receipt) {
+        const current = this.pending.get(sessionId);
+        if (!current || current.clientMessageId === clientMessageId) this.pending.delete(sessionId);
+        return null;
+      }
       this.pending.set(sessionId, {
         clientMessageId,
         deliveredAt: message.delivered_at || new Date(this.now()).toISOString(),
         recordedAt: this.now(),
       });
+      this._bound(this.pending);
       const recent = this.lastActive.get(sessionId);
       if (recent && this.now() - recent.recordedAt <= this.preDeliveryWindowMs) {
         return this.consumeActivity(recent.message);
@@ -45,6 +55,7 @@ class SendLifecycleTracker {
       return null;
     }
     this.lastActive.set(sessionId, { message, recordedAt: this.now() });
+    this._bound(this.lastActive);
     const pending = this.pending.get(sessionId);
     if (!pending) return null;
     if (this.now() - pending.recordedAt > this.maxPendingMs) {
@@ -68,6 +79,19 @@ class SendLifecycleTracker {
   clearSession(sessionId) {
     this.pending.delete(sessionId);
     this.lastActive.delete(sessionId);
+  }
+
+  _bound(map) {
+    while (map.size > this.maxSessions) map.delete(map.keys().next().value);
+  }
+
+  prune(nowMs = this.now()) {
+    for (const [sessionId, state] of this.pending) {
+      if (nowMs - state.recordedAt > this.maxPendingMs) this.pending.delete(sessionId);
+    }
+    for (const [sessionId, state] of this.lastActive) {
+      if (nowMs - state.recordedAt > this.maxPendingMs) this.lastActive.delete(sessionId);
+    }
   }
 }
 

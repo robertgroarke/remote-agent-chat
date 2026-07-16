@@ -2,6 +2,8 @@
 'use strict';
 
 const assert = require('assert');
+const fs = require('fs');
+const path = require('path');
 const { ProxyEngine } = require('../agent-proxy/proxy-engine');
 
 async function main() {
@@ -38,6 +40,7 @@ async function main() {
   assert.strictEqual(sent.length, 2, 'coalesced bulk frame should flush after the socket drains');
   assert.strictEqual(sent[1].marker, 'latest', 'only the latest coalesced bulk frame should flush');
   assert.strictEqual(engine._pendingRelayBulk.size, 0);
+
   assert(logs.some(entry => entry.message.includes('Coalescing bulk history_chunk')));
 
   bufferedAmount = 400 * 1024;
@@ -88,6 +91,59 @@ async function main() {
   assert.strictEqual(engine._pendingRelayBulk.size, 0);
   assert(logs.some(entry => entry.message.includes('Dropping oversized bulk history_chunk')));
 
+  // A Codex Desktop transcript can fit below the 4 MiB frame ceiling once, but
+  // exceed it when the legacy `history` alias duplicates the `messages` array.
+  // The proxy must preserve the full authoritative transcript and omit only
+  // that redundant compatibility copy instead of dropping the update.
+  const compactSessionId = 'session-e';
+  const compactMessages = Array.from({ length: 3 }, (_, index) => ({
+    role: index % 2 === 0 ? 'assistant' : 'user',
+    content: `${index}:`.padEnd(800 * 1024, String(index)),
+    ts: index + 1,
+  }));
+  engine.sessions = new Map([[compactSessionId, { agentType: 'codex-desktop' }]]);
+  engine._largeHistorySkipLogAt = new Map();
+  bufferedAmount = 0;
+  const compatibilitySize = engine._historySnapshotSizeInfo(
+    compactSessionId, compactMessages, 4 * 1024 * 1024, true
+  );
+  const compactSize = engine._historySnapshotSizeInfo(
+    compactSessionId, compactMessages, 4 * 1024 * 1024, false
+  );
+  assert.strictEqual(compatibilitySize.fits, false, 'duplicated compatibility snapshot should exceed the fixture budget');
+  assert.strictEqual(compactSize.fits, true, 'single-copy canonical snapshot should fit the fixture budget');
+  engine._sendHistorySnapshot(compactSessionId, compactMessages, 'assistant completion');
+  const compactPending = engine._pendingRelayBulk.get(`history_snapshot:${compactSessionId}`);
+  assert(compactPending, 'compact authoritative snapshot should enter the bounded bulk queue');
+  assert(compactPending.byteLen < 4 * 1024 * 1024, 'compact snapshot must remain below the bulk frame ceiling');
+  assert.strictEqual(compactPending.byteLen, compactSize.bytes, 'size guard must match the actual encoded frame');
+  const compactSnapshot = JSON.parse(compactPending.encoded);
+  assert.strictEqual(compactSnapshot.messages.length, compactMessages.length, 'compact snapshot must preserve every message');
+  assert.strictEqual(Object.hasOwn(compactSnapshot, 'history'), false, 'compact snapshot should omit only the redundant legacy array');
+  assert(logs.some(entry => entry.message.includes('Sending compact history snapshot')));
+
+  engine._flushPendingRelayBulk();
+  await new Promise(resolve => setTimeout(resolve, 75));
+  assert.strictEqual(sent.at(-1).session_id, compactSessionId, 'compact snapshot must flush after the socket drains');
+  assert.strictEqual(sent.at(-1).messages.length, compactMessages.length);
+
+  const starvedLargeSnapshot = {
+    type: 'history_snapshot',
+    session_id: 'session-starved',
+    marker: 'aged-large-snapshot',
+    payload: 'x'.repeat(800 * 1024),
+  };
+  bufferedAmount = 64 * 1024;
+  engine._sendToRelay(starvedLargeSnapshot, { bulkKey: 'history_snapshot:session-starved' });
+  const agedItem = engine._pendingRelayBulk.get('history_snapshot:session-starved');
+  assert(agedItem, 'large snapshot should enter the bulk queue');
+  agedItem.queuedAt -= 300;
+  engine._flushPendingRelayBulk();
+  await new Promise(resolve => setTimeout(resolve, 75));
+  assert.strictEqual(sent.at(-1).marker, 'aged-large-snapshot',
+    'an aged authoritative snapshot must not starve behind continuous small frames');
+  assert.strictEqual(engine._pendingRelayBulk.size, 0);
+
   let maintenanceCalls = 0;
   engine._priorityControlInFlight = 1;
   assert.strictEqual(await engine._runBackgroundMaintenanceStep('smoke maintenance', async () => {
@@ -101,12 +157,23 @@ async function main() {
   assert.strictEqual(maintenanceCalls, 1, 'deferred maintenance must remain runnable after the control settles');
 
   if (engine._relayBulkFlushTimer) clearTimeout(engine._relayBulkFlushTimer);
-  console.log(JSON.stringify({
+  const result = {
     ok: true,
     sent_types: sent.map(message => message.type),
     coalesced_marker: sent[1].marker,
     large_snapshot_marker: sent[3].marker,
-  }, null, 2));
+    compact_snapshot_messages: compactMessages.length,
+    compatibility_snapshot_bytes: compatibilitySize.bytes,
+    compact_snapshot_bytes: compactSize.bytes,
+    aged_large_snapshot_flushed: true,
+  };
+  const outputIndex = process.argv.indexOf('--output');
+  if (outputIndex >= 0 && process.argv[outputIndex + 1]) {
+    const output = path.resolve(process.argv[outputIndex + 1]);
+    fs.mkdirSync(path.dirname(output), { recursive: true });
+    fs.writeFileSync(output, `${JSON.stringify(result, null, 2)}\n`, 'utf8');
+  }
+  console.log(JSON.stringify(result, null, 2));
 }
 
 if (require.main === module) {

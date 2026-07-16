@@ -75,6 +75,15 @@ async function waitMessage(client, predicate) {
   throw new Error('expected WebSocket validation response was not received');
 }
 
+async function waitMessageCount(client, predicate, count) {
+  const deadline = Date.now() + 3000;
+  while (Date.now() < deadline) {
+    if (client.messages.filter(predicate).length >= count) return;
+    await new Promise(resolve => setTimeout(resolve, 20));
+  }
+  throw new Error(`expected ${count} WebSocket validation responses were not received`);
+}
+
 async function main() {
   const relay = spawn(process.execPath, [path.join(root, 'relay-server', 'index.js')], {
     cwd: root,
@@ -96,15 +105,55 @@ async function main() {
       FIREBASE_SERVICE_ACCOUNT: '',
     },
   });
-  let client;
+  const clients = [];
   try {
     await waitForRelay(relay);
     const ownerA = token('owner-a@example.test');
     const ownerB = token('owner-b@example.test');
 
+    const readiness = await request('/readyz', '');
+    assert.equal(readiness.status, 200);
+    assert.equal(readiness.body.proxy_sessions, undefined, 'public readiness must not expose session identifiers');
+    assert.equal(readiness.body.browser_clients, undefined, 'public readiness must not expose browser activity');
     assert.equal((await request('/api/sessions/history', '')).status, 401);
     assert.equal((await request('/api/preferences/sessions', '')).status, 401);
     assert.equal((await request('/api/push/web-config', '')).status, 401);
+
+    let authExchange;
+    for (let index = 0; index < 30; index += 1) {
+      authExchange = await request('/auth/app-token', '', {
+        method: 'POST', body: JSON.stringify({ token: `invalid-auth-token-${index}` }),
+      });
+    }
+    assert.equal(authExchange.status, 401);
+    const throttledAuthExchange = await request('/auth/app-token', '', {
+      method: 'POST', body: JSON.stringify({ token: 'invalid-auth-token-throttled' }),
+    });
+    assert.equal(throttledAuthExchange.status, 429);
+    assert(throttledAuthExchange.headers.get('retry-after'));
+
+    const fcmToken = `security-fcm-${Date.now()}-APA91`;
+    assert.equal((await request('/fcm-token', ownerA, {
+      method: 'POST', body: JSON.stringify({ fcm_token: fcmToken, platform: 'android' }),
+    })).status, 200);
+    assert.equal((await request('/fcm-token', ownerB, {
+      method: 'POST', body: JSON.stringify({ fcm_token: fcmToken, platform: 'android' }),
+    })).status, 409, 'an FCM token must not be reassigned across authenticated principals');
+    assert.equal((await request('/fcm-token', ownerB, {
+      method: 'POST', body: JSON.stringify({ fcm_token: 'short', platform: 'android' }),
+    })).status, 400);
+    let invalidFcm;
+    for (let index = 0; index < 18; index += 1) {
+      invalidFcm = await request('/fcm-token', ownerB, {
+        method: 'POST', body: JSON.stringify({ fcm_token: `short-${index}`, platform: 'android' }),
+      });
+    }
+    assert.equal(invalidFcm.status, 400);
+    const throttledFcm = await request('/fcm-token', ownerB, {
+      method: 'POST', body: JSON.stringify({ fcm_token: 'short-throttled', platform: 'android' }),
+    });
+    assert.equal(throttledFcm.status, 429);
+    assert(throttledFcm.headers.get('retry-after'));
 
     const preferenceRoute = '/api/preferences/sessions/security-session';
     assert.equal((await request(preferenceRoute, ownerA, {
@@ -147,7 +196,24 @@ async function main() {
     assert.equal(boundedHistory.status, 200);
     assert(Array.isArray(boundedHistory.body.sessions));
 
-    client = await openClient(ownerA);
+    const uploadBytes = Buffer.from('security upload boundary');
+    const validUpload = await request('/upload', ownerA, {
+      method: 'POST',
+      body: JSON.stringify({ filename: 'boundary.txt', content: uploadBytes.toString('base64') }),
+    });
+    assert.equal(validUpload.status, 200, 'bearer-authenticated Android uploads must be accepted');
+    assert(/^\/uploads\/\d{10,16}_boundary\.txt$/.test(validUpload.body.url));
+    const storedUpload = path.join(dataDir, 'uploads', path.basename(validUpload.body.url));
+    assert.equal(fs.readFileSync(storedUpload).toString('utf8'), uploadBytes.toString('utf8'));
+    assert.equal((await request('/upload', ownerA, {
+      method: 'POST', body: JSON.stringify({ filename: 'invalid.txt', content: 'not base64' }),
+    })).status, 400);
+    assert.equal((await request('/upload', ownerA, {
+      method: 'POST', body: JSON.stringify({ filename: 'oversized.bin', content: Buffer.alloc(2 * 1024 * 1024 + 1).toString('base64') }),
+    })).status, 413);
+
+    const client = await openClient(ownerA);
+    clients.push(client);
     client.socket.send(JSON.stringify({ type: 'edit_queued', session_id: 'security-session', content: 'missing id' }));
     await waitMessage(client, message => message.type === 'error' && message.code === 'invalid_message');
     client.socket.send(JSON.stringify({
@@ -158,15 +224,42 @@ async function main() {
       && message.request_id === 'security-request'
       && message.error?.code === 'invalid_message');
 
+    const invalidSend = index => JSON.stringify({
+      type: 'send_message',
+      session_id: 'x',
+      content: 'security rate-limit probe',
+      client_message_id: `security-rate-${index}`,
+    });
+    for (let index = 0; index < 30; index += 1) client.socket.send(invalidSend(index));
+    await waitMessageCount(client, message => message.type === 'error' && message.code === 'invalid_message', 31);
+
+    const reconnectedOwner = await openClient(ownerA);
+    clients.push(reconnectedOwner);
+    reconnectedOwner.socket.send(invalidSend('reconnected'));
+    await waitMessage(reconnectedOwner, message => message.type === 'error' && message.code === 'rate_limited');
+
+    const otherOwner = await openClient(ownerB);
+    clients.push(otherOwner);
+    otherOwner.socket.send(invalidSend('other-owner'));
+    await waitMessage(otherOwner, message => message.type === 'error' && message.code === 'invalid_message');
+
     const result = {
       ok: true,
       anonymous_http_rejected: true,
+      public_readiness_minimized: true,
+      auth_exchange_rate_limit: true,
+      fcm_token_validation_and_ownership: true,
+      fcm_mutation_rate_limit: true,
       preference_cross_user_isolation: true,
       push_endpoint_cross_user_isolation: true,
       push_input_validation: true,
       push_mutation_rate_limit: true,
       history_identifier_and_limit_bounds: true,
+      bearer_upload_authentication: true,
+      upload_decode_and_size_bounds: true,
       queue_and_workspace_ws_validation: true,
+      websocket_rate_limit_reconnect_resistant: true,
+      websocket_rate_limit_principal_isolation: true,
       visible_windows_opened: 0,
       protected_user_apps_touched: 0,
       generated_at: new Date().toISOString(),
@@ -178,7 +271,7 @@ async function main() {
     }
     process.stdout.write(serialized);
   } finally {
-    if (client?.socket) client.socket.close();
+    for (const client of clients) client.socket.close();
     relay.kill();
     await new Promise(resolve => {
       if (relay.exitCode !== null) return resolve();

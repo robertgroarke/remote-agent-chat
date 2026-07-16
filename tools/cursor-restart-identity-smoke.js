@@ -31,6 +31,17 @@ assert.strictEqual(
   buildCursorStableSignatureSource({ workspaceName: ' cursor   agents ' }),
   'pathless Cursor surface names must normalize stably',
 );
+const firstAgentSignature = buildCursorStableSignatureSource({
+  workspacePath: 'C:\\Users\\Robert\\Documents\\gwa3-private',
+  cursorWorkspaceKey: 'repo:github.com/robertgroarke/gwa3-private',
+  cursorAgentId: '11111111-1111-4111-8111-111111111111',
+});
+const secondAgentSignature = buildCursorStableSignatureSource({
+  workspacePath: 'C:\\Users\\Robert\\Documents\\gwa3-private',
+  cursorWorkspaceKey: 'repo:github.com/robertgroarke/gwa3-private',
+  cursorAgentId: '22222222-2222-4222-8222-222222222222',
+});
+assert.notStrictEqual(firstAgentSignature, secondAgentSignature, 'same-workspace native Cursor UUIDs must remain separate');
 
 const fixtures = {
   newerShortDuplicate: {
@@ -63,6 +74,16 @@ const fixtures = {
     workspace_path: null,
     created_at: '2026-07-10T13:52:56.309Z',
   },
+  firstNativeAgent: {
+    agent_type: 'cursor',
+    cursor_agent_id: '11111111-1111-4111-8111-111111111111',
+    workspace_path: 'C:\\Users\\Robert\\Documents\\gwa3-private',
+  },
+  secondNativeAgent: {
+    agent_type: 'cursor',
+    cursor_agent_id: '22222222-2222-4222-8222-222222222222',
+    workspace_path: 'C:\\Users\\Robert\\Documents\\gwa3-private',
+  },
 };
 
 assert.strictEqual(
@@ -74,6 +95,14 @@ assert.strictEqual(
   findCursorStableSession(fixtures, { workspaceName: 'Cursor Agents' })?.[0],
   'originalAgentsSurface',
   'equal pathless surfaces must prefer the earliest durable record',
+);
+assert.strictEqual(
+  findCursorStableSession(fixtures, {
+    workspacePath: 'C:\\Users\\Robert\\Documents\\gwa3-private',
+    cursorAgentId: '22222222-2222-4222-8222-222222222222',
+  })?.[0],
+  'secondNativeAgent',
+  'native Cursor UUID must outrank the shared workspace path',
 );
 
 const storeSource = fs.readFileSync(path.join(__dirname, '..', 'agent-proxy', 'session-store.js'), 'utf8');

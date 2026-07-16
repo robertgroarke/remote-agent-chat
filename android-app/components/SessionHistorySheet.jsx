@@ -9,7 +9,7 @@ import { RELAY_URL, getStoredJwt } from '../lib/auth';
 // Bottom sheet showing past conversation history with resume capability.
 // Fetches from GET /api/sessions/history and lets user pick a session to resume.
 
-export default function SessionHistorySheet({ visible, onResume, onClose }) {
+export default function SessionHistorySheet({ visible, includeTestSessions = false, onResume, onClose }) {
   const [sessions, setSessions] = useState([]);
   const [loading, setLoading]   = useState(false);
   const [error, setError]       = useState(null);
@@ -22,7 +22,7 @@ export default function SessionHistorySheet({ visible, onResume, onClose }) {
     (async () => {
       try {
         const jwt = await getStoredJwt();
-        const res = await fetch(`${RELAY_URL}/api/sessions/history?limit=30`, {
+        const res = await fetch(`${RELAY_URL}/api/sessions/history?limit=30&include_test=${includeTestSessions ? 'true' : 'false'}`, {
           headers: { Authorization: `Bearer ${jwt}` },
         });
         if (!res.ok) throw new Error(`HTTP ${res.status}`);
@@ -35,7 +35,7 @@ export default function SessionHistorySheet({ visible, onResume, onClose }) {
         setLoading(false);
       }
     })();
-  }, [visible]);
+  }, [visible, includeTestSessions]);
 
   function timeAgo(isoStr) {
     if (!isoStr) return '';

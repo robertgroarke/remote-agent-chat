@@ -70,10 +70,10 @@
   },
   "dependencies": {
     "chrome-remote-interface": "^0.34.0",
-    "ws": "^8.19.0"
+    "ws": "^8.21.1"
   },
   "devDependencies": {
-    "esbuild": "^0.25.0",
-    "@vscode/vsce": "^3.7.0"
+    "@vscode/vsce": "^3.7.0",
+    "esbuild": "^0.25.0"
   }
 }

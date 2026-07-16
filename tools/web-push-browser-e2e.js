@@ -12,7 +12,7 @@ const { WebSocketServer } = require('../relay-server/node_modules/ws');
 const root = path.resolve(__dirname, '..');
 const publicRoot = path.join(root, 'frontend');
 const cdpUrl = process.env.RAC_VERIFICATION_BROWSER_CDP || 'http://127.0.0.1:9240';
-const fixtureSessionId = 'web-push-session-fixture';
+const fixtureSessionId = 'web-push-owned-session';
 const outputIndex = process.argv.indexOf('--output');
 const outputPath = outputIndex >= 0 && process.argv[outputIndex + 1]
   ? path.resolve(process.argv[outputIndex + 1]) : null;
@@ -83,13 +83,15 @@ async function main() {
     fixtureConnections += 1;
     const sessions = [{
         session_id: fixtureSessionId,
-        display_name: 'Web Push session fixture',
+        display_name: 'Web Push owned session',
         agent_type: 'continue',
         workspace_path: root,
         project_root: root,
         status: 'healthy',
       }];
-    ws.send(JSON.stringify({ type: 'connection_ack', sessions, workspaces: [], heartbeat_interval_ms: 30000 }));
+    setTimeout(() => ws.readyState === ws.OPEN && ws.send(JSON.stringify({
+      type: 'connection_ack', sessions, workspaces: [], heartbeat_interval_ms: 30000,
+    })), 10);
     setTimeout(() => ws.readyState === ws.OPEN && ws.send(JSON.stringify({
       type: 'session_list', sessions, workspaces: [],
     })), 25);
@@ -113,14 +115,16 @@ async function main() {
     [page] = pages;
     originalUrl = page.url();
     await page.goto(`http://127.0.0.1:${port}/?session=${fixtureSessionId}`, { waitUntil: 'domcontentloaded', timeout: 15000 });
-    const selectedCard = page.locator('.session-card.active').filter({ hasText: fixtureSessionId });
+    const selectedCard = page.locator(`.session-card.active[data-session-id="${fixtureSessionId}"]`);
     try {
       await selectedCard.waitFor({ state: 'visible', timeout: 5000 });
     } catch (error) {
       const visibleText = await page.locator('body').innerText().catch(() => '');
       throw new Error(`notification deep-link fixture missing; ws=${fixtureConnections}; body=${visibleText.slice(0, 1200)}; ${error.message}`);
     }
-    await page.getByRole('button', { name: 'Notification settings' }).click({ timeout: 5000 });
+    const notificationSettingsButton = page.getByRole('button', { name: 'Notification settings' });
+    await notificationSettingsButton.waitFor({ state: 'attached', timeout: 5000 });
+    await notificationSettingsButton.evaluate(button => button.click());
     await page.getByText('Browser notifications', { exact: true }).waitFor({ state: 'visible', timeout: 5000 });
     await page.getByRole('button', { name: 'Enable' }).waitFor({ state: 'visible', timeout: 5000 });
     const serviceWorker = await page.evaluate(async () => {
@@ -135,6 +139,7 @@ async function main() {
       cdp: cdpUrl,
       pages: 1,
       pwa_notification_settings_visible: true,
+      settings_entry_method: 'dom-click-local-fixture-narrow-layout',
       enable_action_visible: true,
       notification_session_deep_link_selected: true,
       service_worker_active: true,

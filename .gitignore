@@ -1,6 +1,7 @@
 # Logs
 proxy.log
 proxy-err.log
+*.log.*
 
 # Env files (contain secrets)
 .env
@@ -21,6 +22,10 @@ GITHUB_PUSH_PRIVATE.md
 
 # Claude Code IDE settings
 .claude/
+
+# Machine-local editor/workspace state
+/.vscode/
+/*.code-workspace
 
 # Local proxy environment overrides (node path, etc.)
 proxy-env.bat
@@ -69,13 +74,19 @@ agent-proxy/test.html
 
 # Android Expo build output
 android-app/dist/
+android-app/dist-*/
 
 # Python cache
 __pycache__/
 
 # Runtime files
+/data/
 data/nightly-validation-ledger.jsonl
 data/nightly-validation.lock
+data/app-update-drift-state.json
+data/app-update-drift-ledger.jsonl
+data/*.lock
+data/nightly-visual-regression/
 agent-proxy/proxy-new.log
 agent-proxy/session-store.json
 agent-proxy/session-store.json.*.tmp
@@ -86,3 +97,25 @@ agent-proxy/vscode-ext/*.vsix
 agent-proxy/vscode-ext/dist/
 agent-proxy/vscode-ext/node_modules/
 *.log
+
+# Generated harness probe and visual-comparison scratch output. Canonical
+# result JSON and approved goldens remain visible/trackable outside these paths.
+agent-proxy/probe-*.json
+evidence/**/raw-probes/
+evidence/harness-maturity/*/visual-regression*/actual/
+evidence/harness-maturity/*/visual-regression*/diff/
+
+# High-cardinality visual matrix attempts are reproducible scratch. Keep their
+# result JSON trackable, while approved goldens and root-level evidence images
+# remain visible to git.
+evidence/harness-maturity/*/*visual*/**/*.png
+evidence/harness-maturity/*/*compare*/**/*.png
+evidence/harness-maturity/*/*generate*/**/*.png
+evidence/harness-maturity/*/*golden-update*/**/*.png
+evidence/harness-maturity/*/*regression*/**/*.png
+evidence/harness-maturity/*/*-before*/**/*.png
+evidence/harness-maturity/*/*-after*/**/*.png
+
+# Accidental shell-fragment filenames (a historical cleanup commit tracked one).
+/-
+/[{]if*

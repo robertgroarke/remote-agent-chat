@@ -75,13 +75,16 @@ function SettingRow({ label, options, value, onChange, disabled = false }) {
 // ── Main sheet ──────────────────────────────────────────────────────────────
 
 export default function AgentSettingsSheet({
-  visible, onClose, agentType, config, relay, sessionId, controlResults,
+  visible, onClose, agentType, config, relay, sessionId, controlResults, onExport,
 }) {
   const [controlStates, setControlStates] = useState({});
+  const [bypassConfirmation, setBypassConfirmation] = useState(false);
+  const [bypassRestoreProfile, setBypassRestoreProfile] = useState(null);
   const controlTimers = useRef({});
   const hasConfig = !!config;
   config = config || {};
   const caps = config.capabilities || {};
+  const splitObservedConfig = agentType === 'codex_cli' && config.config_semantics === 'observed_and_next_send';
 
   const isPending = field => ['pending', 'awaiting_config'].includes(controlStates[field]?.status);
   const valueFor = (field, current) => isPending(field) ? controlStates[field].requestedValue : current;
@@ -116,6 +119,8 @@ export default function AgentSettingsSheet({
     Object.values(controlTimers.current).forEach(timer => clearTimeout(timer));
     controlTimers.current = {};
     setControlStates({});
+    setBypassConfirmation(false);
+    setBypassRestoreProfile(null);
   }, [sessionId]);
 
   useEffect(() => {
@@ -125,7 +130,7 @@ export default function AgentSettingsSheet({
       Object.entries(prev).forEach(([field, state]) => {
         if (!['pending', 'awaiting_config'].includes(state.status)) return;
         const result = controlResults?.[state.requestId];
-        if (!result) return;
+        if (!result || (result.session_id || result.session) !== sessionId) return;
         if (result.result === 'failed') {
           clearControlTimer(field);
           next[field] = { ...state, status: 'failed', error: result.error?.message || result.error || 'The agent rejected this setting.' };
@@ -137,16 +142,17 @@ export default function AgentSettingsSheet({
       });
       return changed ? next : prev;
     });
-  }, [controlResults]);
+  }, [controlResults, sessionId]);
 
   useEffect(() => {
     const confirmedValues = {
-      model: config.model_id,
+      model: splitObservedConfig ? config.next_send_model_id : config.model_id,
       permission_mode: config.permission_mode,
       auto_approve_permissions: config.auto_approve_permissions,
       mode: config.conversation_mode || config.mode,
-      effort: config.effort,
+      effort: splitObservedConfig ? config.next_send_effort : config.effort,
       access_mode: config.permission_mode,
+      permission_profile: config.permission_profile,
       workspace: config.available_workspaces?.find(workspace => workspace.active)?.id || config.file_access_scope,
     };
     setControlStates(prev => {
@@ -160,18 +166,23 @@ export default function AgentSettingsSheet({
       });
       return changed ? next : prev;
     });
-  }, [config.model_id, config.permission_mode, config.auto_approve_permissions, config.conversation_mode, config.mode, config.effort, config.file_access_scope, config.available_workspaces]);
+  }, [config.model_id, config.next_send_model_id, config.permission_mode, config.permission_profile, config.auto_approve_permissions, config.conversation_mode, config.mode, config.effort, config.next_send_effort, config.file_access_scope, config.available_workspaces, splitObservedConfig]);
 
   function modelsForAgent() {
     if (agentType === 'antigravity' || agentType === 'antigravity_panel') return KNOWN_ANTIGRAVITY_MODELS;
     if (agentType === 'gemini') return KNOWN_GEMINI_MODELS;
-    if (caps.set_codex_config && config.available_models?.length) return config.available_models;
+    if (config.available_models?.length) return config.available_models;
     return KNOWN_CLAUDE_MODELS;
   }
 
   function handleModelChange(modelId) {
-    if (caps.set_codex_config) {
-      submitControl('model', config.model_id, modelId, () => relay?.setCodexConfig(sessionId, { model_id: modelId }));
+    if (splitObservedConfig) {
+      submitControl('model', config.next_send_model_id, modelId, () => relay?.setAgentModel(sessionId, modelId));
+    } else if (caps.set_codex_config) {
+      submitControl('model', config.model_id, modelId, () => relay?.setCodexConfig(sessionId, {
+        model_id: modelId,
+        source_revision: config.source_revision,
+      }));
     } else {
       submitControl('model', config.model_id, modelId, () => relay?.setAgentModel(sessionId, modelId));
     }
@@ -186,19 +197,49 @@ export default function AgentSettingsSheet({
   }
 
   function handleEffortChange(effort) {
-    submitControl('effort', config.effort, effort, () => relay?.setCodexConfig(sessionId, { effort }));
+    if (splitObservedConfig) {
+      submitControl('effort', config.next_send_effort, effort, () => relay?.setAgentEffort(sessionId, effort));
+    } else {
+      submitControl('effort', config.effort, effort, () => relay?.setCodexConfig(sessionId, {
+        effort,
+        source_revision: config.source_revision,
+      }));
+    }
   }
 
   function handleAccessChange(accessMode) {
     submitControl('access_mode', config.permission_mode, accessMode, () => relay?.setCodexConfig(sessionId, { access_mode: accessMode }));
   }
 
-  const showModel = caps.set_model || caps.set_codex_config ||
+  function applyPermissionProfile(permissionProfile, confirmBypass = false) {
+    if (permissionProfile === 'full-access' && !caps.codex_bypass_permissions) return;
+    if (permissionProfile === 'full-access' && !confirmBypass) {
+      setBypassConfirmation(true);
+      return;
+    }
+    if (permissionProfile === 'full-access') {
+      setBypassRestoreProfile(config.permission_profile && config.permission_profile !== 'full-access'
+        ? config.permission_profile
+        : 'auto');
+    }
+    setBypassConfirmation(false);
+    submitControl('permission_profile', config.permission_profile, permissionProfile, () => relay?.setCodexConfig(sessionId, {
+      permission_profile: permissionProfile,
+      ...(confirmBypass ? { confirm_bypass: true } : {}),
+      source_revision: config.source_revision,
+    }));
+  }
+
+  const isVsCodeCodex = agentType === 'codex';
+  const codexControlsAvailable = !isVsCodeCodex || config.controls_available !== false;
+  const showModel = caps.set_model || caps.codex_model_change ||
     agentType === 'antigravity' || agentType === 'antigravity_panel';
   const showPermission = caps.permission_mode_change;
   const showAntigravityMode = agentType === 'antigravity' || agentType === 'antigravity_panel';
-  const showEffort = caps.set_codex_config && config.available_efforts?.length > 0;
-  const showAccess = caps.set_codex_config && config.available_access?.length > 0;
+  const showEffort = (caps.set_effort || caps.codex_effort_change) && config.available_efforts?.length > 0;
+  const showAccess = caps.codex_access_change && config.available_access?.length > 0;
+  const showPermissionProfile = caps.codex_permission_profile_change
+    && config.available_permission_profiles?.length > 0;
   const autoApproveEnabled = typeof config.auto_approve_permissions === 'boolean'
     ? config.auto_approve_permissions
     : false;
@@ -215,13 +256,27 @@ export default function AgentSettingsSheet({
         <Text style={s.sheetTitle}>Agent Settings</Text>
 
         <ScrollView style={s.sheetBody} bounces={false}>
+          {splitObservedConfig && (
+            <View style={s.infoRow}>
+              <Text style={s.infoLabel}>Observed model</Text>
+              <Text style={[s.infoValue, config.observed_model_id === 'unknown' && s.infoDim]}>
+                {config.observed_model_id || 'unknown'}
+              </Text>
+              <Text style={s.infoLabel}>Observed effort</Text>
+              <Text style={[s.infoValue, config.observed_effort === 'unknown' && s.infoDim]}>
+                {config.observed_effort || 'unknown'}
+              </Text>
+            </View>
+          )}
           {showModel && (
             <SettingRow
-              label="Model"
+              label={splitObservedConfig
+                ? `Next send model · ${config.next_send_model_status || 'unset'}`
+                : (isVsCodeCodex ? 'Next turn model' : 'Model')}
               options={modelsForAgent()}
-              value={valueFor('model', config.model_id || 'default')}
+              value={valueFor('model', splitObservedConfig ? (config.next_send_model_id || '') : (config.model_id || 'default'))}
               onChange={handleModelChange}
-              disabled={isPending('model')}
+              disabled={isPending('model') || !codexControlsAvailable}
             />
           )}
 
@@ -263,12 +318,78 @@ export default function AgentSettingsSheet({
 
           {showEffort && (
             <SettingRow
-              label="Effort"
+              label={splitObservedConfig
+                ? `Next send effort · ${config.next_send_effort_status || 'unset'}`
+                : (isVsCodeCodex ? 'Next turn effort' : 'Effort')}
               options={config.available_efforts}
-              value={valueFor('effort', (config.effort || 'medium').toLowerCase())}
+              value={valueFor('effort', splitObservedConfig ? (config.next_send_effort || '') : (config.effort || 'medium').toLowerCase())}
               onChange={handleEffortChange}
-              disabled={isPending('effort')}
+              disabled={isPending('effort') || !codexControlsAvailable}
             />
+          )}
+
+          {showPermissionProfile && (
+            <SettingRow
+              label="Next turn permissions"
+              options={config.available_permission_profiles.filter(profile =>
+                profile.id !== 'full-access' || caps.codex_bypass_permissions)}
+              value={valueFor('permission_profile', config.permission_profile || 'unknown')}
+              onChange={applyPermissionProfile}
+              disabled={isPending('permission_profile') || !codexControlsAvailable}
+            />
+          )}
+
+          {bypassConfirmation && (
+            <View style={s.bypassConfirmation} accessibilityRole="alert">
+              <Text style={s.bypassTitle}>Enable Bypass permissions?</Text>
+              <Text style={s.bypassCopy}>
+                Full access sets approval policy to Never and sandbox access to danger-full-access for this Codex conversation.
+              </Text>
+              <View style={s.bypassActions}>
+                <TouchableOpacity
+                  style={s.cancelButton}
+                  onPress={() => setBypassConfirmation(false)}
+                  accessibilityRole="button"
+                >
+                  <Text style={s.cancelButtonText}>Cancel</Text>
+                </TouchableOpacity>
+                <TouchableOpacity
+                  style={s.dangerButton}
+                  onPress={() => applyPermissionProfile('full-access', true)}
+                  accessibilityRole="button"
+                >
+                  <Text style={s.dangerButtonText}>Enable Full access</Text>
+                </TouchableOpacity>
+              </View>
+            </View>
+          )}
+
+          {isVsCodeCodex && config.bypass_permissions_active && (bypassRestoreProfile || config.bypass_restore_profile) && (
+            <TouchableOpacity
+              style={s.restoreButton}
+              onPress={() => applyPermissionProfile(bypassRestoreProfile || config.bypass_restore_profile)}
+              disabled={isPending('permission_profile')}
+              accessibilityRole="button"
+            >
+              <Text style={s.restoreButtonText}>Restore previous safe permissions</Text>
+            </TouchableOpacity>
+          )}
+
+          {isVsCodeCodex && (
+            <View style={s.infoRow}>
+              <Text style={s.infoLabel}>Approval policy</Text>
+              <Text style={s.infoValue}>{config.approval_policy || 'Native custom policy'}</Text>
+              <Text style={[s.infoLabel, s.infoLabelSpaced]}>Access / sandbox</Text>
+              <Text style={s.infoValue}>{config.permission_mode || 'Native custom access'}</Text>
+            </View>
+          )}
+
+          {isVsCodeCodex && !codexControlsAvailable && (
+            <View style={s.controlStatus}>
+              <Text style={s.controlStatusText}>
+                {config.controls_unavailable_reason || 'Codex controls are unavailable for this conversation.'}
+              </Text>
+            </View>
           )}
 
           {showAccess && (
@@ -321,6 +442,21 @@ export default function AgentSettingsSheet({
                 {config.sandbox_status.active ? '\u{1F7E2}' : '\u26AA'}{' '}
                 {config.sandbox_status.label || (config.sandbox_status.active ? 'Active' : 'Inactive')}
               </Text>
+            </View>
+          )}
+
+          {!!onExport && (
+            <View style={s.exportSection}>
+              <Text style={s.settingLabel}>Export session</Text>
+              <Text style={s.toggleHint}>Share the complete transcript with all structured blocks expanded.</Text>
+              <View style={s.exportActions}>
+                <TouchableOpacity style={s.exportButton} onPress={() => onExport('markdown')} accessibilityRole="button">
+                  <Text style={s.exportButtonText}>Share Markdown</Text>
+                </TouchableOpacity>
+                <TouchableOpacity style={s.exportButton} onPress={() => onExport('json')} accessibilityRole="button">
+                  <Text style={s.exportButtonText}>Share JSON</Text>
+                </TouchableOpacity>
+              </View>
             </View>
           )}
         </ScrollView>
@@ -398,6 +534,8 @@ const s = StyleSheet.create({
     gap:           6,
   },
   chip: {
+    minHeight:         44,
+    justifyContent:    'center',
     paddingHorizontal: 12,
     paddingVertical:   7,
     borderRadius:      8,
@@ -451,11 +589,105 @@ const s = StyleSheet.create({
     letterSpacing: 0.5,
     marginBottom: 4,
   },
+  infoLabelSpaced: {
+    marginTop: 10,
+  },
   infoValue: {
     color:    '#cdd9e5',
     fontSize: 13,
   },
   infoDim: {
     color:   '#666',
+  },
+  bypassConfirmation: {
+    marginBottom: 16,
+    padding: 12,
+    borderWidth: 1,
+    borderColor: '#f0883e',
+    borderRadius: 10,
+    backgroundColor: 'rgba(240,136,62,0.10)',
+  },
+  bypassTitle: {
+    color: '#f0f6fc',
+    fontSize: 14,
+    fontWeight: '700',
+    marginBottom: 6,
+  },
+  bypassCopy: {
+    color: '#cdd9e5',
+    fontSize: 13,
+    lineHeight: 19,
+  },
+  bypassActions: {
+    flexDirection: 'row',
+    gap: 8,
+    marginTop: 12,
+  },
+  cancelButton: {
+    minHeight: 44,
+    flex: 1,
+    alignItems: 'center',
+    justifyContent: 'center',
+    borderWidth: 1,
+    borderColor: '#484f58',
+    borderRadius: 8,
+  },
+  cancelButtonText: {
+    color: '#cdd9e5',
+    fontSize: 13,
+    fontWeight: '600',
+  },
+  dangerButton: {
+    minHeight: 44,
+    flex: 1.5,
+    alignItems: 'center',
+    justifyContent: 'center',
+    borderRadius: 8,
+    backgroundColor: '#da3633',
+  },
+  dangerButtonText: {
+    color: '#ffffff',
+    fontSize: 13,
+    fontWeight: '700',
+  },
+  restoreButton: {
+    minHeight: 44,
+    alignItems: 'center',
+    justifyContent: 'center',
+    marginBottom: 16,
+    borderWidth: 1,
+    borderColor: '#3fb950',
+    borderRadius: 8,
+    backgroundColor: 'rgba(63,185,80,0.10)',
+  },
+  restoreButtonText: {
+    color: '#56d364',
+    fontSize: 13,
+    fontWeight: '700',
+  },
+  exportSection: {
+    marginBottom: 16,
+    paddingTop: 12,
+    borderTopWidth: 1,
+    borderTopColor: '#30363d',
+  },
+  exportActions: {
+    flexDirection: 'row',
+    gap: 8,
+    marginTop: 10,
+  },
+  exportButton: {
+    flex: 1,
+    alignItems: 'center',
+    borderWidth: 1,
+    borderColor: '#30363d',
+    borderRadius: 8,
+    backgroundColor: '#21262d',
+    paddingVertical: 9,
+  },
+  exportButtonText: {
+    color: '#58a6ff',
+    fontSize: 12,
+    fontWeight: '600',
   },
 });
