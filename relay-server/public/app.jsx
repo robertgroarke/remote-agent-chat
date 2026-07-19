@@ -10,6 +10,7 @@ import {
   retainStrongerSessionChatTitleProjection,
 } from './session-title.js';
 import { partitionPinnedSessions } from './session-pins.js';
+import { normalizeLatestVisibleMessage, projectRecentChatOwnership } from './recent-chats.js';
 import {
   formatAbsoluteMessageTime,
   formatVisibleMessageTime,
@@ -42,18 +43,23 @@ import {
 } from './broadcast-send-policy.js';
 import { FullTitleDisclosure } from './title-disclosure.jsx';
 import {
+  formatOllamaDuration,
+  formatOllamaTokenRate,
   formatProviderCredits,
   formatProviderPercent,
   formatProviderUsageAge,
   formatProviderUsageReset,
   normalizeProviderUsage,
+  providerFinancialRows,
   selectEstimatedCost,
 } from './provider-usage.js';
+import { ProviderMark } from './provider-marks.jsx';
 import {
   DEFAULT_ACTIVITY_FRESHNESS_MS,
   classifyFleetActivity,
   fleetActivityObservedAtMs,
   fleetFreshnessLabel,
+  fleetGoalSubstateLabel,
   fleetStateIsWorking,
   fleetStateLabel,
 } from './fleet-activity.js';
@@ -67,6 +73,7 @@ import {
   hostResourceIntervalStats,
   hostResourceMetricValue,
   normalizeHostResources,
+  projectHostResourceStrip,
   selectHostResourceRange,
 } from './host-resources.js';
 import {
@@ -2100,7 +2107,7 @@ function QueuedItem({ qm, onSteer, onDiscard, onEdit }) {
 // Each card shows: colored agent badge, agent name, window label, health dot,
 // and either a thinking spinner or an unread count badge.
 
-function SessionCard({ session, health, unread, isThinking, isActive, agentConfig, activity, sessionMessages, hasBlockingPrompt, blockingPromptLabel, muted, pinned, workspaceLabel, menuOpen, onMenuToggle, onSelect, onClose, onManage, onPinChange, onAutomations, showAutomationsActive, onSkills, showSkillsActive }) {
+function SessionCard({ session, health, unread, isThinking, isActive, agentConfig, activity, sessionMessages, hasBlockingPrompt, blockingPromptLabel, muted, pinned, workspaceLabel, recentMessageAt, menuOpen, onMenuToggle, onSelect, onClose, onManage, onPinChange, onAutomations, showAutomationsActive, onSkills, showSkillsActive }) {
   const sessionId = sessionIdOf(session);
   const agent    = sessionAgent(session, agentConfig);
   const winLabel = sessionSubLabel(session, sessionId, agentConfig);
@@ -2112,14 +2119,17 @@ function SessionCard({ session, health, unread, isThinking, isActive, agentConfi
   const pctUsed = session?.percent_used;
   const isAntigravitySession = session?.agent_type === 'antigravity' || session?.agent_type === 'antigravity_panel';
   const quotaSummary = isAntigravitySession ? formatAntigravityQuotaSummary(session?.antigravity_quota_models, 3) : '';
-  const activityLabel = isThinking && activity?.label ? activity.label : null;
+  const goalSubstate = fleetGoalSubstateLabel(activity, { health });
+  const activityLabel = isThinking ? (goalSubstate || activity?.label || 'Working') : null;
   const hostLabel = sessionHostLabel(session);
   const agentContext = workspaceLabel ? `${agent.name} / ${workspaceLabel}` : agent.name;
+  const recentMessageInstant = recentMessageAt ? parseMessageInstant(recentMessageAt) : null;
 
   return (
     <div
       className={`session-card${isActive ? ' active' : ''}${isHardLimited ? ' rate-limited' : ''}${pinned ? ' pinned' : ''}`}
       data-session-id={sessionId}
+      data-last-message-at={recentMessageInstant?.iso || undefined}
       onClick={onSelect}
       onKeyDown={event => {
         if (event.target !== event.currentTarget || !['Enter', ' '].includes(event.key)) return;
@@ -2172,15 +2182,18 @@ function SessionCard({ session, health, unread, isThinking, isActive, agentConfi
           triggerLabel={`Show full title: ${chatTitle}`}
           triggerTag="div"
         />
-        <div className={`session-card-sub${hasBlockingPrompt ? ' perm-active' : ''}`}>
-          {hasBlockingPrompt ? `${agentContext} · ${blockingPromptLabel || 'Action required'}`
-            : isHardLimited ? `${agentContext} · ⏳ Rate limited${rateLimitedUntil && rateLimitedUntil !== 'unknown' ? ` · ${rateLimitedUntil}` : ''}`
-            : quotaSummary ? `${agentContext} · ${quotaSummary}`
-            : isAntigravitySession && pctUsed != null ? `${agentContext} · 📊 ${pctUsed}% used${rateLimitedUntil && rateLimitedUntil !== 'unknown' ? ` · ${rateLimitedUntil}` : ''}`
-            : pctUsed >= 80 ? `${agentContext} · 📊 ${pctUsed}% used`
-            : activityLabel ? `${agentContext} · ${activityLabel}`
-            : hostLabel ? `${agentContext} · ${hostLabel}`
-            : agentContext}
+        <div className={`session-card-sub${hasBlockingPrompt ? ' perm-active' : ''}${recentMessageInstant ? ' has-recent-message' : ''}`}>
+          <span className="session-card-sub-context">
+            {hasBlockingPrompt ? `${agentContext} · ${blockingPromptLabel || 'Action required'}`
+              : isHardLimited ? `${agentContext} · ⏳ Rate limited${rateLimitedUntil && rateLimitedUntil !== 'unknown' ? ` · ${rateLimitedUntil}` : ''}`
+              : quotaSummary ? `${agentContext} · ${quotaSummary}`
+              : isAntigravitySession && pctUsed != null ? `${agentContext} · 📊 ${pctUsed}% used${rateLimitedUntil && rateLimitedUntil !== 'unknown' ? ` · ${rateLimitedUntil}` : ''}`
+              : pctUsed >= 80 ? `${agentContext} · 📊 ${pctUsed}% used`
+              : activityLabel ? `${agentContext} · ${activityLabel}`
+              : hostLabel ? `${agentContext} · ${hostLabel}`
+              : agentContext}
+          </span>
+          {recentMessageInstant && <><span aria-hidden="true">{' \u00b7 '}</span><time dateTime={recentMessageInstant.iso}>{formatVisibleMessageTime(recentMessageInstant)}</time></>}
         </div>
       </div>
       <div className="session-card-right">
@@ -2235,6 +2248,9 @@ function sessionCardActivityKey(activity) {
     activity.label || '',
     activity.goal?.status || '',
     activity.goal?.label || '',
+    activity.goal_run?.lifecycle || '',
+    activity.goal_run?.lease_active === true ? 'leased' : 'released',
+    activity.goal_run?.transition_id || '',
   ].join('\u0001');
 }
 
@@ -2249,6 +2265,7 @@ function areSessionCardPropsEqual(prev, next) {
     && prev.muted === next.muted
     && prev.pinned === next.pinned
     && prev.workspaceLabel === next.workspaceLabel
+    && prev.recentMessageAt === next.recentMessageAt
     && prev.menuOpen === next.menuOpen
     && prev.showAutomationsActive === next.showAutomationsActive
     && prev.showSkillsActive === next.showSkillsActive
@@ -2548,10 +2565,19 @@ function formatPromptCountdown(msLeft) {
   return `${minutes}:${String(seconds).padStart(2, '0')}`;
 }
 
+function questionDeadlineCopy(prompt, msLeft) {
+  if (!prompt?.deadline_at) return '';
+  if (msLeft <= 0) return 'Native deadline elapsed · awaiting receipt';
+  const prefix = prompt.auto_resolution_policy === 'native'
+    ? 'Native auto-resolution in' : 'Response deadline in';
+  return `${prefix} ${formatPromptCountdown(msLeft)}`;
+}
+
 function PermissionOverlay({ prompt, sessionId, agentType, onRespond, onDismissFocus }) {
   const [now, setNow] = React.useState(Date.now());
   const [questionSelections, setQuestionSelections] = React.useState({});
   const [questionOtherText, setQuestionOtherText] = React.useState({});
+  const [questionTextAnswers, setQuestionTextAnswers] = React.useState({});
   const [alternateInstruction, setAlternateInstruction] = React.useState('');
   const [keyboardChoiceId, setKeyboardChoiceId] = React.useState(null);
   const [keyboardDismissed, setKeyboardDismissed] = React.useState(false);
@@ -2564,6 +2590,7 @@ function PermissionOverlay({ prompt, sessionId, agentType, onRespond, onDismissF
   React.useEffect(() => {
     setQuestionSelections({});
     setQuestionOtherText({});
+    setQuestionTextAnswers({});
     setAlternateInstruction('');
     setKeyboardChoiceId(null);
     setKeyboardDismissed(false);
@@ -2571,12 +2598,17 @@ function PermissionOverlay({ prompt, sessionId, agentType, onRespond, onDismissF
 
   const timeoutMs = Math.max(0, Number(prompt?.timeout_ms) || 0);
   const receivedAt = Number(prompt?.received_at) || Date.now();
-  const msLeft = timeoutMs > 0 ? Math.max(0, timeoutMs - (now - receivedAt)) : 0;
+  const deadlineAt = Date.parse(prompt?.deadline_at || '');
+  const hasQuestionDeadline = prompt?.type === 'question_prompt' && Number.isFinite(deadlineAt);
+  const msLeft = hasQuestionDeadline
+    ? Math.max(0, deadlineAt - now)
+    : (timeoutMs > 0 ? Math.max(0, timeoutMs - (now - receivedAt)) : 0);
   const choices = Array.isArray(prompt?.choices) ? prompt.choices : [];
   const submittingChoiceId = prompt?.submitting_choice_id || null;
+  const firstClassQuestionLocked = prompt?.type === 'question_prompt' && prompt?.lifecycle !== 'open';
   const defaultChoiceId = prompt?.default_choice || null;
-  const questions = prompt?.kind === 'question' && Array.isArray(prompt?.questions)
-    ? prompt.questions.filter(question => Array.isArray(question?.choices) && question.choices.length > 0)
+  const questions = (prompt?.kind === 'question' || prompt?.type === 'question_prompt') && Array.isArray(prompt?.questions)
+    ? prompt.questions.filter(question => question && typeof question === 'object')
     : [];
   const structuredQuestion = questions.length > 0;
   const claudeActionPrompt = agentType === 'claude' && !structuredQuestion;
@@ -2586,7 +2618,7 @@ function PermissionOverlay({ prompt, sessionId, agentType, onRespond, onDismissF
   const claudeDescription = safeString(prompt?.description).trim();
   const alternateInstructionSupported = claudeActionPrompt && prompt?.alternate_instruction_supported === true;
   const structuredKeyboardChoices = questions.flatMap(question => (
-    question.choices.map((choice, index) => ({
+    (Array.isArray(question.choices) ? question.choices : []).map((choice, index) => ({
       question,
       choiceId: promptChoiceId(choice, index),
     }))
@@ -2603,22 +2635,33 @@ function PermissionOverlay({ prompt, sessionId, agentType, onRespond, onDismissF
   };
 
   const questionReady = questions.every(question => {
+    const questionChoices = Array.isArray(question.choices) ? question.choices : [];
+    if (question.answer_mode === 'text' || questionChoices.length === 0) {
+      return question.required === false || safeString(questionTextAnswers[question.question_id]).trim().length > 0;
+    }
     const selected = questionSelections[question.question_id] || [];
     if (selected.length === 0) return false;
     return selected.every(choiceId => {
-      const choice = question.choices.find((item, index) => promptChoiceId(item, index) === choiceId);
+      const choice = questionChoices.find((item, index) => promptChoiceId(item, index) === choiceId);
       return !choice?.requires_text || safeString(questionOtherText[`${question.question_id}:${choiceId}`]).trim();
     });
   });
 
   const submitQuestionAnswers = () => {
-    if (!questionReady || submittingChoiceId) return;
+    if (!questionReady || submittingChoiceId || firstClassQuestionLocked) return;
     const answers = questions.map(question => {
+      const questionChoices = Array.isArray(question.choices) ? question.choices : [];
+      if (question.answer_mode === 'text' || questionChoices.length === 0) {
+        return {
+          question_id: question.question_id,
+          text: safeString(questionTextAnswers[question.question_id]).trim(),
+        };
+      }
       const choiceIds = questionSelections[question.question_id] || [];
-      const otherChoice = question.choices.find((choice, index) => (
+      const otherChoice = questionChoices.find((choice, index) => (
         choice.requires_text && choiceIds.includes(promptChoiceId(choice, index))
       ));
-      const otherChoiceIndex = otherChoice ? question.choices.indexOf(otherChoice) : -1;
+      const otherChoiceIndex = otherChoice ? questionChoices.indexOf(otherChoice) : -1;
       const otherChoiceId = otherChoice ? promptChoiceId(otherChoice, otherChoiceIndex) : null;
       return {
         question_id: question.question_id,
@@ -2631,8 +2674,18 @@ function PermissionOverlay({ prompt, sessionId, agentType, onRespond, onDismissF
 
   React.useEffect(() => {
     const handlePromptKey = event => {
+      const promptShortcutTarget = event.target?.closest?.('.permission-card');
+      const composerTarget = event.target?.matches?.('.input-area textarea');
+      const neutralPromptShortcutTarget = event.target === document.body || event.target === document.documentElement;
+      if (!promptShortcutTarget && !composerTarget && !neutralPromptShortcutTarget) return;
+      if (firstClassQuestionLocked && event.key !== 'Escape') return;
       if (event.key === 'Escape') {
         event.preventDefault();
+        if (structuredQuestion && prompt?.type === 'question_prompt'
+          && prompt?.cancel_supported === true && !submittingChoiceId && !firstClassQuestionLocked) {
+          onRespond(sessionId, prompt.prompt_id, null, { action: 'cancel' });
+          return;
+        }
         const claudeCancelChoice = claudeActionPrompt
           ? choices.find((choice, index) => /^(?:reject|deny|cancel|block|not now|no)\b/i.test(
             promptChoiceLabel(choice, index).replace(/^\d+\s+/, ''),
@@ -2652,7 +2705,6 @@ function PermissionOverlay({ prompt, sessionId, agentType, onRespond, onDismissF
       const alternateInstructionSubmit = event.key === 'Enter'
         && !event.shiftKey
         && event.target?.closest?.('.permission-alternate-input');
-      const composerTarget = event.target?.matches?.('.input-area textarea');
       if (alternateInstructionSubmit) {
         event.preventDefault();
         const instruction = alternateInstruction.trim();
@@ -2695,6 +2747,7 @@ function PermissionOverlay({ prompt, sessionId, agentType, onRespond, onDismissF
     choices,
     claudeActionPrompt,
     defaultChoiceId,
+    firstClassQuestionLocked,
     keyboardDismissed,
     keyboardChoiceId,
     onDismissFocus,
@@ -2703,6 +2756,7 @@ function PermissionOverlay({ prompt, sessionId, agentType, onRespond, onDismissF
     questionReady,
     questionSelections,
     questionOtherText,
+    questionTextAnswers,
     sessionId,
     structuredKeyboardChoices,
     structuredQuestion,
@@ -2726,11 +2780,16 @@ function PermissionOverlay({ prompt, sessionId, agentType, onRespond, onDismissF
           </>
         ) : (
           <>
-            <div className="permission-eyebrow">Permission Required</div>
-            <div className="permission-title">Agent Paused In {sessionId ? sessionSubLabel(sessionId, sessionId) : 'Active Session'}</div>
-            <div className="permission-body">{promptBody(prompt)}</div>
+            <div className="permission-eyebrow">{structuredQuestion ? 'Question' : 'Permission Required'}</div>
+            <div className="permission-title">
+              {structuredQuestion
+                ? safeString(prompt?.title, 'Answer the native question')
+                : `Agent Paused In ${sessionId ? sessionSubLabel(sessionId, sessionId) : 'Active Session'}`}
+            </div>
+            {!structuredQuestion && <div className="permission-body">{promptBody(prompt)}</div>}
             <div className="permission-meta">
-              {timeoutMs > 0 && <span className="permission-timer">Auto-choice in {formatPromptCountdown(msLeft)}</span>}
+              {hasQuestionDeadline && <span className="permission-timer">{questionDeadlineCopy(prompt, msLeft)}</span>}
+              {!hasQuestionDeadline && timeoutMs > 0 && <span className="permission-timer">Auto-choice in {formatPromptCountdown(msLeft)}</span>}
               {defaultChoiceId && <span className="permission-default">Default: {defaultChoiceId}</span>}
             </div>
           </>
@@ -2739,10 +2798,23 @@ function PermissionOverlay({ prompt, sessionId, agentType, onRespond, onDismissF
         <div className={`permission-actions${structuredQuestion ? ' permission-question-list' : ''}`}>
           {structuredQuestion ? questions.map((question, questionIndex) => (
             <fieldset className="permission-question" key={question.question_id || questionIndex}>
-              <legend>{safeString(question.label, `Question ${questionIndex + 1}`)}</legend>
+              <legend>{safeString(question.header || question.label, `Question ${questionIndex + 1}`)}</legend>
               {safeString(question.message).trim() && <div className="permission-question-message">{safeString(question.message)}</div>}
               <div className="permission-question-options">
-                {question.choices.map((choice, index) => {
+                {(question.answer_mode === 'text' || !Array.isArray(question.choices) || question.choices.length === 0) ? (
+                  <input
+                    className="permission-question-text-input"
+                    type={question.secret === true ? 'password' : 'text'}
+                    value={questionTextAnswers[question.question_id] || ''}
+                    maxLength={2000}
+                    disabled={!!submittingChoiceId || firstClassQuestionLocked}
+                    autoComplete="off"
+                    spellCheck={question.secret === true ? 'false' : undefined}
+                    placeholder={question.secret === true ? 'Enter private answer' : 'Enter answer'}
+                    aria-label={`${safeString(question.header || question.label, `Question ${questionIndex + 1}`)} answer`}
+                    onChange={event => setQuestionTextAnswers(prev => ({ ...prev, [question.question_id]: event.target.value }))}
+                  />
+                ) : question.choices.map((choice, index) => {
                   const choiceId = promptChoiceId(choice, index);
                   const selected = (questionSelections[question.question_id] || []).includes(choiceId);
                   const otherKey = `${question.question_id}:${choiceId}`;
@@ -2753,7 +2825,7 @@ function PermissionOverlay({ prompt, sessionId, agentType, onRespond, onDismissF
                         className={`permission-action${selected ? ' selected' : ''}`}
                         role={question.multi_select ? 'checkbox' : 'radio'}
                         aria-checked={selected}
-                        disabled={!!submittingChoiceId}
+                        disabled={!!submittingChoiceId || firstClassQuestionLocked}
                         aria-keyshortcuts={structuredKeyboardChoices.findIndex(option => option.question === question && option.choiceId === choiceId) >= 0
                           ? String(structuredKeyboardChoices.findIndex(option => option.question === question && option.choiceId === choiceId) + 1)
                           : undefined}
@@ -2771,10 +2843,12 @@ function PermissionOverlay({ prompt, sessionId, agentType, onRespond, onDismissF
                       {selected && choice.requires_text && (
                         <input
                           className="permission-other-input"
-                          type="text"
+                          type={question.secret === true ? 'password' : 'text'}
                           value={questionOtherText[otherKey] || ''}
                           maxLength={2000}
-                          disabled={!!submittingChoiceId}
+                          disabled={!!submittingChoiceId || firstClassQuestionLocked}
+                          autoComplete="off"
+                          spellCheck={question.secret === true ? 'false' : undefined}
                           placeholder="Enter another answer"
                           aria-label={`${promptChoiceLabel(choice, index)} answer`}
                           onChange={event => setQuestionOtherText(prev => ({ ...prev, [otherKey]: event.target.value }))}
@@ -2833,17 +2907,31 @@ function PermissionOverlay({ prompt, sessionId, agentType, onRespond, onDismissF
           />
         )}
         {structuredQuestion && (
-          <button
-            type="button"
-            className="permission-question-submit"
-            disabled={!questionReady || !!submittingChoiceId}
-            onClick={submitQuestionAnswers}
-          >
-            {submittingChoiceId ? 'Sending...' : safeString(prompt.submit_label, 'Submit answers')}
-          </button>
+          <div className="permission-question-footer">
+            <button
+              type="button"
+              className="permission-question-submit"
+              disabled={!questionReady || !!submittingChoiceId || firstClassQuestionLocked}
+              onClick={submitQuestionAnswers}
+            >
+              {submittingChoiceId ? 'Sending...' : safeString(prompt.submit_label, 'Submit answers')}
+            </button>
+            {prompt?.type === 'question_prompt' && prompt?.cancel_supported === true && (
+              <button
+                type="button"
+                className="permission-question-cancel"
+                disabled={!!submittingChoiceId || firstClassQuestionLocked}
+                onClick={() => onRespond(sessionId, prompt.prompt_id, null, { action: 'cancel' })}
+              >
+                Cancel
+              </button>
+            )}
+          </div>
         )}
         <div className="permission-keyboard-help">
-          {claudeActionPrompt ? safeString(prompt?.cancel_hint, 'Esc to cancel') : '1–9 select · Enter submit · Esc return to composer'}
+          {claudeActionPrompt
+            ? safeString(prompt?.cancel_hint, 'Esc to cancel')
+            : `1–9 select · Enter submit · Esc ${prompt?.cancel_supported === true ? 'cancel' : 'return to composer'}`}
         </div>
       </div>
     </div>
@@ -5641,6 +5729,7 @@ function UsageDashboard({ usage, refreshReceipt, costDetail, onBack, onRefresh, 
       <div className="usage-dashboard-grid">
         {normalized.entries.map(entry => {
           const creditLabel = formatProviderCredits(entry.credits);
+          const financialRows = providerFinancialRows(entry.financials);
           const creditReset = entry.credits?.resets_at
             ? formatProviderUsageReset(entry.credits.resets_at, nowMs)
             : '';
@@ -5653,7 +5742,7 @@ function UsageDashboard({ usage, refreshReceipt, costDetail, onBack, onRefresh, 
               data-account-fingerprint={entry.accountFingerprint}
             >
               <summary className="usage-dashboard-card-summary">
-                <span className="usage-dashboard-provider-mark" aria-hidden="true">{entry.providerName.slice(0, 2).toUpperCase()}</span>
+                <ProviderMark providerId={entry.providerId} providerName={entry.providerName} />
                 <span className="usage-dashboard-card-title">
                   <strong>{entry.providerName}</strong>
                   <span>{entry.accountLabel}{entry.plan ? ` · ${entry.plan}` : ''}</span>
@@ -5723,8 +5812,27 @@ function UsageDashboard({ usage, refreshReceipt, costDetail, onBack, onRefresh, 
                       );
                     })}
                   </div>
-                ) : (
+                ) : !entry.localRuntime ? (
                   <div className="usage-dashboard-unavailable">{entry.error?.message || 'This provider did not report quota windows.'}</div>
+                ) : null}
+                {entry.localRuntime && (
+                  <div className="usage-dashboard-credit-row" data-testid="ollama-local-runtime">
+                    <span><strong>Local runtime</strong>{entry.localRuntime.loadedModelsCount} loaded / {entry.localRuntime.installedModelsCount} installed<small>{entry.localRuntime.endpointScope.replace(/_/g, ' ')}</small></span>
+                    <span><strong>Request telemetry</strong>{entry.localRuntime.telemetryStatus.replace(/_/g, ' ')}<small>{entry.localRuntime.telemetryReason}</small></span>
+                  </div>
+                )}
+                {entry.localRuntime?.latestRequest && (
+                  <div className="usage-dashboard-credit-row" data-testid="ollama-owned-request-metrics">
+                    <span><strong>Latest owned request</strong>{entry.localRuntime.latestRequest.model}<small>{entry.localRuntime.latestRequest.surface.replace(/_/g, ' ')} - {formatProviderUsageAge(entry.localRuntime.latestRequest.capturedAt, nowMs)}</small></span>
+                    <span><strong>Tokens</strong>{entry.localRuntime.latestRequest.promptTokens} prompt - {entry.localRuntime.latestRequest.responseTokens} output<small>{formatOllamaTokenRate(entry.localRuntime.latestRequest.tokensPerSecond)}</small></span>
+                    <span><strong>Total / load</strong>{formatOllamaDuration(entry.localRuntime.latestRequest.totalDurationNs)} / {formatOllamaDuration(entry.localRuntime.latestRequest.loadDurationNs)}<small>terminal response metrics</small></span>
+                    <span><strong>Prompt / eval</strong>{formatOllamaDuration(entry.localRuntime.latestRequest.promptEvalDurationNs)} / {formatOllamaDuration(entry.localRuntime.latestRequest.evalDurationNs)}<small>{entry.localRuntime.observedRequestCount} owned receipt{entry.localRuntime.observedRequestCount === 1 ? '' : 's'}</small></span>
+                  </div>
+                )}
+                {financialRows.length > 0 && (
+                  <div className="usage-dashboard-credit-row usage-dashboard-financial-row">
+                    {financialRows.map(row => <span key={row.id}><strong>{row.label}</strong>{row.value}</span>)}
+                  </div>
                 )}
                 {(creditLabel || entry.resetCredits) && (
                   <div className="usage-dashboard-credit-row">
@@ -5758,7 +5866,7 @@ function UsageDashboard({ usage, refreshReceipt, costDetail, onBack, onRefresh, 
               ? 'The completed scan found no provider usage.'
               : 'Provider usage is not available yet.'}</strong>
             <span>{normalized.collectionState === 'ready'
-              ? 'Connect a supported Codex, Claude Code, Antigravity, or Cursor session, then refresh.'
+              ? 'Connect a supported Codex, Claude Code, Antigravity, or Cursor session, or start local Ollama, then refresh.'
               : 'Quota totals remain unknown until a provider collection completes.'}</span>
           </div>
         )}
@@ -6044,6 +6152,122 @@ function hostResourceProcessRows(processes, search, filter, sort, expanded) {
   return rows;
 }
 
+function hostResourceStripSparklinePath(frames, metric, width = 44, height = 16) {
+  const values = (Array.isArray(frames) ? frames : [])
+    .map(frame => hostResourceMetricValue(frame, metric))
+    .filter(value => value !== null);
+  if (values.length < 2) return '';
+  return values.map((value, index) => {
+    const x = (index / (values.length - 1)) * width;
+    const y = height - (Math.max(0, Math.min(100, value)) / 100) * height;
+    return `${index ? 'L' : 'M'}${x.toFixed(2)},${y.toFixed(2)}`;
+  }).join(' ');
+}
+
+function GlobalHostResourceStrip({
+  connected, error, history, subscription, onOpen, onRefresh, onSubscribe, onUnsubscribe,
+}) {
+  const desktopQuery = '(min-width: 900px)';
+  const [desktop, setDesktop] = React.useState(() => (
+    typeof window !== 'undefined' && typeof window.matchMedia === 'function'
+      ? window.matchMedia(desktopQuery).matches
+      : false
+  ));
+  const [nowMs, setNowMs] = React.useState(Date.now());
+  React.useEffect(() => {
+    if (typeof window === 'undefined' || typeof window.matchMedia !== 'function') return undefined;
+    const media = window.matchMedia(desktopQuery);
+    const update = () => setDesktop(media.matches);
+    update();
+    if (typeof media.addEventListener === 'function') media.addEventListener('change', update);
+    else media.addListener?.(update);
+    return () => {
+      if (typeof media.removeEventListener === 'function') media.removeEventListener('change', update);
+      else media.removeListener?.(update);
+    };
+  }, []);
+  React.useEffect(() => {
+    if (!desktop) return undefined;
+    onSubscribe(true, 'global-strip');
+    return () => onUnsubscribe('global-strip');
+  }, [desktop, onSubscribe, onUnsubscribe]);
+  React.useEffect(() => {
+    if (!desktop) return undefined;
+    const tick = () => setNowMs(Date.now());
+    const timer = setInterval(tick, 1_000);
+    const onVisibility = () => {
+      if (document.visibilityState !== 'visible') return;
+      tick();
+      onRefresh(false);
+    };
+    document.addEventListener('visibilitychange', onVisibility);
+    return () => {
+      clearInterval(timer);
+      document.removeEventListener('visibilitychange', onVisibility);
+    };
+  }, [desktop, onRefresh]);
+  const projection = React.useMemo(() => projectHostResourceStrip(history, {
+    connected,
+    error: Boolean(error),
+    nowMs,
+    subscriptionStatus: subscription?.status,
+  }), [connected, error, history, nowMs, subscription?.status]);
+  if (!desktop) return null;
+  const metricText = value => (value == null ? '\u2014' : String(Math.round(value))).padStart(3, '\u2007');
+  const levelMark = level => level === 'critical' ? '!!' : level === 'warning' ? '!' : '';
+  const statusText = projection.status === 'stale'
+    ? `stale ${projection.ageSeconds}s`
+    : projection.status;
+  const memoryDetail = projection.memoryUsedBytes !== null && projection.memoryTotalBytes !== null
+    ? `${formatHostResourceBytes(projection.memoryUsedBytes)} of ${formatHostResourceBytes(projection.memoryTotalBytes)}`
+    : 'memory totals unavailable';
+  const title = projection.point
+    ? `Host CPU ${projection.cpuPercent?.toFixed(1) ?? 'unknown'}%; memory ${projection.memoryPercent?.toFixed(1) ?? 'unknown'}% (${memoryDetail}); ${statusText}; sample ${projection.sampleSequence}`
+    : `Host resources ${statusText}`;
+  const ariaLabel = projection.point
+    ? `Open Host resources. CPU ${projection.cpuPercent?.toFixed(1) ?? 'unknown'} percent, ${projection.cpuLevel}. RAM ${projection.memoryPercent?.toFixed(1) ?? 'unknown'} percent, ${projection.memoryLevel}. ${statusText}. Sample ${projection.sampleSequence}.`
+    : `Open Host resources. CPU and RAM waiting. ${statusText}.`;
+  return (
+    <div className="global-desktop-status-rail" data-testid="global-desktop-status-rail">
+      <button
+        type="button"
+        className={`global-host-resource-strip ${projection.attention}`}
+        data-testid="global-host-resource-strip"
+        data-status={projection.status}
+        data-cpu-level={projection.cpuLevel}
+        data-memory-level={projection.memoryLevel}
+        data-sample-sequence={projection.sampleSequence || ''}
+        data-sample-captured-at={projection.capturedAt || ''}
+        data-cpu-percent={projection.cpuPercent ?? ''}
+        data-memory-percent={projection.memoryPercent ?? ''}
+        data-history-count={projection.frames.length}
+        aria-label={ariaLabel}
+        title={title}
+        onClick={onOpen}
+      >
+        <span className={`global-host-resource-metric ${projection.cpuLevel}`}>
+          <span className="label">CPU{' '}</span>
+          <span className="value">{metricText(projection.cpuPercent)}</span>
+          <span className="unit">%</span>
+          <span className="attention-mark">{levelMark(projection.cpuLevel)}</span>
+        </span>
+        <span className="global-host-resource-divider" aria-hidden="true">{'\u00b7'}</span>
+        <span className={`global-host-resource-metric ${projection.memoryLevel}`}>
+          <span className="label">RAM{' '}</span>
+          <span className="value">{metricText(projection.memoryPercent)}</span>
+          <span className="unit">%</span>
+          <span className="attention-mark">{levelMark(projection.memoryLevel)}</span>
+        </span>
+        <svg className="global-host-resource-sparkline" viewBox="0 0 44 16" aria-hidden="true">
+          <path className="cpu" d={hostResourceStripSparklinePath(projection.frames, 'cpu_total_percent')} />
+          <path className="memory" d={hostResourceStripSparklinePath(projection.frames, 'memory_used_percent')} />
+        </svg>
+        <span className="global-host-resource-state">{statusText}</span>
+      </button>
+    </div>
+  );
+}
+
 function HostResourceDashboard({
   snapshot, error, history, details, subscription,
   onBack, onRefresh, onSubscribe, onUnsubscribe,
@@ -6061,8 +6285,8 @@ function HostResourceDashboard({
   const [expandedProcesses, setExpandedProcesses] = React.useState({});
   const [selectedProcessKey, setSelectedProcessKey] = React.useState('');
   React.useEffect(() => {
-    onSubscribe(aggregateOnly);
-    return () => onUnsubscribe();
+    onSubscribe(aggregateOnly, 'dashboard');
+    return () => onUnsubscribe('dashboard');
   }, [aggregateOnly, onSubscribe, onUnsubscribe]);
   React.useEffect(() => {
     const timer = setInterval(() => setNowMs(Date.now()), 1_000);
@@ -6280,12 +6504,16 @@ function FleetView({ sessions, activities, thinking, permissionPrompts, errorPro
     });
     const needsAttention = state === 'needs_attention';
     const working = fleetStateIsWorking(state);
+    const goalSubstate = fleetGoalSubstateLabel(capabilitySafeActivity, {
+      connected,
+      health: health[id],
+    });
     const agent = sessionAgent(session, config);
     const workContext = projectFleetWorkContext({
       agentType,
       capabilities: config.capabilities,
       activity: capabilitySafeActivity,
-      latestUserRequest: latestUserRequestFromMessages(messages[id] || []),
+      latestUserRequest: session?.last_user_request || latestUserRequestFromMessages(messages[id] || []),
     });
     const goal = workContext.kind === 'goal' ? capabilitySafeActivity?.goal || null : null;
     const activityKind = safeString(capabilitySafeActivity?.kind).replace(/_/g, ' ');
@@ -6293,7 +6521,7 @@ function FleetView({ sessions, activities, thinking, permissionPrompts, errorPro
       id, session, agent, activity: capabilitySafeActivity, attention: needsAttention, working, state, goal, config,
       title: sidebarChatTitle(session, id, config, messages[id] || []),
       status: prompt ? (safeString(prompt.title).trim() || 'Action required')
-        : (safeString(activity?.label).trim()
+        : (goalSubstate || safeString(activity?.label).trim()
           || (state === 'idle' ? (goal ? 'Goal paused' : 'Idle') : (activityKind || (goal ? 'Goal active' : 'Working')))),
       workContext,
       progress: fleetWorkContextProgress(workContext),
@@ -6667,6 +6895,7 @@ function App() {
   const [drafts, setDrafts]             = useState({});
   const [draftFiles, setDraftFiles]     = useState({});
   const [sidebarOpen, setSidebarOpen]   = useState(false);
+  const [sidebarSearchQuery, setSidebarSearchQuery] = useState('');
   const [toast, setToast]               = useState('');
   const [attentionToast, setAttentionToast] = useState(null);
   const [sessionAttention, setSessionAttention] = useState({});
@@ -6921,17 +7150,27 @@ function App() {
     () => new Set(workingSessions.map(sessionIdOf)),
     [workingSessions],
   );
-  const { pinned: allPinnedSessions, unpinned: allUnpinnedSessions } = React.useMemo(
+  const { pinned: allPinnedSessions } = React.useMemo(
     () => partitionPinnedSessions(orderedSessions, sessionPreferences),
     [orderedSessions, sessionPreferences],
   );
-  const pinnedSessions = React.useMemo(
-    () => allPinnedSessions.filter(session => !workingSessionIds.has(sessionIdOf(session))),
-    [allPinnedSessions, workingSessionIds],
+  const pinnedSessionIds = React.useMemo(
+    () => new Set(allPinnedSessions.map(sessionIdOf)),
+    [allPinnedSessions],
   );
+  const recentChatOwnership = React.useMemo(
+    () => projectRecentChatOwnership(orderedSessions, { workingSessionIds, pinnedSessionIds }),
+    [orderedSessions, workingSessionIds, pinnedSessionIds],
+  );
+  const recentSessions = recentChatOwnership.recent;
+  const recentSessionIds = React.useMemo(
+    () => new Set(recentSessions.map(sessionIdOf)),
+    [recentSessions],
+  );
+  const pinnedSessions = recentChatOwnership.pinned;
   const rawSessionGroups = React.useMemo(
-    () => groupSessionsByDirectory(allUnpinnedSessions, agentConfigs, sessionGroupAliases),
-    [allUnpinnedSessions, agentConfigs, sessionGroupAliases],
+    () => groupSessionsByDirectory(recentChatOwnership.remaining, agentConfigs, sessionGroupAliases),
+    [recentChatOwnership.remaining, agentConfigs, sessionGroupAliases],
   );
   const workspaceLabelBySessionId = React.useMemo(() => Object.fromEntries(
     groupSessionsByDirectory(orderedSessions, agentConfigs, sessionGroupAliases).flatMap(group => (
@@ -6949,10 +7188,14 @@ function App() {
     sortNow: sortSidebarNow,
     revision: sidebarOrderRevision,
   } = useStableSidebarGroups(rawSessionGroups, sidebarRankOptions, sidebarStructureLocked);
-  const sessionGroups = React.useMemo(() => stableSessionGroups.map(group => ({
-    ...group,
-    sessions: group.sessions.filter(session => !workingSessionIds.has(sessionIdOf(session))),
-  })).filter(group => group.sessions.length > 0), [stableSessionGroups, workingSessionIds]);
+  const sessionGroups = React.useMemo(
+    () => stableSessionGroups.filter(group => group.sessions.length > 0),
+    [stableSessionGroups],
+  );
+  const workspaceOwnedSessionIds = React.useMemo(
+    () => new Set(sessionGroups.flatMap(group => group.sessions.map(sessionIdOf))),
+    [sessionGroups],
+  );
   const applySidebarSortNow = React.useCallback(() => {
     const list = sidebarListRef.current;
     const selectedCard = activeSession
@@ -6964,10 +7207,138 @@ function App() {
     } : null;
     sortSidebarNow();
   }, [activeSession, sortSidebarNow]);
-  const sidebarDisplaySessions = React.useMemo(
-    () => [...workingSessions, ...pinnedSessions, ...sessionGroups.flatMap(group => group.sessions)],
-    [workingSessions, pinnedSessions, sessionGroups],
+  const normalizedSidebarSearchQuery = sidebarSearchQuery.trim().toLowerCase();
+  const sidebarSearchTextBySessionId = React.useMemo(() => Object.fromEntries(
+    orderedSessions.map(session => {
+      const id = sessionIdOf(session);
+      const agent = sessionAgent(session, agentConfigs[id]);
+      return [id, [
+        sidebarChatTitle(session, id, agentConfigs[id], messages[id] || []),
+        sessionSubLabel(session, id, agentConfigs[id]),
+        workspaceLabelBySessionId[id] || 'Unscoped',
+        sessionPreferences[id]?.pinned ? 'Pinned' : '',
+        agent.name,
+        session?.agent_type,
+        session?.workspace_name,
+        session?.workspace_path,
+        id,
+      ].filter(Boolean).join(' ').toLowerCase()];
+    }),
+  ), [orderedSessions, agentConfigs, messages, workspaceLabelBySessionId, sessionPreferences]);
+  const filterSidebarSessions = React.useCallback(sessionList => (
+    normalizedSidebarSearchQuery
+      ? sessionList.filter(session => (
+        sidebarSearchTextBySessionId[sessionIdOf(session)] || ''
+      ).includes(normalizedSidebarSearchQuery))
+      : sessionList
+  ), [normalizedSidebarSearchQuery, sidebarSearchTextBySessionId]);
+  const displayedWorkingSessions = React.useMemo(
+    () => filterSidebarSessions(workingSessions),
+    [filterSidebarSessions, workingSessions],
   );
+  const displayedRecentSessions = React.useMemo(
+    () => filterSidebarSessions(recentSessions),
+    [filterSidebarSessions, recentSessions],
+  );
+  const displayedPinnedSessions = React.useMemo(
+    () => filterSidebarSessions(pinnedSessions),
+    [filterSidebarSessions, pinnedSessions],
+  );
+  const displayedSessionGroups = React.useMemo(() => sessionGroups.map(group => ({
+    ...group,
+    sessions: filterSidebarSessions(group.sessions),
+  })).filter(group => group.sessions.length > 0), [filterSidebarSessions, sessionGroups]);
+  const sidebarDisplaySessions = React.useMemo(
+    () => [...workingSessions, ...recentSessions, ...pinnedSessions, ...sessionGroups.flatMap(group => group.sessions)],
+    [workingSessions, recentSessions, pinnedSessions, sessionGroups],
+  );
+  const sidebarPortalSessions = React.useMemo(() => {
+    const seen = new Set();
+    return orderedSessions.filter(session => {
+      const id = sessionIdOf(session);
+      if (!id || seen.has(id)) return false;
+      seen.add(id);
+      return true;
+    });
+  }, [orderedSessions]);
+  const sidebarPortalSessionIds = React.useMemo(
+    () => new Set(sidebarPortalSessions.map(sessionIdOf)),
+    [sidebarPortalSessions],
+  );
+  const sidebarPlacementKey = React.useMemo(() => [
+    `working:${workingSessions.map(sessionIdOf).sort().join(',')}`,
+    `recent:${recentSessions.map(sessionIdOf).sort().join(',')}`,
+    `pinned:${pinnedSessions.map(sessionIdOf).sort().join(',')}`,
+    ...sessionGroups
+      .map(group => `${group.key}:${group.sessions.map(sessionIdOf).sort().join(',')}`)
+      .sort(),
+  ].join('|'), [workingSessions, recentSessions, pinnedSessions, sessionGroups]);
+  const sidebarCardHostsRef = useRef(new Map());
+  const sidebarCardPoolRef = useRef(null);
+  const sidebarPendingFocusRef = useRef(null);
+  useLayoutEffect(() => {
+    const list = sidebarListRef.current;
+    if (!list) return;
+    const focusedElement = sidebarPendingFocusRef.current || document.activeElement;
+    const focusedHost = focusedElement instanceof Element
+      ? focusedElement.closest('[data-sidebar-card-host]')
+      : null;
+    const retainedIds = new Set();
+    for (const slot of list.querySelectorAll('[data-sidebar-card-slot]')) {
+      const id = slot.getAttribute('data-sidebar-card-slot') || '';
+      const host = sidebarCardHostsRef.current.get(id);
+      if (!id || !host) continue;
+      retainedIds.add(id);
+      if (host.parentElement !== slot) {
+        const restoreExactFocus = focusedHost === host && focusedElement?.isConnected;
+        slot.appendChild(host);
+        if (restoreExactFocus && document.activeElement !== focusedElement && focusedElement.isConnected) {
+          focusedElement.focus({ preventScroll: true });
+        }
+      }
+    }
+    sidebarPendingFocusRef.current = null;
+    for (const [id, host] of sidebarCardHostsRef.current) {
+      if (retainedIds.has(id) || sidebarPortalSessionIds.has(id)) continue;
+      host.remove();
+      sidebarCardHostsRef.current.delete(id);
+    }
+    return () => {
+      const activeElement = document.activeElement;
+      const activeHost = activeElement instanceof Element
+        ? activeElement.closest('[data-sidebar-card-host]')
+        : null;
+      sidebarPendingFocusRef.current = activeHost ? activeElement : null;
+      let pool = sidebarCardPoolRef.current;
+      if (!pool) {
+        pool = document.createElement('div');
+        pool.setAttribute('data-sidebar-card-pool', '');
+        Object.assign(pool.style, {
+          position: 'fixed',
+          left: '-10000px',
+          top: '-10000px',
+          width: '1px',
+          height: '1px',
+          overflow: 'hidden',
+          pointerEvents: 'none',
+        });
+        document.body.appendChild(pool);
+        sidebarCardPoolRef.current = pool;
+      }
+      for (const host of sidebarCardHostsRef.current.values()) pool.appendChild(host);
+      if (sidebarPendingFocusRef.current?.isConnected
+          && document.activeElement !== sidebarPendingFocusRef.current) {
+        sidebarPendingFocusRef.current.focus({ preventScroll: true });
+      }
+    };
+  }, [sidebarPlacementKey]);
+  useEffect(() => () => {
+    for (const host of sidebarCardHostsRef.current.values()) host.remove();
+    sidebarCardHostsRef.current.clear();
+    sidebarCardPoolRef.current?.remove();
+    sidebarCardPoolRef.current = null;
+    sidebarPendingFocusRef.current = null;
+  }, []);
   const summarizeSidebarSessions = React.useCallback(sessionList => sessionList.reduce((result, session) => {
     const id = sessionIdOf(session);
     result.unread += testSessionIds.has(id) ? 0 : unread[id] || 0;
@@ -6978,12 +7349,16 @@ function App() {
     testSessionIds, unread, permissionPrompts, errorPrompts, sidebarStateBySessionId,
   ]);
   const workingSessionSummary = React.useMemo(
-    () => summarizeSidebarSessions(workingSessions),
-    [summarizeSidebarSessions, workingSessions],
+    () => summarizeSidebarSessions(displayedWorkingSessions),
+    [summarizeSidebarSessions, displayedWorkingSessions],
+  );
+  const recentSessionSummary = React.useMemo(
+    () => summarizeSidebarSessions(displayedRecentSessions),
+    [summarizeSidebarSessions, displayedRecentSessions],
   );
   const pinnedSessionSummary = React.useMemo(
-    () => summarizeSidebarSessions(pinnedSessions),
-    [summarizeSidebarSessions, pinnedSessions],
+    () => summarizeSidebarSessions(displayedPinnedSessions),
+    [summarizeSidebarSessions, displayedPinnedSessions],
   );
   const quickSwitcherItems = React.useMemo(() => sidebarDisplaySessions.map(session => {
       const id = sessionIdOf(session);
@@ -7227,6 +7602,7 @@ function App() {
   const pinnedToNewestUntilRef = useRef(0);
   const requestOlderHistoryRef = useRef(null);
   const nonWindowedPrependAnchorRef = useRef(null);
+  const blockingPromptScrollKeyRef = useRef('');
   const selectedSessionRef = useRef(activeSession);
   const scrollSnapshotRef = useRef({
     sessionId: null,
@@ -7633,7 +8009,9 @@ function App() {
         playAttentionSound('prompt');
       }
       if (sessionId === activeSession) return;
-      const title = prompt?.kind === 'question' ? 'Question needs an answer' : 'Permission needs attention';
+      const title = prompt?.type === 'question_prompt' || prompt?.kind === 'question'
+        ? 'Question needs an answer'
+        : 'Permission needs attention';
       setSessionAttention(existing => ({
         ...existing,
         [sessionId]: { kind: 'prompt', promptId },
@@ -7643,6 +8021,13 @@ function App() {
     previousPermissionPromptsRef.current = current;
     promptSoundReadyRef.current = true;
   }, [permissionPrompts, activeSession, attentionFeedbackPreferences.completion_sound]);
+
+  useEffect(() => {
+    if (!activeSession || attentionToast?.sessionId !== activeSession) return;
+    if (attentionToastTimerRef.current) clearTimeout(attentionToastTimerRef.current);
+    attentionToastTimerRef.current = null;
+    setAttentionToast(null);
+  }, [activeSession, attentionToast?.sessionId]);
 
   useEffect(() => {
     if (!notificationPreferencesLoaded || !sessionPreferencesLoaded) return undefined;
@@ -8185,10 +8570,31 @@ async function uploadBinaryDraft(sessionId, base64, mimeType, filename) {
   const activeInlineErrorPrompt = activeErrorPrompt && !isBlockingErrorPrompt(activeErrorPrompt) ? activeErrorPrompt : null;
   const activeBlockingPrompt = activePrompt || activeBlockingErrorPrompt;
   const activeBlockingPromptLabel = activePrompt
-    ? 'Permission required'
+    ? (activePrompt.type === 'question_prompt' ? 'Question required' : 'Permission required')
     : activeBlockingErrorPrompt
       ? safeString(activeBlockingErrorPrompt.title, 'Action required')
       : null;
+  useLayoutEffect(() => {
+    const list = messagesListRef.current;
+    if (!list) return;
+    const promptKey = activePrompt
+      ? `${activeSession || ''}\u0000${activePrompt.prompt_id || activePrompt.request_id || activePrompt.id || 'prompt'}`
+      : '';
+    const previousPromptKey = blockingPromptScrollKeyRef.current;
+    blockingPromptScrollKeyRef.current = promptKey;
+    if (promptKey) {
+      scrollPinGenerationRef.current += 1;
+      pinnedToNewestUntilRef.current = 0;
+      stickyToNewestRef.current = false;
+      programmaticScrollUntilRef.current = Date.now() + 800;
+      setScrollTopInstant(list, 0);
+      isAtBottom.current = list.scrollHeight - list.clientHeight < 80;
+      setShowJumpButton(false);
+      setNewMessagesBelow(0);
+    } else if (previousPromptKey) {
+      stickTranscriptToNewest(scrollIdentityKeysForMessages(activeMessagesForScroll), 3);
+    }
+  }, [activeSession, activePrompt?.prompt_id, activeLiveScrollVersion, activeMessagesForScroll]);
   const canSend         = !!(currentInput.trim() || attachedFiles.length > 0) && !!activeSession && !uploading && !activeBlockingPrompt;
   const relayHealthState = connected ? (connectionHealth?.state || 'connecting') : 'offline';
   const relayRttText = connectionHealth?.rttMs != null ? ` · ${connectionHealth.rttMs} ms` : '';
@@ -8863,22 +9269,32 @@ async function uploadBinaryDraft(sessionId, base64, mimeType, filename) {
 
   function renderSidebarSessionCard(session, pinned = false, workspaceLabel = '') {
     const id = sessionIdOf(session);
-    return (
+    const recentMessage = recentSessionIds.has(id) ? normalizeLatestVisibleMessage(session) : null;
+    let host = sidebarCardHostsRef.current.get(id);
+    if (!host) {
+      host = document.createElement('div');
+      host.className = 'sidebar-card-host';
+      host.setAttribute('data-sidebar-card-host', id);
+      sidebarCardHostsRef.current.set(id, host);
+    }
+    return ReactDOM.createPortal((
       <MemoSessionCard
-        key={id}
         session={session}
         health={health[id]}
         unread={testSessionIds.has(id) ? 0 : unread[id] || 0}
-        isThinking={!!thinking[id]}
+        isThinking={!!thinking[id] || !!fleetGoalSubstateLabel(activities[id], { health: health[id] })}
         isActive={id === activeSession}
         agentConfig={agentConfigs[id] || null}
         activity={activities[id] || null}
         sessionMessages={messages[id] || []}
         hasBlockingPrompt={!!permissionPrompts[id] || !!isBlockingErrorPrompt(errorPrompts[id])}
-        blockingPromptLabel={permissionPrompts[id] ? 'Permission required' : (errorPrompts[id]?.title || 'Action required')}
+        blockingPromptLabel={permissionPrompts[id]
+          ? (permissionPrompts[id].type === 'question_prompt' ? 'Question required' : 'Permission required')
+          : (errorPrompts[id]?.title || 'Action required')}
         muted={!!sessionPreferences[id]?.muted}
         pinned={pinned}
         workspaceLabel={workspaceLabel}
+        recentMessageAt={recentMessage?.at || null}
         menuOpen={openSidebarMenuId === id}
         onMenuToggle={open => setOpenSidebarMenuId(current => open ? id : (current === id ? '' : current))}
         onPinChange={nextPinned => saveSessionPreference(id, { pinned: nextPinned }).catch(error => {
@@ -8902,6 +9318,19 @@ async function uploadBinaryDraft(sessionId, base64, mimeType, filename) {
         showAutomationsActive={showAutomations}
         onSkills={(session?.agent_type === 'codex-desktop') ? () => { if (!showSkills) captureChatRouteScroll(); setShowSkills(open => !open); setShowAutomations(false); setShowFleetView(false); setShowUsageDashboard(false); setShowHostResourceDashboard(false); setSidebarOpen(false); if (!skillLists[id]) requestSkillList(id); } : undefined}
         showSkillsActive={showSkills}
+      />
+    ), host, id);
+  }
+
+  function renderSidebarSessionSlot(session, visible = true) {
+    const id = sessionIdOf(session);
+    return (
+      <div
+        key={id}
+        className={`sidebar-card-slot${visible ? '' : ' sidebar-card-slot-filtered'}`}
+        data-sidebar-card-slot={id}
+        aria-hidden={visible ? undefined : 'true'}
+        inert={visible ? undefined : ''}
       />
     );
   }
@@ -9072,6 +9501,25 @@ async function uploadBinaryDraft(sessionId, base64, mimeType, filename) {
             }}
           >+</button>
         </div>
+        <div className="sidebar-session-search">
+          <input
+            type="search"
+            value={sidebarSearchQuery}
+            onChange={event => setSidebarSearchQuery(event.target.value)}
+            placeholder="Filter sessions"
+            aria-label="Filter sidebar sessions"
+            autoComplete="off"
+            spellCheck="false"
+          />
+          {sidebarSearchQuery && (
+            <button
+              type="button"
+              onClick={() => setSidebarSearchQuery('')}
+              aria-label="Clear sidebar filter"
+              title="Clear filter"
+            >x</button>
+          )}
+        </div>
         <div
           className={`sidebar-order-control${sidebarOrderChanged ? ' changed' : ''}`}
           aria-hidden={!sidebarOrderChanged}
@@ -9128,8 +9576,15 @@ async function uploadBinaryDraft(sessionId, base64, mimeType, filename) {
           {orderedSessions.length === 0 && !showNewSession && (
             <div className="session-empty">No agents connected</div>
           )}
+          {orderedSessions.length > 0 && normalizedSidebarSearchQuery
+            && displayedWorkingSessions.length === 0
+            && displayedRecentSessions.length === 0
+            && displayedPinnedSessions.length === 0
+            && displayedSessionGroups.length === 0 && (
+              <div className="session-empty">No matching sessions</div>
+          )}
           {workingSessions.length > 0 && (
-            <section className="session-group working-session-group" aria-label="Working now">
+            <section className={`session-group working-session-group${normalizedSidebarSearchQuery && displayedWorkingSessions.length === 0 ? ' sidebar-group-filtered' : ''}`} aria-label="Working now">
               <div className="session-group-header">
                 <span className="working-session-group-icon" aria-hidden="true">W</span>
                 <span className="session-group-name pinned-session-group-name">Working now</span>
@@ -9139,25 +9594,58 @@ async function uploadBinaryDraft(sessionId, base64, mimeType, filename) {
                   {workingSessionSummary.unread > 0 && (
                     <span className="session-group-unread" title={`${workingSessionSummary.unread} unread`}>{workingSessionSummary.unread > 99 ? '99+' : workingSessionSummary.unread}</span>
                   )}
-                  <span className="session-group-count">{workingSessions.length}</span>
+                  <span className="session-group-count">{displayedWorkingSessions.length}</span>
                 </span>
               </div>
               <div className="session-group-items">
                 <div className="session-group-items-inner">
-                  {workingSessions.map(session => {
-                    const id = sessionIdOf(session);
-                    return renderSidebarSessionCard(
-                      session,
-                      !!sessionPreferences[id]?.pinned,
-                      workspaceLabelBySessionId[id] || 'Unscoped',
-                    );
-                  })}
+                  {workingSessions.map(session => renderSidebarSessionSlot(
+                    session,
+                    !normalizedSidebarSearchQuery || displayedWorkingSessions.includes(session),
+                  ))}
+                </div>
+              </div>
+            </section>
+          )}
+          {recentSessions.length > 0 && (
+            <section
+              className={`session-group recent-session-group${collapsedSessionGroups.__recent__ && !normalizedSidebarSearchQuery ? ' collapsed' : ''}${normalizedSidebarSearchQuery && displayedRecentSessions.length === 0 ? ' sidebar-group-filtered' : ''}`}
+              aria-label="Recent chats"
+            >
+              <div className="session-group-header">
+                <button
+                  type="button"
+                  className="session-group-toggle"
+                  title={`${collapsedSessionGroups.__recent__ ? 'Expand' : 'Collapse'} Recent chats`}
+                  aria-label={`${collapsedSessionGroups.__recent__ ? 'Expand' : 'Collapse'} Recent chats`}
+                  aria-expanded={!collapsedSessionGroups.__recent__ || !!normalizedSidebarSearchQuery}
+                  onClick={() => toggleSessionGroup('__recent__')}
+                >
+                  <span className="session-group-caret" aria-hidden="true">{collapsedSessionGroups.__recent__ && !normalizedSidebarSearchQuery ? '>' : 'v'}</span>
+                </button>
+                <span className="recent-session-group-icon" aria-hidden="true">R</span>
+                <span className="session-group-name pinned-session-group-name">Recent chats</span>
+                <span className="session-group-status-slot">
+                  {recentSessionSummary.hasPrompt && <span className="session-group-alert" title="Action required">!</span>}
+                  {recentSessionSummary.working && <span className="session-group-working" title="Session working" />}
+                  {recentSessionSummary.unread > 0 && (
+                    <span className="session-group-unread" title={`${recentSessionSummary.unread} unread`}>{recentSessionSummary.unread > 99 ? '99+' : recentSessionSummary.unread}</span>
+                  )}
+                  <span className="session-group-count">{displayedRecentSessions.length}</span>
+                </span>
+              </div>
+              <div className="session-group-items">
+                <div className="session-group-items-inner">
+                  {recentSessions.map(session => renderSidebarSessionSlot(
+                    session,
+                    !normalizedSidebarSearchQuery || displayedRecentSessions.includes(session),
+                  ))}
                 </div>
               </div>
             </section>
           )}
           {pinnedSessions.length > 0 && (
-            <section className="session-group pinned-session-group" aria-label="Pinned chats">
+            <section className={`session-group pinned-session-group${normalizedSidebarSearchQuery && displayedPinnedSessions.length === 0 ? ' sidebar-group-filtered' : ''}`} aria-label="Pinned chats">
               <div className="session-group-header">
                 <span className="session-group-pin-icon" aria-hidden="true">📌</span>
                 <span className="session-group-name pinned-session-group-name">Pinned chats</span>
@@ -9167,21 +9655,26 @@ async function uploadBinaryDraft(sessionId, base64, mimeType, filename) {
                   {pinnedSessionSummary.unread > 0 && (
                     <span className="session-group-unread" title={`${pinnedSessionSummary.unread} unread`}>{pinnedSessionSummary.unread > 99 ? '99+' : pinnedSessionSummary.unread}</span>
                   )}
-                  <span className="session-group-count">{pinnedSessions.length}</span>
+                  <span className="session-group-count">{displayedPinnedSessions.length}</span>
                 </span>
               </div>
               <div className="session-group-items">
                 <div className="session-group-items-inner">
-                  {pinnedSessions.map(session => renderSidebarSessionCard(session, true))}
+                  {pinnedSessions.map(session => renderSidebarSessionSlot(
+                    session,
+                    !normalizedSidebarSearchQuery || displayedPinnedSessions.includes(session),
+                  ))}
                 </div>
               </div>
             </section>
           )}
           {sessionGroups.map(group => {
-            const collapsed = !!collapsedSessionGroups[group.key];
-            const summary = summarizeSidebarSessions(group.sessions);
+            const collapsed = !!collapsedSessionGroups[group.key] && !normalizedSidebarSearchQuery;
+            const displayedGroup = displayedSessionGroups.find(candidate => candidate.key === group.key);
+            const displayedGroupSessions = displayedGroup?.sessions || [];
+            const summary = summarizeSidebarSessions(displayedGroupSessions);
             return (
-            <div className={`session-group${collapsed ? ' collapsed' : ''}`} key={group.key}>
+            <div className={`session-group${collapsed ? ' collapsed' : ''}${normalizedSidebarSearchQuery && displayedGroupSessions.length === 0 ? ' sidebar-group-filtered' : ''}`} key={group.key}>
               <div className="session-group-header">
                 <button
                   type="button"
@@ -9208,15 +9701,26 @@ async function uploadBinaryDraft(sessionId, base64, mimeType, filename) {
                   {summary.unread > 0 && (
                     <span className="session-group-unread" title={`${summary.unread} unread`}>{summary.unread > 99 ? '99+' : summary.unread}</span>
                   )}
-                  <span className="session-group-count">{group.sessions.length}</span>
+                  <span className="session-group-count">{normalizedSidebarSearchQuery ? displayedGroupSessions.length : group.sessions.length}</span>
                 </span>
               </div>
               <div className="session-group-items" aria-hidden={collapsed}>
                 <div className="session-group-items-inner">
-              {group.sessions.map(session => renderSidebarSessionCard(session, false))}
+              {group.sessions.map(session => renderSidebarSessionSlot(
+                session,
+                !normalizedSidebarSearchQuery || displayedGroupSessions.includes(session),
+              ))}
                 </div>
               </div>
             </div>
+            );
+          })}
+          {sidebarPortalSessions.map(session => {
+            const id = sessionIdOf(session);
+            return renderSidebarSessionCard(
+              session,
+              !!sessionPreferences[id]?.pinned,
+              workspaceOwnedSessionIds.has(id) ? '' : (workspaceLabelBySessionId[id] || 'Unscoped'),
             );
           })}
         </div>
@@ -9316,6 +9820,28 @@ async function uploadBinaryDraft(sessionId, base64, mimeType, filename) {
 
       {/* Main panel */}
       <div className={`main${showAutomations || showSkills || showUsageDashboard || showHostResourceDashboard || showFleetView || showTranscriptSearch ? ' automations-active' : ''}`}>
+        <GlobalHostResourceStrip
+          connected={connected}
+          error={hostResourceError}
+          history={hostResourceHistory}
+          subscription={hostResourceSubscription}
+          onRefresh={requestHostResourceRefresh}
+          onSubscribe={subscribeHostResources}
+          onUnsubscribe={unsubscribeHostResources}
+          onOpen={() => {
+            if (!showHostResourceDashboard) captureChatRouteScroll();
+            setShowHostResourceDashboard(true);
+            setShowUsageDashboard(false);
+            setShowFleetView(false);
+            setShowAutomations(false);
+            setShowSkills(false);
+            setShowNewSession(false);
+            setShowNotificationSettings(false);
+            setShowSessionManagement(false);
+            setShowTranscriptSearch(false);
+            setSidebarOpen(false);
+          }}
+        />
         {showAutomations && (
           <AutomationsView
             sessions={sessions}
@@ -9747,7 +10273,7 @@ async function uploadBinaryDraft(sessionId, base64, mimeType, filename) {
             )}
           </div>
         )}
-        {showJumpButton && (
+        {showJumpButton && !activeBlockingPrompt && (
           <button
             className="jump-to-newest"
             onClick={pinTranscriptToNewest}
@@ -10114,7 +10640,7 @@ async function uploadBinaryDraft(sessionId, base64, mimeType, filename) {
                 onKeyDown={onKeyDown}
                 onPaste={handlePaste}
                 placeholder={activeBlockingPrompt
-                  ? `Resolve the ${activePrompt ? 'permission prompt' : 'error prompt'} above to continue`
+                  ? `Resolve the ${activePrompt?.type === 'question_prompt' ? 'question' : (activePrompt ? 'permission prompt' : 'error prompt')} above to continue`
                   : activeSession
                     ? (window.innerWidth < 600 ? 'Enter message…' : 'Message… (/ for commands)')
                     : 'Select a session'}

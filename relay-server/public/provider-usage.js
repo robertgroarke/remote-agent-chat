@@ -17,6 +17,94 @@ function finiteNumber(value) {
   return Number.isFinite(numeric) ? numeric : null;
 }
 
+function normalizedMoney(value) {
+  if (!value || typeof value !== 'object') return null;
+  if (value.amount == null || value.amount === '') return null;
+  const amount = finiteNumber(value.amount);
+  if (amount == null) return null;
+  return {
+    amount,
+    currency: String(value.currency || 'USD'),
+    sourceField: String(value.source_field || ''),
+    semantics: String(value.semantics || ''),
+    directlyReported: value.directly_reported === true,
+  };
+}
+
+function normalizeFinancials(value) {
+  if (!value || typeof value !== 'object') return null;
+  const pool = value.pool_classification && typeof value.pool_classification === 'object'
+    ? {
+      status: String(value.pool_classification.classification_status || ''),
+      firstParty: normalizedMoney(value.pool_classification.first_party),
+      thirdParty: normalizedMoney(value.pool_classification.third_party),
+      unclassified: normalizedMoney(value.pool_classification.unclassified),
+      warning: String(value.pool_classification.warning || ''),
+    }
+    : null;
+  return {
+    semanticsVersion: Number(value.semantics_version) || 0,
+    source: String(value.source || ''),
+    observedAt: String(value.observed_at || ''),
+    accountScope: String(value.account_scope || ''),
+    extraUsageEnabled: value.extra_usage_enabled === true,
+    prepaidBalance: normalizedMoney(value.prepaid_balance),
+    extraUsageSpend: normalizedMoney(value.extra_usage_spend),
+    extraUsageCap: normalizedMoney(value.extra_usage_cap),
+    reportedSpend: normalizedMoney(value.reported_spend),
+    includedSpend: normalizedMoney(value.included_spend),
+    bonusSpend: normalizedMoney(value.bonus_spend),
+    planLimit: normalizedMoney(value.plan_limit),
+    allowanceRemaining: normalizedMoney(value.allowance_remaining),
+    reconciliationDelta: normalizedMoney(value.reconciliation_delta),
+    poolClassification: pool,
+    resetsAt: String(value.resets_at || ''),
+    disclaimer: String(value.disclaimer || ''),
+  };
+}
+
+function normalizeLocalRuntime(value) {
+  if (!value || typeof value !== 'object') return null;
+  const requestReceipts = (Array.isArray(value.request_receipts) ? value.request_receipts : []).map(receipt => ({
+    receiptId: String(receipt?.receipt_id || ''),
+    model: String(receipt?.model || ''),
+    surface: String(receipt?.surface || ''),
+    capturedAt: String(receipt?.captured_at || ''),
+    promptTokens: finiteNumber(receipt?.prompt_tokens),
+    responseTokens: finiteNumber(receipt?.response_tokens),
+    tokensPerSecond: finiteNumber(receipt?.tokens_per_second),
+    totalDurationNs: finiteNumber(receipt?.total_duration_ns),
+    loadDurationNs: finiteNumber(receipt?.load_duration_ns),
+    promptEvalDurationNs: finiteNumber(receipt?.prompt_eval_duration_ns),
+    evalDurationNs: finiteNumber(receipt?.eval_duration_ns),
+  })).filter(receipt => receipt.receiptId && receipt.model && receipt.surface);
+  return {
+    status: String(value.status || ''),
+    endpointScope: String(value.endpoint_scope || ''),
+    installedModelsCount: Math.max(0, Number(value.installed_models_count) || 0),
+    loadedModelsCount: Math.max(0, Number(value.loaded_models_count) || 0),
+    loadedModels: (Array.isArray(value.loaded_models) ? value.loaded_models : []).map(model => ({
+      name: String(model?.name || 'Unnamed local model'),
+      sizeBytes: Math.max(0, Number(model?.size_bytes) || 0),
+      sizeVramBytes: Math.max(0, Number(model?.size_vram_bytes) || 0),
+      contextLength: Math.max(0, Number(model?.context_length) || 0),
+      expiresAt: String(model?.expires_at || ''),
+    })),
+    promptTokens: finiteNumber(value.prompt_tokens),
+    responseTokens: finiteNumber(value.response_tokens),
+    tokensPerSecond: finiteNumber(value.tokens_per_second),
+    totalDurationNs: finiteNumber(value.total_duration_ns),
+    loadDurationNs: finiteNumber(value.load_duration_ns),
+    promptEvalDurationNs: finiteNumber(value.prompt_eval_duration_ns),
+    evalDurationNs: finiteNumber(value.eval_duration_ns),
+    observedRequestCount: Math.max(0, Number(value.observed_request_count) || 0),
+    requestReceipts,
+    latestRequest: requestReceipts.at(-1) || null,
+    telemetryStatus: String(value.telemetry_status || ''),
+    telemetryReason: String(value.telemetry_reason || ''),
+  };
+}
+
 function normalizePace(value) {
   if (!value || typeof value !== 'object') return null;
   const category = ['slow', 'steady', 'racing', 'burning'].includes(value.category) ? value.category : '';
@@ -79,6 +167,7 @@ export function providerUsageTone(entry) {
   if (tones.has('critical')) return 'critical';
   if (tones.has('warning')) return 'warning';
   if (entry?.status === 'stale') return 'stale';
+  if (entry?.status === 'fresh' && entry?.localRuntime?.status === 'running') return 'ok';
   return maximum >= 0 ? 'ok' : 'unknown';
 }
 
@@ -104,6 +193,8 @@ function normalizeEntry(snapshot, index) {
     lastGoodCapturedAt: snapshot?.last_good_captured_at ? String(snapshot.last_good_captured_at) : '',
     windows,
     credits: snapshot?.credits && typeof snapshot.credits === 'object' ? snapshot.credits : null,
+    financials: normalizeFinancials(snapshot?.financials),
+    localRuntime: normalizeLocalRuntime(snapshot?.local_runtime),
     resetCredits: snapshot?.reset_credits && typeof snapshot.reset_credits === 'object' ? snapshot.reset_credits : null,
     error: snapshot?.error && typeof snapshot.error === 'object' ? snapshot.error : null,
     requestCount: Math.max(0, Number(snapshot?.request_count) || 0),
@@ -135,7 +226,7 @@ export function normalizeProviderUsage(payload) {
   ));
   const providerIds = new Set(entries.map(entry => entry.providerId));
   const reporting = entries.filter(entry => (
-    entry.windows.length > 0 || entry.credits || entry.resetCredits
+    entry.windows.length > 0 || entry.credits || entry.resetCredits || entry.financials || entry.localRuntime
   )).length;
   const nearLimit = entries.filter(entry => (
     ['warning', 'critical'].includes(entry.tone) && entry.maximumUsedPercent < 100
@@ -273,6 +364,20 @@ export function formatProviderPercent(value) {
   return `${Number.isInteger(numeric) ? numeric : numeric.toFixed(2).replace(/0+$/, '').replace(/\.$/, '')}%`;
 }
 
+export function formatOllamaDuration(value) {
+  const nanoseconds = Number(value);
+  if (!Number.isFinite(nanoseconds) || nanoseconds < 0) return 'Unavailable';
+  if (nanoseconds < 1e6) return `${Math.round(nanoseconds / 1e3)} us`;
+  if (nanoseconds < 1e9) return `${(nanoseconds / 1e6).toFixed(1).replace(/\.0$/, '')} ms`;
+  return `${(nanoseconds / 1e9).toFixed(2).replace(/0+$/, '').replace(/\.$/, '')} s`;
+}
+
+export function formatOllamaTokenRate(value) {
+  const rate = Number(value);
+  if (!Number.isFinite(rate) || rate < 0) return 'Unavailable';
+  return `${rate.toFixed(2).replace(/0+$/, '').replace(/\.$/, '')} tokens/s`;
+}
+
 export function formatProviderUsageAge(value, nowMs = Date.now()) {
   const timestamp = Date.parse(value || '');
   if (!Number.isFinite(timestamp)) return 'Not yet refreshed';
@@ -303,18 +408,41 @@ export function formatProviderUsageReset(value, nowMs = Date.now()) {
 export function formatProviderCredits(credits) {
   if (!credits || typeof credits !== 'object') return '';
   if (credits.unlimited === true) return 'Unlimited credits';
-  if (credits.unit && Number.isFinite(Number(credits.balance))) return `${credits.balance} ${credits.unit}`;
+  const hasBalance = credits.balance != null && credits.balance !== '' && Number.isFinite(Number(credits.balance));
+  if (credits.unit && hasBalance) return `${credits.balance} ${credits.unit}`;
   const currency = credits.currency === 'USD' ? '$' : credits.currency ? `${credits.currency} ` : '';
-  if (Number.isFinite(Number(credits.balance))) return `${currency}${Number(credits.balance).toFixed(2)} balance`;
-  if (Number.isFinite(Number(credits.used))
-    && (Number.isFinite(Number(credits.included)) || Number.isFinite(Number(credits.bonus)))) {
-    const parts = [`${currency}${Number(credits.used).toFixed(2)} used`];
-    if (Number.isFinite(Number(credits.included))) parts.push(`${currency}${Number(credits.included).toFixed(2)} included`);
-    if (Number.isFinite(Number(credits.bonus))) parts.push(`${currency}${Number(credits.bonus).toFixed(2)} bonus`);
-    return parts.join(' · ');
+  if (hasBalance) return `${currency}${Number(credits.balance).toFixed(2)} balance`;
+  return '';
+}
+
+function formatMoney(value) {
+  if (!value || value.amount == null || value.amount === '' || !Number.isFinite(Number(value.amount))) return 'Not reported';
+  const prefix = value.currency === 'USD' ? '$' : value.currency ? `${value.currency} ` : '';
+  return `${prefix}${Number(value.amount).toFixed(2)}`;
+}
+
+export function providerFinancialRows(financials) {
+  if (!financials) return [];
+  const rows = [];
+  if (financials.prepaidBalance) rows.push({ id: 'prepaid-balance', label: 'Available prepaid balance', value: formatMoney(financials.prepaidBalance) });
+  if (financials.extraUsageSpend) rows.push({ id: 'extra-spend', label: 'Extra-usage spend', value: formatMoney(financials.extraUsageSpend) });
+  if (financials.extraUsageCap) rows.push({ id: 'extra-cap', label: 'Extra-usage cap', value: formatMoney(financials.extraUsageCap) });
+  if (!financials.extraUsageEnabled && (financials.extraUsageSpend || financials.extraUsageCap)) {
+    rows.push({ id: 'extra-status', label: 'Extra usage', value: 'Disabled' });
   }
-  if (Number.isFinite(Number(credits.used)) && Number.isFinite(Number(credits.limit))) {
-    return `${currency}${Number(credits.used).toFixed(2)} of ${currency}${Number(credits.limit).toFixed(2)} used`;
+  if (financials.reportedSpend) rows.push({ id: 'reported-spend', label: 'Provider-reported spend', value: formatMoney(financials.reportedSpend) });
+  if (financials.includedSpend) rows.push({ id: 'included-spend', label: 'Included spend bucket', value: formatMoney(financials.includedSpend) });
+  if (financials.bonusSpend) rows.push({ id: 'bonus-spend', label: 'Bonus spend bucket', value: formatMoney(financials.bonusSpend) });
+  if (financials.planLimit) rows.push({ id: 'plan-limit', label: 'Reported plan limit', value: formatMoney(financials.planLimit) });
+  if (financials.reportedSpend && !financials.allowanceRemaining) {
+    rows.push({ id: 'allowance-remaining', label: 'Available allowance', value: 'Not reported by provider' });
   }
-  return credits.enabled === false ? 'Extra usage disabled' : '';
+  if (financials.poolClassification?.status === 'unavailable') {
+    rows.push({
+      id: 'pool-classification',
+      label: 'First/third-party pools',
+      value: financials.poolClassification.warning || 'Not reported by provider',
+    });
+  }
+  return rows;
 }

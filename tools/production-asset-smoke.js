@@ -152,7 +152,7 @@ async function main() {
     'content-block-thinking-native', 'content-block-thinking-codex-desktop', 'content-block-terminal-codex-desktop',
     'proxy_send_result', 'agent_started', 'Native user turn delivered',
     'Native launch accepted; user-turn receipt pending', 'offline_queued', 'web-hb-',
-    'Esc return to composer', 'Press Esc again or Enter to interrupt',
+    'return to composer', 'Press Esc again or Enter to interrupt',
     'Question needs an answer', 'Turn finished', 'Goal completed', 'Goal needs attention',
     'semantic_notification', 'goal_attention',
     'Notification sound', 'completion_sound',
@@ -186,7 +186,7 @@ async function main() {
     markers: [
       'tool_result', 'plan', 'queued_message', 'notice', 'content-block-thinking-native', 'content-block-thinking-codex-desktop', 'content-block-terminal-codex-desktop',
       'proxy_send_result', 'agent_started', 'delivered',
-      'permission-key-hint', 'permission-keyboard-help', 'Esc return to composer',
+      'permission-key-hint', 'permission-keyboard-help', 'return to composer',
       'interrupt-confirm-inline', 'Press Esc again or Enter to interrupt',
       'attention-toast', 'hamburger-attention', 'Question needs an answer',
       'Turn finished', 'Goal completed', 'Goal needs attention', 'semantic_notification', 'goal_attention',

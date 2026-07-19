@@ -9,7 +9,12 @@ const {
 
 const CLIENT_REQUEST_ID_RE = /^[a-zA-Z0-9][a-zA-Z0-9._:-]{2,159}$/;
 const RETAINED_TERMINAL_STATES = new Set(['failed']);
-const NATIVE_DEADLINE_RECEIPT_GRACE_MS = 5000;
+// This is receipt-only grace. Browser answers remain invalid at deadline_at.
+// Production VS Code traces repeatedly wrote the exact native receipt within
+// 10ms, while the authenticated proxy terminal reached the relay ~8.98s later
+// under event-loop pressure. Keep a measured margin without synthesizing an
+// answer or extending the user's response window.
+const NATIVE_DEADLINE_RECEIPT_GRACE_MS = 15000;
 
 function questionPromptDeadlineGraceMs(prompt) {
   return prompt?.auto_resolution_policy === 'native' ? NATIVE_DEADLINE_RECEIPT_GRACE_MS : 0;

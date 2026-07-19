@@ -2,6 +2,7 @@
 'use strict';
 
 const assert = require('assert');
+const fs = require('fs');
 const path = require('path');
 const vm = require('vm');
 const esbuild = require('../frontend/node_modules/esbuild');
@@ -16,6 +17,10 @@ const built = esbuild.buildSync({
 const record = { exports: {} };
 vm.runInNewContext(built.outputFiles[0].text, { module: record, exports: record.exports, console, Date, Map, Set });
 const host = record.exports;
+const outputIndex = process.argv.indexOf('--output');
+const outputPath = outputIndex >= 0 && process.argv[outputIndex + 1]
+  ? path.resolve(process.argv[outputIndex + 1])
+  : null;
 
 const startedAt = Date.parse('2026-07-15T18:00:00.000Z');
 const frames = Array.from({ length: 900 }, (_, index) => {
@@ -92,5 +97,120 @@ assert.equal(normalized.processes[0].stableKey, snapshot.processes[0].stable_key
 assert.equal(normalized.processes[0].cpuCoreEquivalent, 80);
 assert.equal(normalized.processes[0].counterTotals.ioReadBytes, '9007199254740993');
 assert.equal(host.formatHostResourceBytes(1024), '1.00 KiB');
+
+const pressureStart = Date.parse('2026-07-16T20:00:00.000Z');
+const sustainedPressure = Array.from({ length: 16 }, (_, index) => ({
+  schema_version: 2,
+  frame_kind: 'system',
+  status: 'fresh',
+  captured_at: new Date(pressureStart + index * 1000).toISOString(),
+  sample_sequence: 1_001 + index,
+  sample_interval_ms: 1000,
+  cpu: { total_percent: 96 },
+  memory: { used_percent: 86, used_bytes: 55 * 1024 ** 3, total_bytes: 64 * 1024 ** 3 },
+}));
+const pressureProjection = host.projectHostResourceStrip(sustainedPressure, {
+  connected: true,
+  nowMs: pressureStart + 15_500,
+  subscriptionStatus: 'live',
+});
+assert.equal(pressureProjection.status, 'live');
+assert.equal(pressureProjection.cpuLevel, 'critical');
+assert.equal(pressureProjection.memoryLevel, 'warning');
+assert.equal(pressureProjection.attention, 'critical');
+assert.equal(pressureProjection.memoryTotalBytes, 64 * 1024 ** 3);
+
+const oneSampleSpike = sustainedPressure.map((frame, index) => ({
+  ...frame,
+  cpu: { total_percent: index === sustainedPressure.length - 1 ? 99 : 20 },
+  memory: { ...frame.memory, used_percent: index === sustainedPressure.length - 1 ? 99 : 50 },
+}));
+const spikeProjection = host.projectHostResourceStrip(oneSampleSpike, {
+  connected: true,
+  nowMs: pressureStart + 15_500,
+  subscriptionStatus: 'live',
+});
+assert.equal(spikeProjection.cpuLevel, 'normal', 'one CPU spike must not flash warning chrome');
+assert.equal(spikeProjection.memoryLevel, 'normal', 'one RAM spike must not flash warning chrome');
+
+const staleProjection = host.projectHostResourceStrip(sustainedPressure, {
+  connected: true,
+  nowMs: pressureStart + 19_000,
+  subscriptionStatus: 'live',
+});
+assert.equal(staleProjection.status, 'stale');
+assert.equal(staleProjection.ageSeconds, 4);
+assert.equal(staleProjection.cpuPercent, 96, 'stale state must retain the last-good CPU value');
+const reconnectProjection = host.projectHostResourceStrip(sustainedPressure, {
+  connected: false,
+  nowMs: pressureStart + 16_000,
+  subscriptionStatus: 'reconnecting',
+});
+assert.equal(reconnectProjection.status, 'reconnecting');
+assert.equal(reconnectProjection.memoryPercent, 86, 'reconnect must retain the last-good RAM value');
+const boundedProjection = host.projectHostResourceStrip(Array.from({ length: 100 }, (_, index) => ({
+  ...sustainedPressure[index % sustainedPressure.length],
+  sample_sequence: 2_000 + index,
+  captured_at: new Date(pressureStart + index * 1000).toISOString(),
+})), { connected: true, nowMs: pressureStart + 99_500, subscriptionStatus: 'live' });
+assert.equal(boundedProjection.frames.length, 60, 'global strip history must stay bounded to 60 samples');
+
+const alignedStart = Date.parse('2026-07-16T21:00:00.000Z');
+const alignedFrames = Array.from({ length: 60 }, (_, index) => ({
+  schema_version: 2,
+  frame_kind: 'system',
+  status: 'fresh',
+  captured_at: new Date(alignedStart + index * 1_000).toISOString(),
+  sample_sequence: 3_001 + index,
+  sample_interval_ms: 1_000,
+  cpu: { total_percent: 23.037 + index * 0.311 },
+  memory: { used_percent: 41.019 + index * 0.217 },
+}));
+const truthRows = alignedFrames.map((frame, index) => {
+  const compact = host.projectHostResourceStrip(alignedFrames.slice(0, index + 1), {
+    connected: true,
+    nowMs: Date.parse(frame.captured_at) + 10,
+    subscriptionStatus: 'live',
+  });
+  const detail = host.normalizeHostResources({
+    schema_version: 2,
+    source: 'fixture',
+    status: 'fresh',
+    captured_at: frame.captured_at,
+    sample_sequence: frame.sample_sequence,
+    sample_interval_ms: frame.sample_interval_ms,
+    system: { cpu: frame.cpu, cpu_percent: frame.cpu.total_percent, memory: frame.memory },
+    processes: [],
+  });
+  return {
+    sample_sequence: frame.sample_sequence,
+    compact_cpu_percent: compact.cpuPercent,
+    detail_cpu_percent: detail.system.cpuPercent,
+    cpu_error_percentage_points: Math.abs(compact.cpuPercent - detail.system.cpuPercent),
+    compact_memory_percent: compact.memoryPercent,
+    detail_memory_percent: detail.system.memory.usedPercent,
+    memory_error_percentage_points: Math.abs(compact.memoryPercent - detail.system.memory.usedPercent),
+  };
+});
+const maxCpuError = Math.max(...truthRows.map(row => row.cpu_error_percentage_points));
+const maxMemoryError = Math.max(...truthRows.map(row => row.memory_error_percentage_points));
+assert(maxCpuError <= 0.1, `compact/detail CPU drift ${maxCpuError}pp exceeds 0.1pp`);
+assert(maxMemoryError <= 0.1, `compact/detail memory drift ${maxMemoryError}pp exceeds 0.1pp`);
+const result = {
+  ok: true,
+  aligned_samples: truthRows.length,
+  cadence_ms: 1_000,
+  sequence_range: [truthRows[0].sample_sequence, truthRows.at(-1).sample_sequence],
+  maximum_cpu_error_percentage_points: maxCpuError,
+  maximum_memory_error_percentage_points: maxMemoryError,
+  compact_history_points: boundedProjection.frames.length,
+  pressure_duration_ms: 15_000,
+  rows: truthRows,
+  generated_at: new Date().toISOString(),
+};
+if (outputPath) {
+  fs.mkdirSync(path.dirname(outputPath), { recursive: true });
+  fs.writeFileSync(outputPath, `${JSON.stringify(result, null, 2)}\n`);
+}
 
 console.log('host resource frontend math smoke: PASS');

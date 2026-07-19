@@ -104,6 +104,7 @@ function settle() {
   const originalRespond = selectors.respondToCodexDesktopQuestion;
   const originalThinking = selectors.detectThinking;
   const originalDetect = selectors.detectCodexDesktopQuestion;
+  const originalReadThreadList = selectors.readCodexThreadList;
   const originalEvalInPage = selectors.evalInPage;
   const priorLockHeld = process.env.CODEX_DESKTOP_CDP_LOCK_HELD;
   process.env.CODEX_DESKTOP_CDP_LOCK_HELD = '1';
@@ -157,12 +158,55 @@ function settle() {
     selectors.detectCodexDesktopQuestion = async Runtime => {
       assert.strictEqual(Runtime._codexDesktopFreshQuestionClient, true);
       assert.strictEqual(Runtime._codexDesktopSharedClient, undefined);
-      return fixture.expected_observed;
+      return {
+        ...fixture.expected_observed,
+        native_thread_title: 'Owned rotated thread',
+        active_thread_proven: true,
+      };
     };
     await fast.engine._pollCodexDesktopQuestionBounded(fast.session.session_id);
     assert(fast.engine.sent.some(message => message.type === 'question_prompt'), 'Desktop fast poll did not relay the native question');
     assert.strictEqual(fast.engine.freshQuestionClients.length, 1);
     assert.strictEqual(fast.engine.freshQuestionClients[0].closed, true);
+
+    const rotated = harness('desktop-fast-thread-rotation');
+    rotated.engine.CODEX_DESKTOP_QUESTION_POLL_TIMEOUT_MS = 50;
+    rotated.session._activeThreadKey = 'local:previous-thread';
+    rotated.session.codexDesktopActiveThreadKey = 'local:previous-thread';
+    rotated.engine._refreshCodexDesktopThreadMetadata = () => {
+      throw new Error('question identity promotion must not block on archive metadata');
+    };
+    selectors.readCodexThreadList = async () => {
+      throw new Error('question fast path must not wait for the lagging full thread list');
+    };
+    await rotated.engine._pollCodexDesktopQuestionBounded(rotated.session.session_id);
+    assert(rotated.engine.sent.some(message => message.type === 'question_prompt'),
+      'Desktop fast poll did not relay after fresh active-thread validation');
+    assert.strictEqual(rotated.session._activeThreadKey, fixture.expected_observed.native_thread_id,
+      'Desktop fast poll did not promote the freshly validated active thread');
+    assert.strictEqual(rotated.session._activeThreadTitle, 'Owned rotated thread');
+
+    const recurring = harness('desktop-post-send-recurring-poll');
+    recurring.engine.CODEX_DESKTOP_QUESTION_POLL_TIMEOUT_MS = 50;
+    recurring.engine.CODEX_DESKTOP_QUESTION_ACTIVE_POLL_INTERVAL_MS = 17;
+    recurring.session._codexDesktopQuestionRemotePollUntil = Date.now() + 5000;
+    const scheduled = [];
+    recurring.engine._scheduleCodexDesktopQuestionPoll = (sessionId, session, delay) => {
+      assert.strictEqual(sessionId, recurring.session.session_id);
+      assert.strictEqual(session, recurring.session);
+      scheduled.push(delay);
+    };
+    selectors.detectCodexDesktopQuestion = async () => null;
+    await recurring.engine._pollCodexDesktopQuestionBounded(recurring.session.session_id);
+    assert(scheduled.includes(17), 'Desktop post-send window did not schedule a recurring fast question poll');
+    selectors.detectCodexDesktopQuestion = async Runtime => {
+      assert.strictEqual(Runtime._codexDesktopFreshQuestionClient, true);
+      return {
+        ...fixture.expected_observed,
+        native_thread_title: 'Owned rotated thread',
+        active_thread_proven: true,
+      };
+    };
 
     const order = [];
     fast.engine.activeQuestionPromptAdapters.clear();
@@ -172,6 +216,10 @@ function settle() {
     fast.engine._pollSessionBounded = async () => { order.push('transcript'); };
     fast.engine._pollPermissionsBounded = async () => { order.push('permission'); };
     await fast.engine._handleDomPush(fast.session.session_id, {});
+    assert.deepStrictEqual(order, ['question'], 'DOM push held the native-question lane behind secondary reads');
+    assert.strictEqual(fast.engine._domPushSecondaryPollTimers.has(fast.session.session_id), true);
+    fast.engine._cancelDomPushSecondaryPoll(fast.session.session_id);
+    await fast.engine._runDomPushSecondaryPoll(fast.session.session_id);
     assert.deepStrictEqual(order, ['question', 'transcript', 'permission']);
 
     const gated = harness('desktop-open-question-session');
@@ -189,6 +237,8 @@ function settle() {
     gated.engine._pollPermissionsBounded = async () => { gatedOrder.push('permission'); };
     await gated.engine._handleDomPush(gated.session.session_id, {});
     assert.deepStrictEqual(gatedOrder, ['question']);
+    assert.strictEqual(gated.engine._domPushSecondaryPollTimers?.has(gated.session.session_id) || false, false,
+      'open native question retained a secondary transcript timer');
 
     const { engine, session } = harness();
     await engine._handleCodexDesktopQuestionState(
@@ -284,6 +334,7 @@ function settle() {
     selectors.respondToCodexDesktopQuestion = originalRespond;
     selectors.detectThinking = originalThinking;
     selectors.detectCodexDesktopQuestion = originalDetect;
+    selectors.readCodexThreadList = originalReadThreadList;
     selectors.evalInPage = originalEvalInPage;
     if (priorLockHeld === undefined) delete process.env.CODEX_DESKTOP_CDP_LOCK_HELD;
     else process.env.CODEX_DESKTOP_CDP_LOCK_HELD = priorLockHeld;

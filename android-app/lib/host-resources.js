@@ -1,6 +1,9 @@
 // Shared browser/React Native Host Resources normalization and chart math.
 export const HOST_RESOURCE_HISTORY_LIMIT = 900;
 export const HOST_RESOURCE_DETAIL_LIMIT = 180;
+export const HOST_RESOURCE_COMPACT_HISTORY_LIMIT = 60;
+export const HOST_RESOURCE_STRIP_STALE_MIN_MS = 2_500;
+export const HOST_RESOURCE_PRESSURE_DURATION_MS = 15_000;
 export const HOST_RESOURCE_CHART_RANGES = Object.freeze({
   live: 30_000,
   '1m': 60_000,
@@ -233,6 +236,69 @@ export function normalizeHostResourcePoint(frame) {
       receiveBps: nullableNumber(network.receive_bps), sendBps: nullableNumber(network.send_bps),
       receivePps: nullableNumber(network.receive_pps), sendPps: nullableNumber(network.send_pps),
     },
+  };
+}
+
+function sustainedHostResourcePressure(points, metric, threshold) {
+  const valid = points.map(point => ({
+    capturedAtMs: point.capturedAtMs,
+    value: metric === 'cpu' ? point.cpu.totalPercent : point.memory.usedPercent,
+  })).filter(sample => sample.capturedAtMs > 0 && sample.value !== null);
+  if (valid.length < 2 || valid.at(-1).capturedAtMs - valid[0].capturedAtMs < HOST_RESOURCE_PRESSURE_DURATION_MS) return false;
+  return valid.every(sample => sample.value >= threshold);
+}
+
+function hostResourcePressureLevel(points, metric) {
+  if (sustainedHostResourcePressure(points, metric, 95)) return 'critical';
+  if (sustainedHostResourcePressure(points, metric, 85)) return 'warning';
+  return 'normal';
+}
+
+export function projectHostResourceStrip(frames, options = {}) {
+  const boundedFrames = mergeOrderedHostResourceFrames([], frames, HOST_RESOURCE_COMPACT_HISTORY_LIMIT);
+  const points = boundedFrames.map(normalizeHostResourcePoint).filter(Boolean);
+  const point = points.at(-1) || null;
+  const nowMs = Number.isFinite(Number(options.nowMs)) ? Number(options.nowMs) : Date.now();
+  const connected = options.connected !== false;
+  const subscriptionStatus = String(options.subscriptionStatus || '');
+  const cpuPercent = point?.cpu.totalPercent ?? null;
+  const memoryPercent = point?.memory.usedPercent ?? null;
+  const hasValues = point?.status === 'fresh' && cpuPercent !== null && memoryPercent !== null;
+  const ageMs = point?.capturedAtMs > 0 ? Math.max(0, nowMs - point.capturedAtMs) : Infinity;
+  const cadenceMs = Math.max(1_000, point?.sampleIntervalMs || 1_000);
+  const staleAfterMs = Math.max(HOST_RESOURCE_STRIP_STALE_MIN_MS, cadenceMs * 2);
+  let status = 'waiting';
+  if (!connected || subscriptionStatus === 'reconnecting') status = 'reconnecting';
+  else if (!hasValues) status = options.error ? 'unavailable' : 'waiting';
+  else if (ageMs > staleAfterMs) status = 'stale';
+  else status = 'live';
+  const pressureStartMs = point?.capturedAtMs ? point.capturedAtMs - HOST_RESOURCE_PRESSURE_DURATION_MS : Infinity;
+  const pressurePoints = points.filter(sample => sample.capturedAtMs >= pressureStartMs);
+  const cpuLevel = hasValues ? hostResourcePressureLevel(pressurePoints, 'cpu') : 'normal';
+  const memoryLevel = hasValues ? hostResourcePressureLevel(pressurePoints, 'memory') : 'normal';
+  const attention = status === 'live' && (cpuLevel === 'critical' || memoryLevel === 'critical')
+    ? 'critical'
+    : status === 'live' && (cpuLevel === 'warning' || memoryLevel === 'warning')
+      ? 'warning'
+      : status;
+  const rawLatest = boundedFrames.at(-1) || null;
+  const rawSystem = rawLatest?.frame_kind === 'system' ? rawLatest : rawLatest?.system || null;
+  return {
+    status,
+    attention,
+    point,
+    frames: boundedFrames,
+    cpuPercent,
+    memoryPercent,
+    cpuLevel,
+    memoryLevel,
+    ageMs,
+    ageSeconds: Number.isFinite(ageMs) ? Math.max(0, Math.round(ageMs / 1_000)) : null,
+    staleAfterMs,
+    sampleSequence: point?.sampleSequence || 0,
+    capturedAt: point?.capturedAt || '',
+    memoryUsedBytes: nullableNumber(rawSystem?.memory?.used_bytes),
+    memoryTotalBytes: nullableNumber(rawSystem?.memory?.total_bytes),
   };
 }
 

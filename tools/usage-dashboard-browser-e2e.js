@@ -243,9 +243,13 @@ async function main() {
       return;
     }
     const pathname = new URL(request.url, `http://127.0.0.1:${port}`).pathname;
-    const relative = pathname === '/' ? 'index.html' : pathname.replace(/^\/+/, '');
-    const filePath = path.resolve(publicRoot, relative);
-    if (!filePath.startsWith(`${path.resolve(publicRoot)}${path.sep}`)
+    const providerAssetRequest = pathname.startsWith('/provider-assets/');
+    const requestRoot = providerAssetRequest ? path.join(root, 'provider-assets') : publicRoot;
+    const relative = pathname === '/' ? 'index.html' : providerAssetRequest
+      ? pathname.slice('/provider-assets/'.length)
+      : pathname.replace(/^\/+/, '');
+    const filePath = path.resolve(requestRoot, relative);
+    if (!filePath.startsWith(`${path.resolve(requestRoot)}${path.sep}`)
       || !fs.existsSync(filePath) || fs.statSync(filePath).isDirectory()) {
       response.writeHead(404); response.end('not found'); return;
     }
@@ -349,6 +353,16 @@ async function main() {
 
     await loadFixture({ width: 1280, height: 900 });
     assert.equal(await page.locator('.usage-dashboard-card').count(), 3, 'five old surfaces must become three provider-account cards');
+    await page.waitForFunction(() => {
+      const images = [...document.querySelectorAll('.usage-dashboard-provider-mark-image')];
+      return images.length === 6 && images.every(image => image.complete && image.naturalWidth > 0);
+    });
+    assert.equal(await page.locator('.usage-dashboard-provider-mark-fallback').count(), 0,
+      'official provider marks must load without text fallback');
+    assert.deepStrictEqual(
+      (await page.locator('.usage-dashboard-provider-mark').evaluateAll(nodes => nodes.map(node => node.getAttribute('aria-label')))).sort(),
+      ['Anthropic Claude provider mark', 'Google Antigravity provider mark', 'OpenAI provider mark'],
+    );
     await assert.doesNotReject(async () => {
       const codex = page.locator('[data-provider-id="openai-codex"]');
       await codex.getByText('13 mapped sessions').waitFor();
@@ -556,6 +570,8 @@ async function main() {
       light_desktop_overflow_px: lightDesktopOverflow,
       light_mobile_overflow_px: lightMobileOverflow,
       light_and_dark_checked: true,
+      official_provider_marks_loaded: 3,
+      provider_mark_fallbacks: 0,
       no_session_jump_and_header_chip_preserved: true,
       schema_version: 2,
       predictive_pace_windows: await page.locator('.usage-pace').count(),

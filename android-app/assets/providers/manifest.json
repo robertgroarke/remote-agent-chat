@@ -1,0 +1,213 @@
+{
+  "schema_version": 1,
+  "asset_set_version": "2026-07-16.1",
+  "retrieved_date": "2026-07-16",
+  "policy": {
+    "purpose": "First-party provider identification in Remote Agent Chat usage surfaces.",
+    "brand_use": "Identification only; no endorsement is implied. Provider marks remain subject to each owner's brand and trademark terms and are not relicensed by this repository.",
+    "network": "Applications render only vendored files. No provider mark is hotlinked at runtime.",
+    "svg_safety": "Every SVG is reduced to static svg/path geometry with local fill colors; scripts, event handlers, foreign objects, entities, CSS imports, URLs, and external references are forbidden."
+  },
+  "providers": [
+    {
+      "provider_id": "openai-codex",
+      "accessible_name": "OpenAI",
+      "owner": "OpenAI",
+      "brand_use_note": "OpenAI blossom used only to identify the OpenAI account card; follow https://openai.com/brand/.",
+      "source": {
+        "kind": "installed_store_signed_app",
+        "page_url": "https://openai.com/brand/",
+        "package_identity": "OpenAI.Codex_26.707.12708.0_x64__2p2nqsd0c76g0",
+        "package_version": "26.707.12708.0",
+        "signature_kind": "Store",
+        "asset_root": "ms-appx:///assets/"
+      },
+      "render": {
+        "web": { "light": "openai-light.png", "dark": "openai-dark.png" },
+        "android": { "light": "openai-light.png", "dark": "openai-dark.png" },
+        "monochrome": "native black/white package variants"
+      },
+      "files": [
+        {
+          "file": "openai-light.png",
+          "media_type": "image/png",
+          "sha256": "b45359d98553406d60c45e699cbe80de6fe733d51661a317ca37b41632b58823",
+          "source_member": "Square44x44Logo.targetsize-256_altform-lightunplated.png",
+          "source_sha256": "b45359d98553406d60c45e699cbe80de6fe733d51661a317ca37b41632b58823",
+          "transformations": ["renamed only"]
+        },
+        {
+          "file": "openai-dark.png",
+          "media_type": "image/png",
+          "sha256": "2b001fb1f4e7d76e4d459c2ad8f9739e963ffc1c2137abcfffe8da3ee7775f7c",
+          "source_member": "Square44x44Logo.targetsize-256_altform-unplated.png",
+          "source_sha256": "2b001fb1f4e7d76e4d459c2ad8f9739e963ffc1c2137abcfffe8da3ee7775f7c",
+          "transformations": ["renamed only"]
+        }
+      ]
+    },
+    {
+      "provider_id": "anthropic-claude",
+      "accessible_name": "Anthropic Claude",
+      "owner": "Anthropic PBC",
+      "brand_use_note": "Claude Spark used only to identify the Anthropic Claude account card; sourced from Anthropic's press kit.",
+      "source": {
+        "kind": "official_press_kit",
+        "page_url": "https://www.anthropic.com/news",
+        "artifact_url": "https://www-cdn.anthropic.com/ae59ca4ca194dac9c9dc3bc78c5829468cb0e8af.zip",
+        "artifact_sha256": "c68ac92df86c825f95177e24016fcc9a8863a3fd4ca344fe6f0700b2c1e07151"
+      },
+      "render": {
+        "web": { "light": "claude-color.svg", "dark": "claude-color.svg" },
+        "android": { "light": "claude-color.png", "dark": "claude-color.png" },
+        "monochrome": "official clay mark retained on a neutral contrasting tile"
+      },
+      "files": [
+        {
+          "file": "claude-color.svg",
+          "media_type": "image/svg+xml",
+          "sha256": "81fb40bb68c868b8037258a29c76f53e8eaba92398f43af48b92dbca5cf7d60a",
+          "source_member": "Anthropic media resources/Anthropic logos/Claude logos/3 Claude Spark/SVG/Claude Spark - Clay.svg",
+          "source_sha256": "6d53db4be375e899c937c26cf16684a80d6e869b1928d72b37748bef2560e219",
+          "transformations": ["removed width and height attributes", "normalized static svg/path markup and LF line endings"]
+        },
+        {
+          "file": "claude-color.png",
+          "media_type": "image/png",
+          "sha256": "c7d8415b1edba67e5337d3684b480b563826f07be9e28e10ccc14bf92037ef6d",
+          "source_member": "Anthropic media resources/Anthropic logos/Claude logos/3 Claude Spark/PNG/Claude Spark - Clay.png",
+          "source_sha256": "c7d8415b1edba67e5337d3684b480b563826f07be9e28e10ccc14bf92037ef6d",
+          "transformations": ["renamed only"]
+        }
+      ]
+    },
+    {
+      "provider_id": "cursor",
+      "accessible_name": "Cursor",
+      "owner": "Anysphere, Inc.",
+      "brand_use_note": "Cursor cube used only to identify the Cursor account card; sourced from Cursor's official brand kit.",
+      "source": {
+        "kind": "official_brand_kit",
+        "page_url": "https://cursor.com/brand",
+        "artifact_url": "https://ptht05hbb1ssoooe.public.blob.vercel-storage.com/assets/brand/cursor-brand-assets.zip",
+        "artifact_sha256": "97488a7751914e60f9ff532bc33810cdeaebddc017548abe6ca2bc29bbc3928"
+      },
+      "render": {
+        "web": { "light": "cursor-light.svg", "dark": "cursor-dark.svg" },
+        "android": { "light": "cursor-light.png", "dark": "cursor-dark.png" },
+        "monochrome": "official light/dark 2D cube variants",
+        "color": "cursor-color.png"
+      },
+      "files": [
+        {
+          "file": "cursor-light.svg",
+          "media_type": "image/svg+xml",
+          "sha256": "6d5234e1254f3e9ccf1c46830441ee25c9c2a161fa044704117772b88a716664",
+          "source_member": "General Logos/Cube/SVG/CUBE_2D_LIGHT.svg",
+          "source_sha256": "c483c02f78eb2619778fdd959e72a9adfac4844854472cd2653d4cbfd60e4d71",
+          "transformations": ["removed generator metadata and defs/style wrapper", "inlined the official fill color", "normalized LF line endings"]
+        },
+        {
+          "file": "cursor-dark.svg",
+          "media_type": "image/svg+xml",
+          "sha256": "b4dd8a8c36a951016100100ca34c90c2a5381fce1230b1d0773e0d67a0f6e248",
+          "source_member": "General Logos/Cube/SVG/CUBE_2D_DARK.svg",
+          "source_sha256": "cd0e3e5d8991a4cdd4577f8896cd063105207665165c73e25a1ff918dd367eb7",
+          "transformations": ["removed generator metadata and defs/style wrapper", "inlined the official fill color", "normalized LF line endings"]
+        },
+        {
+          "file": "cursor-light.png",
+          "media_type": "image/png",
+          "sha256": "c61776321cea03d00860d5059029397a9b60e95e5c1f36f1b3bafe5a3a59c545",
+          "source_member": "General Logos/Cube/PNG/CUBE_2D_LIGHT.png",
+          "source_sha256": "c61776321cea03d00860d5059029397a9b60e95e5c1f36f1b3bafe5a3a59c545",
+          "transformations": ["renamed only"]
+        },
+        {
+          "file": "cursor-dark.png",
+          "media_type": "image/png",
+          "sha256": "944f2b64bcb4b9603edb8721cf669d496ddc408d91c4a8ff471b650e4fb272b5",
+          "source_member": "General Logos/Cube/PNG/CUBE_2D_DARK.png",
+          "source_sha256": "944f2b64bcb4b9603edb8721cf669d496ddc408d91c4a8ff471b650e4fb272b5",
+          "transformations": ["renamed only"]
+        },
+        {
+          "file": "cursor-color.png",
+          "media_type": "image/png",
+          "sha256": "292696a0da45723f501c5c7546b30433cbd79070fc552682492a000e6ad7202b",
+          "source_member": "General Logos/Cube/PNG/CUBE_25D.png",
+          "source_sha256": "292696a0da45723f501c5c7546b30433cbd79070fc552682492a000e6ad7202b",
+          "transformations": ["renamed only"]
+        }
+      ]
+    },
+    {
+      "provider_id": "google-antigravity",
+      "accessible_name": "Google Antigravity",
+      "owner": "Google LLC",
+      "brand_use_note": "Antigravity icon used only to identify the Google Antigravity account card; sourced from the official press-assets page.",
+      "source": {
+        "kind": "official_press_assets",
+        "page_url": "https://antigravity.google/press",
+        "artifact_urls": {
+          "color": "https://antigravity.google/assets/image/brand/antigravity-icon__full-color.png",
+          "light": "https://antigravity.google/assets/image/brand/antigravity-icon__one-color.png",
+          "dark": "https://antigravity.google/assets/image/brand/antigravity-icon__white.png"
+        }
+      },
+      "render": {
+        "web": { "light": "antigravity-color.png", "dark": "antigravity-color.png" },
+        "android": { "light": "antigravity-color.png", "dark": "antigravity-color.png" },
+        "monochrome": { "light": "antigravity-light.png", "dark": "antigravity-dark.png" }
+      },
+      "files": [
+        {
+          "file": "antigravity-color.png",
+          "media_type": "image/png",
+          "sha256": "e0cd08ccd10cd8d08ccf0ba449823ee88495825c0841619618100d3ab089f51e",
+          "source_sha256": "e0cd08ccd10cd8d08ccf0ba449823ee88495825c0841619618100d3ab089f51e",
+          "transformations": ["renamed only"]
+        },
+        {
+          "file": "antigravity-light.png",
+          "media_type": "image/png",
+          "sha256": "00b50e4f0243cd07dcf536cf36bb2cf071c3e0445a99ca9afcb90142f870cc01",
+          "source_sha256": "00b50e4f0243cd07dcf536cf36bb2cf071c3e0445a99ca9afcb90142f870cc01",
+          "transformations": ["renamed only"]
+        },
+        {
+          "file": "antigravity-dark.png",
+          "media_type": "image/png",
+          "sha256": "b65fac00147e2402dcef1d7730ad0feec6611c6ed5c5cb2ead64ad7609190405",
+          "source_sha256": "b65fac00147e2402dcef1d7730ad0feec6611c6ed5c5cb2ead64ad7609190405",
+          "transformations": ["renamed only"]
+        }
+      ]
+    },
+    {
+      "provider_id": "ollama-local",
+      "accessible_name": "Ollama",
+      "owner": "Ollama",
+      "brand_use_note": "Ollama llama used only to identify the local Ollama runtime card; source-code licensing does not imply trademark permission.",
+      "source": {
+        "kind": "official_first_party_site_asset",
+        "page_url": "https://ollama.com/",
+        "artifact_url": "https://ollama.com/public/ollama.png"
+      },
+      "render": {
+        "web": { "light": "ollama-light.png", "dark": "ollama-light.png", "dark_tint": "CSS invert(1)" },
+        "android": { "light": "ollama-light.png", "dark": "ollama-light.png", "dark_tint": "#ffffff" },
+        "monochrome": "official black raster with deterministic white theme tint"
+      },
+      "files": [
+        {
+          "file": "ollama-light.png",
+          "media_type": "image/png",
+          "sha256": "5c5528504c307d34af504f39bc4e7007d2f6f31ee00dab699cc91584d1af8aca",
+          "source_sha256": "5c5528504c307d34af504f39bc4e7007d2f6f31ee00dab699cc91584d1af8aca",
+          "transformations": ["renamed only", "white dark-theme treatment is applied at render time without modifying source pixels"]
+        }
+      ]
+    }
+  ]
+}

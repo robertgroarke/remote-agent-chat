@@ -3,6 +3,7 @@
 // replace only the touched row.
 
 import { isLowSignalChatTitle } from './session-title.js';
+import { mergeFleetSummary, projectFleetSummary } from './fleet-summary.js';
 
 const UNSAFE_PATCH_KEYS = new Set(['__proto__', 'constructor', 'prototype']);
 
@@ -41,14 +42,34 @@ export function createSessionRegistry(items = []) {
     if (!id || Object.prototype.hasOwnProperty.call(byId, id)) continue;
     indexById[id] = list.length;
     order.push(id);
-    byId[id] = item;
-    list.push(item);
+    const protectedItem = protectFleetSummary(null, item);
+    byId[id] = protectedItem;
+    list.push(protectedItem);
   }
   return { byId, indexById, order, list };
 }
 
 function titleResetRequested(value) {
-  return value?.is_new_chat_draft === true || value?.is_list_view === true;
+  return value?.is_new_chat_draft === true;
+}
+
+function protectFleetSummary(previousItem, incomingItem) {
+  if (!incomingItem || typeof incomingItem !== 'object') return incomingItem;
+  if (titleResetRequested(incomingItem)) {
+    const cleared = { ...incomingItem };
+    for (const field of ['fleet_summary', 'fleet_work_context', 'last_user_request', 'last_snippet', 'last_message_at']) {
+      delete cleared[field];
+    }
+    return cleared;
+  }
+  const merged = mergeFleetSummary(previousItem?.fleet_summary, incomingItem.fleet_summary).summary;
+  if (!merged) return incomingItem;
+  const projection = projectFleetSummary(merged);
+  const next = { ...incomingItem, ...projection };
+  if (projection.fleet_work_context && next.activity && typeof next.activity === 'object' && !next.activity.work_context) {
+    next.activity = { ...next.activity, work_context: projection.fleet_work_context };
+  }
+  return next;
 }
 
 function preserveDurableSessionTitle(previousItem, incomingItem) {
@@ -78,7 +99,7 @@ export function reconcileSessionRegistry(previous, items) {
     const id = sessionRegistryId(item);
     if (!id || Object.prototype.hasOwnProperty.call(byId, id)) continue;
     const previousItem = prior.byId[id];
-    const protectedItem = preserveDurableSessionTitle(previousItem, item);
+    const protectedItem = preserveDurableSessionTitle(previousItem, protectFleetSummary(previousItem, item));
     const nextItem = previousItem !== undefined && sessionRegistryValueEqual(previousItem, protectedItem)
       ? previousItem
       : protectedItem;
@@ -119,7 +140,13 @@ export function patchSessionRegistry(previous, message) {
     if (next === base) next = { ...base };
     delete next[key];
   }
-  if (next === base) return prior;
+  if (resetTitle && !Object.prototype.hasOwnProperty.call(patch, 'chat_title')) {
+    if (next === base) next = { ...base };
+    next.chat_title = null;
+    next.chat_title_source = null;
+  }
+  next = preserveDurableSessionTitle(base, protectFleetSummary(base, next));
+  if (sessionRegistryValueEqual(next, base)) return prior;
   next.session_id = id;
   const index = prior.indexById[id];
   const list = prior.list.slice();

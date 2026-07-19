@@ -5,6 +5,7 @@ const assert = require('assert');
 const fs = require('fs');
 const path = require('path');
 const { computeAssetVersion } = require('../frontend/build');
+const { providerAssetDigest } = require('./provider-brand-assets');
 
 const ROOT = path.resolve(__dirname, '..');
 
@@ -19,10 +20,13 @@ function readVersion(filePath) {
 
 const styles = fs.readFileSync(path.join(ROOT, 'frontend', 'styles.css'));
 const bundle = fs.readFileSync(path.join(ROOT, 'frontend', 'dist', 'bundle.js'));
-const version = computeAssetVersion(styles, bundle);
-const crlfVersion = computeAssetVersion(withCrLf(styles), withCrLf(bundle));
+const providerAssets = providerAssetDigest(path.join(ROOT, 'provider-assets'));
+const version = computeAssetVersion(styles, bundle, providerAssets);
+const crlfVersion = computeAssetVersion(withCrLf(styles), withCrLf(bundle), providerAssets);
+const providerVersion = computeAssetVersion(styles, bundle, Buffer.from('provider-assets-v1'));
 
 assert.strictEqual(crlfVersion, version, 'asset identity must be invariant across LF and CRLF checkouts');
+assert.notStrictEqual(providerVersion, version, 'provider asset changes must advance the asset identity');
 assert.strictEqual(readVersion(path.join(ROOT, 'frontend', 'sw.js')), version,
   'frontend service worker must use the compiled content identity');
 assert.strictEqual(readVersion(path.join(ROOT, 'relay-server', 'public', 'sw.js')), version,
@@ -37,9 +41,14 @@ for (const indexPath of [
   assert(html.includes(`/dist/bundle.js?v=${version}`), `${indexPath} has a stale bundle identity`);
 }
 
-console.log(JSON.stringify({
+const result = {
   ok: true,
   asset_version: version,
   crlf_asset_version: crlfVersion,
   source_and_served_identity_match: true,
-}));
+};
+const outputIndex = process.argv.indexOf('--output');
+if (outputIndex >= 0 && process.argv[outputIndex + 1]) {
+  fs.writeFileSync(path.resolve(process.argv[outputIndex + 1]), `${JSON.stringify(result, null, 2)}\n`, 'utf8');
+}
+console.log(JSON.stringify(result));

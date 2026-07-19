@@ -99,6 +99,63 @@ async function measureHarness({ agentType, sourceField, startWatcher }) {
   }
 }
 
+async function measureCodexParseDeferral() {
+  const source = smallestTranscript('codex_cli', 'codex_cli_file_path');
+  assert(source, 'no readable codex_cli transcript fixture found for deferral test');
+  const tempRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'rac-codex_cli-watch-deferral-'));
+  const fixturePath = path.join(tempRoot, path.basename(source.path));
+  fs.copyFileSync(source.path, fixturePath);
+  let watcher;
+  let deferred = true;
+  let deferChecks = 0;
+  let summaries = 0;
+  let resolveSummary;
+  const observed = new Promise(resolve => { resolveSummary = resolve; });
+  try {
+    watcher = codexCli.watchSessions({
+      rootDir: tempRoot,
+      debounceMs: 10,
+      deferMs: 20,
+      shouldDefer: () => {
+        deferChecks++;
+        return deferred;
+      },
+      onSummary: summary => {
+        summaries++;
+        resolveSummary({ summary, receivedAt: Date.now() });
+      },
+      onError: error => { throw error; },
+    });
+    assert(watcher, 'codex_cli deferral watcher unavailable');
+    await Promise.race([
+      new Promise(resolve => watcher.once('ready', resolve)),
+      new Promise((_, reject) => setTimeout(() => reject(new Error('codex_cli deferral watcher did not become ready')), 5000)),
+    ]);
+    await wait(100);
+    fs.appendFileSync(fixturePath, '\n \n');
+    await wait(150);
+    assert(deferChecks > 0, 'codex_cli watcher did not consult the pre-parse deferral gate');
+    assert.strictEqual(summaries, 0, 'codex_cli watcher parsed while its pre-parse gate was active');
+    const releasedAt = Date.now();
+    deferred = false;
+    const event = await Promise.race([
+      observed,
+      new Promise((_, reject) => setTimeout(() => reject(new Error('codex_cli deferred parse did not resume')), 5000)),
+    ]);
+    const releaseToSummaryMs = event.receivedAt - releasedAt;
+    assert(releaseToSummaryMs <= 500, `codex_cli deferred parse resumed in ${releaseToSummaryMs}ms`);
+    return {
+      pre_parse_gate_checked: true,
+      summaries_while_deferred: 0,
+      release_to_summary_ms: releaseToSummaryMs,
+      configured_defer_ms: 20,
+    };
+  } finally {
+    if (watcher) await watcher.close().catch(() => {});
+    fs.rmSync(tempRoot, { recursive: true, force: true });
+  }
+}
+
 (async () => {
   const results = [];
   results.push(await measureHarness({
@@ -116,11 +173,13 @@ async function measureHarness({ agentType, sourceField, startWatcher }) {
     sourceField: 'cursor_cli_file_path',
     startWatcher: (rootDir, onSummary, onError) => cursorCli.watchSessions(onSummary, { rootDir, debounceMs: 10, onError }),
   }));
+  const codexParseDeferral = await measureCodexParseDeferral();
 
   const result = {
     ok: results.every(entry => entry.p95_ms <= 500),
     scope: 'isolated copies of real native CLI JSONL transcripts; append to parsed watcher callback',
     harnesses: results,
+    codex_parse_deferral: codexParseDeferral,
     downstream_existing_evidence: {
       relay_roundtrip_ms: 1,
       browser_render_ms: 9,

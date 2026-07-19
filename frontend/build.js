@@ -15,9 +15,11 @@ const esbuild = require('esbuild');
 const crypto = require('crypto');
 const fs = require('fs');
 const path = require('path');
+const { providerAssetDigest, syncProviderAssets } = require('../tools/provider-brand-assets');
 
 const isWatch = process.argv.includes('--watch');
 const publicDir = path.join(__dirname, '..', 'relay-server', 'public');
+const providerAssetDir = path.join(__dirname, '..', 'provider-assets');
 
 function copyFile(source, destination) {
   fs.mkdirSync(path.dirname(destination), { recursive: true });
@@ -28,10 +30,11 @@ function canonicalAssetBytes(value) {
   return Buffer.from(Buffer.from(value).toString('utf8').replace(/\r\n/g, '\n'), 'utf8');
 }
 
-function computeAssetVersion(styles, bundle) {
+function computeAssetVersion(styles, bundle, providerAssets = Buffer.alloc(0)) {
   const digest = crypto.createHash('sha256')
     .update(canonicalAssetBytes(styles))
     .update(canonicalAssetBytes(bundle))
+    .update(providerAssets)
     .digest('hex')
     .slice(0, 16);
   return `build-${digest}`;
@@ -43,6 +46,7 @@ function stampAssetIdentity() {
   const assetVersion = computeAssetVersion(
     fs.readFileSync(stylesPath),
     fs.readFileSync(bundlePath),
+    providerAssetDigest(providerAssetDir),
   );
   const cacheName = `agent-chat-${assetVersion}`;
 
@@ -61,11 +65,12 @@ function stampAssetIdentity() {
 }
 
 function syncPublicAssets() {
-  const assets = ['index.html', 'styles.css', 'app.jsx', 'hooks.jsx', 'file-utils.js', 'fleet-activity.js', 'host-resources.js', 'markdown.js', 'message-delta.js', 'message-time.js', 'navigation-epoch.js', 'provider-usage.js', 'semantic-notifications.js', 'session-pins.js', 'session-registry.js', 'session-title.js', 'state-sequence.js', 'title-disclosure.jsx', 'transcript-cache.js', 'workspace-groups.js', 'broadcast-send-policy.js', 'sw.js'];
+  const assets = ['index.html', 'styles.css', 'app.jsx', 'hooks.jsx', 'file-utils.js', 'fleet-activity.js', 'fleet-summary.js', 'host-resources.js', 'markdown.js', 'message-delta.js', 'message-time.js', 'navigation-epoch.js', 'provider-marks.jsx', 'provider-usage.js', 'semantic-notifications.js', 'session-pins.js', 'session-registry.js', 'session-title.js', 'state-sequence.js', 'title-disclosure.jsx', 'transcript-cache.js', 'workspace-groups.js', 'broadcast-send-policy.js', 'sw.js'];
   for (const asset of assets) {
     copyFile(path.join(__dirname, asset), path.join(publicDir, asset));
   }
   copyFile(path.join(__dirname, 'dist', 'bundle.js'), path.join(publicDir, 'dist', 'bundle.js'));
+  syncProviderAssets(providerAssetDir, path.join(publicDir, 'provider-assets'));
   console.log('[build] Synced relay-server/public assets');
 }
 

@@ -24,7 +24,9 @@ import { mergeSemanticNotifications } from './semantic-notifications.js';
 import { resolveDeliverySession, updateDeliveryMessage } from './delivery-tracking.js';
 import { sessionChatTitleMetadataPatch } from './session-title.js';
 import { createNavigationEpochGate } from './navigation-epoch.js';
+import { latestVisibleMessageSessionPatch } from './recent-chats.js';
 import {
+  HOST_RESOURCE_COMPACT_HISTORY_LIMIT,
   HOST_RESOURCE_DETAIL_LIMIT,
   HOST_RESOURCE_HISTORY_LIMIT,
   mergeOrderedHostResourceFrames,
@@ -62,6 +64,18 @@ export function boundedRecordWith(previous, key, value, limit = CLIENT_RUNTIME_R
   const overflow = keys.length - Math.max(1, Number(limit) || CLIENT_RUNTIME_RECORD_LIMIT);
   for (let index = 0; index < overflow; index += 1) delete next[keys[index]];
   return next;
+}
+
+export function hostResourceConsumerDemand(consumers) {
+  const entries = consumers instanceof Map ? [...consumers.values()] : Object.values(consumers || {});
+  const activeEntries = entries.filter(entry => entry && typeof entry === 'object');
+  const detailConsumerCount = activeEntries.filter(entry => entry.aggregateOnly !== true).length;
+  return {
+    active: activeEntries.length > 0,
+    aggregateOnly: detailConsumerCount === 0,
+    consumerCount: activeEntries.length,
+    detailConsumerCount,
+  };
 }
 
 function shallowMapMerge(prev, next) {
@@ -212,6 +226,7 @@ export function sessionMetadataActivityMaps(sessionList) {
       startedAt: session.activity.started_at || null,
       interruptHint: session.activity.interrupt_hint || '',
       goal: session.activity.goal || null,
+      goal_run: session.activity.goal_run || null,
       thinking: session.activity.thinking || null,
       current: session.activity.current || null,
       step: session.activity.step || null,
@@ -280,7 +295,8 @@ export function useRelay() {
     const [hostResourceHistory, setHostResourceHistory] = useState([]);
     const [hostResourceDetails, setHostResourceDetails] = useState([]);
     const [hostResourceSubscription, setHostResourceSubscription] = useState({
-      id: '', status: 'idle', aggregateOnly: false, resumed: false,
+      id: '', status: 'idle', aggregateOnly: true, resumed: false,
+      consumerCount: 0, detailConsumerCount: 0,
     });
     const [provisionalStreams, setProvisionalStreams] = useState({}); // sessionId -> ephemeral assistant stream
     const [semanticNotifications, setSemanticNotifications] = useState([]);
@@ -289,6 +305,7 @@ export function useRelay() {
     const deliveryTimers   = useRef({});
     const deliveryStatesRef = useRef({});
     const deliverySessionsRef = useRef({});
+    const permissionPromptsRef = useRef({});
     const configControlStatesRef = useRef({});
     const configControlTimers = useRef({});
     const agentConfigsRef = useRef({});
@@ -324,8 +341,12 @@ export function useRelay() {
     const provisionalPendingFlush = useRef(new Map());
     // Host resource resume tokens are requester-scoped and deliberately kept
     // only in memory. They are never written to storage, logs, or transcripts.
-    const hostResourceDesiredRef = useRef({ active: false, aggregateOnly: false });
+    const hostResourceConsumersRef = useRef(new Map());
+    const hostResourceDesiredRef = useRef({
+      active: false, aggregateOnly: true, consumerCount: 0, detailConsumerCount: 0,
+    });
     const hostResourceSubscriptionRef = useRef('');
+    const hostResourceActiveModeRef = useRef(true);
     const hostResourceSubscribeRequestRef = useRef('');
     const hostResourceRequestSerial = useRef(0);
     const hostResourceHistoryRequestRef = useRef({ system: '', detail: '' });
@@ -471,6 +492,7 @@ export function useRelay() {
         type: 'host_resource_refresh',
         protocol_version: 1,
         force: force === true,
+        aggregate_only: hostResourceDesiredRef.current.aggregateOnly === true,
         request_id: requestId,
       });
       return requestId;
@@ -522,39 +544,71 @@ export function useRelay() {
       return requestId;
     }, [send]);
 
-    const subscribeHostResources = useCallback((aggregateOnly = false) => {
-      const normalizedAggregateOnly = aggregateOnly === true;
+    const reconcileHostResourceConsumers = useCallback(() => {
       const previous = hostResourceDesiredRef.current;
-      const previousId = hostResourceSubscriptionRef.current;
-      if (previous.active && previous.aggregateOnly === normalizedAggregateOnly && previousId) return previousId;
-      if (previousId && previous.aggregateOnly !== normalizedAggregateOnly) {
-        send({
+      const next = hostResourceConsumerDemand(hostResourceConsumersRef.current);
+      hostResourceDesiredRef.current = next;
+      const subscriptionId = hostResourceSubscriptionRef.current;
+      if (!next.active) {
+        hostResourceSubscriptionRef.current = '';
+        hostResourceSubscribeRequestRef.current = '';
+        hostResourceHistoryRequestRef.current = { system: '', detail: '' };
+        hostResourceActiveModeRef.current = true;
+        if (subscriptionId) send({
           type: 'host_resource_unsubscribe', protocol_version: 1,
           request_id: `host-resource-unsubscribe-${Date.now()}-${++hostResourceRequestSerial.current}`,
-          subscription_id: previousId,
+          subscription_id: subscriptionId,
         });
-        hostResourceSubscriptionRef.current = '';
+        clearHostResources();
+        setHostResourceSubscription({
+          id: '', status: 'idle', aggregateOnly: true, resumed: false,
+          consumerCount: 0, detailConsumerCount: 0,
+        });
+        return null;
       }
-      hostResourceDesiredRef.current = { active: true, aggregateOnly: normalizedAggregateOnly };
-      clearHostResources();
-      sendHostResourceSubscribe(normalizedAggregateOnly, '');
-      return null;
+      setHostResourceSubscription(current => ({
+        ...current,
+        aggregateOnly: next.aggregateOnly,
+        consumerCount: next.consumerCount,
+        detailConsumerCount: next.detailConsumerCount,
+      }));
+      if (!previous.active) {
+        clearHostResources();
+        sendHostResourceSubscribe(next.aggregateOnly, '');
+        return null;
+      }
+      if (previous.aggregateOnly === next.aggregateOnly) return subscriptionId || null;
+      if (next.aggregateOnly) {
+        setHostResourceHistory(current => mergeOrderedHostResourceFrames(
+          [], current, HOST_RESOURCE_COMPACT_HISTORY_LIMIT,
+        ));
+        setHostResourceDetails([]);
+        setHostResources(null);
+        hostResourceHistoryRequestRef.current.detail = '';
+        hostResourceHistoryCursorRef.current.detail = 0;
+        hostResourceLastLiveSequenceRef.current.detail = 0;
+      }
+      // If the first subscribe is still awaiting acknowledgement, the ack
+      // handler observes the new desired mode and reconfigures once using the
+      // newly assigned subscription ID. This avoids parallel subscriptions.
+      if (subscriptionId) sendHostResourceSubscribe(next.aggregateOnly, subscriptionId);
+      return subscriptionId || null;
     }, [clearHostResources, send, sendHostResourceSubscribe]);
 
-    const unsubscribeHostResources = useCallback(() => {
-      hostResourceDesiredRef.current = { active: false, aggregateOnly: false };
-      const subscriptionId = hostResourceSubscriptionRef.current;
-      hostResourceSubscriptionRef.current = '';
-      hostResourceSubscribeRequestRef.current = '';
-      hostResourceHistoryRequestRef.current = { system: '', detail: '' };
-      if (subscriptionId) send({
-        type: 'host_resource_unsubscribe', protocol_version: 1,
-        request_id: `host-resource-unsubscribe-${Date.now()}-${++hostResourceRequestSerial.current}`,
-        subscription_id: subscriptionId,
-      });
-      clearHostResources();
-      setHostResourceSubscription({ id: '', status: 'idle', aggregateOnly: false, resumed: false });
-    }, [clearHostResources, send]);
+    const subscribeHostResources = useCallback((aggregateOnly = false, consumerId = 'dashboard') => {
+      const normalizedId = String(consumerId || 'dashboard').trim().slice(0, 64) || 'dashboard';
+      const normalizedAggregateOnly = aggregateOnly === true;
+      const existing = hostResourceConsumersRef.current.get(normalizedId);
+      if (existing?.aggregateOnly === normalizedAggregateOnly) return hostResourceSubscriptionRef.current || null;
+      hostResourceConsumersRef.current.set(normalizedId, { aggregateOnly: normalizedAggregateOnly });
+      return reconcileHostResourceConsumers();
+    }, [reconcileHostResourceConsumers]);
+
+    const unsubscribeHostResources = useCallback((consumerId = 'dashboard') => {
+      const normalizedId = String(consumerId || 'dashboard').trim().slice(0, 64) || 'dashboard';
+      if (!hostResourceConsumersRef.current.delete(normalizedId)) return hostResourceSubscriptionRef.current || null;
+      return reconcileHostResourceConsumers();
+    }, [reconcileHostResourceConsumers]);
 
     const setSessionSubscriptions = useCallback((sessionIds) => {
       const normalized = [...new Set((Array.isArray(sessionIds) ? sessionIds : [])
@@ -686,6 +740,7 @@ export function useRelay() {
     }
 
     useEffect(() => { agentConfigsRef.current = agentConfigs; }, [agentConfigs]);
+    useEffect(() => { permissionPromptsRef.current = permissionPrompts; }, [permissionPrompts]);
 
     function configControlKey(sessionId, field) {
       return `${sessionId}:${field}`;
@@ -1214,18 +1269,31 @@ export function useRelay() {
     function respondToPrompt(sessionId, promptId, choiceId, details = {}) {
       const requestId = `prompt-${Date.now()}-${Math.random().toString(36).slice(2, 7)}`;
       const instruction = typeof details.instruction === 'string' ? details.instruction.trim() : '';
-      const submittingChoiceId = choiceId || (Array.isArray(details.answers)
-        ? 'question_answers' : (instruction ? 'alternate_instruction' : null));
+      const prompt = permissionPromptsRef.current[sessionId];
+      const firstClassQuestion = prompt?.type === 'question_prompt';
+      const questionAction = details.action === 'cancel' ? 'cancel' : 'answer';
+      const submittingChoiceId = choiceId || (questionAction === 'cancel'
+        ? 'question_cancel' : (Array.isArray(details.answers)
+          ? 'question_answers' : (instruction ? 'alternate_instruction' : null)));
       setPermissionPrompts(prev => prev[sessionId]
         ? { ...prev, [sessionId]: { ...prev[sessionId], submitting_choice_id: submittingChoiceId, request_id: requestId, error: null } }
         : prev);
-      send({
-        type: 'permission_response', session_id: sessionId, prompt_id: promptId,
-        ...(choiceId ? { choice_id: choiceId } : {}),
-        ...(Array.isArray(details.answers) ? { answers: details.answers } : {}),
-        ...(instruction ? { instruction } : {}),
-        request_id: requestId,
-      });
+      if (firstClassQuestion) {
+        send({
+          type: 'question_response', session_id: sessionId, prompt_id: promptId,
+          generation: prompt.generation, action: questionAction,
+          ...(questionAction === 'answer' ? { answers: details.answers || [] } : {}),
+          request_id: requestId,
+        });
+      } else {
+        send({
+          type: 'permission_response', session_id: sessionId, prompt_id: promptId,
+          ...(choiceId ? { choice_id: choiceId } : {}),
+          ...(Array.isArray(details.answers) ? { answers: details.answers } : {}),
+          ...(instruction ? { instruction } : {}),
+          request_id: requestId,
+        });
+      }
     }
 
     function respondToErrorPrompt(sessionId, promptId, actionId) {
@@ -1700,7 +1768,11 @@ export function useRelay() {
         const previousId = hostResourceSubscriptionRef.current;
         const subscriptionId = msg.subscription_id;
         const resumed = msg.resumed === true && previousId === subscriptionId;
+        const acknowledgedAggregateOnly = msg.aggregate_only === true;
+        const modeChanged = previousId === subscriptionId
+          && hostResourceActiveModeRef.current !== acknowledgedAggregateOnly;
         hostResourceSubscriptionRef.current = subscriptionId;
+        hostResourceActiveModeRef.current = acknowledgedAggregateOnly;
         hostResourceSubscribeRequestRef.current = '';
         if (!resumed) {
           setHostResourceHistory([]);
@@ -1708,15 +1780,31 @@ export function useRelay() {
           setHostResources(null);
           hostResourceHistoryCursorRef.current = { system: 0, detail: 0 };
           hostResourceLastLiveSequenceRef.current = { system: 0, detail: 0 };
+        } else if (modeChanged && acknowledgedAggregateOnly) {
+          setHostResourceHistory(previous => mergeOrderedHostResourceFrames(
+            [], previous, HOST_RESOURCE_COMPACT_HISTORY_LIMIT,
+          ));
+          setHostResourceDetails([]);
+          setHostResources(null);
+          hostResourceHistoryRequestRef.current.detail = '';
+          hostResourceHistoryCursorRef.current.detail = 0;
+          hostResourceLastLiveSequenceRef.current.detail = 0;
         }
         setHostResourceSubscription({
           id: subscriptionId,
           status: 'live',
-          aggregateOnly: msg.aggregate_only === true,
+          aggregateOnly: acknowledgedAggregateOnly,
           resumed,
+          consumerCount: hostResourceDesiredRef.current.consumerCount,
+          detailConsumerCount: hostResourceDesiredRef.current.detailConsumerCount,
         });
         requestHostResourceHistory('system', resumed ? hostResourceHistoryCursorRef.current.system : 0);
-        requestHostResourceHistory('detail', resumed ? hostResourceHistoryCursorRef.current.detail : 0);
+        if (!acknowledgedAggregateOnly) {
+          requestHostResourceHistory('detail', resumed ? hostResourceHistoryCursorRef.current.detail : 0);
+        }
+        if (hostResourceDesiredRef.current.aggregateOnly !== acknowledgedAggregateOnly) {
+          sendHostResourceSubscribe(hostResourceDesiredRef.current.aggregateOnly, subscriptionId);
+        }
         return;
       }
       if (t === 'host_resource_history_chunk') {
@@ -1726,8 +1814,12 @@ export function useRelay() {
           || msg.request_id !== hostResourceHistoryRequestRef.current[stream]) return;
         const points = Array.isArray(chunk.points) ? chunk.points : [];
         if (stream === 'system') {
-          setHostResourceHistory(previous => mergeOrderedHostResourceFrames(previous, points, HOST_RESOURCE_HISTORY_LIMIT));
+          const historyLimit = hostResourceDesiredRef.current.aggregateOnly
+            ? HOST_RESOURCE_COMPACT_HISTORY_LIMIT
+            : HOST_RESOURCE_HISTORY_LIMIT;
+          setHostResourceHistory(previous => mergeOrderedHostResourceFrames(previous, points, historyLimit));
         } else {
+          if (hostResourceDesiredRef.current.aggregateOnly) return;
           setHostResourceDetails(previous => mergeOrderedHostResourceFrames(previous, points, HOST_RESOURCE_DETAIL_LIMIT));
           const latest = points.filter(point => point && typeof point === 'object')
             .sort((left, right) => Number(left.sample_sequence || 0) - Number(right.sample_sequence || 0)).at(-1);
@@ -1750,11 +1842,15 @@ export function useRelay() {
           || sequence <= hostResourceLastLiveSequenceRef.current.system) return;
         hostResourceLastLiveSequenceRef.current.system = sequence;
         hostResourceHistoryCursorRef.current.system = Math.max(hostResourceHistoryCursorRef.current.system, sequence);
-        setHostResourceHistory(previous => mergeOrderedHostResourceFrames(previous, point, HOST_RESOURCE_HISTORY_LIMIT));
+        const historyLimit = hostResourceDesiredRef.current.aggregateOnly
+          ? HOST_RESOURCE_COMPACT_HISTORY_LIMIT
+          : HOST_RESOURCE_HISTORY_LIMIT;
+        setHostResourceHistory(previous => mergeOrderedHostResourceFrames(previous, point, historyLimit));
         setHostResourceError(null);
         return;
       }
       if (t === 'host_resource_detail') {
+        if (hostResourceDesiredRef.current.aggregateOnly) return;
         const snapshot = msg.snapshot;
         const sequence = Number(snapshot?.sample_sequence);
         if (msg.subscription_id !== hostResourceSubscriptionRef.current
@@ -1880,7 +1976,7 @@ export function useRelay() {
         // Restore open permission prompts on reconnect
         {
           const restored = {};
-          (msg.open_prompts || []).forEach(p => {
+          [...(msg.open_prompts || []), ...(msg.open_question_prompts || [])].forEach(p => {
             const sid = p.session_id || p.session;
             if (sid) restored[sid] = { ...p, received_at: Date.now() };
           });
@@ -1937,8 +2033,11 @@ export function useRelay() {
             ...(msg.status ? { status: msg.status } : {}),
             ...(msg.activity ? { activity: msg.activity } : {}),
             ...(msg.goal ? { goal: msg.goal } : {}),
+            ...(msg.fleet_summary ? { fleet_summary: msg.fleet_summary } : {}),
+            ...(msg.fleet_work_context ? { fleet_work_context: msg.fleet_work_context } : {}),
+            ...(msg.last_user_request ? { last_user_request: msg.last_user_request } : {}),
             ...(msg.last_snippet != null ? { last_snippet: msg.last_snippet } : {}),
-            ...(msg.last_message_at != null ? { last_message_at: msg.last_message_at } : {}),
+            ...latestVisibleMessageSessionPatch(msg),
             ...sessionChatTitleMetadataPatch(msg),
           };
         }));
@@ -2209,6 +2308,7 @@ export function useRelay() {
               startedAt: msg.activity?.started_at || null,
               interruptHint: msg.activity?.interrupt_hint || '',
               goal: msg.activity?.goal || null,
+              goal_run: msg.activity?.goal_run || null,
               thinking: msg.activity?.thinking || null,
               current: msg.activity?.current || null,
               step: msg.activity?.step || null,
@@ -2256,6 +2356,55 @@ export function useRelay() {
       if (t === 'permission_prompt') {
         const sid = msg.session_id || msg.session;
         if (sid) setPermissionPrompts(prev => ({ ...prev, [sid]: { ...msg, received_at: Date.now() } }));
+        return;
+      }
+
+      if (t === 'question_prompt') {
+        const sid = msg.session_id || msg.session;
+        if (sid) setPermissionPrompts(prev => {
+          const current = prev[sid];
+          const samePrompt = current?.prompt_id === msg.prompt_id && current?.generation === msg.generation;
+          return {
+            ...prev,
+            [sid]: {
+              ...(samePrompt ? current : {}),
+              ...msg,
+              received_at: samePrompt ? current.received_at : Date.now(),
+              ...(msg.lifecycle === 'submitting'
+                ? { submitting_choice_id: current?.submitting_choice_id || 'question_answers' }
+                : {}),
+            },
+          };
+        });
+        return;
+      }
+
+      if (t === 'question_prompt_state') {
+        const sid = msg.session_id || msg.session;
+        if (sid && msg.lifecycle === 'failed') {
+          setPermissionPrompts(prev => {
+            const current = prev[sid];
+            const samePrompt = current?.prompt_id === msg.prompt_id && current?.generation === msg.generation;
+            if (current && !samePrompt) return prev;
+            return {
+              ...prev,
+              [sid]: {
+                ...(samePrompt ? current : {}),
+                ...msg,
+                type: 'question_prompt',
+                received_at: samePrompt ? current.received_at : Date.now(),
+                submitting_choice_id: null,
+              },
+            };
+          });
+        } else if (sid && !['open', 'submitting'].includes(msg.lifecycle)) {
+          setPermissionPrompts(prev => {
+            const current = prev[sid];
+            if (current?.prompt_id !== msg.prompt_id || current?.generation !== msg.generation) return prev;
+            const { [sid]: _, ...rest } = prev;
+            return rest;
+          });
+        }
         return;
       }
 
@@ -2418,11 +2567,15 @@ export function useRelay() {
         if (sid && msg.result === 'ok' && msg.command === 'switch_chat') {
           requestChatList(sid);
         }
-        if (msg.command === 'permission_response' && sid) {
+        if (['permission_response', 'question_response'].includes(msg.command) && sid) {
           if (msg.result === 'ok') {
-            setPermissionPrompts(prev => { const { [sid]: _, ...rest } = prev; return rest; });
+            setPermissionPrompts(prev => {
+              if (prev[sid]?.request_id !== msg.request_id) return prev;
+              const { [sid]: _, ...rest } = prev;
+              return rest;
+            });
           } else if (msg.result === 'failed') {
-            setPermissionPrompts(prev => prev[sid]
+            setPermissionPrompts(prev => prev[sid]?.request_id === msg.request_id
               ? { ...prev, [sid]: { ...prev[sid], submitting_choice_id: null, error: msg.error?.message || 'Permission response failed' } }
               : prev);
           }
@@ -2777,6 +2930,14 @@ export function useRelay() {
 
         if (role === 'assistant' && id !== activeSessionRef.current) {
           setUnread(prev => ({ ...prev, [id]: (prev[id] || 0) + 1 }));
+        }
+        const latestMessagePatch = latestVisibleMessageSessionPatch(msg);
+        if (Object.keys(latestMessagePatch).length > 0) {
+          setSessions(prev => prev.map(session => (
+            (typeof session === 'string' ? session : session?.session_id) === id
+              ? { ...(typeof session === 'object' ? session : {}), session_id: id, ...latestMessagePatch }
+              : session
+          )));
         }
         return;
       }

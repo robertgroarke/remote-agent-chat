@@ -311,13 +311,20 @@ const completedWithoutAssistantFixture = path.join(os.tmpdir(), `codex-cli-compl
 const completedWithoutAssistantBase = now - 120000;
 fs.writeFileSync(completedWithoutAssistantFixture, [
   { timestamp: new Date(completedWithoutAssistantBase).toISOString(), type: 'session_meta', payload: { id: '00000000-0000-4000-8000-000000000104', cwd: process.cwd(), model: 'gpt-5.6-sol' } },
-  { timestamp: new Date(completedWithoutAssistantBase + 1000).toISOString(), type: 'event_msg', payload: { type: 'task_started', started_at: Math.floor((completedWithoutAssistantBase + 1000) / 1000) } },
+  { timestamp: new Date(completedWithoutAssistantBase + 1000).toISOString(), type: 'event_msg', payload: { type: 'task_started', turn_id: 'completed-without-assistant-turn', started_at: Math.floor((completedWithoutAssistantBase + 1000) / 1000) } },
   { timestamp: new Date(completedWithoutAssistantBase + 1500).toISOString(), type: 'response_item', payload: { type: 'message', role: 'user', content: [{ type: 'input_text', text: 'A request that receives no assistant row' }] } },
   { timestamp: new Date(completedWithoutAssistantBase + 2000).toISOString(), type: 'event_msg', payload: { type: 'token_count', info: { total_token_usage: {} }, rate_limits: { limit_id: 'premium', credits: { has_credits: false, balance: '0' } } } },
-  { timestamp: new Date(completedWithoutAssistantBase + 2500).toISOString(), type: 'event_msg', payload: { type: 'task_complete', completed_at: Math.floor((completedWithoutAssistantBase + 2500) / 1000), last_agent_message: null } },
+  { timestamp: new Date(completedWithoutAssistantBase + 2200).toISOString(), type: 'response_item', payload: { type: 'reasoning', summary: [] } },
+  { timestamp: new Date(completedWithoutAssistantBase + 2500).toISOString(), type: 'event_msg', payload: { type: 'task_complete', turn_id: 'completed-without-assistant-turn', completed_at: Math.floor((completedWithoutAssistantBase + 2500) / 1000), last_agent_message: null } },
 ].map(entry => JSON.stringify(entry)).join('\n') + '\n');
 const completedWithoutAssistantSummary = codexCli.readSessionSummary(completedWithoutAssistantFixture);
-assert.strictEqual(completedWithoutAssistantSummary.activity, null, 'task_complete without an assistant row must clear generating activity');
+assert.strictEqual(completedWithoutAssistantSummary.activity, null, 'task_complete must clear pre-terminal reasoning even without an assistant row');
+assert.strictEqual(completedWithoutAssistantSummary.taskStartedTurnId, 'completed-without-assistant-turn');
+assert.strictEqual(completedWithoutAssistantSummary.taskCompletedTurnId, 'completed-without-assistant-turn');
+assert.strictEqual(
+  completedWithoutAssistantSummary.taskCompletedAt,
+  new Date(completedWithoutAssistantBase + 2500).toISOString(),
+);
 assert.strictEqual(completedWithoutAssistantSummary.messages.length, 1);
 assert.strictEqual(completedWithoutAssistantSummary.messages[0].role, 'user');
 try { fs.unlinkSync(completedWithoutAssistantFixture); } catch {}

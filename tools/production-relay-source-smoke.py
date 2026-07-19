@@ -55,7 +55,9 @@ def main() -> None:
         "/app/scheduled-sends.js": sha256(source_root / "relay-server" / "scheduled-sends.js"),
         "/app/question-contract-loader.js": sha256(source_root / "relay-server" / "question-contract-loader.js"),
         "/app/question-prompt-registry.js": sha256(source_root / "relay-server" / "question-prompt-registry.js"),
+        "/app/fleet-summary-loader.js": sha256(source_root / "relay-server" / "fleet-summary-loader.js"),
         "/app/shared/question-prompt-contract.js": sha256(source_root / "shared" / "question-prompt-contract.js"),
+        "/app/shared/fleet-summary.js": sha256(source_root / "shared" / "fleet-summary.js"),
     }
     ssh = paramiko.SSHClient()
     ssh.set_missing_host_key_policy(paramiko.AutoAddPolicy())

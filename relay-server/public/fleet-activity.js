@@ -12,11 +12,28 @@ const FLEET_ATTENTION_GOAL_STATES = new Set([
 ]);
 
 const FLEET_TERMINAL_GOAL_STATES = new Set(['complete', 'completed', 'cancelled', 'canceled']);
+const FLEET_WORKING_GOAL_RUN_STATES = new Set([
+  'starting', 'running_turn', 'checkpoint_pending_continuation', 'verifying',
+]);
+const FLEET_ATTENTION_GOAL_RUN_STATES = new Set(['waiting_for_user', 'blocked_limited']);
+const FLEET_TERMINAL_GOAL_RUN_STATES = new Set([
+  'paused', 'completed_cancelled_failed', 'unknown_disconnected',
+]);
 export const DEFAULT_ACTIVITY_FRESHNESS_MS = 15_000;
 
 function normalizedGoalState(activity) {
   return String(activity?.goal?.state || activity?.goal?.status || '')
     .trim().toLowerCase().replace(/[^a-z]/g, '');
+}
+
+function canonicalGoalRun(activity) {
+  const goal = activity?.goal;
+  const run = activity?.goal_run;
+  if (!goal || !run || run.schema_version !== 1) return null;
+  if (!run.run_id || !run.goal_fingerprint || !Number.isFinite(Number(run.goal_generation))) return null;
+  if (String(run.goal_fingerprint) !== String(goal.fingerprint || '')) return null;
+  if (Number(run.goal_generation) !== Math.max(1, Number(goal.generation) || 1)) return null;
+  return run;
 }
 
 function timestampMs(value) {
@@ -49,20 +66,48 @@ export function fleetActivityIsFresh(activity, options = {}) {
 export function classifyFleetActivity(activity, needsAttention = false, options = {}) {
   const kind = String(activity?.kind || '').trim().toLowerCase();
   const goalState = normalizedGoalState(activity);
-  if (needsAttention || FLEET_ATTENTION_KINDS.has(kind) || FLEET_ATTENTION_GOAL_STATES.has(goalState)) {
+  const goalRun = canonicalGoalRun(activity);
+  const runLifecycle = String(goalRun?.lifecycle || '').trim().toLowerCase();
+  if (needsAttention || FLEET_ATTENTION_KINDS.has(kind) || FLEET_ATTENTION_GOAL_STATES.has(goalState)
+      || FLEET_ATTENTION_GOAL_RUN_STATES.has(runLifecycle)) {
     return 'needs_attention';
   }
+  if (goalRun && runLifecycle === 'unknown_disconnected') return 'stale';
+  if (goalRun && FLEET_TERMINAL_GOAL_RUN_STATES.has(runLifecycle)) return 'idle';
   if (FLEET_TERMINAL_GOAL_STATES.has(goalState)) return 'idle';
+  // A producer-owned lease is stronger than generic activity freshness. It is
+  // intentionally sticky across native turn checkpoints and relay reconnects.
+  if (goalRun?.lease_active === true && FLEET_WORKING_GOAL_RUN_STATES.has(runLifecycle)) {
+    return 'working_goal';
+  }
+  // Once a producer emits the canonical contract, an unleased active archive
+  // cannot fall through to legacy generating heuristics and resurrect itself.
+  if (goalRun && goalState === 'active') {
+    return fleetActivityIsFresh(activity, options) ? 'between_goal_turns' : 'stale';
+  }
+  if (goalState === 'active') {
+    return fleetActivityIsFresh(activity, options) ? 'between_goal_turns' : 'stale';
+  }
   // Freshness gates claims of active work, not an explicit native idle state.
   // Otherwise every settled session flips to Stale and reappears when Fleet's
   // bounded freshness window expires.
   if (kind === 'idle' && goalState !== 'active') return 'idle';
   if (!fleetActivityIsFresh(activity, options)) return 'stale';
   const hasExecutionProof = activity?.generating === true || FLEET_ACTIVE_KINDS.has(kind);
-  if (hasExecutionProof && goalState === 'active') return 'working_goal';
   if (hasExecutionProof) return 'working';
-  if (goalState === 'active') return 'between_goal_turns';
   return 'idle';
+}
+
+export function fleetGoalSubstateLabel(activity, options = {}) {
+  const run = canonicalGoalRun(activity);
+  const lifecycle = String(run?.lifecycle || '').trim().toLowerCase();
+  if (!run || run.lease_active !== true) return '';
+  if (lifecycle === 'checkpoint_pending_continuation') return 'Waiting for next goal turn';
+  if (lifecycle === 'verifying' || options.connected === false
+      || String(options.health || '').toLowerCase() === 'disconnected') return 'Reconnecting';
+  if (lifecycle === 'starting') return 'Starting goal';
+  if (lifecycle === 'running_turn') return 'Working';
+  return 'Goal loop active';
 }
 
 export function fleetStateLabel(state) {

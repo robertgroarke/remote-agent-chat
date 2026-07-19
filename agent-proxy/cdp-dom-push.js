@@ -80,6 +80,7 @@ class CdpDomPushManager {
       lastSignalAt: state.lastSignalAt || 0,
       consecutiveErrors: state.consecutiveErrors || 0,
       backoffUntil: state.backoffUntil || 0,
+      installedContextIds: [...(state.installedContextIds || [])],
     };
   }
 
@@ -111,8 +112,7 @@ class CdpDomPushManager {
     try { return await options.resolveContextId(); } catch { return null; }
   }
 
-  async _install(state) {
-    const contextId = await this._resolveContextId(state.options);
+  async _installInContext(state, contextId, authoritative = true) {
     const result = await state.runtime.evaluate({
       expression: observerExpression(this.policy.bindingName, this.policy.observerKey, state.token),
       returnByValue: true,
@@ -121,9 +121,60 @@ class CdpDomPushManager {
       ...(Number.isInteger(contextId) ? { contextId } : {}),
     });
     const value = result?.result?.value || { ok: false, reason: 'observer_result_missing' };
-    state.status = value.ok ? 'active' : 'fallback';
-    if (value.ok) state.consecutiveErrors = 0;
+    if (authoritative) state.status = value.ok ? 'active' : 'fallback';
+    if (value.ok) {
+      state.installedContextIds.add(Number.isInteger(contextId) ? contextId : null);
+      if (authoritative) {
+        state.consecutiveErrors = 0;
+        state.installedContextId = Number.isInteger(contextId) ? contextId : null;
+      }
+    }
     return value;
+  }
+
+  async _install(state) {
+    const contextId = await this._resolveContextId(state.options);
+    if (state.options.requireContext === true && !Number.isInteger(contextId)) {
+      throw new Error('execution context unavailable');
+    }
+    return this._installInContext(state, contextId, true);
+  }
+
+  _installCreatedContext(state, contextId) {
+    if (!Number.isInteger(contextId) || this.states.get(state.sessionId) !== state) return;
+    if (state.contextInstallTimers.has(contextId)) clearTimeout(state.contextInstallTimers.get(contextId));
+    const timer = setTimeout(() => {
+      state.contextInstallTimers.delete(contextId);
+      if (this.states.get(state.sessionId) !== state) return;
+      this._installInContext(state, contextId, false).catch(error => {
+        if (!this._isContextError(error)) {
+          this.log('warn', `[${state.sessionId}] DOM push new-context install: ${error.message}`);
+        }
+      });
+    }, Math.max(0, Number(this.policy.reinstallMs) || 0));
+    timer.unref?.();
+    state.contextInstallTimers.set(contextId, timer);
+  }
+
+  _scheduleReinstall(state, delayMs = this.policy.reinstallMs) {
+    if (this.states.get(state.sessionId) !== state) return;
+    if (state.reinstallTimer) clearTimeout(state.reinstallTimer);
+    state.status = 'reinstalling';
+    state.reinstallTimer = setTimeout(() => {
+      state.reinstallTimer = null;
+      this._install(state).catch(async error => {
+        const contextError = this._isContextError(error);
+        await this._recordRuntimeError(state, error, 'reinstall');
+        if (contextError && this.states.get(state.sessionId) === state) {
+          const retryDelay = Math.min(
+            1000,
+            this.policy.reinstallMs * Math.max(1, Number(state.consecutiveErrors || 1)),
+          );
+          this._scheduleReinstall(state, retryDelay);
+        }
+      });
+    }, Math.max(0, Number(delayMs) || 0));
+    state.reinstallTimer.unref?.();
   }
 
   _isContextError(error) {
@@ -143,18 +194,26 @@ class CdpDomPushManager {
     if (state) {
       if (state.debounceTimer) clearTimeout(state.debounceTimer);
       if (state.reinstallTimer) clearTimeout(state.reinstallTimer);
+      for (const timer of state.contextInstallTimers || []) clearTimeout(timer[1]);
       try { state.disposeBinding?.(); } catch {}
       try { state.disposeContexts?.(); } catch {}
-      try {
-        const contextId = await this._resolveContextId(state.options);
-        await state.runtime.evaluate({
-          expression: `(() => { const entry = globalThis[${JSON.stringify(this.policy.observerKey)}]; try { entry?.observer?.disconnect(); } catch {} delete globalThis[${JSON.stringify(this.policy.observerKey)}]; return true; })()`,
-          returnByValue: true,
-          silent: true,
-          userGesture: false,
-          ...(Number.isInteger(contextId) ? { contextId } : {}),
-        });
-      } catch {}
+      try { state.disposeContextCreated?.(); } catch {}
+      try { state.disposeContextDestroyed?.(); } catch {}
+      const contextIds = new Set(state.installedContextIds || []);
+      if (contextIds.size === 0) {
+        try { contextIds.add(await this._resolveContextId(state.options)); } catch {}
+      }
+      for (const contextId of contextIds) {
+        try {
+          await state.runtime.evaluate({
+            expression: `(() => { const entry = globalThis[${JSON.stringify(this.policy.observerKey)}]; try { entry?.observer?.disconnect(); } catch {} delete globalThis[${JSON.stringify(this.policy.observerKey)}]; return true; })()`,
+            returnByValue: true,
+            silent: true,
+            userGesture: false,
+            ...(Number.isInteger(contextId) ? { contextId } : {}),
+          });
+        } catch {}
+      }
       try { await state.runtime.removeBinding?.({ name: this.policy.bindingName }); } catch {}
       this.states.delete(sessionId);
     }
@@ -197,7 +256,11 @@ class CdpDomPushManager {
 
   _queueDispatch(state, payload) {
     state.pendingEvent = payload;
-    if (state.debounceTimer) clearTimeout(state.debounceTimer);
+    // Bound first-observation latency during continuous DOM mutation storms.
+    // Resetting a trailing debounce here lets animated request cards postpone
+    // their first poll indefinitely; retain the latest payload but keep the
+    // original deadline once a dispatch window has started.
+    if (state.debounceTimer) return;
     state.debounceTimer = setTimeout(() => {
       state.debounceTimer = null;
       this._dispatch(state).catch(error => {
@@ -227,6 +290,8 @@ class CdpDomPushManager {
         sourceAt: Number(payload.source_at || receivedAt),
         receivedAt,
         bindingToProxyMs: Math.max(0, receivedAt - Number(payload.source_at || receivedAt)),
+        cdpToQueueMs: Math.max(0, Number(payload.proxy_received_at || receivedAt) - Number(payload.source_at || receivedAt)),
+        queueToDispatchMs: Math.max(0, receivedAt - Number(payload.proxy_received_at || receivedAt)),
       });
       state.consecutiveErrors = 0;
     } finally {
@@ -271,8 +336,12 @@ class CdpDomPushManager {
       inFlight: false,
       pendingEvent: null,
       queuedEvent: null,
+      installedContextIds: new Set(),
+      contextInstallTimers: new Map(),
       disposeBinding: null,
       disposeContexts: null,
+      disposeContextCreated: null,
+      disposeContextDestroyed: null,
       consecutiveErrors: 0,
       backoffCount: Number(fallback?.backoffCount || 0),
     };
@@ -285,17 +354,35 @@ class CdpDomPushManager {
         let payload;
         try { payload = JSON.parse(event.payload || '{}'); } catch { return; }
         if (payload.token !== state.token) return;
-        this._queueDispatch(state, payload);
+        this._queueDispatch(state, {
+          ...payload,
+          proxy_received_at: Date.now(),
+          executionContextId: Number.isInteger(event.executionContextId)
+            ? event.executionContextId
+            : null,
+        });
       });
       if (typeof runtime.executionContextsCleared === 'function') {
         state.disposeContexts = runtime.executionContextsCleared(() => {
-          if (state.reinstallTimer) clearTimeout(state.reinstallTimer);
-          state.reinstallTimer = setTimeout(() => {
-            state.reinstallTimer = null;
-            this._install(state).catch(error => {
-              this._recordRuntimeError(state, error, 'reinstall').catch(() => {});
-            });
-          }, this.policy.reinstallMs);
+          state.installedContextId = null;
+          state.installedContextIds.clear();
+          this._scheduleReinstall(state);
+        });
+      }
+      if (typeof runtime.executionContextDestroyed === 'function') {
+        state.disposeContextDestroyed = runtime.executionContextDestroyed(event => {
+          const contextId = Number(event?.executionContextId);
+          state.installedContextIds.delete(contextId);
+          if (contextId !== Number(state.installedContextId)) return;
+          state.installedContextId = null;
+          this._scheduleReinstall(state);
+        });
+      }
+      if (typeof runtime.executionContextCreated === 'function') {
+        state.disposeContextCreated = runtime.executionContextCreated(event => {
+          const contextId = Number(event?.context?.id);
+          this._installCreatedContext(state, contextId);
+          if (state.status !== 'active') this._scheduleReinstall(state);
         });
       }
       const installed = await this._install(state);

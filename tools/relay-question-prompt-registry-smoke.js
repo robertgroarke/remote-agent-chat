@@ -160,6 +160,8 @@ const expiring = registry.open(prompt('codex-desktop', 1001, {
 clock += 1001;
 expectCode(() => registry.claim(response(expiring, 'deadline-late-response')), 'prompt_expired');
 assert.strictEqual(questionPromptDeadlineGraceMs(expiring), NATIVE_DEADLINE_RECEIPT_GRACE_MS);
+assert.strictEqual(NATIVE_DEADLINE_RECEIPT_GRACE_MS, 15000,
+  'native receipt-only grace does not cover the measured 8.98s proxy delivery tail');
 assert.strictEqual(registry.get(expiring.session_id, expiring.prompt_id).lifecycle, 'open',
   'a late browser response must not beat the native deadline receipt during its bounded grace');
 assert.strictEqual(registry.terminalFromSource({
@@ -248,6 +250,7 @@ console.log(JSON.stringify({
   terminal_duplicate_not_resurrected: true,
   deadline_failed_closed: true,
   native_deadline_receipt_grace_ms: NATIVE_DEADLINE_RECEIPT_GRACE_MS,
+  browser_response_window_extended: false,
   cancel_contract_idempotent: true,
   legacy_question_adapter_separate_from_permissions: true,
   deployed_contract_layout_loaded: deployedLayoutLoaded,

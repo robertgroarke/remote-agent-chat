@@ -1274,7 +1274,8 @@ const s = StyleSheet.create({
     color:     '#8b949e',
     fontSize:  12,
     lineHeight: 16,
-    minWidth:  68,
+    minWidth:  0,
+    flexShrink: 1,
     marginTop: 3,
     marginHorizontal: 4,
     fontVariant: ['tabular-nums'],
@@ -1287,6 +1288,7 @@ const s = StyleSheet.create({
   },
   metaRow: {
     flexDirection: 'row',
+    flexWrap:      'wrap',
     alignItems:    'center',
     gap:           6,
   },

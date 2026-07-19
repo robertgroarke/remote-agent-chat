@@ -1,0 +1,34 @@
+{
+  "dark": {
+    "container": "#1c2128",
+    "border": "#f0883e",
+    "text": "#cdd9e5",
+    "muted": "#768390",
+    "questionBorder": "#30363d",
+    "optionBackground": "#21262d",
+    "optionBorder": "#30363d",
+    "selectedBackground": "#1b365d",
+    "selectedBorder": "#58a6ff",
+    "inputBackground": "#0d1117",
+    "inputBorder": "#30363d",
+    "accent": "#58a6ff",
+    "submitBackground": "#1f6feb",
+    "submitText": "#ffffff"
+  },
+  "light": {
+    "container": "#f6f8fa",
+    "border": "#bc6b00",
+    "text": "#24292f",
+    "muted": "#57606a",
+    "questionBorder": "#d0d7de",
+    "optionBackground": "#ffffff",
+    "optionBorder": "#d0d7de",
+    "selectedBackground": "#ddf4ff",
+    "selectedBorder": "#0969da",
+    "inputBackground": "#ffffff",
+    "inputBorder": "#afb8c1",
+    "accent": "#0969da",
+    "submitBackground": "#0969da",
+    "submitText": "#ffffff"
+  }
+}

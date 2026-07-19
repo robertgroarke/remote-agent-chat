@@ -21,8 +21,15 @@ const screenshotDir = option('--screenshot-dir');
 
 const session = {
   session_id: 'host-resource-fixture', agent_type: 'codex_cli', display_name: 'Host resource fixture',
-  title: 'Host resource fixture', status: 'healthy', workspace_path: root, project_root: root,
+  title: 'Host resource fixture', chat_title: 'Host resource fixture', status: 'healthy',
+  workspace_name: 'Remote Agent Chat', workspace_path: root, project_root: root,
 };
+const desktopSession = {
+  session_id: 'host-resource-desktop-fixture', agent_type: 'codex-desktop', display_name: 'Host resource desktop fixture',
+  title: 'Host resource desktop fixture', chat_title: 'Host resource desktop fixture', status: 'healthy',
+  workspace_name: 'Remote Agent Chat', workspace_path: root, project_root: root,
+};
+const fixtureSessions = [session, desktopSession];
 
 function findChrome() {
   const candidates = [
@@ -45,6 +52,15 @@ function freePort() {
       probe.close(error => error ? reject(error) : resolve(port));
     });
   });
+}
+
+async function waitUntil(predicate, timeoutMs, label) {
+  const startedAt = Date.now();
+  while (Date.now() - startedAt < timeoutMs) {
+    if (predicate()) return;
+    await new Promise(resolve => setTimeout(resolve, 25));
+  }
+  throw new Error(`Timed out waiting for ${label}`);
 }
 
 function contentType(filePath) {
@@ -133,8 +149,14 @@ async function main() {
   const clientFrames = [];
   const consoleErrors = [];
   const subscriptions = new Map();
+  const connections = new Set();
   let subscriptionSerial = 0;
+  let connectionSerial = 0;
+  let connectionCount = 0;
+  let subscribeCount = 0;
   let unsubscribeCount = 0;
+  let maxSubscriptions = 0;
+  let maxSubscriptionsPerConnection = 0;
   const server = http.createServer((request, response) => {
     if (request.url.startsWith('/api/')) {
       response.writeHead(200, { 'content-type': 'application/json' });
@@ -156,21 +178,21 @@ async function main() {
     wss.handleUpgrade(request, socket, head, ws => wss.emit('connection', ws));
   });
   wss.on('connection', ws => {
+    const connectionId = ++connectionSerial;
+    connectionCount += 1;
+    connections.add(ws);
     const send = payload => ws.readyState === ws.OPEN && ws.send(JSON.stringify(payload));
-    let ackSent = false;
+    send({ type: 'connection_ack', heartbeat_interval_ms: 1000, heartbeat_timeout_ms: 5000, sessions: fixtureSessions, workspaces: [] });
+    setTimeout(() => {
+      send({ type: 'session_list', sessions: fixtureSessions, workspaces: [] });
+      send({ type: 'session_snapshot', sessions: fixtureSessions });
+    }, 25);
     ws.on('message', raw => {
       let message;
       try { message = JSON.parse(String(raw)); } catch { return; }
       clientFrames.push(message);
       const sessionId = message.session_id || message.session;
-      if (message.type === 'subscribe' && !ackSent) {
-        ackSent = true;
-        send({ type: 'connection_ack', heartbeat_interval_ms: 1000, heartbeat_timeout_ms: 5000, sessions: [session], workspaces: [] });
-        setTimeout(() => {
-          send({ type: 'session_list', sessions: [session], workspaces: [] });
-          send({ type: 'session_snapshot', sessions: [session] });
-        }, 25);
-      } else if (message.type === 'heartbeat') {
+      if (message.type === 'heartbeat') {
         send({ type: 'heartbeat_ack', request_id: message.request_id, server_ts: new Date().toISOString() });
       } else if (message.type === 'agent_config_request') {
         send({ type: 'agent_config', session_id: sessionId, capabilities: {} });
@@ -182,8 +204,12 @@ async function main() {
         send({ type: 'history_delta', session: sessionId, session_id: sessionId, request_id: message.request_id, messages: [] });
       } else if (message.type === 'host_resource_subscribe') {
         const id = message.resume_subscription_id || `host-sub-${String(++subscriptionSerial).padStart(32, '0')}`;
-        subscriptions.set(id, { aggregateOnly: message.aggregate_only === true });
-        send({ type: 'host_resource_subscription_ack', request_id: message.request_id, subscription_id: id, aggregate_only: message.aggregate_only === true, resumed: !!message.resume_subscription_id, system_points: 900, detail_points: 180 });
+        subscriptions.set(id, { aggregateOnly: message.aggregate_only === true, connectionId, ws });
+        subscribeCount += 1;
+        maxSubscriptions = Math.max(maxSubscriptions, subscriptions.size);
+        maxSubscriptionsPerConnection = Math.max(maxSubscriptionsPerConnection,
+          [...subscriptions.values()].filter(subscription => subscription.connectionId === connectionId).length);
+        send({ type: 'host_resource_subscription_ack', request_id: message.request_id, subscription_id: id, aggregate_only: message.aggregate_only === true, resumed: !!message.resume_subscription_id, system_points: message.aggregate_only === true ? 60 : 900, detail_points: message.aggregate_only === true ? 0 : 180 });
       } else if (message.type === 'host_resource_history_request') {
         const subscription = subscriptions.get(message.subscription_id);
         const aggregateOnly = subscription?.aggregateOnly === true;
@@ -193,14 +219,25 @@ async function main() {
         const maximum = message.stream === 'detail' ? 8 : 64;
         const points = source.filter(point => point.sample_sequence > Number(message.after_sequence || 0)).slice(0, maximum);
         const next = points.at(-1)?.sample_sequence || Number(message.after_sequence || 0);
-        send({ type: 'host_resource_history_chunk', request_id: message.request_id, subscription_id: message.subscription_id, chunk: { stream: message.stream, points, after_sequence: message.after_sequence || 0, next_sequence: next, done: !source.some(point => point.sample_sequence > next), retained_points: source.length, aggregate_only: aggregateOnly } });
+        const done = !source.some(point => point.sample_sequence > next);
+        send({ type: 'host_resource_history_chunk', request_id: message.request_id, subscription_id: message.subscription_id, chunk: { stream: message.stream, points, after_sequence: message.after_sequence || 0, next_sequence: next, done, retained_points: source.length, aggregate_only: aggregateOnly } });
+        if (message.stream === 'system' && done) {
+          const freshPoint = { ...systemPoint(900), sample_sequence: 901, monotonic_ms: 901_000, captured_at: new Date().toISOString() };
+          setTimeout(() => send({ type: 'host_resource_live', subscription_id: message.subscription_id, point: freshPoint }), 5);
+        }
       } else if (message.type === 'host_resource_refresh') {
-        const active = [...subscriptions.values()].at(-1);
+        const active = [...subscriptions.values()].filter(subscription => subscription.connectionId === connectionId).at(-1);
         send({ type: 'host_resource_snapshot', request_id: message.request_id, snapshot: detailSnapshot(900, active?.aggregateOnly === true) });
       } else if (message.type === 'host_resource_unsubscribe') {
         subscriptions.delete(message.subscription_id);
         unsubscribeCount += 1;
         send({ type: 'host_resource_unsubscribed', request_id: message.request_id, subscription_id: message.subscription_id });
+      }
+    });
+    ws.on('close', () => {
+      connections.delete(ws);
+      for (const [id, subscription] of subscriptions) {
+        if (subscription.connectionId === connectionId) subscriptions.delete(id);
       }
     });
   });
@@ -210,19 +247,305 @@ async function main() {
   try {
     browser = await chromium.launch({ executablePath: findChrome(), headless: true, args: ['--disable-gpu', '--no-first-run', '--no-default-browser-check'] });
     const context = await browser.newContext({ viewport: { width: 1440, height: 900 }, serviceWorkers: 'block', colorScheme: 'light', reducedMotion: 'no-preference', ignoreHTTPSErrors: true });
+    await context.addInitScript(() => {
+      localStorage.setItem('remote-agent-chat:show-test-sessions:v1', '1');
+      localStorage.setItem('remote-agent-chat-theme', 'light');
+    });
     const page = await context.newPage();
     page.on('console', message => { if (message.type() === 'error') consoleErrors.push(message.text()); });
     page.on('pageerror', error => consoleErrors.push(error.message));
     page.on('requestfailed', request => consoleErrors.push(`request failed: ${request.url()} (${request.failure()?.errorText || 'unknown'})`));
     await page.goto(`http://127.0.0.1:${port}/?session=${session.session_id}`, { waitUntil: 'domcontentloaded', timeout: 15000 });
-    const hostResourcesButton = page.getByRole('button', { name: 'Host resources' });
+    await page.waitForFunction(() => document.documentElement.dataset.theme === 'light', null, { timeout: 10000 });
+    const globalStrip = page.locator('[data-testid="global-host-resource-strip"]');
+    await globalStrip.waitFor({ state: 'visible', timeout: 12000 });
+    await page.waitForFunction(() => /CPU\s+\d+%.*RAM\s+\d+%/s.test(document.querySelector('[data-testid="global-host-resource-strip"]')?.textContent || ''), null, { timeout: 10000 });
+    const stripBeforeDashboard = await globalStrip.evaluate(node => {
+      const box = node.getBoundingClientRect();
+      const rail = node.closest('[data-testid="global-desktop-status-rail"]')?.getBoundingClientRect();
+      return {
+        text: node.textContent.replace(/\s+/g, ' ').trim(),
+        status: node.dataset.status,
+        sampleSequence: Number(node.dataset.sampleSequence || 0),
+        bounds: { x: box.x, y: box.y, width: box.width, height: box.height },
+        railHeight: rail?.height || 0,
+      };
+    });
+    assert(
+      stripBeforeDashboard.status === 'live' || stripBeforeDashboard.status === 'stale',
+      `route matrix strip must retain a truthful live/stale state, received ${stripBeforeDashboard.status}`,
+    );
+    assert.match(stripBeforeDashboard.text, /CPU\s+\d+%.*RAM\s+\d+%/s);
+    assert.equal(stripBeforeDashboard.railHeight, 36);
+    assert(stripBeforeDashboard.sampleSequence > 0);
+    await page.locator(`.session-card[data-session-id="${session.session_id}"]`).click();
+    await page.locator('.topbar-title-row').waitFor({ state: 'visible', timeout: 10000 });
+
+    const routeSamples = [];
+    const captureRoute = async (name, selector, theme) => {
+      await page.locator(selector).waitFor({ state: 'visible', timeout: 10000 });
+      const sample = await page.evaluate(({ routeName, themeName }) => {
+        const rail = document.querySelector('[data-testid="global-desktop-status-rail"]');
+        const strip = document.querySelector('[data-testid="global-host-resource-strip"]');
+        const railBox = rail?.getBoundingClientRect();
+        const stripBox = strip?.getBoundingClientRect();
+        return {
+          route: routeName,
+          expectedTheme: themeName,
+          theme: document.documentElement.dataset.theme || null,
+          rail: railBox ? { x: railBox.x, y: railBox.y, width: railBox.width, height: railBox.height } : null,
+          strip: stripBox ? { x: stripBox.x, y: stripBox.y, width: stripBox.width, height: stripBox.height } : null,
+          status: strip?.dataset.status || null,
+          text: strip?.textContent?.replace(/\s+/g, ' ').trim() || '',
+          horizontalOverflow: document.documentElement.scrollWidth - document.documentElement.clientWidth,
+        };
+      }, { routeName: name, themeName: theme });
+      assert(sample.rail, `${name} route is missing the global desktop rail`);
+      assert(sample.strip, `${name} route is missing the CPU/RAM strip`);
+      assert.equal(sample.theme, theme, `${name} route did not apply the ${theme} app theme`);
+      assert.equal(sample.rail.height, 36, `${name} route changed the reserved rail height`);
+      assert.equal(sample.strip.width, 326, `${name} route changed the strip width`);
+      assert(sample.horizontalOverflow <= 1, `${name} route horizontal overflow ${sample.horizontalOverflow}`);
+      routeSamples.push(sample);
+      if (screenshotDir) await page.screenshot({ path: path.join(screenshotDir, `global-strip-${name}-1440-${theme}.png`), fullPage: true });
+    };
+    const backToChat = async selector => {
+      await page.locator(selector).click();
+      await page.locator('.messages').waitFor({ state: 'visible', timeout: 10000 });
+    };
+    const cycleRoutes = async theme => {
+      await captureRoute('chat', '.messages', theme);
+
+      await page.getByRole('button', { name: 'Usage and limits', exact: true }).click();
+      await captureRoute('usage', '[data-testid="usage-dashboard"]', theme);
+      await backToChat('.usage-dashboard .automations-back');
+
+      await page.getByRole('button', { name: 'Fleet view', exact: true }).click();
+      await captureRoute('fleet', '[data-testid="fleet-view"]', theme);
+      await backToChat('.fleet-view .automations-back');
+
+      await page.getByRole('button', { name: 'Search all transcripts', exact: true }).click();
+      await captureRoute('search', '[data-testid="transcript-search-view"]', theme);
+      await backToChat('.transcript-search-view .skills-back');
+
+      const sessionActions = page.getByLabel('Session actions for Host resource desktop fixture');
+      const automationsItem = page.getByRole('menuitem', { name: 'Automations', exact: true });
+      if (!(await automationsItem.isVisible().catch(() => false))) {
+        await sessionActions.click();
+      }
+      await automationsItem.click();
+      await captureRoute('automations', '.automations-view', theme);
+      await backToChat('.automations-view .automations-back');
+
+      if (!(await page.getByRole('menuitem', { name: 'Skills', exact: true }).isVisible().catch(() => false))) {
+        await sessionActions.click();
+      }
+      await page.getByRole('menuitem', { name: 'Skills', exact: true }).click();
+      await captureRoute('skills', '.skills-view', theme);
+      await backToChat('.skills-view .skills-back');
+    };
+    const captureZoomAndWide = async theme => {
+      const samples = [];
+      for (const zoom of [1, 1.25, 2]) {
+        await page.evaluate(value => { document.body.style.zoom = String(value); }, zoom);
+        await page.waitForTimeout(50);
+        const sample = await page.evaluate(({ zoomValue, themeName }) => {
+          const rail = document.querySelector('[data-testid="global-desktop-status-rail"]')?.getBoundingClientRect();
+          const strip = document.querySelector('[data-testid="global-host-resource-strip"]')?.getBoundingClientRect();
+          return {
+            theme: themeName,
+            actualTheme: document.documentElement.dataset.theme || null,
+            zoom: zoomValue,
+            railHeight: rail?.height || 0,
+            stripWidth: strip?.width || 0,
+            horizontalOverflow: document.documentElement.scrollWidth - document.documentElement.clientWidth,
+          };
+        }, { zoomValue: zoom, themeName: theme });
+        assert.equal(sample.actualTheme, theme);
+        assert(sample.railHeight > 0 && sample.stripWidth > 0, `${theme} ${zoom * 100}% zoom hid the desktop strip`);
+        assert(sample.horizontalOverflow <= 1, `${theme} ${zoom * 100}% zoom overflow ${sample.horizontalOverflow}`);
+        samples.push(sample);
+        if (screenshotDir && zoom > 1) {
+          await page.screenshot({ path: path.join(screenshotDir, `global-strip-chat-1440-zoom-${Math.round(zoom * 100)}-${theme}.png`), fullPage: true });
+        }
+      }
+      await page.evaluate(() => { document.body.style.zoom = ''; });
+      await page.setViewportSize({ width: 1920, height: 1080 });
+      await page.waitForTimeout(50);
+      const wide = await page.locator('[data-testid="global-host-resource-strip"]').evaluate((node, themeName) => {
+        const box = node.getBoundingClientRect();
+        return {
+          theme: themeName,
+          actualTheme: document.documentElement.dataset.theme || null,
+          x: box.x,
+          y: box.y,
+          width: box.width,
+          height: box.height,
+          overflow: document.documentElement.scrollWidth - document.documentElement.clientWidth,
+        };
+      }, theme);
+      assert.equal(wide.actualTheme, theme);
+      assert.equal(wide.width, 326);
+      assert(wide.overflow <= 1);
+      if (screenshotDir) await page.screenshot({ path: path.join(screenshotDir, `global-strip-chat-1920-${theme}.png`), fullPage: true });
+      await page.setViewportSize({ width: 1440, height: 900 });
+      return { samples, wide };
+    };
+    const chatTitleBeforeRoutes = await page.locator('.topbar-title-row').evaluate(node => {
+      const box = node.getBoundingClientRect();
+      return { x: box.x, y: box.y, width: box.width, height: box.height };
+    });
+    await cycleRoutes('light');
+    const lightGeometry = await captureZoomAndWide('light');
+    const unsubscribesBeforeLightMobile = unsubscribeCount;
+    await page.setViewportSize({ width: 390, height: 844 });
+    await page.waitForTimeout(100);
+    assert.equal(await page.locator('[data-testid="global-desktop-status-rail"]').count(), 0,
+      '390px light Web must reserve no permanent CPU/RAM strip slot');
+    await page.getByRole('button', { name: 'Host resources', exact: true }).waitFor({ state: 'visible', timeout: 10000 });
+    const lightMobile = await page.evaluate(() => ({
+      theme: document.documentElement.dataset.theme || null,
+      overflow: document.documentElement.scrollWidth - document.documentElement.clientWidth,
+    }));
+    assert.equal(lightMobile.theme, 'light');
+    assert(lightMobile.overflow <= 1, `390px light Web overflow ${lightMobile.overflow}`);
+    if (screenshotDir) await page.screenshot({ path: path.join(screenshotDir, 'global-strip-chat-390x844-light.png'), fullPage: true });
+    assert.equal(unsubscribeCount, unsubscribesBeforeLightMobile + 1,
+      'the final light-mobile consumer release must unsubscribe exactly once');
+    await page.setViewportSize({ width: 1440, height: 900 });
+    await globalStrip.waitFor({ state: 'visible', timeout: 10000 });
+    await page.waitForTimeout(100);
+    await page.getByTitle('Toggle Light/Dark Mode').click();
+    await page.waitForFunction(() => document.documentElement.dataset.theme === 'dark', null, { timeout: 10000 });
+    await cycleRoutes('dark');
+    const darkGeometry = await captureZoomAndWide('dark');
+    const visibilityRefreshBefore = clientFrames.filter(frame => frame.type === 'host_resource_refresh').length;
+    await page.evaluate(() => {
+      window.__hostResourceOriginalVisibilityDescriptor = Object.getOwnPropertyDescriptor(document, 'visibilityState') || null;
+      window.__hostResourceFixtureVisibility = 'hidden';
+      Object.defineProperty(document, 'visibilityState', {
+        configurable: true,
+        get: () => window.__hostResourceFixtureVisibility,
+      });
+      document.dispatchEvent(new Event('visibilitychange'));
+    });
+    assert.equal(await page.evaluate(() => document.visibilityState), 'hidden');
+    await page.evaluate(() => {
+      window.__hostResourceFixtureVisibility = 'visible';
+      document.dispatchEvent(new Event('visibilitychange'));
+    });
+    assert.equal(await page.evaluate(() => document.visibilityState), 'visible');
+    await waitUntil(
+      () => clientFrames.filter(frame => frame.type === 'host_resource_refresh').length > visibilityRefreshBefore,
+      5000,
+      'visibility-return aggregate refresh',
+    );
+    await page.evaluate(() => {
+      const original = window.__hostResourceOriginalVisibilityDescriptor;
+      if (original) Object.defineProperty(document, 'visibilityState', original);
+      else delete document.visibilityState;
+      delete window.__hostResourceFixtureVisibility;
+      delete window.__hostResourceOriginalVisibilityDescriptor;
+    });
+    const visibilityLifecycle = {
+      hidden_observed: true,
+      visible_observed: true,
+      refresh_frames: clientFrames.filter(frame => frame.type === 'host_resource_refresh').length - visibilityRefreshBefore,
+    };
+
+    const connectionCountBeforeReconnect = connectionCount;
+    const subscribeCountBeforeReconnect = subscribeCount;
+    const activeMainSubscription = [...subscriptions.values()][0];
+    assert(activeMainSubscription?.ws, 'main tab is missing its aggregate subscription before reconnect');
+    activeMainSubscription.ws.close(4001, 'fixture reconnect');
+    await waitUntil(
+      () => connectionCount > connectionCountBeforeReconnect && subscriptions.size === 1 && subscribeCount > subscribeCountBeforeReconnect,
+      10000,
+      'main tab aggregate subscription reconnect',
+    );
+    await page.waitForFunction(() => {
+      const status = document.querySelector('[data-testid="global-host-resource-strip"]')?.dataset.status;
+      return status === 'live' || status === 'stale';
+    }, null, { timeout: 10000 });
+    const reconnectLifecycle = {
+      connections_created: connectionCount - connectionCountBeforeReconnect,
+      subscribe_frames: subscribeCount - subscribeCountBeforeReconnect,
+      effective_subscriptions_after: subscriptions.size,
+      retained_values: await globalStrip.evaluate(node => (
+        node.dataset.cpuPercent !== ''
+        && node.dataset.memoryPercent !== ''
+        && Number.isFinite(Number(node.dataset.cpuPercent))
+        && Number.isFinite(Number(node.dataset.memoryPercent))
+      )),
+    };
+    assert(reconnectLifecycle.retained_values, 'reconnect cleared the strip last-good values');
+
+    const secondPage = await context.newPage();
+    secondPage.on('console', message => { if (message.type() === 'error') consoleErrors.push(`tab2: ${message.text()}`); });
+    secondPage.on('pageerror', error => consoleErrors.push(`tab2: ${error.message}`));
+    await secondPage.goto(`http://127.0.0.1:${port}/?session=${session.session_id}`, { waitUntil: 'domcontentloaded', timeout: 15000 });
+    await secondPage.locator('[data-testid="global-host-resource-strip"]').waitFor({ state: 'visible', timeout: 10000 });
+    await waitUntil(() => subscriptions.size === 2, 5000, 'one effective aggregate subscription per browser tab');
+    assert.equal(maxSubscriptionsPerConnection, 1, 'a Web client created duplicate effective subscriptions');
+    const twoTabLifecycle = {
+      effective_subscriptions_while_open: subscriptions.size,
+      maximum_per_connection: maxSubscriptionsPerConnection,
+    };
+    await secondPage.close();
+    await waitUntil(() => subscriptions.size === 1, 5000, 'second-tab subscription cleanup');
+    twoTabLifecycle.effective_subscriptions_after_close = subscriptions.size;
+    twoTabLifecycle.first_tab_retained_values = await globalStrip.evaluate(node => (
+      node.dataset.cpuPercent !== ''
+      && node.dataset.memoryPercent !== ''
+      && Number.isFinite(Number(node.dataset.cpuPercent))
+      && Number.isFinite(Number(node.dataset.memoryPercent))
+    ));
+    assert(twoTabLifecycle.first_tab_retained_values, 'closing tab two cleared tab one strip values');
+
+    const unsubscribeBeforeRapidMounts = unsubscribeCount;
+    const rapidMountSequences = [];
+    for (let cycle = 0; cycle < 3; cycle += 1) {
+      await page.setViewportSize({ width: 899, height: 900 });
+      await page.waitForFunction(() => !document.querySelector('[data-testid="global-desktop-status-rail"]'), null, { timeout: 5000 });
+      await waitUntil(() => subscriptions.size === 0, 5000, `rapid unmount ${cycle + 1}`);
+      await page.setViewportSize({ width: 900, height: 900 });
+      await globalStrip.waitFor({ state: 'visible', timeout: 5000 });
+      await waitUntil(() => subscriptions.size === 1, 5000, `rapid remount ${cycle + 1}`);
+      await page.waitForFunction(minimumSequence => (
+        Number(document.querySelector('[data-testid="global-host-resource-strip"]')?.dataset.sampleSequence || 0)
+          >= minimumSequence
+      ), stripBeforeDashboard.sampleSequence, { timeout: 10000 });
+      rapidMountSequences.push(await globalStrip.evaluate(node => Number(node.dataset.sampleSequence || 0)));
+    }
+    assert.equal(unsubscribeCount - unsubscribeBeforeRapidMounts, 3,
+      'each rapid final-consumer unmount must unsubscribe exactly once');
+    assert(rapidMountSequences.every(sequence => sequence >= stripBeforeDashboard.sampleSequence),
+      'rapid remount cleared or regressed retained aggregate history');
+    await page.setViewportSize({ width: 1440, height: 900 });
+    const rapidMountLifecycle = {
+      cycles: 3,
+      explicit_unsubscribes: unsubscribeCount - unsubscribeBeforeRapidMounts,
+      sequences_after_remount: rapidMountSequences,
+      effective_subscriptions_after: subscriptions.size,
+    };
+    const chatTitleAfterRoutes = await page.locator('.topbar-title-row').evaluate(node => {
+      const box = node.getBoundingClientRect();
+      return { x: box.x, y: box.y, width: box.width, height: box.height };
+    });
+    assert.deepEqual(chatTitleAfterRoutes, chatTitleBeforeRoutes,
+      'route cycles must restore the exact chat-title geometry');
+
+    const zoomSamples = [...lightGeometry.samples, ...darkGeometry.samples];
+    const wideDesktop = { light: lightGeometry.wide, dark: darkGeometry.wide };
+
+    const hostResourcesButton = page.getByRole('button', { name: 'Host resources', exact: true });
     await hostResourcesButton.waitFor({ state: 'visible', timeout: 12000 });
     await hostResourcesButton.click();
     const dashboard = page.locator('[data-testid="host-resource-dashboard"]');
     await dashboard.waitFor({ state: 'visible', timeout: 5000 });
     await dashboard.locator('.host-resource-process-table tbody tr').first().waitFor({ state: 'visible', timeout: 10000 });
     await page.getByRole('button', { name: 'Since open' }).click();
-    await page.waitForFunction(() => document.querySelector('.host-resource-controls')?.textContent.includes('900 samples'), null, { timeout: 10000 });
+    await page.waitForFunction(() => document.querySelector('.host-resource-controls')?.textContent.includes('60 samples'), null, { timeout: 10000 });
 
     assert.equal(await dashboard.locator('.host-resource-chart').count(), 4, 'four interactive charts must render');
     assert.equal(await dashboard.locator('.host-resource-chart-data').count(), 4, 'each chart must expose an accessible table');
@@ -286,6 +609,7 @@ async function main() {
     assert(!(await dashboard.innerText()).includes('Fixture workstation'), 'aggregate-only mode must remove the machine label');
     await aggregate.uncheck();
     await dashboard.locator('.host-resource-process-section').waitFor({ state: 'visible', timeout: 10000 });
+    const explicitUnsubscribesBeforeFinalDashboardClose = unsubscribeCount;
 
     if (screenshotDir) {
       fs.mkdirSync(screenshotDir, { recursive: true });
@@ -293,6 +617,8 @@ async function main() {
     }
     await page.setViewportSize({ width: 390, height: 844 });
     await page.waitForTimeout(100);
+    assert.equal(await page.locator('[data-testid="global-desktop-status-rail"]').count(), 0,
+      '390px Web must reserve no permanent CPU/RAM strip slot');
     const mobile = await dashboard.evaluate(node => ({
       overflow: node.scrollWidth - node.clientWidth,
       bounds: (() => { const box = node.getBoundingClientRect(); return { left: box.left, right: box.right }; })(),
@@ -308,7 +634,8 @@ async function main() {
     await dashboard.locator('.automations-back').click();
     await page.locator('.messages').waitFor({ state: 'visible', timeout: 5000 });
     await page.waitForTimeout(50);
-    assert(unsubscribeCount >= 3, 'route close and aggregate mode changes must explicitly unsubscribe');
+    assert.equal(unsubscribeCount, explicitUnsubscribesBeforeFinalDashboardClose + 1,
+      'aggregate/detail mode changes must retain one subscription; the final dashboard consumer release must unsubscribe once');
     const forbidden = new Set(['send', 'input', 'agent_interrupt', 'agent_config_set', 'agent_control', 'broadcast_send', 'permission_response', 'question_answer', 'terminal_input', 'new_conversation', 'switch_conversation', 'close_session']);
     const mutating = clientFrames.filter(frame => forbidden.has(frame.type));
     assert.deepEqual(mutating, []);
@@ -320,11 +647,24 @@ async function main() {
         const bundle = document.querySelector('script[src*="/dist/bundle.js"]');
         return bundle ? new URL(bundle.src, location.href).searchParams.get('v') : null;
       }),
-      system_points: 900, detail_points: 180, unavailable_gaps: 2, spike_sequence: 777,
-      desktop, mobile, charts: 4, accessible_tables: 4, keyboard_crosshair: true,
+      system_points: 60, detail_points: 180, unavailable_gaps: 0, spike_sequence: null,
+      strip_before_dashboard: stripBeforeDashboard,
+      route_samples: routeSamples,
+      zoom_samples: zoomSamples,
+      wide_desktop: wideDesktop,
+      visibility_lifecycle: visibilityLifecycle,
+      reconnect_lifecycle: reconnectLifecycle,
+      two_tab_lifecycle: twoTabLifecycle,
+      rapid_mount_lifecycle: rapidMountLifecycle,
+      chat_title_geometry_restored: true,
+      desktop, mobile_light: lightMobile, mobile, charts: 4, accessible_tables: 4, keyboard_crosshair: true,
       wheel_zoom: true, touch_pinch: true, synchronized_viewport: true, pause_resume: true,
       process_tree_rows: 3, process_overlay: true, exact_64_bit_counter: true,
       aggregate_only_labels_removed: true, explicit_unsubscribes: unsubscribeCount,
+      subscribe_frames: subscribeCount,
+      max_effective_subscriptions_all_tabs: maxSubscriptions,
+      max_effective_subscriptions_per_client: maxSubscriptionsPerConnection,
+      mode_change_unsubscribes: 0, mobile_permanent_strip: false,
       console_errors: consoleErrors, mutating_frames: mutating.length,
       visible_windows_opened: 0, focus_actions: 0, headless: true,
       generated_at: new Date().toISOString(),

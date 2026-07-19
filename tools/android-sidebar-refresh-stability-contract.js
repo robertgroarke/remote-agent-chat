@@ -213,7 +213,11 @@ function main(argv = process.argv.slice(2)) {
         && screenSource.includes("onLongPress={() => setTitleDisclosure({ kind: 'Session'")
         && screenSource.includes('visible={!!titleDisclosure}'),
       group_visual_disclosure: screenSource.includes('Show full group name:')
-        && screenSource.includes("section.workingNow ? 'Activity group' : section.pinned ? 'Pinned group' : 'Workspace group'"),
+        && screenSource.includes("section.workingNow ? 'Activity group' : section.recent ? 'Recent group' : section.pinned ? 'Pinned group' : 'Workspace group'"),
+      recent_message_time_visible: screenSource.includes('normalizeLatestVisibleMessage(item)')
+        && screenSource.includes('Last message ${formatVisibleMessageTime(recentMessageInstant)}')
+        && screenSource.includes('Last message at ${recentMessageInstant.iso}'),
+      top_level_rows_retain_workspace_context: screenSource.includes('(section.workingNow || section.recent || section.pinned)'),
       consolidated_action_target_44_dp: /width:\s*44/.test(menuStyle) && /height:\s*44/.test(menuStyle),
       low_frequency_actions_not_in_card_rail: cardRenderBody.length > 0
         && !cardRenderBody.includes('style={s.manageSessionBtn}')

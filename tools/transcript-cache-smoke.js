@@ -14,8 +14,11 @@ const webSource = fs.readFileSync(webModulePath, 'utf8');
 const androidSource = fs.readFileSync(androidModulePath, 'utf8');
 const webTimeSource = fs.readFileSync(webTimePath, 'utf8');
 const androidTimeSource = fs.readFileSync(androidTimePath, 'utf8');
-assert.strictEqual(androidSource, webSource, 'web and Android transcript caches must remain byte-identical');
-assert.strictEqual(androidTimeSource, webTimeSource, 'web and Android timestamp normalization must remain byte-identical');
+const canonicalSource = source => source.replace(/\r\n/g, '\n');
+assert.strictEqual(canonicalSource(androidSource), canonicalSource(webSource),
+  'web and Android transcript caches must remain canonically identical');
+assert.strictEqual(canonicalSource(androidTimeSource), canonicalSource(webTimeSource),
+  'web and Android timestamp normalization must remain canonically identical');
 
 function loadCache(source, timeSource) {
   const executable = `${timeSource

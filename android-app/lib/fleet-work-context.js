@@ -14,6 +14,48 @@ const GENERIC_ACTIVITY_LABELS = new Set([
 const MAX_CONTEXT_TEXT = 240;
 const MAX_CONTEXT_LABEL = 32;
 const MAX_CONTEXT_SOURCE = 48;
+const DURATION_ONLY_RE = /^(?=.*\d)(?:(?:\d+)\s*d\s*)?(?:(?:\d+)\s*h\s*)?(?:(?:\d+)\s*m\s*)?(?:(?:\d+)\s*s)?$/i;
+const DURATION_LIKE_RE = /^[+-]?\d+\s*[dhms]\b/i;
+const AGE_ONLY_RE = /^(?:just now|today|yesterday|(?:\d+|an?|one)\s+(?:seconds?|secs?|minutes?|mins?|hours?|hrs?|days?|weeks?|months?|years?)\s+ago)$/i;
+const GOAL_STATUS_ONLY_RE = /^(?:pursuing goal|paused goal|goal (?:paused|blocked|usage limited|rate limited|limited|budget limited|achieved|cancelled|canceled|stopped|failed)|idle|ready|connected|awaiting live update)$/i;
+const PLACEHOLDER_ONLY_RE = /^(?:no (?:recent message|current work|data|activity)(?: reported)?|unavailable|unknown|not available)$/i;
+const SURFACE_LABEL_ONLY_RE = /^(?:remote agent chat|(?:antigravity|claude(?: code)?|cline|codex|continue|cursor|gemini|roo code)\s+(?:harness|workspace))$/i;
+const GOAL_STATE_ALIASES = Object.freeze({
+  active: 'active',
+  running: 'active',
+  working: 'active',
+  pursuing: 'active',
+  pursuing_goal: 'active',
+  paused: 'paused',
+  pause: 'paused',
+  paused_goal: 'paused',
+  blocked: 'blocked',
+  goal_blocked: 'blocked',
+  needs_attention: 'blocked',
+  waiting_for_user: 'blocked',
+  usagelimited: 'usageLimited',
+  usage_limited: 'usageLimited',
+  goal_usage_limited: 'usageLimited',
+  rate_limited: 'usageLimited',
+  goal_rate_limited: 'usageLimited',
+  budgetlimited: 'budgetLimited',
+  budget_limited: 'budgetLimited',
+  goal_limited: 'budgetLimited',
+  goal_budget_limited: 'budgetLimited',
+  complete: 'complete',
+  completed: 'complete',
+  achieved: 'complete',
+  goal_achieved: 'complete',
+  cancelled: 'cancelled',
+  canceled: 'cancelled',
+  stopped: 'cancelled',
+  goal_cancelled: 'cancelled',
+  goal_canceled: 'cancelled',
+  goal_stopped: 'cancelled',
+  failed: 'failed',
+  failure: 'failed',
+  goal_failed: 'failed',
+});
 
 function normalizedAgentType(value) {
   return String(value || '').trim().toLowerCase();
@@ -44,6 +86,18 @@ function containsCredentialShape(value) {
   return /(?:\bbearer\s+[a-z0-9._~+/=-]{8,}|\b(?:api[_ -]?key|password|passwd|secret|access[_ -]?token|refresh[_ -]?token)\s*[:=]\s*\S+|\bsk-[a-z0-9_-]{8,})/i.test(value);
 }
 
+function rejectedDisplayTextReason(value) {
+  const text = String(value == null ? '' : value).replace(/\s+/g, ' ').trim();
+  if (!text) return 'empty';
+  if (DURATION_ONLY_RE.test(text)) return 'duration_only';
+  if (DURATION_LIKE_RE.test(text)) return 'duration_malformed';
+  if (AGE_ONLY_RE.test(text)) return 'age_only';
+  if (GOAL_STATUS_ONLY_RE.test(text)) return 'status_only';
+  if (PLACEHOLDER_ONLY_RE.test(text)) return 'placeholder_only';
+  if (SURFACE_LABEL_ONLY_RE.test(text)) return 'surface_label_only';
+  return '';
+}
+
 function boundedDisplayText(value, maximum = MAX_CONTEXT_TEXT) {
   if (typeof value !== 'string' && typeof value !== 'number') return '';
   let text = String(value)
@@ -52,10 +106,30 @@ function boundedDisplayText(value, maximum = MAX_CONTEXT_TEXT) {
     .replace(/\s+/g, ' ')
     .trim();
   if (!text || containsCredentialShape(text)) return '';
+  if (rejectedDisplayTextReason(text)) return '';
   if (/^[{[]\s*["']?[\w.-]+["']?\s*:/.test(text)) return '';
   if (/^(?:powershell|pwsh|cmd(?:\.exe)?|bash|sh|zsh|fish)\s+-/i.test(text)) return '';
   text = text.replace(/^(?:[-*•]\s+|#{1,6}\s+)/, '').trim();
   return text.slice(0, maximum).trim();
+}
+
+function normalizeGoalState(value) {
+  const compact = String(value || '')
+    .trim()
+    .replace(/([a-z0-9])([A-Z])/g, '$1_$2')
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, '_')
+    .replace(/^_+|_+$/g, '');
+  if (!compact) return 'unknown';
+  return GOAL_STATE_ALIASES[compact] || GOAL_STATE_ALIASES[compact.replace(/_/g, '')] || 'unknown';
+}
+
+function coherentGoalState(goal) {
+  for (const candidate of [goal?.state, goal?.status, goal?.raw_state, goal?.native_state]) {
+    const state = normalizeGoalState(candidate);
+    if (state !== 'unknown') return state;
+  }
+  return 'unknown';
 }
 
 function taskState(task) {
@@ -93,6 +167,8 @@ function normalizeFleetWorkContext(value, options = {}) {
   const text = boundedDisplayText(value.text);
   const source = boundedDisplayText(value.source, MAX_CONTEXT_SOURCE).replace(/\s+/g, '_').toLowerCase();
   if (!label || !text || !source) return null;
+  const goalState = kind === 'goal' ? coherentGoalState(value) : 'unknown';
+  if (kind === 'goal' && goalState === 'unknown') return null;
   const progress = normalizeProgress(value.completed, value.total);
   const percent = Number(value.percent);
   return {
@@ -103,7 +179,8 @@ function normalizeFleetWorkContext(value, options = {}) {
     updated_at: firstTimestamp(value.updated_at) || null,
     ...(progress || {}),
     ...(Number.isFinite(percent) ? { percent: Math.max(0, Math.min(100, percent)) } : {}),
-    ...(value.state ? { state: boundedDisplayText(value.state, 32).toLowerCase() } : {}),
+    ...(kind === 'goal' ? { state: goalState } : (value.state ? { state: boundedDisplayText(value.state, 32).toLowerCase() } : {})),
+    ...(value.diagnostic_reason ? { diagnostic_reason: String(value.diagnostic_reason).slice(0, 64) } : {}),
   };
 }
 
@@ -244,6 +321,8 @@ function goalCandidate(activity, goalCapable) {
   const goal = activity.goal;
   const text = boundedDisplayText(goal.objective || goal.text);
   if (!text) return null;
+  const state = coherentGoalState(goal);
+  if (state === 'unknown') return null;
   const progress = normalizeProgress(goal.completed, goal.total);
   const percent = explicitGoalProgress(goal);
   return {
@@ -254,7 +333,7 @@ function goalCandidate(activity, goalCapable) {
     updated_at: firstTimestamp(goal.updated_at, goal.observed_at, activity.updated_at),
     ...(progress || {}),
     ...(percent == null ? {} : { percent }),
-    ...(goal.state || goal.status ? { state: String(goal.state || goal.status).toLowerCase().slice(0, 32) } : {}),
+    state,
   };
 }
 
@@ -291,9 +370,10 @@ function projectFleetWorkContext(options = {}) {
     selected = {
       kind: 'empty',
       label: 'Current work',
-      text: 'No current work reported',
+      text: 'Current work unavailable',
       source: 'none',
       updated_at: firstTimestamp(activity.updated_at),
+      diagnostic_reason: 'no_authoritative_work_context',
     };
   }
   return normalizeFleetWorkContext(selected, { goalCapable });
@@ -303,9 +383,12 @@ module.exports = {
   CODEX_GOAL_AGENT_TYPES,
   MAX_CONTEXT_TEXT,
   boundedDisplayText,
+  coherentGoalState,
   goalLifecycleSupported,
   latestUserRequestFromMessages,
   normalizeFleetWorkContext,
+  normalizeGoalState,
   projectFleetWorkContext,
+  rejectedDisplayTextReason,
   timestampMs,
 };

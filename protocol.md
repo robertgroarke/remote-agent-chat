@@ -739,19 +739,26 @@ runtimes use a bounded hidden Python stdlib `sqlite3` read-only query and record
 in sanitized source history.
 The Claude fallback runs in a dedicated hidden pseudo-console, never opens or focuses a
 window, and publishes only parsed normalized windows; its raw terminal stream stays local.
+Ollama inventory uses only its loopback `/api/ps` and `/api/tags` endpoints. Because Ollama
+does not expose historical request totals, request telemetry is accepted only from explicit
+owned terminal response receipts. The proxy persists at most 32 receipts in local app state;
+each receipt contains only model, Remote Agent Chat surface, capture time, prompt/output token
+counts, derived output tokens/second, and load/prompt/eval/total durations. Prompt text,
+response text, request bodies, credentials, and non-terminal responses are rejected or
+discarded before persistence and never cross the relay boundary.
 
 ```json
 {
   "type": "provider_usage_snapshot",
   "protocol_version": 1,
   "snapshot": {
-    "schema_version": 1,
+    "schema_version": 3,
     "generation": 42,
     "generated_at": "2026-07-14T12:00:00.000Z",
     "poll_interval_ms": 300000,
     "in_flight": false,
     "snapshots": [{
-      "schema_version": 1,
+      "schema_version": 3,
       "provider_id": "openai-codex",
       "provider_name": "OpenAI Codex",
       "quota_domain": "codex-plan",
@@ -979,10 +986,10 @@ device, adapter, process, and workspace labels while retaining numeric system me
 
 Failures use a requester-scoped `host_resource_error` with the original client `request_id`,
 a bounded `code` (`refresh_throttled`, `proxy_unavailable`, `collector_timeout`, or
-`invalid_snapshot`), and a safe message. Web and Android clients refresh at most every five
-seconds while the view is open and stop immediately when it closes; they do not persist raw
-snapshots or process lists. The proxy's 30-second lease absorbs close/reconnect races but is not
-persistent retention.
+`invalid_snapshot`), and a safe message. Android subscribes only while its detailed view is open.
+Desktop Web keeps one aggregate-only global consumer and adds a detail consumer while the Host
+resources view is open; neither client persists raw snapshots or process lists. The proxy's
+30-second lease absorbs close/reconnect races but is not persistent retention.
 
 ### Host resource subscription and history
 
@@ -1005,9 +1012,20 @@ ID upstream, binds the token to that browser socket and the chosen proxy, and fo
 same in-memory token for up to 30 seconds. The relay does not persist, cache, log, broadcast, or
 restore the token or its telemetry in `connection_ack`.
 
+One client may hold multiple local consumer leases, but it owns exactly one wire subscription.
+The effective mode is detail when any consumer requests detail and aggregate-only otherwise.
+Mode changes resubmit `host_resource_subscribe` with the same in-memory subscription ID: the proxy
+preserves the privacy-safe ordered system ring, purges the mode-bound detail ring, and does not stop
+the shared sampler. Releasing one consumer cannot unsubscribe another; only the final release emits
+`host_resource_unsubscribe`. If the first acknowledgement races a local mode change, the client
+waits for that acknowledgement and performs one in-place reconfiguration instead of opening a
+parallel subscription.
+
 While subscribed, the proxy emits requester-addressed `host_resource_live` system points at no
-more than 1 Hz and `host_resource_detail` schema-v2 snapshots at no more than one five-second
-cadence. A live point is capped at 16 KiB and contains wall/monotonic time, ordered sequence,
+more than 1 Hz. Detail-mode subscriptions additionally receive `host_resource_detail` schema-v2
+snapshots at no more than one five-second cadence; aggregate-only subscriptions retain no detail
+ring and receive no detail-history chunks or detail frames. A live point is capped at 16 KiB and
+contains wall/monotonic time, ordered sequence,
 actual interval/gap count, collection status, and numeric CPU/memory/disk/network aggregates; it
 contains no machine, device, adapter, process, workspace, or session label. A detail frame retains
 the 64 KiB/32-row snapshot boundary. The relay rejects duplicate or out-of-order sequences on each
@@ -1033,11 +1051,13 @@ eight snapshots; every encoded chunk is capped at 64 KiB. Clients continue from 
 until `done`. Presentation range, legend, hover, pause, zoom, and pan are client-only operations and
 must not issue collector calls.
 
-`host_resource_unsubscribe` explicitly destroys the requester ring. An unplanned socket close
+`host_resource_unsubscribe` explicitly destroys the requester ring after the final local consumer
+releases it. An unplanned socket close
 causes relay-to-proxy `host_resource_detach`; the proxy keeps that ring only for the 30-second
 resume grace, then clears it and stops the single helper when no other subscriber remains.
-Aggregate-only subscription detail sets `machine_label` to null, removes device/adapter/process/
-workspace labels and rows, and keeps only numeric system telemetry.
+Aggregate-only subscription state keeps only the bounded numeric system ring (the desktop strip
+retains at most 60 one-second points). It never emits or retains machine/device/adapter/process/
+workspace labels or detail rows.
 
 ## Usage Threshold Events
 
@@ -2034,14 +2054,16 @@ This section defines the protocol for:
 - stopping or interrupting a running agent generation
 - reading and changing per-session agent configuration (model, permission mode, file access)
 
-All messages in this section are routed through the relay. The proxy originates `permission_prompt` and `agent_config` events; the browser originates all control commands.
+All messages in this section are routed through the relay. The proxy originates
+`permission_prompt`, `question_prompt`, and `agent_config` events; Web and Android originate
+the corresponding control commands.
 
 ### Relay Routing Rules
 
 | Direction | Message types | Relay action |
 |---|---|---|
-| proxy → relay → browser | `permission_prompt`, `agent_config` | broadcast to all browsers watching the session; cache latest value |
-| browser → relay → proxy | `permission_response`, `agent_interrupt`, `agent_set_model`, `set_codex_config`, `agent_config_request` | validate, then forward to the proxy socket registered for `session_id` |
+| proxy → relay → browser | `permission_prompt`, `question_prompt`, `question_prompt_state`, `agent_config` | broadcast to all clients watching the session; cache current control state |
+| Web/Android → relay → proxy | `permission_response`, `question_response`, `agent_interrupt`, `agent_set_model`, `set_codex_config`, `agent_config_request` | validate, then forward to the proxy socket registered for `session_id` |
 | proxy → relay → browser (scoped) | `agent_control_result` | forward only to the browser identified by `request_id` |
 
 Rules:
@@ -2239,6 +2261,137 @@ Rules:
 
 - Browsers must dismiss any open overlay for this `prompt_id` on receipt.
 - The relay has already applied the `default_choice` to the proxy before broadcasting this event.
+
+### First-class question prompt contract
+
+`question_prompt` is distinct from permission approval. It represents a native product request
+for user input and is independently advertised through `agent_config.capabilities.question_prompts`.
+The compatibility shape `permission_prompt kind="question"` is accepted only for older producers;
+new Codex producers must use the version-1 contract below.
+
+```json
+{
+  "type": "question_prompt",
+  "contract_version": 1,
+  "protocol_version": 1,
+  "session_id": "sess_codex_123",
+  "prompt_id": "question_opaque_single_use_id",
+  "generation": "connection_and_native_turn_generation",
+  "kind": "request_user_input",
+  "source": { "surface": "codex", "version": "26.707.71524" },
+  "title": "Choose implementation details",
+  "questions": [
+    {
+      "question_id": "route",
+      "header": "Implementation route",
+      "message": "Choose how Remote Agent Chat should continue.",
+      "answer_mode": "single",
+      "required": true,
+      "multi_select": false,
+      "allow_other": true,
+      "secret": false,
+      "choices": [
+        { "choice_id": "relay", "label": "Relay", "description": "Use the verified relay path.", "requires_text": false, "is_other": false },
+        { "choice_id": "other", "label": "Other", "description": "Enter another answer.", "requires_text": true, "is_other": true }
+      ]
+    },
+    {
+      "question_id": "note",
+      "header": "Short answer",
+      "message": "Enter a bounded response.",
+      "answer_mode": "text",
+      "required": true,
+      "multi_select": false,
+      "allow_other": false,
+      "secret": false,
+      "choices": []
+    }
+  ],
+  "lifecycle": "open",
+  "native_at": "2026-07-16T12:00:00.000Z",
+  "observed_at": "2026-07-16T12:00:00.040Z",
+  "deadline_at": "2026-07-16T12:01:00.000Z",
+  "auto_resolution_ms": 60000,
+  "auto_resolution_policy": "native",
+  "cancel_supported": true,
+  "contains_secret": false
+}
+```
+
+An Ollama account snapshot uses `local_runtime` instead of quota windows. Its optional
+`request_receipts` list is bounded to 32 entries and each item has this exact redacted shape:
+
+```json
+{
+  "receipt_id": "0123456789abcdef01234567",
+  "schema_version": 1,
+  "model": "gemma4:e2b",
+  "surface": "remote_agent_chat_owned_canary",
+  "captured_at": "2026-07-16T12:00:00.000Z",
+  "prompt_tokens": 12,
+  "response_tokens": 4,
+  "tokens_per_second": 8.5,
+  "total_duration_ns": 1800000000,
+  "load_duration_ns": 500000000,
+  "prompt_eval_duration_ns": 300000000,
+  "eval_duration_ns": 470588235
+}
+```
+
+`local_runtime.telemetry_status=observed_owned_requests` means at least one such explicit
+receipt exists; it is not a claim that Ollama provides complete historical usage. With no
+owned receipt, all request metrics remain null and the status is `not_observed`.
+
+Required identity fields are `session_id`, opaque single-use `prompt_id`, and `generation`.
+`generation` binds the connection plus exact native thread/turn/item; the connection-scoped native
+request ID remains private to the proxy adapter. Each question has a stable `question_id`, header,
+body, `answer_mode` (`single`, `multiple`, or `text`), required/Other/secret semantics, and ordered
+choices. Text and Other values are limited to 2,000 characters. Secret answers exist only in the
+ephemeral client frame and proxy/native bridge: clients, relay stores, receipts, logs, analytics,
+notifications, accessibility announcements, screenshots, and evidence must not persist or echo them.
+
+Reconnect snapshots expose current and retained-failure entries separately from permissions:
+
+```json
+{
+  "type": "connection_ack",
+  "open_question_prompts": [
+    { "type": "question_prompt", "session_id": "sess_codex_123", "prompt_id": "question_opaque_single_use_id", "generation": "connection_and_native_turn_generation", "lifecycle": "open" }
+  ]
+}
+```
+
+Web or Android answers every question atomically, or cancels only when advertised:
+
+```json
+{
+  "type": "question_response",
+  "contract_version": 1,
+  "protocol_version": 1,
+  "request_id": "prompt-client-unique-id",
+  "session_id": "sess_codex_123",
+  "prompt_id": "question_opaque_single_use_id",
+  "generation": "connection_and_native_turn_generation",
+  "action": "answer",
+  "answers": [
+    { "question_id": "route", "choice_ids": ["other"], "other_text": "Use the bounded fallback" },
+    { "question_id": "note", "text": "Run the presenter suite" }
+  ]
+}
+```
+
+A cancel response uses `action: "cancel"` and omits `answers`. The relay validates the response
+against the exact open prompt, atomically claims it across every client, changes lifecycle to
+`submitting`, and forwards it once. Reuse, wrong session/generation/question/choice, incomplete
+answers, late deadlines, or unsupported cancellation fail closed without a native attempt.
+
+The relay broadcasts the full public prompt as `question_prompt` for `open`/`submitting`, and
+`question_prompt_state` for terminal `answered`, `auto_resolved`, `cancelled`, `expired`, or
+`failed`. A successful `agent_control_result command="question_response"` requires an exact native
+acknowledgement. Clients disable all controls while non-open, clear answered/auto-resolved/cancelled/
+expired cards, and retain failed cards with the truthful error. They never infer success merely from
+sending the response frame, never replay an answer on reconnect, and display native deadline policy
+without inventing a default choice.
 
 ### `session_error_prompt`
 
@@ -2918,8 +3071,9 @@ To reduce migration risk, implement in this order:
 11. `agent_config` on session connect; `agent_config_request`
 12. `agent_interrupt` and `agent_control_result`
 13. `permission_prompt`, `permission_response`, `permission_prompt_expired`
-14. `file_changes` read and `file_change_response` accept/reject (Cursor)
-15. `agent_set_model` with confirming `agent_config`
+14. `question_prompt`, `question_response`, `question_prompt_state`, reconnect restoration
+15. `file_changes` read and `file_change_response` accept/reject (Cursor)
+16. `agent_set_model` with confirming `agent_config`
 
 ## Acceptance Criteria
 

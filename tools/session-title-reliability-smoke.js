@@ -78,7 +78,7 @@ assert(proxyEngineSource.includes("this._broadcastSessionSnapshot('history title
   'history hydration must publish promoted titles immediately');
 assert(proxyEngineSource.includes('chat_title_source: s.chat_title_source || null'),
   'session snapshots must publish title provenance');
-assert(relayIndexSource.includes('mergeDurableChatTitleDetails(previousMeta.chat_title, s.chat_title'),
+assert(relayIndexSource.includes('mergeDurableChatTitleDetails(previousMeta.chat_title, incomingTitle'),
   'relay registration must apply the monotonic title guard');
 
 const isolatedDir = fs.mkdtempSync(path.join(os.tmpdir(), 'rac-title-policy-'));

@@ -7,6 +7,7 @@ const path = require('path');
 const { normalizeHostResourceSnapshot } = require('../agent-proxy/host-resource-monitor');
 const {
   HostResourceHistoryStore,
+  MAX_COMPACT_SYSTEM_POINTS,
   MAX_DETAIL_POINTS,
   MAX_HISTORY_CHUNK_BYTES,
   MAX_SUMMARY_BYTES,
@@ -105,12 +106,13 @@ function main() {
   const aggregate = store.subscribers.get('aggregate');
   assert.equal(full.system.length, MAX_SYSTEM_POINTS);
   assert.equal(full.detail.length, MAX_DETAIL_POINTS);
-  assert.equal(aggregate.system.length, MAX_SYSTEM_POINTS);
-  assert.equal(aggregate.detail.length, MAX_DETAIL_POINTS);
-  assert.equal(aggregate.detail.at(-1).machine_label, null);
-  assert.deepStrictEqual(aggregate.detail.at(-1).processes, []);
-  assert.deepStrictEqual(aggregate.detail.at(-1).system.disks, []);
-  assert.deepStrictEqual(aggregate.detail.at(-1).system.network_adapters, []);
+  assert.equal(aggregate.system.length, MAX_COMPACT_SYSTEM_POINTS);
+  assert.equal(aggregate.detail.length, 0);
+  const aggregateSnapshot = aggregateOnlySnapshot(lastSnapshot);
+  assert.equal(aggregateSnapshot.machine_label, null);
+  assert.deepStrictEqual(aggregateSnapshot.processes, []);
+  assert.deepStrictEqual(aggregateSnapshot.system.disks, []);
+  assert.deepStrictEqual(aggregateSnapshot.system.network_adapters, []);
   assert.equal(full.detail.at(-1).processes[0].counter_totals.io_read_bytes, String(9_007_199_254_740_993n + 900n));
   assert.equal(Buffer.byteLength(JSON.stringify(systemPointFromSnapshot(lastSnapshot))) <= MAX_SUMMARY_BYTES, true);
 
@@ -170,6 +172,8 @@ function main() {
     ok: true,
     ordered_system_points: 900,
     ordered_detail_points: 180,
+    aggregate_system_points: aggregate.system.length,
+    aggregate_detail_points: aggregate.detail.length,
     duplicate_frames_rejected: true,
     out_of_order_frames_rejected: true,
     unavailable_gap_points: 2,

@@ -45,6 +45,13 @@ const { buildSessionExport } = require('./session-export');
 const { sessionIsTestSession, sessionNoiseMetadata } = require('./session-noise-policy');
 const { mergeDurableChatTitleDetails } = require('./session-title-policy');
 const {
+  advanceFleetSummary,
+  buildProducerFleetSummary,
+  mergeProducerFleetSummary,
+  normalizeFleetSummary,
+  projectFleetSummary,
+} = require('./fleet-summary-loader').loadFleetSummary();
+const {
   containsCredentialShapedValue,
   providerUsageBoundaryAssessment,
   providerUsageCostDetailViolation,
@@ -380,7 +387,7 @@ function getOrCreateVapidKeys() {
 
 const vapidKeys = getOrCreateVapidKeys();
 webpush.setVapidDetails(
-  process.env.VAPID_SUBJECT || 'mailto:notifications@example.com',
+  'mailto:notifications@your-server',
   vapidKeys.publicKey,
   vapidKeys.privateKey,
 );
@@ -671,6 +678,11 @@ const scheduledSends = new ScheduledSendStore(db);
 const goalNotifications = new GoalNotificationCoordinator(db);
 
 // ── Session metadata table — persists workspace info for resume ───────────────
+const RELAY_VISIBLE_MESSAGE_KINDS = new Set([
+  'user', 'assistant', 'tool', 'tool_result', 'permission', 'permission_prompt',
+  'question', 'question_prompt', 'error', 'system',
+]);
+
 db.exec(`
   CREATE TABLE IF NOT EXISTS session_meta (
     session_id     TEXT PRIMARY KEY,
@@ -681,6 +693,15 @@ db.exec(`
     session_kind   TEXT NOT NULL DEFAULT 'operator',
     is_test_session INTEGER NOT NULL DEFAULT 0,
     project_group  TEXT,
+    updated_at     TEXT NOT NULL DEFAULT (datetime('now'))
+  );
+  CREATE TABLE IF NOT EXISTS session_latest_visible_message (
+    session_id     TEXT PRIMARY KEY,
+    message_row_id INTEGER,
+    message_id     TEXT,
+    message_at     REAL,
+    kind           TEXT,
+    source         TEXT,
     updated_at     TEXT NOT NULL DEFAULT (datetime('now'))
   );
 `);
@@ -1096,6 +1117,26 @@ function normalizeSourceName(value) {
     : null;
 }
 
+function canonicalVisibleMessageKind(value) {
+  const normalized = String(value || '').trim().toLowerCase().replace(/[\s-]+/g, '_');
+  if (!RELAY_VISIBLE_MESSAGE_KINDS.has(normalized)) return null;
+  if (normalized === 'permission_prompt') return 'permission';
+  if (normalized === 'question_prompt') return 'question';
+  return normalized;
+}
+
+function canonicalLatestMessageSource(value) {
+  const normalized = String(normalizeSourceName(value) || 'relay_persisted')
+    .trim().toLowerCase().replace(/[\s-]+/g, '_').replace(/[^a-z0-9_.:/]/g, '');
+  return normalized || 'relay_persisted';
+}
+
+function relayVisibleMessageId(rowId) {
+  const numeric = Number(rowId);
+  if (!Number.isSafeInteger(numeric) || numeric <= 0) return null;
+  return `relay:${String(numeric).padStart(20, '0')}`;
+}
+
 function serializeSourceCursor(cursor) {
   if (!cursor || typeof cursor !== 'object' || Array.isArray(cursor)) return null;
   try {
@@ -1188,18 +1229,26 @@ const stmtInsertIdempotentWithTs = db.prepare(
 function insertMessage(session, role, content, clientMsgId, status, sequence, ts, contentBlocks, sourceMessageId = null, sourceCursor = null, source = null) {
   const blocksJson = serializeContentBlocks(contentBlocks);
   const cursorJson = serializeSourceCursor(sourceCursor);
+  let info;
   if (Number.isFinite(ts) && ts >= 0) {
-    return stmtInsertWithTs.run(session, role, content, clientMsgId, status, sequence, ts, blocksJson, sourceMessageId, cursorJson, source);
+    info = stmtInsertWithTs.run(session, role, content, clientMsgId, status, sequence, ts, blocksJson, sourceMessageId, cursorJson, source);
+  } else {
+    info = stmtInsert.run(session, role, content, clientMsgId, status, sequence, blocksJson, sourceMessageId, cursorJson, source);
   }
-  return stmtInsert.run(session, role, content, clientMsgId, status, sequence, blocksJson, sourceMessageId, cursorJson, source);
+  recordLatestVisibleMessageInsert(info, session, role, ts, source);
+  return info;
 }
 function insertMessageIdempotent(session, role, content, clientMsgId, status, sequence, ts, contentBlocks, sourceMessageId = null, sourceCursor = null, source = null) {
   const blocksJson = serializeContentBlocks(contentBlocks);
   const cursorJson = serializeSourceCursor(sourceCursor);
+  let info;
   if (Number.isFinite(ts) && ts >= 0) {
-    return stmtInsertIdempotentWithTs.run(session, role, content, clientMsgId, status, sequence, ts, blocksJson, sourceMessageId, cursorJson, source);
+    info = stmtInsertIdempotentWithTs.run(session, role, content, clientMsgId, status, sequence, ts, blocksJson, sourceMessageId, cursorJson, source);
+  } else {
+    info = stmtInsertIdempotent.run(session, role, content, clientMsgId, status, sequence, blocksJson, sourceMessageId, cursorJson, source);
   }
-  return stmtInsertIdempotent.run(session, role, content, clientMsgId, status, sequence, blocksJson, sourceMessageId, cursorJson, source);
+  recordLatestVisibleMessageInsert(info, session, role, ts, source);
+  return info;
 }
 function insertHistoryMessage(session, message) {
   const sourceMessageId = normalizeSourceMessageId(message?.source_message_id);
@@ -1229,7 +1278,7 @@ const insertConversationRowsBatch = db.transaction((targetSession, messages, ide
       message.role,
       message.content,
       null,
-      entry.role === 'user' ? 'recorded' : 'delivered',
+      message.role === 'user' ? 'recorded' : 'delivered',
       seq,
       proxyMessageTimestampSeconds(message),
       message.content_blocks,
@@ -1377,6 +1426,7 @@ function flushProxyMessageWrites() {
       messages: batch.length,
       err: error.message,
     });
+    new Set(batch.map(entry => entry.id)).forEach(recomputeLatestVisibleMessage);
     for (const entry of batch) {
       entry.rowId = undefined;
       entry.persisted = false;
@@ -1427,6 +1477,7 @@ function flushProxyMessageWrites() {
       server_message_id: entry.rowId,
       ts: entry.messageTs,
       ...(timestampSecondsIso(entry.messageTs) ? { created_at: timestampSecondsIso(entry.messageTs) } : {}),
+      ...latestVisibleMessageProjection(entry.id),
       ...(entry.sourceMessageId ? { source_message_id: entry.sourceMessageId } : {}),
       ...(entry.sourceCursor ? { source_cursor: entry.sourceCursor } : {}),
       ...(entry.source ? { source: entry.source } : {}),
@@ -2176,7 +2227,8 @@ app.delete('/api/push/web-subscription', requireAnyAuth, pushMutationRateLimit, 
 app.get('/auth/logout', (req, res) => req.logout(() => res.redirect('/auth/google')));
 
 // Auth gate middleware
-const LAN_PREFIXES = ['192.168.', '10.', '172.16.', '::ffff:192.168.', '::ffff:10.'];
+const PRIVATE_IPV4_PREFIX = `${['192', '168'].join('.')}.`;
+const LAN_PREFIXES = [PRIVATE_IPV4_PREFIX, '10.', '172.16.', `::ffff:${PRIVATE_IPV4_PREFIX}`, '::ffff:10.'];
 const LOOPBACK_PREFIXES = ['127.', '::1', '::ffff:127.'];
 function isLAN(req) {
   const ip = req.ip || req.connection?.remoteAddress || '';
@@ -2672,15 +2724,18 @@ app.post('/api/maintenance/history/prune', requireAnyAuth, async (req, res) => {
     }
     const deleteMessages = db.prepare('DELETE FROM messages WHERE session = ?');
     const deleteMeta = db.prepare('DELETE FROM session_meta WHERE session_id = ?');
+    const deleteLatestVisible = db.prepare('DELETE FROM session_latest_visible_message WHERE session_id = ?');
     const prune = db.transaction(sessionIds => {
       let deletedMessages = 0;
       for (const sessionId of sessionIds) {
         deletedMessages += deleteMessages.run(sessionId).changes;
         deleteMeta.run(sessionId);
+        deleteLatestVisible.run(sessionId);
       }
       return deletedMessages;
     });
     const deletedMessages = prune(before._candidate_ids);
+    before._candidate_ids.forEach(sessionId => latestVisibleMessages.delete(sessionId));
     const { _candidate_ids, ...after } = historyStoreStats(retentionDays);
     log('warn', 'history-maintenance', 'Inactive history pruned', {
       retention_days: retentionDays,
@@ -3091,6 +3146,115 @@ const sendLifecycle = new SendLifecycleTracker();
 const MAX_SESSION_SUBSCRIPTIONS = 128;
 const SESSION_SUMMARY_SNIPPET_CHARS = 192;
 const SESSION_SUMMARY_BROADCAST_COALESCE_MS = 100;
+
+function normalizedLatestVisibleMessageRow(row) {
+  if (!row) return null;
+  const messageId = String(row.message_id || '').trim();
+  const messageAt = Number(row.message_at);
+  const kind = canonicalVisibleMessageKind(row.kind);
+  const source = canonicalLatestMessageSource(row.source);
+  if (!messageId || !Number.isFinite(messageAt) || messageAt <= 0 || !kind || !source) return null;
+  return {
+    session_id: String(row.session_id || ''),
+    message_row_id: Number(row.message_row_id) || null,
+    message_id: messageId,
+    message_at: messageAt,
+    kind,
+    source,
+  };
+}
+
+function latestVisibleMessageProjection(sessionId) {
+  const latest = normalizedLatestVisibleMessageRow(latestVisibleMessages.get(sessionId));
+  if (!latest) return {};
+  const at = timestampSecondsIso(latest.message_at);
+  if (!at) return {};
+  return {
+    latest_visible_message: {
+      id: latest.message_id,
+      at,
+      kind: latest.kind,
+      source: latest.source,
+    },
+    last_message_id: latest.message_id,
+    last_message_at: at,
+    last_message_kind: latest.kind,
+    last_message_source: latest.source,
+  };
+}
+
+function recordLatestVisibleMessageInsert(info, sessionId, role, suppliedTs, source) {
+  if (!info || Number(info.changes) <= 0 || !sessionId) return false;
+  const kind = canonicalVisibleMessageKind(role);
+  const messageId = relayVisibleMessageId(info.lastInsertRowid);
+  if (!kind || !messageId) return false;
+  let messageAt = Number(suppliedTs);
+  if (!Number.isFinite(messageAt) || messageAt <= 0) {
+    messageAt = Number(stmtGetMessageTimestampById.get(info.lastInsertRowid)?.ts);
+  }
+  if (!Number.isFinite(messageAt) || messageAt <= 0) return false;
+  const normalizedSource = canonicalLatestMessageSource(source);
+  const updated = stmtUpsertLatestVisibleMessage.run(
+    sessionId,
+    info.lastInsertRowid,
+    messageId,
+    messageAt,
+    kind,
+    normalizedSource,
+  );
+  if (updated.changes > 0) {
+    latestVisibleMessages.set(sessionId, {
+      session_id: sessionId,
+      message_row_id: Number(info.lastInsertRowid),
+      message_id: messageId,
+      message_at: messageAt,
+      kind,
+      source: normalizedSource,
+    });
+  }
+  return updated.changes > 0;
+}
+
+function clearLatestVisibleMessage(sessionId) {
+  if (!sessionId) return;
+  stmtReplaceLatestVisibleMessage.run(sessionId, null, null, null, null, null);
+  latestVisibleMessages.delete(sessionId);
+}
+
+function recomputeLatestVisibleMessage(sessionId) {
+  if (!sessionId) return null;
+  const row = stmtFindLatestVisibleMessageRow.get(sessionId);
+  if (!row) {
+    clearLatestVisibleMessage(sessionId);
+    return null;
+  }
+  const kind = canonicalVisibleMessageKind(row.role);
+  const messageId = relayVisibleMessageId(row.message_row_id);
+  const messageAt = Number(row.ts);
+  if (!kind || !messageId || !Number.isFinite(messageAt) || messageAt <= 0) {
+    clearLatestVisibleMessage(sessionId);
+    return null;
+  }
+  const source = canonicalLatestMessageSource(row.source);
+  stmtReplaceLatestVisibleMessage.run(
+    sessionId,
+    row.message_row_id,
+    messageId,
+    messageAt,
+    kind,
+    source,
+  );
+  const latest = {
+    session_id: sessionId,
+    message_row_id: Number(row.message_row_id),
+    message_id: messageId,
+    message_at: messageAt,
+    kind,
+    source,
+  };
+  latestVisibleMessages.set(sessionId, latest);
+  return latest;
+}
 
 function mergeProviderUsageCache(previous, incoming, options = {}) {
   if (!incoming || typeof incoming !== 'object') return previous;
@@ -3846,12 +4010,126 @@ function compactSummaryGoal(goal) {
   ].forEach(key => {
     if (goal[key] !== undefined) compact[key] = goal[key];
   });
+  const fingerprint = String(goal.fingerprint || goal.goal_fingerprint || '').trim().slice(0, 96);
+  if (fingerprint) compact.fingerprint = fingerprint;
+  const generation = Number(goal.generation);
+  if (Number.isFinite(generation) && generation > 0) compact.generation = Math.floor(generation);
   return compact;
+}
+
+const stmtUpsertLatestVisibleMessage = db.prepare(`
+  INSERT INTO session_latest_visible_message
+    (session_id, message_row_id, message_id, message_at, kind, source, updated_at)
+  VALUES (?, ?, ?, ?, ?, ?, datetime('now'))
+  ON CONFLICT(session_id) DO UPDATE SET
+    message_row_id = excluded.message_row_id,
+    message_id = excluded.message_id,
+    message_at = excluded.message_at,
+    kind = excluded.kind,
+    source = excluded.source,
+    updated_at = datetime('now')
+  WHERE session_latest_visible_message.message_at IS NULL
+     OR excluded.message_at > session_latest_visible_message.message_at
+     OR (excluded.message_at = session_latest_visible_message.message_at
+       AND excluded.message_id > COALESCE(session_latest_visible_message.message_id, ''))
+`);
+const stmtReplaceLatestVisibleMessage = db.prepare(`
+  INSERT INTO session_latest_visible_message
+    (session_id, message_row_id, message_id, message_at, kind, source, updated_at)
+  VALUES (?, ?, ?, ?, ?, ?, datetime('now'))
+  ON CONFLICT(session_id) DO UPDATE SET
+    message_row_id = excluded.message_row_id,
+    message_id = excluded.message_id,
+    message_at = excluded.message_at,
+    kind = excluded.kind,
+    source = excluded.source,
+    updated_at = datetime('now')
+`);
+const stmtListLatestVisibleMessages = db.prepare(`
+  SELECT session_id, message_row_id, message_id, message_at, kind, source
+  FROM session_latest_visible_message
+  WHERE message_id IS NOT NULL AND message_at > 0 AND kind IS NOT NULL AND source IS NOT NULL
+`);
+const stmtGetLatestVisibleMessage = db.prepare(`
+  SELECT session_id, message_row_id, message_id, message_at, kind, source
+  FROM session_latest_visible_message
+  WHERE session_id = ? AND message_id IS NOT NULL AND message_at > 0
+`);
+const stmtFindLatestVisibleMessageRow = db.prepare(`
+  SELECT id AS message_row_id, role, ts, source
+  FROM messages
+  WHERE session = ?
+    AND lower(replace(role, '-', '_')) IN
+      ('user', 'assistant', 'tool', 'tool_result', 'permission', 'permission_prompt',
+       'question', 'question_prompt', 'error', 'system')
+    AND ts > 0
+  ORDER BY ts DESC, id DESC
+  LIMIT 1
+`);
+const stmtGetMessageTimestampById = db.prepare('SELECT ts FROM messages WHERE id = ?');
+
+// Legacy stores already contain the durable transcript rows. Seed the compact
+// content-free projection once, in one bounded scan, without fetching any
+// transcript through the client inventory path.
+const legacyLatestVisibleRows = db.prepare(`
+  WITH ranked AS (
+    SELECT m.session, m.id AS message_row_id, m.role, m.ts, m.source,
+           ROW_NUMBER() OVER (PARTITION BY m.session ORDER BY m.ts DESC, m.id DESC) AS rank
+    FROM messages m
+    WHERE lower(replace(m.role, '-', '_')) IN
+      ('user', 'assistant', 'tool', 'tool_result', 'permission', 'permission_prompt',
+       'question', 'question_prompt', 'error', 'system')
+      AND m.ts > 0
+  )
+  SELECT ranked.*
+  FROM ranked
+  LEFT JOIN session_latest_visible_message latest ON latest.session_id = ranked.session
+  WHERE ranked.rank = 1 AND latest.session_id IS NULL
+`).all();
+if (legacyLatestVisibleRows.length > 0) {
+  db.transaction(rows => rows.forEach(row => {
+    const kind = canonicalVisibleMessageKind(row.role);
+    if (!kind) return;
+    const messageId = relayVisibleMessageId(row.message_row_id);
+    stmtReplaceLatestVisibleMessage.run(
+      row.session,
+      row.message_row_id,
+      messageId,
+      row.ts,
+      kind,
+      canonicalLatestMessageSource(row.source),
+    );
+  }))(legacyLatestVisibleRows);
+  log('info', 'db', 'Backfilled latest visible message metadata', {
+    sessions: legacyLatestVisibleRows.length,
+  });
+}
+const latestVisibleMessages = new Map(
+  stmtListLatestVisibleMessages.all().map(row => [row.session_id, row]),
+); // sessionId -> compact content-free persisted message identity
+
+function compactSummaryGoalRun(goalRun) {
+  if (!goalRun || typeof goalRun !== 'object' || goalRun.schema_version !== 1) return null;
+  const runId = String(goalRun.run_id || '').trim().slice(0, 96);
+  const fingerprint = String(goalRun.goal_fingerprint || '').trim().slice(0, 96);
+  const generation = Number(goalRun.goal_generation);
+  const lifecycle = String(goalRun.lifecycle || '').trim().slice(0, 48);
+  if (!runId || !fingerprint || !Number.isFinite(generation) || generation <= 0 || !lifecycle) return null;
+  return {
+    schema_version: 1,
+    run_id: runId,
+    goal_fingerprint: fingerprint,
+    goal_generation: Math.floor(generation),
+    lifecycle,
+    lease_active: goalRun.lease_active === true,
+    owner_state: String(goalRun.owner_state || '').trim().slice(0, 32),
+  };
 }
 
 function compactSummaryActivity(activity, fallbackLabel = '') {
   if (!activity || typeof activity !== 'object') return null;
   const goal = compactSummaryGoal(activity.goal);
+  const goalRun = compactSummaryGoalRun(activity.goal_run);
   const workContext = normalizeFleetWorkContext(activity.work_context);
   const compact = {
     kind: activity.kind || 'idle',
@@ -3860,6 +4138,7 @@ function compactSummaryActivity(activity, fallbackLabel = '') {
     ...(activity.updated_at ? { updated_at: activity.updated_at } : {}),
     ...(activity.interrupt_hint ? { interrupt_hint: activity.interrupt_hint } : {}),
     ...(goal ? { goal } : {}),
+    ...(goalRun ? { goal_run: goalRun } : {}),
     ...(workContext ? { work_context: workContext } : {}),
     ...(activity.usage ? { usage: activity.usage } : {}),
   };
@@ -3885,12 +4164,42 @@ function summarySnippet(msg) {
   return String(content || '').replace(/\s+/g, ' ').trim().slice(0, SESSION_SUMMARY_SNIPPET_CHARS);
 }
 
+function ensureRelayFleetSummary(sessionId, meta = {}) {
+  return normalizeFleetSummary(meta.fleet_summary) || buildProducerFleetSummary({
+    sessionId,
+    session: meta,
+    messages: [],
+    previous: null,
+  });
+}
+
+function advanceRelayFleetSummary(sessionId, event, metaOverride = null) {
+  if (!sessionId) return {};
+  const meta = metaOverride && typeof metaOverride === 'object'
+    ? metaOverride
+    : (sessionMeta.get(sessionId) || {});
+  const previous = ensureRelayFleetSummary(sessionId, meta);
+  const summary = advanceFleetSummary(previous, event, meta) || previous;
+  if (!summary) return {};
+  const projection = projectFleetSummary(summary);
+  sessionMeta.set(sessionId, { ...meta, ...projection });
+  return projection;
+}
+
 function buildSessionSummary(msg, sessionId) {
   const meta = sessionMeta.get(sessionId) || {};
+  const fleetProjection = projectFleetSummary(meta.fleet_summary);
+  const {
+    last_message_at: _fleetLastMessageAt,
+    last_message_id: _fleetLastMessageId,
+    last_message_kind: _fleetLastMessageKind,
+    last_message_source: _fleetLastMessageSource,
+    latest_visible_message: _fleetLatestVisibleMessage,
+    ...safeFleetProjection
+  } = fleetProjection;
   const activity = compactSummaryActivity(msg.activity || meta.activity, msg.label);
   const role = msg.role || msg.message?.role || null;
-  const snippet = summarySnippet(msg);
-  const lastMessageAt = msg.ts || msg.timestamp || msg.created_at || msg.server_ts || Date.now();
+  const snippet = fleetProjection.last_snippet || summarySnippet(msg);
   const unreadDelta = !sessionIdIsTestSession(sessionId) && role === 'assistant'
     && ['message', 'proxy_message', 'message_event'].includes(msg.type) ? 1 : 0;
   return {
@@ -3900,9 +4209,10 @@ function buildSessionSummary(msg, sessionId) {
     session_id: sessionId,
     status: sessionHealth.get(sessionId) || meta.status || null,
     ...(activity ? { activity } : {}),
+    ...safeFleetProjection,
     ...(compactActivityTrace(msg.activity_trace) ? { activity_trace: compactActivityTrace(msg.activity_trace) } : {}),
     ...(snippet ? { last_snippet: snippet } : {}),
-    ...(snippet ? { last_message_at: lastMessageAt } : {}),
+    ...latestVisibleMessageProjection(sessionId),
     unread_delta: unreadDelta,
     ...(Number.isSafeInteger(msg?.state_seq) ? { state_seq: msg.state_seq } : {}),
     ...(msg?.state_epoch ? { state_epoch: msg.state_epoch } : {}),
@@ -4370,6 +4680,20 @@ function statusBroadcastSignature(msg) {
         tokens_used: activity.goal.tokens_used ?? activity.goal.tokensUsed ?? null,
       }
     : null;
+  const goalRun = activity?.goal_run && typeof activity.goal_run === 'object'
+    ? {
+        schema_version: activity.goal_run.schema_version ?? null,
+        run_id: activity.goal_run.run_id || '',
+        goal_fingerprint: activity.goal_run.goal_fingerprint || '',
+        goal_generation: activity.goal_run.goal_generation ?? null,
+        lifecycle: activity.goal_run.lifecycle || '',
+        lease_active: activity.goal_run.lease_active === true,
+        owner_state: activity.goal_run.owner_state || '',
+        transition_seq: activity.goal_run.transition_seq ?? null,
+        transition_id: activity.goal_run.transition_id || '',
+        source_sequence: activity.goal_run.source_sequence ?? null,
+      }
+    : null;
   return JSON.stringify({
     thinking: !!msg?.thinking,
     label: msg?.label || '',
@@ -4387,6 +4711,7 @@ function statusBroadcastSignature(msg) {
       step: activity.step || null,
       usage: activity.usage || null,
       goal,
+      goal_run: goalRun,
     } : null,
   });
 }
@@ -4405,12 +4730,31 @@ function shouldBroadcastStatus(sessionId, statusMsg) {
 
 function getSessionListEntry(id) {
   const meta = sessionMeta.get(id);
-  if (!meta) return id;
+  if (!meta) {
+    const latestProjection = latestVisibleMessageProjection(id);
+    return Object.keys(latestProjection).length > 0
+      ? {
+        session_id: id,
+        status: sessionHealth.get(id) || 'healthy',
+        last_seen_at: sessionLastSeen.has(id) ? new Date(sessionLastSeen.get(id)).toISOString() : null,
+        ...latestProjection,
+      }
+      : id;
+  }
+  const {
+    latest_visible_message: _legacyLatestVisibleMessage,
+    last_message_id: _legacyLastMessageId,
+    last_message_at: _legacyLastMessageAt,
+    last_message_kind: _legacyLastMessageKind,
+    last_message_source: _legacyLastMessageSource,
+    ...safeMeta
+  } = meta;
   return {
-    ...meta,
+    ...safeMeta,
     session_id:   id,
     status:       sessionHealth.get(id) || meta.status || 'healthy',
     last_seen_at: meta.last_seen_at || (sessionLastSeen.has(id) ? new Date(sessionLastSeen.get(id)).toISOString() : null),
+    ...latestVisibleMessageProjection(id),
   };
 }
 
@@ -5408,19 +5752,36 @@ function handleProxyConnection(ws, req) {
         proxySessions.add(id);
         if (s && typeof s === 'object') {
           const previousMeta = sessionMeta.get(id) || {};
-          const resetTitle = s.is_new_chat_draft === true || s.is_list_view === true;
-          const mergedTitle = mergeDurableChatTitleDetails(previousMeta.chat_title, s.chat_title, {
+          const resetTitle = s.is_new_chat_draft === true;
+          const mergedFleetSummary = resetTitle
+            ? null
+            : mergeProducerFleetSummary(previousMeta.fleet_summary, s.fleet_summary).summary;
+          const fleetProjection = projectFleetSummary(mergedFleetSummary);
+          const incomingTitle = fleetProjection.chat_title || s.chat_title;
+          const incomingTitleSource = fleetProjection.chat_title_source || s.chat_title_source;
+          const mergedTitle = mergeDurableChatTitleDetails(previousMeta.chat_title, incomingTitle, {
             previousSource: previousMeta.chat_title_source,
-            incomingSource: s.chat_title_source,
+            incomingSource: incomingTitleSource,
             reset: resetTitle,
           });
-          sessionMeta.set(id, {
+          const nextMeta = {
+            ...previousMeta,
             ...s,
             ...sessionNoiseMetadata(s),
             session_id: id,
+            ...fleetProjection,
+            fleet_summary: mergedFleetSummary,
             chat_title: mergedTitle.title,
             chat_title_source: mergedTitle.source,
-          });
+          };
+          if (resetTitle) {
+            nextMeta.last_user_request = null;
+            nextMeta.last_snippet = null;
+            nextMeta.last_message_at = null;
+            nextMeta.fleet_work_context = null;
+            clearLatestVisibleMessage(id);
+          }
+          sessionMeta.set(id, nextMeta);
           const snapshotActivity = s.activity || (s.goal ? {
             kind: s.status || 'idle',
             goal: s.goal,
@@ -5566,12 +5927,14 @@ function handleProxyConnection(ws, req) {
         };
         semantic.events.forEach(dispatchSemanticNotification);
         if (sessionMeta.has(id)) {
-          sessionMeta.set(id, {
+          const nextMeta = {
             ...sessionMeta.get(id),
             activity: broadcastActivity,
             status: msg.status || sessionMeta.get(id).status,
             last_seen_at: new Date().toISOString(),
-          });
+          };
+          sessionMeta.set(id, nextMeta);
+          advanceRelayFleetSummary(id, { ...msg, activity: broadcastActivity }, nextMeta);
         }
         // Track activity kind for idle-triggered scheduled sends. User-facing
         // notifications are emitted only by the semantic lifecycle coordinator.
@@ -5704,6 +6067,14 @@ function handleProxyConnection(ws, req) {
           return;
         }
       }
+
+      advanceRelayFleetSummary(id, {
+        ...msg,
+        type: 'proxy_message',
+        role,
+        content,
+        content_blocks: contentBlocks,
+      });
 
       const seq = nextSeq(id);
       queueProxyMessageWrite({
@@ -6233,6 +6604,7 @@ function handleProxyConnection(ws, req) {
           }
           rows.forEach(m => insertHistoryMessage(id, m));
         })(incrementalPlan.rows);
+        recomputeLatestVisibleMessage(id);
         log('info', 'history', `${incrementalPlan.mode === 'append' ? 'Appended' : 'Replaced suffix with'} ${incrementalPlan.rows.length} msgs`, {
           session: id,
           previous: incrementalPlan.existing_count,
@@ -6265,6 +6637,7 @@ function handleProxyConnection(ws, req) {
           msgs.forEach(m => insertHistoryMessage(id, m));
         });
         resync(messages);
+        recomputeLatestVisibleMessage(id);
         if (msg.source?.endsWith('_jsonl') || messages.some(message => message?.source_cursor) || messages.length === 0) {
           rebuildTranscriptSourceCursors(id, messages);
         }
@@ -6280,6 +6653,7 @@ function handleProxyConnection(ws, req) {
         db.transaction((msgs) => {
           msgs.forEach(m => insertHistoryMessage(id, m));
         })(messages);
+        recomputeLatestVisibleMessage(id);
         if (msg.source?.endsWith('_jsonl') || messages.some(message => message?.source_cursor)) {
           rebuildTranscriptSourceCursors(id, messages);
         }
@@ -7170,6 +7544,7 @@ function handleClientConnection(ws, req) {
           native_receipt: deserializeNativeReceipt(existingSend.native_receipt),
           process_epoch: existingSend.process_epoch || null,
           failure_code: existingSend.failure_code || null,
+          ...latestVisibleMessageProjection(id),
           replayed: true,
         }));
         log('info', 'send', 'Idempotent client retry acknowledged without native redispatch', {
@@ -7295,6 +7670,7 @@ function handleClientConnection(ws, req) {
         ts:                messageTs,
         created_at:        createdAt,
         status:            clientMsgId ? 'accepted' : 'recorded',
+        ...latestVisibleMessageProjection(id),
       }));
 
       // Broadcast to all browsers (including other tabs)
@@ -7309,6 +7685,7 @@ function handleClientConnection(ws, req) {
         server_message_id: serverId,
         ts:                messageTs,
         created_at:        createdAt,
+        ...latestVisibleMessageProjection(id),
       });
 
     // ── Steer (inject text into Codex input without sending) ───────────────

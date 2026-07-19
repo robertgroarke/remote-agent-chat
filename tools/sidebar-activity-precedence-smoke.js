@@ -40,7 +40,15 @@ function idOf(session) {
 function fixtureState(index) {
   const states = [
     { name: 'thinking', activity: { kind: 'thinking', generating: true, updated_at: FRESH_AT }, expected: 'working' },
-    { name: 'working_goal', activity: { kind: 'tool', generating: true, goal: { state: 'active' }, updated_at: FRESH_AT }, expected: 'working_goal' },
+    { name: 'working_goal', activity: {
+      kind: 'tool', generating: true,
+      goal: { state: 'active', fingerprint: 'fixture-goal', generation: 1 },
+      goal_run: {
+        schema_version: 1, run_id: 'fixture-run', goal_fingerprint: 'fixture-goal', goal_generation: 1,
+        lifecycle: 'running_turn', lease_active: true, owner_state: 'confirmed', transition_seq: 1,
+      },
+      updated_at: FRESH_AT,
+    }, expected: 'working_goal' },
     { name: 'idle', activity: { kind: 'idle', updated_at: FRESH_AT }, expected: 'idle' },
     { name: 'asking', activity: { kind: 'waiting_for_user', updated_at: FRESH_AT }, expected: 'needs_attention' },
     { name: 'blocked', activity: { kind: 'blocked', updated_at: FRESH_AT }, expected: 'needs_attention' },

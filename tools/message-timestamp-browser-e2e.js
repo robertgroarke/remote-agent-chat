@@ -70,17 +70,25 @@ function fixtureRows() {
     if (sequence % 3 === 0) return { ...row, created_at: new Date(instantMs).toISOString() };
     if (sequence % 3 === 1) return { ...row, timestamp: new Date(instantMs).toISOString() };
     return { ...row, ts: instantMs / 1000 };
-  }).map((row, index) => index === 20 ? {
-    ...row,
-    content: 'One top-level message owns these nested blocks.',
-    content_blocks: [
-      { type: 'markdown', text: 'Prose before the command.' },
-      { type: 'tool_call', tool: 'shell_command', input: { command: 'Write-Output timestamp-fixture' } },
-      { type: 'tool_result', tool: 'shell_command', output: 'timestamp-fixture' },
-      { type: 'file_changes', files: [{ path: 'fixture.txt', change: 'modified' }] },
-      { type: 'markdown', text: 'Prose after the command.' },
-    ],
-  } : row);
+  }).map((row, index) => {
+    if (index === 20 || index === 34) return {
+      ...row,
+      content: 'One top-level message owns these nested tool blocks.',
+      content_blocks: [
+        { type: 'markdown', text: 'Prose before the command.' },
+        { type: 'tool_call', tool: 'shell_command', input: { command: 'Write-Output timestamp-fixture' } },
+        { type: 'tool_result', tool: 'shell_command', output: 'timestamp-fixture' },
+        { type: 'file_changes', files: [{ path: 'fixture.txt', change: 'modified' }] },
+        { type: 'markdown', text: 'Prose after the command.' },
+      ],
+    };
+    if (index === 36) return {
+      ...row,
+      content: 'Timestamped error fixture.',
+      content_blocks: [{ type: 'error', content: 'The owned fixture failed safely.' }],
+    };
+    return row;
+  });
 }
 
 async function main() {
@@ -91,6 +99,7 @@ async function main() {
   let activeSocket = null;
   let sentMessage = null;
   let olderRequests = 0;
+  let connectionCount = 0;
   const clientMessageTypes = [];
 
   const server = http.createServer((request, response) => {
@@ -115,6 +124,7 @@ async function main() {
     wss.handleUpgrade(request, socket, head, ws => wss.emit('connection', ws));
   });
   wss.on('connection', ws => {
+    connectionCount += 1;
     activeSocket = ws;
     const send = payload => ws.readyState === ws.OPEN && ws.send(JSON.stringify(payload));
     const sessions = [{
@@ -173,12 +183,12 @@ async function main() {
         });
       } else if (message.type === 'send') {
         sentMessage = message;
-        send({
+        setTimeout(() => send({
           type: 'message_accepted', session: SESSION_ID,
           client_message_id: message.client_message_id,
           created_at: message.created_at,
           ts: Date.parse(message.created_at) / 1000,
-        });
+        }), 500);
         setTimeout(() => send({
           type: 'message', session: SESSION_ID, role: 'user', content: message.content,
           client_message_id: message.client_message_id,
@@ -186,7 +196,7 @@ async function main() {
           source_message_id: 'timestamp-fixture:optimistic-settled',
           created_at: message.created_at,
           ts: Date.parse(message.created_at) / 1000,
-        }), 20);
+        }), 900);
       }
     });
   });
@@ -202,15 +212,30 @@ async function main() {
     { name: 'light-desktop', theme: 'light', viewport: { width: 1280, height: 900 } },
     { name: 'dark-mobile-390', theme: 'dark', viewport: { width: 390, height: 844 } },
     { name: 'light-mobile-390', theme: 'light', viewport: { width: 390, height: 844 } },
+    {
+      name: 'dark-mobile-390-long-locale-200pct', theme: 'dark',
+      viewport: { width: 390, height: 844 }, locale: 'de-DE', zoom: 2,
+    },
+    {
+      name: 'light-mobile-390-rtl', theme: 'light',
+      viewport: { width: 390, height: 844 }, locale: 'ar-EG', direction: 'rtl',
+    },
   ];
   const results = [];
   try {
     for (const scenario of scenarios) {
       sentMessage = null;
       olderRequests = 0;
-      const context = await browser.newContext({ viewport: scenario.viewport, colorScheme: scenario.theme });
-      await context.addInitScript((theme) => {
+      const context = await browser.newContext({
+        viewport: scenario.viewport,
+        colorScheme: scenario.theme,
+        locale: scenario.locale || 'en-US',
+        timezoneId: 'America/Los_Angeles',
+      });
+      await context.addInitScript(({ theme, direction, zoom }) => {
         localStorage.setItem('remote-agent-chat-theme', theme);
+        if (direction) document.documentElement.dir = direction;
+        if (zoom) document.documentElement.style.zoom = String(zoom);
         window.__timestampLayoutShifts = [];
         new PerformanceObserver(list => {
           for (const entry of list.getEntries()) {
@@ -226,7 +251,7 @@ async function main() {
             });
           }
         }).observe({ type: 'layout-shift', buffered: true });
-      }, scenario.theme);
+      }, scenario);
       const page = await context.newPage();
       const pageErrors = [];
       page.on('pageerror', error => pageErrors.push(String(error?.stack || error)));
@@ -248,6 +273,17 @@ async function main() {
         const settled = rows.filter(row => row.classList.contains('transcript-virtual-row'));
         const perRow = rows.map(row => row.querySelectorAll(':scope > .user-content .message-timestamp, :scope > .assistant-content .message-timestamp').length);
         const allTimes = rows.flatMap(row => [...row.querySelectorAll(':scope > .user-content .message-timestamp, :scope > .assistant-content .message-timestamp')]);
+        const semanticTimes = allTimes.filter(node => node.tagName === 'TIME');
+        const expectedVisibleParts = node => {
+          const instant = new Date(node.dateTime);
+          const now = new Date();
+          const options = {
+            ...(instant.getFullYear() === now.getFullYear() ? {} : { year: 'numeric' }),
+            month: 'short', day: 'numeric', hour: 'numeric', minute: '2-digit',
+          };
+          const formatter = new Intl.DateTimeFormat(undefined, options);
+          return { text: formatter.format(instant), parts: formatter.formatToParts(instant) };
+        };
         const contrastRatio = node => {
           const parse = value => {
             const values = String(value).match(/[\d.]+/g)?.map(Number) || [];
@@ -278,7 +314,16 @@ async function main() {
           settled: settled.length,
           timestamp_nodes: allTimes.length,
           per_row_exactly_one: perRow.every(count => count === 1),
-          semantic_time_nodes: allTimes.filter(node => node.tagName === 'TIME').length,
+          semantic_time_nodes: semanticTimes.length,
+          visible_matches_authoritative_instant: semanticTimes.every(node =>
+            node.textContent.trim() === expectedVisibleParts(node).text),
+          visible_has_date_and_time: semanticTimes.every(node => {
+            const types = new Set(expectedVisibleParts(node).parts.map(part => part.type));
+            return types.has('month') && types.has('day') && types.has('hour') && types.has('minute');
+          }),
+          accessible_label_has_exact_iso: semanticTimes.every(node =>
+            node.getAttribute('aria-label')?.includes(node.dateTime)
+              && node.getAttribute('title')?.includes(node.dateTime)),
           unknown_nodes: allTimes.filter(node => node.classList.contains('message-timestamp-unknown')).length,
           nested_timestamp_nodes: document.querySelectorAll('.content-block .message-timestamp, details .message-timestamp').length,
           minimum_contrast: Math.min(...allTimes.map(contrastRatio)),
@@ -296,6 +341,9 @@ async function main() {
       const initial = await coverage();
       assert.strictEqual(initial.per_row_exactly_one, true);
       assert.strictEqual(initial.timestamp_nodes, initial.rows);
+      assert.strictEqual(initial.visible_matches_authoritative_instant, true);
+      assert.strictEqual(initial.visible_has_date_and_time, true);
+      assert.strictEqual(initial.accessible_label_has_exact_iso, true);
       assert.strictEqual(initial.unknown_nodes, 1, 'missing legacy instant must render exactly one honest unknown label');
       assert.strictEqual(initial.nested_timestamp_nodes, 0, 'nested tool/diff blocks must inherit the top-level timestamp');
       assert(initial.minimum_contrast >= 4.5, `timestamp contrast ${initial.minimum_contrast} is below AA`);
@@ -328,6 +376,22 @@ async function main() {
       const composer = page.locator('.textarea-row textarea');
       await composer.fill('Optimistic timestamp fixture');
       await composer.press('Enter');
+      await page.waitForFunction(() => [...document.querySelectorAll('.message.user')]
+        .some(row => row.textContent.includes('Optimistic timestamp fixture')));
+      const pendingTimestamp = await page.locator('.message.user', { hasText: 'Optimistic timestamp fixture' })
+        .last().locator('.message-timestamp').evaluate(node => ({
+          text: node.textContent.trim(),
+          iso: node.dateTime || '',
+          label: node.getAttribute('aria-label') || '',
+        }));
+      assert(pendingTimestamp.iso, 'optimistic message omitted its authoritative client instant');
+      assert(pendingTimestamp.label.includes(pendingTimestamp.iso),
+        'optimistic accessible timestamp omitted its exact client instant');
+      if (OUTPUT_DIR) {
+        fs.mkdirSync(OUTPUT_DIR, { recursive: true });
+        await page.locator('.message.user', { hasText: 'Optimistic timestamp fixture' }).last()
+          .screenshot({ path: path.join(OUTPUT_DIR, `${scenario.name}-pending.png`) });
+      }
       await page.waitForFunction(() => !!window.document.querySelector('[data-message-source-id="timestamp-fixture:optimistic-settled"]'));
       assert(sentMessage?.created_at, 'client send did not carry the optimistic producer instant');
 
@@ -384,7 +448,41 @@ async function main() {
       const finalCoverage = await coverage();
       assert.strictEqual(finalCoverage.per_row_exactly_one, true);
       assert.strictEqual(finalCoverage.timestamp_nodes, finalCoverage.rows);
+      assert.strictEqual(finalCoverage.visible_matches_authoritative_instant, true);
+      assert.strictEqual(finalCoverage.visible_has_date_and_time, true);
+      assert.strictEqual(finalCoverage.accessible_label_has_exact_iso, true);
       assert(finalCoverage.minimum_contrast >= 4.5);
+
+      const producerTimestampSnapshot = () => page.evaluate(() =>
+        [...document.querySelectorAll('[data-message-source-id^="timestamp-fixture:"]')]
+          .map(row => {
+            const sourceId = row.dataset.messageSourceId || '';
+            const sequence = Number(sourceId.match(/^timestamp-fixture:(\d+)$/)?.[1]);
+            const time = row.querySelector('.message-timestamp');
+            return { sourceId, sequence, text: time?.textContent?.trim() || '', iso: time?.dateTime || '' };
+          })
+          .filter(entry => entry.sequence >= 4 && entry.sequence <= 39 && entry.iso)
+          .sort((left, right) => left.sequence - right.sequence));
+      const beforeReconnectTimestamps = await producerTimestampSnapshot();
+      assert.strictEqual(beforeReconnectTimestamps.length, 35,
+        'reconnect baseline did not retain every producer-timestamped fixture row');
+      const connectionsBeforeReconnect = connectionCount;
+      activeSocket.close(1012, 'timestamp fixture reconnect');
+      await new Promise((resolve, reject) => {
+        const deadline = Date.now() + 15_000;
+        const poll = () => {
+          if (connectionCount > connectionsBeforeReconnect) return resolve();
+          if (Date.now() >= deadline) return reject(new Error('browser did not reconnect to timestamp fixture'));
+          setTimeout(poll, 50);
+        };
+        poll();
+      });
+      await page.waitForFunction(() =>
+        document.querySelectorAll('[data-message-source-id^="timestamp-fixture:"]').length >= 35);
+      const afterReconnectTimestamps = await producerTimestampSnapshot();
+      assert.deepStrictEqual(afterReconnectTimestamps, beforeReconnectTimestamps,
+        'reconnect changed a producer timestamp or its visible localized date/time');
+
       const layoutShifts = await page.evaluate(() => window.__timestampLayoutShifts || []);
       const pageLayoutShift = layoutShifts.reduce((sum, entry) => sum + entry.value, 0);
       const layoutShift = layoutShifts.filter(entry => entry.transcript).reduce((sum, entry) => sum + entry.value, 0);
@@ -393,6 +491,10 @@ async function main() {
       if (OUTPUT_DIR) {
         fs.mkdirSync(OUTPUT_DIR, { recursive: true });
         await page.screenshot({ path: path.join(OUTPUT_DIR, `${scenario.name}.png`), fullPage: false });
+        await page.locator('[data-message-source-id="timestamp-fixture:35"]')
+          .screenshot({ path: path.join(OUTPUT_DIR, `${scenario.name}-tool.png`) });
+        await page.locator('[data-message-source-id="timestamp-fixture:37"]')
+          .screenshot({ path: path.join(OUTPUT_DIR, `${scenario.name}-error.png`) });
       }
       results.push({
         ...scenario,
@@ -405,6 +507,9 @@ async function main() {
         prepend_anchor_drift_px: prependAnchorDrift,
         cls: layoutShift,
         page_cls: pageLayoutShift,
+        reconnect_preserved_producer_timestamps: true,
+        reconnect_rows_compared: beforeReconnectTimestamps.length,
+        optimistic_visible_timestamp: pendingTimestamp,
         optimistic_created_at: sentMessage.created_at,
       });
       await context.close();

@@ -38,6 +38,7 @@ import {
 } from '../lib/attention-feedback';
 import { processSemanticNotification } from '../lib/semantic-notifications';
 import { AgentIcon } from '../components/AgentIcons';
+import ProviderMark from '../components/ProviderMark';
 import { useReducedMotion } from '../lib/reduced-motion';
 import SessionHistorySheet from '../components/SessionHistorySheet';
 import LaunchSessionSheet from '../components/LaunchSessionSheet';
@@ -46,8 +47,14 @@ import {
   getCachedTranscript,
   isTranscriptActivityLive,
 } from '../lib/transcript-cache';
-import { resolveSessionChatTitle, titleFromSessionMessages } from '../lib/session-title';
+import { resolveSessionChatTitle, sessionChatTitleMetadataPatch, titleFromSessionMessages } from '../lib/session-title';
 import { partitionPinnedSessions } from '../lib/session-pins';
+import {
+  latestVisibleMessageSessionPatch,
+  normalizeLatestVisibleMessage,
+  projectRecentChatOwnership,
+} from '../lib/recent-chats';
+import { formatVisibleMessageTime, parseMessageInstant } from '../lib/message-time';
 import {
   MAX_BROADCAST_CONTENT_CHARS,
   MAX_BROADCAST_SESSIONS,
@@ -55,11 +62,14 @@ import {
   sessionSupportsBroadcast,
 } from '../lib/broadcast-send-policy';
 import {
+  formatOllamaDuration,
+  formatOllamaTokenRate,
   formatProviderCredits,
   formatProviderPercent,
   formatProviderUsageAge,
   formatProviderUsageReset,
   normalizeProviderUsage,
+  providerFinancialRows,
   selectEstimatedCost,
 } from '../lib/provider-usage';
 import {
@@ -80,6 +90,7 @@ import {
   classifyFleetActivity,
   fleetActivityObservedAtMs,
   fleetFreshnessLabel,
+  fleetGoalSubstateLabel,
   fleetStateIsWorking,
   fleetStateLabel,
   normalizeFleetActivityTrace,
@@ -423,7 +434,6 @@ export default function SessionListScreen({ navigation }) {
   const [healthMap,     setHealthMap]     = useState({});    // sessionId → 'healthy'|'degraded'|'disconnected'
   const [unreadMap,     setUnreadMap]     = useState({});    // sessionId → unread count
   const [showHistory,   setShowHistory]   = useState(false);
-  const [lastMessageAt, setLastMessageAt] = useState({});
   const [permPrompts,   setPermPrompts]   = useState({});    // sessionId → prompt object
   const [collapsedGroups, setCollapsedGroups] = useState({});
   const [groupAliases, setGroupAliases] = useState(DEFAULT_GROUP_ALIASES);
@@ -733,9 +743,9 @@ export default function SessionListScreen({ navigation }) {
         if (msg.session_health) {
           setHealthMap(msg.session_health);
         }
-        if (Array.isArray(msg.open_prompts) && msg.open_prompts.length > 0) {
+        {
           const restored = {};
-          msg.open_prompts.forEach(p => {
+          [...(msg.open_prompts || []), ...(msg.open_question_prompts || [])].forEach(p => {
             const sid = p.session_id || p.session;
             if (sid) {
               restored[sid] = p;
@@ -923,8 +933,12 @@ export default function SessionListScreen({ navigation }) {
             ...(msg.status ? { status: msg.status } : {}),
             ...(msg.activity ? { activity: msg.activity } : {}),
             ...(msg.goal ? { goal: msg.goal } : {}),
+            ...(msg.fleet_summary ? { fleet_summary: msg.fleet_summary } : {}),
+            ...(msg.fleet_work_context ? { fleet_work_context: msg.fleet_work_context } : {}),
+            ...(msg.last_user_request ? { last_user_request: msg.last_user_request } : {}),
             ...(msg.last_snippet != null ? { last_snippet: msg.last_snippet } : {}),
-            ...(msg.last_message_at != null ? { last_message_at: msg.last_message_at } : {}),
+            ...latestVisibleMessageSessionPatch(msg),
+            ...sessionChatTitleMetadataPatch(msg),
           };
         }));
         if (msg.status) setHealthMap(previous => ({ ...previous, [sid]: msg.status }));
@@ -940,12 +954,6 @@ export default function SessionListScreen({ navigation }) {
               transport: normalizeFleetActivityTrace(msg.activity_trace),
             },
           }));
-        }
-        if (msg.last_message_at != null) {
-          const parsed = Number(msg.last_message_at)
-            || Date.parse(msg.last_message_at || '')
-            || Date.now();
-          setLastMessageAt(previous => ({ ...previous, [sid]: parsed }));
         }
         if (Number(msg.unread_delta) > 0 && sid !== activeSessionRef.current) {
           setUnreadMap(previous => ({
@@ -966,8 +974,14 @@ export default function SessionListScreen({ navigation }) {
         }
         if (msgSid) {
           refreshSidebarTranscriptTitle(msgSid, [msg]);
-          const parsed = Number(msg.ts) || Date.parse(msg.timestamp || msg.created_at || '') || Date.now();
-          setLastMessageAt(previous => previous[msgSid] === parsed ? previous : ({ ...previous, [msgSid]: parsed }));
+          const latestMessagePatch = latestVisibleMessageSessionPatch(msg);
+          if (Object.keys(latestMessagePatch).length > 0) {
+            setSessions(previous => previous.map(item => (
+              sessionKey(item) === msgSid
+                ? { ...(typeof item === 'object' ? item : {}), session_id: msgSid, ...latestMessagePatch }
+                : item
+            )));
+          }
         }
         break;
       }
@@ -990,11 +1004,53 @@ export default function SessionListScreen({ navigation }) {
         break;
       }
 
+      case 'question_prompt': {
+        const sid = msg.session_id || msg.session;
+        if (sid) {
+          notePromptForAttentionFeedback(msg, activeSessionRef.current).catch(() => {});
+          setPermPrompts(prev => ({ ...prev, [sid]: { ...msg, type: 'question_prompt' } }));
+        }
+        break;
+      }
+
+      case 'question_prompt_state': {
+        const sid = msg.session_id || msg.session;
+        if (!sid) break;
+        if (msg.lifecycle === 'failed' || ['open', 'submitting'].includes(msg.lifecycle)) {
+          setPermPrompts(prev => {
+            const current = prev[sid];
+            const samePrompt = current?.prompt_id === msg.prompt_id && current?.generation === msg.generation;
+            if (current && !samePrompt) return prev;
+            return {
+              ...prev,
+              [sid]: {
+                ...(samePrompt ? current : {}),
+                ...msg,
+                type: 'question_prompt',
+              },
+            };
+          });
+        } else {
+          setPermPrompts(prev => {
+            const current = prev[sid];
+            if (current?.prompt_id !== msg.prompt_id || current?.generation !== msg.generation) return prev;
+            clearPromptAttentionFeedback(msg);
+            const { [sid]: _, ...rest } = prev;
+            return rest;
+          });
+        }
+        break;
+      }
+
       case 'permission_prompt_expired': {
         const sid = msg.session_id || msg.session;
         if (sid) {
-          clearPromptAttentionFeedback(msg);
-          setPermPrompts(prev => { const { [sid]: _, ...rest } = prev; return rest; });
+          setPermPrompts(prev => {
+            if (prev[sid]?.prompt_id !== msg.prompt_id) return prev;
+            clearPromptAttentionFeedback(msg);
+            const { [sid]: _, ...rest } = prev;
+            return rest;
+          });
         }
         break;
       }
@@ -1002,8 +1058,12 @@ export default function SessionListScreen({ navigation }) {
       case 'agent_control_result': {
         const sid = msg.session_id || msg.session;
         if (sid && msg.command === 'permission_response' && msg.result === 'ok') {
-          clearPromptAttentionFeedback(msg);
-          setPermPrompts(prev => { const { [sid]: _, ...rest } = prev; return rest; });
+          setPermPrompts(prev => {
+            if (!prev[sid]) return prev;
+            clearPromptAttentionFeedback(msg);
+            const { [sid]: _, ...rest } = prev;
+            return rest;
+          });
         }
         break;
       }
@@ -1155,10 +1215,11 @@ export default function SessionListScreen({ navigation }) {
   function activityLabel(sid, type) {
     const a = activities[sid];
     if (!a) return null;
+    const substate = fleetGoalSubstateLabel(a, { connected, health: healthMap[sid] });
     const glyph = (type === 'claude' || type === 'claude_cli') ? '✻'
       : (type === 'codex' || type === 'codex-desktop' || type === 'codex_cli') ? '◌'
         : type === 'cursor' ? '•••' : '●';
-    return `${glyph} ${a.label || 'Generating'}`;
+    return `${glyph} ${substate || a.label || 'Generating'}`;
   }
 
   function healthDotColor(sid) {
@@ -1207,14 +1268,20 @@ export default function SessionListScreen({ navigation }) {
     () => new Set(workingSessions.map(sessionId)),
     [workingSessions],
   );
-  const { pinned: allPinnedSessions, unpinned: allUnpinnedSessions } = useMemo(
+  const { pinned: allPinnedSessions } = useMemo(
     () => partitionPinnedSessions(visibleSessions, sessionPreferences),
     [visibleSessions, sessionPreferences],
   );
-  const pinnedSessions = useMemo(
-    () => allPinnedSessions.filter(item => !workingSessionIds.has(sessionId(item))),
-    [allPinnedSessions, workingSessionIds],
+  const pinnedSessionIds = useMemo(
+    () => new Set(allPinnedSessions.map(sessionId)),
+    [allPinnedSessions],
   );
+  const recentChatOwnership = useMemo(
+    () => projectRecentChatOwnership(visibleSessions, { workingSessionIds, pinnedSessionIds }),
+    [visibleSessions, workingSessionIds, pinnedSessionIds],
+  );
+  const recentSessions = recentChatOwnership.recent;
+  const pinnedSessions = recentChatOwnership.pinned;
   const normalizedSearchQuery = searchQuery.trim().toLowerCase();
   const AGENT_BADGES = {
     claude:            { abbr: 'CC', color: '#cc785c', label: 'Claude Code' },
@@ -1246,8 +1313,8 @@ export default function SessionListScreen({ navigation }) {
   }
 
   const rawGroups = useMemo(
-    () => groupSessionsByDirectory(allUnpinnedSessions, groupAliases),
-    [allUnpinnedSessions, groupAliases],
+    () => groupSessionsByDirectory(recentChatOwnership.remaining, groupAliases),
+    [recentChatOwnership.remaining, groupAliases],
   );
   const workspaceLabelBySessionId = useMemo(() => Object.fromEntries(
     groupSessionsByDirectory(visibleSessions, groupAliases).flatMap(group => (
@@ -1257,18 +1324,17 @@ export default function SessionListScreen({ navigation }) {
 
   const sidebarRankOptions = useMemo(() => ({
     ...sidebarStateOptions,
-    lastMessageAt,
     rankWorking: false,
-  }), [sidebarStateOptions, lastMessageAt]);
+  }), [sidebarStateOptions]);
   const {
     groups: stableOrderedGroups,
     orderChanged: sidebarOrderChanged,
     sortNow: sortSidebarNow,
   } = useStableSidebarGroups(rawGroups, sidebarRankOptions, sidebarStructureLocked);
-  const orderedGroups = useMemo(() => stableOrderedGroups.map(group => ({
-    ...group,
-    sessions: group.sessions.filter(item => !workingSessionIds.has(sessionId(item))),
-  })).filter(group => group.sessions.length > 0), [stableOrderedGroups, workingSessionIds]);
+  const orderedGroups = useMemo(
+    () => stableOrderedGroups.filter(group => group.sessions.length > 0),
+    [stableOrderedGroups],
+  );
   const summarizeSessions = groupSessions => groupSessions.reduce((result, item) => {
     const sid = sessionId(item);
     result.unread += testSessionIds.has(sid) ? 0 : unreadMap[sid] || 0;
@@ -1282,6 +1348,9 @@ export default function SessionListScreen({ navigation }) {
   const searchedPinnedSessions = normalizedSearchQuery
     ? pinnedSessions.filter(item => sessionSearchText(item).includes(normalizedSearchQuery))
     : pinnedSessions;
+  const searchedRecentSessions = normalizedSearchQuery
+    ? recentSessions.filter(item => sessionSearchText(item).includes(normalizedSearchQuery))
+    : recentSessions;
   const pinnedSection = searchedPinnedSessions.length > 0 ? {
     key: '__pinned__',
     title: 'Pinned chats',
@@ -1300,7 +1369,17 @@ export default function SessionListScreen({ navigation }) {
     ...summarizeSessions(searchedWorkingSessions),
     data: searchedWorkingSessions,
   } : null;
-  const sections = [workingSection, pinnedSection, ...orderedGroups.map(group => {
+  const recentCollapsed = !!collapsedGroups.__recent__ && !searchQuery;
+  const recentSection = searchedRecentSessions.length > 0 ? {
+    key: '__recent__',
+    title: 'Recent chats',
+    count: searchedRecentSessions.length,
+    collapsed: recentCollapsed,
+    recent: true,
+    ...summarizeSessions(searchedRecentSessions),
+    data: recentCollapsed ? [] : searchedRecentSessions,
+  } : null;
+  const sections = [workingSection, recentSection, pinnedSection, ...orderedGroups.map(group => {
     const groupSessions = normalizedSearchQuery
       ? group.sessions.filter(item => sessionSearchText(item).includes(normalizedSearchQuery))
       : group.sessions;
@@ -1424,6 +1503,10 @@ export default function SessionListScreen({ navigation }) {
     });
     const needsAttention = state === 'needs_attention';
     const working = fleetStateIsWorking(state);
+    const goalSubstate = fleetGoalSubstateLabel(capabilitySafeActivity, {
+      connected,
+      health: healthMap[id],
+    });
     const badge = agentBadge(type);
     const workContext = projectFleetWorkContext({
       agentType: type,
@@ -1442,7 +1525,7 @@ export default function SessionListScreen({ navigation }) {
       goal,
       badge,
       title: sessionName(session),
-      status: attention ? 'Action required' : (capabilitySafeActivity?.label || (state === 'idle' ? (goal ? 'Goal paused' : 'Idle') : String(capabilitySafeActivity?.kind || 'Working').replace(/_/g, ' '))),
+      status: attention ? 'Action required' : (goalSubstate || capabilitySafeActivity?.label || (state === 'idle' ? (goal ? 'Goal paused' : 'Idle') : String(capabilitySafeActivity?.kind || 'Working').replace(/_/g, ' '))),
       workContext,
       progress: fleetWorkContextProgress(workContext),
       snippet: fleetSnippet(session),
@@ -1877,6 +1960,7 @@ export default function SessionListScreen({ navigation }) {
                 : entry.tone === 'warning' || entry.tone === 'stale' ? '#d29922'
                   : entry.tone === 'unavailable' ? '#8b949e' : '#3fb950';
               const creditLabel = formatProviderCredits(entry.credits);
+              const financialRows = providerFinancialRows(entry.financials);
               const creditReset = entry.credits?.resets_at
                 ? formatProviderUsageReset(entry.credits.resets_at, providerUsageNowMs)
                 : '';
@@ -1895,9 +1979,7 @@ export default function SessionListScreen({ navigation }) {
                     accessibilityState={{ expanded: !collapsed }}
                     onPress={() => setCollapsedProviderUsage(previous => ({ ...previous, [entry.key]: !previous[entry.key] }))}
                   >
-                    <View style={s.usageProviderMark}>
-                      <Text style={s.usageProviderMarkText}>{entry.providerName.slice(0, 2).toUpperCase()}</Text>
-                    </View>
+                    <ProviderMark providerId={entry.providerId} providerName={entry.providerName} colorScheme="dark" />
                     <View style={s.usageProviderIdentity}>
                       <Text style={s.usageCardTitle}>{entry.providerName}</Text>
                       <Text style={s.usageSessions}>{entry.accountLabel}{entry.plan ? ` - ${entry.plan}` : ''}</Text>
@@ -1966,9 +2048,49 @@ export default function SessionListScreen({ navigation }) {
                         );
                       })}
                     </View>
-                  ) : (
+                  ) : !entry.localRuntime ? (
                     <Text style={s.usageUnavailable}>{entry.error?.message || 'This provider did not report quota windows.'}</Text>
-                  )}
+                  ) : null}
+                  {!!entry.localRuntime && <View style={s.usageCredits} accessibilityLabel="Ollama local runtime">
+                    <View style={s.usageCreditCell}>
+                      <Text style={s.usageCreditLabel}>Local runtime</Text>
+                      <Text style={s.usageCreditValue}>{entry.localRuntime.loadedModelsCount} loaded / {entry.localRuntime.installedModelsCount} installed</Text>
+                      <Text style={s.usageSessions}>{entry.localRuntime.endpointScope.replace(/_/g, ' ')}</Text>
+                    </View>
+                    <View style={s.usageCreditCell}>
+                      <Text style={s.usageCreditLabel}>Request telemetry</Text>
+                      <Text style={s.usageCreditValue}>{entry.localRuntime.telemetryStatus.replace(/_/g, ' ')}</Text>
+                      <Text style={s.usageSessions}>{entry.localRuntime.telemetryReason}</Text>
+                    </View>
+                  </View>}
+                  {!!entry.localRuntime?.latestRequest && <View style={s.usageCredits} accessibilityLabel="Ollama owned request metrics">
+                    <View style={s.usageCreditCell}>
+                      <Text style={s.usageCreditLabel}>Latest owned request</Text>
+                      <Text style={s.usageCreditValue}>{entry.localRuntime.latestRequest.model}</Text>
+                      <Text style={s.usageSessions}>{entry.localRuntime.latestRequest.surface.replace(/_/g, ' ')} - {formatProviderUsageAge(entry.localRuntime.latestRequest.capturedAt, providerUsageNowMs)}</Text>
+                    </View>
+                    <View style={s.usageCreditCell}>
+                      <Text style={s.usageCreditLabel}>Tokens</Text>
+                      <Text style={s.usageCreditValue}>{entry.localRuntime.latestRequest.promptTokens} prompt - {entry.localRuntime.latestRequest.responseTokens} output</Text>
+                      <Text style={s.usageSessions}>{formatOllamaTokenRate(entry.localRuntime.latestRequest.tokensPerSecond)}</Text>
+                    </View>
+                    <View style={s.usageCreditCell}>
+                      <Text style={s.usageCreditLabel}>Total / load</Text>
+                      <Text style={s.usageCreditValue}>{formatOllamaDuration(entry.localRuntime.latestRequest.totalDurationNs)} / {formatOllamaDuration(entry.localRuntime.latestRequest.loadDurationNs)}</Text>
+                      <Text style={s.usageSessions}>terminal response metrics</Text>
+                    </View>
+                    <View style={s.usageCreditCell}>
+                      <Text style={s.usageCreditLabel}>Prompt / eval</Text>
+                      <Text style={s.usageCreditValue}>{formatOllamaDuration(entry.localRuntime.latestRequest.promptEvalDurationNs)} / {formatOllamaDuration(entry.localRuntime.latestRequest.evalDurationNs)}</Text>
+                      <Text style={s.usageSessions}>{entry.localRuntime.observedRequestCount} owned receipt{entry.localRuntime.observedRequestCount === 1 ? '' : 's'}</Text>
+                    </View>
+                  </View>}
+                  {financialRows.length > 0 && <View style={s.usageCredits}>
+                    {financialRows.map(row => <View style={s.usageCreditCell} key={row.id}>
+                      <Text style={s.usageCreditLabel}>{row.label}</Text>
+                      <Text style={s.usageCreditValue}>{row.value}</Text>
+                    </View>)}
+                  </View>}
                   {(creditLabel || entry.resetCredits) && (
                     <View style={s.usageCredits}>
                       {!!creditLabel && <View style={s.usageCreditCell}>
@@ -2513,6 +2635,7 @@ export default function SessionListScreen({ navigation }) {
               s.sectionHeader,
               section.pinned && s.pinnedSectionHeader,
               section.workingNow && s.workingSectionHeader,
+              section.recent && s.recentSectionHeader,
             ]}
           >
             {section.workingNow ? (
@@ -2538,8 +2661,8 @@ export default function SessionListScreen({ navigation }) {
               style={s.sectionTitleButton}
               accessibilityRole="button"
               accessibilityLabel={`Show full group name: ${section.title}`}
-              onPress={() => setTitleDisclosure({ kind: section.workingNow ? 'Activity group' : section.pinned ? 'Pinned group' : 'Workspace group', title: section.title })}
-              onLongPress={() => setTitleDisclosure({ kind: section.workingNow ? 'Activity group' : section.pinned ? 'Pinned group' : 'Workspace group', title: section.title })}
+              onPress={() => setTitleDisclosure({ kind: section.workingNow ? 'Activity group' : section.recent ? 'Recent group' : section.pinned ? 'Pinned group' : 'Workspace group', title: section.title })}
+              onLongPress={() => setTitleDisclosure({ kind: section.workingNow ? 'Activity group' : section.recent ? 'Recent group' : section.pinned ? 'Pinned group' : 'Workspace group', title: section.title })}
             >
               <Text style={s.sectionTitle} numberOfLines={2}>{section.title}</Text>
             </TouchableOpacity>
@@ -2565,10 +2688,18 @@ export default function SessionListScreen({ navigation }) {
           const dotColor = healthDotColor(sid);
           const subtitle = sessionSubtitle(item);
           const badge  = agentBadge(agentType(item));
-          const workspaceLabel = section.workingNow ? workspaceLabelBySessionId[sid] || 'Unscoped' : '';
+          const workspaceLabel = (section.workingNow || section.recent || section.pinned)
+            ? workspaceLabelBySessionId[sid] || 'Unscoped' : '';
           const contextualSubtitle = workspaceLabel ? `${subtitle || badge.label} / ${workspaceLabel}` : subtitle;
+          const latestVisibleMessage = section.recent ? normalizeLatestVisibleMessage(item) : null;
+          const recentMessageInstant = latestVisibleMessage ? parseMessageInstant(latestVisibleMessage.at) : null;
+          const rowActivityLabel = recentMessageInstant
+            ? `Last message ${formatVisibleMessageTime(recentMessageInstant)}`
+            : label;
           const unread = testSessionIds.has(sid) ? 0 : unreadMap[sid] || 0;
           const hasPerm = !!permPrompts[sid];
+          const promptRequiredLabel = permPrompts[sid]?.type === 'question_prompt'
+            ? 'Question required' : 'Permission required';
           const pinned = !!sessionPreferences[sid]?.pinned;
           return (
             <TouchableOpacity
@@ -2621,9 +2752,13 @@ export default function SessionListScreen({ navigation }) {
                   <Text style={s.cardName} numberOfLines={2}>{sessionName(item)}</Text>
                 </TouchableOpacity>
                 {hasPerm
-                  ? <Text style={s.cardPermLabel} numberOfLines={1}>{`${badge.label} · Permission required`}</Text>
+                  ? <Text style={s.cardPermLabel} numberOfLines={1}>{`${badge.label} · ${promptRequiredLabel}`}</Text>
                   : <Text style={s.cardSubtitle} numberOfLines={1}>{contextualSubtitle || ' '}</Text>}
-                <Text style={[s.cardActivity, !label && s.reservedTextHidden]} numberOfLines={1}>{label || 'Reserved'}</Text>
+                <Text
+                  style={[s.cardActivity, !rowActivityLabel && s.reservedTextHidden]}
+                  numberOfLines={1}
+                  accessibilityLabel={recentMessageInstant ? `Last message at ${recentMessageInstant.iso}` : undefined}
+                >{rowActivityLabel || 'Reserved'}</Text>
               </View>
               <View style={s.cardSignalSlot}>
                 {hasPerm
@@ -2927,11 +3062,6 @@ const s = StyleSheet.create({
     backgroundColor: '#161b22', borderWidth: 1, borderColor: '#30363d', borderRadius: 12, padding: 13,
   },
   usageProviderHeader: { flexDirection: 'row', alignItems: 'center', gap: 10 },
-  usageProviderMark: {
-    width: 34, height: 34, borderRadius: 8, alignItems: 'center', justifyContent: 'center',
-    backgroundColor: '#0d1117', borderWidth: 1, borderColor: '#30363d',
-  },
-  usageProviderMarkText: { color: '#58a6ff', fontSize: 11, fontWeight: '800' },
   usageProviderIdentity: { flex: 1, minWidth: 0 },
   usageStatus: { borderWidth: 1, borderRadius: 12, fontSize: 10, paddingHorizontal: 7, paddingVertical: 3, textTransform: 'capitalize' },
   usageCollapseMark: { color: '#8b949e', fontSize: 18, width: 14, textAlign: 'center' },
@@ -3205,6 +3335,10 @@ const s = StyleSheet.create({
   },
   workingSectionHeader: {
     backgroundColor:   'rgba(88,166,255,0.08)',
+    borderRadius:      8,
+  },
+  recentSectionHeader: {
+    backgroundColor:   'rgba(88,166,255,0.05)',
     borderRadius:      8,
   },
   sectionToggle: {

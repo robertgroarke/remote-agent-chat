@@ -9,6 +9,7 @@ const root = path.join(__dirname, '..');
 const app = fs.readFileSync(path.join(root, 'frontend', 'app.jsx'), 'utf8');
 const hooks = fs.readFileSync(path.join(root, 'frontend', 'hooks.jsx'), 'utf8');
 const styles = fs.readFileSync(path.join(root, 'frontend', 'styles.css'), 'utf8');
+const marks = fs.readFileSync(path.join(root, 'frontend', 'provider-marks.jsx'), 'utf8');
 
 for (const marker of [
   'function usageSnapshotForSession(session, activityOverride = null)',
@@ -19,6 +20,7 @@ for (const marker of [
   'Warnings start at 80% used.',
   '<details',
   'data-provider-id={entry.providerId}',
+  '<ProviderMark providerId={entry.providerId} providerName={entry.providerName} />',
   '<span>providers</span>',
   '<span>accounts</span>',
   'Open provider dashboard',
@@ -31,6 +33,9 @@ for (const marker of [
   'window.visualPercent',
   'window.pace.category',
   'window.thresholds.warningPercent',
+  'data-testid="ollama-owned-request-metrics"',
+  'formatOllamaTokenRate(entry.localRuntime.latestRequest.tokensPerSecond)',
+  'formatOllamaDuration(entry.localRuntime.latestRequest.promptEvalDurationNs)',
   'usage-pace-budgets',
   'usage-cost-table',
   'requestProviderUsageRefresh',
@@ -70,6 +75,13 @@ for (const marker of [
   'grid-template-columns: repeat(2, minmax(0, 1fr))',
 ]) assert(styles.includes(marker), `missing usage dashboard style: ${marker}`);
 
+for (const marker of [
+  "from '../provider-assets/manifest.json'",
+  'aria-label={`${accessibleName} provider mark`}',
+  'usage-dashboard-provider-mark-fallback',
+]) assert(marks.includes(marker), `missing provider mark marker: ${marker}`);
+assert(!app.includes('entry.providerName.slice(0, 2).toUpperCase()'), 'synthetic provider initials must not be primary marks');
+
 const result = {
   ok: true,
   provider_account_aggregation: true,
@@ -92,6 +104,9 @@ const result = {
   correlated_refresh_receipts: true,
   paginated_cost_detail: true,
   arbitrary_session_jump_removed: !app.includes('onSelectSession={(sessionId)'),
+  official_provider_marks: true,
+  provider_mark_text_fallback: true,
+  ollama_owned_request_metrics: true,
 };
 const outputIndex = process.argv.indexOf('--output');
 if (outputIndex >= 0 && process.argv[outputIndex + 1]) {

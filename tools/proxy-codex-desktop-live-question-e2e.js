@@ -10,6 +10,7 @@ const selectors = require('../agent-proxy/selectors');
 const production = require('./vscode-extension-production-e2e');
 const desktop = require('./codex-desktop-owned-controls-e2e');
 const { selectPlanMode } = require('./codex-desktop-question-owned-probe');
+const { semanticChoice } = require('../shared/question-choice-label');
 const {
   OPERATION_LOCK_PATH,
   acquirePidLock,
@@ -22,6 +23,7 @@ function parseArgs(argv) {
   const options = {
     sendLive: false,
     requireCapability: false,
+    response: 'beta',
     output: freshEvidencePath(ROOT, 'codex-desktop-live-question-e2e.json'),
     timeoutMs: 180000,
   };
@@ -29,11 +31,14 @@ function parseArgs(argv) {
     const arg = argv[index];
     if (arg === '--send-live') options.sendLive = true;
     else if (arg === '--require-capability') options.requireCapability = true;
+    else if (arg === '--response' && argv[index + 1]) options.response = String(argv[++index]).toLowerCase();
     else if (arg === '--output' && argv[index + 1]) options.output = path.resolve(argv[++index]);
     else if (arg === '--timeout-ms' && argv[index + 1]) options.timeoutMs = Number(argv[++index]);
     else throw new Error(`Unknown or incomplete argument: ${arg}`);
   }
   assert.strictEqual(options.sendLive, true, 'explicit --send-live is required');
+  assert(['alpha', 'beta', 'cancel'].includes(options.response),
+    '--response must be alpha, beta, or cancel');
   assert(Number.isFinite(options.timeoutMs) && options.timeoutMs >= 30000, '--timeout-ms must be at least 30000');
   return options;
 }
@@ -41,7 +46,7 @@ function parseArgs(argv) {
 function responseFrame(prompt, requestId, choiceLabel) {
   const question = prompt.questions.find(item => Array.isArray(item.choices) && item.choices.length > 0);
   assert(question, 'live question prompt has no choice question');
-  const choice = question.choices.find(item => item.label === choiceLabel);
+  const choice = semanticChoice(question, choiceLabel);
   assert(choice, `live question prompt has no ${choiceLabel} choice`);
   return {
     type: 'question_response',
@@ -52,6 +57,45 @@ function responseFrame(prompt, requestId, choiceLabel) {
     generation: prompt.generation,
     action: 'answer',
     answers: [{ question_id: question.question_id, choice_ids: [choice.choice_id] }],
+  };
+}
+
+function validateDesktopChoiceFidelity(livePrompt, nativePrompt) {
+  const liveQuestion = livePrompt.questions[0];
+  const nativeQuestion = nativePrompt.questions.find(item =>
+    item.question_id === liveQuestion.question_id) || nativePrompt.questions[0];
+  const alpha = semanticChoice(liveQuestion, 'Alpha');
+  const beta = semanticChoice(liveQuestion, 'Beta');
+  const nativeChoices = { choices: nativeQuestion?.options || [] };
+  const nativeAlpha = semanticChoice(nativeChoices, 'Alpha');
+  const nativeBeta = semanticChoice(nativeChoices, 'Beta');
+  assert(alpha && beta && nativeAlpha && nativeBeta,
+    'production prompt did not preserve both native choices');
+  for (const [relayChoice, nativeChoice] of [[alpha, nativeAlpha], [beta, nativeBeta]]) {
+    assert.strictEqual(relayChoice.choice_id, nativeChoice.choice_id,
+      'relay choice identity diverged from the directly observed native choice');
+    assert.strictEqual(relayChoice.label, nativeChoice.label,
+      'relay choice label diverged from the directly observed native choice');
+    assert.strictEqual(relayChoice.description, nativeChoice.description,
+      'relay choice description diverged from the directly observed native choice');
+    assert.strictEqual(relayChoice.selected, nativeChoice.selected,
+      'relay selected state diverged from the directly observed native choice');
+  }
+  assert(alpha.description.includes('First branch'), 'native Alpha description lost the requested content');
+  assert(beta.description.includes('Second branch'), 'native Beta description lost the requested content');
+  return { alpha, beta };
+}
+
+function cancelFrame(prompt, requestId) {
+  assert.strictEqual(prompt.cancel_supported, true, 'live Desktop prompt does not support cancel');
+  return {
+    type: 'question_response',
+    protocol_version: 1,
+    request_id: requestId,
+    session_id: prompt.session_id,
+    prompt_id: prompt.prompt_id,
+    generation: prompt.generation,
+    action: 'cancel',
   };
 }
 
@@ -83,7 +127,11 @@ async function waitForNativeAndRelayQuestion({
       if (!nativeQuestion) {
         try {
           const current = await selectors.detectCodexDesktopQuestion(Runtime);
-          if (current && !current.error) nativeQuestion = current;
+          if (current && !current.error) {
+            nativeQuestion = current;
+            const observedAt = Date.now();
+            if (typeof onNative === 'function') onNative(current, observedAt - started, observedAt);
+          }
         } catch {}
       }
       return { relayPrompt, nativeQuestion };
@@ -93,7 +141,8 @@ async function waitForNativeAndRelayQuestion({
         const current = await selectors.detectCodexDesktopQuestion(Runtime);
         if (current && !current.error) {
           nativeQuestion = current;
-          if (typeof onNative === 'function') onNative(current, Date.now() - started);
+          const observedAt = Date.now();
+          if (typeof onNative === 'function') onNative(current, observedAt - started, observedAt);
           deadline = Math.min(deadline, Date.now() + relayAfterNativeMs);
         } else if (current?.error) {
           lastNativeError = current;
@@ -241,19 +290,24 @@ async function main(argv = process.argv.slice(2)) {
         && message.source?.surface === 'codex-desktop'
         && message.lifecycle === 'open',
       timeoutMs: options.timeoutMs,
-      onNative: (question, elapsedMs) => {
+      onNative: (question, elapsedMs, observedAt) => {
         result.direct_native_question = question;
         result.send_receipt_to_native_visible_ms = elapsedMs;
+        result.native_observed_at = new Date(observedAt).toISOString();
       },
     });
     livePrompt = observed.relayPrompt;
     if (observed.nativeQuestion && !result.direct_native_question) {
       result.direct_native_question = observed.nativeQuestion;
       result.send_receipt_to_native_visible_ms = Date.now() - visibleStarted;
+      result.native_observed_at = new Date().toISOString();
     }
     const visibleAt = Date.now();
     result.send_receipt_to_visible_ms = visibleAt - visibleStarted;
-    result.native_observed_to_visible_ms = Math.max(0, visibleAt - Date.parse(livePrompt.observed_at));
+    const nativeObservedAt = Date.parse(result.native_observed_at || '');
+    assert(Number.isFinite(nativeObservedAt), 'independent native question observation timestamp is unavailable');
+    result.native_observed_to_visible_ms = Math.max(0, visibleAt - nativeObservedAt);
+    result.proxy_observed_to_visible_ms = Math.max(0, visibleAt - Date.parse(livePrompt.observed_at));
     const nativePrompt = result.direct_native_question || observed.nativeQuestion;
     assert(nativePrompt && !nativePrompt.error, 'relay prompt arrived without a directly observed native question');
     result.requested_header_rendered_natively = nativePrompt.title === 'RAC check';
@@ -265,11 +319,7 @@ async function main(argv = process.argv.slice(2)) {
     assert.strictEqual(livePrompt.title, 'Choose the validation branch.');
     assert.strictEqual(livePrompt.questions.length, 1);
     assert.strictEqual(livePrompt.questions[0].message, 'Choose the validation branch.');
-    const alpha = livePrompt.questions[0].choices.find(choice => choice.label === 'Alpha');
-    const beta = livePrompt.questions[0].choices.find(choice => choice.label === 'Beta');
-    assert(alpha && beta, 'production prompt did not preserve both native choices');
-    assert.strictEqual(alpha.description, 'First branch');
-    assert.strictEqual(beta.description, 'Second branch');
+    const { alpha, beta } = validateDesktopChoiceFidelity(livePrompt, nativePrompt);
     assert.strictEqual(alpha.selected, true, 'native initially-selected Alpha state was not preserved');
     assert.strictEqual(beta.selected, false, 'native initially-unselected Beta state was not preserved');
     assert(!Object.prototype.hasOwnProperty.call(livePrompt, 'native_thread_id'), 'relay leaked native thread identity');
@@ -314,7 +364,12 @@ async function main(argv = process.argv.slice(2)) {
     result.stages.push('native_scope_verified');
 
     const requestId = `codex-desktop-live-answer-${runId}`;
-    const response = responseFrame(livePrompt, requestId, 'Beta');
+    const responseLabel = options.response === 'alpha' ? 'Alpha' : 'Beta';
+    const response = options.response === 'cancel'
+      ? cancelFrame(livePrompt, requestId)
+      : responseFrame(livePrompt, requestId, responseLabel);
+    const expectedLifecycle = options.response === 'cancel' ? 'cancelled' : 'answered';
+    result.requested_response = options.response;
     const responseStart = relay.messages.length;
     const answerStarted = Date.now();
     relay.ws.send(JSON.stringify(response));
@@ -340,9 +395,9 @@ async function main(argv = process.argv.slice(2)) {
       responseStart,
       message => message.type === 'question_prompt_state'
         && message.prompt_id === livePrompt.prompt_id
-        && message.lifecycle === 'answered',
+        && message.lifecycle === expectedLifecycle,
       30000,
-      'answered question terminal state',
+      `${expectedLifecycle} question terminal state`,
     );
     result.terminal_lifecycle = terminal.lifecycle;
     await production.waitFor(async () => {
@@ -351,12 +406,12 @@ async function main(argv = process.argv.slice(2)) {
     }, 15000, 'native question card disappearance', 50);
     const answeredState = await desktop.nativeState(native, sessionId);
     assert.strictEqual(answeredState.active?.id, ownedThreadId, 'native acknowledgement changed threads');
-    const ordinaryBetaTurns = answeredState.messages.filter(message =>
-      message.role === 'user' && String(message.content || '').trim() === 'Beta').length;
-    assert.strictEqual(ordinaryBetaTurns, 0, 'Beta was appended as an ordinary user transcript turn');
+    const ordinaryAnswerTurns = answeredState.messages.filter(message =>
+      message.role === 'user' && ['Alpha', 'Beta'].includes(String(message.content || '').trim())).length;
+    assert.strictEqual(ordinaryAnswerTurns, 0, 'native answer was appended as an ordinary user transcript turn');
     result.native_prompt_disappeared = true;
     result.same_thread = true;
-    result.ordinary_answer_user_turns = ordinaryBetaTurns;
+    result.ordinary_answer_user_turns = ordinaryAnswerTurns;
     result.after_answer_thinking = !!answeredState.thinking?.thinking;
     result.stages.push('native_answer_acknowledged');
 
@@ -442,10 +497,12 @@ if (require.main === module) {
 }
 
 module.exports = {
+  cancelFrame,
   cleanupOpenPrompt,
   main,
   parseArgs,
   responseFrame,
+  validateDesktopChoiceFidelity,
   waitForFrame,
   waitForNativeAndRelayQuestion,
 };

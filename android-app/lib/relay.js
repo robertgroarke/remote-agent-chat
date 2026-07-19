@@ -220,8 +220,19 @@ export class RelayClient {
     this._send({ type: 'agent_interrupt', session_id: sessionId });
   }
 
-  respondToPermission(sessionId, promptId, choiceId, details = {}) {
+  respondToPermission(sessionId, promptId, choiceId, details = {}, prompt = null) {
     const requestId = `prompt-${Date.now()}-${Math.random().toString(36).slice(2, 7)}`;
+    if (prompt?.type === 'question_prompt') {
+      const action = details.action === 'cancel' ? 'cancel' : 'answer';
+      this._send({
+        type: 'question_response', session_id: sessionId, prompt_id: promptId,
+        generation: prompt.generation,
+        action,
+        ...(action === 'answer' ? { answers: Array.isArray(details.answers) ? details.answers : [] } : {}),
+        request_id: requestId,
+      });
+      return requestId;
+    }
     this._send({
       type: 'permission_response', session_id: sessionId, prompt_id: promptId,
       ...(choiceId ? { choice_id: choiceId } : {}),

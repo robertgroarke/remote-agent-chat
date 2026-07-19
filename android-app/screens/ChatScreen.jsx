@@ -706,15 +706,75 @@ export default function ChatScreen({ route, navigation }) {
         break;
       }
 
+      case 'question_prompt': {
+        notePromptForAttentionFeedback(msg, sessionId).catch(() => {});
+        if ((msg.session_id || msg.session) !== sessionId) break;
+        setPermPrompt(prev => {
+          const samePrompt = prev?.prompt_id === msg.prompt_id && prev?.generation === msg.generation;
+          return {
+            ...(samePrompt ? prev : {}),
+            ...msg,
+            type: 'question_prompt',
+            received_at: samePrompt ? prev.received_at : Date.now(),
+            ...(msg.lifecycle === 'submitting'
+              ? { submitting_choice_id: prev?.submitting_choice_id || 'question_answers' }
+              : {}),
+          };
+        });
+        break;
+      }
+
+      case 'question_prompt_state': {
+        const sid = msg.session_id || msg.session;
+        if (sid !== sessionId) break;
+        if (msg.lifecycle === 'failed') {
+          setPermPrompt(prev => {
+            const samePrompt = prev?.prompt_id === msg.prompt_id && prev?.generation === msg.generation;
+            if (prev && !samePrompt) return prev;
+            return {
+              ...(samePrompt ? prev : {}),
+              ...msg,
+              type: 'question_prompt',
+              received_at: samePrompt ? prev.received_at : Date.now(),
+              submitting_choice_id: null,
+            };
+          });
+        } else if (['open', 'submitting'].includes(msg.lifecycle)) {
+          setPermPrompt(prev => {
+            const samePrompt = prev?.prompt_id === msg.prompt_id && prev?.generation === msg.generation;
+            if (prev && !samePrompt) return prev;
+            return {
+              ...(samePrompt ? prev : {}),
+              ...msg,
+              type: 'question_prompt',
+              received_at: samePrompt ? prev.received_at : Date.now(),
+              ...(msg.lifecycle === 'submitting'
+                ? { submitting_choice_id: prev?.submitting_choice_id || 'question_answers' }
+                : { submitting_choice_id: null }),
+            };
+          });
+        } else {
+          setPermPrompt(prev => {
+            if (prev?.prompt_id !== msg.prompt_id || prev?.generation !== msg.generation) return prev;
+            clearPromptAttentionFeedback(msg);
+            return null;
+          });
+        }
+        break;
+      }
+
       case 'semantic_notification': {
         processSemanticNotification(msg, sessionId).catch(() => {});
         break;
       }
 
       case 'permission_prompt_expired': {
-        clearPromptAttentionFeedback(msg);
         if ((msg.session_id || msg.session) !== sessionId) break;
-        setPermPrompt(prev => prev?.prompt_id === msg.prompt_id ? null : prev);
+        setPermPrompt(prev => {
+          if (prev?.prompt_id !== msg.prompt_id) return prev;
+          clearPromptAttentionFeedback(msg);
+          return null;
+        });
         break;
       }
 
@@ -738,8 +798,9 @@ export default function ChatScreen({ route, navigation }) {
           typeof item === 'object' && (item.session_id || item.id) === sessionId
         ));
         if (session) mergeSessionMetadata(session);
-        const openPermission = (msg.open_prompts || [])
-          .find(prompt => (prompt.session_id || prompt.session) === sessionId);
+        const openPermission = (msg.open_question_prompts || [])
+          .find(prompt => (prompt.session_id || prompt.session) === sessionId)
+          || (msg.open_prompts || []).find(prompt => (prompt.session_id || prompt.session) === sessionId);
         const openError = (msg.open_error_prompts || [])
           .find(prompt => (prompt.session_id || prompt.session) === sessionId);
         if (openPermission) rememberPromptForAttentionFeedback(openPermission);
@@ -771,14 +832,17 @@ export default function ChatScreen({ route, navigation }) {
         if (msg.request_id) {
           setControlResults(prev => ({ ...prev, [msg.request_id]: { ...msg, received_at: Date.now() } }));
         }
-        if (msg.command === 'permission_response') {
+        if (['permission_response', 'question_response'].includes(msg.command)) {
           if (msg.result === 'ok') {
-            clearPromptAttentionFeedback(msg);
-            setPermPrompt(null);
+            setPermPrompt(prev => {
+              if (prev?.request_id !== msg.request_id) return prev;
+              clearPromptAttentionFeedback(msg);
+              return null;
+            });
           } else if (msg.result === 'failed') {
-            setPermPrompt(prev => prev
-              ? { ...prev, submitting_choice_id: null, error: msg.error?.message || 'Permission response failed' }
-              : null);
+            setPermPrompt(prev => prev?.request_id === msg.request_id
+              ? { ...prev, submitting_choice_id: null, error: msg.error?.message || `${msg.command === 'question_response' ? 'Question' : 'Permission'} response failed` }
+              : prev);
           }
         }
         if (msg.command === 'error_prompt_action' && msg.result === 'failed') {
@@ -1343,11 +1407,13 @@ export default function ChatScreen({ route, navigation }) {
   }
 
   function handlePermChoice(promptId, choiceId, details = {}) {
-    const submittingChoiceId = choiceId || (Array.isArray(details.answers) ? 'question_answers' : null);
+    const submittingChoiceId = choiceId
+      || (details.action === 'cancel' ? 'question_cancel' : (Array.isArray(details.answers) ? 'question_answers' : null));
+    const prompt = permPrompt;
+    const requestId = clientRef.current?.respondToPermission(sessionId, promptId, choiceId, details, prompt);
     setPermPrompt(prev => prev
-      ? { ...prev, submitting_choice_id: submittingChoiceId, error: null }
+      ? { ...prev, submitting_choice_id: submittingChoiceId, request_id: requestId, error: null }
       : null);
-    clientRef.current?.respondToPermission(sessionId, promptId, choiceId, details);
   }
 
   function handleErrorPromptAction(promptId, actionId) {

@@ -14,6 +14,8 @@ const ARRAY_LIMITS = new Map([
   ['$.snapshots[].mapped_harness_types', 32],
   ['$.snapshots[].source_history', 8],
   ['$.snapshots[].windows', 64],
+  ['$.snapshots[].local_runtime.loaded_models', 64],
+  ['$.snapshots[].local_runtime.request_receipts', 32],
   ['$.snapshots[].reset_credits.details', 10],
   ['$.estimated_cost.by_provider', 32],
   ['$.estimated_cost.by_model', 512],
@@ -38,7 +40,7 @@ const ALLOWED_KEYS = new Set([
   'provider_id', 'provider_name', 'quota_domain', 'dashboard_url',
   'account_fingerprint', 'account_label', 'plan', 'account_metadata',
   'source', 'source_history', 'status', 'captured_at', 'stale_after',
-  'windows', 'credits', 'reset_credits', 'error', 'request_count', 'latency_ms',
+  'windows', 'credits', 'financials', 'local_runtime', 'reset_credits', 'error', 'request_count', 'latency_ms',
   'session_count', 'mapped_harness_types', 'last_good_captured_at',
   'id', 'label', 'scope', 'used_percent', 'remaining_percent', 'duration_minutes',
   'starts_at', 'resets_at', 'reset_description', 'window_kind', 'model_scope',
@@ -54,6 +56,17 @@ const ALLOWED_KEYS = new Set([
   'detail', 'total_rows', 'inline_rows', 'page_size', 'next_cursor', 'truncated',
   'collections', 'name', 'returned_rows', 'reason_code', 'reason_path',
   'last_good_generated_at', 'last_good_age_ms', 'next_retry_at', 'refresh_request_id',
+  'semantics_version', 'observed_at', 'account_scope', 'amount', 'source_field', 'semantics',
+  'directly_reported', 'extra_usage_enabled', 'prepaid_balance', 'extra_usage_spend',
+  'extra_usage_cap', 'allowance_remaining', 'reported_spend', 'included_spend',
+  'bonus_spend', 'plan_limit', 'reconciliation_delta', 'pool_classification',
+  'classification_status', 'first_party', 'third_party', 'unclassified', 'warning',
+  'disclaimer',
+  'endpoint_scope', 'installed_models_count', 'loaded_models_count', 'loaded_models',
+  'size_bytes', 'size_vram_bytes', 'context_length', 'prompt_tokens', 'response_tokens',
+  'total_duration_ns', 'load_duration_ns', 'prompt_eval_duration_ns', 'eval_duration_ns',
+  'tokens_per_second', 'observed_request_count', 'request_receipts', 'receipt_id', 'surface',
+  'telemetry_status', 'telemetry_reason',
 ]);
 
 const DETAIL_ALLOWED_KEYS = new Set([
@@ -66,6 +79,7 @@ const ALLOWED_PROVIDER_IDS = new Set([
   'anthropic-claude',
   'google-antigravity',
   'cursor',
+  'ollama-local',
 ]);
 
 const ALLOWED_STATUSES = new Set([
@@ -116,7 +130,7 @@ function validOptionalArray(value, maxLength) {
 
 function validateSnapshot(snapshot) {
   if (!snapshot || typeof snapshot !== 'object' || Array.isArray(snapshot)) return false;
-  if (![1, 2].includes(snapshot.schema_version)) return false;
+  if (![1, 2, 3].includes(snapshot.schema_version)) return false;
   if (!ALLOWED_PROVIDER_IDS.has(snapshot.provider_id)) return false;
   if (!ALLOWED_STATUSES.has(snapshot.status)) return false;
   if (typeof snapshot.account_fingerprint !== 'string'
@@ -171,7 +185,7 @@ function quotaEnvelope(payload) {
 
 function quotaBoundaryViolation(payload) {
   if (!payload || typeof payload !== 'object' || Array.isArray(payload)) return '$:payload';
-  if (![1, 2].includes(payload.schema_version)) return '$.schema_version';
+  if (![1, 2, 3].includes(payload.schema_version)) return '$.schema_version';
   if (!Array.isArray(payload.snapshots) || payload.snapshots.length > 32) return '$.snapshots';
   const invalidSnapshot = payload.snapshots.findIndex(snapshot => !validateSnapshot(snapshot));
   if (invalidSnapshot >= 0) return `$.snapshots[${invalidSnapshot}]:snapshot`;

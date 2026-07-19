@@ -1,0 +1,228 @@
+{
+  "schema_version": 1,
+  "description": "Redacted structural fixtures. Unsupported provider-like extensions are intentionally fail-closed and are not claimed as observed account response shapes.",
+  "cases": [
+    {
+      "id": "claude_missing",
+      "provider": "claude",
+      "variant": "missing",
+      "account_scope": "Claude Pro",
+      "raw": {},
+      "expected": {
+        "extra_usage_enabled": false,
+        "prepaid_balance": null,
+        "extra_usage_spend": null,
+        "extra_usage_cap": null,
+        "allowance_remaining": null
+      }
+    },
+    {
+      "id": "claude_null",
+      "provider": "claude",
+      "variant": "null",
+      "account_scope": "Claude Pro",
+      "raw": {
+        "extra_usage": { "is_enabled": null, "used_credits": null, "monthly_limit": null },
+        "spend": { "used": null, "balance": null, "cap": null }
+      },
+      "expected": {
+        "extra_usage_enabled": false,
+        "prepaid_balance": null,
+        "extra_usage_spend": null,
+        "extra_usage_cap": null,
+        "allowance_remaining": null
+      }
+    },
+    {
+      "id": "claude_legacy_camelcase",
+      "provider": "claude",
+      "variant": "legacy",
+      "account_scope": "Claude Pro",
+      "raw": {
+        "extraUsage": { "is_enabled": true, "used_credits": 12.34, "monthlyLimit": 50, "currency": "USD" }
+      },
+      "expected": {
+        "extra_usage_enabled": true,
+        "prepaid_balance": null,
+        "extra_usage_spend": 12.34,
+        "extra_usage_cap": 50,
+        "allowance_remaining": null
+      }
+    },
+    {
+      "id": "claude_direct_envelopes",
+      "provider": "claude",
+      "variant": "individual",
+      "account_scope": "Claude Max",
+      "raw": {
+        "spend": {
+          "enabled": true,
+          "used": { "amount_minor": 1234, "exponent": 2, "currency": "USD" },
+          "balance": { "amount": 88.76, "currency": "USD" },
+          "cap": { "value": 150, "currency": "USD" }
+        }
+      },
+      "expected": {
+        "extra_usage_enabled": true,
+        "prepaid_balance": 88.76,
+        "extra_usage_spend": 12.34,
+        "extra_usage_cap": 150,
+        "allowance_remaining": null
+      }
+    },
+    {
+      "id": "claude_refund_extension",
+      "provider": "claude",
+      "variant": "refund",
+      "account_scope": "Claude Max",
+      "raw": {
+        "spend": {
+          "enabled": true,
+          "used": { "amount": -5, "currency": "USD" },
+          "refund": { "amount": 5, "currency": "USD" },
+          "cap": { "amount": 100, "currency": "USD" }
+        }
+      },
+      "expected": {
+        "extra_usage_enabled": true,
+        "prepaid_balance": null,
+        "extra_usage_spend": -5,
+        "extra_usage_cap": 100,
+        "allowance_remaining": null
+      }
+    },
+    {
+      "id": "cursor_missing",
+      "provider": "cursor",
+      "variant": "missing",
+      "account_scope": "Cursor Pro",
+      "raw": {},
+      "expected": {
+        "reported_spend": null,
+        "included_spend": null,
+        "bonus_spend": null,
+        "plan_limit": null,
+        "allowance_remaining": null,
+        "prepaid_balance": null,
+        "reconciliation_delta": null,
+        "classification_status": "unavailable"
+      }
+    },
+    {
+      "id": "cursor_null",
+      "provider": "cursor",
+      "variant": "null",
+      "account_scope": "Cursor Pro",
+      "raw": {
+        "planUsage": { "totalSpend": null, "includedSpend": null, "bonusSpend": null, "limit": null },
+        "billingCycleEnd": null
+      },
+      "expected": {
+        "reported_spend": null,
+        "included_spend": null,
+        "bonus_spend": null,
+        "plan_limit": null,
+        "allowance_remaining": null,
+        "prepaid_balance": null,
+        "reconciliation_delta": null,
+        "classification_status": "unavailable"
+      }
+    },
+    {
+      "id": "cursor_legacy_flat",
+      "provider": "cursor",
+      "variant": "legacy",
+      "account_scope": "Cursor Pro",
+      "raw": { "totalSpend": 11063, "includedSpend": 2000, "bonusSpend": 9063, "limit": 2000 },
+      "expected": {
+        "reported_spend": null,
+        "included_spend": null,
+        "bonus_spend": null,
+        "plan_limit": null,
+        "allowance_remaining": null,
+        "prepaid_balance": null,
+        "reconciliation_delta": null,
+        "classification_status": "unavailable"
+      }
+    },
+    {
+      "id": "cursor_individual_reconciled",
+      "provider": "cursor",
+      "variant": "individual",
+      "account_scope": "Cursor Pro",
+      "raw": {
+        "planUsage": { "totalSpend": 11063, "includedSpend": 2000, "bonusSpend": 9063, "limit": 2000 },
+        "billingCycleEnd": "2026-08-01T00:00:00.000Z"
+      },
+      "expected": {
+        "reported_spend": 110.63,
+        "included_spend": 20,
+        "bonus_spend": 90.63,
+        "plan_limit": 20,
+        "allowance_remaining": null,
+        "prepaid_balance": null,
+        "reconciliation_delta": 0,
+        "classification_status": "unavailable"
+      }
+    },
+    {
+      "id": "cursor_team_extension_unclassified",
+      "provider": "cursor",
+      "variant": "team",
+      "account_scope": "Cursor Business",
+      "raw": {
+        "planUsage": { "totalSpend": 12500, "includedSpend": 10000, "bonusSpend": 2500, "limit": 20000 },
+        "teamUsage": { "firstPartySpend": 8000, "thirdPartySpend": 4500 },
+        "billingCycleEnd": "2026-08-01T00:00:00.000Z"
+      },
+      "expected": {
+        "reported_spend": 125,
+        "included_spend": 100,
+        "bonus_spend": 25,
+        "plan_limit": 200,
+        "allowance_remaining": null,
+        "prepaid_balance": null,
+        "reconciliation_delta": 0,
+        "classification_status": "unavailable"
+      }
+    },
+    {
+      "id": "cursor_bonus_only",
+      "provider": "cursor",
+      "variant": "bonus",
+      "account_scope": "Cursor Pro",
+      "raw": {
+        "planUsage": { "totalSpend": 9000, "includedSpend": 0, "bonusSpend": 9000, "limit": 2000 }
+      },
+      "expected": {
+        "reported_spend": 90,
+        "included_spend": 0,
+        "bonus_spend": 90,
+        "plan_limit": 20,
+        "allowance_remaining": null,
+        "prepaid_balance": null,
+        "reconciliation_delta": 0,
+        "classification_status": "unavailable"
+      }
+    },
+    {
+      "id": "cursor_refund_extension_delta",
+      "provider": "cursor",
+      "variant": "refund",
+      "account_scope": "Cursor Pro",
+      "raw": {
+        "planUsage": { "totalSpend": 9500, "includedSpend": 10000, "bonusSpend": 0, "refundSpend": 500, "limit": 20000 }
+      },
+      "expected": {
+        "reported_spend": 95,
+        "included_spend": 100,
+        "bonus_spend": 0,
+        "plan_limit": 200,
+        "allowance_remaining": null,
+        "prepaid_balance": null,
+        "reconciliation_delta": -5,
+        "classification_status": "unavailable"
+      }
+    }
+  ]
+}

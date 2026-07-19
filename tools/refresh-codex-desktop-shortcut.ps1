@@ -58,7 +58,10 @@ if (-not $pkg) {
 }
 
 $installLocation = $pkg.InstallLocation
-$exePath = Join-Path $installLocation "app\Codex.exe"
+$exePath = @(
+  (Join-Path $installLocation "app\ChatGPT.exe"),
+  (Join-Path $installLocation "app\Codex.exe")
+) | Where-Object { Test-Path -LiteralPath $_ } | Select-Object -First 1
 $pngCandidates = @(
   (Join-Path $installLocation "assets\Square44x44Logo.targetsize-256_altform-unplated.png"),
   (Join-Path $installLocation "assets\Square44x44Logo.targetsize-256.png"),
@@ -67,8 +70,8 @@ $pngCandidates = @(
 )
 $pngPath = $pngCandidates | Where-Object { Test-Path -LiteralPath $_ } | Select-Object -First 1
 
-if (-not (Test-Path -LiteralPath $exePath)) {
-  throw "Codex executable not found: $exePath"
+if (-not $exePath) {
+  throw "Codex executable not found under: $installLocation\app"
 }
 if (-not $pngPath) {
   throw "Could not locate a Codex icon asset under: $installLocation\assets"
@@ -99,5 +102,6 @@ $shortcut.Save()
   IconPath = $iconPath
   PackageVersion = [string]$pkg.Version
   PackageInstallLocation = $installLocation
+  PackageExecutable = $exePath
   LauncherPath = $launcherFull
 }

@@ -263,12 +263,31 @@ async function main() {
     }
 
     const sentinelSession = sessions[sessionCount - 1].session_id;
+    const sentinelGoalFingerprint = 'goal:subscription-summary-sentinel';
     proxy.ws.send(JSON.stringify({
       type: 'status',
       session: sentinelSession,
       thinking: false,
       label: 'BENCHMARK_SENTINEL',
-      activity: { kind: 'idle', label: 'BENCHMARK_SENTINEL' },
+      activity: {
+        kind: 'idle',
+        label: 'BENCHMARK_SENTINEL',
+        goal: {
+          objective: 'Keep the summary-only session in Working.',
+          fingerprint: sentinelGoalFingerprint,
+          generation: 1,
+          status: 'active',
+        },
+        goal_run: {
+          schema_version: 1,
+          run_id: 'goal-run:subscription-summary-sentinel',
+          goal_fingerprint: sentinelGoalFingerprint,
+          goal_generation: 1,
+          lifecycle: 'checkpoint_pending_continuation',
+          lease_active: true,
+          owner_state: 'confirmed',
+        },
+      },
     }));
     await waitFor(
       () => browser.messages.slice(measurementStart).some(entry => (
@@ -310,6 +329,19 @@ async function main() {
       'a compact background summary leaked raw current/thinking/task/step state');
       assert(compactSummaryRows.every(entry => Buffer.byteLength(JSON.stringify(entry.message.activity.work_context), 'utf8') <= 512),
         'a compact background work-context record exceeded 512 bytes');
+      const sentinelSummary = compactSummaryRows.find(entry => (
+        (entry.message.session || entry.message.session_id) === sentinelSession
+        && entry.message.activity?.label === 'BENCHMARK_SENTINEL'
+      ));
+      assert(sentinelSummary, 'summary-only goal-run sentinel was not received');
+      assert.equal(sentinelSummary.message.activity.goal?.fingerprint, sentinelGoalFingerprint,
+        'compact summary omitted the canonical goal fingerprint');
+      assert.equal(sentinelSummary.message.activity.goal_run?.goal_fingerprint, sentinelGoalFingerprint,
+        'compact summary omitted the canonical goal-run lease');
+      assert.equal(sentinelSummary.message.activity.goal_run?.lifecycle, 'checkpoint_pending_continuation',
+        'compact summary changed the canonical goal-run lifecycle');
+      assert.equal(sentinelSummary.message.activity.goal_run?.lease_active, true,
+        'compact summary released the canonical goal-run lease');
     } else {
       assert(backgroundFullFidelityEvents > 0, 'baseline unexpectedly filtered background traffic');
     }

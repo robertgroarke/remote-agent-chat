@@ -38,6 +38,7 @@ const androidSemanticNotifications = read('android-app/lib/semantic-notification
 const androidBroadcastPolicy = read('android-app/lib/broadcast-send-policy.js');
 const androidFleetActivity = read('android-app/lib/fleet-activity.js');
 const androidFleetWorkContext = read('android-app/lib/fleet-work-context.js');
+const androidRecentChats = read('android-app/lib/recent-chats.js');
 const androidHostResources = read('android-app/lib/host-resources.js');
 const androidProviderUsage = read('android-app/lib/provider-usage.js');
 const webApp = read('frontend/app.jsx');
@@ -48,6 +49,7 @@ const relayFleetWorkContext = read('relay-server/fleet-work-context.js');
 const webHostResources = read('frontend/host-resources.js');
 const webProviderUsage = read('frontend/provider-usage.js');
 const webWorkspaceGroups = read('frontend/workspace-groups.js');
+const webRecentChats = read('frontend/recent-chats.js');
 const webSessionTitle = read('frontend/session-title.js');
 const webSessionPins = read('frontend/session-pins.js');
 const webSessionRegistry = read('frontend/session-registry.js');
@@ -60,6 +62,7 @@ const relayBroadcastPolicy = read('relay-server/broadcast-send-policy.js');
 
 const count = (source, pattern) => (source.match(pattern) || []).length;
 const hasAll = (source, values) => values.every(value => source.includes(value));
+const normalizeEol = source => source.replace(/\r\n/g, '\n').replace(/\r/g, '\n');
 
 const canonicalTypes = [
   'markdown', 'thinking', 'tool_call', 'tool_result', 'terminal', 'file_changes',
@@ -141,7 +144,7 @@ assert(hasAll(webSessionRegistry, [
   'UNSAFE_PATCH_KEYS', 'indexById',
 ]), 'Web must expose the normalized keyed inventory and patch primitives');
 const registryContractStart = source => source.slice(source.indexOf('const UNSAFE_PATCH_KEYS'));
-assert.strictEqual(registryContractStart(androidSessionRegistry), registryContractStart(webSessionRegistry),
+assert.strictEqual(normalizeEol(registryContractStart(androidSessionRegistry)), normalizeEol(registryContractStart(webSessionRegistry)),
   'Web and Android normalized keyed inventory implementations must remain byte-identical after their file headers');
 assert(!webHooks.includes('JSON.stringify(normalized) === JSON.stringify(sessionSubscriptionsRef.current)')
   && !androidRelay.includes('JSON.stringify(normalized) === JSON.stringify(this._sessionSubscriptions)'),
@@ -170,9 +173,9 @@ assert.match(androidList, /groupSessionsByDirectory/);
 assert.match(androidList, /COLLAPSED_DIRECTORY_KEY/);
 assert(hasAll(androidList, ['useStableSidebarGroups', 'maintainVisibleContentPosition', 'pendingPrompts: permPrompts', 'Order changed', 'Sort now']),
   'Android must match the operator-controlled stable sidebar ordering contract');
-assert.strictEqual(androidSessionTitle, webSessionTitle,
+assert.strictEqual(normalizeEol(androidSessionTitle), normalizeEol(webSessionTitle),
   'Web and Android must share one byte-identical sidebar chat-title policy');
-assert.strictEqual(androidSessionPins, webSessionPins,
+assert.strictEqual(normalizeEol(androidSessionPins), normalizeEol(webSessionPins),
   'Web and Android must share one byte-identical pinned-chat ordering policy');
 assert(hasAll(androidList, [
   'partitionPinnedSessions(visibleSessions, sessionPreferences)', "key: '__pinned__'",
@@ -381,9 +384,9 @@ assert(hasAll(androidList, [
   'visible={showFleetView}', 'classifyFleetActivity', 'fleetWorkContextProgress', 'fleetElapsedLabel',
   'fleetStateLabel(entry.state)', 'Show ${fleetIdleCount} idle', 'testID="fleet-view"',
 ]), 'Android must expose the matching active-session fleet dashboard');
-assert.strictEqual(androidFleetActivity, webFleetActivity,
+assert.strictEqual(normalizeEol(androidFleetActivity), normalizeEol(webFleetActivity),
   'Web and Android must share one byte-identical Fleet activity/freshness policy');
-assert.strictEqual(androidFleetWorkContext, relayFleetWorkContext,
+assert.strictEqual(normalizeEol(androidFleetWorkContext), normalizeEol(relayFleetWorkContext),
   'Relay/Web and Android must share one byte-identical Fleet work-context projection');
 assert(hasAll(relayFleetWorkContext, [
   'goalLifecycleSupported', 'projectFleetWorkContext', 'latestUserRequestFromMessages',
@@ -479,26 +482,31 @@ assert(hasAll(relayScheduledSends, ['ScheduledSendStore', "trigger_kind IN ('at'
   && hasAll(androidChat, ['ScheduledSendSheet', 'Schedule message'])
   && hasAll(androidScheduledSend, ['Next idle', 'At time', '/api/scheduled-sends', 'Cancel']),
   'Web and Android must create/list/cancel the same durable timed and next-idle scheduled sends');
-assert.strictEqual(androidFleetActivity, webFleetActivity,
+assert.strictEqual(normalizeEol(androidFleetActivity), normalizeEol(webFleetActivity),
   'Web and Android must use a byte-identical freshness-aware Fleet/sidebar activity classifier');
 assert(hasAll(webWorkspaceGroups, [
   'partitionSidebarSessionsByWorking', 'createSidebarWorkingLedger', 'reconcileSidebarWorkingLedger',
 ]) && hasAll(androidWorkspaceGroups, [
   'partitionSidebarSessionsByWorking', 'createSidebarWorkingLedger', 'reconcileSidebarWorkingLedger',
 ]), 'Web and Android must share the stable working-section ledger contract');
+assert.strictEqual(normalizeEol(webRecentChats).trim(), "export * from '../android-app/lib/recent-chats.js';",
+  'Web must consume the canonical Android Recent chats projection without a divergent copy');
+assert(hasAll(androidRecentChats, [
+  'normalizeLatestVisibleMessage', 'projectRecentChatOwnership', 'working, recent, pinned, remaining',
+]), 'Web and Android must share the canonical Working -> Recent -> Pinned -> workspace ownership contract');
 assert(hasAll(webApp, [
-  'Working now', '...workingSessions, ...pinnedSessions, ...sessionGroups',
-  'working-session-group', 'workspaceLabelBySessionId',
+  'Working now', 'Recent chats', '...workingSessions, ...recentSessions, ...pinnedSessions, ...sessionGroups',
+  'working-session-group', 'recent-session-group', 'workspaceLabelBySessionId',
 ]) && hasAll(androidList, [
-  "title: 'Working now'", 'const sections = [workingSection, pinnedSection',
+  "title: 'Working now'", "title: 'Recent chats'", 'const sections = [workingSection, recentSection, pinnedSection',
   'workspaceLabelBySessionId', 'maintainVisibleContentPosition',
-]), 'Both clients must render Working now before remaining pinned/workspace sessions');
+]), 'Both clients must render Working now, Recent chats, Pinned chats, then workspace sessions');
 
 const rows = [
   ['Directory-only session grouping and persistent collapse', 'PARITY',
     'Web localStorage and Android AsyncStorage use resolved project-root groups with activity summaries.'],
   ['Global working-first stable sidebar ordering', 'PARITY',
-    'Both clients use one freshness-aware classifier and stable working ledger, render every working session once in Working now above all non-working rows, and preserve home order across state edges.'],
+    'Both clients use one freshness-aware classifier and stable working ledger, then one canonical Recent projection before remaining pinned/workspace rows, with exclusive ownership across state edges.'],
   ['Chat-summary sidebar titles with hydration refresh', 'PARITY',
     'Both clients prefer native titles, then operator renames, then the first meaningful user message; generic harness labels become New chat and Android re-titles after cache hydration.'],
   ['Relay-backed operator-ordered pinned chats', 'PARITY',

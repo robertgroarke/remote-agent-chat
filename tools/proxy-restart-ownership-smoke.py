@@ -6,6 +6,7 @@ from datetime import datetime, timezone
 import json
 from pathlib import Path
 import sys
+from tempfile import TemporaryDirectory
 from unittest.mock import patch
 
 
@@ -88,7 +89,7 @@ def main() -> None:
     timeout_lock = ProxyRestartLock(agent="reconnect-timeout-smoke")
     with (
         patch.object(timeout_lock, "_get_proxy_relay_pids", return_value=[]),
-        patch("proxy_restart_lock.time.monotonic", side_effect=[0, 31]),
+        patch("proxy_restart_lock.time.monotonic", side_effect=[0, 91]),
         patch("proxy_restart_lock.time.sleep", return_value=None),
     ):
         try:
@@ -97,6 +98,41 @@ def main() -> None:
             pass
         else:
             raise AssertionError("reconnect timeout did not fail closed")
+
+    delayed_start_lock = ProxyRestartLock(agent="delayed-authenticated-readiness-smoke")
+    with (
+        patch.object(delayed_start_lock, "_get_proxy_relay_pids", side_effect=[[], [], [21]]),
+        patch.object(delayed_start_lock, "_relay_handshake_ready", return_value=True),
+        patch("proxy_restart_lock.time.monotonic", side_effect=[0, 1, 31, 45]),
+        patch("proxy_restart_lock.time.sleep", return_value=None),
+    ):
+        delayed_ready_pids = delayed_start_lock.wait_for_proxy_up()
+    assert delayed_ready_pids == [21], "authenticated startup after 30 seconds was rejected"
+
+    readiness_lock = ProxyRestartLock(agent="authenticated-readiness-smoke")
+    with (
+        patch.object(readiness_lock, "_get_proxy_relay_pids", side_effect=[[21], [21]]),
+        patch.object(readiness_lock, "_relay_handshake_ready", side_effect=[False, True]) as handshake,
+        patch("proxy_restart_lock.time.monotonic", side_effect=[0, 1, 2]),
+        patch("proxy_restart_lock.time.sleep", return_value=None),
+    ):
+        ready_pids = readiness_lock.wait_for_proxy_up()
+    assert ready_pids == [21]
+    assert handshake.call_count == 2, "TCP-only readiness returned before relay authentication"
+
+    with TemporaryDirectory() as temp_dir:
+        boundary_lock = ProxyRestartLock(
+            agent="handshake-boundary-smoke",
+            source_root=temp_dir,
+        )
+        proxy_log = Path(temp_dir) / "proxy.log"
+        old_bytes = b"[relay] Handshake OK. stale-worker\n"
+        proxy_log.write_bytes(old_bytes)
+        boundary_lock._proxy_log_start_offset = len(old_bytes)
+        assert boundary_lock._relay_handshake_ready() is False
+        with proxy_log.open("ab") as log_file:
+            log_file.write(b"[relay] Handshake OK. replacement-worker\n")
+        assert boundary_lock._relay_handshake_ready() is True
 
     evidence = {
         "schema_version": 1,
@@ -110,7 +146,11 @@ def main() -> None:
             "explicit_agent_proxy_path_pid": 40,
             "restart_mutex_anchored_to_config_root": True,
             "reconnect_timeout_failed_closed": True,
-            "checks": 7,
+            "relay_authentication_required": True,
+            "stale_handshake_excluded_at_restart_boundary": True,
+            "startup_beyond_30_seconds_tolerated": True,
+            "startup_timeout_seconds": 90,
+            "checks": 10,
         },
     }
 

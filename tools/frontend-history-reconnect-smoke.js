@@ -119,13 +119,17 @@ assert.equal(typeof sessionMetadataActivityMaps, 'function');
 assert.deepEqual(reconnectDelays, [250, 500, 1000, 2000, 3000], 'relay reconnect must begin below the 3-second recovery target');
 assert.deepEqual(
   sessionMetadataActivityMaps([
-    { session_id: 'active-cli', activity: { kind: 'generating', label: 'Working', thinkingContent: 'running' } },
+    { session_id: 'active-cli', activity: {
+      kind: 'generating', label: 'Working', thinkingContent: 'running',
+      goal: { state: 'active', fingerprint: 'goal-fixture', generation: 1 },
+      goal_run: { schema_version: 1, run_id: 'run-fixture', goal_fingerprint: 'goal-fixture', goal_generation: 1, lifecycle: 'running_turn', lease_active: true },
+    } },
     { session_id: 'idle-cli', activity: { kind: 'idle', label: '', thinkingContent: '' } },
   ]),
   {
     activities: {
-        'active-cli': { kind: 'generating', label: 'Working', updatedAt: null, startedAt: null, interruptHint: '', goal: null, thinking: null, current: null, step: null, usage: null, task_list: null, context_card: null, thinkingContent: 'running', transport: null },
-        'idle-cli': { kind: 'idle', label: '', updatedAt: null, startedAt: null, interruptHint: '', goal: null, thinking: null, current: null, step: null, usage: null, task_list: null, context_card: null, thinkingContent: '', transport: null },
+        'active-cli': { kind: 'generating', label: 'Working', updatedAt: null, startedAt: null, interruptHint: '', goal: { state: 'active', fingerprint: 'goal-fixture', generation: 1 }, goal_run: { schema_version: 1, run_id: 'run-fixture', goal_fingerprint: 'goal-fixture', goal_generation: 1, lifecycle: 'running_turn', lease_active: true }, thinking: null, current: null, step: null, usage: null, task_list: null, context_card: null, thinkingContent: 'running', transport: null },
+        'idle-cli': { kind: 'idle', label: '', updatedAt: null, startedAt: null, interruptHint: '', goal: null, goal_run: null, thinking: null, current: null, step: null, usage: null, task_list: null, context_card: null, thinkingContent: '', transport: null },
     },
     thinkingContent: { 'active-cli': 'running', 'idle-cli': '' },
     thinking: { 'active-cli': 'Working', 'idle-cli': false },

@@ -7,6 +7,7 @@ const path = require('path');
 const {
   CodexAppServerConnection,
 } = require('../agent-proxy/codex-app-server');
+const { semanticChoice } = require('../shared/question-choice-label');
 
 const repoRoot = path.resolve(__dirname, '..');
 
@@ -124,7 +125,7 @@ function waitForTurnCompleted(connection, threadId, turnId, timeoutMs = 90000) {
     assert.strictEqual(prompt.questions.length, 1);
     assert.strictEqual(prompt.questions[0].question_id, 'color');
     assert.strictEqual(prompt.questions[0].answer_mode, 'single');
-    const red = prompt.questions[0].choices.find(choice => choice.label === 'Red');
+    const red = semanticChoice(prompt.questions[0], 'Red');
     assert.ok(red, 'real native question did not include the requested Red option');
 
     const turnCompletedPromise = waitForTurnCompleted(connection, threadId, turnResult.turn.id);

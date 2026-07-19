@@ -122,7 +122,7 @@ function main() {
   });
   assert.deepStrictEqual(
     { kind: terminalCleared.kind, text: terminalCleared.text, source: terminalCleared.source },
-    { kind: 'empty', text: 'No current work reported', source: 'none' },
+    { kind: 'empty', text: 'Current work unavailable', source: 'none' },
   );
 
   const contextCard = context('roo_code', {

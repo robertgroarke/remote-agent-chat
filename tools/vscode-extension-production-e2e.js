@@ -82,22 +82,57 @@ async function openRelay() {
   const messages = [];
   ws.on('message', data => { try { messages.push(JSON.parse(data.toString())); } catch {} });
   await new Promise((resolve, reject) => {
-    const timer = setTimeout(() => reject(new Error('relay open timeout')), 30000);
+    const timer = setTimeout(() => {
+      try { ws.terminate(); } catch {}
+      reject(new Error('relay open timeout'));
+    }, 30000);
     ws.once('open', () => {
       clearTimeout(timer);
       ws.send(JSON.stringify({ type: 'connection_hello', protocol_version: 1, peer_role: 'browser', client_name: 'vscode-extension-production-e2e' }));
       resolve();
     });
-    ws.once('error', reject);
+    ws.once('error', error => {
+      clearTimeout(timer);
+      reject(error);
+    });
   });
   return { ws, messages };
 }
 
 function latestSessions(messages) {
+  let snapshotIndex = -1;
+  let sessions = [];
   for (let i = messages.length - 1; i >= 0; i--) {
-    if (Array.isArray(messages[i]?.sessions)) return messages[i].sessions;
+    if (Array.isArray(messages[i]?.sessions)) {
+      snapshotIndex = i;
+      sessions = messages[i].sessions;
+      break;
+    }
   }
-  return [];
+  if (snapshotIndex < 0) return sessions;
+  const latestSeqBySession = new Map();
+  for (let i = snapshotIndex + 1; i < messages.length; i++) {
+    const message = messages[i];
+    if (!['status', 'proxy_status', 'session_status', 'session_summary', 'session_patch'].includes(message?.type)) continue;
+    const id = message.session_id || message.session;
+    const patch = message.patch && typeof message.patch === 'object' ? message.patch : null;
+    const activity = patch?.activity || message.activity;
+    if (!id || !activity || typeof activity !== 'object') continue;
+    const stateSeq = Number(message.state_seq);
+    const previousSeq = latestSeqBySession.get(id);
+    if (Number.isSafeInteger(stateSeq) && Number.isSafeInteger(previousSeq) && stateSeq < previousSeq) continue;
+    if (Number.isSafeInteger(stateSeq)) latestSeqBySession.set(id, stateSeq);
+    sessions = sessions.map(session => {
+      if (!session || typeof session !== 'object' || session.session_id !== id) return session;
+      return {
+        ...session,
+        ...(patch || {}),
+        status: patch?.status || message.status || session.status,
+        activity: { ...(session.activity || {}), ...activity },
+      };
+    });
+  }
+  return sessions;
 }
 
 function captureProxyLogOffsets() {

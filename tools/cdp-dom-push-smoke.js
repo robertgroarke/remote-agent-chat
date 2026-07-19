@@ -15,6 +15,8 @@ function wait(ms) {
 function fakeRuntime() {
   const bindingListeners = new Set();
   const clearedListeners = new Set();
+  const createdListeners = new Set();
+  const destroyedListeners = new Set();
   return {
     addBindingCalls: [],
     evaluateCalls: [],
@@ -33,14 +35,29 @@ function fakeRuntime() {
       clearedListeners.add(listener);
       return () => clearedListeners.delete(listener);
     },
+    executionContextCreated(listener) {
+      createdListeners.add(listener);
+      return () => createdListeners.delete(listener);
+    },
+    executionContextDestroyed(listener) {
+      destroyedListeners.add(listener);
+      return () => destroyedListeners.delete(listener);
+    },
     emitBinding(event) { for (const listener of bindingListeners) listener(event); },
     emitContextsCleared() { for (const listener of clearedListeners) listener(); },
+    emitContextCreated(context = { id: 42 }) {
+      for (const listener of createdListeners) listener({ context });
+    },
+    emitContextDestroyed(executionContextId) {
+      for (const listener of destroyedListeners) listener({ executionContextId });
+    },
   };
 }
 
 async function main() {
   const runtime = fakeRuntime();
   const dispatches = [];
+  let currentContext = 42;
   let releaseFirst;
   const firstPoll = new Promise(resolve => { releaseFirst = resolve; });
   const manager = new CdpDomPushManager({
@@ -51,7 +68,11 @@ async function main() {
     },
   });
 
-  const attached = await manager.attach('session-a', { Runtime: runtime }, { contextId: 42 });
+  const attached = await manager.attach(
+    'session-a',
+    { Runtime: runtime },
+    { requireContext: true, resolveContextId: async () => currentContext },
+  );
   assert.deepStrictEqual(attached, { ok: true, reused: false });
   assert.deepStrictEqual(runtime.addBindingCalls, [{ name: '__racDomChanged' }]);
   assert.strictEqual(runtime.evaluateCalls.length, 1);
@@ -67,6 +88,7 @@ async function main() {
   const emit = sequence => runtime.emitBinding({
     name: '__racDomChanged',
     payload: JSON.stringify({ token, sequence, source_at: Date.now() }),
+    executionContextId: currentContext,
   });
   emit(1);
   emit(2);
@@ -80,6 +102,34 @@ async function main() {
   await wait(15);
   assert.strictEqual(dispatches.length, 2, 'one follow-up poll should run after the in-flight poll');
   assert.strictEqual(dispatches[1].event.sequence, 4);
+  assert.strictEqual(dispatches[1].event.executionContextId, 42,
+    'binding dispatch must preserve the exact execution context that emitted the mutation');
+  assert(Number.isFinite(dispatches[1].event.cdpToQueueMs));
+  assert(Number.isFinite(dispatches[1].event.queueToDispatchMs));
+
+  const stormRuntime = fakeRuntime();
+  const stormDispatches = [];
+  const stormManager = new CdpDomPushManager({
+    policy: { debounceMs: 10 },
+    onDirty: async (sessionId, event) => stormDispatches.push({ sessionId, event }),
+  });
+  await stormManager.attach('storm-session', { Runtime: stormRuntime }, { contextId: 7 });
+  const stormToken = JSON.parse(
+    stormRuntime.evaluateCalls[0].expression.match(/token === ("[a-f0-9]+")/)[1],
+  );
+  for (let sequence = 1; sequence <= 12; sequence++) {
+    stormRuntime.emitBinding({
+      name: '__racDomChanged',
+      payload: JSON.stringify({ token: stormToken, sequence, source_at: Date.now() }),
+      executionContextId: 7,
+    });
+    await wait(2);
+  }
+  assert(stormDispatches.length >= 1,
+    'continuous mutations postponed the first bounded dispatch until a quiet period');
+  assert(stormDispatches[0].event.sequence < 12,
+    'continuous mutation dispatch did not preserve the original debounce deadline');
+  await stormManager.close();
 
   const now = 1_000_000;
   const idle = { agentType: 'codex', activity: { kind: 'idle' } };
@@ -95,6 +145,47 @@ async function main() {
   runtime.emitContextsCleared();
   await wait(15);
   assert.strictEqual(runtime.evaluateCalls.length, 2, 'context reset should reinstall observer');
+
+  let failReplacementOnce = true;
+  const originalEvaluate = runtime.evaluate.bind(runtime);
+  runtime.evaluate = async params => {
+    if (failReplacementOnce) {
+      failReplacementOnce = false;
+      throw new Error('Cannot find context with specified id');
+    }
+    return originalEvaluate(params);
+  };
+  runtime.emitContextDestroyed(42);
+  await wait(8);
+  assert.strictEqual(manager.getState('session-a').status, 'reinstalling',
+    'a transient context replacement failure must not remain labeled active');
+  currentContext = 84;
+  runtime.emitContextCreated({ id: currentContext });
+  await wait(15);
+  assert.strictEqual(manager.getState('session-a').status, 'active',
+    'observer should recover when the replacement execution context arrives');
+  assert.strictEqual(manager.getState('session-a').consecutiveErrors, 0,
+    'successful replacement-context install should clear transient errors');
+  assert.strictEqual(runtime.evaluateCalls.at(-1).contextId, 84,
+    'replacement observer must install in the newly resolved execution context');
+  assert(manager.getState('session-a').installedContextIds.includes(84),
+    'new execution contexts must receive their own mutation observer');
+
+  const requiredRuntime = fakeRuntime();
+  const requiredManager = new CdpDomPushManager({
+    policy: { reinstallMs: 5 },
+    onDirty: async () => {},
+  });
+  const missingRequired = await requiredManager.attach(
+    'required-session',
+    { Runtime: requiredRuntime },
+    { requireContext: true, resolveContextId: async () => null },
+  );
+  assert.strictEqual(missingRequired.ok, false);
+  assert.match(missingRequired.reason, /execution context unavailable/);
+  assert.strictEqual(requiredRuntime.evaluateCalls.filter(call => /MutationObserver/.test(call.expression)).length, 0,
+    'a required scoped observer must not silently attach to the outer page');
+  await requiredManager.close();
 
   await manager.detach('session-a');
   assert.deepStrictEqual(runtime.removeBindingCalls, [{ name: '__racDomChanged' }]);
@@ -175,10 +266,16 @@ async function main() {
     binding_unavailable_working_fallback_ms: 750,
     binding_unavailable_idle_fallback_ms: 5000,
     context_reinstall_verified: true,
+    replacement_context_recovery_verified: true,
+    binding_context_forwarded: true,
+    binding_latency_split_verified: true,
+    created_context_observer_verified: true,
+    required_context_fail_closed_verified: true,
     kill_switch_fallback_verified: true,
     context_error_auto_uninstall_threshold: 3,
     reinjection_backoff_verified: true,
     bounded_guardrail_warnings: true,
+    mutation_storm_first_dispatch_bounded: true,
     proxy_engine_integrated: true,
   };
   const serialized = JSON.stringify(result, null, 2) + '\n';

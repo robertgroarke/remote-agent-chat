@@ -21,15 +21,21 @@ for (const [label, marker] of [
   ['Other-text Enter submit', "closest?.('.permission-other-input')"],
   ['unresolved Esc focus fallback', 'onDismissFocus?.();'],
   ['Claude native Esc cancellation', 'claudeCancelChoice'],
+  ['first-class native cancellation', "{ action: 'cancel' }"],
+  ['advertised question cancellation guard', "prompt?.cancel_supported === true"],
   ['dismissed keyboard mode', 'setKeyboardDismissed(true)'],
   ['composer shortcut target', "matches?.('.input-area textarea')"],
+  ['focused prompt shortcut scope', "closest?.('.permission-card')"],
+  ['neutral document shortcut scope', 'neutralPromptShortcutTarget'],
   ['blocked composer send guard', 'if (activeBlockingPrompt) return;'],
   ['number accessibility metadata', 'aria-keyshortcuts='],
   ['prompt dialog semantics', "aria-label={claudeActionPrompt ? 'Claude Code permission prompt' : 'Permission or question prompt'}"],
-  ['discoverable keyboard help', '1–9 select · Enter submit · Esc return to composer'],
+  ['discoverable unresolved keyboard help', 'return to composer'],
 ]) {
   assert(app.includes(marker), `keyboard prompt contract is missing ${label}: ${marker}`);
 }
+
+assert(/1.+9 select.+Enter submit.+Esc/.test(app), 'keyboard prompt contract is missing discoverable shortcut help');
 
 for (const marker of ['.permission-key-hint', '.permission-keyboard-help']) {
   assert(styles.includes(marker), `keyboard prompt stylesheet is missing ${marker}`);

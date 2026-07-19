@@ -38,6 +38,7 @@ const launchers    = require('./launchers');
 const claudeCli    = require('./claude-cli');
 const codexCli     = require('./codex-cli');
 const { CodexCliAppServerTurn } = require('./codex-cli-app-server');
+const { CodexAppServerConnection } = require('./codex-app-server');
 const {
   codexDesktopCliSessionId,
   codexDesktopArchiveMessages,
@@ -53,16 +54,36 @@ const { LocalUsageCostScanner } = require('./usage-costs');
 const { HostResourceMonitor } = require('./host-resource-monitor');
 const { pruneDirectory } = require('../relay-server/storage-retention');
 const { appendBoundedFileSync } = require('./bounded-file-log');
-const { canonicalGoalRecord } = require('./goal-lifecycle');
+const { canonicalGoalRecord, reduceGoalRunLifecycle } = require('./goal-lifecycle');
 const {
   QuestionContractError,
   canonicalQuestionPrompt,
   canonicalQuestionResponse,
 } = require('../shared/question-prompt-contract');
+const {
+  buildProducerFleetSummary,
+  projectFleetSummary,
+} = require('../shared/fleet-summary');
 const { LatestSessionOperationQueue } = require('./latest-session-operation-queue');
 const { normalizeNavigationEpoch } = require('../relay-server/navigation-epoch');
 
 const SERIALIZED_NAVIGATION = Symbol('serializedNavigation');
+const PRIORITY_RELAY_CONTROL = Symbol('priorityRelayControl');
+const PRIORITY_RELAY_TYPES = new Set([
+  'send_message',
+  'send',
+  'new_chat',
+  'new_thread',
+  'switch_chat',
+  'switch_thread',
+  'interrupt',
+  'question_response',
+  'permission_response',
+  'error_prompt_action',
+  'agent_set_model',
+  'agent_set_mode',
+  'agent_set_permission_mode',
+]);
 const NAVIGATION_SCOPED_RELAY_TYPES = new Set([
   'agent_control_result',
   'history',
@@ -156,6 +177,33 @@ function pruneExpiredMap(map, now = Date.now()) {
   return removed;
 }
 
+function mergeCodexCliArchiveDiscoverySummaries(activeSummaries, archiveSummaries, limit = 0) {
+  const externalActiveIds = new Set();
+  const mergedById = new Map();
+  for (const summary of Array.isArray(activeSummaries) ? activeSummaries : []) {
+    const cliSessionId = String(summary?.cliSessionId || '').trim();
+    if (!cliSessionId) continue;
+    externalActiveIds.add(cliSessionId);
+    if (!mergedById.has(cliSessionId)) mergedById.set(cliSessionId, summary);
+  }
+  for (const summary of Array.isArray(archiveSummaries) ? archiveSummaries : []) {
+    const cliSessionId = String(summary?.cliSessionId || '').trim();
+    if (!cliSessionId || mergedById.has(cliSessionId)) continue;
+    mergedById.set(cliSessionId, summary);
+  }
+  const configuredLimit = Number.isFinite(Number(limit)) && Number(limit) > 0
+    ? Math.floor(Number(limit))
+    : 0;
+  const effectiveLimit = configuredLimit > 0
+    ? Math.max(configuredLimit, externalActiveIds.size)
+    : 0;
+  const summaries = Array.from(mergedById.values());
+  return {
+    externalActiveIds,
+    summaries: effectiveLimit > 0 ? summaries.slice(0, effectiveLimit) : summaries,
+  };
+}
+
 function shouldImmediatelyStreamCursorAssistant(pending, current) {
   return pending?.role === 'assistant'
     && current?.role === 'assistant'
@@ -245,6 +293,11 @@ function shouldRunContinueRemoteFastPoll(session, now = Date.now()) {
     );
 }
 
+function shouldFastPollCodexCliSession(session) {
+  return session?.agentType === 'codex_cli'
+    && !!(session._codexAppServerTurn || session._codexCliChild);
+}
+
 function shouldHoldContinueRemoteWaitOnRegression(
   session,
   effectiveMessageCount,
@@ -293,6 +346,28 @@ function liveStepFromTaskList(taskList) {
     state: tasks[index]?.state || 'pending',
     text: tasks[index]?.text || '',
   };
+}
+
+function expectedCodexQuestionAnswers(prompt, response) {
+  if (response?.action === 'cancel') return {};
+  const questions = Array.isArray(prompt?.questions) ? prompt.questions : [];
+  const answers = Array.isArray(response?.answers) ? response.answers : [];
+  const expected = {};
+  for (const answer of answers) {
+    const question = questions.find(candidate => candidate?.question_id === answer?.question_id);
+    if (!question) continue;
+    let values = [];
+    if (typeof answer.other_text === 'string' && answer.other_text.trim()) {
+      values = [answer.other_text.trim()];
+    } else {
+      const choiceIds = Array.isArray(answer.choice_ids) ? answer.choice_ids : [];
+      values = choiceIds.map(choiceId => (
+        (question.choices || []).find(choice => choice?.choice_id === choiceId)?.label || ''
+      )).filter(Boolean);
+    }
+    expected[question.question_id] = { answers: values };
+  }
+  return expected;
 }
 
 function codexUsageActivity(session) {
@@ -743,10 +818,14 @@ const CODEX_CLI_HISTORY_CHUNK_BYTES = envMbBytes('CODEX_CLI_HISTORY_CHUNK_MB', 1
 const CODEX_CLI_HISTORY_TAIL_MIN_INTERVAL_MS = 1_500;
 const CODEX_CLI_HISTORY_OLDER_MIN_INTERVAL_MS = 5_000;
 const CODEX_CLI_HISTORY_REPEAT_CURSOR_MS = 60_000;
+const FILE_TRANSCRIPT_ASYNC_APPEND_THRESHOLD = 20;
+const FILE_TRANSCRIPT_APPEND_BATCH_ROWS = 8;
+const FILE_TRANSCRIPT_APPEND_BATCH_MS = 8;
 const CODEX_CLI_ACTIVE_FILE_MAX_AGE_MS = Math.max(
   60_000,
   parseInt(process.env.CODEX_CLI_ACTIVE_FILE_MAX_AGE_MS || '1800000', 10) || 1_800_000
 );
+const VSCODE_CODEX_NATIVE_DEADLINE_RECEIPT_GRACE_MS = 15000;
 
 // ─── Cursor CLI history streaming constants ─────────────────────────────────
 // Env vars: CURSOR_CLI_PATH, CURSOR_CLI_SESSION_LIMIT (20),
@@ -795,6 +874,10 @@ class ProxyEngine extends EventEmitter {
       this.CODEX_DESKTOP_QUESTION_ACTIVE_POLL_INTERVAL_MS,
       Number(config.codexDesktopQuestionIdlePollIntervalMs || 750),
     );
+    this.CODEX_DESKTOP_QUESTION_REMOTE_POLL_WINDOW_MS = Math.max(
+      this.CODEX_DESKTOP_QUESTION_ACTIVE_POLL_INTERVAL_MS,
+      Number(config.codexDesktopQuestionRemotePollWindowMs || 120000),
+    );
     this.VSCODE_CODEX_QUESTION_POLL_TIMEOUT_MS = Math.max(
       10,
       Number(config.vscodeCodexQuestionPollTimeoutMs || 1500),
@@ -807,9 +890,21 @@ class ProxyEngine extends EventEmitter {
       this.VSCODE_CODEX_QUESTION_ACTIVE_POLL_INTERVAL_MS,
       Number(config.vscodeCodexQuestionIdlePollIntervalMs || 750),
     );
+    this.VSCODE_CODEX_QUESTION_REMOTE_POLL_WINDOW_MS = Math.max(
+      this.VSCODE_CODEX_QUESTION_ACTIVE_POLL_INTERVAL_MS,
+      Number(config.vscodeCodexQuestionRemotePollWindowMs || 120000),
+    );
     this.VSCODE_CODEX_QUESTION_MISSING_GRACE_MS = Math.max(
       this.VSCODE_CODEX_QUESTION_ACTIVE_POLL_INTERVAL_MS,
       Number(config.vscodeCodexQuestionMissingGraceMs || 600),
+    );
+    this.CODEX_CLI_GOAL_MONITOR_INTERVAL_MS = Math.max(
+      250,
+      Number(config.codexCliGoalMonitorIntervalMs || 750),
+    );
+    this.CODEX_CLI_GOAL_MONITOR_REQUEST_TIMEOUT_MS = Math.max(
+      1000,
+      Number(config.codexCliGoalMonitorRequestTimeoutMs || 1800),
     );
     this.CODEX_DESKTOP_SEND_LOCK_WAIT_MS = Math.max(
       1000,
@@ -837,6 +932,16 @@ class ProxyEngine extends EventEmitter {
     this.activeErrorPrompts = new Map();
     this._codexCliAppServerTurnFactory = config.codexCliAppServerTurnFactory
       || (options => new CodexCliAppServerTurn(options));
+    this._codexCliGoalDecisionConnectionFactory = config.codexCliGoalDecisionConnectionFactory
+      || (options => new CodexAppServerConnection(options));
+    this._codexCliGoalMonitorConnectionFactory = config.codexCliGoalMonitorConnectionFactory
+      || (options => new CodexAppServerConnection(options));
+    this._codexCliGoalMonitorOwnerProbe = config.codexCliGoalMonitorOwnerProbe
+      || ((cliSessionId, options) => codexCli.codexCliSessionOwnerStateAsync(cliSessionId, options));
+    this._codexCliGoalMonitorConnection = null;
+    this._codexCliGoalMonitorStartPromise = null;
+    this._codexCliGoalMonitorInFlight = new Map();
+    this._codexCliGoalMonitorTimer = null;
     this._codexVsCodeQuestionResolutionReader = config.codexVsCodeQuestionResolutionReader
       || codexCli.readCodexRequestUserInputResolution;
     this._codexConfigQueues = new Map();
@@ -905,6 +1010,9 @@ class ProxyEngine extends EventEmitter {
     // OS-level focus stealing.
     this._pollWindowIndex = 0;
     this._pollWindowSessionIndexes = new Map();
+    this._domPushSecondaryPollTimers = new Map();
+    this._domPushSecondaryPollInFlight = new Set();
+    this._domPushSecondaryDelayMs = 750;
 
     // Persistent CDP targets notify the proxy immediately when their DOM
     // changes. Timer polling remains as an adaptive safety/fallback path.
@@ -921,7 +1029,10 @@ class ProxyEngine extends EventEmitter {
     // its normalized, redacted public snapshot.
     this._providerUsage = new ProviderUsageRegistry({
       getSessions: () => this.sessions.values(),
-      getAntigravityQuota: () => this._antigravityQuotaCache,
+      getAntigravityQuota: async () => {
+        await this._refreshAntigravityQuotaUsage();
+        return this._antigravityQuotaCache;
+      },
       onSnapshot: snapshot => this._sendToRelay({
         type: 'provider_usage_snapshot',
         protocol_version: proto.PROTOCOL_VERSION,
@@ -989,20 +1100,31 @@ class ProxyEngine extends EventEmitter {
     const signalMs = Number.isFinite(event?.sourceAt)
       ? Math.max(0, Date.now() - event.sourceAt)
       : null;
-    this._log('debug', `[push] ${sessionId} DOM signal -> poll${signalMs === null ? '' : ` (${signalMs}ms)`}`);
+    const signalBreakdown = Number.isFinite(event?.cdpToQueueMs) && Number.isFinite(event?.queueToDispatchMs)
+      ? `; cdp=${event.cdpToQueueMs}ms queue=${event.queueToDispatchMs}ms`
+      : '';
+    this._log('debug', `[push] ${sessionId} DOM signal -> poll${signalMs === null ? '' : ` (${signalMs}ms${signalBreakdown})`}`);
     this._domPush.notePoll(sessionId, session);
     if (session.agentType === 'codex-desktop') {
       await this._pollCodexDesktopQuestionBounded(sessionId);
-      if (this._hasOpenCodexDesktopQuestion(sessionId)) {
-        this._log('debug', `[push] ${sessionId} native question open; deferring transcript and permission reads`);
+      if (this._isCodexDesktopQuestionLatencyWindow(sessionId, session)) {
+        this._cancelDomPushSecondaryPoll(sessionId);
+        this._log('debug', `[push] ${sessionId} native question latency lane active; deferring transcript and permission reads`);
         return;
       }
+      this._scheduleDomPushSecondaryPoll(sessionId);
+      this._log('debug', `[push] ${sessionId} native question lane complete in ${Date.now() - startedAt}ms; secondary reads scheduled`);
+      return;
     } else if (session.agentType === 'codex') {
-      await this._pollCodexVsCodeQuestionBounded(sessionId);
-      if (this._hasOpenCodexVsCodeQuestion(sessionId)) {
-        this._log('debug', `[push] ${sessionId} native VS Code question open; deferring transcript and permission reads`);
+      await this._pollCodexVsCodeQuestionBounded(sessionId, event?.executionContextId);
+      if (this._isCodexVsCodeQuestionLatencyWindow(sessionId, session)) {
+        this._cancelDomPushSecondaryPoll(sessionId);
+        this._log('debug', `[push] ${sessionId} native VS Code question latency lane active; deferring transcript and permission reads`);
         return;
       }
+      this._scheduleDomPushSecondaryPoll(sessionId);
+      this._log('debug', `[push] ${sessionId} native VS Code question lane complete in ${Date.now() - startedAt}ms; secondary reads scheduled`);
+      return;
     }
     await this._pollSessionBounded(sessionId);
     await this._pollPermissionsBounded(sessionId);
@@ -1013,6 +1135,63 @@ class ProxyEngine extends EventEmitter {
     );
   }
 
+  _cancelDomPushSecondaryPoll(sessionId) {
+    const timer = this._domPushSecondaryPollTimers?.get(sessionId);
+    if (!timer) return false;
+    clearTimeout(timer);
+    this._domPushSecondaryPollTimers.delete(sessionId);
+    return true;
+  }
+
+  _scheduleDomPushSecondaryPoll(sessionId, delayMs = this._domPushSecondaryDelayMs) {
+    if (!this._running || !this.sessions.has(sessionId)) return false;
+    if (!this._domPushSecondaryPollTimers) this._domPushSecondaryPollTimers = new Map();
+    if (!this._domPushSecondaryPollInFlight) this._domPushSecondaryPollInFlight = new Set();
+    this._cancelDomPushSecondaryPoll(sessionId);
+    const configuredDelayMs = Number(delayMs);
+    const effectiveDelayMs = Number.isFinite(configuredDelayMs) && configuredDelayMs > 0
+      ? configuredDelayMs
+      : 750;
+    const timer = setTimeout(() => {
+      this._domPushSecondaryPollTimers.delete(sessionId);
+      this._runDomPushSecondaryPoll(sessionId).catch(error => {
+        this._log('warn', `[push] ${sessionId} secondary poll failed: ${error.message}`);
+      });
+    }, Math.max(25, effectiveDelayMs));
+    timer.unref?.();
+    this._domPushSecondaryPollTimers.set(sessionId, timer);
+    return true;
+  }
+
+  async _runDomPushSecondaryPoll(sessionId) {
+    const session = this.sessions.get(sessionId);
+    if (!this._running || !session) return false;
+    if (!this._domPushSecondaryPollTimers) this._domPushSecondaryPollTimers = new Map();
+    if (!this._domPushSecondaryPollInFlight) this._domPushSecondaryPollInFlight = new Set();
+    if ((this._priorityControlInFlight || 0) > 0
+        || this._isCodexDesktopQuestionLatencyWindow(sessionId, session)
+        || this._isCodexVsCodeQuestionLatencyWindow(sessionId, session)
+        || this._domPushSecondaryPollInFlight.has(sessionId)) {
+      this._scheduleDomPushSecondaryPoll(sessionId);
+      return false;
+    }
+    this._domPushSecondaryPollInFlight.add(sessionId);
+    const startedAt = Date.now();
+    try {
+      await this._pollSessionBounded(sessionId);
+      if ((this._priorityControlInFlight || 0) > 0
+          || this._isCodexDesktopQuestionLatencyWindow(sessionId, session)
+          || this._isCodexVsCodeQuestionLatencyWindow(sessionId, session)) {
+        return false;
+      }
+      await this._pollPermissionsBounded(sessionId);
+      this._log('debug', `[push] ${sessionId} ${session.agentType} secondary poll complete in ${Date.now() - startedAt}ms`);
+      return true;
+    } finally {
+      this._domPushSecondaryPollInFlight.delete(sessionId);
+    }
+  }
+
   async _runAdaptivePollCycle(sessionId, options = {}) {
     const session = this.sessions.get(sessionId);
     if (!session) return false;
@@ -1020,10 +1199,10 @@ class ProxyEngine extends EventEmitter {
     this._domPush.notePoll(sessionId, session);
     if (session.agentType === 'codex-desktop') {
       await this._pollCodexDesktopQuestionBounded(sessionId);
-      if (this._hasOpenCodexDesktopQuestion(sessionId)) return true;
+      if (this._isCodexDesktopQuestionLatencyWindow(sessionId, session)) return true;
     } else if (session.agentType === 'codex') {
       await this._pollCodexVsCodeQuestionBounded(sessionId);
-      if (this._hasOpenCodexVsCodeQuestion(sessionId)) return true;
+      if (this._isCodexVsCodeQuestionLatencyWindow(sessionId, session)) return true;
     }
     await this._pollSessionBounded(sessionId);
     if (options.includePermissions !== false) {
@@ -1052,11 +1231,16 @@ class ProxyEngine extends EventEmitter {
           // outer workbench document. Keep page-level surfaces unscoped.
           if (session.agentType !== 'codex' && !session._iframeInnerContextId) return null;
           try {
-            await selectors.cacheInnerContextId(session.client.Runtime);
-            session._iframeInnerContextId = session.client.Runtime?._innerContextId || session._iframeInnerContextId;
+            if (!Number.isInteger(session.client.Runtime?._innerContextId)) {
+              await selectors.cacheInnerContextId(session.client.Runtime);
+            }
+            session._iframeInnerContextId = Number.isInteger(session.client.Runtime?._innerContextId)
+              ? session.client.Runtime._innerContextId
+              : null;
           } catch {}
           return Number.isInteger(session._iframeInnerContextId) ? session._iframeInnerContextId : null;
         },
+        requireContext: session.agentType === 'codex',
       });
       if (!priorState) {
         this._log(
@@ -2181,6 +2365,18 @@ class ProxyEngine extends EventEmitter {
     return entry?.adapter_surface === 'codex';
   }
 
+  _isCodexVsCodeQuestionLatencyWindow(sessionId, session = this.sessions.get(sessionId), now = Date.now()) {
+    return session?.agentType === 'codex'
+      && (Number(session._vscodeQuestionRemotePollUntil || 0) > now
+        || this._hasOpenCodexVsCodeQuestion(sessionId));
+  }
+
+  _isCodexDesktopQuestionLatencyWindow(sessionId, session = this.sessions.get(sessionId), now = Date.now()) {
+    return session?.agentType === 'codex-desktop'
+      && (Number(session._codexDesktopQuestionRemotePollUntil || 0) > now
+        || this._hasOpenCodexDesktopQuestion(sessionId));
+  }
+
   _scheduleCodexVsCodeQuestionPoll(sessionId, session, delayMs) {
     if (!session || session._vscodeQuestionPollTimer) return;
     session._vscodeQuestionPollTimer = setTimeout(() => {
@@ -2269,11 +2465,23 @@ class ProxyEngine extends EventEmitter {
       return;
     }
 
-    const activeThreadKey = String(session._activeThreadKey || session.codexDesktopActiveThreadKey || '');
+    let activeThreadKey = String(session._activeThreadKey || session.codexDesktopActiveThreadKey || '');
+    if (observed.active_thread_proven === true
+        && observed.native_thread_id
+        && !codexDesktopThreadKeysMatch(activeThreadKey, observed.native_thread_id)) {
+      this._applyCodexDesktopActiveThread(sessionId, session, {
+        id: observed.native_thread_id,
+        cache_key: observed.native_thread_id,
+        title: observed.native_thread_title || '',
+        active: true,
+      }, { refreshMetadata: false });
+      activeThreadKey = String(session._activeThreadKey || session.codexDesktopActiveThreadKey || '');
+    }
     if (!activeThreadKey || !codexDesktopThreadKeysMatch(activeThreadKey, observed.native_thread_id)) {
       this._log('warn', `[${sessionId}] [question] Refusing Desktop prompt outside exact active thread ${activeThreadKey || '(unknown)'}`);
       return;
     }
+    session._codexDesktopQuestionRemotePollUntil = 0;
     const signatureDigest = crypto.createHash('sha256')
       .update(String(observed.native_signature || ''))
       .digest('hex');
@@ -2453,9 +2661,17 @@ class ProxyEngine extends EventEmitter {
     if (!existing || existing.claimed === true || !session?.client?.Runtime) return false;
     let resolution = null;
     try {
-      resolution = await selectors.detectCodexVsCodeQuestionReceipt(
-        session.client.Runtime,
-        { ...existing, prompt: existing.prompt },
+      const timeoutMs = Math.max(100, Math.min(
+        1500,
+        Number(this.VSCODE_CODEX_QUESTION_POLL_TIMEOUT_MS || 1500),
+      ));
+      resolution = await this._withTimeout(
+        Promise.resolve().then(() => selectors.detectCodexVsCodeQuestionReceipt(
+          session.client.Runtime,
+          { ...existing, prompt: existing.prompt },
+        )),
+        timeoutMs,
+        `VS Code native DOM receipt ${String(sessionId).slice(0, 8)}`,
       );
     } catch (error) {
       this._log('warn', `[${sessionId}] [question] VS Code native DOM receipt read failed: ${error.message}`);
@@ -2489,7 +2705,7 @@ class ProxyEngine extends EventEmitter {
       return true;
     }
     if (this._finishCodexVsCodeQuestionFromNative(sessionId, session, existing)) return true;
-    if (Date.now() <= deadlineMs + 5000) {
+    if (Date.now() <= deadlineMs + VSCODE_CODEX_NATIVE_DEADLINE_RECEIPT_GRACE_MS) {
       this._scheduleCodexVsCodeQuestionDeadlinePoll(sessionId, session, deadlineMs, 100);
       return true;
     }
@@ -2516,6 +2732,66 @@ class ProxyEngine extends EventEmitter {
     return matched;
   }
 
+  async _readCodexVsCodeQuestionCallEvidence(observed) {
+    const reader = this._codexVsCodeQuestionCallEvidenceReader
+      || codexCli.readCodexRequestUserInputCallEvidence;
+    const options = {
+      turnId: observed.native_turn_id,
+      questions: observed.questions.map(question => ({
+        question_id: question.question_id,
+        header: question.header,
+        message: question.question,
+        choices: question.options,
+      })),
+    };
+    for (let attempt = 0; attempt < 5; attempt += 1) {
+      try {
+        const evidence = reader(observed.native_conversation_id, options);
+        if (evidence?.native_at) return evidence;
+      } catch (error) {
+        this._log('warn', `[question] VS Code native producer timestamp read failed: ${error.message}`);
+        return null;
+      }
+      if (attempt < 4) await new Promise(resolve => setTimeout(resolve, 20));
+    }
+    return null;
+  }
+
+  _sweepCodexVsCodeQuestionDeadlineReceipts() {
+    let checked = 0;
+    const now = Date.now();
+    for (const [sessionId, existing] of this.activeQuestionPromptAdapters.entries()) {
+      if (existing?.adapter_surface !== 'codex' || existing.claimed === true) continue;
+      const deadlineMs = Date.parse(existing.prompt?.deadline_at || '');
+      if (!Number.isFinite(deadlineMs) || now < deadlineMs) continue;
+      if (!existing.deadline_sweep_observed_at) {
+        existing.deadline_sweep_observed_at = new Date(now).toISOString();
+        this._log(
+          'info',
+          `[${sessionId}] [question] Engine deadline receipt sweep entered at ${now - deadlineMs}ms`,
+        );
+      }
+      checked += 1;
+      this._pollCodexVsCodeQuestionDeadlineReceipt(sessionId, deadlineMs);
+    }
+    return checked;
+  }
+
+  _sweepCodexVsCodeActiveQuestionPolls() {
+    const now = Date.now();
+    let started = 0;
+    for (const [sessionId, session] of this.sessions.entries()) {
+      if (session?.agentType !== 'codex'
+          || now >= Number(session._vscodeQuestionRemotePollUntil || 0)
+          || this._hasOpenCodexVsCodeQuestion(sessionId)) continue;
+      started += 1;
+      this._pollCodexVsCodeQuestionBounded(sessionId).catch(error => {
+        this._log('warn', `[${sessionId}] [question] Active VS Code sweep error: ${error.message}`);
+      });
+    }
+    return started;
+  }
+
   _reconcileCodexVsCodeQuestionDeadline(sessionId, session, existing) {
     const deadlineMs = Date.parse(existing?.prompt?.deadline_at || '');
     if (!Number.isFinite(deadlineMs) || Date.now() < deadlineMs) return false;
@@ -2537,10 +2813,12 @@ class ProxyEngine extends EventEmitter {
     if (!observed) {
       session._codexVsCodeQuestionTerminalSignature = null;
       if (isVsCodeEntry && existing.claimed !== true) {
-        if (await this._finishCodexVsCodeQuestionFromNativeDom(sessionId, session, existing)) return;
         const deadlineMs = Date.parse(existing.prompt?.deadline_at || '');
         if (Number.isFinite(deadlineMs) && Date.now() >= deadlineMs
-            && Date.now() <= deadlineMs + 5000) {
+            && this._finishCodexVsCodeQuestionFromNative(sessionId, session, existing)) return;
+        if (await this._finishCodexVsCodeQuestionFromNativeDom(sessionId, session, existing)) return;
+        if (Number.isFinite(deadlineMs) && Date.now() >= deadlineMs
+            && Date.now() <= deadlineMs + VSCODE_CODEX_NATIVE_DEADLINE_RECEIPT_GRACE_MS) {
           this._scheduleCodexVsCodeQuestionPoll(sessionId, session, 100);
         }
         if (this._reconcileCodexVsCodeQuestionDeadline(sessionId, session, existing)) return;
@@ -2589,8 +2867,10 @@ class ProxyEngine extends EventEmitter {
         && existing.native_request_id === observed.native_request_id
         && existing.native_signature_digest === signatureDigest) {
       const deadlineMs = Date.parse(existing.prompt?.deadline_at || '');
-      if (Number.isFinite(deadlineMs) && Date.now() >= deadlineMs
-          && await this._finishCodexVsCodeQuestionFromNativeDom(sessionId, session, existing)) return;
+      if (Number.isFinite(deadlineMs) && Date.now() >= deadlineMs) {
+        if (this._finishCodexVsCodeQuestionFromNative(sessionId, session, existing)) return;
+        if (await this._finishCodexVsCodeQuestionFromNativeDom(sessionId, session, existing)) return;
+      }
       if (this._reconcileCodexVsCodeQuestionDeadline(sessionId, session, existing)) return;
       return;
     }
@@ -2603,6 +2883,7 @@ class ProxyEngine extends EventEmitter {
     }
 
     const observedMs = Date.now();
+    session._vscodeQuestionRemotePollUntil = 0;
     const nativeDeadlineMs = observed.native_deadline_ms == null
       ? null
       : Number(observed.native_deadline_ms);
@@ -2618,6 +2899,7 @@ class ProxyEngine extends EventEmitter {
       : remainingSeconds != null && Number.isFinite(remainingSeconds) && remainingSeconds >= 0
         ? Math.round(remainingSeconds * 1000)
         : null;
+    const nativeCallEvidence = await this._readCodexVsCodeQuestionCallEvidence(observed);
     let prompt;
     try {
       prompt = canonicalQuestionPrompt({
@@ -2630,7 +2912,7 @@ class ProxyEngine extends EventEmitter {
         source: { surface: 'codex', version: this.VSCODE_CODEX_SURFACE_VERSION },
         title: observed.title,
         questions: observed.questions,
-        native_at: null,
+        native_at: nativeCallEvidence?.native_at || null,
         observed_at: new Date(observedMs).toISOString(),
         deadline_at: exactDeadlineMs == null
           ? (autoResolutionMs == null ? null : new Date(observedMs + autoResolutionMs).toISOString())
@@ -2647,6 +2929,7 @@ class ProxyEngine extends EventEmitter {
     const adapterIdentity = {
       adapter_surface: 'codex',
       target_id: session.targetId,
+      cdp_port: Number(session._cdpPort || 0),
       native_conversation_id: observed.native_conversation_id,
       native_turn_id: observed.native_turn_id,
       native_request_id: observed.native_request_id,
@@ -2668,16 +2951,29 @@ class ProxyEngine extends EventEmitter {
         };
       }
       const currentSession = this.sessions.get(sessionId);
-      if (!currentSession || currentSession !== session || !currentSession.client
-          || currentSession.targetId !== adapterIdentity.target_id) {
+      if (!currentSession || !currentSession.client
+          || currentSession.agentType !== 'codex'
+          || currentSession.targetId !== adapterIdentity.target_id
+          || Number(currentSession._cdpPort || 0) !== adapterIdentity.cdp_port) {
         return { ok: false, native_attempted: false, retryable: false, code: 'vscode_session_changed', detail: 'The native VS Code Codex session or target changed' };
       }
       try {
+        const expectedAnswers = expectedCodexQuestionAnswers(prompt, response);
+        const readNativeResolution = () => {
+          const reader = this._codexVsCodeQuestionResolutionReader
+            || codexCli.readCodexRequestUserInputResolution;
+          return reader(adapterIdentity.native_conversation_id, {
+            turnId: adapterIdentity.native_turn_id,
+            questions: prompt.questions,
+            deadlineMs: Date.parse(prompt.deadline_at || ''),
+            expectedAnswers,
+          });
+        };
         const result = await selectors.respondToCodexVsCodeQuestion(
           currentSession.client.Runtime,
           currentSession.client.Input,
           response,
-          { ...adapterIdentity, prompt },
+          { ...adapterIdentity, prompt, readNativeResolution },
         );
         if (result?.ok && result.native_acknowledged === true) {
           const nativeActivity = await selectors.detectThinking(currentSession.client.Runtime, 'codex').catch(() => null);
@@ -2710,7 +3006,8 @@ class ProxyEngine extends EventEmitter {
     }
     this._log(
       'info',
-      `[${sessionId}] [question] VS Code Codex prompt detected on native conversation ${observed.native_conversation_id} turn ${observed.native_turn_id}`,
+      `[${sessionId}] [question] VS Code Codex prompt detected on native conversation ${observed.native_conversation_id} `
+        + `turn ${observed.native_turn_id}`,
     );
 
     const attention = {
@@ -3012,6 +3309,66 @@ class ProxyEngine extends EventEmitter {
     };
   }
 
+  _scheduleFileTranscriptAppendDrain(sessionId, session, drain) {
+    if (!drain || drain.scheduled || session?._fileTranscriptAppendDrain !== drain) return;
+    drain.scheduled = true;
+    const immediate = setImmediate(() => {
+      drain.scheduled = false;
+      this._drainFileTranscriptAppend(sessionId, session, drain);
+    });
+    immediate.unref?.();
+  }
+
+  _drainFileTranscriptAppend(sessionId, session, drain) {
+    if (!session || session._fileTranscriptAppendDrain !== drain || this._running === false) return;
+    const startedAt = Date.now();
+    let batchRows = 0;
+    while (drain.nextIndex < drain.candidate.messages.length
+      && batchRows < FILE_TRANSCRIPT_APPEND_BATCH_ROWS
+      && Date.now() - startedAt < FILE_TRANSCRIPT_APPEND_BATCH_MS) {
+      const index = drain.nextIndex;
+      const message = drain.candidate.messages[index];
+      const frame = this._fileTranscriptMessage(drain.candidate, message, index, drain.sourceCursor);
+      if (!this._sendProxyMessage(sessionId, frame)) {
+        const acceptedMessages = drain.candidate.messages.slice(0, index);
+        session._fileTranscriptState = {
+          ...drain.candidate,
+          messages: acceptedMessages,
+          messageIds: drain.candidate.messageIds.slice(0, index),
+        };
+        session.lastTranscriptSig = this._transcriptSignature(acceptedMessages);
+        session.lastObservedCount = acceptedMessages.length;
+        session.lastMessageCount = acceptedMessages.length;
+        const pending = drain.pending;
+        session._fileTranscriptAppendDrain = null;
+        if (pending) setImmediate(() => this._sendFileBackedTranscriptUpdate(
+          sessionId,
+          session,
+          pending.messages,
+          pending.options,
+        ));
+        return;
+      }
+      drain.nextIndex += 1;
+      drain.sent += 1;
+      batchRows += 1;
+    }
+    if (drain.nextIndex < drain.candidate.messages.length) {
+      this._scheduleFileTranscriptAppendDrain(sessionId, session, drain);
+      return;
+    }
+    session._fileTranscriptState = drain.candidate;
+    const pending = drain.pending;
+    session._fileTranscriptAppendDrain = null;
+    this._log('info', `[${sessionId}] Emitted ${drain.sent} ${drain.agentType} semantic append rows in priority-safe batches (${drain.reason}, cursor ${drain.sourceCursor?.start_offset ?? '?'}-${drain.sourceCursor?.end_offset ?? '?'})`);
+    if (pending) setImmediate(() => this._sendFileBackedTranscriptUpdate(
+      sessionId,
+      session,
+      pending.messages,
+      pending.options,
+    ));
+  }
+
   _sendFileBackedTranscriptUpdate(sessionId, session, messages, {
     agentType,
     filePath,
@@ -3022,6 +3379,13 @@ class ProxyEngine extends EventEmitter {
     const currentMessages = Array.isArray(messages) ? messages : [];
     const previous = session?._fileTranscriptState || null;
     if (!session || !agentType || !filePath) return { mode: 'ignored', sent: 0 };
+    if (session._fileTranscriptAppendDrain) {
+      session._fileTranscriptAppendDrain.pending = {
+        messages: [...currentMessages],
+        options: { agentType, filePath, sourceCursor, reason, allowInitialAppend },
+      };
+      return { mode: 'append_coalesced', sent: 0 };
+    }
     if (this._promoteSessionChatTitle(sessionId, session, currentMessages)) {
       this._broadcastSessionSnapshot('file-backed title hydration');
     }
@@ -3056,6 +3420,21 @@ class ProxyEngine extends EventEmitter {
         messageIds: this._fileTranscriptMessageIds(previous.agentType, previous.generation, currentMessages),
         sourceCursor: sourceCursor ? { ...sourceCursor } : previous.sourceCursor,
       };
+      if (appended.length > FILE_TRANSCRIPT_ASYNC_APPEND_THRESHOLD) {
+        const drain = {
+          agentType,
+          candidate,
+          sourceCursor: sourceCursor ? { ...sourceCursor } : previous.sourceCursor,
+          reason,
+          nextIndex: priorMessages.length,
+          sent: 0,
+          scheduled: false,
+          pending: null,
+        };
+        session._fileTranscriptAppendDrain = drain;
+        this._scheduleFileTranscriptAppendDrain(sessionId, session, drain);
+        return { mode: 'append_scheduled', sent: 0, pending: appended.length };
+      }
       let sent = 0;
       appended.forEach((message, offset) => {
         const index = priorMessages.length + offset;
@@ -3405,6 +3784,56 @@ class ProxyEngine extends EventEmitter {
     return changed;
   }
 
+  _applyCodexDesktopActiveThread(sessionId, session, activeThread, options = {}) {
+    if (!session || session.agentType !== 'codex-desktop' || !activeThread) return;
+    const activeThreadKey = String(activeThread.cache_key || activeThread.id || activeThread.title || '');
+    if (!activeThreadKey) return;
+    const previousThreadKey = session._activeThreadKey || session.codexDesktopActiveThreadKey || session.codex_desktop_active_thread_key || '';
+    const previousMatchesActive = codexDesktopThreadKeysMatch(previousThreadKey, activeThreadKey);
+    if (previousThreadKey && !previousMatchesActive) {
+      this._log('info', `[${sessionId}] Codex Desktop active thread changed; resetting transcript accumulator`);
+      this._resetTranscriptState(session, 'codex-desktop active thread change');
+      sessionStore.updateSession(sessionId, {
+        accumulated_messages: null,
+        codex_desktop_active_thread_key: activeThreadKey,
+        codex_desktop_active_thread_title: activeThread.title || null,
+      });
+      session._codexDesktopArchiveMessages = null;
+      session._codexDesktopArchivePath = null;
+      session._codexDesktopArchiveUpdatedAt = null;
+      session._codexDesktopArchiveSizeBytes = null;
+      session._codexDesktopArchivePollSettledActivity = null;
+      session._codexDesktopArchiveCliSessionId = null;
+      session._codexDesktopArchiveBlockCounts = null;
+      session._codexDesktopArchivePartial = false;
+      session._lastStreamedContent = null;
+    }
+    session._activeThreadKey = activeThreadKey;
+    session._activeThreadTitle = activeThread.title || session._activeThreadTitle || null;
+    session.codexDesktopActiveThreadKey = activeThreadKey;
+    session.chat_title = session._activeThreadTitle || session.chat_title || null;
+    if (session._activeThreadTitle) session.chat_title_source = 'native';
+    sessionStore.updateSession(sessionId, {
+      codex_desktop_active_thread_key: activeThreadKey,
+      codex_desktop_active_thread_title: session._activeThreadTitle || null,
+      chat_title: session.chat_title,
+      chat_title_source: session.chat_title_source || null,
+    });
+    const lookupDue = session._codexDesktopWorkspaceThreadKey !== activeThreadKey
+      && (
+        session._lastCodexDesktopWorkspaceLookupKey !== activeThreadKey
+        || Date.now() - Number(session._lastCodexDesktopWorkspaceLookupAt || 0) >= 30000
+      );
+    if (lookupDue && options.refreshMetadata !== false) {
+      this._refreshCodexDesktopThreadMetadata(
+        sessionId,
+        session,
+        activeThreadKey,
+        session._activeThreadTitle || '',
+      );
+    }
+  }
+
   _applyCodexDesktopThreadList(sessionId, session, threads) {
     if (!session || !['codex-desktop', 'cursor'].includes(session.agentType) || !Array.isArray(threads) || threads.length === 0) return;
 
@@ -3467,52 +3896,7 @@ class ProxyEngine extends EventEmitter {
       }
       return;
     }
-    const previousThreadKey = session._activeThreadKey || session.codexDesktopActiveThreadKey || session.codex_desktop_active_thread_key || '';
-    const previousMatchesActive = codexDesktopThreadKeysMatch(previousThreadKey, activeThreadKey);
-    if (activeThreadKey && previousThreadKey && !previousMatchesActive) {
-      this._log('info', `[${sessionId}] Codex Desktop active thread changed; resetting transcript accumulator`);
-      this._resetTranscriptState(session, 'codex-desktop active thread change');
-      sessionStore.updateSession(sessionId, {
-        accumulated_messages: null,
-        codex_desktop_active_thread_key: activeThreadKey,
-        codex_desktop_active_thread_title: activeThread?.title || null,
-      });
-      session._codexDesktopArchiveMessages = null;
-      session._codexDesktopArchivePath = null;
-      session._codexDesktopArchiveUpdatedAt = null;
-      session._codexDesktopArchiveSizeBytes = null;
-      session._codexDesktopArchivePollSettledActivity = null;
-      session._codexDesktopArchiveCliSessionId = null;
-      session._codexDesktopArchiveBlockCounts = null;
-      session._codexDesktopArchivePartial = false;
-      session._lastStreamedContent = null;
-    }
-    if (activeThreadKey) {
-      session._activeThreadKey = activeThreadKey;
-      session._activeThreadTitle = activeThread?.title || session._activeThreadTitle || null;
-      session.codexDesktopActiveThreadKey = activeThreadKey;
-      session.chat_title = session._activeThreadTitle || session.chat_title || null;
-      if (session._activeThreadTitle) session.chat_title_source = 'native';
-      sessionStore.updateSession(sessionId, {
-        codex_desktop_active_thread_key: activeThreadKey,
-        codex_desktop_active_thread_title: session._activeThreadTitle || null,
-        chat_title: session.chat_title,
-        chat_title_source: session.chat_title_source || null,
-      });
-      const lookupDue = session._codexDesktopWorkspaceThreadKey !== activeThreadKey
-        && (
-          session._lastCodexDesktopWorkspaceLookupKey !== activeThreadKey
-          || Date.now() - Number(session._lastCodexDesktopWorkspaceLookupAt || 0) >= 30000
-        );
-      if (lookupDue) {
-        this._refreshCodexDesktopThreadMetadata(
-          sessionId,
-          session,
-          activeThreadKey,
-          session._activeThreadTitle || '',
-        );
-      }
-    }
+    if (activeThreadKey) this._applyCodexDesktopActiveThread(sessionId, session, activeThread);
   }
 
   // ─── Reconnect backoff ───────────────────────────────────────────────────
@@ -4030,6 +4414,40 @@ class ProxyEngine extends EventEmitter {
   _handleRelayMessage(msg) {
     const { type } = msg;
 
+    if (PRIORITY_RELAY_TYPES.has(type) && !msg[PRIORITY_RELAY_CONTROL]) {
+      const sessionId = msg.session_id || msg.session;
+      const prioritySession = sessionId ? this.sessions.get(sessionId) : null;
+      this._priorityControlInFlight = (this._priorityControlInFlight || 0) + 1;
+      if (prioritySession) {
+        prioritySession._priorityControlInFlight = (prioritySession._priorityControlInFlight || 0) + 1;
+      }
+      if (sessionId) this._cancelDomPushSecondaryPoll(sessionId);
+      let released = false;
+      const release = () => {
+        if (released) return;
+        released = true;
+        this._priorityControlInFlight = Math.max(0, (this._priorityControlInFlight || 1) - 1);
+        if (prioritySession) {
+          prioritySession._priorityControlInFlight = Math.max(
+            0,
+            (prioritySession._priorityControlInFlight || 1) - 1,
+          );
+        }
+      };
+      let result;
+      try {
+        result = this._handleRelayMessage({ ...msg, [PRIORITY_RELAY_CONTROL]: true });
+      } catch (error) {
+        release();
+        throw error;
+      }
+      if (result && typeof result.then === 'function') {
+        return Promise.resolve(result).finally(release);
+      }
+      release();
+      return result;
+    }
+
     if (['new_chat', 'new_thread', 'switch_chat', 'switch_thread'].includes(type)
         && !msg[SERIALIZED_NAVIGATION]) {
       const sessionId = msg.session_id || msg.session;
@@ -4110,7 +4528,12 @@ class ProxyEngine extends EventEmitter {
       // Re-sync transcript history
       for (const [sessionId, session] of this.sessions.entries()) {
         if (session.agentType === 'codex_cli' && session.codexCliArchiveDiscovered === true
-            && !session._codexCliChild && !session._codexAppServerTurn) {
+            && !session._codexCliChild && !session._codexAppServerTurn
+            && session._goalRunLifecycle?.lease_active !== true) {
+          continue;
+        }
+        if (shouldFastPollCodexCliSession(session)) {
+          everyTickIds.push(sessionId);
           continue;
         }
         if (session.agentType === 'cursor_cli' && session.cursorCliArchiveDiscovered === true && !session._cursorCliChild) {
@@ -4159,6 +4582,7 @@ class ProxyEngine extends EventEmitter {
       this._providerUsage.refresh({
         force: msg.force === true,
         reason: 'client',
+        waitForCost: false,
       }).then(snapshot => {
         this._sendToRelay({
           type: 'provider_usage_refresh_receipt',
@@ -4291,7 +4715,7 @@ class ProxyEngine extends EventEmitter {
 
     // ── Send requests ───────────────────────────────────────────────────
     if (type === 'send_message') {
-      this._handleSendRequest({
+      return this._handleSendRequest({
         session:           msg.session_id,
         content:           msg.content,
         file:              msg.file,
@@ -4301,8 +4725,7 @@ class ProxyEngine extends EventEmitter {
     }
 
     if (type === 'send') {
-      this._handleSendRequest(msg);
-      return;
+      return this._handleSendRequest(msg);
     }
 
     if (type === 'steer') {
@@ -4557,7 +4980,7 @@ class ProxyEngine extends EventEmitter {
         return;
       }
       entry.claimed = true;
-      Promise.resolve(entry.answer(msg))
+      return Promise.resolve(entry.answer(msg))
         .then(result => {
           if (result?.ok && result?.native_acknowledged === true) {
             this.activeQuestionPromptAdapters.delete(sid);
@@ -4583,11 +5006,12 @@ class ProxyEngine extends EventEmitter {
         })
         .catch(error => {
           this.activeQuestionPromptAdapters.delete(sid);
+          const nativeAttempted = error.native_attempted !== false;
           this._sendToRelay({
             ...proto.agentControlResult(sid, msg.request_id, 'question_response', 'failed', {
-              code: 'question_adapter_exception', message: error.message,
+              code: error.code || 'question_adapter_exception', message: error.message,
             }),
-            native_attempted: true,
+            native_attempted: nativeAttempted,
             retryable: false,
           });
         });
@@ -8579,13 +9003,23 @@ class ProxyEngine extends EventEmitter {
       observed.goal,
       'codex_desktop_archive',
     );
-    const idleActivity = {
+    const idleActivity = this._applyGoalRunLifecycle(sessionId, session, {
       ...observed,
       kind: 'idle',
       label: observed.label || '',
       updated_at: observed.updated_at || new Date().toISOString(),
       ...(canonicalGoal ? { goal: canonicalGoal } : {}),
-    };
+    }, {
+      source: 'codex_desktop_archive',
+      sourceCursor: canonicalGoal?.native_cursor || null,
+      nativeEventAt: canonicalGoal?.native_updated_at || observed.updated_at || null,
+      observedAt: new Date().toISOString(),
+      evidenceType: 'desktop_task_complete',
+      liveLeaseProof: false,
+      ownerState: 'confirmed',
+      taskStartedTurnId: 'desktop-archive-settled',
+      taskCompletedTurnId: 'desktop-archive-settled',
+    });
     session.pendingLast = null;
     session._pendingFirstSeenAt = null;
     session._lastStreamedContent = null;
@@ -8898,7 +9332,7 @@ class ProxyEngine extends EventEmitter {
   // ─── Session broadcast ───────────────────────────────────────────────
 
   _promoteSessionChatTitle(sessionId, session, messages = null, nativeTitle = null) {
-    if (!session || session._newChatPending || (session._listView && (!messages || messages.length === 0))) {
+    if (!session || session._newChatPending) {
       return false;
     }
     const stored = sessionStore.getSession(sessionId) || {};
@@ -8936,9 +9370,34 @@ class ProxyEngine extends EventEmitter {
     return true;
   }
 
+  _buildFleetSummary(session) {
+    if (!session?.session_id) return {};
+    const stored = sessionStore.getSession(session.session_id) || {};
+    const previous = session._fleetSummary || stored.fleet_summary || null;
+    const messages = Array.isArray(session._accumulatedMessages)
+      ? session._accumulatedMessages
+      : Array.isArray(stored.accumulated_messages) ? stored.accumulated_messages : [];
+    const summary = buildProducerFleetSummary({
+      sessionId: session.session_id,
+      session,
+      messages,
+      previous,
+    });
+    if (!summary) return previous ? projectFleetSummary(previous) : {};
+    session._fleetSummary = summary;
+    if (!previous || JSON.stringify(previous) !== JSON.stringify(summary)) {
+      sessionStore.updateSession(session.session_id, { fleet_summary: summary });
+    }
+    return projectFleetSummary(summary);
+  }
+
   _buildSessionMetas() {
     return Array.from(this.sessions.values()).map(s => {
       this._promoteSessionChatTitle(s.session_id, s);
+      const fleetProjection = this._buildFleetSummary(s);
+      const activity = fleetProjection.fleet_work_context && !s.activity?.work_context
+        ? { ...(s.activity || { kind: 'idle', label: '' }), work_context: fleetProjection.fleet_work_context }
+        : s.activity;
       return ({
       session_id:       s.session_id,
       agent_type:       s.agentType,
@@ -8968,7 +9427,7 @@ class ProxyEngine extends EventEmitter {
       cursor_workspace_key: s.cursorWorkspaceKey || null,
       cursor_native_status: s.nativeStatus || null,
       status:           s.status,
-      activity:         s.activity,
+      activity,
       last_seen_at:     s.last_seen_at,
       rate_limited_until: s.rate_limited_until || null,
       rate_limit_active:  s.rateLimitActive    || false,
@@ -8984,6 +9443,7 @@ class ProxyEngine extends EventEmitter {
       ...(s.model_id ? { model_id: s.model_id } : {}),
       ...(s.permission_mode ? { permission_mode: s.permission_mode } : {}),
       ...(Array.isArray(s._lastChatList) ? { chat_list: s._lastChatList } : {}),
+      ...fleetProjection,
       });
     });
   }
@@ -9113,16 +9573,37 @@ class ProxyEngine extends EventEmitter {
     }
   }
 
-  async _runBackgroundMaintenanceStep(label, work) {
+  _hasLatencySensitiveQuestionWindow(now = Date.now()) {
+    for (const [sessionId, session] of this.sessions.entries()) {
+      if (this._isCodexVsCodeQuestionLatencyWindow(sessionId, session, now)) {
+        return true;
+      }
+      if (session?.agentType === 'codex-desktop'
+          && this._isCodexDesktopQuestionLatencyWindow(sessionId, session, now)) {
+        return true;
+      }
+    }
+    return false;
+  }
+
+  async _runBackgroundMaintenanceStep(label, work, options = {}) {
     // Yield once before synchronous discovery/summary work. A relay control
     // already queued on the event loop can then claim the priority lane before
     // maintenance starts instead of waiting behind a multi-second scan.
     await new Promise(resolve => setImmediate(resolve));
-    if ((this._priorityControlInFlight || 0) > 0) {
+    const priorityControlActive = (this._priorityControlInFlight || 0) > 0;
+    const questionLatencyActive = options.deferForQuestionLatency === true
+      && this._hasLatencySensitiveQuestionWindow();
+    if (priorityControlActive || questionLatencyActive) {
       const now = Date.now();
       if (!this._lastPriorityMaintenanceDeferralAt || now - this._lastPriorityMaintenanceDeferralAt >= 30000) {
         this._lastPriorityMaintenanceDeferralAt = now;
-        this._log('info', `[poll] Deferring ${label}; user control is in flight`);
+        this._log(
+          'info',
+          `[poll] Deferring ${label}; ${priorityControlActive
+            ? 'user control is in flight'
+            : 'native question latency lane is active'}`,
+        );
       }
       return false;
     }
@@ -9193,37 +9674,53 @@ class ProxyEngine extends EventEmitter {
   }
 
   async _withAntigravitySettingsClient(work) {
-    const cdpPort = this.CDP_PORTS[0];
-    const targets = await this._withTimeout(
-      CDP.List({ port: cdpPort }), 3000, 'CDP.List for settings page'
-    );
-    const settingsPages = targets.filter(t =>
-      t.type === 'page' &&
-      t.title === 'Settings' &&
-      t.url &&
-      t.url.includes('workbench-jetski-agent')
-    );
-    if (settingsPages.length === 0) {
-      throw new Error('No Antigravity Settings page found');
-    }
-
-    let client;
-    try {
-      client = await this._withTimeout(
-        CDP({ port: cdpPort, target: settingsPages[0].id }),
-        4000, 'CDP attach settings page'
-      );
-      await this._withTimeout(client.Runtime.enable(), 3000, 'Runtime.enable settings');
-      // Bound the work callback itself — it issues Runtime.evaluate against
-      // the settings page renderer, which can hang indefinitely if that
-      // renderer is wedged. An unbounded await here was previously enough
-      // to freeze the entire proxy poll loop for many minutes.
-      return await this._withTimeout(work(client), 8000, 'antigravity settings work');
-    } finally {
-      if (client) {
-        try { await this._withTimeout(client.close(), 2000, 'close settings client'); } catch {}
+    for (const cdpPort of this.CDP_PORTS) {
+      let targets;
+      try {
+        targets = await this._withTimeout(
+          CDP.List({ port: cdpPort }),
+          3000,
+          'CDP.List for Antigravity quota page on ' + cdpPort
+        );
+      } catch {
+        continue;
+      }
+      const settingsPages = targets.filter(t => {
+        if (t.type !== 'page' || !t.url) return false;
+        if (t.title === 'Settings' && t.url.includes('workbench-jetski-agent')) return true;
+        if (t.title !== 'Antigravity') return false;
+        try {
+          const url = new URL(t.url);
+          return ['http:', 'https:'].includes(url.protocol)
+            && ['127.0.0.1', '::1', 'localhost'].includes(url.hostname)
+            && url.pathname === '/';
+        } catch {
+          return false;
+        }
+      });
+      for (const settingsPage of settingsPages) {
+        let client;
+        try {
+          client = await this._withTimeout(
+            CDP({ port: cdpPort, target: settingsPage.id }),
+            4000,
+            'CDP attach Antigravity quota page on ' + cdpPort
+          );
+          await this._withTimeout(client.Runtime.enable(), 3000, 'Runtime.enable Antigravity quota');
+          // The callback is read-only. It may inspect a protected signed-in
+          // page, but must never navigate, focus, click, or refresh it.
+          const result = await this._withTimeout(work(client), 8000, 'antigravity quota read');
+          if (result) return result;
+        } catch {
+          // Continue to the next exact Antigravity candidate/port.
+        } finally {
+          if (client) {
+            try { await this._withTimeout(client.close(), 2000, 'close Antigravity quota client'); } catch {}
+          }
+        }
       }
     }
+    throw new Error('No readable Antigravity quota page found');
   }
 
   _normalizeAntigravityModelName(name) {
@@ -9314,12 +9811,6 @@ class ProxyEngine extends EventEmitter {
     try {
       const snapshot = await this._withTimeout(
         this._withAntigravitySettingsClient(async client => {
-          const refreshResult = await this._withTimeout(
-            selectors.refreshAntigravityModelQuota(client.Runtime), 4000, 'refresh quota'
-          );
-          if (refreshResult?.ok) {
-            await sleep(750);
-          }
           return this._withTimeout(
             selectors.readAntigravityModelQuota(client.Runtime), 4000, 'read quota'
           );
@@ -10096,11 +10587,23 @@ class ProxyEngine extends EventEmitter {
     const goal = activity.goal && typeof activity.goal === 'object'
       ? { ...activity.goal, updated_at: undefined }
       : activity.goal || null;
+    const goalRun = activity.goal_run && typeof activity.goal_run === 'object'
+      ? {
+          ...activity.goal_run,
+          observed_at: undefined,
+          lease_observed_at: undefined,
+          source_cursor: undefined,
+          source_sequence: undefined,
+          native_event_at: undefined,
+          evidence_type: undefined,
+        }
+      : activity.goal_run || null;
     return JSON.stringify({
       ...activity,
       updated_at: undefined,
       started_at: activity.started_at || null,
       goal,
+      goal_run: goalRun,
     });
   }
 
@@ -10121,7 +10624,7 @@ class ProxyEngine extends EventEmitter {
       || session?.codexDesktopThreadId
       || session?.activeThreadId
       || sessionId;
-    const nativeUpdatedAt = sourceName === 'codex_cli_jsonl'
+    const nativeUpdatedAt = ['codex_cli_jsonl', 'codex_cli_goal_controller'].includes(sourceName)
       ? (observedGoal.native_updated_at || null)
       : null;
     const canonical = canonicalGoalRecord(observedGoal, {
@@ -10132,48 +10635,696 @@ class ProxyEngine extends EventEmitter {
       nativeUpdatedAt,
       observedAt: observedGoal.observed_at || new Date().toISOString(),
     });
+    if (canonical && previousGoal) {
+      const previousGeneration = Math.max(1, Number(previousGoal.generation) || 1);
+      const canonicalGeneration = Math.max(1, Number(canonical.generation) || 1);
+      const previousState = String(previousGoal.state || previousGoal.status || '').toLowerCase();
+      if (canonicalGeneration < previousGeneration
+          || (['complete', 'cancelled', 'failed'].includes(previousState)
+            && canonical.state === 'active' && canonicalGeneration <= previousGeneration)) {
+        return previousGoal;
+      }
+    }
     if (canonical) session._lastCanonicalGoal = canonical;
     return canonical;
   }
 
-  _setCodexCliActivity(sessionId, session, activity) {
+  _codexCliGoalRunOwnerState(session) {
+    if (session?._codexAppServerTurn || session?._codexCliChild) {
+      session._goalRunOwnerMissingSinceMs = 0;
+      session._goalRunOwnerMissingChecks = 0;
+      return 'confirmed';
+    }
+    const probe = codexCli.codexCliSessionOwnerState(session?.cliSessionId, { cacheMs: 750 });
+    if (probe.state === 'confirmed') {
+      session._goalRunOwnerMissingSinceMs = 0;
+      session._goalRunOwnerMissingChecks = 0;
+      session._goalRunLastOwnerCheckAtMs = probe.checked_at_ms || Date.now();
+      return 'confirmed';
+    }
+    if (probe.state !== 'missing') return 'ambiguous';
+    const checkedAt = Number(probe.checked_at_ms) || Date.now();
+    if (checkedAt !== Number(session._goalRunLastOwnerCheckAtMs || 0)) {
+      session._goalRunLastOwnerCheckAtMs = checkedAt;
+      session._goalRunOwnerMissingChecks = Number(session._goalRunOwnerMissingChecks || 0) + 1;
+      if (!session._goalRunOwnerMissingSinceMs) session._goalRunOwnerMissingSinceMs = checkedAt;
+    }
+    const missingForMs = checkedAt - Number(session._goalRunOwnerMissingSinceMs || checkedAt);
+    return session._goalRunOwnerMissingChecks >= 2 && missingForMs >= 1500 ? 'gone' : 'ambiguous';
+  }
+
+  async _ensureCodexCliGoalMonitorConnection() {
+    const current = this._codexCliGoalMonitorConnection;
+    if (current?._racGoalMonitorReady === true && current.disconnected !== true) return current;
+    if (this._codexCliGoalMonitorStartPromise) return this._codexCliGoalMonitorStartPromise;
+    const factory = this._codexCliGoalMonitorConnectionFactory
+      || (options => new CodexAppServerConnection(options));
+    const connection = factory({
+      sessionId: `goal-monitor-${this.PROXY_ID || crypto.randomUUID()}`,
+      cwd: process.cwd(),
+      clientName: 'remote-agent-chat-goal-monitor',
+      clientVersion: '1.0.0',
+      requestTimeoutMs: Number(this.CODEX_CLI_GOAL_MONITOR_REQUEST_TIMEOUT_MS || 1800),
+    });
+    this._codexCliGoalMonitorConnection = connection;
+    connection.on?.('disconnect', () => {
+      connection._racGoalMonitorReady = false;
+      if (this._codexCliGoalMonitorConnection === connection) {
+        this._codexCliGoalMonitorConnection = null;
+      }
+    });
+    const startPromise = Promise.resolve(connection.start()).then(() => {
+      if (this._codexCliGoalMonitorConnection !== connection) {
+        throw new Error('Codex goal monitor was superseded during startup');
+      }
+      connection._racGoalMonitorReady = true;
+      return connection;
+    }).catch(async error => {
+      connection._racGoalMonitorReady = false;
+      if (this._codexCliGoalMonitorConnection === connection) {
+        this._codexCliGoalMonitorConnection = null;
+      }
+      try { await connection.stop?.(); } catch {}
+      throw error;
+    }).finally(() => {
+      if (this._codexCliGoalMonitorStartPromise === startPromise) {
+        this._codexCliGoalMonitorStartPromise = null;
+      }
+    });
+    this._codexCliGoalMonitorStartPromise = startPromise;
+    return startPromise;
+  }
+
+  async _stopCodexCliGoalMonitor() {
+    const pending = this._codexCliGoalMonitorStartPromise;
+    let connection = this._codexCliGoalMonitorConnection;
+    this._codexCliGoalMonitorConnection = null;
+    this._codexCliGoalMonitorStartPromise = null;
+    if (pending) {
+      try { connection = await pending; } catch {}
+    }
+    if (!connection) return;
+    connection._racGoalMonitorReady = false;
+    try { await connection.stop?.(); } catch {}
+  }
+
+  _codexCliGoalControllerIso(value) {
+    if (value == null || value === '') return null;
+    if (typeof value === 'number' && Number.isFinite(value)) {
+      const ms = value < 1e12 ? value * 1000 : value;
+      return new Date(ms).toISOString();
+    }
+    const number = Number(value);
+    if (Number.isFinite(number) && String(value).trim() !== '') {
+      const ms = number < 1e12 ? number * 1000 : number;
+      return new Date(ms).toISOString();
+    }
+    const ms = Date.parse(String(value));
+    return Number.isFinite(ms) ? new Date(ms).toISOString() : null;
+  }
+
+  _canonicalCodexCliControllerGoal(sessionId, session, nativeGoal, observedAt) {
+    if (!nativeGoal || typeof nativeGoal !== 'object') return null;
+    const objective = String(nativeGoal.objective || '').trim();
+    if (!objective) return null;
+    const sessionKey = String(session?.cliSessionId || sessionId || '').trim();
+    const createdAt = this._codexCliGoalControllerIso(nativeGoal.createdAt ?? nativeGoal.created_at);
+    const updatedAt = this._codexCliGoalControllerIso(nativeGoal.updatedAt ?? nativeGoal.updated_at);
+    const objectiveHash = crypto.createHash('sha256').update(objective, 'utf8').digest('hex');
+    const previousGoal = session?._lastCanonicalGoal || session?.activity?.goal || null;
+    const previousGeneration = Math.max(1, Number(previousGoal?.generation) || 1);
+    const fingerprint = `goal:${crypto.createHash('sha256').update([
+      sessionKey,
+      objectiveHash,
+      createdAt || `generation:${previousGeneration}`,
+    ].join('\u0000')).digest('hex').slice(0, 40)}`;
+    const generation = previousGoal
+      ? (String(previousGoal.fingerprint || '') === fingerprint
+        ? previousGeneration
+        : previousGeneration + 1)
+      : 1;
+    const nativeState = String(nativeGoal.status || nativeGoal.state || '').trim() || 'active';
+    const controllerCursor = {
+      kind: 'codex_cli_goal_controller',
+      signature: crypto.createHash('sha256')
+        .update(`${nativeState}\u0000${updatedAt || createdAt || fingerprint}`)
+        .digest('hex')
+        .slice(0, 32),
+    };
+    return this._canonicalGoalForSession(sessionId, session, {
+      objective,
+      objective_hash: objectiveHash,
+      fingerprint,
+      generation,
+      raw_state: nativeState,
+      state: nativeState,
+      status: nativeState,
+      created_at: createdAt,
+      native_updated_at: updatedAt,
+      observed_at: observedAt,
+      native_cursor: controllerCursor,
+      time_used_seconds: Math.max(0, Number(nativeGoal.timeUsedSeconds ?? nativeGoal.time_used_seconds) || 0),
+      tokens_used: Math.max(0, Number(nativeGoal.tokensUsed ?? nativeGoal.tokens_used) || 0),
+      source: 'codex_cli_goal_controller',
+    }, 'codex_cli_goal_controller');
+  }
+
+  _codexCliGoalControllerActivity(session, goal, observedAt) {
+    const state = String(goal?.state || '').toLowerCase();
+    const previous = session?.activity && typeof session.activity === 'object'
+      ? session.activity
+      : { kind: 'idle', label: '' };
+    let kind = previous.kind || 'idle';
+    let label = previous.label || '';
+    if (state === 'paused' || ['complete', 'cancelled'].includes(state)) {
+      kind = 'idle';
+      label = goal.label || '';
+    } else if (state === 'failed') {
+      kind = 'failed';
+      label = goal.label || 'Goal failed';
+    } else if (state === 'blocked') {
+      kind = 'blocked';
+      label = goal.label || 'Goal blocked';
+    } else if (state === 'usagelimited') {
+      kind = 'usage_limited';
+      label = goal.label || 'Goal usage limited';
+    } else if (state === 'budgetlimited') {
+      kind = 'budget_limited';
+      label = goal.label || 'Goal budget limited';
+    }
+    return { ...previous, kind, label, goal, updated_at: observedAt };
+  }
+
+  async _auditCodexCliGoalController(sessionId, session, { force = false, nowMs = Date.now() } = {}) {
+    if (!sessionId || !session || session.agentType !== 'codex_cli' || !session.cliSessionId) return false;
+    if (this.sessions?.get(sessionId) !== session) return false;
+    const owned = !!(session._codexCliChild || session._codexAppServerTurn);
+    if (!owned && session.codexCliExternalActive !== true) return false;
+    if (!this._codexCliGoalMonitorInFlight) this._codexCliGoalMonitorInFlight = new Map();
+    if (this._codexCliGoalMonitorInFlight.has(sessionId)) {
+      return this._codexCliGoalMonitorInFlight.get(sessionId);
+    }
+    const intervalMs = Number(this.CODEX_CLI_GOAL_MONITOR_INTERVAL_MS || 750);
+    if (!force && session._lastCodexCliGoalMonitorAtMs
+        && nowMs - session._lastCodexCliGoalMonitorAtMs < intervalMs) return false;
+    session._lastCodexCliGoalMonitorAtMs = nowMs;
+
+    const audit = (async () => {
+      const ownerProbe = this._codexCliGoalMonitorOwnerProbe
+        || ((cliSessionId, options) => codexCli.codexCliSessionOwnerStateAsync(cliSessionId, options));
+      const ownerPromise = owned
+        ? Promise.resolve({ state: 'confirmed', checked_at_ms: Date.now() })
+        : Promise.resolve().then(() => ownerProbe(session.cliSessionId, { cacheMs: 500 }));
+      const goalPromise = Promise.resolve()
+        .then(() => this._ensureCodexCliGoalMonitorConnection())
+        .then(connection => connection.getGoal(session.cliSessionId));
+      const [ownerSettled, goalSettled] = await Promise.allSettled([ownerPromise, goalPromise]);
+      const owner = ownerSettled.status === 'fulfilled'
+        ? ownerSettled.value
+        : { state: 'unknown', checked_at_ms: Date.now() };
+      if (this.sessions?.get(sessionId) !== session) return false;
+      if (owner?.state !== 'confirmed') {
+        if (session.activity?.goal) {
+          const ownerState = owner?.state === 'missing'
+            ? this._codexCliGoalRunOwnerState(session)
+            : 'ambiguous';
+          return this._setCodexCliActivity(sessionId, session, session.activity, {
+            source: 'codex_cli_goal_controller',
+            goalSource: 'codex_cli_goal_controller',
+            observedAt: new Date().toISOString(),
+            evidenceType: ownerState === 'gone' ? 'confirmed_owner_gone' : 'owner_reconnect_audit',
+            ownerState,
+            liveLeaseProof: false,
+          });
+        }
+        return false;
+      }
+
+      if (goalSettled.status === 'rejected') {
+        const error = goalSettled.reason;
+        if (session.activity?.goal && session.activity?.goal_run?.lease_active === true) {
+          this._setCodexCliActivity(sessionId, session, session.activity, {
+            source: 'codex_cli_goal_controller',
+            goalSource: 'codex_cli_goal_controller',
+            observedAt: new Date().toISOString(),
+            evidenceType: 'goal_controller_query_failed',
+            ownerState: 'ambiguous',
+            liveLeaseProof: false,
+          });
+        }
+        const logNow = Date.now();
+        if (!session._lastCodexCliGoalMonitorErrorAtMs
+            || logNow - session._lastCodexCliGoalMonitorErrorAtMs >= 30000) {
+          session._lastCodexCliGoalMonitorErrorAtMs = logNow;
+          this._log('warn', `[goal-run] controller query failed harness=codex_cli code=${error?.code || error?.name || 'unknown'}`);
+        }
+        return false;
+      }
+      const result = goalSettled.value;
+      if (this.sessions?.get(sessionId) !== session) return false;
+      const observedAt = new Date().toISOString();
+      const nativeGoal = result?.goal || null;
+      if (!nativeGoal) {
+        if (!session.activity?.goal || session.activity?.goal_run?.lease_active !== true) return false;
+        return this._setCodexCliActivity(sessionId, session, session.activity, {
+          source: 'codex_cli_goal_controller',
+          goalSource: 'codex_cli_goal_controller',
+          observedAt,
+          evidenceType: 'goal_controller_absent',
+          ownerState: 'confirmed',
+          controllerGoalAbsent: true,
+          liveLeaseProof: false,
+        });
+      }
+      const goal = this._canonicalCodexCliControllerGoal(sessionId, session, nativeGoal, observedAt);
+      if (!goal) return false;
+      const activity = this._codexCliGoalControllerActivity(session, goal, observedAt);
+      return this._setCodexCliActivity(sessionId, session, activity, {
+        source: 'codex_cli_goal_controller',
+        goalSource: 'codex_cli_goal_controller',
+        sourceCursor: goal.native_cursor || null,
+        nativeEventAt: goal.native_updated_at || observedAt,
+        observedAt,
+        evidenceType: 'native_goal_controller',
+        ownerState: 'confirmed',
+        liveLeaseProof: goal.state === 'active',
+      });
+    })();
+    this._codexCliGoalMonitorInFlight.set(sessionId, audit);
+    try {
+      return await audit;
+    } finally {
+      if (this._codexCliGoalMonitorInFlight.get(sessionId) === audit) {
+        this._codexCliGoalMonitorInFlight.delete(sessionId);
+      }
+    }
+  }
+
+  _scheduleCodexCliGoalControllerAudit(sessionId, session) {
+    this._auditCodexCliGoalController(sessionId, session).catch(error => {
+      this._log('warn', `[goal-run] controller audit failed harness=codex_cli code=${error?.code || error?.name || 'unknown'}`);
+    });
+  }
+
+  _applyGoalRunLifecycle(sessionId, session, activity, context = {}) {
+    if (!activity?.goal || typeof activity.goal !== 'object') return activity;
+    const previousRun = session?._goalRunLifecycle || session?.activity?.goal_run || null;
+    const activityKind = String(activity.kind || '').trim().toLowerCase();
+    const goalState = String(activity.goal.state || activity.goal.status || '').trim().toLowerCase();
+    const ownerAuditRelevant = goalState === 'active'
+      && !['waiting_for_user', 'needs_attention', 'blocked', 'rate_limited', 'usage_limited', 'budget_limited', 'failed', 'error'].includes(activityKind);
+    const ownerState = context.ownerState || (
+      session?.agentType === 'codex_cli' && ownerAuditRelevant
+        ? this._codexCliGoalRunOwnerState(session)
+        : (context.liveLeaseProof === true ? 'confirmed' : 'ambiguous')
+    );
+    const activeOwnedTurn = !!(session?._codexCliChild
+      || (session?._codexAppServerTurn && session._codexAppServerTurnCompleted !== true));
+    const run = reduceGoalRunLifecycle(previousRun, {
+      session_key: session?.cliSessionId || session?.codexDesktopThreadId || session?.activeThreadId || sessionId,
+      goal: activity.goal,
+      activity_kind: activity.kind,
+      task_started_turn_id: context.taskStartedTurnId || null,
+      task_completed_turn_id: context.taskCompletedTurnId || null,
+      source: context.source || activity.goal.source || (
+        session?.agentType === 'codex_cli' ? 'codex_cli_jsonl' : `${session?.agentType || 'codex'}_dom`
+      ),
+      source_cursor: context.sourceCursor || activity.goal.native_cursor || null,
+      native_event_at: context.nativeEventAt || activity.goal.native_updated_at || activity.updated_at || null,
+      observed_at: context.observedAt || new Date().toISOString(),
+      evidence_type: context.evidenceType || (activeOwnedTurn ? 'owned_turn' : 'activity_observation'),
+      live_lease_proof: context.liveLeaseProof === true || activeOwnedTurn,
+      owner_state: ownerState,
+      explicit_stop: context.explicitStop === true || session?._codexCliInterrupted === true,
+      controller_goal_absent: context.controllerGoalAbsent === true,
+      confirmed_disconnect: context.confirmedDisconnect === true || ownerState === 'gone',
+    });
+    if (!run) return activity;
+    const priorSeq = Number(previousRun?.transition_seq || 0);
+    const priorLifecycle = previousRun?.lifecycle || 'none';
+    session._goalRunLifecycle = run;
+    if (run.transition_seq !== priorSeq || run.lifecycle !== priorLifecycle) {
+      const sessionHash = crypto.createHash('sha256').update(String(sessionId || '')).digest('hex').slice(0, 12);
+      this._log('info', `[goal-run] session=${sessionHash} harness=${session?.agentType || 'unknown'} goal=${String(run.goal_fingerprint || '').slice(0, 12)} generation=${run.goal_generation || 0} ${priorLifecycle}->${run.lifecycle} seq=${run.transition_seq} source_seq=${run.source_sequence || 0} owner=${run.owner_state} evidence=${run.evidence_type}`);
+    }
+    let label = activity.label || '';
+    if (run.lease_active === true) {
+      if (run.lifecycle === 'checkpoint_pending_continuation') label = 'Waiting for next goal turn';
+      else if (run.lifecycle === 'verifying') label = 'Reconnecting';
+      else if (run.lifecycle === 'starting') label = 'Starting goal';
+      else if (run.lifecycle === 'running_turn' && !label) label = 'Working';
+    }
+    return { ...activity, label, goal_run: run };
+  }
+
+  _codexCliGoalRunContext(summary, {
+    liveObserved = false,
+    evidenceType = '',
+    ownerState = '',
+  } = {}) {
+    const cursor = summary?.sourceCursor || null;
+    const currentAppend = cursor?.mode === 'append' && Number(cursor?.events_read || 0) > 0;
+    const completedCheckpoint = !!summary?.taskCompletedTurnId
+      && summary.taskCompletedTurnId === summary.taskStartedTurnId;
+    return {
+      taskStartedTurnId: summary?.taskStartedTurnId || null,
+      taskCompletedTurnId: summary?.taskCompletedTurnId || null,
+      source: 'codex_cli_jsonl',
+      sourceCursor: cursor,
+      nativeEventAt: completedCheckpoint
+        ? summary?.taskCompletedAt || summary?.activity?.updated_at || summary?.updatedAt || null
+        : summary?.taskStartedAt || summary?.activity?.updated_at || summary?.updatedAt || null,
+      observedAt: new Date().toISOString(),
+      evidenceType: evidenceType || (completedCheckpoint ? 'task_complete' : (currentAppend ? 'current_generation_event' : 'summary_snapshot')),
+      liveLeaseProof: liveObserved === true && currentAppend,
+      ...(ownerState ? { ownerState } : {}),
+    };
+  }
+
+  _setCodexCliActivity(sessionId, session, activity, lifecycleContext = {}) {
     const sourceActivity = activity || { kind: 'idle', label: '', updated_at: new Date().toISOString() };
-    const preserveOwnedQuestion = session._codexAppServerTurn
+    const terminalCompletedAtMs = Number(session._codexAppServerTerminalCompletedAtMs || 0);
+    const sourceUpdatedAtMs = Date.parse(sourceActivity.updated_at || sourceActivity.started_at || '');
+    const staleAfterOwnedTerminal = terminalCompletedAtMs > 0
+      && ['thinking', 'generating', 'working', 'running_command', 'applying_patch', 'reading_files', 'waiting_for_user']
+        .includes(String(sourceActivity.kind || '').toLowerCase())
+      && (!Number.isFinite(sourceUpdatedAtMs) || sourceUpdatedAtMs <= terminalCompletedAtMs)
+      && session.activity?.kind === 'idle';
+    const activeQuestion = this.activeQuestionPromptAdapters.get(sessionId);
+    const sourceGoalDecisionIdentity = this._codexCliGoalDecisionIdentity(
+      sessionId,
+      session,
+      sourceActivity.goal,
+    );
+    const preserveGoalDecision = activeQuestion?.adapter_surface === 'codex_cli_goal_decision'
+      && session.activity?.kind === 'waiting_for_user'
+      && session.codexCliExternalActive === true
+      && sourceGoalDecisionIdentity?.key === activeQuestion.goal_identity?.key;
+    const preserveOwnedQuestion = (session._codexAppServerTurn
       && session._codexAppServerTurnCompleted !== true
-      && this.activeQuestionPromptAdapters.has(sessionId)
-      && session.activity?.kind === 'waiting_for_user';
+      && activeQuestion
+      && session.activity?.kind === 'waiting_for_user')
+      || preserveGoalDecision;
     const preserveOwnedTurn = session._codexAppServerTurn
       && session._codexAppServerTurnCompleted !== true
       && sourceActivity.kind === 'idle'
       && ['generating', 'waiting_for_user'].includes(session.activity?.kind);
-    const incomingActivity = preserveOwnedQuestion || preserveOwnedTurn
+    const incomingActivity = preserveOwnedQuestion || preserveOwnedTurn || staleAfterOwnedTerminal
       ? session.activity
       : sourceActivity;
     const canonicalGoal = this._canonicalGoalForSession(
       sessionId,
       session,
       incomingActivity.goal,
-      'codex_cli_jsonl',
+      lifecycleContext.goalSource || lifecycleContext.source || 'codex_cli_jsonl',
     );
-    const observedActivity = canonicalGoal
+    const canonicalActivity = canonicalGoal
       ? { ...incomingActivity, goal: canonicalGoal }
       : incomingActivity;
+    const observedActivity = this._applyGoalRunLifecycle(
+      sessionId,
+      session,
+      canonicalActivity,
+      lifecycleContext,
+    );
     const nextActivity = session._codexCliInterrupted === true && observedActivity.kind !== 'idle'
       ? {
         kind: 'idle',
         label: 'Interrupted',
         updated_at: session.activity?.updated_at || new Date().toISOString(),
         ...(canonicalGoal ? { goal: canonicalGoal } : {}),
+        ...(observedActivity.goal_run ? { goal_run: observedActivity.goal_run } : {}),
       }
       : observedActivity;
     const prevSig = this._activitySemanticSignature(session.activity || null);
     const nextSig = this._activitySemanticSignature(nextActivity);
-    if (prevSig === nextSig) return false;
-    session.activity = nextActivity;
-    if (nextActivity.thinkingContent) session.thinkingContent = nextActivity.thinkingContent;
-    else session.thinkingContent = '';
-    sessionStore.updateSession(sessionId, { activity: nextActivity });
-    this._sendToRelay(proto.proxyStatus(sessionId, session.status || 'healthy', nextActivity));
+    const changed = prevSig !== nextSig;
+    const previousSourceSequence = Number(session.activity?.goal_run?.source_sequence || 0);
+    const nextSourceSequence = Number(nextActivity.goal_run?.source_sequence || 0);
+    if (changed) {
+      session.activity = nextActivity;
+      if (nextActivity.thinkingContent) session.thinkingContent = nextActivity.thinkingContent;
+      else session.thinkingContent = '';
+      sessionStore.updateSession(sessionId, { activity: nextActivity });
+      this._sendToRelay(proto.proxyStatus(sessionId, session.status || 'healthy', nextActivity));
+    } else if (nextSourceSequence > previousSourceSequence) {
+      // Persist replay protection without producing a cosmetic status frame.
+      session.activity = nextActivity;
+      sessionStore.updateSession(sessionId, { activity: nextActivity });
+    }
+    const promptChanged = this._syncCodexCliGoalDecisionPrompt(sessionId, session, nextActivity);
+    if (this._running === true) this._scheduleCodexCliGoalControllerAudit(sessionId, session);
+    return changed || promptChanged;
+  }
+
+  _codexCliGoalDecisionIdentity(sessionId, session, goal = session?.activity?.goal) {
+    const threadId = String(session?.cliSessionId || '').trim();
+    if (!sessionId || !threadId || !goal || goal.state !== 'paused') return null;
+    const objectiveHash = String(goal.objective_hash || crypto.createHash('sha256')
+      .update(String(goal.objective || goal.text || ''), 'utf8')
+      .digest('hex'));
+    const stable = {
+      session_id: sessionId,
+      thread_id: threadId,
+      fingerprint: String(goal.fingerprint || ''),
+      generation: Math.max(1, Number(goal.generation) || 1),
+      transition_id: String(goal.transition_id || ''),
+      objective_hash: objectiveHash,
+      objective: String(goal.objective || goal.text || ''),
+    };
+    return {
+      ...stable,
+      key: crypto.createHash('sha256').update(JSON.stringify(stable)).digest('hex'),
+    };
+  }
+
+  _syncCodexCliGoalDecisionPrompt(sessionId, session, activity = session?.activity) {
+    if (!session || session.agentType !== 'codex_cli') return false;
+    const existing = this.activeQuestionPromptAdapters.get(sessionId);
+    const existingGoalDecision = existing?.adapter_surface === 'codex_cli_goal_decision';
+    const identity = this._codexCliGoalDecisionIdentity(sessionId, session, activity?.goal);
+    if (!identity || activity?.kind !== 'idle' || session.codexCliExternalActive !== true
+        || session._codexAppServerTurn || session._codexCliChild) {
+      if (existingGoalDecision && !existing.claimed) {
+        this._clearQuestionPromptAdapter(sessionId, 'expired', { error_code: 'native_goal_changed' });
+        session.waitingForAssistant = false;
+      }
+      return false;
+    }
+    if (session._codexCliGoalDecisionDismissedIdentity === identity.key) return false;
+    if (existing) {
+      return existingGoalDecision && existing.goal_identity?.key === identity.key;
+    }
+
+    const prompt = canonicalQuestionPrompt({
+      prompt_id: crypto.randomUUID(),
+      session_id: sessionId,
+      generation: crypto.createHash('sha256')
+        .update(`goal_resume_decision\0${identity.key}\0${crypto.randomUUID()}`)
+        .digest('hex'),
+      kind: 'goal_resume_decision',
+      source: {
+        surface: 'codex_cli',
+        version: String(codexCli.CODEX_CLI_CATALOG.client_version || 'app-server-goal-v1'),
+      },
+      title: 'Goal paused',
+      questions: [{
+        id: 'goal_resume_decision',
+        header: 'Goal',
+        message: 'Resume paused goal?',
+        options: [
+          {
+            id: 'resume',
+            label: 'Resume goal',
+            description: 'Mark it active and continue when idle',
+          },
+          {
+            id: 'leave_paused',
+            label: 'Leave paused',
+            description: 'Keep it paused; use /goal resume later',
+          },
+        ],
+      }],
+      observed_at: new Date().toISOString(),
+      cancel_supported: false,
+    });
+    this._registerQuestionPromptAdapter(sessionId, prompt, response => (
+      this._answerCodexCliGoalDecision(sessionId, session, prompt, identity, response)
+    ), {
+      adapter_surface: 'codex_cli_goal_decision',
+      goal_identity: identity,
+    });
+    session.waitingForAssistant = true;
+    const attention = {
+      kind: 'waiting_for_user',
+      label: 'Goal decision required',
+      updated_at: new Date().toISOString(),
+      goal: activity.goal,
+    };
+    session.activity = attention;
+    sessionStore.updateSession(sessionId, { activity: attention });
+    this._sendToRelay(proto.proxyStatus(sessionId, session.status || 'healthy', attention));
+    return true;
+  }
+
+  async _answerCodexCliGoalDecision(sessionId, session, prompt, identity, rawResponse) {
+    if (this.sessions.get(sessionId) !== session) {
+      throw Object.assign(new Error('The Codex CLI session changed before the goal decision arrived'), {
+        code: 'goal_session_changed',
+        native_attempted: false,
+      });
+    }
+    const currentIdentity = this._codexCliGoalDecisionIdentity(sessionId, session, session.activity?.goal);
+    if (!currentIdentity || currentIdentity.key !== identity.key) {
+      throw Object.assign(new Error('The native Codex goal changed before the decision arrived'), {
+        code: 'stale_goal_generation',
+        native_attempted: false,
+      });
+    }
+    const response = canonicalQuestionResponse(prompt, rawResponse);
+    const decision = response.answers[0]?.choice_ids?.[0];
+    if (!['resume', 'leave_paused'].includes(decision)) {
+      throw Object.assign(new Error('The goal decision is not supported'), {
+        code: 'invalid_goal_decision',
+        native_attempted: false,
+      });
+    }
+    const factory = this._codexCliGoalDecisionConnectionFactory
+      || (options => new CodexAppServerConnection(options));
+    const connection = factory({
+      sessionId,
+      cwd: session.workspace_path || process.cwd(),
+      clientName: 'remote-agent-chat-goal-control',
+      clientVersion: '1.0.0',
+      requestTimeoutMs: Math.max(1000, Number(process.env.CODEX_CLI_APP_SERVER_TIMEOUT_MS) || 120000),
+    });
+    try {
+      const started = await connection.start();
+      const before = (await connection.getGoal(identity.thread_id))?.goal;
+      if (!before || before.status !== 'paused') {
+        throw Object.assign(new Error('The authoritative Codex goal is no longer paused'), {
+          code: 'native_goal_changed',
+        });
+      }
+      if (String(before.objective || '') !== identity.objective) {
+        throw Object.assign(new Error('The authoritative Codex goal objective changed'), {
+          code: 'native_goal_changed',
+        });
+      }
+      const result = await connection.resolveGoalDecision(identity.thread_id, decision);
+      const expectedStatus = decision === 'resume' ? 'active' : 'paused';
+      if (result?.native_acknowledged !== true
+          || result?.native_operations !== 1
+          || result?.transcript_messages_appended !== 0
+          || result?.after?.status !== expectedStatus) {
+        throw Object.assign(new Error('Codex did not return the exact goal-decision receipt'), {
+          code: 'goal_decision_not_acknowledged',
+        });
+      }
+      session._codexCliGoalDecisionDismissedIdentity = decision === 'leave_paused' ? identity.key : null;
+      const goal = this._canonicalGoalForSession(sessionId, session, {
+        ...result.after,
+        raw_state: result.after.status,
+      }, 'codex_cli_app_server');
+      const activity = {
+        kind: 'idle',
+        label: '',
+        updated_at: new Date().toISOString(),
+        ...(goal ? { goal } : {}),
+      };
+      session.waitingForAssistant = false;
+      this._setCodexCliActivity(sessionId, session, activity, {
+        source: 'codex_cli_app_server',
+        nativeEventAt: activity.updated_at,
+        observedAt: activity.updated_at,
+        evidenceType: 'native_goal_controller_receipt',
+        liveLeaseProof: decision === 'resume',
+        ownerState: decision === 'resume' ? 'confirmed' : 'ambiguous',
+      });
+      sessionStore.updateSession(sessionId, {
+        codex_cli_goal_decision_dismissed_identity: session._codexCliGoalDecisionDismissedIdentity,
+      });
+      return {
+        ok: true,
+        native_acknowledged: true,
+        lifecycle: 'answered',
+        native_receipt: {
+          transport: 'codex_app_server',
+          method: 'thread/goal/set',
+          codex_cli_version: started.version || null,
+          thread_id: identity.thread_id,
+          decision,
+          before_status: result.before.status,
+          after_status: result.after.status,
+          native_operations: result.native_operations,
+          transcript_messages_appended: result.transcript_messages_appended,
+          observed_at: new Date().toISOString(),
+        },
+      };
+    } finally {
+      await connection.stop();
+    }
+  }
+
+  _observeCodexCliOwnedTurnCompletion(sessionId, session, summary) {
+    const turn = session?._codexAppServerTurn;
+    const identity = session?._codexAppServerTurnIdentity;
+    const lastIdentity = session?._codexAppServerLastTurnIdentity;
+    const pendingReceipt = session?._codexCliPendingReceipt?.native_receipt;
+    const completedTurnId = String(summary?.taskCompletedTurnId || '').trim();
+    if (!completedTurnId) return false;
+    const ownedTurnId = String(identity?.turn_id || turn?.turnId || lastIdentity?.turn_id || pendingReceipt?.turn_id || '').trim();
+    const ownedThreadId = String(identity?.thread_id || turn?.threadId || lastIdentity?.thread_id || pendingReceipt?.thread_id || session?.cliSessionId || '').trim();
+    if (!ownedTurnId) return false;
+    const summaryThreadId = String(summary?.cliSessionId || '').trim();
+    const exactTurn = !!ownedTurnId && completedTurnId === ownedTurnId;
+    const exactThread = !summaryThreadId || (!!ownedThreadId && summaryThreadId === ownedThreadId);
+    const alreadyReconciled = session?._codexAppServerTerminalReconciledTurnId === completedTurnId;
+    if (exactTurn && exactThread && alreadyReconciled && !turn && session.activity?.kind === 'idle') {
+      return true;
+    }
+    this._log(
+      'info',
+      `[codex-cli] terminal JSONL observed for ${sessionId} `
+        + `summary=${summaryThreadId || 'unknown'}/${completedTurnId} `
+        + `owned=${ownedThreadId || 'unknown'}/${ownedTurnId || 'unknown'} `
+        + `live_turn=${!!turn} match=${exactThread && exactTurn}`,
+    );
+    if (!exactTurn || !exactThread) return false;
+    session._codexAppServerTerminalReconciledTurnId = completedTurnId;
+    const completedAtMs = Date.parse(summary.taskCompletedAt || '');
+    session._codexAppServerTerminalCompletedAtMs = Number.isFinite(completedAtMs)
+      ? Math.max(Number(session._codexAppServerTerminalCompletedAtMs || 0), completedAtMs)
+      : Date.now();
+    if (turn) {
+      turn.emit('turn_completed', {
+        thread_id: ownedThreadId,
+        turn_id: ownedTurnId,
+        status: 'completed',
+        source: 'codex_cli_jsonl',
+        completed_at: summary.taskCompletedAt || null,
+      });
+    } else {
+      session.waitingForAssistant = false;
+      this._closeCodexCliMessageDelta(session, sessionId);
+      const terminalActivity = {
+        kind: 'idle',
+        label: '',
+        updated_at: summary.taskCompletedAt || new Date().toISOString(),
+      };
+      const changed = this._setCodexCliActivity(sessionId, session, terminalActivity);
+      if (!changed) {
+        // Activity is intentionally excluded from full session-list snapshot
+        // signatures. Re-emit the authoritative terminal status when another
+        // app-server path already changed memory to idle but its cleanup is
+        // still pending or the client missed that earlier frame.
+        this._sendToRelay(proto.proxyStatus(
+          sessionId,
+          session.status || 'healthy',
+          session.activity || terminalActivity,
+        ));
+      }
+    }
     return true;
   }
 
@@ -10228,13 +11379,18 @@ class ProxyEngine extends EventEmitter {
     return cfg;
   }
 
-  _buildCodexCliSessionFromSummary(sessionMeta, summary) {
+  _buildCodexCliSessionFromSummary(sessionMeta, summary, { rehydrateGoalRun = false } = {}) {
     const now = new Date().toISOString();
     const interrupted = sessionMeta.codex_cli_interrupted === true;
     const observedModelId = summary.model_observation ? (summary.model_id || 'unknown') : 'unknown';
     const observedEffort = summary.effort_observation ? (summary.effort || 'unknown') : 'unknown';
     const legacyNextModel = sessionMeta.codex_cli_model_configured === true ? sessionMeta.model_id : null;
     const legacyNextEffort = sessionMeta.codex_cli_effort_configured === true ? sessionMeta.effort : null;
+    const persistedGoalRun = rehydrateGoalRun === true
+      && sessionMeta.activity?.goal_run
+      && typeof sessionMeta.activity.goal_run === 'object'
+      ? sessionMeta.activity.goal_run
+      : null;
     return {
       session_id: sessionMeta.session_id,
       display_name: sessionMeta.display_name || 'Codex CLI',
@@ -10255,7 +11411,10 @@ class ProxyEngine extends EventEmitter {
       status: 'healthy',
       activity: interrupted
         ? { kind: 'idle', label: 'Interrupted', updated_at: sessionMeta.activity?.updated_at || now }
-        : (summary.activity || { kind: 'idle', label: '', updated_at: summary.updatedAt || now }),
+        : {
+            ...(summary.activity || { kind: 'idle', label: '', updated_at: summary.updatedAt || now }),
+            ...(persistedGoalRun ? { goal_run: persistedGoalRun } : {}),
+          },
       last_seen_at: summary.updatedAt || now,
       windowTitle: sessionMeta.window_title || summary.workspaceName || 'Codex CLI',
       agentType: 'codex_cli',
@@ -10296,6 +11455,9 @@ class ProxyEngine extends EventEmitter {
       ),
       _codexCliInterrupted: interrupted,
       _codexCliPendingReceipt: sessionMeta.codex_cli_pending_receipt || null,
+      _codexCliGoalDecisionDismissedIdentity:
+        sessionMeta.codex_cli_goal_decision_dismissed_identity || null,
+      _goalRunLifecycle: persistedGoalRun,
     };
   }
 
@@ -10532,7 +11694,13 @@ class ProxyEngine extends EventEmitter {
     });
   }
 
-  _registerCodexCliSession(summary, { sendInitialHistory = true, archiveDiscovered = false, externalActive = null } = {}) {
+  _registerCodexCliSession(summary, {
+    sendInitialHistory = true,
+    archiveDiscovered = false,
+    externalActive = null,
+    liveObserved = false,
+    evidenceType = '',
+  } = {}) {
     if (!summary?.cliSessionId) return null;
     const displayName = 'Codex CLI';
     const norm = p => String(p || '').replace(/\\/g, '/').replace(/\/+$/, '').toLowerCase();
@@ -10563,8 +11731,13 @@ class ProxyEngine extends EventEmitter {
         'codex_cli'
       );
       if (migratedMeta?.target_signature) existing.target_signature = migratedMeta.target_signature;
+      const ownedTurnCompleted = this._observeCodexCliOwnedTurnCompletion(sessionId, existing, summary);
+      const lifecycleContext = this._codexCliGoalRunContext(summary, { liveObserved, evidenceType });
       this._setCodexCliActivity(sessionId, existing,
-        summary.activity || { kind: 'idle', label: '', updated_at: summary.updatedAt || new Date().toISOString() });
+        ownedTurnCompleted && summary.activity?.kind !== 'idle'
+          ? { ...summary.activity, kind: 'idle', label: '', updated_at: summary.taskCompletedAt || summary.updatedAt || new Date().toISOString() }
+          : (summary.activity || { kind: 'idle', label: '', updated_at: summary.updatedAt || new Date().toISOString() }),
+        lifecycleContext);
       sessionStore.updateSession(sessionId, {
         cli_session_id: existing.cliSessionId,
         codex_cli_file_path: existing.codexCliFilePath || null,
@@ -10645,8 +11818,13 @@ class ProxyEngine extends EventEmitter {
       existing.codexCliArchiveDiscovered = archiveDiscovered === true;
       existing.codexCliExternalActive = externalActiveFlag;
       existing.cliSessionId = summary.cliSessionId;
+      const ownedTurnCompleted = this._observeCodexCliOwnedTurnCompletion(sessionId, existing, summary);
+      const lifecycleContext = this._codexCliGoalRunContext(summary, { liveObserved, evidenceType });
       this._setCodexCliActivity(sessionId, existing,
-        summary.activity || { kind: 'idle', label: '', updated_at: summary.updatedAt || new Date().toISOString() });
+        ownedTurnCompleted && summary.activity?.kind !== 'idle'
+          ? { ...summary.activity, kind: 'idle', label: '', updated_at: summary.taskCompletedAt || summary.updatedAt || new Date().toISOString() }
+          : (summary.activity || { kind: 'idle', label: '', updated_at: summary.updatedAt || new Date().toISOString() }),
+        lifecycleContext);
       if (metaChanged) this._publishCodexCliConfig(sessionId, existing);
       if (metaChanged || dedupedAliases) this._broadcastSessionSnapshot();
       this._recoverCodexCliPendingReceipt(sessionId, existing, summary);
@@ -10670,8 +11848,22 @@ class ProxyEngine extends EventEmitter {
       }
       return existing;
     }
-    const session = this._buildCodexCliSessionFromSummary(sessionMeta, summary);
+    const ownerProbe = externalActive === true
+      ? codexCli.codexCliSessionOwnerState(summary.cliSessionId, { cacheMs: 750 })
+      : { state: 'unknown' };
+    const rehydrateGoalRun = externalActive === true && ownerProbe.state === 'confirmed';
+    const session = this._buildCodexCliSessionFromSummary(sessionMeta, summary, { rehydrateGoalRun });
     this.sessions.set(sessionId, session);
+    this._setCodexCliActivity(
+      sessionId,
+      session,
+      summary.activity || { kind: 'idle', label: '', updated_at: summary.updatedAt || new Date().toISOString() },
+      this._codexCliGoalRunContext(summary, {
+        liveObserved,
+        evidenceType,
+        ownerState: ownerProbe.state === 'confirmed' ? 'confirmed' : '',
+      }),
+    );
     this._log('info', `[codex-cli] registered ${sessionId} cli=${summary.cliSessionId} (${summary.messageCount} msgs)`);
     if (sendInitialHistory) {
       const initialMessages = summary.messages?.length
@@ -10684,6 +11876,7 @@ class ProxyEngine extends EventEmitter {
       }
     }
     this._publishCodexCliConfig(sessionId, session);
+    this._syncCodexCliGoalDecisionPrompt(sessionId, session, session.activity);
     this._recoverCodexCliPendingReceipt(sessionId, session, summary);
     if (dedupedAliases) this._broadcastSessionSnapshot();
     return session;
@@ -10836,17 +12029,23 @@ class ProxyEngine extends EventEmitter {
     const scanLimit = limit > 0 ? Math.max(limit * 4, 80) : 0;
     const includeMessages = process.env.CODEX_CLI_HYDRATE_ARCHIVES === 'true';
     const nowMs = Date.now();
-    const summaries = codexCli
+    const archiveSummaries = codexCli
       .discoverSessions(scanLimit, { includeMessages })
-      .filter(summary => this._codexCliArchiveSummaryVisible(summary, nowMs))
-      .slice(0, limit > 0 ? limit : undefined);
+      .filter(summary => this._codexCliArchiveSummaryVisible(summary, nowMs));
+    const {
+      externalActiveIds,
+      summaries,
+    } = mergeCodexCliArchiveDiscoverySummaries(
+      this._codexCliExternalActiveSummaries(),
+      archiveSummaries,
+      limit,
+    );
     const visibleCliIds = new Set(summaries.map(summary => summary.cliSessionId).filter(Boolean));
     let changed = false;
     for (const sess of sessionStore.getAllSessions()) {
       if (sess.agent_type !== 'codex_cli') continue;
       if (sess.status !== 'healthy') continue;
       if (sess.codex_cli_archive_discovered !== true) continue;
-      if (sess.codex_cli_external_active === true) continue;
       if (sess.cli_session_id && visibleCliIds.has(sess.cli_session_id)) continue;
       sessionStore.markDisconnected(sess.session_id);
       changed = true;
@@ -10854,14 +12053,17 @@ class ProxyEngine extends EventEmitter {
     for (const [sessionId, session] of this.sessions.entries()) {
       if (session.agentType !== 'codex_cli') continue;
       if (session.codexCliArchiveDiscovered !== true) continue;
-      if (session.codexCliExternalActive === true) continue;
       if (session.cliSessionId && visibleCliIds.has(session.cliSessionId)) continue;
       this.sessions.delete(sessionId);
       changed = true;
     }
     for (const summary of summaries) {
       const before = this.sessions.size;
-      this._registerCodexCliSession(summary, { archiveDiscovered: true, sendInitialHistory: summary.messagesHydrated === true });
+      this._registerCodexCliSession(summary, {
+        archiveDiscovered: true,
+        externalActive: externalActiveIds.has(summary.cliSessionId),
+        sendInitialHistory: summary.messagesHydrated === true,
+      });
       if (this.sessions.size !== before) changed = true;
     }
     if (changed) this._broadcastSessionSnapshot();
@@ -10888,6 +12090,8 @@ class ProxyEngine extends EventEmitter {
     }
     const watcher = codexCli.watchSessions({
       summaryOptions: this._codexCliActiveSummaryOptions(),
+      deferMs: this.VSCODE_CODEX_QUESTION_ACTIVE_POLL_INTERVAL_MS,
+      shouldDefer: () => this._hasLatencySensitiveQuestionWindow(),
       onSummary: summary => {
         if (!this._running || !summary?.cliSessionId) return;
         this._reconcileCodexVsCodeQuestionReceiptForCliSession(summary.cliSessionId);
@@ -10897,9 +12101,13 @@ class ProxyEngine extends EventEmitter {
         );
         if (!archiveDiscovery && !existing) return;
         const before = this.sessions.size;
+        const liveObserved = summary.sourceCursor?.mode === 'append'
+          && Number(summary.sourceCursor?.events_read || 0) > 0;
         const session = this._registerCodexCliSession(summary, {
           archiveDiscovered: archiveDiscovery,
           externalActive: existing?.codexCliExternalActive === true,
+          liveObserved,
+          evidenceType: liveObserved ? 'watch_append' : 'watch_snapshot',
         });
         if (session) {
           const changed = this.sessions.size !== before;
@@ -11114,6 +12322,9 @@ class ProxyEngine extends EventEmitter {
     });
     session._codexAppServerTurn = turn;
     session._codexAppServerTurnCompleted = false;
+    session._codexAppServerLastTurnIdentity = null;
+    session._codexAppServerTerminalReconciledTurnId = null;
+    session._codexAppServerTerminalCompletedAtMs = 0;
     const releaseTurn = async ({ failed = false, detail = null } = {}) => {
       if (session._codexAppServerTurn !== turn) return;
       session._codexAppServerTurn = null;
@@ -11167,6 +12378,10 @@ class ProxyEngine extends EventEmitter {
     turn.on('turn_completed', completion => {
       if (this.sessions.get(sessionId) !== session || session._codexAppServerTurn !== turn) return;
       session._codexAppServerTurnCompleted = true;
+      const completedAtMs = Date.parse(completion.completed_at || '');
+      session._codexAppServerTerminalCompletedAtMs = Number.isFinite(completedAtMs)
+        ? Math.max(Number(session._codexAppServerTerminalCompletedAtMs || 0), completedAtMs)
+        : Date.now();
       session.waitingForAssistant = false;
       this._closeCodexCliMessageDelta(session, sessionId);
       this._setCodexCliActivity(sessionId, session, {
@@ -11209,6 +12424,7 @@ class ProxyEngine extends EventEmitter {
         turn_id: started.turn_id,
         process_epoch: processEpoch,
       };
+      session._codexAppServerLastTurnIdentity = { ...session._codexAppServerTurnIdentity };
       receiptBaseline.cli_session_id = started.thread_id;
       if (started.thread_path) receiptBaseline.file_path = started.thread_path;
       session._codexCliPendingReceipt = {
@@ -12263,6 +13479,8 @@ class ProxyEngine extends EventEmitter {
     }
     let messages = [];
     let summaryActivity = null;
+    let ownedTurnCompleted = false;
+    let ownedTurnCompletedAt = null;
     let summaryPartial = false;
     let summaryCursor = null;
     let transcriptMaybeChanged = !session.cursorCliFilePath;
@@ -12330,6 +13548,9 @@ class ProxyEngine extends EventEmitter {
 
   async _pollSessionCodexCli(sessionId, session) {
     const now = Date.now();
+    let ownedTurnCompleted = false;
+    let ownedTurnCompletedAt = null;
+    let lifecycleContext = {};
     const shouldLookupTranscript = !session._lastCodexCliTranscriptLookupAt
       || now - session._lastCodexCliTranscriptLookupAt >= 10000;
     if (!session.codexCliFilePath && session.cliSessionId && shouldLookupTranscript) {
@@ -12363,6 +13584,10 @@ class ProxyEngine extends EventEmitter {
         messages = session._lastCodexCliMessages;
         summaryActivity = session._lastCodexCliActivity || null;
         summaryPartial = session._lastCodexCliMessagesPartial === true;
+        lifecycleContext = this._codexCliGoalRunContext(
+          session._lastCodexCliLifecycleSummary || null,
+          { liveObserved: false, evidenceType: 'poll_unchanged' },
+        );
       } else {
         transcriptMaybeChanged = true;
         const summary = codexCli.readSessionSummary(session.codexCliFilePath, this._codexCliActiveSummaryOptions());
@@ -12375,6 +13600,23 @@ class ProxyEngine extends EventEmitter {
         session._lastCodexCliActivity = summaryActivity;
         session._lastCodexCliMessagesPartial = summaryPartial;
         if (summary) {
+          session._lastCodexCliLifecycleSummary = {
+            taskStartedTurnId: summary.taskStartedTurnId || null,
+            taskStartedAt: summary.taskStartedAt || null,
+            taskCompletedTurnId: summary.taskCompletedTurnId || null,
+            taskCompletedAt: summary.taskCompletedAt || null,
+            sourceCursor: summary.sourceCursor || null,
+            activity: summary.activity || null,
+            updatedAt: summary.updatedAt || null,
+          };
+          const liveObserved = summary.sourceCursor?.mode === 'append'
+            && Number(summary.sourceCursor?.events_read || 0) > 0;
+          lifecycleContext = this._codexCliGoalRunContext(summary, {
+            liveObserved,
+            evidenceType: liveObserved ? 'poll_append' : 'poll_snapshot',
+          });
+          ownedTurnCompleted = this._observeCodexCliOwnedTurnCompletion(sessionId, session, summary);
+          ownedTurnCompletedAt = summary.taskCompletedAt || null;
           if (this._applyCodexCliSummaryMetadata(sessionId, session, summary)) {
             this._broadcastSessionSnapshot();
           }
@@ -12400,7 +13642,10 @@ class ProxyEngine extends EventEmitter {
     const fallbackActivity = session._codexCliChild || session._codexAppServerTurn
       ? { kind: 'generating', label: 'Codex CLI running', thinkingContent: session._codexCliLiveText || '', updated_at: new Date().toISOString() }
       : (session.activity?.kind === 'idle' ? session.activity : { kind: 'idle', label: '', updated_at: new Date().toISOString() });
-    this._setCodexCliActivity(sessionId, session, summaryActivity || fallbackActivity);
+    const observedActivity = ownedTurnCompleted && summaryActivity?.kind !== 'idle'
+      ? { ...summaryActivity, kind: 'idle', label: '', updated_at: ownedTurnCompletedAt || new Date().toISOString() }
+      : (summaryActivity || fallbackActivity);
+    this._setCodexCliActivity(sessionId, session, observedActivity, lifecycleContext);
   }
 
   async _pollSessionContinue(sessionId, session) {
@@ -13393,7 +14638,22 @@ class ProxyEngine extends EventEmitter {
               this._resetTranscriptState(session, 'codex active chat change');
               sessionStore.updateSession(sessionId, { accumulated_messages: null });
             }
-            if (activeChatKey) session._activeChatKey = activeChatKey;
+            if (activeChatKey) {
+              const identityChanged = activeChatKey !== session._activeChatKey
+                || activeChat.title !== session._activeChatTitle;
+              session._activeChatKey = activeChatKey;
+              session._activeChatTitle = activeChat.title || session._activeChatTitle || null;
+              const titleChanged = this._promoteSessionChatTitle(sessionId, session, null, activeChat.title);
+              if (identityChanged || titleChanged) {
+                sessionStore.updateSession(sessionId, {
+                  codex_active_chat_key: activeChatKey,
+                  codex_active_chat_title: session._activeChatTitle,
+                  chat_title: session.chat_title || null,
+                  chat_title_source: session.chat_title_source || null,
+                });
+                this._broadcastSessionSnapshot();
+              }
+            }
             const shouldBeListView = hasChats && !hasActiveChat;
             if (shouldBeListView) {
               const wasListView = !!session._listView;
@@ -13855,7 +15115,7 @@ class ProxyEngine extends EventEmitter {
               const ts = await selectors.detectThinking(session.client.Runtime, session.agentType);
               if (ts?.thinking) {
                 const observedAt = new Date().toISOString();
-                const genActivity = {
+                let genActivity = {
                   kind: 'thinking',
                   label: ts.label || 'Thinking',
                   updated_at: observedAt,
@@ -13881,6 +15141,15 @@ class ProxyEngine extends EventEmitter {
                   genActivity.current = { kind: 'answer', label: 'Answering', partial: '' };
                 }
                 if (ts.thinkingContent) genActivity.thinkingContent = ts.thinkingContent;
+                genActivity = this._applyGoalRunLifecycle(sessionId, session, genActivity, {
+                  source: 'codex_desktop_dom',
+                  sourceCursor: { mode: 'live_dom', end_offset: Date.now() },
+                  nativeEventAt: observedAt,
+                  observedAt,
+                  evidenceType: 'native_goal_dom',
+                  liveLeaseProof: !!ts.goal,
+                  ownerState: 'confirmed',
+                });
                 session.thinking = true;
                 session.thinkingLabel = genActivity.label;
                 session.thinkingContent = ts.thinkingContent || '';
@@ -14020,7 +15289,7 @@ class ProxyEngine extends EventEmitter {
         ? (ownedQuestion.prompt?.title || 'Needs input')
         : (ts.label || (active ? 'Generating' : ''));
       const observedAt = new Date().toISOString();
-      const newActivity = { kind, label, updated_at: observedAt };
+      let newActivity = { kind, label, updated_at: observedAt };
       // Carry forward task list from previous activity
       if (session.taskList) {
         newActivity.task_list = session.taskList;
@@ -14047,6 +15316,15 @@ class ProxyEngine extends EventEmitter {
       if (ts.thinkingContent) {
         newActivity.thinkingContent = ts.thinkingContent;
       }
+      newActivity = this._applyGoalRunLifecycle(sessionId, session, newActivity, {
+        source: session.agentType === 'codex-desktop' ? 'codex_desktop_dom' : 'codex_extension_dom',
+        sourceCursor: { mode: 'live_dom', end_offset: Date.now() },
+        nativeEventAt: observedAt,
+        observedAt,
+        evidenceType: 'native_goal_dom',
+        liveLeaseProof: !!ts.goal,
+        ownerState: 'confirmed',
+      });
 
       const prevKind = session.activity?.kind || 'idle';
       const prevThinkingContent = session.thinkingContent || '';
@@ -14286,9 +15564,15 @@ class ProxyEngine extends EventEmitter {
 
   // ─── Permission dialog polling ───────────────────────────────────────
 
-  async _pollCodexVsCodeQuestionBounded(sessionId) {
+  async _pollCodexVsCodeQuestionBounded(sessionId, hintContextId = null) {
     const session = this.sessions.get(sessionId);
     if (!session || session.agentType !== 'codex' || !session.client?.Runtime) return;
+    if (Number.isInteger(hintContextId)) {
+      if (!(session._vscodeQuestionPollHintContextIds instanceof Set)) {
+        session._vscodeQuestionPollHintContextIds = new Set();
+      }
+      session._vscodeQuestionPollHintContextIds.add(hintContextId);
+    }
     if (session._vscodeQuestionPollInProgress) {
       this._scheduleCodexVsCodeQuestionPoll(sessionId, session, 50);
       return;
@@ -14305,8 +15589,10 @@ class ProxyEngine extends EventEmitter {
     session._vscodeQuestionPollBackoffUntil = 0;
 
     const activityKind = String(session.activity?.kind || '').toLowerCase();
+    const remotePollWindowActive = now < Number(session._vscodeQuestionRemotePollUntil || 0);
     const questionRelevant = session.pendingLast !== null
       || session.waitingForAssistant === true
+      || remotePollWindowActive
       || this._hasOpenCodexVsCodeQuestion(sessionId)
       || ['thinking', 'generating', 'working', 'waiting_for_user'].includes(activityKind);
     const minIntervalMs = questionRelevant
@@ -14321,8 +15607,38 @@ class ProxyEngine extends EventEmitter {
     session._vscodeQuestionPollInProgress = true;
     session._lastCodexVsCodeQuestionPollAt = now;
     const work = (async () => {
-      const question = await selectors.detectCodexVsCodeQuestion(session.client.Runtime);
+      const hintedContextIds = session._vscodeQuestionPollHintContextIds instanceof Set
+        ? [...session._vscodeQuestionPollHintContextIds]
+        : [];
+      const observerContextIds = (this._domPush?.getState?.(sessionId)?.installedContextIds || [])
+        .filter(Number.isInteger)
+        .reverse();
+      const candidateContextIds = [...new Set([...hintedContextIds, ...observerContextIds])];
+      session._vscodeQuestionPollHintContextIds = new Set();
+      let question = null;
+      let matchedContextId = null;
+      let validHintContextId = null;
+      for (const contextId of candidateContextIds) {
+        question = await selectors.detectCodexVsCodeQuestion(
+          session.client.Runtime,
+          { contextId },
+        );
+        if (!question?.error) validHintContextId = contextId;
+        if (question) {
+          matchedContextId = contextId;
+          break;
+        }
+      }
+      if (!question && Number.isInteger(validHintContextId)) {
+        session.client.Runtime._innerContextId = validHintContextId;
+        session._iframeInnerContextId = validHintContextId;
+      }
+      if (!question) question = await selectors.detectCodexVsCodeQuestion(session.client.Runtime);
       if (this.sessions.get(sessionId) !== session) return;
+      if (question && !question.error && Number.isInteger(matchedContextId)) {
+        session.client.Runtime._innerContextId = matchedContextId;
+        session._iframeInnerContextId = matchedContextId;
+      }
       await this._handleCodexVsCodeQuestionState(sessionId, session, question);
       session._vscodeQuestionPollBackoffUntil = 0;
     })();
@@ -14350,6 +15666,21 @@ class ProxyEngine extends EventEmitter {
       this._scheduleCodexVsCodeQuestionPoll(sessionId, session, 250);
       this._log('warn', `[${sessionId}] [question] VS Code fast poll exceeded ${timeoutMs}ms; retaining the in-flight read`);
     }
+    const current = this.sessions.get(sessionId);
+    if (current === session && !this._hasOpenCodexVsCodeQuestion(sessionId)) {
+      const currentActivityKind = String(session.activity?.kind || '').toLowerCase();
+      const stillQuestionRelevant = session.pendingLast !== null
+        || session.waitingForAssistant === true
+        || Date.now() < Number(session._vscodeQuestionRemotePollUntil || 0)
+        || ['thinking', 'generating', 'working'].includes(currentActivityKind);
+      if (stillQuestionRelevant) {
+        this._scheduleCodexVsCodeQuestionPoll(
+          sessionId,
+          session,
+          Number(this.VSCODE_CODEX_QUESTION_ACTIVE_POLL_INTERVAL_MS || 150),
+        );
+      }
+    }
   }
 
   async _pollCodexDesktopQuestionBounded(sessionId) {
@@ -14367,8 +15698,10 @@ class ProxyEngine extends EventEmitter {
     session._questionPollBackoffUntil = 0;
 
     const activityKind = String(session.activity?.kind || '').toLowerCase();
+    const remotePollWindowActive = now < Number(session._codexDesktopQuestionRemotePollUntil || 0);
     const questionRelevant = session.pendingLast !== null
       || session.waitingForAssistant === true
+      || remotePollWindowActive
       || this._hasOpenCodexDesktopQuestion(sessionId)
       || ['thinking', 'generating', 'working', 'waiting_for_user'].includes(activityKind);
     const minIntervalMs = questionRelevant
@@ -14422,16 +15755,32 @@ class ProxyEngine extends EventEmitter {
       this._scheduleCodexDesktopQuestionPoll(sessionId, session, 250);
       this._log('warn', `[${sessionId}] [question] Desktop fast poll exceeded ${timeoutMs}ms; retaining the in-flight read`);
     }
+    const current = this.sessions.get(sessionId);
+    if (current === session && !this._hasOpenCodexDesktopQuestion(sessionId)) {
+      const currentActivityKind = String(session.activity?.kind || '').toLowerCase();
+      const stillQuestionRelevant = session.pendingLast !== null
+        || session.waitingForAssistant === true
+        || Date.now() < Number(session._codexDesktopQuestionRemotePollUntil || 0)
+        || ['thinking', 'generating', 'working'].includes(currentActivityKind);
+      if (stillQuestionRelevant) {
+        this._scheduleCodexDesktopQuestionPoll(
+          sessionId,
+          session,
+          Number(this.CODEX_DESKTOP_QUESTION_ACTIVE_POLL_INTERVAL_MS || 200),
+        );
+      }
+    }
   }
 
   async _pollSessionBounded(sessionId) {
     const session = this.sessions.get(sessionId);
     if (!session) return;
     const now = Date.now();
-    if (session.agentType === 'codex-desktop' && session._pollInProgress) {
+    if (this._isCodexSurface(session.agentType) && session._pollInProgress) {
       const inFlightAge = now - Number(session._pollStartedAt || now);
+      if ((session._priorityControlInFlight || 0) > 0) return;
       if (inFlightAge < 60000) return;
-      this._log('warn', `[${sessionId}] Codex Desktop poll remained in-flight for ${inFlightAge}ms; closing genuinely stuck CDP client`);
+      this._log('warn', `[${sessionId}] Codex poll remained in-flight for ${inFlightAge}ms; closing genuinely stuck CDP client`);
       session._intentionalPollClose = true;
       if (session.client?.Runtime) session.client.Runtime._suppressReadErrors = true;
       this._cooldownCdpTarget(
@@ -14497,6 +15846,18 @@ class ProxyEngine extends EventEmitter {
       if (!this._consecutiveTimeoutsByTarget) this._consecutiveTimeoutsByTarget = new Map();
       if (session.targetId) this._consecutiveTimeoutsByTarget.delete(session.targetId);
     } catch (e) {
+      if (session.agentType === 'codex'
+          && String(e.message || '').startsWith('poll timeout after ')
+          && (session._priorityControlInFlight || 0) > 0) {
+        // A relay send/control shares this target's CDP socket. Runtime.evaluate
+        // cannot be cancelled, so closing the timed-out background poll here
+        // also rejects the authoritative control and can escape as a transport
+        // error. Preserve the socket until the exact session control settles;
+        // the in-flight watchdog above still closes a true 60-second wedge.
+        session._pollBackoffUntil = Date.now() + 5000;
+        this._log('warn', `[${sessionId}] Codex poll exceeded ${timeoutMs}ms during a priority control; retaining the shared CDP client`);
+        return;
+      }
       if (session.agentType === 'codex-desktop' && String(e.message || '').startsWith('poll timeout after ')) {
         // Runtime.evaluate cannot be cancelled. During active output (or a
         // simultaneous read-only validator) a valid bounded read can remain
@@ -14576,8 +15937,7 @@ class ProxyEngine extends EventEmitter {
 
     try {
       if (session.agentType === 'codex') {
-        const question = await selectors.detectCodexVsCodeQuestion(session.client.Runtime);
-        await this._handleCodexVsCodeQuestionState(sessionId, session, question);
+        await this._pollCodexVsCodeQuestionBounded(sessionId);
         if (this._hasOpenCodexVsCodeQuestion(sessionId)) return;
       }
       if (session.agentType === 'codex-desktop') {
@@ -15007,6 +16367,24 @@ class ProxyEngine extends EventEmitter {
     } else if (result.ok && result.lifecycle_managed) {
       sessionData.waitingForAssistant = true;
     }
+    if (result.ok && sessionData.agentType === 'codex') {
+      sessionData._vscodeQuestionRemotePollUntil = Date.now()
+        + Number(this.VSCODE_CODEX_QUESTION_REMOTE_POLL_WINDOW_MS || 120000);
+      this._scheduleCodexVsCodeQuestionPoll(
+        sessionId,
+        sessionData,
+        Number(this.VSCODE_CODEX_QUESTION_ACTIVE_POLL_INTERVAL_MS || 150),
+      );
+    }
+    if (result.ok && sessionData.agentType === 'codex-desktop') {
+      sessionData._codexDesktopQuestionRemotePollUntil = Date.now()
+        + Number(this.CODEX_DESKTOP_QUESTION_REMOTE_POLL_WINDOW_MS || 120000);
+      this._scheduleCodexDesktopQuestionPoll(
+        sessionId,
+        sessionData,
+        Number(this.CODEX_DESKTOP_QUESTION_ACTIVE_POLL_INTERVAL_MS || 200),
+      );
+    }
 
     if (client_message_id) {
       if (result.ok) {
@@ -15080,6 +16458,24 @@ class ProxyEngine extends EventEmitter {
       this._sendToRelay(proto.proxyStatus(sessionId, session.status || 'healthy', genActivity));
     } else if (result.ok && result.lifecycle_managed) {
       session.waitingForAssistant = true;
+    }
+    if (result.ok && session.agentType === 'codex') {
+      session._vscodeQuestionRemotePollUntil = Date.now()
+        + Number(this.VSCODE_CODEX_QUESTION_REMOTE_POLL_WINDOW_MS || 120000);
+      this._scheduleCodexVsCodeQuestionPoll(
+        sessionId,
+        session,
+        Number(this.VSCODE_CODEX_QUESTION_ACTIVE_POLL_INTERVAL_MS || 150),
+      );
+    }
+    if (result.ok && session.agentType === 'codex-desktop') {
+      session._codexDesktopQuestionRemotePollUntil = Date.now()
+        + Number(this.CODEX_DESKTOP_QUESTION_REMOTE_POLL_WINDOW_MS || 120000);
+      this._scheduleCodexDesktopQuestionPoll(
+        sessionId,
+        session,
+        Number(this.CODEX_DESKTOP_QUESTION_ACTIVE_POLL_INTERVAL_MS || 200),
+      );
     }
     if (result.ok) {
       this._sendToRelay(proto.queueDelivered(sessionId, item.client_message_id));
@@ -16029,6 +17425,8 @@ class ProxyEngine extends EventEmitter {
           ? sessionMeta.cursor_agent_histories
           : {};
         const storedCursorThreadKey = agentType === 'cursor' ? String(sessionMeta.cursor_active_thread_key || '') : '';
+        const storedCodexChatKey = agentType === 'codex' ? String(sessionMeta.codex_active_chat_key || '') : '';
+        const storedCodexChatTitle = agentType === 'codex' ? String(sessionMeta.codex_active_chat_title || '') : '';
         let storedAccumulated = Array.isArray(sessionMeta.accumulated_messages) ? sessionMeta.accumulated_messages : null;
         if (agentType === 'cursor' && storedCursorThreadKey && Array.isArray(storedCursorAgentHistories[storedCursorThreadKey])) {
           storedAccumulated = storedCursorAgentHistories[storedCursorThreadKey];
@@ -16090,7 +17488,7 @@ class ProxyEngine extends EventEmitter {
           : null;
         const initialActiveChat = Array.isArray(initialChatList) ? initialChatList.find(c => c && c.active) : null;
         const initialTitle = selectDurableChatTitleDetails({
-          nativeTitle: [innerClaudeTitle, initialActiveChat?.title],
+          nativeTitle: [innerClaudeTitle, initialActiveChat?.title, storedCodexChatTitle],
           storedTitle: sessionMeta.chat_title,
           storedSource: sessionMeta.chat_title_source,
           messages: initialMsgs,
@@ -16147,10 +17545,10 @@ class ProxyEngine extends EventEmitter {
           _listView:        initialListView,
           _lastChatListSig: initialChatList ? JSON.stringify(initialChatList.map(c => `${c.id || ''}:${c.title || ''}:${!!c.active}`)) : '',
           _lastChatList:    initialChatList ? initialChatList.slice() : [],
-          _activeChatTitle: initialActiveChat?.title || null,
+          _activeChatTitle: initialActiveChat?.title || storedCodexChatTitle || null,
           _lastThreadListSig: initialThreadList ? JSON.stringify(initialThreadList.map(t => `${t.id || ''}:${t.title || ''}:${!!t.active}:${t.age || ''}`)) : '',
           _lastThreadList: initialThreadList ? initialThreadList.slice() : [],
-          _activeChatKey:   initialActiveChatKey,
+          _activeChatKey:   initialActiveChatKey || storedCodexChatKey,
           _activeThreadTitle: initialActiveThread?.title || null,
           _activeThreadKey:   initialActiveThreadKey || storedCursorThreadKey,
           codexDesktopActiveThreadKey: initialActiveThreadKey,
@@ -16892,11 +18290,53 @@ class ProxyEngine extends EventEmitter {
     );
     this._localUploadMaintenanceTimer.unref?.();
 
+    // Native Codex JSONL receipts are authoritative at request_user_input
+    // deadlines. Keep one engine-owned lane independent of CDP renderer
+    // reads, per-session timer ownership, and filesystem watcher delivery.
+    this._codexVsCodeQuestionDeadlineSweepTimer = setInterval(() => {
+      try {
+        this._sweepCodexVsCodeQuestionDeadlineReceipts();
+      } catch (error) {
+        this._log('warn', `[question] VS Code deadline receipt sweep failed: ${error.message}`);
+      }
+    }, 100);
+    this._codexVsCodeQuestionDeadlineSweepTimer.unref?.();
+    this._codexVsCodeQuestionActiveSweepTimer = setInterval(() => {
+      try {
+        this._sweepCodexVsCodeActiveQuestionPolls();
+      } catch (error) {
+        this._log('warn', `[question] Active VS Code question sweep failed: ${error.message}`);
+      }
+    }, this.VSCODE_CODEX_QUESTION_ACTIVE_POLL_INTERVAL_MS);
+    this._codexVsCodeQuestionActiveSweepTimer.unref?.();
+    let deadlineSweepSourceHash = 'unavailable';
+    try {
+      deadlineSweepSourceHash = crypto.createHash('sha256')
+        .update(fs.readFileSync(__filename))
+        .digest('hex')
+        .slice(0, 16);
+    } catch {}
+    this._log(
+      'info',
+      `[question] VS Code deadline receipt sweep active (100ms, source ${deadlineSweepSourceHash})`,
+    );
+
     this.connectRelay();
     await this._discoverClaudeCliSessions();
     this._startClaudeCliWatcher();
     await this._discoverCodexCliSessions();
     this._startCodexCliWatcher();
+    this._codexCliGoalMonitorTimer = setInterval(() => {
+      if (!this._running) return;
+      for (const [sessionId, session] of this.sessions.entries()) {
+        if (session.agentType !== 'codex_cli') continue;
+        if (session.codexCliExternalActive !== true
+            && !session._codexCliChild
+            && !session._codexAppServerTurn) continue;
+        this._scheduleCodexCliGoalControllerAudit(sessionId, session);
+      }
+    }, this.CODEX_CLI_GOAL_MONITOR_INTERVAL_MS);
+    this._codexCliGoalMonitorTimer.unref?.();
     await this._discoverCursorCliSessions();
     this._startCursorCliWatcher();
     await this._discoverTargets();
@@ -17040,7 +18480,7 @@ class ProxyEngine extends EventEmitter {
           try {
             await this._withTimeout(this._discoverTargets(), 30000, 'tick discoverTargets');
           } catch (e) { this._log('warn', `[poll] discoverTargets: ${e.message}`); }
-        });
+        }, { deferForQuestionLatency: true });
         if (ran) this._targetDiscoveryDue = false;
       }
       if (this._cliDiscoveryDue) {
@@ -17054,7 +18494,7 @@ class ProxyEngine extends EventEmitter {
           try {
             await this._withTimeout(this._discoverCursorCliSessions(), 10000, 'tick discoverCursorCli');
           } catch (e) { this._log('warn', `[poll] discoverCursorCli: ${e.message}`); }
-        });
+        }, { deferForQuestionLatency: true });
         if (ran) this._cliDiscoveryDue = false;
       }
 
@@ -17082,7 +18522,12 @@ class ProxyEngine extends EventEmitter {
       const windowGroups = new Map(); // parentId → [sessionId, ...]
       for (const [sessionId, session] of this.sessions.entries()) {
         if (session.agentType === 'codex_cli' && session.codexCliArchiveDiscovered === true
-            && !session._codexCliChild && !session._codexAppServerTurn) {
+            && !session._codexCliChild && !session._codexAppServerTurn
+            && session._goalRunLifecycle?.lease_active !== true) {
+          continue;
+        }
+        if (session.agentType === 'codex_cli') {
+          everyTickIds.push(sessionId);
           continue;
         }
         if (session.agentType === 'cursor_cli' && session.cursorCliArchiveDiscovered === true && !session._cursorCliChild) {
@@ -17263,9 +18708,20 @@ class ProxyEngine extends EventEmitter {
     this._claudeCliPollInProgress = false;
     this._continueRemotePollInProgress = false;
     if (this._snapshotTimer) { clearTimeout(this._snapshotTimer); this._snapshotTimer = null; }
+    for (const timer of this._domPushSecondaryPollTimers?.values() || []) clearTimeout(timer);
+    this._domPushSecondaryPollTimers?.clear();
+    this._domPushSecondaryPollInFlight?.clear();
     if (this._localUploadMaintenanceTimer) {
       clearInterval(this._localUploadMaintenanceTimer);
       this._localUploadMaintenanceTimer = null;
+    }
+    if (this._codexVsCodeQuestionDeadlineSweepTimer) {
+      clearInterval(this._codexVsCodeQuestionDeadlineSweepTimer);
+      this._codexVsCodeQuestionDeadlineSweepTimer = null;
+    }
+    if (this._codexVsCodeQuestionActiveSweepTimer) {
+      clearInterval(this._codexVsCodeQuestionActiveSweepTimer);
+      this._codexVsCodeQuestionActiveSweepTimer = null;
     }
     if (this._relayBulkFlushTimer) {
       clearTimeout(this._relayBulkFlushTimer);
@@ -17275,6 +18731,12 @@ class ProxyEngine extends EventEmitter {
       try { this._codexCliWatcher.close(); } catch {}
       this._codexCliWatcher = null;
     }
+    if (this._codexCliGoalMonitorTimer) {
+      clearInterval(this._codexCliGoalMonitorTimer);
+      this._codexCliGoalMonitorTimer = null;
+    }
+    this._stopCodexCliGoalMonitor().catch(() => {});
+    this._codexCliGoalMonitorInFlight?.clear();
     if (this._claudeCliWatcher) {
       try { this._claudeCliWatcher.close(); } catch {}
       this._claudeCliWatcher = null;
@@ -17344,6 +18806,7 @@ class ProxyEngine extends EventEmitter {
 
 module.exports = {
   ProxyEngine,
+  mergeCodexCliArchiveDiscoverySummaries,
   detectCodexDesktopInstalledVersion,
   detectVsCodeCodexInstalledVersion,
   codexDesktopThreadKeysMatch,
@@ -17372,9 +18835,11 @@ module.exports = {
   completedPrefixMutationIndex,
   appendedMutationCandidateStableEnd,
   shouldRunContinueRemoteFastPoll,
+  shouldFastPollCodexCliSession,
   shouldHoldContinueRemoteWaitOnRegression,
   shouldImmediatelyStreamContinueInPlace,
   shouldImmediatelyStreamContinueTailMutation,
   shouldPreserveCursorPassiveRotation,
   shouldBypassHistoryBulkQueue,
+  expectedCodexQuestionAnswers,
 };

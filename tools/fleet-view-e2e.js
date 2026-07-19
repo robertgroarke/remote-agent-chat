@@ -10,6 +10,7 @@ const path = require('path');
 const { spawn } = require('child_process');
 const WebSocket = require(process.env.RAC_WS_MODULE || '../relay-server/node_modules/ws');
 const { chromium } = require(process.env.RAC_PLAYWRIGHT_CORE || '../frontend/node_modules/playwright-core');
+const { buildProducerFleetSummary, projectFleetSummary } = require('../shared/fleet-summary');
 
 function findChrome() {
   const candidates = [
@@ -149,6 +150,8 @@ async function captureFleetVisualMatrix(browser, origin, screenshotDir, refreshL
           non_codex_goal_elements: document.querySelectorAll('.fleet-card[data-session-id="fleet-goal"] .fleet-work-context.kind-goal').length,
           explicit_goal_40: document.querySelectorAll('[aria-label="Goal 40% complete"]').length,
           indeterminate_goal: document.querySelectorAll('[aria-label="Goal working on goal"].fleet-work-meter.indeterminate').length,
+          checkpoint_status: document.querySelector('.fleet-card[data-session-id="fleet-working"] .fleet-card-status strong')?.textContent?.trim() || '',
+          verifying_status: document.querySelector('.fleet-card[data-session-id="fleet-goal-two"] .fleet-card-status strong')?.textContent?.trim() || '',
           layout_shift: Number((window.__fleetLayoutShift || 0).toFixed(6)),
           theme: document.documentElement.dataset.theme,
         };
@@ -166,14 +169,55 @@ async function captureFleetVisualMatrix(browser, origin, screenshotDir, refreshL
       assert.strictEqual(metrics.non_codex_goal_elements, 0, `${visualCase.name} rendered a non-Codex goal`);
       assert.strictEqual(metrics.explicit_goal_40, 1, `${visualCase.name} lost explicit goal progress`);
       assert.strictEqual(metrics.indeterminate_goal, 1, `${visualCase.name} lost an indeterminate native goal`);
+      assert.strictEqual(metrics.checkpoint_status, 'Waiting for next goal turn', `${visualCase.name} lost the goal checkpoint substate`);
+      assert.strictEqual(metrics.verifying_status, 'Reconnecting', `${visualCase.name} lost the goal verification substate`);
       assert.strictEqual(metrics.layout_shift, 0, `${visualCase.name} shifted after the Fleet view settled`);
       assert.strictEqual(metrics.theme, visualCase.theme, `${visualCase.name} used the wrong theme`);
       const screenshot = screenshotDir ? path.join(screenshotDir, `${visualCase.name}.png`) : null;
       if (screenshot) await page.screenshot({ path: screenshot, fullPage: true });
+      const checkpointScreenshot = screenshotDir ? path.join(screenshotDir, `${visualCase.name}-checkpoint-card.png`) : null;
+      const verifyingScreenshot = screenshotDir ? path.join(screenshotDir, `${visualCase.name}-verifying-card.png`) : null;
+      if (checkpointScreenshot) {
+        await page.setViewportSize({ width: visualCase.css[0], height: 4000 });
+        await page.evaluate(() => {
+          window.scrollTo(0, 0);
+          document.documentElement.scrollLeft = 0;
+          document.body.scrollLeft = 0;
+          for (const node of document.querySelectorAll('[data-testid="fleet-view"], .app-main, .fleet-grid')) {
+            node.scrollLeft = 0;
+          }
+        });
+        await page.waitForTimeout(100);
+        const captureVisibleCard = async (selector, outputPath) => {
+          const locator = page.locator(selector);
+          const box = await locator.boundingBox();
+          assert(box, `${visualCase.name} could not measure ${selector}`);
+          const viewport = page.viewportSize();
+          assert(box.x >= 0 && box.y >= 0
+            && box.x + box.width <= viewport.width
+            && box.y + box.height <= viewport.height,
+          `${visualCase.name} focused card left the capture viewport: ${JSON.stringify(box)}`);
+          await page.screenshot({
+            path: outputPath,
+            clip: { x: box.x, y: box.y, width: box.width, height: box.height },
+            animations: 'disabled',
+          });
+        };
+        await captureVisibleCard('.fleet-card[data-session-id="fleet-working"]', checkpointScreenshot);
+        await captureVisibleCard('.fleet-card[data-session-id="fleet-goal-two"]', verifyingScreenshot);
+      }
       rows.push({
         ...visualCase,
         metrics,
-        screenshot,
+        screenshot: screenshot
+          ? path.relative(path.resolve(__dirname, '..'), screenshot).replace(/\\/g, '/')
+          : null,
+        checkpoint_screenshot: checkpointScreenshot
+          ? path.relative(path.resolve(__dirname, '..'), checkpointScreenshot).replace(/\\/g, '/')
+          : null,
+        verifying_screenshot: verifyingScreenshot
+          ? path.relative(path.resolve(__dirname, '..'), verifyingScreenshot).replace(/\\/g, '/')
+          : null,
       });
     } finally {
       await context.close();
@@ -213,6 +257,30 @@ async function main() {
   try {
     await waitForHealth(port);
     proxy = await connectProxy(port, secret);
+    const summaryOnlyFleet = buildProducerFleetSummary({
+      sessionId: 'fleet-idle-claude',
+      session: {
+        target_signature: 'fleet-idle-claude-target',
+        _activeChatKey: 'fleet-idle-claude-thread',
+        chat_title: 'Recovered summary lane',
+        chat_title_source: 'native',
+        activity: {
+          kind: 'idle',
+          work_context: {
+            kind: 'request',
+            text: 'Restore the populated Codex card',
+            source: 'latest_user_request',
+            updated_at: new Date().toISOString(),
+          },
+        },
+      },
+      messages: [
+        { role: 'user', content: 'Restore the populated Codex card', timestamp: Date.now() - 1000 },
+        { role: 'assistant', content: 'Compact inventory summary is ready', timestamp: Date.now() },
+      ],
+    });
+    assert(summaryOnlyFleet, 'summary-only Fleet fixture failed to build');
+    const summaryOnlyProjection = projectFleetSummary(summaryOnlyFleet);
     const sessions = [
       { session_id: 'fleet-working', agent_type: 'codex_cli', chat_title: 'Build lane', display_name: 'Build lane', workspace_name: 'Remote Agent Chat', last_snippet: 'Applying the verified dashboard patch.' },
       { session_id: 'fleet-goal', agent_type: 'claude_cli', chat_title: 'Validation lane', display_name: 'Validation lane', workspace_name: 'Remote Agent Chat', last_snippet: 'Running the mobile parity audit.' },
@@ -224,7 +292,14 @@ async function main() {
       { session_id: 'fleet-cursor-work', agent_type: 'cursor', chat_title: 'Cursor lane', display_name: 'Cursor lane', workspace_name: 'Remote Agent Chat', last_snippet: 'Reviewing the active diff.' },
       { session_id: 'fleet-antigravity-work', agent_type: 'antigravity_panel', chat_title: 'Antigravity lane', display_name: 'Antigravity lane', workspace_name: 'Remote Agent Chat', last_snippet: 'Drafting the current response.' },
       { session_id: 'fleet-attention-two', agent_type: 'continue', chat_title: 'Blocked lane', display_name: 'Blocked lane', workspace_name: 'Remote Agent Chat', last_snippet: 'Waiting for an operator choice.' },
-      { session_id: 'fleet-idle-claude', agent_type: 'claude', chat_title: 'Claude idle', display_name: 'Claude idle', workspace_name: 'Remote Agent Chat', last_snippet: 'No current work.' },
+      {
+        session_id: 'fleet-idle-claude',
+        agent_type: 'claude',
+        display_name: 'Claude idle',
+        workspace_name: 'Remote Agent Chat',
+        activity: { kind: 'idle', label: 'Idle', work_context: summaryOnlyProjection.fleet_work_context },
+        fleet_summary: summaryOnlyFleet,
+      },
       { session_id: 'fleet-idle-cursor', agent_type: 'cursor_cli', chat_title: 'Cursor CLI idle', display_name: 'Cursor CLI idle', workspace_name: 'Remote Agent Chat', last_snippet: 'No current work.' },
       { session_id: 'fleet-idle-gemini', agent_type: 'gemini', chat_title: 'Gemini idle', display_name: 'Gemini idle', workspace_name: 'Remote Agent Chat', last_snippet: 'No current work.' },
       { session_id: 'fleet-idle-continue', agent_type: 'continue_yolo', chat_title: 'Continue idle', display_name: 'Continue idle', workspace_name: 'Remote Agent Chat', last_snippet: 'No current work.' },
@@ -248,11 +323,12 @@ async function main() {
     proxy.send(JSON.stringify({ type: 'session_list', proxy_id: 'fleet-view-e2e', sessions }));
     const now = Date.now();
     proxy.send(JSON.stringify({
-      type: 'status', session: 'fleet-working', thinking: true,
+      type: 'status', session: 'fleet-working', thinking: false,
       activity_trace: { proxy_emitted_at_ms: Date.now() },
       activity: {
-        kind: 'applying_patch', label: 'Applying patch', started_at: new Date(now - 65_000).toISOString(),
-        goal: { status: 'active', objective: 'Ship fleet dashboard', time_used_seconds: 125, updated_at: new Date(now).toISOString() },
+        kind: 'idle', label: '', started_at: new Date(now - 65_000).toISOString(),
+        goal: { status: 'active', state: 'active', objective: 'Ship fleet dashboard', fingerprint: 'fleet-build-goal', generation: 1, time_used_seconds: 125, updated_at: new Date(now).toISOString() },
+        goal_run: { schema_version: 1, run_id: 'fleet-build-run', goal_fingerprint: 'fleet-build-goal', goal_generation: 1, lifecycle: 'checkpoint_pending_continuation', lease_active: true, owner_state: 'confirmed', transition_seq: 2, transition_id: 'fleet-build-checkpoint', lease_started_at: new Date(now - 65_000).toISOString() },
         task_list: { tasks: [
           { state: 'completed', text: 'Model fleet state' }, { state: 'completed', text: 'Build web cards' },
           { state: 'in_progress', text: 'Verify mobile' }, { state: 'pending', text: 'Deploy' },
@@ -296,7 +372,7 @@ async function main() {
       activity: { kind: 'thinking', label: 'Waiting for thread selection' },
     }));
     [
-      ['fleet-goal-two', { kind: 'generating', label: 'Preparing release', goal: { status: 'active', objective: 'Ship the verified release', progress_percent: 40, updated_at: new Date(now).toISOString() } }],
+      ['fleet-goal-two', { kind: 'idle', label: '', started_at: new Date(now - 45_000).toISOString(), goal: { status: 'active', state: 'active', objective: 'Ship the verified release', fingerprint: 'fleet-release-goal', generation: 1, progress_percent: 40, updated_at: new Date(now).toISOString() }, goal_run: { schema_version: 1, run_id: 'fleet-release-run', goal_fingerprint: 'fleet-release-goal', goal_generation: 1, lifecycle: 'verifying', lease_active: true, owner_state: 'verifying', transition_seq: 2, transition_id: 'fleet-release-verifying', lease_started_at: new Date(now - 45_000).toISOString() } }],
       ['fleet-cursor-work', { kind: 'working', label: 'Reviewing diff', current: { kind: 'tool', label: 'Reviewing active diff', since: new Date(now).toISOString() } }],
       ['fleet-antigravity-work', { kind: 'generating', label: 'Drafting response', current: { kind: 'response', label: 'Drafting the current response', since: new Date(now).toISOString() } }],
       ['fleet-attention-two', { kind: 'blocked', label: 'Operator choice required' }],
@@ -323,8 +399,9 @@ async function main() {
       const refreshedAt = Date.now();
       [
         ['fleet-working', {
-          kind: 'applying_patch', label: 'Applying patch', started_at: new Date(refreshedAt - 65_000).toISOString(),
-          goal: { status: 'active', objective: 'Ship fleet dashboard', time_used_seconds: 125, updated_at: new Date(refreshedAt).toISOString() },
+          kind: 'idle', label: '', started_at: new Date(refreshedAt - 65_000).toISOString(),
+          goal: { status: 'active', state: 'active', objective: 'Ship fleet dashboard', fingerprint: 'fleet-build-goal', generation: 1, time_used_seconds: 125, updated_at: new Date(refreshedAt).toISOString() },
+          goal_run: { schema_version: 1, run_id: 'fleet-build-run', goal_fingerprint: 'fleet-build-goal', goal_generation: 1, lifecycle: 'checkpoint_pending_continuation', lease_active: true, owner_state: 'confirmed', transition_seq: 2, transition_id: 'fleet-build-checkpoint', lease_started_at: new Date(refreshedAt - 65_000).toISOString() },
           task_list: { tasks: [
             { state: 'completed', text: 'Model fleet state' }, { state: 'completed', text: 'Build web cards' },
             { state: 'in_progress', text: 'Verify mobile' }, { state: 'pending', text: 'Deploy' },
@@ -336,12 +413,12 @@ async function main() {
           current: { kind: 'response', label: 'Running the mobile parity audit', since: new Date(refreshedAt).toISOString() },
         }],
         ['fleet-readonly', { kind: 'thinking', label: 'Waiting for thread selection' }],
-        ['fleet-goal-two', { kind: 'generating', label: 'Preparing release', goal: { status: 'active', objective: 'Ship the verified release', progress_percent: 40, updated_at: new Date(refreshedAt).toISOString() } }],
+        ['fleet-goal-two', { kind: 'idle', label: '', started_at: new Date(refreshedAt - 45_000).toISOString(), goal: { status: 'active', state: 'active', objective: 'Ship the verified release', fingerprint: 'fleet-release-goal', generation: 1, progress_percent: 40, updated_at: new Date(refreshedAt).toISOString() }, goal_run: { schema_version: 1, run_id: 'fleet-release-run', goal_fingerprint: 'fleet-release-goal', goal_generation: 1, lifecycle: 'verifying', lease_active: true, owner_state: 'verifying', transition_seq: 2, transition_id: 'fleet-release-verifying', lease_started_at: new Date(refreshedAt - 45_000).toISOString() } }],
         ['fleet-cursor-work', { kind: 'working', label: 'Reviewing diff', current: { kind: 'tool', label: 'Reviewing active diff', since: new Date(refreshedAt).toISOString() } }],
         ['fleet-antigravity-work', { kind: 'generating', label: 'Drafting response', current: { kind: 'response', label: 'Drafting the current response', since: new Date(refreshedAt).toISOString() } }],
         ['fleet-attention-two', { kind: 'blocked', label: 'Operator choice required' }],
       ].forEach(([session, activity]) => proxy.send(JSON.stringify({
-        type: 'status', session, thinking: true,
+        type: 'status', session, thinking: ['thinking', 'generating', 'working'].includes(activity.kind),
         activity_trace: { proxy_emitted_at_ms: Date.now() }, activity,
       })));
       await new Promise(resolve => setTimeout(resolve, 100));
@@ -368,6 +445,9 @@ async function main() {
     assert.ok(sidebarIds.slice(0, workingSidebarIds.length).every((id, index) => id === workingSidebarIds[index]), 'every working session must precede every non-working session');
     const workingContext = await workingSection.locator('.session-card[data-session-id="fleet-working"] .session-card-sub').textContent();
     assert.match(workingContext || '', /Remote Agent Chat|Unscoped/, `working row lost workspace context: ${JSON.stringify(workingContext)}`);
+    assert.match(workingContext || '', /Waiting for next goal turn/, `working row lost checkpoint substate: ${JSON.stringify(workingContext)}`);
+    const verifyingContext = await workingSection.locator('.session-card[data-session-id="fleet-goal-two"] .session-card-sub').textContent();
+    assert.match(verifyingContext || '', /Reconnecting/, `working row lost verifying substate: ${JSON.stringify(verifyingContext)}`);
     await page.getByRole('button', { name: 'Fleet view' }).click();
     await page.getByRole('heading', { name: 'Fleet view' }).waitFor();
     assert.equal(await page.locator('.fleet-card').count(), 9, 'fleet must omit ordinary idle sessions while retaining paused-goal and active read-only sessions');
@@ -378,13 +458,15 @@ async function main() {
     }
     const body = await page.locator('body').innerText();
     for (const marker of [
-      'Build lane', 'Applying patch', 'Ship fleet dashboard', 'Applying the verified dashboard patch.',
+      'Build lane', 'Waiting for next goal turn', 'Ship fleet dashboard', 'Applying the verified dashboard patch.',
       'Validation lane', 'Running the mobile parity audit', 'Review lane', 'Needs attention', 'Waiting for approval on the generated diff.',
-      'Paused lane', 'Goal paused', 'Read-only lane', 'Unavailable', 'Working on goal', 'Activity',
+      'Paused lane', 'Goal paused', 'Read-only lane', 'Unavailable', 'Working on goal', 'Reconnecting', 'Activity',
     ]) assert(body.includes(marker), `fleet body missing ${marker}`);
     assert(!body.includes('Validate every client'), 'non-Codex stray goal text leaked into Fleet');
     assert(!body.includes('No active goal reported'), 'Fleet retained the false empty-goal copy');
     assert.equal(await page.locator('.fleet-card[data-session-id="fleet-working"][data-activity-state="working_goal"]').count(), 1);
+    assert.equal(await page.locator('.fleet-card[data-session-id="fleet-working"] .fleet-card-status strong').innerText(), 'Waiting for next goal turn');
+    assert.equal(await page.locator('.fleet-card[data-session-id="fleet-goal-two"] .fleet-card-status strong').innerText(), 'Reconnecting');
     assert.equal(await page.locator('.fleet-card[data-session-id="fleet-goal"][data-activity-state="working"] .fleet-work-context.kind-response').count(), 1);
     assert.equal(await page.locator('.fleet-card[data-session-id="fleet-goal"] .fleet-work-context.kind-goal').count(), 0);
     assert.equal(await page.locator('.fleet-card[data-session-id="fleet-goal"] .fleet-work-meter.kind-goal').count(), 0);
@@ -409,6 +491,10 @@ async function main() {
     await page.getByRole('button', { name: 'Show 8 idle sessions' }).click();
     assert.equal(await page.locator('.fleet-card').count(), 16, 'idle reveal must expose every operator-visible session');
     assert.equal(await page.locator('.fleet-card[data-session-id="fleet-idle"][data-activity-state="idle"]').count(), 1);
+    const summaryOnlyCardText = await page.locator('.fleet-card[data-session-id="fleet-idle-claude"]').innerText();
+    for (const marker of ['Recovered summary lane', 'Restore the populated Codex card', 'Compact inventory summary is ready']) {
+      assert(summaryOnlyCardText.includes(marker), 'summary-only initial inventory card missing ' + marker);
+    }
     assert.equal(
       await page.locator('.fleet-card[data-session-id="fleet-idle"] .fleet-card-status strong').innerText(),
       'Idle',

@@ -2,6 +2,7 @@
 
 const crypto = require('crypto');
 const fs = require('fs');
+const http = require('http');
 const https = require('https');
 const os = require('os');
 const path = require('path');
@@ -13,10 +14,13 @@ const {
   sanitizeProviderUsageSnapshot,
 } = require('../relay-server/provider-usage-boundary');
 
-const SCHEMA_VERSION = 2;
+const SCHEMA_VERSION = 3;
 const DEFAULT_POLL_INTERVAL_MS = 5 * 60 * 1000;
 const DEFAULT_STALE_AFTER_MS = 10 * 60 * 1000;
 const MAX_RESPONSE_BYTES = 2 * 1024 * 1024;
+const OLLAMA_RECEIPT_SCHEMA_VERSION = 1;
+const MAX_OLLAMA_REQUEST_RECEIPTS = 32;
+const MAX_OLLAMA_RECEIPT_STATE_BYTES = 256 * 1024;
 
 const PROVIDERS = Object.freeze({
   codex: {
@@ -46,6 +50,14 @@ const PROVIDERS = Object.freeze({
     quota_domain: 'cursor-plan',
     dashboard_url: 'https://cursor.com/settings/usage',
     agent_types: new Set(['cursor', 'cursor_cli']),
+  },
+  ollama: {
+    provider_id: 'ollama-local',
+    provider_name: 'Ollama',
+    quota_domain: 'ollama-local-runtime',
+    dashboard_url: null,
+    agent_types: new Set(['ollama']),
+    always_collect: true,
   },
 });
 
@@ -336,6 +348,260 @@ function codexCommand() {
   return 'codex';
 }
 
+function requestLoopbackJson(pathname, options = {}) {
+  return new Promise((resolve, reject) => {
+    const configured = safeText(options.baseUrl || process.env.OLLAMA_HOST || 'http://127.0.0.1:11434', 240);
+    let base;
+    try { base = new URL(configured.includes('://') ? configured : `http://${configured}`); } catch {
+      reject(new ProviderUsageError('Ollama loopback endpoint is invalid.', { code: 'endpoint_rejected' }));
+      return;
+    }
+    const loopbackHosts = new Set(['127.0.0.1', 'localhost', '::1', '[::1]']);
+    if (base.protocol !== 'http:' || !loopbackHosts.has(base.hostname)
+        || base.username || base.password || base.search || base.hash) {
+      reject(new ProviderUsageError('Ollama endpoint must remain loopback-only.', { code: 'endpoint_rejected' }));
+      return;
+    }
+    const target = new URL(pathname, `${base.origin}/`);
+    const request = http.request(target, {
+      method: 'GET',
+      headers: { Accept: 'application/json', 'User-Agent': 'Remote-Agent-Chat/1.0' },
+      timeout: Math.max(250, Number(options.timeoutMs) || 1500),
+    }, response => {
+      let bytes = 0;
+      const chunks = [];
+      response.on('data', chunk => {
+        bytes += chunk.length;
+        if (bytes <= MAX_RESPONSE_BYTES) chunks.push(chunk);
+      });
+      response.on('end', () => {
+        if (bytes > MAX_RESPONSE_BYTES) {
+          reject(new ProviderUsageError('Ollama response exceeded the safe size limit.', { code: 'response_too_large' }));
+          return;
+        }
+        const statusCode = Number(response.statusCode) || 0;
+        if (statusCode < 200 || statusCode >= 300) {
+          reject(new ProviderUsageError(`Ollama returned HTTP ${statusCode}.`, { code: `http_${statusCode || 'error'}` }));
+          return;
+        }
+        try {
+          const text = Buffer.concat(chunks).toString('utf8');
+          resolve(text ? JSON.parse(text) : {});
+        } catch {
+          reject(new ProviderUsageError('Ollama returned malformed JSON.', { code: 'malformed_payload' }));
+        }
+      });
+    });
+    request.on('timeout', () => request.destroy(new ProviderUsageError('Ollama loopback request timed out.', { code: 'timeout' })));
+    request.on('error', error => reject(error instanceof ProviderUsageError
+      ? error
+      : new ProviderUsageError('Ollama is not running on the loopback endpoint.', {
+        code: safeText(error?.code, 40) || 'not_running',
+      })));
+    request.end();
+  });
+}
+
+function ollamaReceiptStatePath(options = {}) {
+  if (options.receiptPath) return path.resolve(options.receiptPath);
+  if (process.env.RAC_OLLAMA_RECEIPT_PATH) return path.resolve(process.env.RAC_OLLAMA_RECEIPT_PATH);
+  const base = process.env.LOCALAPPDATA || path.join(os.homedir(), '.remote-agent-chat');
+  return path.join(base, 'RemoteAgentChat', 'ollama-request-receipts-v1.json');
+}
+
+function ollamaIdentifier(value, maxLength) {
+  const normalized = safeText(value, maxLength);
+  return normalized && /^[a-z0-9][a-z0-9._:/-]*$/i.test(normalized) ? normalized : null;
+}
+
+function nonNegativeMetric(value, { integer = false } = {}) {
+  const normalized = safeNumber(value);
+  if (normalized == null || normalized < 0 || (integer && !Number.isSafeInteger(normalized))) return null;
+  return normalized;
+}
+
+function normalizeOllamaTerminalReceipt(response, metadata = {}) {
+  if (!response || response.done !== true) {
+    throw new ProviderUsageError('Ollama request receipt is not terminal.', { code: 'receipt_not_terminal' });
+  }
+  const model = ollamaIdentifier(metadata.model || response.model, 160);
+  const surface = ollamaIdentifier(metadata.surface, 80);
+  const capturedAt = isoTimestamp(metadata.capturedAt || metadata.captured_at || Date.now());
+  const promptTokens = nonNegativeMetric(response.prompt_eval_count, { integer: true });
+  const responseTokens = nonNegativeMetric(response.eval_count, { integer: true });
+  const totalDurationNs = nonNegativeMetric(response.total_duration, { integer: true });
+  const loadDurationNs = nonNegativeMetric(response.load_duration, { integer: true });
+  const promptEvalDurationNs = nonNegativeMetric(response.prompt_eval_duration, { integer: true });
+  const evalDurationNs = nonNegativeMetric(response.eval_duration, { integer: true });
+  if (!model || !surface || !capturedAt || [
+    promptTokens,
+    responseTokens,
+    totalDurationNs,
+    loadDurationNs,
+    promptEvalDurationNs,
+    evalDurationNs,
+  ].some(value => value == null)) {
+    throw new ProviderUsageError('Ollama terminal receipt is missing bounded request metrics.', {
+      code: 'receipt_metrics_missing',
+    });
+  }
+  const tokensPerSecond = evalDurationNs > 0
+    ? Math.round((responseTokens * 1e9 / evalDurationNs) * 1000) / 1000
+    : null;
+  const receipt = {
+    schema_version: OLLAMA_RECEIPT_SCHEMA_VERSION,
+    model,
+    surface,
+    captured_at: capturedAt,
+    prompt_tokens: promptTokens,
+    response_tokens: responseTokens,
+    tokens_per_second: tokensPerSecond,
+    total_duration_ns: totalDurationNs,
+    load_duration_ns: loadDurationNs,
+    prompt_eval_duration_ns: promptEvalDurationNs,
+    eval_duration_ns: evalDurationNs,
+  };
+  return {
+    receipt_id: crypto.createHash('sha256').update(JSON.stringify(receipt)).digest('hex').slice(0, 24),
+    ...receipt,
+  };
+}
+
+function normalizePersistedOllamaReceipt(value) {
+  if (!value || Number(value.schema_version) !== OLLAMA_RECEIPT_SCHEMA_VERSION) return null;
+  try {
+    const normalized = normalizeOllamaTerminalReceipt({
+      done: true,
+      model: value.model,
+      prompt_eval_count: value.prompt_tokens,
+      eval_count: value.response_tokens,
+      total_duration: value.total_duration_ns,
+      load_duration: value.load_duration_ns,
+      prompt_eval_duration: value.prompt_eval_duration_ns,
+      eval_duration: value.eval_duration_ns,
+    }, {
+      model: value.model,
+      surface: value.surface,
+      captured_at: value.captured_at,
+    });
+    return value.receipt_id && value.receipt_id !== normalized.receipt_id ? null : normalized;
+  } catch {
+    return null;
+  }
+}
+
+function readOllamaRequestReceipts(options = {}) {
+  const statePath = ollamaReceiptStatePath(options);
+  try {
+    const stats = fs.statSync(statePath);
+    if (!stats.isFile() || stats.size > MAX_OLLAMA_RECEIPT_STATE_BYTES) return [];
+    const parsed = JSON.parse(fs.readFileSync(statePath, 'utf8'));
+    if (Number(parsed?.schema_version) !== OLLAMA_RECEIPT_SCHEMA_VERSION || !Array.isArray(parsed.receipts)) return [];
+    const deduped = new Map();
+    for (const raw of parsed.receipts.slice(-MAX_OLLAMA_REQUEST_RECEIPTS * 2)) {
+      const receipt = normalizePersistedOllamaReceipt(raw);
+      if (receipt) deduped.set(receipt.receipt_id, receipt);
+    }
+    return [...deduped.values()]
+      .sort((left, right) => Date.parse(left.captured_at) - Date.parse(right.captured_at))
+      .slice(-MAX_OLLAMA_REQUEST_RECEIPTS);
+  } catch {
+    return [];
+  }
+}
+
+function writeOllamaRequestReceipt(response, metadata = {}, options = {}) {
+  const receipt = normalizeOllamaTerminalReceipt(response, metadata);
+  const statePath = ollamaReceiptStatePath(options);
+  const receipts = readOllamaRequestReceipts(options).filter(item => item.receipt_id !== receipt.receipt_id);
+  receipts.push(receipt);
+  const state = {
+    schema_version: OLLAMA_RECEIPT_SCHEMA_VERSION,
+    updated_at: receipt.captured_at,
+    receipts: receipts.slice(-MAX_OLLAMA_REQUEST_RECEIPTS),
+  };
+  fs.mkdirSync(path.dirname(statePath), { recursive: true });
+  const temporary = `${statePath}.${process.pid}.tmp`;
+  fs.writeFileSync(temporary, `${JSON.stringify(state)}\n`, { encoding: 'utf8', mode: 0o600 });
+  fs.renameSync(temporary, statePath);
+  return receipt;
+}
+
+function roundedMoney(value) {
+  const numeric = safeNumber(value);
+  return numeric == null ? null : Math.round(numeric * 100) / 100;
+}
+
+function canonicalMoney(amount, {
+  currency = 'USD',
+  sourceField = '',
+  semantics = '',
+  directlyReported = true,
+} = {}) {
+  const normalizedAmount = roundedMoney(amount);
+  if (normalizedAmount == null) return null;
+  return {
+    amount: normalizedAmount,
+    currency: safeText(currency, 12) || 'USD',
+    source_field: safeText(sourceField, 120),
+    semantics: safeText(semantics, 80),
+    directly_reported: directlyReported === true,
+  };
+}
+
+function moneyFromEnvelope(value, options = {}) {
+  if (value == null) return null;
+  if (typeof value === 'number' || typeof value === 'string') {
+    return canonicalMoney(value, options);
+  }
+  if (typeof value !== 'object' || Array.isArray(value)) return null;
+  const amountMinor = safeNumber(value.amount_minor ?? value.amountMinor);
+  if (amountMinor != null) {
+    const exponent = Math.max(0, Math.min(6, Math.trunc(safeNumber(value.exponent) ?? 2)));
+    return canonicalMoney(amountMinor / (10 ** exponent), {
+      ...options,
+      currency: value.currency || options.currency,
+    });
+  }
+  return canonicalMoney(value.amount ?? value.value, {
+    ...options,
+    currency: value.currency || options.currency,
+  });
+}
+
+function validateProviderDashboardUrl(providerKey, candidate) {
+  const expected = PROVIDERS[providerKey]?.dashboard_url || null;
+  if (!expected || !candidate) return null;
+  let parsed;
+  let canonical;
+  try {
+    parsed = new URL(String(candidate));
+    canonical = new URL(expected);
+  } catch {
+    return null;
+  }
+  if (parsed.protocol !== 'https:' || parsed.username || parsed.password
+      || parsed.search || parsed.hash) return null;
+  if (parsed.origin !== canonical.origin || parsed.pathname !== canonical.pathname) return null;
+  return expected;
+}
+
+function bindCodexAppServerInput(child, finish) {
+  const fail = error => finish(new ProviderUsageError('Codex app-server input pipe failed.', {
+    code: error?.code === 'EPIPE' ? 'app_server_epipe' : 'app_server_pipe_error',
+  }));
+  child.stdin.on('error', fail);
+  return message => {
+    try {
+      child.stdin.write(`${JSON.stringify(message)}\n`, error => {
+        if (error) fail(error);
+      });
+    } catch (error) {
+      fail(error);
+    }
+  };
+}
+
 function runCodexAppServer(timeoutMs = 10000) {
   return new Promise((resolve, reject) => {
     const executable = codexCommand();
@@ -364,10 +630,8 @@ function runCodexAppServer(timeoutMs = 10000) {
       try { child.kill(); } catch {}
       if (error) reject(error); else resolve(result);
     };
-    const send = message => {
-      try { child.stdin.write(`${JSON.stringify(message)}\n`); } catch {}
-    };
     const timer = setTimeout(() => finish(new ProviderUsageError('Codex app-server timed out.', { code: 'app_server_timeout' })), timeoutMs);
+    const send = bindCodexAppServerInput(child, finish);
     child.on('error', () => finish(new ProviderUsageError('Codex app-server could not start.', { code: 'app_server_unavailable' })));
     child.on('exit', code => {
       if (!settled) finish(new ProviderUsageError(`Codex app-server exited (${code ?? 'unknown'}).`, { code: 'app_server_exit' }));
@@ -724,7 +988,7 @@ function parseClaudeCliUsage(output, nowMs = Date.now()) {
 function claudeScopedWeeklyEntries(usage) {
   const candidates = [
     usage?.scoped_weekly, usage?.weekly_scoped, usage?.scopedWeekly, usage?.weeklyScoped,
-    usage?.rate_limits, usage?.rateLimits, usage?.windows,
+    usage?.rate_limits, usage?.rateLimits, usage?.windows, usage?.limits,
   ].flatMap(value => Array.isArray(value) ? value : []);
   return candidates.filter(value => {
     const kind = String(value?.kind || value?.type || '').toLowerCase();
@@ -737,7 +1001,7 @@ function claudeUsageWindows(usage, source = 'oauth_api') {
   const windows = [];
   const ignoredKeys = new Set([
     'extra_usage', 'extraUsage', 'scoped_weekly', 'weekly_scoped', 'scopedWeekly',
-    'weeklyScoped', 'rate_limits', 'rateLimits', 'windows',
+    'weeklyScoped', 'rate_limits', 'rateLimits', 'windows', 'limits', 'spend',
   ]);
   for (const [key, value] of Object.entries(usage || {})) {
     const used = clampPercent(value?.utilization ?? value?.used_percent ?? value?.usedPercent);
@@ -764,7 +1028,9 @@ function claudeUsageWindows(usage, source = 'oauth_api') {
     const modelId = safeText(model?.id || model?.model_id || value?.model_id || value?.id, 120);
     const modelLabel = safeText(model?.display_name || model?.label || model?.name || value?.display_name, 120)
       || (modelId ? humanize(modelId.replace(/^claude-/, '')) : null);
-    const used = clampPercent(value?.utilization ?? value?.used_percent ?? value?.usedPercent ?? value?.percentage);
+    const used = clampPercent(
+      value?.utilization ?? value?.used_percent ?? value?.usedPercent ?? value?.percentage ?? value?.percent,
+    );
     if (!modelLabel || used == null) continue;
     const slug = (modelId || modelLabel).toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-|-$/g, '');
     const normalized = normalizedWindow({
@@ -784,6 +1050,86 @@ function claudeUsageWindows(usage, source = 'oauth_api') {
     if (normalized && !windows.some(window => window.id === normalized.id)) windows.push(normalized);
   }
   return windows;
+}
+
+function normalizeClaudeFinancials(usage, context = {}) {
+  const extra = usage?.extra_usage || usage?.extraUsage || {};
+  const spend = usage?.spend && typeof usage.spend === 'object' ? usage.spend : {};
+  const currency = safeText(
+    spend?.used?.currency || spend?.balance?.currency || spend?.cap?.currency
+      || extra.currency || context.currency,
+    12,
+  ) || 'USD';
+  const extraUsageSpend = moneyFromEnvelope(spend.used, {
+    currency, sourceField: 'spend.used', semantics: 'extra_usage_spend',
+  }) || canonicalMoney(extra.used_credits, {
+    currency, sourceField: 'extra_usage.used_credits', semantics: 'extra_usage_spend',
+  });
+  const extraUsageCap = moneyFromEnvelope(spend.cap ?? spend.limit, {
+    currency,
+    sourceField: spend.cap != null ? 'spend.cap' : 'spend.limit',
+    semantics: 'extra_usage_cap',
+  }) || canonicalMoney(extra.monthly_limit ?? extra.monthlyLimit, {
+    currency, sourceField: 'extra_usage.monthly_limit', semantics: 'extra_usage_cap',
+  });
+  const prepaidBalance = moneyFromEnvelope(spend.balance, {
+    currency, sourceField: 'spend.balance', semantics: 'prepaid_balance',
+  });
+  return {
+    semantics_version: 1,
+    source: safeText(context.source, 60) || 'oauth_api',
+    observed_at: isoTimestamp(context.observedAt) || new Date().toISOString(),
+    account_scope: safeText(context.accountScope, 100),
+    extra_usage_enabled: spend.enabled === true || extra.is_enabled === true,
+    prepaid_balance: prepaidBalance,
+    extra_usage_spend: extraUsageSpend,
+    extra_usage_cap: extraUsageCap,
+    allowance_remaining: null,
+    disclaimer: safeText(spend.disclaimer, 240),
+  };
+}
+
+function normalizeCursorFinancials(usage, context = {}) {
+  const planUsage = usage?.planUsage && typeof usage.planUsage === 'object' ? usage.planUsage : {};
+  const cents = (field, semantics) => {
+    const value = safeNumber(planUsage[field]);
+    return value == null ? null : canonicalMoney(value / 100, {
+      currency: 'USD', sourceField: `planUsage.${field}`, semantics,
+    });
+  };
+  const reportedSpend = cents('totalSpend', 'reported_spend');
+  const includedSpend = cents('includedSpend', 'included_spend');
+  const bonusSpend = cents('bonusSpend', 'bonus_spend');
+  const planLimit = cents('limit', 'reported_plan_limit');
+  const reconciliationAmount = reportedSpend && includedSpend && bonusSpend
+    ? roundedMoney(reportedSpend.amount - includedSpend.amount - bonusSpend.amount)
+    : null;
+  return {
+    semantics_version: 1,
+    source: safeText(context.source, 60) || 'cursor_connect',
+    observed_at: isoTimestamp(context.observedAt) || new Date().toISOString(),
+    account_scope: safeText(context.accountScope, 100),
+    reported_spend: reportedSpend,
+    included_spend: includedSpend,
+    bonus_spend: bonusSpend,
+    plan_limit: planLimit,
+    allowance_remaining: null,
+    prepaid_balance: null,
+    reconciliation_delta: reconciliationAmount == null ? null : canonicalMoney(reconciliationAmount, {
+      currency: 'USD',
+      sourceField: 'planUsage.totalSpend-includedSpend-bonusSpend',
+      semantics: 'reconciliation_delta',
+      directlyReported: false,
+    }),
+    pool_classification: {
+      classification_status: 'unavailable',
+      first_party: null,
+      third_party: null,
+      unclassified: reportedSpend,
+      warning: 'Current account response does not expose first-party and third-party monetary pools.',
+    },
+    resets_at: isoTimestamp(usage?.billingCycleEnd),
+  };
 }
 
 function claudeCliExecutable() {
@@ -924,6 +1270,11 @@ async function collectClaudeOAuth(fingerprintKey, credentialsOverride = null) {
     || profile?.organization?.seat_tier
     || profile?.organization?.rate_limit_tier
     || oauth.rateLimitTier;
+  const financials = normalizeClaudeFinancials(usage, {
+    observedAt: Date.now(),
+    accountScope: planLabel('claude', plan),
+    source: 'oauth_api',
+  });
   return {
     account_fingerprint: accountFingerprint(organizationIdentity || email || 'claude-local', fingerprintKey),
     account_label: maskEmail(email) || 'Local Claude account',
@@ -934,14 +1285,12 @@ async function collectClaudeOAuth(fingerprintKey, credentialsOverride = null) {
       sourceAttempt('oauth_profile', profileResult.error ? 'failed' : 'ok', { code: profileResult.error?.code }),
     ],
     windows,
-    credits: extra ? {
-      enabled: extra.is_enabled === true,
-      used: safeNumber(extra.used_credits),
-      limit: safeNumber(extra.monthly_limit ?? extra.monthlyLimit),
-      currency: safeText(extra.currency, 12) || 'USD',
-      utilization_percent: clampPercent(extra.utilization),
-      period: 'Monthly',
+    credits: financials.prepaid_balance ? {
+      enabled: true,
+      balance: financials.prepaid_balance.amount,
+      currency: financials.prepaid_balance.currency,
     } : null,
+    financials,
     reset_credits: null,
     request_count: profileResult.error ? 1 : 2,
   };
@@ -1072,18 +1421,41 @@ async function readCursorLocalAuth(options = {}) {
 }
 
 async function collectCursor(fingerprintKey, options = {}) {
-  const auth = await readCursorLocalAuth(options);
+  const authReader = options.authReader || readCursorLocalAuth;
+  const requester = options.requester || requestJson;
+  const auth = await authReader(options);
   if (!auth.token) throw new ProviderUsageError('Cursor local authentication is unavailable.', { code: 'local_auth_missing', status: 'auth_required' });
-  const usage = await requestJson('https://api2.cursor.sh/aiserver.v1.DashboardService/GetCurrentPeriodUsage', {
+  const requestOptions = {
     method: 'POST',
     headers: {
       Authorization: `Bearer ${auth.token}`,
       'Connect-Protocol-Version': '1',
     },
     body: {},
-  });
+    timeoutMs: Math.max(1000, Math.min(5000, Number(options.requestTimeoutMs) || 4000)),
+  };
+  const requestAttempts = Math.max(1, Math.min(2, Number(options.requestAttempts) || 2));
+  const requestFailures = [];
+  let usage;
+  for (let attempt = 1; attempt <= requestAttempts; attempt += 1) {
+    try {
+      usage = await requester(
+        'https://api2.cursor.sh/aiserver.v1.DashboardService/GetCurrentPeriodUsage',
+        requestOptions,
+      );
+      break;
+    } catch (error) {
+      const code = safeText(error?.code, 60) || 'unavailable';
+      requestFailures.push(sourceAttempt('cursor_usage_connect', 'failed', { code }));
+      if (code !== 'timeout' || attempt >= requestAttempts) throw error;
+    }
+  }
   const planUsage = usage?.planUsage || null;
   const source = auth.storageSource === 'python_sqlite' ? 'python_sqlite_connect' : 'local_auth_connect';
+  const accountScope = planLabel('cursor', auth.membership);
+  const financials = normalizeCursorFinancials(usage, {
+    observedAt: Date.now(), accountScope, source,
+  });
   const resetAt = isoTimestamp(usage?.billingCycleEnd);
   const windows = [];
   if (planUsage) {
@@ -1106,25 +1478,80 @@ async function collectCursor(fingerprintKey, options = {}) {
   return {
     account_fingerprint: accountFingerprint(auth.email || 'cursor-local', fingerprintKey),
     account_label: maskEmail(auth.email) || 'Local Cursor account',
-    plan: planLabel('cursor', auth.membership),
+    plan: accountScope,
     account_metadata: auth.subscriptionStatus ? { subscription_status: safeText(auth.subscriptionStatus, 40) } : null,
     source,
-    source_history: auth.storageSource === 'python_sqlite'
-      ? [sourceAttempt('node_sqlite', 'failed', { code: 'sqlite_unavailable' }), sourceAttempt('python_sqlite_connect', 'ok')]
-      : [sourceAttempt('local_auth_connect', 'ok')],
+    source_history: [
+      ...(auth.storageSource === 'python_sqlite'
+        ? [sourceAttempt('node_sqlite', 'failed', { code: 'sqlite_unavailable' }), sourceAttempt('python_sqlite_connect', 'ok')]
+        : [sourceAttempt('local_auth_connect', 'ok')]),
+      ...requestFailures,
+      sourceAttempt('cursor_usage_connect', 'ok'),
+    ],
     windows,
-    credits: planUsage ? {
-      enabled: true,
-      used: safeNumber(planUsage.totalSpend) == null ? null : safeNumber(planUsage.totalSpend) / 100,
-      included: safeNumber(planUsage.includedSpend) == null ? null : safeNumber(planUsage.includedSpend) / 100,
-      bonus: safeNumber(planUsage.bonusSpend) == null ? null : safeNumber(planUsage.bonusSpend) / 100,
-      limit: safeNumber(planUsage.limit) == null ? null : safeNumber(planUsage.limit) / 100,
-      currency: 'USD',
-      period: 'Billing cycle',
-      resets_at: resetAt,
-    } : null,
+    credits: null,
+    financials,
     reset_credits: null,
     request_count: 1,
+  };
+}
+
+async function collectOllama(fingerprintKey, options = {}) {
+  const requester = options.requester || requestLoopbackJson;
+  const receiptReader = options.receiptReader || readOllamaRequestReceipts;
+  const [running, installed, requestReceiptsValue] = await Promise.all([
+    requester('/api/ps', options),
+    requester('/api/tags', options),
+    Promise.resolve(receiptReader(options)),
+  ]);
+  const runningModels = (Array.isArray(running?.models) ? running.models : []).slice(0, 64).map(model => ({
+    name: safeText(model?.name || model?.model, 160) || 'Unnamed local model',
+    size_bytes: Math.max(0, safeNumber(model?.size) || 0),
+    size_vram_bytes: Math.max(0, safeNumber(model?.size_vram) || 0),
+    context_length: Math.max(0, safeNumber(model?.context_length) || 0),
+    expires_at: isoTimestamp(model?.expires_at),
+  }));
+  const installedCount = Array.isArray(installed?.models) ? installed.models.length : 0;
+  const requestReceipts = (Array.isArray(requestReceiptsValue) ? requestReceiptsValue : [])
+    .map(normalizePersistedOllamaReceipt)
+    .filter(Boolean)
+    .slice(-MAX_OLLAMA_REQUEST_RECEIPTS);
+  const latestReceipt = requestReceipts.at(-1) || null;
+  return {
+    account_fingerprint: accountFingerprint('ollama-loopback-runtime', fingerprintKey),
+    account_label: 'Loopback runtime',
+    plan: 'Local models',
+    source: 'loopback_api',
+    source_history: [
+      sourceAttempt('ollama_api_ps', 'ok'),
+      sourceAttempt('ollama_api_tags', 'ok'),
+      ...(latestReceipt ? [sourceAttempt('ollama_owned_request_receipt', 'ok')] : []),
+    ],
+    windows: [],
+    credits: null,
+    financials: null,
+    local_runtime: {
+      status: 'running',
+      endpoint_scope: 'loopback_only',
+      installed_models_count: installedCount,
+      loaded_models_count: runningModels.length,
+      loaded_models: runningModels,
+      prompt_tokens: latestReceipt?.prompt_tokens ?? null,
+      response_tokens: latestReceipt?.response_tokens ?? null,
+      tokens_per_second: latestReceipt?.tokens_per_second ?? null,
+      total_duration_ns: latestReceipt?.total_duration_ns ?? null,
+      load_duration_ns: latestReceipt?.load_duration_ns ?? null,
+      prompt_eval_duration_ns: latestReceipt?.prompt_eval_duration_ns ?? null,
+      eval_duration_ns: latestReceipt?.eval_duration_ns ?? null,
+      observed_request_count: requestReceipts.length,
+      request_receipts: requestReceipts,
+      telemetry_status: latestReceipt ? 'observed_owned_requests' : 'not_observed',
+      telemetry_reason: latestReceipt
+        ? 'Only explicit owned terminal response receipts are counted; Ollama exposes no historical request totals.'
+        : 'Ollama exposes no historical request totals; only explicit owned terminal response receipts are counted.',
+    },
+    reset_credits: null,
+    request_count: 2,
   };
 }
 
@@ -1191,15 +1618,23 @@ class ProviderUsageRegistry {
     this.pollIntervalMs = Math.max(60_000, Number(options.pollIntervalMs) || DEFAULT_POLL_INTERVAL_MS);
     this.staleAfterMs = Math.max(this.pollIntervalMs, Number(options.staleAfterMs) || DEFAULT_STALE_AFTER_MS);
     this.fingerprintKey = localFingerprintKey(options.fingerprintKey);
+    const suppliedCollectors = options.collectors && typeof options.collectors === 'object'
+      ? options.collectors
+      : null;
+    this.explicitCollectorKeys = new Set(Object.keys(suppliedCollectors || {}));
+    this.collectAlwaysProviders = options.collectAlwaysProviders == null
+      ? suppliedCollectors == null
+      : options.collectAlwaysProviders === true;
     this.collectors = {
       codex: options.collectors?.codex || (() => collectCodex(this.fingerprintKey)),
       claude: options.collectors?.claude || (() => collectClaude(this.fingerprintKey)),
-      antigravity: options.collectors?.antigravity || (() => collectAntigravity(
+      antigravity: options.collectors?.antigravity || (async () => collectAntigravity(
         this.fingerprintKey,
-        this.getAntigravityQuota(),
+        await this.getAntigravityQuota(),
         this.machineLabel,
       )),
       cursor: options.collectors?.cursor || (() => collectCursor(this.fingerprintKey)),
+      ollama: options.collectors?.ollama || (() => collectOllama(this.fingerprintKey)),
     };
     this.random = typeof options.random === 'function' ? options.random : Math.random;
     this.now = typeof options.now === 'function' ? options.now : Date.now;
@@ -1226,7 +1661,10 @@ class ProviderUsageRegistry {
       key,
       provider,
       mapped: mappedProviderSessions(sessions, provider),
-    })).filter(entry => entry.mapped.session_count > 0);
+    })).filter(entry => entry.mapped.session_count > 0 || (
+      entry.provider.always_collect === true
+      && (this.collectAlwaysProviders || this.explicitCollectorKeys.has(entry.key))
+    ));
   }
 
   snapshot(statusOverride = null) {
@@ -1265,6 +1703,8 @@ class ProviderUsageRegistry {
           stale_after: null,
           windows: [],
           credits: null,
+          financials: null,
+          local_runtime: null,
           reset_credits: null,
           error: failure.error,
           request_count: 0,
@@ -1303,6 +1743,19 @@ class ProviderUsageRegistry {
     return sanitized;
   }
 
+  _startCostRefresh() {
+    if (!this.costScanner || this.costInFlight) return this.costInFlight;
+    this.costAbortController = new AbortController();
+    const costRun = this.costScanner.refresh({ signal: this.costAbortController.signal }).catch(error => {
+      this.log('warn', `[usage] local estimated cost: ${safeText(error?.code || error?.message, 100) || 'unavailable'}`);
+    }).then(() => {
+      if (this.costInFlight === costRun) this.costInFlight = null;
+      return this.emit();
+    });
+    this.costInFlight = costRun;
+    return costRun;
+  }
+
   async refresh(options = {}) {
     const force = options.force === true;
     const cacheFresh = !force && this.lastCompletedAt && this.now() < this.nextRoutineAt;
@@ -1311,6 +1764,13 @@ class ProviderUsageRegistry {
     }
     const active = this.activeProviders();
     if (active.length === 0 && !this.costScanner) return this.emit();
+    if (options.waitForCost === false && this.costInFlight && this.costAbortController) {
+      // A client-correlated provider refresh has a 15-second receipt contract.
+      // Stop any older incremental transcript scan at its next bounded yield so
+      // it cannot contend with provider network/CDP callbacks. The durable cost
+      // checkpoint resumes on the next routine scan.
+      this.costAbortController.abort();
+    }
     let startedProvider = false;
     let startedCost = false;
     if (!this.providerInFlight && !cacheFresh) {
@@ -1338,7 +1798,8 @@ class ProviderUsageRegistry {
               thresholds: this.thresholds,
               now: this.now(),
             })).filter(Boolean);
-            if (windows.length === 0 && !result?.credits && !result?.reset_credits) {
+            if (windows.length === 0 && !result?.credits && !result?.reset_credits
+                && !result?.financials && !result?.local_runtime) {
               throw new ProviderUsageError('Provider returned no usable quota values.', { code: 'usage_not_reported' });
             }
             const fingerprint = safeText(result?.account_fingerprint, 80);
@@ -1369,6 +1830,8 @@ class ProviderUsageRegistry {
               stale_after: new Date(parsedCapturedAt + this.staleAfterMs).toISOString(),
               windows,
               credits: result.credits || null,
+              financials: result.financials || null,
+              local_runtime: result.local_runtime || null,
               reset_credits: result.reset_credits || null,
               error: null,
               request_count: Math.max(0, Number(result.request_count) || 0),
@@ -1406,21 +1869,23 @@ class ProviderUsageRegistry {
       });
       this.providerInFlight = providerRun;
     }
+    let deferredCostRun = null;
     if (this.costScanner && !this.costInFlight && !cacheFresh) {
       startedCost = true;
-      this.costAbortController = new AbortController();
-      const costRun = this.costScanner.refresh({ signal: this.costAbortController.signal }).catch(error => {
-        this.log('warn', `[usage] local estimated cost: ${safeText(error?.code || error?.message, 100) || 'unavailable'}`);
-      }).then(() => {
-        if (this.costInFlight === costRun) this.costInFlight = null;
-        return this.emit();
-      });
-      this.costInFlight = costRun;
+      // Provider APIs and the local transcript-cost scan are independent.
+      // Let network/CDP quota collection settle first so JSONL aggregation
+      // cannot starve its callbacks past the correlated 15-second receipt.
+      deferredCostRun = this.providerInFlight
+        ? this.providerInFlight.then(() => this._startCostRefresh())
+        : this._startCostRefresh();
     }
     if ((startedProvider || startedCost) && (this.lastGood.size > 0 || this.currentErrors.size > 0)) {
       this.emit(startedProvider ? 'refreshing' : null);
     }
-    const pending = [this.providerInFlight, this.costInFlight].filter(Boolean);
+    const pending = [
+      this.providerInFlight,
+      ...(options.waitForCost === false ? [] : [deferredCostRun || this.costInFlight]),
+    ].filter(Boolean);
     if (pending.length === 0) return this.snapshot();
     const requestRun = Promise.all(pending).then(() => this.snapshot()).finally(() => {
       if (this.inFlight === requestRun) this.inFlight = null;
@@ -1465,6 +1930,7 @@ module.exports = {
   ProviderUsageRegistry,
   SCHEMA_VERSION,
   accountFingerprint,
+  bindCodexAppServerInput,
   clampPercent,
   collectAntigravity,
   collectClaude,
@@ -1472,14 +1938,23 @@ module.exports = {
   collectClaudeOAuth,
   collectCodex,
   collectCursor,
+  collectOllama,
   codexWindows,
   claudeUsageWindows,
   maskEmail,
+  normalizeClaudeFinancials,
+  normalizeCursorFinancials,
   normalizedWindow,
   planLabel,
+  readOllamaRequestReceipts,
   parseClaudeCliUsage,
   relativeDurationMs,
   readCursorLocalAuth,
   runClaudeUsagePty,
   requestJson,
+  requestLoopbackJson,
+  normalizeOllamaTerminalReceipt,
+  ollamaReceiptStatePath,
+  validateProviderDashboardUrl,
+  writeOllamaRequestReceipt,
 };

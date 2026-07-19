@@ -94,6 +94,7 @@ function analyzeSourceMap(mapPath) {
   assert(Array.isArray(sourceMap.sources), 'export source map has no sources array');
   assert(Array.isArray(sourceMap.sourcesContent), 'export source map has no sourcesContent array');
   const firstParty = [];
+  const firstPartyAssets = [];
   const outside = [];
   for (let index = 0; index < sourceMap.sources.length; index += 1) {
     const source = String(sourceMap.sources[index] || '').replace(/\\/g, '/').replace(/^\u0000/, '');
@@ -102,6 +103,19 @@ function analyzeSourceMap(mapPath) {
     const resolved = path.resolve(ANDROID_ROOT, relative);
     if (!isInside(ANDROID_ROOT, resolved) || !fs.existsSync(resolved) || !fs.statSync(resolved).isFile()) {
       outside.push(source);
+      continue;
+    }
+    if (['.avif', '.gif', '.ico', '.jpeg', '.jpg', '.png', '.svg', '.webp']
+      .includes(path.extname(relative).toLowerCase())) {
+      const bytes = fs.readFileSync(resolved);
+      const mapped = sourceMap.sourcesContent[index];
+      assert(mapped == null || mapped === '', `binary asset unexpectedly embeds source text: ${source}`);
+      firstPartyAssets.push({
+        source,
+        path: path.relative(ROOT, resolved).replace(/\\/g, '/'),
+        bytes: bytes.length,
+        sha256: sha256(bytes),
+      });
       continue;
     }
     const disk = normalizedText(fs.readFileSync(resolved, 'utf8'));
@@ -130,6 +144,8 @@ function analyzeSourceMap(mapPath) {
     first_party_source_count: firstParty.length,
     first_party_source_roots: roots,
     first_party_source_tree_sha256: sourceTree.digest('hex'),
+    first_party_asset_sources: firstPartyAssets.sort((left, right) => left.path.localeCompare(right.path)),
+    first_party_asset_source_count: firstPartyAssets.length,
     outside_first_party_sources: outside,
   };
 }

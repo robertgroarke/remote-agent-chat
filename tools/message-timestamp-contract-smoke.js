@@ -77,6 +77,55 @@ for (const api of modules) {
   assert.notStrictEqual(absoluteA, absoluteB, 'DST duplicate hour needs a distinct accessible full value');
   assert.match(absoluteA, /PDT|Pacific Daylight Time/);
   assert.match(absoluteB, /PST|Pacific Standard Time/);
+  assert.match(absoluteA, /2025-11-02T08:30:00\.000Z/,
+    'accessible full timestamp must retain the exact machine-readable instant');
+
+  const sameDay = api.formatVisibleMessageTime(
+    api.parseMessageInstant('2026-07-15T11:12:00Z'),
+    new Date('2026-07-15T18:00:00Z'),
+    'en-US',
+  );
+  assert.strictEqual(sameDay, 'Jul 15, 4:12 AM',
+    'same-day visible timestamps must include an unambiguous calendar date');
+
+  const yesterday = api.formatVisibleMessageTime(
+    api.parseMessageInstant('2026-07-14T23:45:00Z'),
+    new Date('2026-07-15T18:00:00Z'),
+    'en-US',
+    'America/Los_Angeles',
+  );
+  assert.strictEqual(yesterday, 'Jul 14, 4:45 PM');
+
+  const crossMidnight = api.formatVisibleMessageTime(
+    api.parseMessageInstant('2026-07-16T07:15:00Z'),
+    new Date('2026-07-16T06:30:00Z'),
+    'en-US',
+    'America/Los_Angeles',
+  );
+  assert.strictEqual(crossMidnight, 'Jul 16, 12:15 AM');
+
+  const beforeDstGap = api.formatVisibleMessageTime(
+    api.parseMessageInstant('2025-03-09T09:30:00Z'),
+    new Date('2025-03-09T18:00:00Z'),
+    'en-US',
+    'America/Los_Angeles',
+  );
+  const afterDstGap = api.formatVisibleMessageTime(
+    api.parseMessageInstant('2025-03-09T10:30:00Z'),
+    new Date('2025-03-09T18:00:00Z'),
+    'en-US',
+    'America/Los_Angeles',
+  );
+  assert.strictEqual(beforeDstGap, 'Mar 9, 1:30 AM');
+  assert.strictEqual(afterDstGap, 'Mar 9, 3:30 AM');
+
+  const longLocale = api.formatVisibleMessageTime(
+    api.parseMessageInstant('2026-09-15T11:12:00Z'),
+    new Date('2026-09-15T18:00:00Z'),
+    'de-DE',
+    'America/Los_Angeles',
+  );
+  assert.match(longLocale, /15\. Sept\./);
 
   const oldYear = api.formatVisibleMessageTime(
     api.parseMessageInstant('2024-12-31T23:59:00Z'),
@@ -135,7 +184,8 @@ const missingTimeFrame = protocol.proxyMessage('timestamp-smoke', 'assistant', '
 assert.ok(!Object.hasOwn(missingTimeFrame, 'created_at'));
 assert.ok(!Object.hasOwn(missingTimeFrame, 'ts'));
 assert.match(relaySource, /function proxyMessageTimestampSeconds[\s\S]*:\s*0;/);
-assert.match(relaySource, /insertMessageIdempotent\(id, 'user', content, clientMsgId, 'delivered', seq, messageTs\)/);
+assert.match(relaySource,
+  /insertMessageIdempotent\(\s*id,\s*'user',\s*content,\s*clientMsgId,\s*'accepted',\s*seq,\s*messageTs\s*\)/);
 assert.match(relaySource, /const messageTs = clientMessageTs > 0|let messageTs = clientMessageTs > 0/);
 
 const contrastPairs = [

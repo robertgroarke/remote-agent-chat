@@ -7,6 +7,12 @@ const path = require('path');
 const { ProxyEngine } = require('../agent-proxy/proxy-engine');
 
 async function main() {
+  const proxySource = fs.readFileSync(path.join(__dirname, '..', 'agent-proxy', 'proxy-engine.js'), 'utf8');
+  assert(proxySource.includes('shouldDefer: () => this._hasLatencySensitiveQuestionWindow()'),
+    'Codex watcher parsing is not wholly deferred during the native question latency window');
+  assert(!proxySource.includes('CODEX_CLI_WATCH_QUESTION_DEFER_BYTES'),
+    'Codex watcher deferral still leaves a small-file exception during the native question latency window');
+
   const engine = Object.create(ProxyEngine.prototype);
   const sent = [];
   const logs = [];
@@ -102,6 +108,7 @@ async function main() {
     ts: index + 1,
   }));
   engine.sessions = new Map([[compactSessionId, { agentType: 'codex-desktop' }]]);
+  engine.activeQuestionPromptAdapters = new Map();
   engine._largeHistorySkipLogAt = new Map();
   bufferedAmount = 0;
   const compatibilitySize = engine._historySnapshotSizeInfo(
@@ -156,6 +163,46 @@ async function main() {
   }), true);
   assert.strictEqual(maintenanceCalls, 1, 'deferred maintenance must remain runnable after the control settles');
 
+  const questionSessionId = 'question-latency-maintenance';
+  engine.sessions.set(questionSessionId, {
+    session_id: questionSessionId,
+    agentType: 'codex',
+    _vscodeQuestionRemotePollUntil: Date.now() + 10000,
+  });
+  assert.strictEqual(await engine._runBackgroundMaintenanceStep('target discovery', async () => {
+    maintenanceCalls++;
+  }, { deferForQuestionLatency: true }), false);
+  assert.strictEqual(maintenanceCalls, 1,
+    'target discovery ran during the post-send native-question latency window');
+  engine.sessions.get(questionSessionId)._vscodeQuestionRemotePollUntil = 0;
+  engine.activeQuestionPromptAdapters.set(questionSessionId, { adapter_surface: 'codex' });
+  assert.strictEqual(await engine._runBackgroundMaintenanceStep('target discovery', async () => {
+    maintenanceCalls++;
+  }, { deferForQuestionLatency: true }), false);
+  assert.strictEqual(maintenanceCalls, 1, 'target discovery ran while a native question was open');
+  engine.activeQuestionPromptAdapters.delete(questionSessionId);
+  assert.strictEqual(await engine._runBackgroundMaintenanceStep('target discovery', async () => {
+    maintenanceCalls++;
+  }, { deferForQuestionLatency: true }), true);
+  assert.strictEqual(maintenanceCalls, 2, 'target discovery did not resume after the native question closed');
+
+  const desktopQuestionSessionId = 'desktop-question-latency-maintenance';
+  engine.sessions.set(desktopQuestionSessionId, {
+    session_id: desktopQuestionSessionId,
+    agentType: 'codex-desktop',
+    _codexDesktopQuestionRemotePollUntil: Date.now() + 10000,
+  });
+  assert.strictEqual(engine._isCodexDesktopQuestionLatencyWindow(desktopQuestionSessionId), true,
+    'Desktop post-send question latency window was not recognized before native card discovery');
+  assert.strictEqual(await engine._runBackgroundMaintenanceStep('CLI discovery', async () => {
+    maintenanceCalls++;
+  }, { deferForQuestionLatency: true }), false);
+  assert.strictEqual(maintenanceCalls, 2,
+    'CLI discovery ran during the Desktop post-send native-question latency window');
+  engine.sessions.get(desktopQuestionSessionId)._codexDesktopQuestionRemotePollUntil = 0;
+  assert.strictEqual(engine._isCodexDesktopQuestionLatencyWindow(desktopQuestionSessionId), false,
+    'Desktop question latency window did not close after its bounded deadline');
+
   if (engine._relayBulkFlushTimer) clearTimeout(engine._relayBulkFlushTimer);
   const result = {
     ok: true,
@@ -166,6 +213,7 @@ async function main() {
     compatibility_snapshot_bytes: compatibilitySize.bytes,
     compact_snapshot_bytes: compactSize.bytes,
     aged_large_snapshot_flushed: true,
+    question_latency_discovery_gate: true,
   };
   const outputIndex = process.argv.indexOf('--output');
   if (outputIndex >= 0 && process.argv[outputIndex + 1]) {

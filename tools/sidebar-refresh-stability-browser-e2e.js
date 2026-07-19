@@ -119,9 +119,9 @@ async function closeSocket(ws) {
   });
 }
 
-function fixtureSessions() {
+function fixtureSessions(count = SESSION_COUNT) {
   const base = Date.parse('2026-07-13T12:00:00Z');
-  return Array.from({ length: SESSION_COUNT }, (_, index) => {
+  return Array.from({ length: count }, (_, index) => {
     const projectName = index < 23 ? READABILITY_GROUP : `Project ${Math.floor(index / 23) + 1}`;
     const projectRoot = `C:\\production-shape\\${projectName}`;
     return {
@@ -137,6 +137,21 @@ function fixtureSessions() {
     health: 'connected',
     };
   });
+}
+
+function sendVisibleFixtureMessage(proxy, sessionId, index, createdAt, prefix = 'recent-seed') {
+  const sourceMessageId = `${prefix}-${String(index).padStart(3, '0')}`;
+  proxy.send(JSON.stringify({
+    type: 'proxy_message',
+    protocol_version: 1,
+    session: sessionId,
+    role: index % 3 === 0 ? 'tool_result' : index % 2 === 0 ? 'assistant' : 'user',
+    content: `Visible recent chat fixture ${prefix} ${index}`,
+    created_at: createdAt,
+    source: 'sidebar_recent_e2e',
+    source_message_id: sourceMessageId,
+  }));
+  return { sessionId, sourceMessageId, createdAt };
 }
 
 function sendStatus(proxy, session, { label, updatedAt, thinking = true, kind = 'working' }) {
@@ -162,10 +177,20 @@ async function captureSidebar(page) {
         return cardRect.bottom > listRect.top && cardRect.top < listRect.bottom;
       }).map(card => card.dataset.sessionId),
       cards: Object.fromEntries(cards.map(card => [card.dataset.sessionId, rect(card)])),
+      sectionBySession: Object.fromEntries(cards.map(card => [
+        card.dataset.sessionId,
+        card.closest('.working-session-group') ? 'working'
+          : card.closest('.recent-session-group') ? 'recent'
+            : card.closest('.pinned-session-group') ? 'pinned'
+              : card.closest('.session-group')?.querySelector('.session-group-name')?.textContent?.trim() || 'workspace',
+      ])),
       scrollTop: list?.scrollTop || 0,
       selectedTop: rect(document.querySelector('.session-card.active')).top,
       focusedSession: document.activeElement?.closest?.('[data-session-id]')?.dataset?.sessionId || null,
       nodeIdentityStable: cards.every(card => window.__RAC_SIDEBAR_STABILITY__?.nodes?.get(card.dataset.sessionId) === card),
+      remountedSessionIds: cards.filter(card => (
+        window.__RAC_SIDEBAR_STABILITY__?.nodes?.get(card.dataset.sessionId) !== card
+      )).map(card => card.dataset.sessionId),
       layoutShift: (window.__RAC_SIDEBAR_STABILITY__?.shifts || []).reduce((sum, entry) => sum + entry.value, 0),
       layoutShiftEntries: window.__RAC_SIDEBAR_STABILITY__?.shifts || [],
       ignoredNonSidebarShiftEntries: window.__RAC_SIDEBAR_STABILITY__?.ignoredShifts || [],
@@ -173,6 +198,50 @@ async function captureSidebar(page) {
         .map(node => getComputedStyle(node).animationName).filter(name => name && name !== 'none'))],
     };
   });
+}
+
+async function captureRecentOwnership(page) {
+  return page.evaluate(() => {
+    const list = document.querySelector('.session-list');
+    const cards = [...document.querySelectorAll('.session-card[data-session-id]')];
+    const recentSection = document.querySelector('.recent-session-group');
+    const recentCards = [...(recentSection?.querySelectorAll('.session-card[data-session-id]') || [])];
+    const sectionOf = card => card.closest('.working-session-group') ? 'working'
+      : card.closest('.recent-session-group') ? 'recent'
+        : card.closest('.pinned-session-group') ? 'pinned'
+          : card.closest('.session-group')?.querySelector('.session-group-name')?.textContent?.trim() || 'workspace';
+    return {
+      allIds: cards.map(card => card.dataset.sessionId),
+      uniqueIds: new Set(cards.map(card => card.dataset.sessionId)).size,
+      recent: recentCards.map(card => ({
+        id: card.dataset.sessionId,
+        at: card.dataset.lastMessageAt || null,
+        renderedTime: card.querySelector('time')?.textContent?.trim() || null,
+        dateTime: card.querySelector('time')?.getAttribute('datetime') || null,
+      })),
+      sections: Object.fromEntries(cards.map(card => [card.dataset.sessionId, sectionOf(card)])),
+      recentCount: Number(recentSection?.querySelector('.session-group-count')?.textContent || 0),
+      recentCollapsed: recentSection?.classList.contains('collapsed') || false,
+      scrollTop: list?.scrollTop || 0,
+      focusedSession: document.activeElement?.closest?.('.session-card[data-session-id]')?.dataset?.sessionId || null,
+      activeSession: document.querySelector('.session-card.active')?.dataset?.sessionId || null,
+      nodeIdentityStable: cards.every(card => window.__RAC_RECENT_STABILITY__?.nodes?.get(card.dataset.sessionId) === card),
+      remountedSessionIds: cards.filter(card => (
+        window.__RAC_RECENT_STABILITY__?.nodes?.get(card.dataset.sessionId) !== card
+      )).map(card => card.dataset.sessionId),
+      sidebarCls: (window.__RAC_RECENT_STABILITY__?.shifts || []).reduce((sum, entry) => sum + entry.value, 0),
+      mutationMoves: window.__RAC_RECENT_STABILITY__?.moves || 0,
+      scrollSamples: (window.__RAC_RECENT_STABILITY__?.scrollSamples || []).slice(-20),
+      mutationSamples: (window.__RAC_RECENT_STABILITY__?.mutationSamples || []).slice(-20),
+      visibleSectionOrder: [...document.querySelectorAll('.session-list > .session-group')]
+        .filter(group => getComputedStyle(group).display !== 'none')
+        .map(group => group.getAttribute('aria-label') || group.querySelector('.session-group-name')?.textContent?.trim() || ''),
+    };
+  });
+}
+
+function changedSectionIds(before, after) {
+  return Object.keys(before.sections).filter(id => after.sections[id] && before.sections[id] !== after.sections[id]);
 }
 
 async function measureSidebarReadability(page) {
@@ -435,6 +504,418 @@ function writeHalfBlendOverlay(beforePath, afterPath, outputPath) {
   fs.writeFileSync(outputPath, PNG.sync.write(overlay));
 }
 
+async function runRecentChatsMode({
+  page, context, proxy, sessions, port, seedMessages, transcriptRequests,
+  viewportText, colorScheme, zoomPercent, framesDir, pinsMode,
+}) {
+  const expectedSeedRecent = [19, 18, 17, 16, 15]
+    .map(index => `sidebar-session-${String(index).padStart(3, '0')}`);
+  await page.waitForFunction(expected => {
+    const ids = [...document.querySelectorAll('.recent-session-group .session-card[data-session-id]')]
+      .map(card => card.dataset.sessionId);
+    return JSON.stringify(ids) === JSON.stringify(expected);
+  }, expectedSeedRecent);
+
+  const coldLoad = await captureRecentOwnership(page);
+  assert.deepStrictEqual(coldLoad.recent.map(item => item.id), expectedSeedRecent);
+  assert.strictEqual(coldLoad.recentCount, 5);
+  assert.strictEqual(coldLoad.allIds.length, sessions.length);
+  assert.strictEqual(coldLoad.uniqueIds, sessions.length);
+  assert(coldLoad.recent.every(item => item.at && item.at === item.dateTime && item.renderedTime),
+    'Recent rows must render their canonical timestamps');
+  assert.deepStrictEqual(coldLoad.visibleSectionOrder.slice(0, 2), ['Working now', 'Recent chats']);
+
+  const visual = await page.evaluate(expectPinnedRecent => {
+    const section = document.querySelector('.recent-session-group');
+    const list = document.querySelector('.session-list');
+    const sidebar = document.querySelector('.sidebar');
+    const cards = [...(section?.querySelectorAll('.session-card[data-session-id]') || [])];
+    const within = (child, parent) => {
+      const childRect = child.getBoundingClientRect();
+      const parentRect = parent.getBoundingClientRect();
+      return childRect.left >= parentRect.left - 0.5 && childRect.right <= parentRect.right + 0.5;
+    };
+    return {
+      applied_theme: document.documentElement.getAttribute('data-theme'),
+      recent_accessible_name: section?.getAttribute('aria-label') || null,
+      toggle_accessible_name: section?.querySelector('.session-group-toggle')?.getAttribute('aria-label') || null,
+      cards_within_sidebar: !!sidebar && cards.every(card => within(card, sidebar)),
+      section_within_list: !!section && !!list && within(section, list),
+      document_horizontal_overflow_px: Math.max(0, document.documentElement.scrollWidth - document.documentElement.clientWidth),
+      title_line_clamps: cards.map(card => getComputedStyle(card.querySelector('.session-card-name')).webkitLineClamp),
+      pinned_recent_marker_preserved: expectPinnedRecent
+        ? !!section?.querySelector('.session-card[data-session-id="sidebar-session-018"].pinned')
+        : null,
+    };
+  }, pinsMode);
+  assert.strictEqual(visual.applied_theme, colorScheme);
+  assert.strictEqual(visual.recent_accessible_name, 'Recent chats');
+  assert.match(visual.toggle_accessible_name || '', /Recent chats/);
+  assert.strictEqual(visual.cards_within_sidebar, true);
+  assert.strictEqual(visual.section_within_list, true);
+  assert.strictEqual(visual.document_horizontal_overflow_px, 0);
+  assert(visual.title_line_clamps.every(value => value === '2'), 'Recent titles must retain the two-line clamp');
+  visual.timestamp_metrics = [];
+  for (const sessionId of expectedSeedRecent) {
+    const card = page.locator(`.recent-session-group .session-card[data-session-id="${sessionId}"]`);
+    await card.evaluate(node => node.scrollIntoView({ block: 'center' }));
+    await page.evaluate(() => new Promise(resolve => requestAnimationFrame(() => requestAnimationFrame(resolve))));
+    visual.timestamp_metrics.push(await card.evaluate(node => {
+      const time = node.querySelector('time');
+      const style = time ? getComputedStyle(time) : null;
+      return {
+        session_id: node.dataset.sessionId,
+        text: time?.textContent?.trim() || null,
+        width: time ? Number(time.getBoundingClientRect().width.toFixed(3)) : 0,
+        display: style?.display || null,
+        visibility: style?.visibility || null,
+      };
+    }));
+  }
+  visual.timestamps_visible = visual.timestamp_metrics.every(item => (
+    !!item.text && item.width > 0 && item.display !== 'none' && item.visibility === 'visible'
+  ));
+  assert.strictEqual(visual.timestamps_visible, true, JSON.stringify(visual.timestamp_metrics));
+  if (pinsMode) assert.strictEqual(visual.pinned_recent_marker_preserved, true);
+  let visualFrame = null;
+  if (framesDir) {
+    fs.mkdirSync(framesDir, { recursive: true });
+    visualFrame = path.join(framesDir, `${viewportText}-${colorScheme}-${zoomPercent}pct-recent-chats.png`);
+    if (zoomPercent >= 200) {
+      await page.locator('.recent-session-group').evaluate(node => node.scrollIntoView({ block: 'start' }));
+      await page.evaluate(() => new Promise(resolve => requestAnimationFrame(() => requestAnimationFrame(resolve))));
+    } else {
+      await page.locator('.session-list').evaluate(node => { node.scrollTop = 0; });
+    }
+    await page.locator('.sidebar').screenshot({ path: visualFrame, animations: 'disabled' });
+  }
+  await page.locator('.session-list').evaluate(node => { node.scrollTop = 0; });
+
+  await page.locator('.recent-session-group .session-group-toggle').click();
+  assert.strictEqual((await captureRecentOwnership(page)).recentCollapsed, true);
+  const sidebarFilter = page.getByLabel('Filter sidebar sessions');
+  await sidebarFilter.fill('Stable card 18');
+  await page.waitForFunction(() => (
+    [...document.querySelectorAll('.recent-session-group .session-card[data-session-id]')]
+      .filter(card => card.getBoundingClientRect().height > 0).length === 1
+  ));
+  assert.strictEqual((await captureRecentOwnership(page)).recentCollapsed, false,
+    'search must temporarily reveal a collapsed Recent section');
+  await page.getByLabel('Clear sidebar filter').click();
+  assert.strictEqual((await captureRecentOwnership(page)).recentCollapsed, true,
+    'clearing search must restore the durable collapse state');
+  await page.locator('.recent-session-group .session-group-toggle').click();
+
+  await page.locator('.session-card[data-session-id="sidebar-session-018"] .session-card-manage').focus();
+  await page.waitForTimeout(100);
+  await page.evaluate(() => {
+    const sidebar = document.querySelector('.sidebar');
+    const state = {
+      nodes: new Map([...document.querySelectorAll('.session-card[data-session-id]')]
+        .map(card => [card.dataset.sessionId, card])),
+      shifts: [],
+      moves: 0,
+      scrollSamples: [],
+      mutationSamples: [],
+    };
+    const shiftObserver = new PerformanceObserver(list => {
+      for (const entry of list.getEntries()) {
+        if (entry.hadRecentInput) continue;
+        const sources = entry.sources || [];
+        if (sources.length === 0 || sources.some(source => sidebar?.contains(source.node))) {
+          state.shifts.push({ value: entry.value, at: entry.startTime });
+        }
+      }
+    });
+    shiftObserver.observe({ type: 'layout-shift', buffered: false });
+    const moveObserver = new MutationObserver(records => {
+      for (const record of records) {
+        const changed = [...record.addedNodes, ...record.removedNodes].some(node => (
+          node.nodeType === Node.ELEMENT_NODE
+          && (node.matches?.('[data-sidebar-card-host]') || node.querySelector?.('[data-sidebar-card-host]'))
+        ));
+        if (changed) {
+          state.moves += 1;
+          state.mutationSamples.push({
+            at: performance.now(),
+            scrollTop: document.querySelector('.session-list')?.scrollTop || 0,
+            focusedSession: document.activeElement?.closest?.('[data-session-id]')?.dataset?.sessionId || null,
+          });
+        }
+      }
+    });
+    const list = document.querySelector('.session-list');
+    moveObserver.observe(list, { childList: true, subtree: true });
+    const recordScroll = () => state.scrollSamples.push({
+      at: performance.now(),
+      scrollTop: list.scrollTop,
+      focusedSession: document.activeElement?.closest?.('[data-session-id]')?.dataset?.sessionId || null,
+    });
+    list.addEventListener('scroll', recordScroll, { passive: true });
+    state.shiftObserver = shiftObserver;
+    state.moveObserver = moveObserver;
+    window.__RAC_RECENT_STABILITY__ = state;
+  });
+
+  const stormBefore = await captureRecentOwnership(page);
+  const transcriptRequestsBeforeStorm = transcriptRequests.length;
+  const stormStartedAt = Date.now();
+  const tickMs = 100;
+  const stormDurationIndex = process.argv.indexOf('--recent-storm-ms');
+  const requestedStormMs = stormDurationIndex === -1 ? 60_000 : Number(process.argv[stormDurationIndex + 1]);
+  assert(Number.isFinite(requestedStormMs) && requestedStormMs >= 1_000, '--recent-storm-ms must be at least 1000');
+  const totalTicks = Math.ceil(requestedStormMs / tickMs);
+  const burstStarts = Array.from({ length: 10 }, (_, index) => (
+    Math.floor(((index + 1) * totalTicks) / 11) - 5
+  ));
+  let inventorySnapshots = 0;
+  let duplicateReplays = 0;
+  let activityFrames = 0;
+  let clientReconnects = 0;
+  const refreshStableWorking = () => {
+    for (let workingIndex = 0; workingIndex < 3; workingIndex += 1) {
+      sendStatus(proxy, `sidebar-session-${String(workingIndex).padStart(3, '0')}`, {
+        label: `Stable work ${workingIndex + 1}`,
+        updatedAt: new Date(Date.now() - workingIndex).toISOString(),
+        thinking: true,
+        kind: 'working',
+      });
+    }
+  };
+  for (let tick = 0; tick < totalTicks; tick += 1) {
+    if (tick === 200 || tick === 400) {
+      await context.setOffline(true);
+      await page.waitForTimeout(120);
+      await context.setOffline(false);
+      clientReconnects += 1;
+    }
+    if (tick % 10 === 0) {
+      const seed = seedMessages[tick / 10 % seedMessages.length];
+      sendVisibleFixtureMessage(
+        proxy,
+        seed.sessionId,
+        Number(seed.sessionId.slice(-3)),
+        seed.createdAt,
+        'recent-seed',
+      );
+      duplicateReplays += 1;
+      sendStatus(proxy, 'sidebar-session-040', {
+        label: `Idle heartbeat ${tick / 10}`,
+        updatedAt: new Date(Date.now()).toISOString(),
+        thinking: false,
+        kind: 'idle',
+      });
+      refreshStableWorking();
+      activityFrames += 4;
+    }
+    const burst = burstStarts.some(start => tick >= start && tick < start + 10);
+    if (tick % 10 === 0 || burst) {
+      proxy.send(JSON.stringify({
+        type: 'session_list', protocol_version: 1, proxy_id: 'sidebar-stability-e2e',
+        sessions: sessions.map((session, index) => ({
+          ...session,
+          last_seen_at: new Date(Date.now() + index).toISOString(),
+        })),
+      }));
+      inventorySnapshots += 1;
+    }
+    const nextTickAt = stormStartedAt + (tick + 1) * tickMs;
+    const delay = nextTickAt - Date.now();
+    if (delay > 0) await new Promise(resolve => setTimeout(resolve, delay));
+  }
+  await page.waitForTimeout(500);
+  const stormAfter = await captureRecentOwnership(page);
+  const stormDurationMs = Date.now() - stormStartedAt;
+  assert(stormDurationMs >= requestedStormMs, `storm ended early at ${stormDurationMs}ms`);
+  assert.deepStrictEqual(stormAfter.recent, stormBefore.recent);
+  assert.deepStrictEqual(stormAfter.allIds, stormBefore.allIds);
+  assert.strictEqual(stormAfter.nodeIdentityStable, true);
+  assert.strictEqual(stormAfter.remountedSessionIds.length, 0);
+  assert.strictEqual(stormAfter.sidebarCls, 0);
+  assert.strictEqual(stormAfter.scrollTop, stormBefore.scrollTop,
+    `sidebar scroll drifted: ${JSON.stringify({
+      before: stormBefore.scrollTop,
+      after: stormAfter.scrollTop,
+      scrollSamples: stormAfter.scrollSamples,
+      mutationMoves: stormAfter.mutationMoves,
+      mutationSamples: stormAfter.mutationSamples,
+    })}`);
+  assert.strictEqual(stormAfter.focusedSession, stormBefore.focusedSession);
+  assert.strictEqual(stormAfter.activeSession, stormBefore.activeSession);
+  assert.strictEqual(stormAfter.mutationMoves, 0);
+  assert.strictEqual(transcriptRequests.length - transcriptRequestsBeforeStorm, 0);
+
+  await page.evaluate(() => {
+    window.__RAC_RECENT_STABILITY__.shifts = [];
+    window.__RAC_RECENT_STABILITY__.moves = 0;
+  });
+  const messageTransitions = [];
+  const messageEventBase = Date.now();
+  for (let index = 0; index < 10; index += 1) {
+    refreshStableWorking();
+    const target = `sidebar-session-${String(20 + index).padStart(3, '0')}`;
+    if (index === 0) {
+      await page.locator(`.session-card[data-session-id="${target}"]`).scrollIntoViewIfNeeded();
+      await page.locator(`.session-card[data-session-id="${target}"] .session-card-manage`).focus();
+    }
+    const before = await captureRecentOwnership(page);
+    const createdAt = new Date(messageEventBase + index * 1_000).toISOString();
+    const sentAt = Date.now();
+    sendVisibleFixtureMessage(proxy, target, 20 + index, createdAt, 'recent-transition');
+    sendStatus(proxy, 'sidebar-session-040', {
+      label: `Message flush ${index}`,
+      updatedAt: new Date().toISOString(),
+      thinking: false,
+      kind: 'idle',
+    });
+    await page.waitForFunction(({ targetId, timestamp }) => {
+      const first = document.querySelector('.recent-session-group .session-card[data-session-id]');
+      return first?.dataset.sessionId === targetId && first?.dataset.lastMessageAt === timestamp;
+    }, { targetId: target, timestamp: createdAt }, { timeout: 2_000 });
+    const latencyMs = Date.now() - sentAt;
+    const after = await captureRecentOwnership(page);
+    const changed = changedSectionIds(before, after);
+    assert.strictEqual(changed.length, 2, `message ${index + 1} changed ${changed.length} sections`);
+    assert.strictEqual(after.nodeIdentityStable, true,
+      `message ${index + 1} remounted ${after.remountedSessionIds.join(',')}`);
+    assert.strictEqual(after.uniqueIds, sessions.length);
+    assert(latencyMs <= 2_000, `message ${index + 1} latency ${latencyMs}ms`);
+    if (index === 0) assert.strictEqual(after.focusedSession, target, 'focused row lost focus while entering Recent');
+    messageTransitions.push({ target, created_at: createdAt, latency_ms: latencyMs, changed_section_ids: changed });
+  }
+
+  const workingTransitions = [];
+  const workingTargets = [29, 28, 27, 26, 25]
+    .map(index => `sidebar-session-${String(index).padStart(3, '0')}`);
+  for (const target of workingTargets) {
+    refreshStableWorking();
+    const beforeStart = await captureRecentOwnership(page);
+    const startSentAt = Date.now();
+    sendStatus(proxy, target, {
+      label: 'Recent edge working', updatedAt: new Date().toISOString(), thinking: true, kind: 'working',
+    });
+    await page.waitForFunction(targetId => (
+      !!document.querySelector(`.working-session-group .session-card[data-session-id="${targetId}"]`)
+    ), target, { timeout: 2_000 });
+    const startLatencyMs = Date.now() - startSentAt;
+    const afterStart = await captureRecentOwnership(page);
+    const startChanged = changedSectionIds(beforeStart, afterStart);
+    assert.strictEqual(startChanged.length, 2, `working start for ${target} changed ${startChanged.length} sections`);
+    assert.strictEqual(afterStart.nodeIdentityStable, true);
+
+    const stopSentAt = Date.now();
+    sendStatus(proxy, target, {
+      label: 'Recent edge idle', updatedAt: new Date().toISOString(), thinking: false, kind: 'idle',
+    });
+    await page.waitForFunction(targetId => (
+      !!document.querySelector(`.recent-session-group .session-card[data-session-id="${targetId}"]`)
+    ), target, { timeout: 2_000 });
+    const afterStop = await captureRecentOwnership(page);
+    const stopChanged = changedSectionIds(afterStart, afterStop);
+    assert.strictEqual(stopChanged.length, 2, `working stop for ${target} changed ${stopChanged.length} sections`);
+    assert.strictEqual(afterStop.nodeIdentityStable, true);
+    workingTransitions.push({
+      target,
+      start_latency_ms: startLatencyMs,
+      stop_latency_ms: Date.now() - stopSentAt,
+      start_changed_section_ids: startChanged,
+      stop_changed_section_ids: stopChanged,
+    });
+  }
+  assert(workingTransitions.every(item => item.start_latency_ms <= 2_000 && item.stop_latency_ms <= 2_000));
+
+  const canonicalBeforeSearch = await captureRecentOwnership(page);
+  await sidebarFilter.fill('Stable card 28');
+  await page.waitForFunction(() => (
+    [...document.querySelectorAll('.recent-session-group .session-card[data-session-id]')]
+      .filter(card => card.getBoundingClientRect().height > 0).length === 1
+  ));
+  const filteredRecentIds = await page.locator('.recent-session-group .session-card[data-session-id]')
+    .evaluateAll(cards => cards.filter(card => card.getBoundingClientRect().height > 0).map(card => card.dataset.sessionId));
+  await page.getByLabel('Clear sidebar filter').click();
+  const canonicalAfterSearch = await captureRecentOwnership(page);
+  assert.deepStrictEqual(filteredRecentIds, ['sidebar-session-028']);
+  assert.deepStrictEqual(canonicalAfterSearch.recent, canonicalBeforeSearch.recent);
+  assert.strictEqual(canonicalAfterSearch.nodeIdentityStable, true);
+
+  await page.locator('.recent-session-group .session-group-toggle').click();
+  const collapsedBeforeReload = await captureRecentOwnership(page);
+  assert.strictEqual(collapsedBeforeReload.recentCollapsed, true);
+  const recentBeforeReload = collapsedBeforeReload.recent;
+  const transcriptRequestsBeforeReload = transcriptRequests.length;
+  await page.reload({ waitUntil: 'networkidle' });
+  await page.waitForFunction(count => document.querySelectorAll('.session-card[data-session-id]').length === count, sessions.length);
+  const reconnectColdLoad = await captureRecentOwnership(page);
+  assert.strictEqual(reconnectColdLoad.recentCollapsed, true);
+  assert.deepStrictEqual(reconnectColdLoad.recent, recentBeforeReload);
+
+  const result = {
+    status: 'PASS',
+    mode: 'recent-chats',
+    actual_relay: true,
+    actual_built_bundle: true,
+    production_shape_sessions: sessions.length,
+    viewport: viewportText,
+    color_scheme: colorScheme,
+    zoom_percent: zoomPercent,
+    visual: {
+      ...visual,
+      frame: visualFrame
+        ? path.relative(path.join(__dirname, '..'), visualFrame).replace(/\\/g, '/')
+        : null,
+    },
+    cold_load: coldLoad,
+    storm: {
+      requested_duration_ms: requestedStormMs,
+      measured_duration_ms: stormDurationMs,
+      inventory_snapshots: inventorySnapshots,
+      ten_hz_bursts: burstStarts.length,
+      duplicate_stable_id_replays: duplicateReplays,
+      activity_frames: activityFrames,
+      client_reconnects: clientReconnects,
+      row_moves: 0,
+      group_moves: 0,
+      remounts: stormAfter.remountedSessionIds.length,
+      sidebar_cls: stormAfter.sidebarCls,
+      scroll_drift_px: Math.abs(stormAfter.scrollTop - stormBefore.scrollTop),
+      transcript_fetch_fan_out: transcriptRequests.length - transcriptRequestsBeforeStorm,
+      node_identity_stable: stormAfter.nodeIdentityStable,
+      keyboard_focus_stable: stormAfter.focusedSession === stormBefore.focusedSession,
+      selected_chat_stable: stormAfter.activeSession === stormBefore.activeSession,
+    },
+    persisted_message_transitions: messageTransitions,
+    working_edges: workingTransitions.flatMap(item => [
+      { target: item.target, edge: 'start', latency_ms: item.start_latency_ms, changed_section_ids: item.start_changed_section_ids },
+      { target: item.target, edge: 'stop', latency_ms: item.stop_latency_ms, changed_section_ids: item.stop_changed_section_ids },
+    ]),
+    search: {
+      filtered_recent_ids: filteredRecentIds,
+      canonical_order_restored: true,
+      node_identity_stable: canonicalAfterSearch.nodeIdentityStable,
+    },
+    durable_collapse: {
+      before_reload: collapsedBeforeReload.recentCollapsed,
+      after_reload: reconnectColdLoad.recentCollapsed,
+    },
+    reconnect_cold_load: {
+      recent: reconnectColdLoad.recent,
+      transcript_requests_during_reload: transcriptRequests.length - transcriptRequestsBeforeReload,
+    },
+    visible_windows: 0,
+    protected_user_apps_touched: 0,
+    recorded_at: new Date().toISOString(),
+  };
+  const evidenceIndex = process.argv.indexOf('--evidence');
+  if (evidenceIndex !== -1) {
+    const evidencePath = process.argv[evidenceIndex + 1];
+    assert(evidencePath, '--evidence requires an output path');
+    fs.mkdirSync(path.dirname(path.resolve(evidencePath)), { recursive: true });
+    fs.writeFileSync(path.resolve(evidencePath), `${JSON.stringify(result, null, 2)}\n`);
+  }
+  console.log(JSON.stringify(result, null, 2));
+  return proxy;
+}
+
 async function main() {
   const viewportIndex = process.argv.indexOf('--viewport');
   const viewportText = viewportIndex === -1 ? '1440x900' : String(process.argv[viewportIndex + 1] || '1440x900');
@@ -458,6 +939,8 @@ async function main() {
   const fontSubstitution = process.argv.includes('--font-substitution');
   const disclosureOnly = process.argv.includes('--disclosure-only');
   const pinsMode = process.argv.includes('--pins');
+  const recentMode = process.argv.includes('--recent-chats');
+  const fixtureSessionCount = recentMode ? 79 : SESSION_COUNT;
   const framesIndex = process.argv.indexOf('--frames-dir');
   const framesDir = framesIndex === -1 ? null : path.resolve(process.argv[framesIndex + 1]);
   const port = await freePort();
@@ -488,21 +971,38 @@ async function main() {
   let proxy;
   let browser;
   let seededPinPreferences = [];
+  const seedMessages = [];
+  const transcriptRequests = [];
   try {
     await waitForHealth(port);
     proxy = await connectProxy(port, secret);
-    const sessions = fixtureSessions();
+    const sessions = fixtureSessions(fixtureSessionCount);
     proxy.send(JSON.stringify({ type: 'session_list', protocol_version: 1, proxy_id: 'sidebar-stability-e2e', sessions }));
     if (pinsMode) {
       for (const sessionId of PINNED_SESSION_IDS) {
         seededPinPreferences.push(await putSessionPreference(port, sessionId, { pinned: true }));
       }
     }
-    for (let index = 0; index < 5; index += 1) {
-      const updatedAt = new Date(Date.parse('2026-07-13T12:30:00Z') - index * 1_000).toISOString();
+    for (let index = 0; index < (recentMode ? 3 : 5); index += 1) {
+      const updatedAt = new Date((recentMode ? Date.now() : Date.parse('2026-07-13T12:30:00Z')) - index * 1_000).toISOString();
       sendStatus(proxy, `sidebar-session-${String(index).padStart(3, '0')}`, {
         label: `Initial work ${index + 1}`, updatedAt,
       });
+    }
+    if (recentMode) {
+      const seedBase = Date.now() - 120_000;
+      for (let index = 10; index < 20; index += 1) {
+        seedMessages.push(sendVisibleFixtureMessage(
+          proxy,
+          `sidebar-session-${String(index).padStart(3, '0')}`,
+          index,
+          new Date(seedBase + index * 1_000).toISOString(),
+          'recent-seed',
+        ));
+      }
+      proxy.send(JSON.stringify({
+        type: 'session_list', protocol_version: 1, proxy_id: 'sidebar-stability-e2e', sessions,
+      }));
     }
     await new Promise(resolve => setTimeout(resolve, 250));
 
@@ -519,17 +1019,40 @@ async function main() {
       hasTouch: touchMode,
       isMobile: touchMode,
     });
+    await context.addInitScript(theme => {
+      try { localStorage.setItem('remote-agent-chat-theme', theme); } catch {}
+    }, colorScheme);
     const page = await context.newPage();
+    page.on('request', request => {
+      if (/\/api\/sessions\/[^/]+\/messages(?:\?|$)/.test(request.url())) transcriptRequests.push(request.url());
+    });
+    page.on('websocket', socket => {
+      socket.on('framesent', event => {
+        try {
+          const payload = JSON.parse(String(event.payload || ''));
+          if (payload.type === 'get_history' || payload.type === 'history_request') {
+            transcriptRequests.push(`${payload.type}:${payload.session || payload.session_id || ''}`);
+          }
+        } catch { /* binary/non-JSON WebSocket frame */ }
+      });
+    });
     await page.goto(`http://127.0.0.1:${port}/`, { waitUntil: 'networkidle' });
     await page.evaluate(({ width, substituteFont }) => {
       document.documentElement.style.setProperty('--sidebar-w', `${width}px`);
       if (substituteFont) document.body.style.fontFamily = 'Georgia, "Times New Roman", serif';
     }, { width: sidebarWidth, substituteFont: fontSubstitution });
-    await page.waitForFunction(count => document.querySelectorAll('.session-card[data-session-id]').length === count, SESSION_COUNT);
+    await page.waitForFunction(count => document.querySelectorAll('.session-card[data-session-id]').length === count, fixtureSessionCount);
     if (viewport.width <= 640) {
       await page.locator('.hamburger').click();
       await page.locator('.sidebar.open').waitFor();
       await page.waitForTimeout(250);
+    }
+    if (recentMode) {
+      proxy = await runRecentChatsMode({
+        page, context, proxy, sessions, port, seedMessages, transcriptRequests,
+        viewportText, colorScheme, zoomPercent, framesDir, pinsMode,
+      });
+      return;
     }
     await page.locator('.session-list').evaluate(node => { node.scrollTop = 0; });
     if (pinsMode) {
@@ -1171,7 +1694,7 @@ async function main() {
     const removalVisibleIds = beforeRemoval.visibleOrder.filter(id => id !== removalId && afterRemoval.cards[id]);
     const removalVisibleDelta = maxRectDeltaForIds(beforeRemoval, afterRemoval, removalVisibleIds);
     if (removalVisibleDelta > 1 || !afterRemoval.nodeIdentityStable) {
-      structuralViolations.push(`removal above viewport lost its visual anchor (${removalVisibleDelta.toFixed(3)}px)`);
+      structuralViolations.push(`removal above viewport lost its visual anchor (${removalVisibleDelta.toFixed(3)}px; remounted=${afterRemoval.remountedSessionIds.map(id => `${id}:${beforeRemoval.sectionBySession[id]}->${afterRemoval.sectionBySession[id]}`).join(',')})`);
     }
 
     await page.locator(`.session-card[data-session-id="${SELECTED_SESSION_ID}"]`).scrollIntoViewIfNeeded();

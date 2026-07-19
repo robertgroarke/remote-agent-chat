@@ -1,6 +1,7 @@
 'use strict';
 
 const MAX_SYSTEM_POINTS = 900;
+const MAX_COMPACT_SYSTEM_POINTS = 60;
 const MAX_DETAIL_POINTS = 180;
 const MAX_SUMMARY_BYTES = 16 * 1024;
 const MAX_HISTORY_CHUNK_BYTES = 60 * 1024;
@@ -203,9 +204,12 @@ class HostResourceHistoryStore {
       state = { id: subscriberId, aggregateOnly: options.aggregateOnly === true, system: [], detail: [], detachedAt: null };
       this.subscribers.set(subscriberId, state);
     } else if (state.aggregateOnly !== (options.aggregateOnly === true)) {
-      state.system = [];
+      // System points are privacy-safe aggregate telemetry and remain valid
+      // across a detail-mode upgrade/downgrade. Detail rows are mode-bound:
+      // clear them so aggregate-only consumers never retain process data.
       state.detail = [];
       state.aggregateOnly = options.aggregateOnly === true;
+      if (state.aggregateOnly) state.system = state.system.slice(-MAX_COMPACT_SYSTEM_POINTS);
     }
     state.detachedAt = null;
     return state;
@@ -244,7 +248,8 @@ class HostResourceHistoryStore {
     let appended = 0;
     this.prune();
     for (const state of this.subscribers.values()) {
-      if (appendOrdered(state.system, point, MAX_SYSTEM_POINTS)) appended += 1;
+      const limit = state.aggregateOnly ? MAX_COMPACT_SYSTEM_POINTS : MAX_SYSTEM_POINTS;
+      if (appendOrdered(state.system, point, limit)) appended += 1;
     }
     return { point, appended };
   }
@@ -253,8 +258,8 @@ class HostResourceHistoryStore {
     let appended = 0;
     this.prune();
     for (const state of this.subscribers.values()) {
-      const detail = state.aggregateOnly ? aggregateOnlySnapshot(snapshot) : snapshot;
-      if (appendOrdered(state.detail, detail, MAX_DETAIL_POINTS)) appended += 1;
+      if (state.aggregateOnly) continue;
+      if (appendOrdered(state.detail, snapshot, MAX_DETAIL_POINTS)) appended += 1;
     }
     return appended;
   }
@@ -293,6 +298,7 @@ module.exports = {
   DETACHED_RETENTION_MS,
   HostResourceHistoryStore,
   MAX_DETAIL_POINTS,
+  MAX_COMPACT_SYSTEM_POINTS,
   MAX_HISTORY_CHUNK_BYTES,
   MAX_SUBSCRIBERS,
   MAX_SUMMARY_BYTES,

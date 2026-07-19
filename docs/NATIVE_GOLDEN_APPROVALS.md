@@ -33,22 +33,22 @@ harness, and cannot duplicate another source path within that harness.
 | Harness | Hashed native sources | Native-approved surfaces | Approved cases | Genuine pending cases | Natively inapplicable cases |
 |---------|-----------------------|--------------------------|---------------:|----------------------:|----------------------------:|
 | Claude Code | 5 dark + 5 light screenshots | 9 dark / 9 light blocks + both-theme layout/composer | 44 | 16 | 0 |
-| Codex extension | 7 dark + 4 light screenshots | 6 dark / 4 light blocks + both-theme current status/layout/composer + dark goal | 34 | 54 | 0 |
-| Codex Desktop | 4 hidden light screenshots | 8 blocks + 3 live statuses + light layout/composer | 26 | 62 | 0 |
+| Codex extension | 8 dark + 4 light screenshots | 7 dark / 4 light blocks + both-theme current status/layout/composer + dark goal | 36 | 52 | 0 |
+| Codex Desktop | 5 hidden light screenshots | 9 blocks + 3 live statuses + light layout/composer | 28 | 60 | 0 |
 | Cursor IDE | 4 dark + 2 light screenshots | 8 dark / 3 light blocks + both-theme layout/composer | 30 | 30 | 0 |
 | Continue | 1 dark + 1 light screenshot | both-theme markdown | 4 | 48 | 0 |
 | Antigravity v2 | 3 dark screenshots + 22-conversation retained taxonomy | 6 blocks | 12 | 36 | 4 |
 | Claude CLI | 6 dark TUI screenshots | 9 blocks | 18 | 4 | 30 |
-| Codex CLI | 1 dark TUI screenshot | 4 blocks + dark layout/composer | 12 | 30 | 46 |
+| Codex CLI | 2 dark TUI screenshots | 5 blocks + dark layout/composer | 14 | 28 | 46 |
 | Cursor CLI | 4 dark TUI screenshots | 7 blocks | 14 | 0 | 38 |
-| **Per-harness total** | **47** | | **194** | **280** | **118** |
+| **Per-harness total** | **50** | | **200** | **274** | **118** |
 
-<!-- native-golden-totals approved=194 pending=280 inapplicable=118 shared=4 total=596 -->
+<!-- native-golden-totals approved=200 pending=274 inapplicable=118 shared=4 total=596 -->
 
 Those 592 per-harness cases plus four shared sidebar source cases form the complete 596-case
 desktop/mobile, dark/light visual matrix. All 596 source pixel comparisons currently pass.
-The native ledger does not close WS4: the 280 genuinely pending cases still require matching
-native references. They comprise 56 dark / 53 light block families, 19 dark / 10 light
+The native ledger does not close WS4: the 274 genuinely pending cases still require matching
+native references. They comprise 54 dark / 52 light block families, 19 dark / 10 light
 live-status families, one dark layout family, and one dark composer family; every family has
 desktop and mobile cases.
 

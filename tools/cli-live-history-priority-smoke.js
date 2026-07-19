@@ -18,7 +18,7 @@ assert(proxySource.includes('resyncId') && proxySource.includes('minResyncInterv
   'mutation recovery must be identified and rate-limited');
 
 const codexCliSendSection = proxySource.slice(
-  proxySource.indexOf('_sendCodexCliMessage(session, content, sessionId)'),
+  proxySource.indexOf('_sendCodexCliMessage(session, content, sessionId'),
   proxySource.indexOf('// ─── Cursor CLI session helpers'),
 );
 assert(

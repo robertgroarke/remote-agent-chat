@@ -653,7 +653,7 @@ class HostResourceMonitor {
     for (const state of this.history.subscribers.values()) {
       if (state.detachedAt !== null) continue;
       this.onLivePoint(point, state.id);
-      if (detailCollected) this.onDetailSnapshot(state.detail.at(-1), state.id);
+      if (detailCollected && !state.aggregateOnly) this.onDetailSnapshot(state.detail.at(-1), state.id);
     }
     return true;
   }

@@ -2,6 +2,12 @@
 
 const IMAGE_REFERENCE_RE = /(?:!\[[^\]]*\]\([^)]+\)|\[File:\s*[^\]]+\]|\b(?:image|screenshot|screen\s*shot|capture)[\w .()[\]-]*\.(?:png|jpe?g|gif|webp|bmp|svg)\b)/gi;
 const ABSOLUTE_PATH_RE = /(?:[A-Za-z]:[\\/]|\\\\[^\\/\s]+[\\/]|\/(?:Users|home|mnt|var|tmp|etc|opt|workspace|workspaces)\/)[^\s"'<>)]{2,}/gi;
+const DURATION_ONLY_RE = /^(?=.*\d)(?:(?:\d+)\s*d\s*)?(?:(?:\d+)\s*h\s*)?(?:(?:\d+)\s*m\s*)?(?:(?:\d+)\s*s)?$/i;
+const DURATION_LIKE_RE = /^[+-]?\d+\s*[dhms]\b/i;
+const AGE_ONLY_RE = /^(?:just now|today|yesterday|(?:\d+|an?|one)\s+(?:seconds?|secs?|minutes?|mins?|hours?|hrs?|days?|weeks?|months?|years?)\s+ago)$/i;
+const GOAL_STATUS_ONLY_RE = /^(?:pursuing goal|paused goal|goal (?:paused|blocked|usage limited|rate limited|limited|budget limited|achieved|cancelled|canceled|stopped|failed)|idle|ready|connected|awaiting live update)$/i;
+const PLACEHOLDER_ONLY_RE = /^(?:no (?:recent message|current work|data|activity)(?: reported)?|unavailable|unknown|not available)$/i;
+const SURFACE_LABEL_ONLY_RE = /^(?:(?:antigravity|claude(?: code)?|cline|codex|continue|cursor|gemini|roo code)\s+(?:harness|workspace))$/i;
 
 const GENERIC_TITLE_KEYS = new Set([
   'agent', 'agentmanager', 'agentsession', 'antigravity', 'antigravitychat', 'antigravityv2',
@@ -24,6 +30,18 @@ function normalizedTitle(value) {
   return stringValue(value).replace(/\s+/g, ' ').trim();
 }
 
+function invalidIdentityTextReason(value) {
+  const text = normalizedTitle(value);
+  if (!text) return 'empty';
+  if (DURATION_ONLY_RE.test(text)) return 'duration_only';
+  if (DURATION_LIKE_RE.test(text)) return 'duration_malformed';
+  if (AGE_ONLY_RE.test(text)) return 'age_only';
+  if (GOAL_STATUS_ONLY_RE.test(text)) return 'status_only';
+  if (PLACEHOLDER_ONLY_RE.test(text)) return 'placeholder_only';
+  if (SURFACE_LABEL_ONLY_RE.test(text)) return 'surface_label_only';
+  return '';
+}
+
 function resetNoiseRegexes() {
   IMAGE_REFERENCE_RE.lastIndex = 0;
   ABSOLUTE_PATH_RE.lastIndex = 0;
@@ -32,6 +50,7 @@ function resetNoiseRegexes() {
 function isLowSignalChatTitle(value) {
   const text = normalizedTitle(value);
   if (!text) return true;
+  if (invalidIdentityTextReason(text)) return true;
   if (/^\[(?:attachment|file|image|screenshot)(?:\s*:[^\]]*)?\]$/i.test(text)) return true;
   if (/^new\s+(?:antigravity|claude|codex|continue|cursor|gemini|roo)(?:\s+(?:agent|chat|cli|code|desktop|ide|panel))*\s+(?:chat|conversation|session|thread)$/i.test(text)) return true;
   const hasAttachmentNoise = IMAGE_REFERENCE_RE.test(text) || ABSOLUTE_PATH_RE.test(text);
@@ -160,6 +179,7 @@ function mergeDurableChatTitleDetails(previousTitle, incomingTitle, {
 
 module.exports = {
   firstDurableTitle,
+  invalidIdentityTextReason,
   isLowSignalChatTitle,
   mergeDurableChatTitle,
   mergeDurableChatTitleDetails,

@@ -118,12 +118,26 @@ async function authenticateProxy(port, proxySecret, proxyId) {
   return socket;
 }
 
-async function openBrowser(port) {
+async function openClient(port, clientName = 'web') {
   const socket = await openSocket(`ws://127.0.0.1:${port}/client-ws`, {
-    headers: { Origin: `http://127.0.0.1:${port}` },
+    headers: {
+      Origin: `http://127.0.0.1:${port}`,
+      'User-Agent': clientName === 'android'
+        ? 'RemoteAgentChat-Android-FaultMatrix/1'
+        : 'RemoteAgentChat-Web-FaultMatrix/1',
+      'X-RAC-Fault-Client': clientName,
+    },
   });
   const ack = await socket.messages.wait(message => message.type === 'connection_ack');
-  return { ...socket, ack };
+  return { ...socket, ack, clientName };
+}
+
+async function openBrowser(port) {
+  return openClient(port, 'web');
+}
+
+async function openAndroid(port) {
+  return openClient(port, 'android');
 }
 
 function registerSession(proxy, sessionId) {
@@ -230,7 +244,8 @@ function directoryContains(root, needle) {
 
     const browserA = await openBrowser(port);
     const browserB = await openBrowser(port);
-    sockets.push(browserA.ws, browserB.ws);
+    const android = await openAndroid(port);
+    sockets.push(browserA.ws, browserB.ws, android.ws);
     const launchRequestId = 'question-e2e-plan-launch';
     browserA.ws.send(JSON.stringify({
       type: 'launch_session',
@@ -257,20 +272,47 @@ function directoryContains(root, needle) {
     proxy.ws.send(JSON.stringify(prompt));
     const visibleA = await browserA.messages.wait(message => message.type === 'question_prompt' && message.prompt_id === prompt.prompt_id);
     const visibleB = await browserB.messages.wait(message => message.type === 'question_prompt' && message.prompt_id === prompt.prompt_id);
+    const visibleAndroid = await android.messages.wait(message => message.type === 'question_prompt' && message.prompt_id === prompt.prompt_id);
     assert.strictEqual(visibleA.lifecycle, 'open');
     assert.strictEqual(visibleB.lifecycle, 'open');
+    assert.strictEqual(visibleAndroid.lifecycle, 'open');
     assert.ok(!JSON.stringify(visibleA).includes(secretAnswer));
 
+    android.ws.send(JSON.stringify({
+      ...answer(visibleAndroid, 'question-e2e-response-stale-generation'),
+      generation: `${visibleAndroid.generation}-stale`,
+    }));
+    const staleGenerationFailure = await android.messages.wait(message => (
+      message.command === 'question_response'
+      && message.request_id === 'question-e2e-response-stale-generation'
+    ));
+    assert.strictEqual(staleGenerationFailure.result, 'failed');
+    assert.strictEqual(staleGenerationFailure.error.code, 'stale_generation');
+
     browserA.ws.send(JSON.stringify(answer(visibleA, 'question-e2e-response-a')));
+    browserA.ws.send(JSON.stringify(answer(visibleA, 'question-e2e-response-a-duplicate-click')));
     browserB.ws.send(JSON.stringify(answer(visibleB, 'question-e2e-response-b')));
+    android.ws.send(JSON.stringify(answer(visibleAndroid, 'question-e2e-response-android')));
     const forwarded = await proxy.messages.wait(message => message.type === 'question_response' && message.prompt_id === prompt.prompt_id);
     assert.strictEqual(forwarded.answers[1].text, secretAnswer);
 
-    const duplicateFailure = await Promise.race([
-      browserA.messages.wait(message => message.command === 'question_response' && message.result === 'failed'),
-      browserB.messages.wait(message => message.command === 'question_response' && message.result === 'failed'),
+    await new Promise(resolve => setTimeout(resolve, 200));
+    const raceRequestIds = new Set([
+      'question-e2e-response-a',
+      'question-e2e-response-a-duplicate-click',
+      'question-e2e-response-b',
+      'question-e2e-response-android',
     ]);
-    assert.strictEqual(duplicateFailure.error.code, 'prompt_already_claimed');
+    const raceFailures = [browserA, browserB, android].flatMap(client => client.messages.frames.filter(message => (
+      message.command === 'question_response'
+      && message.result === 'failed'
+      && raceRequestIds.has(message.request_id)
+    )));
+    assert.strictEqual(raceFailures.length, 3, JSON.stringify(raceFailures));
+    raceFailures.forEach(failure => assert.ok(
+      ['prompt_already_claimed', 'duplicate_request_id'].includes(failure.error.code),
+      JSON.stringify(failure),
+    ));
 
     proxy.ws.send(JSON.stringify({
       type: 'agent_control_result',
@@ -292,10 +334,26 @@ function directoryContains(root, needle) {
       && message.prompt_id === prompt.prompt_id
       && message.lifecycle === 'answered'
     ));
+    const terminalAndroid = await android.messages.wait(message => (
+      message.type === 'question_prompt_state'
+      && message.prompt_id === prompt.prompt_id
+      && message.lifecycle === 'answered'
+    ));
     assert.ok(!JSON.stringify(terminalA).includes(secretAnswer));
     assert.ok(!JSON.stringify(terminalB).includes(secretAnswer));
+    assert.ok(!JSON.stringify(terminalAndroid).includes(secretAnswer));
     await new Promise(resolve => setTimeout(resolve, 150));
     assert.strictEqual(proxy.messages.count(message => message.type === 'question_response' && message.prompt_id === prompt.prompt_id), 1);
+
+    // Native frames may be duplicated or arrive after the terminal receipt.
+    // They must never resurrect the question or create another native answer.
+    proxy.ws.send(JSON.stringify(prompt));
+    proxy.ws.send(JSON.stringify(prompt));
+    await browserA.messages.wait(message => (
+      message.type === 'question_prompt_state'
+      && message.prompt_id === prompt.prompt_id
+      && message.lifecycle === 'answered'
+    ));
 
     const cancelPrompt = question(
       sessionId,
@@ -339,6 +397,61 @@ function directoryContains(root, needle) {
       && message.lifecycle === 'cancelled'
     ));
 
+    const replacedPrompt = question(
+      sessionId,
+      'question-e2e-prompt-replaced-001',
+      'question-e2e-generation-replaced-001',
+    );
+    const replacementPrompt = question(
+      sessionId,
+      'question-e2e-prompt-replacement-002',
+      'question-e2e-generation-replacement-002',
+    );
+    proxy.ws.send(JSON.stringify(replacedPrompt));
+    const visibleReplaced = await browserA.messages.wait(message => (
+      message.type === 'question_prompt' && message.prompt_id === replacedPrompt.prompt_id
+    ));
+    proxy.ws.send(JSON.stringify(replacementPrompt));
+    const replacedTerminal = await browserA.messages.wait(message => (
+      message.type === 'question_prompt_state'
+      && message.prompt_id === replacedPrompt.prompt_id
+      && message.lifecycle === 'cancelled'
+    ));
+    assert.strictEqual(replacedTerminal.error_code, 'replaced_by_native_prompt');
+    const visibleReplacement = await browserA.messages.wait(message => (
+      message.type === 'question_prompt' && message.prompt_id === replacementPrompt.prompt_id
+    ));
+    browserA.ws.send(JSON.stringify(answer(visibleReplaced, 'question-e2e-response-replaced-late')));
+    const replacedLateFailure = await browserA.messages.wait(message => (
+      message.command === 'question_response'
+      && message.request_id === 'question-e2e-response-replaced-late'
+    ));
+    assert.strictEqual(replacedLateFailure.result, 'failed');
+    assert.strictEqual(replacedLateFailure.error.code, 'prompt_already_claimed');
+    // Reordered duplicate frames for both identities retain their exact current state.
+    proxy.ws.send(JSON.stringify(replacedPrompt));
+    proxy.ws.send(JSON.stringify(replacementPrompt));
+    proxy.ws.send(JSON.stringify(replacementPrompt));
+    browserB.ws.send(JSON.stringify(answer(visibleReplacement, 'question-e2e-response-replacement')));
+    const forwardedReplacement = await proxy.messages.wait(message => (
+      message.type === 'question_response' && message.prompt_id === replacementPrompt.prompt_id
+    ));
+    proxy.ws.send(JSON.stringify({
+      type: 'agent_control_result',
+      protocol_version: 1,
+      request_id: forwardedReplacement.request_id,
+      session_id: sessionId,
+      command: 'question_response',
+      result: 'ok',
+      native_acknowledged: true,
+      lifecycle: 'answered',
+    }));
+    await browserA.messages.wait(message => (
+      message.type === 'question_prompt_state'
+      && message.prompt_id === replacementPrompt.prompt_id
+      && message.lifecycle === 'answered'
+    ));
+
     const openPrompt = question(sessionId, 'question-e2e-prompt-002', 'question-e2e-generation-002');
     proxy.ws.send(JSON.stringify(openPrompt));
     await browserA.messages.wait(message => message.type === 'question_prompt' && message.prompt_id === openPrompt.prompt_id);
@@ -360,18 +473,131 @@ function directoryContains(root, needle) {
       item.prompt_id === openPrompt.prompt_id && item.lifecycle === 'open'
     )));
 
+    // Android disconnect before submit preserves the open native question and
+    // reconnect hydration. The reconnected Android client can then answer it.
+    await closeSocket(android.ws);
+    const androidReconnect = await openAndroid(port);
+    sockets.push(androidReconnect.ws);
+    assert.ok(androidReconnect.ack.open_question_prompts?.some(item => (
+      item.prompt_id === openPrompt.prompt_id && item.lifecycle === 'open'
+    )));
+    androidReconnect.ws.send(JSON.stringify(answer(openPrompt, 'question-e2e-response-after-client-reconnect')));
+    const forwardedAfterClientReconnect = await proxyReconnect.messages.wait(message => (
+      message.type === 'question_response' && message.prompt_id === openPrompt.prompt_id
+    ));
+    proxyReconnect.ws.send(JSON.stringify({
+      type: 'agent_control_result',
+      protocol_version: 1,
+      request_id: forwardedAfterClientReconnect.request_id,
+      session_id: sessionId,
+      command: 'question_response',
+      result: 'ok',
+      native_acknowledged: true,
+      lifecycle: 'answered',
+    }));
+    await androidReconnect.messages.wait(message => (
+      message.type === 'question_prompt_state'
+      && message.prompt_id === openPrompt.prompt_id
+      && message.lifecycle === 'answered'
+    ));
+
+    // A proxy/relay disconnect after submit makes the in-flight answer
+    // terminal-failed. A late receipt from the reconnected proxy cannot turn it
+    // into success or resurrect the prompt.
+    const disconnectAfterSubmitPrompt = question(
+      sessionId,
+      'question-e2e-prompt-disconnect-after-submit',
+      'question-e2e-generation-disconnect-after-submit',
+    );
+    proxyReconnect.ws.send(JSON.stringify(disconnectAfterSubmitPrompt));
+    const visibleDisconnectAfterSubmit = await browserA.messages.wait(message => (
+      message.type === 'question_prompt'
+      && message.prompt_id === disconnectAfterSubmitPrompt.prompt_id
+    ));
+    browserA.ws.send(JSON.stringify(answer(
+      visibleDisconnectAfterSubmit,
+      'question-e2e-response-disconnect-after-submit',
+    )));
+    const forwardedDisconnectAfterSubmit = await proxyReconnect.messages.wait(message => (
+      message.type === 'question_response'
+      && message.prompt_id === disconnectAfterSubmitPrompt.prompt_id
+    ));
+    await closeSocket(proxyReconnect.ws);
+    const failedAfterDisconnect = await browserA.messages.wait(message => (
+      message.type === 'question_prompt_state'
+      && message.prompt_id === disconnectAfterSubmitPrompt.prompt_id
+      && message.lifecycle === 'failed'
+    ));
+    assert.strictEqual(failedAfterDisconnect.error_code, 'adapter_disconnected_during_submit');
+
+    const proxyAfterDisconnect = await authenticateProxy(port, proxySecret, 'question-e2e-proxy');
+    sockets.push(proxyAfterDisconnect.ws);
+    registerSession(proxyAfterDisconnect, sessionId);
+    proxyAfterDisconnect.ws.send(JSON.stringify({
+      type: 'agent_control_result',
+      protocol_version: 1,
+      request_id: forwardedDisconnectAfterSubmit.request_id,
+      session_id: sessionId,
+      command: 'question_response',
+      result: 'ok',
+      native_acknowledged: true,
+      lifecycle: 'answered',
+    }));
+    const rejectedLateReceipt = await browserA.messages.wait(message => (
+      message.type === 'agent_control_result'
+      && message.request_id === forwardedDisconnectAfterSubmit.request_id
+      && message.result === 'failed'
+    ));
+    assert.strictEqual(rejectedLateReceipt.error.code, 'question_receipt_not_pending');
+    proxyAfterDisconnect.ws.send(JSON.stringify(disconnectAfterSubmitPrompt));
+    await browserB.messages.wait(message => (
+      message.type === 'question_prompt_state'
+      && message.prompt_id === disconnectAfterSubmitPrompt.prompt_id
+      && message.lifecycle === 'failed'
+    ));
+
+    const terminalExpectations = new Map([
+      [prompt.prompt_id, 'answered'],
+      [cancelPrompt.prompt_id, 'cancelled'],
+      [replacedPrompt.prompt_id, 'cancelled'],
+      [replacementPrompt.prompt_id, 'answered'],
+      [openPrompt.prompt_id, 'answered'],
+      [disconnectAfterSubmitPrompt.prompt_id, 'failed'],
+    ]);
+    for (const [promptId, lifecycle] of terminalExpectations) {
+      assert.ok([browserA, browserB, browserReconnect, androidReconnect].some(client => (
+        client.messages.frames.some(message => (
+          message.type === 'question_prompt_state'
+          && message.prompt_id === promptId
+          && message.lifecycle === lifecycle
+        ))
+      )), `missing ${lifecycle} terminal for ${promptId}`);
+    }
+
     assert.ok(!output.value.includes(secretAnswer), 'secret appeared in relay logs');
     console.log(JSON.stringify({
       result: 'PASS',
-      native_question_forwards: 1,
+      prompts_exercised: terminalExpectations.size,
+      terminal_prompts: terminalExpectations.size,
+      native_question_forwards: 5,
       duplicate_native_answers: 0,
       wrong_session_answers: 0,
+      wrong_generation_answers: 0,
       false_success_receipts: 0,
       secret_log_hits: 0,
       two_tab_atomic_claim: true,
+      android_atomic_claim: true,
+      duplicate_click_rejected: true,
+      stale_generation_rejected: true,
+      reordered_duplicate_frames_deduplicated: true,
+      question_replacement_terminal: true,
       native_acknowledgement_required: true,
       cancel_contract_idempotent: true,
       open_prompt_reconnect_resurfaced: true,
+      client_disconnect_before_submit_resurfaced: true,
+      proxy_disconnect_after_submit_failed_closed: true,
+      late_receipt_after_proxy_reconnect_rejected: true,
+      stale_prompt_resurrections: 0,
       codex_cli_plan_launch_forwarded: true,
     }, null, 2));
   } finally {

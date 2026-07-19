@@ -752,6 +752,24 @@ async function evalInWorkbenchWebview(Runtime, webviewId, code) {
 async function evalInFrame(Runtime, code, options = {}) {
   const useAsync = !!options.awaitPromise;
   const webviewId = Runtime._webviewId || '';
+  if (Number.isInteger(options.contextId)) {
+    const result = await Runtime.evaluate({
+      expression: `(${useAsync ? 'async ' : ''}function() {
+        const d = document;
+        ${code}
+      })()`,
+      contextId: options.contextId,
+      returnByValue: true,
+      awaitPromise: useAsync,
+      silent: true,
+      userGesture: false,
+    });
+    if (result.exceptionDetails) {
+      const desc = result.exceptionDetails.exception?.description || result.exceptionDetails.text;
+      throw new Error(`JS exception: ${desc}`);
+    }
+    return result.result?.value ?? null;
+  }
   // If the session has a cached inner-frame contextId, evaluate directly
   // in that context to avoid accessing active-frame.contentDocument which
   // can trigger focus/scroll changes in Electron webviews.
@@ -1079,21 +1097,37 @@ async function detectThinking(Runtime, agentType) {
             if (lower === 'pursuing goal') return 'active';
             if (lower === 'paused goal') return 'paused';
             if (lower === 'goal blocked') return 'blocked';
-            if (lower === 'goal usage limited') return 'usageLimited';
-            if (lower === 'goal limited') return 'budgetLimited';
+            if (lower === 'goal usage limited' || lower === 'goal rate limited') return 'usageLimited';
+            if (lower === 'goal limited' || lower === 'goal budget limited') return 'budgetLimited';
             if (lower === 'goal achieved') return 'complete';
             if (lower === 'goal cancelled' || lower === 'goal canceled' || lower === 'goal stopped') return 'cancelled';
             if (lower === 'goal failed') return 'failed';
             return '';
           }
           function durationSeconds(text) {
-            var match = norm(text).match(/(?:(\\d+)h\\s*)?(?:(\\d+)m\\s*)?(\\d+)s\\b/i) ||
-              norm(text).match(/(?:(\\d+)h\\s*)?(\\d+)m\\b/i);
-            if (!match) return 0;
-            if (/s/i.test(match[0])) {
-              return (Number(match[1]) || 0) * 3600 + (Number(match[2]) || 0) * 60 + (Number(match[3]) || 0);
+            var value = norm(text);
+            var suffix = value.match(/(?:^|\\s)((?:\\d+\\s*[dhms]\\s*)+)$/i);
+            if (!suffix) return 0;
+            var tokens = Array.from(suffix[1].matchAll(/(\\d+)\\s*([dhms])/gi));
+            if (tokens.length === 0) return 0;
+            var order = { d: 0, h: 1, m: 2, s: 3 };
+            var multiplier = { d: 86400, h: 3600, m: 60, s: 1 };
+            var lastOrder = -1;
+            var total = 0;
+            for (var token of tokens) {
+              var unit = token[2].toLowerCase();
+              if (order[unit] <= lastOrder) return 0;
+              lastOrder = order[unit];
+              total += Number(token[1]) * multiplier[unit];
             }
-            return (Number(match[1]) || 0) * 3600 + (Number(match[2]) || 0) * 60;
+            return total;
+          }
+          function durationOnly(text) {
+            return /^(?:(?:\\d+)d\\s*)?(?:(?:\\d+)h\\s*)?(?:(?:\\d+)m\\s*)?(?:(?:\\d+)s)?$/i.test(norm(text)) &&
+              durationSeconds(text) > 0;
+          }
+          function durationLike(text) {
+            return /^[+-]?\\d+\\s*[dhms]\\b/i.test(norm(text));
           }
 
           var composer = d.querySelector('.ProseMirror, textarea[aria-label*="follow-up" i], textarea[placeholder*="follow-up" i]');
@@ -1155,7 +1189,7 @@ async function detectThinking(Runtime, agentType) {
               var text = candidate.text;
               if (!text || goalStatus(text)) return false;
               if (/^(edit goal|pause goal|resume goal|stop goal)$/i.test(text)) return false;
-              if (/^(?:(?:\\d+h\\s*)?(?:\\d+m\\s*)?\\d+s|(?:\\d+h\\s*)?\\d+m)$/i.test(text)) return false;
+              if (durationOnly(text) || durationLike(text)) return false;
               return text.length <= 300;
             }).sort(function(a, b) {
               return a.text.length - b.text.length;
@@ -2911,19 +2945,27 @@ const CODEX_READ_EXPR = `
     if (msgs.length > 0) return JSON.stringify(msgs);
   }
 
-  // Strategy 2: legacy class-based selectors (fallback)
-  var userEls = Array.from(d.querySelectorAll('.whitespace-pre-wrap'))
-    .filter(function(el) { return !!el.closest('[class*="items-end"]'); });
-
-  var assistantEls = Array.from(d.querySelectorAll('[class*="overflow-x-auto"]'))
+  // Strategy 2: stable message test ids plus legacy class-based fallbacks.
+  // Prefer the installed test-id host when both generations are nested so a
+  // single visible message can never be emitted twice.
+  var userEls = Array.from(d.querySelectorAll('[data-testid="user-message"], .whitespace-pre-wrap'))
     .filter(function(el) {
+      if (el.matches('[data-testid="user-message"]')) return true;
+      if (el.closest('[data-testid="user-message"]')) return false;
+      return !!el.closest('[class*="items-end"]');
+    });
+
+  var assistantEls = Array.from(d.querySelectorAll('[data-testid="assistant-message"], [class*="overflow-x-auto"]'))
+    .filter(function(el) {
+      if (el.matches('[data-testid="assistant-message"]')) return true;
+      if (el.closest('[data-testid="assistant-message"]')) return false;
       if (el.closest('[class*="items-end"]')) return false;
       var p = el.parentElement;
       while (p && p !== d.body) {
         if (p.className && typeof p.className === 'string' && p.className.includes('overflow-x-auto')) return false;
         p = p.parentElement;
       }
-      return !!(el.querySelector('p') || el.querySelector('li') || el.querySelector('pre'));
+      return !!(el.querySelector('p') || el.querySelector('li') || el.querySelector('pre') || (el.innerText || el.textContent || '').trim());
     });
 
   if (userEls.length === 0 && assistantEls.length === 0) return JSON.stringify([]);
@@ -2958,6 +3000,7 @@ const CODEX_READ_EXPR = `
         }
       }
       var content = parts.join('\\n').trim();
+      if (!content) content = (item.el.innerText || item.el.textContent || '').trim();
       if (content.length > 5) msgs.push({ role: 'assistant', content: content });
     }
   }
@@ -9208,10 +9251,10 @@ const READ_ANTIGRAVITY_MODEL_QUOTA_EXPR = `
   }
 
   var pageText = d.body ? (d.body.innerText || '') : '';
-  if (pageText.indexOf('MODEL QUOTA') === -1) return null;
+  if (!/MODEL QUOTA/i.test(pageText)) return null;
 
-  var creditsMatch = pageText.match(/Available AI Credits:\\s*(\\d+)/i);
-  var availableCredits = creditsMatch ? parseInt(creditsMatch[1], 10) : null;
+  var creditsMatch = pageText.match(/Available AI Credits:\\s*([\\d,.]+)/i);
+  var availableCredits = creditsMatch ? parseFloat(creditsMatch[1].replace(/,/g, '')) : null;
 
   var quotaRows = Array.from(d.querySelectorAll('.py-3')).filter(function(row) {
     return /Refreshes in/i.test(row.innerText || '');
@@ -9254,9 +9297,62 @@ const READ_ANTIGRAVITY_MODEL_QUOTA_EXPR = `
     };
   }).filter(Boolean);
 
+  var schemaVariant = 'model_rows_v1';
+  if (models.length === 0) {
+    var quotaHeading = Array.from(d.querySelectorAll('*')).find(function(el) {
+      return el.children.length === 0 && /^Model Quota$/i.test(cleanText(el.textContent || ''));
+    });
+    var quotaSection = quotaHeading && quotaHeading.closest
+      ? quotaHeading.closest('.space-y-2')
+      : null;
+    var groupHeadings = quotaSection
+      ? Array.from(quotaSection.querySelectorAll('h3'))
+      : [];
+    models = groupHeadings.flatMap(function(groupHeading) {
+      var card = groupHeading.closest ? groupHeading.closest('.bg-card') : null;
+      if (!card) return [];
+      var groupName = cleanText(groupHeading.textContent || '');
+      if (!groupName) return [];
+      var rows = Array.from(card.querySelectorAll('.py-2')).filter(function(row) {
+        return /(?:Weekly|Five Hour) Limit/i.test(row.innerText || '');
+      });
+      return rows.map(function(row) {
+        var limitElement = Array.from(row.querySelectorAll('*')).find(function(el) {
+          return /^(?:Weekly|Five Hour) Limit$/i.test(cleanText(el.textContent || ''));
+        });
+        var limitName = cleanText(limitElement && limitElement.textContent || '');
+        var percentElement = Array.from(row.querySelectorAll('span, div')).find(function(el) {
+          return /^\\d+(?:\\.\\d+)?%$/.test(cleanText(el.textContent || ''));
+        });
+        var remainingMatch = cleanText(percentElement && percentElement.textContent || '').match(/^(\\d+(?:\\.\\d+)?)%$/);
+        var percentRemaining = remainingMatch
+          ? Math.max(0, Math.min(100, parseFloat(remainingMatch[1])))
+          : null;
+        if (!limitName || percentRemaining == null) return null;
+        var rowText = cleanText(row.innerText || '');
+        var refreshMatch = rowText.match(/\\brefresh(?:es)? in\\s+(.+?)(?:[.!]|$)/i);
+        var progressCircle = Array.from(row.querySelectorAll('circle')).find(function(circle) {
+          return circle.getAttribute('stroke-dasharray');
+        });
+        return {
+          model: groupName + ' · ' + limitName,
+          quota_group: groupName,
+          quota_window: limitName,
+          refreshes_in: refreshMatch ? cleanText(refreshMatch[1]) : null,
+          percent_remaining: percentRemaining,
+          percent_used: Math.max(0, Math.min(100, 100 - percentRemaining)),
+          color: progressCircle ? getComputedStyle(progressCircle).stroke || null : null,
+        };
+      }).filter(Boolean);
+    });
+    schemaVariant = 'grouped_limits_v2';
+  }
+
   return JSON.stringify({
     available_ai_credits: availableCredits,
     models: models,
+    schema_variant: schemaVariant,
+    percentage_semantics: schemaVariant === 'grouped_limits_v2' ? 'remaining' : 'derived_from_remaining_bar',
     fetched_at: new Date().toISOString(),
   });
 `;
@@ -10671,6 +10767,7 @@ const CODEX_DESKTOP_QUESTION_EXPR = `
   var nativeThreadId = activeThreadRow
     ? String(activeThreadRow.getAttribute('data-app-action-sidebar-thread-id') || '').trim()
     : '';
+  var nativeThreadTitle = activeThreadRow ? cdqText(activeThreadRow) : '';
   var cards = Array.from(d.querySelectorAll('[class*="request-card"]')).filter(function(card) {
     if (!cdqVisible(card)) return false;
     var rows = Array.from(card.querySelectorAll('[role="radio"], [role="checkbox"]')).filter(cdqVisible);
@@ -10728,6 +10825,8 @@ const CODEX_DESKTOP_QUESTION_EXPR = `
   });
   return JSON.stringify({
     native_thread_id: nativeThreadId,
+    native_thread_title: nativeThreadTitle.substring(0, 240),
+    active_thread_proven: true,
     native_signature: signature,
     title: questionText.substring(0, 240),
     questions: [{
@@ -10869,7 +10968,38 @@ async function respondToCodexDesktopQuestion(Runtime, response, expected) {
   return { ok: false, native_attempted: true, retryable: false, code: 'native_question_not_acknowledged', detail: 'Native request card remained visible after the exact answer click' };
 }
 
+function codexVsCodeCanonicalChoiceLabel(nativeLabel, renderedText) {
+  var nativeValue = String(nativeLabel || '').replace(/\s+/g, ' ').trim();
+  var renderedValue = String(renderedText || '').replace(/\s+/g, ' ').trim()
+    .replace(/^\d+\s+/, '');
+  if (!nativeValue || !renderedValue) return null;
+  if (nativeValue === renderedValue) return renderedValue;
+  if (nativeValue === renderedValue + ' (Recommended)') return renderedValue;
+  return null;
+}
+
+function codexVsCodeQuestionPageIndex(counterValues, questionCount) {
+  if (!Number.isInteger(questionCount) || questionCount < 1 || questionCount > 3) return -1;
+  if (questionCount === 1) return 0;
+  const pages = new Set();
+  for (const value of Array.isArray(counterValues) ? counterValues : []) {
+    const match = String(value || '').trim().match(/^(\d+)\s+of\s+(\d+)$/i);
+    if (!match) continue;
+    const page = Number(match[1]);
+    const total = Number(match[2]);
+    if (total === questionCount && page >= 1 && page <= total) pages.add(page);
+  }
+  if (pages.size !== 1) return -1;
+  return [...pages][0] - 1;
+}
+
+const CODEX_VSCODE_CANONICAL_CHOICE_LABEL_SOURCE = codexVsCodeCanonicalChoiceLabel.toString();
+const CODEX_VSCODE_QUESTION_PAGE_INDEX_SOURCE = codexVsCodeQuestionPageIndex.toString();
+const CODEX_VSCODE_EXACT_RESPONSE_VERSION = '26.707.91948';
+
 const CODEX_VSCODE_QUESTION_EXPR = `
+  ${CODEX_VSCODE_CANONICAL_CHOICE_LABEL_SOURCE}
+  ${CODEX_VSCODE_QUESTION_PAGE_INDEX_SOURCE}
   function cvqVisible(el) {
     if (!el || !el.isConnected || !el.getBoundingClientRect) return false;
     var style = getComputedStyle(el);
@@ -10912,10 +11042,12 @@ const CODEX_VSCODE_QUESTION_EXPR = `
     }
     return identity;
   }
-  function cvqChoice(row, index) {
-    var label = String(row.getAttribute('aria-label') || '').trim();
+  function cvqChoice(row, index, nativeOption) {
+    var nativeLabel = String(nativeOption && nativeOption.label || '').trim();
+    var ariaLabel = String(row.getAttribute('aria-label') || '').trim();
     var full = cvqText(row).replace(/^\\d+\\s+/, '');
-    if (!label) label = full.split(/\\s{2,}/)[0] || full;
+    var label = codexVsCodeCanonicalChoiceLabel(nativeLabel, full);
+    var ariaMatches = !ariaLabel || ariaLabel === nativeLabel || ariaLabel === label;
     var description = String(row.getAttribute('aria-description') || '').trim();
     if (!description) {
       description = full;
@@ -10925,12 +11057,13 @@ const CODEX_VSCODE_QUESTION_EXPR = `
     }
     return {
       choice_id: 'vscode-choice-' + (index + 1),
-      label: label.substring(0, 240),
+      label: String(label || '').substring(0, 240),
       description: description.substring(0, 1000),
       selected: row.getAttribute('aria-checked') === 'true' || row.getAttribute('aria-selected') === 'true',
       requires_text: false,
       is_other: false,
-      native_role: row.getAttribute('role') || ''
+      native_role: row.getAttribute('role') || '',
+      native_label_matches: !!label && ariaMatches
     };
   }
   var cards = Array.from(d.querySelectorAll('[class*="request-card"]')).filter(function(card) {
@@ -10954,23 +11087,15 @@ const CODEX_VSCODE_QUESTION_EXPR = `
   if (disabledRows.length > 0) {
     return JSON.stringify({ error: 'native_question_controls_disabled', count: disabledRows.length });
   }
-  var heading = Array.from(card.querySelectorAll('[class*="font-medium"], h1, h2, h3, h4, [role="heading"]'))
-    .find(function(el) {
-      var value = cvqText(el);
-      return cvqVisible(el) && value && !rows.some(function(row) { return row.contains(el); });
-    });
-  var questionText = cvqText(heading) || String(nativeQuestion.question || '').trim();
-  if (!questionText) {
-    var firstRowText = rows.length ? cvqText(rows[0]) : '';
-    var fullCardText = cvqText(card);
-    questionText = firstRowText ? fullCardText.split(firstRowText)[0].trim() : fullCardText;
-  }
-  if (!questionText) return JSON.stringify({ error: 'question_text_missing' });
-  var currentQuestionIndex = identity.questions.findIndex(function(question) {
-    return String(question && question.question || '').trim() === questionText;
-  });
+  var counterValues = Array.from(card.querySelectorAll('span, div')).filter(cvqVisible).map(cvqText);
+  var currentQuestionIndex = codexVsCodeQuestionPageIndex(counterValues, identity.questions.length);
   if (currentQuestionIndex < 0) {
-    return JSON.stringify({ error: 'native_question_page_mismatch', question: questionText.substring(0, 240) });
+    return JSON.stringify({ error: 'native_question_page_counter_ambiguous' });
+  }
+  var questionText = String(identity.questions[currentQuestionIndex]
+    && identity.questions[currentQuestionIndex].question || '').trim();
+  if (!questionText || cvqText(card).indexOf(questionText) === -1) {
+    return JSON.stringify({ error: 'native_question_page_mismatch', question_index: currentQuestionIndex });
   }
   var header = String((identity.questions[0] || {}).header || questionText).trim();
   var otherInput = Array.from(card.querySelectorAll('textarea, input[type="text"], input:not([type])'))
@@ -10978,9 +11103,11 @@ const CODEX_VSCODE_QUESTION_EXPR = `
   var otherPlaceholder = otherInput ? String(otherInput.getAttribute('placeholder') || '').trim() : '';
   var nativeOptions = Array.isArray(identity.questions[currentQuestionIndex].options)
     ? identity.questions[currentQuestionIndex].options : [];
-  var visibleChoices = rows.map(cvqChoice);
+  var visibleChoices = rows.map(function(row, index) {
+    return cvqChoice(row, index, nativeOptions[index]);
+  });
   if (nativeOptions.length !== visibleChoices.length || nativeOptions.some(function(option, index) {
-    return String(option && option.label || '').trim() !== visibleChoices[index].label;
+    return !visibleChoices[index].native_label_matches;
   })) {
     return JSON.stringify({ error: 'native_question_options_mismatch', question_index: currentQuestionIndex });
   }
@@ -11047,9 +11174,7 @@ const CODEX_VSCODE_QUESTION_EXPR = `
         other: question && question.isOther === true,
         secret: question && question.isSecret === true
       };
-    }),
-    cancel: !!skip,
-    deadline_ms: identity.deadline_ms,
+    })
   });
   var nativeDeadlineMs = Number(identity.deadline_ms);
   var deadlineRemaining = Number.isFinite(nativeDeadlineMs)
@@ -11075,9 +11200,9 @@ const CODEX_VSCODE_QUESTION_EXPR = `
   });
 `;
 
-async function detectCodexVsCodeQuestion(Runtime) {
+async function detectCodexVsCodeQuestion(Runtime, options = {}) {
   try {
-    const raw = await evalInFrame(Runtime, CODEX_VSCODE_QUESTION_EXPR);
+    const raw = await evalInFrame(Runtime, CODEX_VSCODE_QUESTION_EXPR, options);
     if (!raw) return null;
     const parsed = typeof raw === 'string' ? JSON.parse(raw) : raw;
     return parsed;
@@ -11299,19 +11424,95 @@ function codexVsCodeQuestionNativeAction(response, expected) {
       }
       nativeActions.push({ kind: 'other', text: otherText, question_index: questionIndex, question: question.message });
     } else {
-      nativeActions.push({ kind: 'choice', label: choice.label, question_index: questionIndex, question: question.message });
+      nativeActions.push({
+        kind: 'choice',
+        label: choice.label,
+        question_index: questionIndex,
+        question: question.message,
+      });
     }
   }
   return { ok: true, action, nativeActions };
+}
+
+async function waitForCodexVsCodeQuestionAcknowledgement(Runtime, {
+  expected,
+  action,
+  submissionPath,
+  timeoutMs = 10000,
+  domQuietMs = 1500,
+  pollIntervalMs = 100,
+} = {}) {
+  const startedAt = Date.now();
+  const expectedLifecycle = action === 'cancel' ? 'cancelled' : 'answered';
+  while (Date.now() - startedAt <= timeoutMs) {
+    if (typeof expected?.readNativeResolution === 'function') {
+      let resolution = null;
+      try { resolution = await expected.readNativeResolution(); } catch {}
+      if (resolution?.error === 'native_answer_mismatch' || resolution?.answers_match === false) {
+        return { ok: false, native_attempted: true, retryable: false, code: 'native_answer_mismatch', detail: 'The native persisted response did not match the exact requested answer' };
+      }
+      if (resolution?.native_acknowledged === true) {
+        if (resolution.lifecycle !== expectedLifecycle || resolution.answers_match !== true) {
+          return { ok: false, native_attempted: true, retryable: false, code: 'native_lifecycle_mismatch', detail: 'The native persisted response did not match the requested lifecycle' };
+        }
+        return {
+          ok: true,
+          native_attempted: true,
+          native_acknowledged: true,
+          lifecycle: expectedLifecycle,
+          native_receipt: {
+            surface: 'codex',
+            submission_path: submissionPath,
+            receipt_path: 'native_jsonl_function_call_output',
+            conversation_unchanged: true,
+            turn_id: expected.native_turn_id,
+            request_card_disappeared: false,
+            native_resolution_persisted: true,
+            resolved_at: resolution.resolved_at || null,
+            answer_count: Number(resolution.answer_count || 0),
+            answers_match: true,
+            call_id_hash: resolution.call_id_hash || null,
+          },
+        };
+      }
+    }
+    if (Date.now() - startedAt >= domQuietMs) {
+      const followup = await detectCodexVsCodeQuestion(Runtime);
+      const followupState = codexVsCodeQuestionFollowupState(followup, expected);
+      if (followupState === 'disappeared') {
+        const conversationId = await readCodexVsCodeConversationId(Runtime);
+        if (conversationId !== expected.native_conversation_id) {
+          return { ok: false, native_attempted: true, retryable: false, code: 'native_conversation_changed', detail: 'The native conversation changed before acknowledgement' };
+        }
+        return {
+          ok: true,
+          native_attempted: true,
+          native_acknowledged: true,
+          lifecycle: expectedLifecycle,
+          native_receipt: {
+            surface: 'codex',
+            submission_path: submissionPath,
+            receipt_path: 'request_card_disappeared',
+            conversation_unchanged: true,
+            turn_id: expected.native_turn_id,
+            request_card_disappeared: true,
+          },
+        };
+      }
+      if (followupState === 'replaced') {
+        return { ok: false, native_attempted: true, retryable: false, code: 'native_question_replaced_before_ack', detail: 'The native request changed before exact acknowledgement' };
+      }
+    }
+    await new Promise(resolve => setTimeout(resolve, pollIntervalMs));
+  }
+  return { ok: false, native_attempted: true, retryable: false, code: 'native_question_not_acknowledged', detail: 'Native VS Code did not persist the exact response or remove the exact request card' };
 }
 
 async function respondToCodexVsCodeQuestion(Runtime, Input, response, expected) {
   if (!expected?.native_conversation_id || !expected?.native_turn_id
       || !expected?.native_request_id || !expected?.native_signature) {
     return { ok: false, native_attempted: false, retryable: false, code: 'question_identity_missing', detail: 'Native VS Code question identity is missing' };
-  }
-  if (!Input?.dispatchMouseEvent) {
-    return { ok: false, native_attempted: false, retryable: false, code: 'cdp_input_unavailable', detail: 'Trusted CDP input is unavailable' };
   }
   const current = await detectCodexVsCodeQuestion(Runtime);
   if (!current || current.error) {
@@ -11327,173 +11528,136 @@ async function respondToCodexVsCodeQuestion(Runtime, Input, response, expected) 
   const actionResult = codexVsCodeQuestionNativeAction(response, expected);
   if (!actionResult.ok) return actionResult;
   const { action, nativeActions } = actionResult;
-  if (nativeActions.some(nativeAction => nativeAction.kind === 'other')
-      && (!Input?.insertText || !Input?.dispatchKeyEvent)) {
-    return { ok: false, native_attempted: false, retryable: false, code: 'cdp_text_input_unavailable', detail: 'Trusted CDP text input is unavailable' };
+  if (expected.prompt?.source?.surface !== 'codex'
+      || expected.prompt?.source?.version !== CODEX_VSCODE_EXACT_RESPONSE_VERSION) {
+    return { ok: false, native_attempted: false, retryable: false, code: 'native_exact_response_version_mismatch', detail: 'Installed VS Code question response contract is not validated for this surface version' };
   }
 
-  const dispatchNativeAction = async nativeAction => {
-    const target = await evalInFrame(Runtime, `
-    var expectedConversationId = ${JSON.stringify(expected.native_conversation_id)};
-    var expectedTurnId = ${JSON.stringify(expected.native_turn_id)};
-    var expectedRequestId = ${JSON.stringify(expected.native_request_id)};
-    var expectedQuestion = ${JSON.stringify(nativeAction.question || expected.prompt?.questions?.[nativeAction.question_index]?.message || '')};
-    var nativeAction = ${JSON.stringify(nativeAction)};
-    function visible(el) {
-      if (!el || !el.isConnected || !el.getBoundingClientRect) return false;
-      var style = getComputedStyle(el);
-      var rect = el.getBoundingClientRect();
-      return style.display !== 'none' && style.visibility !== 'hidden'
-        && style.opacity !== '0' && rect.width > 0 && rect.height > 0;
-    }
-    function text(el) { return String(el && (el.innerText || el.textContent) || '').replace(/\\s+/g, ' ').trim(); }
-    function identity(el) {
-      var result = { conversation: '', turn: '', request: '' };
-      for (var node = el, nd = 0; node && nd < 14; node = node.parentElement, nd += 1) {
-        var key = Object.getOwnPropertyNames(node).find(function(name) { return name.indexOf('__reactFiber$') === 0; });
-        var fiber = key ? node[key] : null;
-        for (var fd = 0; fiber && fd < 20; fiber = fiber.return, fd += 1) {
-          var props = fiber.pendingProps || fiber.memoizedProps;
-          if (!props || typeof props !== 'object') continue;
-          var conversation = props.conversationId || props.browserConversationId;
-          if (!result.conversation && typeof conversation === 'string') result.conversation = conversation;
-          var request = props.request;
-          if (request && typeof request === 'object') {
-            if (!result.turn && typeof request.turnId === 'string') result.turn = request.turnId;
-            if (!result.request && request.requestId != null) result.request = String(request.requestId);
+  const dispatchNativeExactResponse = async () => {
+    const submitted = await evalInFrame(Runtime, `
+      var expectedConversationId = ${JSON.stringify(expected.native_conversation_id)};
+      var expectedTurnId = ${JSON.stringify(expected.native_turn_id)};
+      var expectedRequestId = ${JSON.stringify(expected.native_request_id)};
+      var expectedQuestions = ${JSON.stringify(expected.prompt.questions)};
+      var responseAction = ${JSON.stringify(action)};
+      var nativeActions = ${JSON.stringify(nativeActions)};
+      function visible(el) {
+        if (!el || !el.isConnected || !el.getBoundingClientRect) return false;
+        var rect = el.getBoundingClientRect();
+        var style = getComputedStyle(el);
+        return rect.width > 0 && rect.height > 0 && style.display !== 'none'
+          && style.visibility !== 'hidden' && style.opacity !== '0';
+      }
+      function text(el) { return String(el && (el.innerText || el.textContent) || '').replace(/\\s+/g, ' ').trim(); }
+      function identity(el) {
+        var result = { conversation: '', turn: '', request: '' };
+        for (var node = el, nd = 0; node && nd < 14; node = node.parentElement, nd += 1) {
+          var key = Object.getOwnPropertyNames(node).find(function(name) { return name.indexOf('__reactFiber$') === 0; });
+          var fiber = key ? node[key] : null;
+          for (var fd = 0; fiber && fd < 20; fiber = fiber.return, fd += 1) {
+            var props = fiber.pendingProps || fiber.memoizedProps;
+            if (!props || typeof props !== 'object') continue;
+            var conversation = props.conversationId || props.browserConversationId;
+            if (!result.conversation && typeof conversation === 'string') result.conversation = conversation;
+            var request = props.request;
+            if (request && typeof request === 'object') {
+              if (!result.turn && typeof request.turnId === 'string') result.turn = request.turnId;
+              if (!result.request && request.requestId != null) result.request = String(request.requestId);
+            }
           }
         }
+        return result;
       }
-      return result;
-    }
-    var cards = Array.from(d.querySelectorAll('[class*="request-card"]')).filter(function(card) {
-      if (!visible(card) || text(card).indexOf(expectedQuestion) === -1) return false;
-      var current = identity(card);
-      return current.conversation === expectedConversationId
-        && current.turn === expectedTurnId && current.request === expectedRequestId;
-    });
-    if (cards.length !== 1) return { ok: false, code: 'active-card-count', count: cards.length };
-    var control = null;
-    if (nativeAction.kind === 'cancel') {
-      control = Array.from(cards[0].querySelectorAll('button')).find(function(button) {
-        return visible(button) && text(button) === nativeAction.label;
-      }) || null;
-    } else if (nativeAction.kind === 'other') {
-      var textControls = Array.from(cards[0].querySelectorAll('textarea, input[type="text"], input:not([type])'))
-        .filter(visible);
-      if (textControls.length !== 1) return { ok: false, code: 'native-text-control-count', count: textControls.length };
-      control = textControls[0];
-      if (String(control.value || '')) return { ok: false, code: 'native-text-present' };
-    } else {
-      var matches = Array.from(cards[0].querySelectorAll('[role="radio"], [role="checkbox"]')).filter(function(row) {
-        return visible(row) && String(row.getAttribute('aria-label') || '').trim() === nativeAction.label;
+      var cards = Array.from(d.querySelectorAll('[class*="request-card"]')).filter(function(card) {
+        if (!visible(card) || text(card).indexOf(expectedQuestions[0].message) === -1) return false;
+        var current = identity(card);
+        return current.conversation === expectedConversationId
+          && current.turn === expectedTurnId && current.request === expectedRequestId;
       });
-      if (matches.length === 1) control = matches[0];
-    }
-    if (!control || control.disabled || control.getAttribute('aria-disabled') === 'true') {
-      return { ok: false, code: 'native-control-missing' };
-    }
-    var rect = control.getBoundingClientRect();
-    return {
-      ok: true,
-      action: nativeAction.kind,
-      bounds: { x: rect.x, y: rect.y, width: rect.width, height: rect.height }
-    };
-  `);
-  if (!target?.ok || !target.bounds?.width || !target.bounds?.height) {
-    return { ok: false, native_attempted: false, retryable: false, code: target?.code || 'native_control_missing', detail: 'Exact native VS Code question control was not available' };
-  }
-
-  const x = target.bounds.x + target.bounds.width / 2;
-  const y = target.bounds.y + target.bounds.height / 2;
-  try {
-    await Input.dispatchMouseEvent({ type: 'mouseMoved', x, y });
-    await Input.dispatchMouseEvent({ type: 'mousePressed', x, y, button: 'left', clickCount: 1 });
-    await new Promise(resolve => setTimeout(resolve, 60));
-    await Input.dispatchMouseEvent({ type: 'mouseReleased', x, y, button: 'left', clickCount: 1 });
-    if (nativeAction.kind === 'other') {
-      await Input.insertText({ text: nativeAction.text });
-      const textAccepted = await evalInFrame(Runtime, `
-        var expectedText = ${JSON.stringify(nativeAction.text)};
-        var controls = Array.from(d.querySelectorAll('[class*="request-card"] textarea, [class*="request-card"] input[type="text"], [class*="request-card"] input:not([type])'))
-          .filter(function(el) {
-            if (!el || !el.isConnected || !el.getBoundingClientRect) return false;
-            var rect = el.getBoundingClientRect();
-            var style = getComputedStyle(el);
-            return rect.width > 0 && rect.height > 0 && style.display !== 'none'
-              && style.visibility !== 'hidden' && style.opacity !== '0';
-          });
-        return controls.length === 1 && String(controls[0].value || '') === expectedText;
-      `);
-      if (textAccepted !== true) {
-        return { ok: false, native_attempted: true, retryable: false, code: 'native_text_not_acknowledged', detail: 'Native Other input did not acknowledge the exact text' };
+      if (cards.length !== 1) return { ok: false, code: 'active-card-count', count: cards.length };
+      var fiberKey = Object.getOwnPropertyNames(cards[0]).find(function(name) {
+        return name.indexOf('__reactFiber$') === 0;
+      });
+      var fiber = fiberKey ? cards[0][fiberKey] : null;
+      var candidates = [];
+      var seenSubmit = new Set();
+      for (var depth = 0; fiber && depth < 30; depth += 1, fiber = fiber.return) {
+        var propsList = [fiber.pendingProps, fiber.memoizedProps];
+        for (var props of propsList) {
+          if (!props || props.isImmediateResponse !== true
+              || !Array.isArray(props.questionAndOptions)
+              || typeof props.onSubmit !== 'function'
+              || typeof props.onEscapeDismiss !== 'function'
+              || seenSubmit.has(props.onSubmit)) continue;
+          seenSubmit.add(props.onSubmit);
+          candidates.push(props);
+        }
       }
-      await Input.dispatchKeyEvent({
-        type: 'keyDown', key: 'Enter', code: 'Enter', windowsVirtualKeyCode: 13,
-        nativeVirtualKeyCode: 13,
-      });
-      await Input.dispatchKeyEvent({
-        type: 'keyUp', key: 'Enter', code: 'Enter', windowsVirtualKeyCode: 13,
-        nativeVirtualKeyCode: 13,
-      });
+      if (candidates.length !== 1) {
+        return { ok: false, code: 'native-exact-response-handler-count', count: candidates.length };
+      }
+      var candidate = candidates[0];
+      if (candidate.questionAndOptions.length !== expectedQuestions.length) {
+        return { ok: false, code: 'native-exact-question-count' };
+      }
+      for (var questionIndex = 0; questionIndex < expectedQuestions.length; questionIndex += 1) {
+        if (String(candidate.questionAndOptions[questionIndex] && candidate.questionAndOptions[questionIndex].question || '').trim()
+            !== String(expectedQuestions[questionIndex].message || '').trim()) {
+          return { ok: false, code: 'native-exact-question-mismatch', question_index: questionIndex };
+        }
+      }
+      if (responseAction === 'cancel') {
+        candidate.onEscapeDismiss();
+        return { ok: true, response: 'cancel', submitted_questions: 0 };
+      }
+      if (nativeActions.length !== expectedQuestions.length) {
+        return { ok: false, code: 'native-exact-action-count' };
+      }
+      var answers = [];
+      for (var index = 0; index < nativeActions.length; index += 1) {
+        var nativeAction = nativeActions[index];
+        var question = candidate.questionAndOptions[index];
+        if (nativeAction.kind === 'choice') {
+          var matches = Array.isArray(question.options) ? question.options.filter(function(option) {
+            return String(option && option.id || '') === nativeAction.label;
+          }) : [];
+          if (matches.length !== 1) {
+            return { ok: false, code: 'native-exact-choice-count', question_index: index, count: matches.length };
+          }
+          answers.push({ selectedOptionId: nativeAction.label, freeformText: null });
+        } else if (nativeAction.kind === 'other' && question.isOther === true && nativeAction.text) {
+          answers.push({ selectedOptionId: null, freeformText: nativeAction.text });
+        } else {
+          return { ok: false, code: 'native-exact-action-unsupported', question_index: index };
+        }
+      }
+      candidate.onSubmit(answers);
+      return { ok: true, submitted_questions: answers.length };
+    `);
+    const expectedSubmittedQuestions = action === 'cancel' ? 0 : nativeActions.length;
+    if (!submitted?.ok || submitted.submitted_questions !== expectedSubmittedQuestions) {
+      return {
+        ok: false,
+        native_attempted: submitted?.ok === true,
+        retryable: false,
+        code: submitted?.code || 'native_exact_response_handler_missing',
+        detail: 'Installed VS Code exact question response handler was not available',
+      };
     }
-  } catch (error) {
-    return { ok: false, native_attempted: true, retryable: false, code: 'native_input_uncertain', detail: error.message };
-  }
     return { ok: true };
   };
 
-  for (let actionIndex = 0; actionIndex < nativeActions.length; actionIndex += 1) {
-    const dispatched = await dispatchNativeAction(nativeActions[actionIndex]);
-    if (!dispatched.ok) return dispatched;
-    if (actionIndex >= nativeActions.length - 1) continue;
+  const submitted = await dispatchNativeExactResponse();
+  if (!submitted.ok) return submitted;
+  const submissionPath = action === 'cancel'
+    ? 'installed_exact_dismiss_callback'
+    : 'installed_exact_submit_callback';
 
-    const expectedNextIndex = nativeActions[actionIndex + 1].question_index;
-    let advanced = false;
-    for (let attempt = 0; attempt < 100; attempt += 1) {
-      await new Promise(resolve => setTimeout(resolve, 50));
-      const followup = await detectCodexVsCodeQuestion(Runtime);
-      const followupState = codexVsCodeQuestionFollowupState(followup, expected);
-      if (followupState === 'replaced' || followupState === 'disappeared') {
-        return { ok: false, native_attempted: true, retryable: false, code: 'native_question_replaced_before_navigation', detail: 'The native request changed before the next question page' };
-      }
-      if (followupState === 'still_open' && followup.native_question_index === expectedNextIndex) {
-        advanced = true;
-        break;
-      }
-    }
-    if (!advanced) {
-      return { ok: false, native_attempted: true, retryable: false, code: 'native_question_navigation_not_acknowledged', detail: 'Native VS Code did not advance to the exact next question page' };
-    }
-  }
-
-  for (let attempt = 0; attempt < 100; attempt += 1) {
-    await new Promise(resolve => setTimeout(resolve, 50));
-    const followup = await detectCodexVsCodeQuestion(Runtime);
-    const followupState = codexVsCodeQuestionFollowupState(followup, expected);
-    if (followupState === 'disappeared') {
-      const conversationId = await readCodexVsCodeConversationId(Runtime);
-      if (conversationId !== expected.native_conversation_id) {
-        return { ok: false, native_attempted: true, retryable: false, code: 'native_conversation_changed', detail: 'The native conversation changed before acknowledgement' };
-      }
-      return {
-        ok: true,
-        native_attempted: true,
-        native_acknowledged: true,
-        lifecycle: action === 'cancel' ? 'cancelled' : 'answered',
-        native_receipt: {
-          surface: 'codex',
-          conversation_unchanged: true,
-          turn_id: expected.native_turn_id,
-          request_card_disappeared: true
-        }
-      };
-    }
-    if (followupState === 'replaced') {
-      return { ok: false, native_attempted: true, retryable: false, code: 'native_question_replaced_before_ack', detail: 'The native request changed before exact card-disappearance acknowledgement' };
-    }
-  }
-  return { ok: false, native_attempted: true, retryable: false, code: 'native_question_not_acknowledged', detail: 'Native VS Code request card remained visible after the exact answer click' };
+  return waitForCodexVsCodeQuestionAcknowledgement(Runtime, {
+    expected,
+    action,
+    submissionPath,
+  });
 }
 
 const PERMISSION_DIALOG_EXPR = `
@@ -16069,6 +16233,7 @@ module.exports = {
   // Structured Claude AskUserQuestion fixtures/validators.
   CODEX_DESKTOP_QUESTION_EXPR,
   CODEX_VSCODE_QUESTION_EXPR,
+  CODEX_VSCODE_EXACT_RESPONSE_VERSION,
   PERMISSION_DIALOG_EXPR,
   _claudeTerminalBlockFromParts,
   _buildQuestionAnswerExpr,
@@ -16090,8 +16255,11 @@ module.exports = {
   respondToPermissionDialog,
   respondToCodexDesktopQuestion,
   respondToCodexVsCodeQuestion,
+  waitForCodexVsCodeQuestionAcknowledgement,
   codexVsCodeQuestionFollowupState,
+  codexVsCodeQuestionPageIndex,
   codexVsCodeQuestionNativeAction,
+  codexVsCodeCanonicalChoiceLabel,
   readCodexVsCodeConversationId,
   respondToSessionErrorPrompt,
   sendMessage,

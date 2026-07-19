@@ -9,7 +9,10 @@ const { EventEmitter } = require('events');
 
 const tempRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'rac-proxy-codex-app-server-'));
 process.env.SESSION_STORE_PATH = path.join(tempRoot, 'session-store.json');
-const { ProxyEngine } = require('../agent-proxy/proxy-engine');
+const {
+  ProxyEngine,
+  shouldFastPollCodexCliSession,
+} = require('../agent-proxy/proxy-engine');
 const { canonicalQuestionPrompt } = require('../shared/question-prompt-contract');
 
 class FakeTurn extends EventEmitter {
@@ -28,6 +31,8 @@ class FakeTurn extends EventEmitter {
       error.code = 'owned_app_server_failed';
       throw error;
     }
+    this.threadId = 'native-thread';
+    this.turnId = 'native-turn';
     return {
       thread_id: 'native-thread',
       turn_id: 'native-turn',
@@ -62,11 +67,12 @@ function createHarness(fakeTurn) {
   engine.activePermissionPrompts = new Map();
   engine.sent = [];
   engine.logs = [];
+  engine.broadcasts = 0;
   engine._codexCliAppServerTurnFactory = () => fakeTurn;
   engine._findCodexCliSummaryByCliId = () => null;
   engine._sendToRelay = message => { engine.sent.push(message); return true; };
   engine._publishCodexCliConfig = () => {};
-  engine._broadcastSessionSnapshot = () => {};
+  engine._broadcastSessionSnapshot = () => { engine.broadcasts += 1; };
   engine._processMessageQueue = async () => {};
   engine._log = (level, message) => engine.logs.push({ level, message });
   return engine;
@@ -94,6 +100,10 @@ function settle() {
 }
 
 (async () => {
+  assert.strictEqual(shouldFastPollCodexCliSession({ agentType: 'codex_cli' }), false);
+  assert.strictEqual(shouldFastPollCodexCliSession({ agentType: 'codex_cli', _codexAppServerTurn: {} }), true);
+  assert.strictEqual(shouldFastPollCodexCliSession({ agentType: 'codex_cli', _codexCliChild: {} }), true);
+  assert.strictEqual(shouldFastPollCodexCliSession({ agentType: 'codex', _codexAppServerTurn: {} }), false);
   const fakeTurn = new FakeTurn();
   const engine = createHarness(fakeTurn);
   const sessionId = 'codex-cli-session';
@@ -117,6 +127,11 @@ function settle() {
   assert.strictEqual(result.native_receipt.transport, 'codex_app_server');
   assert.strictEqual(session.cliSessionId, 'native-thread');
   assert.strictEqual(session._codexAppServerTurn, fakeTurn);
+  assert.deepStrictEqual(session._codexAppServerLastTurnIdentity, {
+    thread_id: 'native-thread',
+    turn_id: 'native-turn',
+    process_epoch: result.process_epoch,
+  });
   assert.deepStrictEqual(fakeTurn.startCalls[0], {
     threadId: null,
     content: 'Ask a native question.',
@@ -157,14 +172,66 @@ function settle() {
   assert.strictEqual(answerReceipt.native_acknowledged, true);
   assert.strictEqual(session.activity.kind, 'generating');
 
-  fakeTurn.emit('turn_completed', {
-    thread_id: 'native-thread', turn_id: 'native-turn', status: 'completed',
-  });
+  assert.strictEqual(engine._observeCodexCliOwnedTurnCompletion(sessionId, session, {
+    cliSessionId: 'native-thread',
+    taskCompletedTurnId: 'different-turn',
+    taskCompletedAt: new Date().toISOString(),
+  }), false, 'a different JSONL turn must not release the owned app-server turn');
+  assert.strictEqual(session.activity.kind, 'generating');
+  session._codexAppServerTurnIdentity = null;
+  const idleStatusCount = () => engine.sent.filter(message =>
+    message.type === 'proxy_status' && message.activity?.kind === 'idle').length;
+  const liveTerminalStatuses = idleStatusCount();
+  assert.strictEqual(engine._observeCodexCliOwnedTurnCompletion(sessionId, session, {
+    cliSessionId: 'native-thread',
+    taskCompletedTurnId: 'native-turn',
+    taskCompletedAt: new Date().toISOString(),
+  }), true, 'the exact terminal JSONL turn must release via live turn-object identity');
+  assert.strictEqual(idleStatusCount(), liveTerminalStatuses + 1,
+    'exact terminal JSONL must publish idle status before asynchronous turn cleanup');
   await settle();
   await settle();
   assert.strictEqual(session._codexAppServerTurn, null);
   assert.strictEqual(session.waitingForAssistant, false);
+  assert.strictEqual(session.activity.kind, 'idle');
+  const terminalWatermark = session._codexAppServerTerminalCompletedAtMs;
+  assert(Number.isFinite(terminalWatermark) && terminalWatermark > 0,
+    'exact owned completion must retain a terminal activity watermark');
+  assert.strictEqual(engine._setCodexCliActivity(sessionId, session, {
+    kind: 'thinking',
+    label: 'Stale reasoning',
+    updated_at: new Date(terminalWatermark - 1).toISOString(),
+  }), false, 'pre-terminal reasoning must not overwrite authoritative idle');
+  assert.strictEqual(session.activity.kind, 'idle');
   assert.strictEqual(fakeTurn.stopCalls, 1);
+
+  session.activity = { kind: 'generating', label: 'stale', updated_at: new Date().toISOString() };
+  session._codexCliPendingReceipt = null;
+  assert.strictEqual(engine._observeCodexCliOwnedTurnCompletion(sessionId, session, {
+    cliSessionId: 'native-thread',
+    taskCompletedTurnId: 'native-turn',
+    taskCompletedAt: new Date().toISOString(),
+  }), true, 'the retained exact turn identity must reconcile terminal activity after live ownership detaches');
+  assert.strictEqual(session.activity.kind, 'idle');
+
+  const reconciledStatuses = idleStatusCount();
+  assert.strictEqual(engine._observeCodexCliOwnedTurnCompletion(sessionId, session, {
+    cliSessionId: 'native-thread',
+    taskCompletedTurnId: 'native-turn',
+    taskCompletedAt: new Date().toISOString(),
+  }), true, 'an already reconciled exact terminal remains acknowledged');
+  assert.strictEqual(idleStatusCount(), reconciledStatuses,
+    'an already published idle terminal must not emit repeated status');
+
+  session._codexAppServerTerminalReconciledTurnId = null;
+  const detachedNoopStatuses = idleStatusCount();
+  assert.strictEqual(engine._observeCodexCliOwnedTurnCompletion(sessionId, session, {
+    cliSessionId: 'native-thread',
+    taskCompletedTurnId: 'native-turn',
+    taskCompletedAt: new Date().toISOString(),
+  }), true, 'a detached exact terminal must reconcile even when activity is already idle');
+  assert.strictEqual(idleStatusCount(), detachedNoopStatuses + 1,
+    'a first detached terminal must publish status when the idle update is a semantic no-op');
 
   const failedTurn = new FakeTurn({ fail: true });
   const failedEngine = createHarness(failedTurn);
@@ -181,12 +248,23 @@ function settle() {
   console.log(JSON.stringify({
     result: 'PASS',
     app_server_default_transport: true,
+    owned_turn_fast_poll_lane: true,
     native_turn_receipt: true,
     question_relayed_once: true,
     response_forwarded_once: fakeTurn.answerCalls.length,
     native_ack_required: true,
     stale_idle_preserved_prompt: true,
     native_ack_resumed_activity: true,
+    mismatched_jsonl_terminal_rejected: true,
+    exact_jsonl_terminal_released_owner: true,
+    live_turn_identity_fallback: true,
+    detached_turn_receipt_reconciled: true,
+    last_turn_identity_retained: true,
+    terminal_status_before_cleanup: true,
+    detached_noop_terminal_status: true,
+    terminal_status_deduplicated: true,
+    stale_post_terminal_activity_rejected: true,
+    terminal_activity_idle: true,
     completion_released_owner: true,
     launch_failure_no_fallback: true,
     permission_path_untouched: engine.activePermissionPrompts.size === 0,

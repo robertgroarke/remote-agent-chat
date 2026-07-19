@@ -3,7 +3,20 @@
 
 const fs = require('fs');
 const path = require('path');
+const esbuild = require('../frontend/node_modules/esbuild');
 const providerUsage = require('../agent-proxy/provider-usage');
+
+function loadFrontendProviderUsage() {
+  const source = fs.readFileSync(path.join(__dirname, '..', 'frontend', 'provider-usage.js'), 'utf8');
+  const transformed = esbuild.transformSync(source, {
+    loader: 'js', format: 'cjs', target: 'es2020',
+  }).code;
+  const compiled = { exports: {} };
+  new Function('module', 'exports', transformed)(compiled, compiled.exports);
+  return compiled.exports;
+}
+
+const frontendUsage = loadFrontendProviderUsage();
 
 const args = process.argv.slice(2);
 const outputIndex = args.indexOf('--output');
@@ -63,7 +76,58 @@ if (typeof providerUsage.normalizeCursorFinancials === 'function') {
       - (actual?.included_spend?.amount || 0)
       - (actual?.bonus_spend?.amount || 0)
   ) < 0.005, { actual });
+  const normalized = frontendUsage.normalizeProviderUsage({
+    schema_version: 3,
+    generation: 1,
+    snapshots: [{
+      provider_id: 'cursor', provider_name: 'Cursor', quota_domain: 'cursor-plan',
+      account_fingerprint: `acct_${'a'.repeat(20)}`, account_label: 'Fixture account',
+      status: 'fresh', windows: [], financials: actual,
+    }],
+  });
+  const rows = frontendUsage.providerFinancialRows(normalized.entries[0]?.financials);
+  check('cursor_ui_uses_financial_semantics', rows.some(row => (
+    row.label === 'Provider-reported spend' && row.value === '$110.63'
+  )) && rows.some(row => (
+    row.label === 'Available allowance' && row.value === 'Not reported by provider'
+  )) && !rows.some(row => row.label === 'Available prepaid balance'), { rows });
+  check('legacy_cursor_spend_not_formatted_as_balance', frontendUsage.formatProviderCredits({
+    used: 110.63, included: 20, bonus: 90.63, limit: 20, currency: 'USD',
+  }) === '', {
+    actual: frontendUsage.formatProviderCredits({
+      used: 110.63, included: 20, bonus: 90.63, limit: 20, currency: 'USD',
+    }),
+  });
+  check('null_credit_balance_never_becomes_zero', frontendUsage.formatProviderCredits({
+    balance: null, currency: 'USD',
+  }) === '', {
+    actual: frontendUsage.formatProviderCredits({ balance: null, currency: 'USD' }),
+  });
+  const nullMoney = frontendUsage.normalizeProviderUsage({
+    schema_version: 3, generation: 1, snapshots: [{
+      provider_id: 'fixture', provider_name: 'Fixture', quota_domain: 'fixture',
+      account_fingerprint: `acct_${'b'.repeat(20)}`, status: 'fresh', windows: [],
+      financials: { semantics_version: 1, prepaid_balance: { amount: null, currency: 'USD' } },
+    }],
+  });
+  check('null_money_never_becomes_zero', !frontendUsage.providerFinancialRows(
+    nullMoney.entries[0]?.financials,
+  ).some(row => row.value === '$0.00'), { rows: frontendUsage.providerFinancialRows(nullMoney.entries[0]?.financials) });
 }
+const ollamaUi = frontendUsage.normalizeProviderUsage({
+  schema_version: 3, generation: 1, snapshots: [{
+    provider_id: 'ollama-local', provider_name: 'Ollama', quota_domain: 'ollama-local-runtime',
+    account_fingerprint: `acct_${'c'.repeat(20)}`, account_label: 'Loopback runtime',
+    status: 'fresh', windows: [], local_runtime: {
+      status: 'running', endpoint_scope: 'loopback_only', installed_models_count: 2,
+      loaded_models_count: 1, loaded_models: [], telemetry_status: 'not_observed',
+      telemetry_reason: 'Fixture historical request totals are unavailable.',
+    },
+  }],
+});
+check('ollama_ui_reports_fresh_runtime', ollamaUi.summary.reporting === 1
+  && ollamaUi.entries[0]?.tone === 'ok'
+  && ollamaUi.entries[0]?.localRuntime?.loadedModelsCount === 1, { actual: ollamaUi });
 if (typeof providerUsage.validateProviderDashboardUrl === 'function') {
   check('cursor_usage_url_allowed', providerUsage.validateProviderDashboardUrl(
     'cursor', 'https://cursor.com/settings/usage',

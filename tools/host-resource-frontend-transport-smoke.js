@@ -93,23 +93,24 @@ vm.runInContext(built.outputFiles[0].text, context, { filename: 'hooks.bundle.cj
 const relay = moduleRecord.exports.useRelay();
 const firstSocket = FakeWebSocket.instances[0];
 firstSocket.open();
-relay.subscribeHostResources(false);
+relay.subscribeHostResources(true, 'global-strip');
 const subscribe = firstSocket.sent.find(message => message.type === 'host_resource_subscribe');
 assert(subscribe, 'opening Host Resources must create a requester-scoped subscription');
-assert.equal(subscribe.aggregate_only, false);
+assert.equal(subscribe.aggregate_only, true);
 assert.equal(subscribe.resume_subscription_id, undefined, 'new subscriptions must not invent resume tokens');
 
 firstSocket.receive({
   type: 'host_resource_subscription_ack',
   request_id: subscribe.request_id,
   subscription_id: 'host-sub-0123456789abcdef0123456789abcdef',
-  aggregate_only: false,
+  aggregate_only: true,
   resumed: false,
   system_points: 2,
   detail_points: 1,
 });
 const initialHistory = firstSocket.sent.filter(message => message.type === 'host_resource_history_request');
-assert.deepEqual(initialHistory.map(message => message.stream).sort(), ['detail', 'system']);
+assert.deepEqual(initialHistory.map(message => message.stream), ['system'],
+  'aggregate-only consumers must not request detail history');
 assert(initialHistory.every(message => message.after_sequence === 0));
 
 const systemRequest = initialHistory.find(message => message.stream === 'system');
@@ -146,17 +147,57 @@ assert(systemState, 'history arriving after live data must be merged into one or
 assert.deepEqual(systemState.map(point => point.sample_sequence), [1, 2, 3]);
 assert.equal(systemState[2].duplicate, undefined, 'duplicate live frames must be rejected');
 
+const beforeUpgradeCount = firstSocket.sent.length;
+relay.subscribeHostResources(false, 'dashboard');
+const upgradeMessages = firstSocket.sent.slice(beforeUpgradeCount);
+assert.equal(upgradeMessages.filter(message => message.type === 'host_resource_unsubscribe').length, 0,
+  'adding a detail consumer must not stop the global aggregate stream');
+const upgrade = upgradeMessages.find(message => message.type === 'host_resource_subscribe');
+assert(upgrade, 'adding a detail consumer must upgrade the effective subscription');
+assert.equal(upgrade.aggregate_only, false);
+assert.equal(upgrade.resume_subscription_id, 'host-sub-0123456789abcdef0123456789abcdef',
+  'mode upgrades must retain the requester subscription identity');
+firstSocket.receive({
+  type: 'host_resource_subscription_ack',
+  request_id: upgrade.request_id,
+  subscription_id: upgrade.resume_subscription_id,
+  aggregate_only: false,
+  resumed: true,
+  system_points: 3,
+  detail_points: 0,
+});
+
+const beforeDowngradeCount = firstSocket.sent.length;
+relay.unsubscribeHostResources('dashboard');
+const downgradeMessages = firstSocket.sent.slice(beforeDowngradeCount);
+assert.equal(downgradeMessages.filter(message => message.type === 'host_resource_unsubscribe').length, 0,
+  'releasing the detail consumer must not disable the remaining global consumer');
+const downgrade = downgradeMessages.find(message => message.type === 'host_resource_subscribe');
+assert(downgrade, 'releasing the detail consumer must downgrade to aggregate-only');
+assert.equal(downgrade.aggregate_only, true);
+assert.equal(downgrade.resume_subscription_id, 'host-sub-0123456789abcdef0123456789abcdef');
+firstSocket.receive({
+  type: 'host_resource_subscription_ack',
+  request_id: downgrade.request_id,
+  subscription_id: downgrade.resume_subscription_id,
+  aggregate_only: true,
+  resumed: true,
+  system_points: 3,
+  detail_points: 0,
+});
+
 firstSocket.close();
 runTimer(250);
 const secondSocket = FakeWebSocket.instances[1];
 secondSocket.open();
 const resume = secondSocket.sent.find(message => message.type === 'host_resource_subscribe');
 assert.equal(resume.resume_subscription_id, 'host-sub-0123456789abcdef0123456789abcdef');
+assert.equal(resume.aggregate_only, true, 'reconnect must preserve the effective aggregate-only mode');
 secondSocket.receive({
   type: 'host_resource_subscription_ack',
   request_id: resume.request_id,
   subscription_id: resume.resume_subscription_id,
-  aggregate_only: false,
+  aggregate_only: true,
   resumed: true,
   system_points: 4,
   detail_points: 1,
@@ -164,7 +205,7 @@ secondSocket.receive({
 const resumedSystem = secondSocket.sent.find(message => message.type === 'host_resource_history_request' && message.stream === 'system');
 assert.equal(resumedSystem.after_sequence, 3, 'resume must hydrate only the sequence gap after the local tail');
 
-relay.unsubscribeHostResources();
+relay.unsubscribeHostResources('global-strip');
 const unsubscribe = secondSocket.sent.find(message => message.type === 'host_resource_unsubscribe');
 assert.equal(unsubscribe.subscription_id, resume.resume_subscription_id);
 
