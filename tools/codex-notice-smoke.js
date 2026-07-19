@@ -80,6 +80,43 @@ async function main() {
     assert(thinking?.goal?.objective === 'Restore Codex notice fidelity', 'Codex goal objective is captured', thinking);
     assert(thinking?.goal?.time_used_seconds === 521, 'Codex goal elapsed time is captured', thinking);
 
+    const durationFixtures = [
+      {
+        label: 'whitespace-separated timer tokens',
+        html: '<span>Pursuing goal</span> \n <span>Whitespace timer fixture</span> \n <span>2m 5s</span>',
+        seconds: 125,
+      },
+      {
+        label: 'single timer token',
+        html: '<span>Pursuing goal</span><span>Single timer fixture</span><span>47s</span>',
+        seconds: 47,
+      },
+      {
+        label: 'ordered multi-unit timer tokens',
+        html: '<span>Pursuing goal</span><span>Multi-unit timer fixture</span><span>1d 2h 3m 4s</span>',
+        seconds: 93784,
+      },
+      {
+        label: 'nested legacy goal timer',
+        html: '<span>Pursuing goal</span><div><span>Nested legacy timer fixture</span><span>3h 2m</span></div>',
+        seconds: 10920,
+      },
+      {
+        label: 'objective duration prose is rejected',
+        html: '<span>Pursuing goal</span><span>Transcript prose says a build took 8m 41s</span><span>7s</span>',
+        seconds: 7,
+      },
+    ];
+    for (const fixture of durationFixtures) {
+      await evaluate(client.Runtime,
+        '(() => { document.querySelector('
+          + JSON.stringify('#' + FIXTURE_ID + ' [data-fixture="goal"]')
+          + ').innerHTML = ' + JSON.stringify(fixture.html) + '; return true; })()');
+      const fixtureThinking = await selectors.detectThinking(client.Runtime, 'codex-desktop');
+      assert(fixtureThinking?.goal?.time_used_seconds === fixture.seconds,
+        fixture.label, fixtureThinking);
+    }
+
     const queue = await selectors.readCodexNativeQueue(client.Runtime, true);
     assert(queue?.length === 1, 'native Codex queue item is detected', queue);
     assert(queue?.[0]?.text === QUEUED_TEXT, 'native Codex queue text is captured without truncation', queue);

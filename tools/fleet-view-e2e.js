@@ -564,7 +564,7 @@ async function main() {
     const androidSource = fs.readFileSync(path.join(__dirname, '..', 'android-app', 'screens', 'SessionListScreen.jsx'), 'utf8');
     for (const marker of [
       'visible={showFleetView}', 'Fleet view', 'fleetEntries', 'fleetElapsedLabel',
-      'fleetStateLabel(entry.state)', 'Activity {entry.freshness}', 'Show ${fleetIdleCount} idle',
+      'fleetStateLabel(state)', 'entry.stateLabel', 'Activity {entry.freshness}', 'Show ${fleetIdleCount} idle',
       'Open session', "{'\\u203A'}", 'workContext', "navigation.navigate('Chat'",
       'broadcastSelectedIds', 'Broadcast prompt', 'SEND TO ${broadcastSelectedIds.length} SESSIONS',
       'Broadcast delivery receipts', 'sessionSupportsBroadcast',

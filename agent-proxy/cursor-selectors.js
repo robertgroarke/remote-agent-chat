@@ -593,12 +593,38 @@ const CURSOR_AGENT_LIST_EXPR = `
           && (!clip || clip.getAttribute('aria-hidden') !== 'true'),
       };
     }
-    function nativeStatus(el) {
-      var status = el && el.querySelector ? el.querySelector('.agent-status-dot') : null;
-      var value = norm(status ? (status.getAttribute('aria-label') || status.className || '') : '').toLowerCase();
+    function nativeStatus(el, item) {
+      var signals = [];
+      function add(source, value) {
+        var normalized = norm(value).toLowerCase();
+        if (!normalized || signals.some(function(signal) { return signal.source === source && signal.value === normalized; })) return;
+        signals.push({ source: source, value: normalized });
+      }
+      var statusNodes = el && el.querySelectorAll
+        ? Array.from(el.querySelectorAll('.agent-status-dot, .agent-status, [data-agent-status], [data-status], [aria-busy="true"]'))
+        : [];
+      statusNodes.forEach(function(status, index) {
+        add('status-node-' + index + ':aria-label', status.getAttribute('aria-label'));
+        add('status-node-' + index + ':title', status.getAttribute('title'));
+        add('status-node-' + index + ':data-agent-status', status.getAttribute('data-agent-status'));
+        add('status-node-' + index + ':data-status', status.getAttribute('data-status'));
+        add('status-node-' + index + ':aria-busy', status.getAttribute('aria-busy'));
+        add('status-node-' + index + ':class', status.className);
+      });
+      [el, item].forEach(function(node, index) {
+        if (!node || !node.getAttribute) return;
+        add('row-' + index + ':data-agent-status', node.getAttribute('data-agent-status'));
+        add('row-' + index + ':data-status', node.getAttribute('data-status'));
+        if (node.getAttribute('aria-busy') === 'true') add('row-' + index + ':aria-busy', 'true');
+      });
+      var value = signals.map(function(signal) { return signal.value; }).join(' | ');
       return {
         value: value,
-        working: /working|running|generating|thinking|in[-_ ]?progress|executing/.test(value),
+        source: signals.length ? signals[0].source : '',
+        signals: signals,
+        working: /working|running|generating|thinking|in[-_ ]?progress|executing/.test(value)
+          || signals.some(function(signal) { return signal.source.indexOf('aria-busy') >= 0 && signal.value === 'true'; }),
+        terminal: /done(?:[-_ ]?(?:seen|unseen))?|complete(?:d)?|finished|idle|stopped|cancel(?:led|ed)|aborted/.test(value),
       };
     }
     function titleOfCell(cell) {
@@ -685,7 +711,7 @@ const CURSOR_AGENT_LIST_EXPR = `
         }
         if (explicitlySelected) explicitActiveId = id;
         var workspace = workspaceMeta(btn);
-        var status = nativeStatus(btn);
+        var status = nativeStatus(btn, item);
         pushItem(items, seen, {
           id: id,
           cache_key: resourceKeyForTitle(title) || nativeId,
@@ -698,7 +724,10 @@ const CURSOR_AGENT_LIST_EXPR = `
           workspace_name: workspace.name,
           workspace_expanded: workspace.expanded,
           native_status: status.value,
+          native_status_source: status.source,
+          native_status_signals: status.signals,
           native_working: status.working,
+          native_terminal: status.terminal,
         });
       });
     }

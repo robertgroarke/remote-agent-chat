@@ -37,8 +37,6 @@ async function main() {
     target: target.id,
   }), 'Codex Desktop attach');
 
-  let originalThreadId = '';
-  let validationThreadId = '';
   try {
     await client.Runtime.enable();
     const initialThreads = await withTimeout(
@@ -46,14 +44,13 @@ async function main() {
       'initial native thread list',
     );
     const originalThread = initialThreads.find(thread => thread && thread.active) || null;
-    originalThreadId = String(originalThread?.id || '');
+    const originalThreadId = String(originalThread?.id || '');
     assert(originalThreadId, 'current native thread was not detected');
 
-    // The currently selected disposable thread may intentionally contain no
-    // commands or edits. Choose a native thread whose exact local archive has
-    // both structures, then restore the original selection in finally. The
-    // cross-process CDP lock keeps the production poller from observing this
-    // temporary read-only selection.
+    // The currently selected thread may intentionally contain no commands or
+    // edits. Choose a listed thread whose exact local archive has both
+    // structures, but never switch the native UI: aggregate validation must
+    // remain a passive read of the operator's current selection.
     const orderedThreads = [
       originalThread,
       ...initialThreads.filter(thread => thread && thread.id !== originalThreadId),
@@ -74,14 +71,7 @@ async function main() {
     }
     assert(validationThread && validationArchive,
       'no listed Codex Desktop thread has an exact archive with terminal and file-change blocks');
-    validationThreadId = String(validationThread.id || '');
-    if (validationThreadId !== originalThreadId) {
-      const switched = await withTimeout(
-        selectors.switchCodexThread(client.Runtime, validationThreadId, true),
-        'structured fixture thread switch',
-      );
-      assert.equal(switched?.ok, true, `structured fixture thread switch failed: ${JSON.stringify(switched)}`);
-    }
+    const validationThreadId = String(validationThread.id || '');
 
     const messageRaw = await withTimeout(
       selectors.readMessages(
@@ -99,18 +89,18 @@ async function main() {
     );
     const nativeActiveThread = nativeThreads.find(thread => thread && thread.active) || null;
     const nativeActiveThreadKey = String(nativeActiveThread?.id || '');
-    assert.equal(nativeActiveThreadKey, validationThreadId,
-      'native active thread differs from the selected structured fixture');
+    assert.equal(nativeActiveThreadKey, originalThreadId,
+      'passive structured validation changed the native active thread');
     const engine = Object.create(ProxyEngine.prototype);
     engine._log = () => {};
     const messages = engine._maybeUseCodexDesktopArchive(
       'structured-control-smoke',
       {
         agentType: 'codex-desktop',
-        _activeThreadKey: nativeActiveThreadKey,
-        _activeThreadTitle: nativeActiveThread?.title || '',
+        _activeThreadKey: validationThreadId,
+        _activeThreadTitle: validationThread?.title || '',
       },
-      recentMessages,
+      [],
     );
     const nativeTerminalBlocks = [];
     const nativeChangeBlocks = [];
@@ -183,15 +173,7 @@ async function main() {
       `${recentTerminalEntries.length}/${recentChangeEntries.length} in current bounded window)`,
     );
   } finally {
-    try {
-      if (originalThreadId && validationThreadId && originalThreadId !== validationThreadId) {
-        const restored = await selectors.switchCodexThread(client.Runtime, originalThreadId, true);
-        assert.equal(restored?.ok, true,
-          `failed to restore original Codex Desktop thread ${originalThreadId}`);
-      }
-    } finally {
-      await client.close();
-    }
+    await client.close();
   }
 }
 

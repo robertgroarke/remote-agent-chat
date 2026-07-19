@@ -1106,9 +1106,9 @@ async function detectThinking(Runtime, agentType) {
           }
           function durationSeconds(text) {
             var value = norm(text);
-            var suffix = value.match(/(?:^|\\s)((?:\\d+\\s*[dhms]\\s*)+)$/i);
-            if (!suffix) return 0;
-            var tokens = Array.from(suffix[1].matchAll(/(\\d+)\\s*([dhms])/gi));
+            var timer = value.match(/^((?:\\d+\\s*[dhms]\\s*)+)$/i);
+            if (!timer) return 0;
+            var tokens = Array.from(timer[1].matchAll(/(\\d+)\\s*([dhms])/gi));
             if (tokens.length === 0) return 0;
             var order = { d: 0, h: 1, m: 2, s: 3 };
             var multiplier = { d: 86400, h: 3600, m: 60, s: 1 };
@@ -1121,6 +1121,24 @@ async function detectThinking(Runtime, agentType) {
               total += Number(token[1]) * multiplier[unit];
             }
             return total;
+          }
+          function durationSecondsFromSurface(scope) {
+            if (!scope) return 0;
+            // Current Desktop/extension goal chips render the timer in a
+            // sibling span. Older builds can wrap it one level deeper. Read
+            // only a node whose complete visible text is an ordered timer;
+            // never mine a duration-looking suffix out of objective or
+            // transcript prose.
+            var nodes = [scope].concat(Array.from(scope.querySelectorAll('time, span, p, div')));
+            nodes.sort(function(a, b) {
+              return norm(a.innerText || a.textContent).length - norm(b.innerText || b.textContent).length;
+            });
+            for (var node of nodes) {
+              if (!visible(node)) continue;
+              var seconds = durationSeconds(node.innerText || node.textContent);
+              if (seconds > 0) return seconds;
+            }
+            return 0;
           }
           function durationOnly(text) {
             return /^(?:(?:\\d+)d\\s*)?(?:(?:\\d+)h\\s*)?(?:(?:\\d+)m\\s*)?(?:(?:\\d+)s)?$/i.test(norm(text)) &&
@@ -1154,7 +1172,7 @@ async function detectThinking(Runtime, agentType) {
             // The first ancestor carrying the elapsed timer is the complete
             // goal row. Do not climb into the above-composer queue, where a
             // neighboring slow-response notice can become an objective candidate.
-            if (durationSeconds(text) > 0) {
+            if (durationSecondsFromSurface(current) > 0) {
               root = current;
               break;
             }
@@ -1163,8 +1181,7 @@ async function detectThinking(Runtime, agentType) {
             current = current.parentElement;
           }
           var compactRoot = labelNode.parentElement || labelNode;
-          var rootText = norm(compactRoot.innerText || compactRoot.textContent) || norm(root.innerText || root.textContent);
-          var seconds = durationSeconds(rootText);
+          var seconds = durationSecondsFromSurface(compactRoot) || durationSecondsFromSurface(root);
           function goalObjectiveText(el) {
             // The live truncated chip preserves its raw prompt boundary in
             // textContent while browser fixtures preserve <br><br> in innerText.

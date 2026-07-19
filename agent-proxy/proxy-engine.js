@@ -551,16 +551,92 @@ function resolveCursorWorkspacePath(agent, candidates) {
   return ranked[0]?.candidate || null;
 }
 
-function cursorNativeActivity(agent) {
-  const status = String(agent?.native_status || '').toLowerCase();
-  const now = new Date().toISOString();
-  if (agent?.native_working === true || /working|running|generating|thinking|in[-_ ]?progress|executing/.test(status)) {
-    return { kind: 'generating', label: 'Working', updated_at: now };
+const CURSOR_WORKING_CONTINUITY_LEASE_MS = 5_000;
+const CURSOR_NATIVE_OBSERVED_SOURCE = 'cursor_native_observed';
+
+function cursorNativeActivity(agent, previous = null, options = {}) {
+  const signalValues = [
+    agent?.native_status,
+    ...(Array.isArray(agent?.native_status_signals)
+      ? agent.native_status_signals.map(signal => signal?.value || signal)
+      : []),
+  ];
+  const status = signalValues.map(value => String(value || '').toLowerCase()).filter(Boolean).join(' | ');
+  const nowMs = Number.isFinite(Number(options.nowMs)) ? Number(options.nowMs) : Date.now();
+  const now = new Date(nowMs).toISOString();
+  const previousKind = String(previous?.kind || '').toLowerCase();
+  const transitionAt = kind => (
+    previousKind === kind && previous?.updated_at ? previous.updated_at : now
+  );
+  const needsAttention = /needs|attention|blocked|error|failed|permission/.test(status);
+  const terminal = /(?:^|[^a-z])(?:done(?:[-_ ]?(?:seen|unseen))?|complete(?:d)?|finished|idle|stopped|cancel(?:led|ed)|aborted)(?:$|[^a-z])/.test(status);
+  const nativeWorking = agent?.native_working === true
+    || /working|running|generating|thinking|in[-_ ]?progress|executing/.test(status);
+  const transcriptWorking = options.correlatedTranscriptWorking === true;
+
+  if (needsAttention) {
+    return {
+      kind: 'needs_attention',
+      label: 'Needs attention',
+      updated_at: transitionAt('needs_attention'),
+      cursor_evidence_at: now,
+      cursor_evidence_source: 'native_status',
+    };
   }
-  if (/needs|attention|blocked|error|failed|permission/.test(status)) {
-    return { kind: 'needs_attention', label: 'Needs attention', updated_at: now };
+  if (terminal) {
+    return {
+      kind: 'idle',
+      label: '',
+      updated_at: transitionAt('idle'),
+      cursor_evidence_at: now,
+      cursor_evidence_source: 'native_terminal',
+    };
   }
-  return { kind: 'idle', label: '', updated_at: now };
+  if (nativeWorking || transcriptWorking) {
+    return {
+      kind: 'generating',
+      label: 'Working',
+      updated_at: transitionAt('generating'),
+      cursor_evidence_at: now,
+      cursor_evidence_source: nativeWorking ? 'native_status' : 'active_transcript',
+    };
+  }
+
+  const previousEvidenceAt = Math.max(
+    Date.parse(previous?.cursor_evidence_at || '') || 0,
+    Date.parse(previous?.observed_at || '') || 0,
+    Date.parse(previous?.updated_at || '') || 0,
+  );
+  if (
+    previousKind === 'generating'
+    && Number.isFinite(previousEvidenceAt)
+    && nowMs - previousEvidenceAt <= CURSOR_WORKING_CONTINUITY_LEASE_MS
+  ) {
+    return {
+      ...previous,
+      kind: 'generating',
+      label: previous?.label || 'Working',
+      updated_at: previous?.updated_at || now,
+      cursor_evidence_at: new Date(previousEvidenceAt).toISOString(),
+      cursor_evidence_source: 'continuity_lease',
+    };
+  }
+  return { kind: 'idle', label: '', updated_at: transitionAt('idle') };
+}
+
+function cursorHasAuthoritativeWorkingSignal(agent) {
+  const activity = cursorNativeActivity(agent, null, { nowMs: 0 });
+  return activity.kind === 'generating' && activity.cursor_evidence_source === 'native_status';
+}
+
+function cursorAgentEligible(agent, existing = false) {
+  const uuid = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+  return uuid.test(String(agent?.id || '')) && (
+    agent?.workspace_expanded !== false
+    || agent?.active === true
+    || cursorHasAuthoritativeWorkingSignal(agent)
+    || existing === true
+  );
 }
 
 function codexDesktopThreadKeysMatch(storedKey, currentKey) {
@@ -3265,6 +3341,87 @@ class ProxyEngine extends EventEmitter {
     try { return JSON.parse(JSON.stringify(Array.isArray(messages) ? messages : [])); } catch { return []; }
   }
 
+  _cursorObservationTimestampSeconds(message) {
+    for (const value of [message?.created_at, message?.timestamp, message?.ts]) {
+      if (typeof value === 'number' || (typeof value === 'string' && /^\d+(?:\.\d+)?$/.test(value.trim()))) {
+        const numeric = Number(value);
+        if (Number.isFinite(numeric) && numeric > 0) return numeric > 1e12 ? numeric / 1000 : numeric;
+        continue;
+      }
+      const parsed = Date.parse(String(value || ''));
+      if (Number.isFinite(parsed) && parsed > 0) return parsed / 1000;
+    }
+    return 0;
+  }
+
+  _cursorObservationSequenceFromId(agentId, sourceMessageId) {
+    const prefix = `${CURSOR_NATIVE_OBSERVED_SOURCE}:${String(agentId || '').toLowerCase()}:`;
+    const value = String(sourceMessageId || '').toLowerCase();
+    if (!value.startsWith(prefix)) return 0;
+    const sequence = Number.parseInt(value.substring(prefix.length).split(':', 1)[0], 10);
+    return Number.isSafeInteger(sequence) && sequence > 0 ? sequence : 0;
+  }
+
+  _cursorObservedMessageId(agentId, sequence, message) {
+    const semantic = JSON.stringify([
+      String(message?.role || '').toLowerCase(),
+      String(message?.content || '').replace(/\s+/g, ' ').trim(),
+      Array.isArray(message?.content_blocks) ? message.content_blocks : null,
+    ]);
+    const fingerprint = crypto.createHash('sha256').update(semantic).digest('hex').substring(0, 16);
+    return `${CURSOR_NATIVE_OBSERVED_SOURCE}:${String(agentId || '').toLowerCase()}:${sequence}:${fingerprint}`;
+  }
+
+  _preserveCursorObservationMetadata(previous, observed) {
+    const next = { ...(observed || {}) };
+    for (const key of ['source_message_id', 'source', 'ts', 'timestamp', 'created_at']) {
+      if (previous && Object.prototype.hasOwnProperty.call(previous, key)) next[key] = previous[key];
+    }
+    return next;
+  }
+
+  _prepareCursorMessageObservations(agentId, messages, options = {}) {
+    const rows = Array.isArray(messages) ? messages : [];
+    const observedAtMs = Number.isFinite(Number(options.observedAtMs))
+      ? Number(options.observedAtMs)
+      : Date.now();
+    const observeCurrent = options.observeCurrent === true;
+    let sequence = Math.max(0, Number(options.sequence) || 0);
+    let changed = false;
+    let newlyObserved = 0;
+    const prepared = rows.map(message => {
+      const row = message && typeof message === 'object' ? message : {};
+      const existingSourceId = String(row.source_message_id || '').trim();
+      sequence = Math.max(sequence, this._cursorObservationSequenceFromId(agentId, existingSourceId));
+      if (existingSourceId) {
+        if (this._cursorObservationTimestampSeconds(row) > 0 || Object.prototype.hasOwnProperty.call(row, 'ts')) {
+          return row;
+        }
+        changed = true;
+        return { ...row, ts: 0 };
+      }
+
+      sequence += 1;
+      const sourceMessageId = this._cursorObservedMessageId(agentId, sequence, row);
+      const timestampSeconds = observeCurrent ? observedAtMs / 1000 : 0;
+      const next = {
+        ...row,
+        source_message_id: sourceMessageId,
+        source: CURSOR_NATIVE_OBSERVED_SOURCE,
+        ts: timestampSeconds,
+      };
+      if (timestampSeconds > 0) {
+        const observedAt = new Date(observedAtMs).toISOString();
+        next.timestamp = observedAt;
+        next.created_at = observedAt;
+        newlyObserved += 1;
+      }
+      changed = true;
+      return next;
+    });
+    return { messages: prepared, sequence, changed, newlyObserved };
+  }
+
   _fileTranscriptGeneration(agentType, filePath, sourceCursor, nonce = '') {
     const basis = [
       String(agentType || 'cli'),
@@ -3718,6 +3875,7 @@ class ProxyEngine extends EventEmitter {
       this._cacheCursorActiveTranscript(session);
       updates.cursor_agent_histories = session._cursorAgentHistories || {};
       updates.cursor_active_thread_key = session._activeThreadKey || null;
+      updates.cursor_message_observation_seq = Math.max(0, Number(session._cursorMessageObservationSeq) || 0);
     }
     if (session.agentType === 'codex-desktop') {
       updates.codex_desktop_active_thread_key = session._activeThreadKey || null;
@@ -3778,7 +3936,7 @@ class ProxyEngine extends EventEmitter {
 
       if (matchIndex >= 0) {
         if (this._shouldReplaceAccumulatedMessage('cursor', acc[matchIndex], observed)) {
-          acc[matchIndex] = observed;
+          acc[matchIndex] = this._preserveCursorObservationMetadata(acc[matchIndex], observed);
           changed = true;
         }
         searchStart = matchIndex + 1;
@@ -3795,7 +3953,7 @@ class ProxyEngine extends EventEmitter {
         && acc[tailIndex]?.role === observed?.role
         && this._shouldReplaceAccumulatedMessage('cursor', acc[tailIndex], observed)
       ) {
-        acc[tailIndex] = observed;
+        acc[tailIndex] = this._preserveCursorObservationMetadata(acc[tailIndex], observed);
       } else {
         acc.push(observed);
       }
@@ -9758,6 +9916,7 @@ class ProxyEngine extends EventEmitter {
       cursor_agent_id:  s.cursorAgentId || null,
       cursor_workspace_key: s.cursorWorkspaceKey || null,
       cursor_native_status: s.nativeStatus || null,
+      cursor_native_working: s.nativeWorking === true,
       status:           s.status,
       activity,
       last_seen_at:     s.last_seen_at,
@@ -14934,6 +15093,15 @@ class ProxyEngine extends EventEmitter {
         return await this._pollSessionContinue(sessionId, session);
       }
 
+      // Cursor 3.5+ virtual rows all share one workbench Runtime.  Only the
+      // selected UUID owns the visible transcript, while the dedicated
+      // page-owner inventory lane refreshes identity/status for every UUID.
+      // Returning here prevents every inactive row from independently
+      // walking the same global Agents DOM and starving that owner read.
+      if (session.agentType === 'cursor' && session._cursorVirtual && !session._cursorNativeActive) {
+        return;
+      }
+
       // Task list detection — runs before readMessages so it isn't skipped
       // by early returns in null-read or pending-stabilisation paths
       if (session.agentType === 'codex' || session.agentType === 'codex-desktop') {
@@ -14980,7 +15148,8 @@ class ProxyEngine extends EventEmitter {
       // state. Refresh the active-thread marker even while busy so the WebUI
       // does not keep showing the previous thread's accumulated history after
       // the user switches chats or Codex focuses a different thread.
-      if (session.agentType === 'codex-desktop' || session.agentType === 'cursor') {
+      if (session.agentType === 'codex-desktop'
+          || (session.agentType === 'cursor' && !session._cursorVirtual)) {
         const now = Date.now();
         if (!session._lastCodexDesktopThreadPollAt || now - session._lastCodexDesktopThreadPollAt > 5000) {
           session._lastCodexDesktopThreadPollAt = now;
@@ -14998,14 +15167,6 @@ class ProxyEngine extends EventEmitter {
             this._log('warn', `[${sessionId}] ${session.agentType} thread list poll failed: ${e.message}`);
           }
         }
-      }
-
-      // Cursor's global Agents window hosts many independent native threads in
-      // one page. Only the UUID-marked active virtual session owns the rendered
-      // transcript; polling an inactive row would copy the active thread into
-      // the wrong durable session.
-      if (session.agentType === 'cursor' && session._cursorVirtual && !session._cursorNativeActive) {
-        return;
       }
 
       const raw = await selectors.readMessages(
@@ -15479,7 +15640,9 @@ class ProxyEngine extends EventEmitter {
                 // `Thinking.` -> `Thought for 1s` without changing block text; retain
                 // those equal-text structural updates so relay history matches native.
                 if (this._shouldReplaceAccumulatedMessage(session.agentType, acc[accIdx], dom[domIdx])) {
-                  acc[accIdx] = dom[domIdx];
+                  acc[accIdx] = session.agentType === 'cursor'
+                    ? this._preserveCursorObservationMetadata(acc[accIdx], dom[domIdx])
+                    : dom[domIdx];
                   session._accumulatedDirty = true;
                   if (accIdx < acc.length - 1) expandedHistoricalMessage = true;
                   if (
@@ -15541,7 +15704,27 @@ class ProxyEngine extends EventEmitter {
             }
           }
         }
-        this._maybePersistAccumulatedMessages(sessionId, session);
+        let cursorObservation = null;
+        if (session.agentType === 'cursor' && Array.isArray(session._accumulatedMessages)) {
+          cursorObservation = this._prepareCursorMessageObservations(
+            session.cursorAgentId || session._activeThreadKey,
+            session._accumulatedMessages,
+            {
+              sequence: session._cursorMessageObservationSeq,
+              observedAtMs: Date.now(),
+              observeCurrent: true,
+            },
+          );
+          session._cursorMessageObservationSeq = cursorObservation.sequence;
+          if (cursorObservation.changed) {
+            session._accumulatedMessages = cursorObservation.messages;
+            session._accumulatedDirty = true;
+          }
+        }
+        this._maybePersistAccumulatedMessages(sessionId, session, {
+          force: cursorObservation?.newlyObserved > 0,
+        });
+        if (cursorObservation?.newlyObserved > 0) sessionStore.flushPendingSaves();
       }
 
       // Use accumulated messages for antigravity sessions, DOM snapshot for others
@@ -15912,12 +16095,25 @@ class ProxyEngine extends EventEmitter {
       const ownedQuestion = this.activeQuestionPromptAdapters.get(sessionId);
       const waitingForQuestion = ['codex', 'codex-desktop'].includes(ownedQuestion?.adapter_surface)
         && ownedQuestion.claimed !== true;
-      const kind   = waitingForQuestion ? 'waiting_for_user' : ts.thinking ? 'thinking' : active ? 'generating' : 'idle';
-      const label  = waitingForQuestion
+      let kind = waitingForQuestion ? 'waiting_for_user' : ts.thinking ? 'thinking' : active ? 'generating' : 'idle';
+      let label = waitingForQuestion
         ? (ownedQuestion.prompt?.title || 'Needs input')
         : (ts.label || (active ? 'Generating' : ''));
       const observedAt = new Date().toISOString();
-      let newActivity = { kind, label, updated_at: observedAt };
+      let newActivity;
+      if (session.agentType === 'cursor') {
+        newActivity = cursorNativeActivity({
+          native_status: session.nativeStatus,
+          native_working: session.nativeWorking === true,
+        }, session.activity, {
+          nowMs: Date.parse(observedAt),
+          correlatedTranscriptWorking: ts.thinking === true || active,
+        });
+        kind = newActivity.kind;
+        label = newActivity.label;
+      } else {
+        newActivity = { kind, label, updated_at: observedAt };
+      }
       // Carry forward task list from previous activity
       if (session.taskList) {
         newActivity.task_list = session.taskList;
@@ -15988,13 +16184,17 @@ class ProxyEngine extends EventEmitter {
           this._processMessageQueue(sessionId);
         }
       } else {
-        this._emitActivityObservationHeartbeat(sessionId, session, { observedAt });
+        if (session.agentType === 'cursor') session.activity = newActivity;
+        if (session.agentType !== 'cursor' || newActivity.cursor_evidence_source !== 'continuity_lease') {
+          this._emitActivityObservationHeartbeat(sessionId, session, { observedAt });
+        }
       }
 
 
       // Thread list polling — Codex Desktop only (Epic 2)
       // Polls every 10 cycles (~30-50s) to keep the thread list current.
-      if (session.agentType === 'codex-desktop' || session.agentType === 'cursor') {
+      if (session.agentType === 'codex-desktop'
+          || (session.agentType === 'cursor' && !session._cursorVirtual)) {
         if (session._threadListPollCount === undefined) {
           session._threadListPollCount = staggerOffset(sessionId, 'threadList', 60);
         }
@@ -17245,19 +17445,30 @@ class ProxyEngine extends EventEmitter {
         changed = true;
       }
       if (!agent) continue;
-      const nextActivity = cursorNativeActivity(agent);
-      if (session.nativeStatus !== agent.native_status
+      const nextActivity = cursorNativeActivity(agent, session.activity);
+      const nextNativeWorking = agent.native_working === true;
+      if (session.nativeStatus !== (agent.native_status || '')
+          || session.nativeWorking !== nextNativeWorking
           || session.activity?.kind !== nextActivity.kind
           || session.activity?.label !== nextActivity.label) {
         session.nativeStatus = agent.native_status || '';
+        session.nativeWorking = nextNativeWorking;
         session.activity = nextActivity;
         session.waitingForAssistant = nextActivity.kind === 'generating';
         sessionStore.updateSession(session.session_id, {
           activity: nextActivity,
           cursor_native_status: session.nativeStatus,
+          cursor_native_working: session.nativeWorking,
         });
         this._sendToRelay(proto.proxyStatus(session.session_id, session.status || 'healthy', nextActivity));
         changed = true;
+      } else {
+        session.activity = nextActivity;
+        if (nextActivity.kind === 'generating' && nextActivity.cursor_evidence_source !== 'continuity_lease') {
+          this._emitActivityObservationHeartbeat(session.session_id, session, {
+            observedAt: nextActivity.cursor_evidence_at,
+          });
+        }
       }
     }
     if (changed) this._broadcastSessionSnapshot();
@@ -17304,14 +17515,10 @@ class ProxyEngine extends EventEmitter {
 
   async _syncCursorVirtualSessions(target, client, agents) {
     const allAgents = Array.isArray(agents) ? agents : [];
-    const uuid = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
     const existingIds = new Set(Array.from(this.sessions.values())
       .filter(session => session._cursorVirtual && session.targetId === target.id)
       .map(session => session.cursorAgentId));
-    const eligible = allAgents.filter(agent => (
-      uuid.test(String(agent?.id || ''))
-      && (agent.workspace_expanded !== false || agent.native_working === true || existingIds.has(agent.id))
-    ));
+    const eligible = allAgents.filter(agent => cursorAgentEligible(agent, existingIds.has(agent?.id)));
     if (eligible.length === 0) return { count: 0, changed: false };
 
     let cursorPaths = this._readCursorWindowPaths();
@@ -17368,6 +17575,16 @@ class ProxyEngine extends EventEmitter {
             }
           }
         }
+        const hadDurableHistory = initialMessages.length > 0;
+        let observationSequence = Math.max(0, Number(sessionMeta.cursor_message_observation_seq) || 0);
+        if (hadDurableHistory) {
+          const baseline = this._prepareCursorMessageObservations(agent.id, initialMessages, {
+            sequence: observationSequence,
+            observeCurrent: false,
+          });
+          initialMessages = baseline.messages;
+          observationSequence = baseline.sequence;
+        }
         if (agent.active) {
           const raw = await selectors.readMessages(client.Runtime, 'cursor', sessionMeta.session_id).catch(() => null);
           const fresh = raw ? JSON.parse(raw) : [];
@@ -17377,8 +17594,17 @@ class ProxyEngine extends EventEmitter {
               : fresh;
           }
         }
-        const activity = cursorNativeActivity(agent);
-        const now = new Date().toISOString();
+        const nowMs = Date.now();
+        const activity = cursorNativeActivity(agent, sessionMeta.activity, { nowMs });
+        const initialObservation = this._prepareCursorMessageObservations(agent.id, initialMessages, {
+          sequence: observationSequence,
+          observedAtMs: nowMs,
+          observeCurrent: hadDurableHistory
+            || (sessionMeta._matched_existing === false && activity.kind === 'generating'),
+        });
+        initialMessages = initialObservation.messages;
+        observationSequence = initialObservation.sequence;
+        const now = new Date(nowMs).toISOString();
         runtime = {
           session_id: sessionMeta.session_id,
           display_name: 'Cursor',
@@ -17394,6 +17620,7 @@ class ProxyEngine extends EventEmitter {
           lastTranscriptSig: this._transcriptSignature(initialMessages),
           _accumulatedMessages: initialMessages.slice(),
           _cursorAgentHistories: { [agent.id]: initialMessages.slice() },
+          _cursorMessageObservationSeq: observationSequence,
           _activeThreadKey: agent.id,
           _activeThreadTitle: agent.title || '',
           _lastThreadList: eligible.slice(),
@@ -17408,6 +17635,7 @@ class ProxyEngine extends EventEmitter {
           status: 'healthy',
           activity,
           nativeStatus: agent.native_status || '',
+          nativeWorking: agent.native_working === true,
           last_seen_at: now,
           windowTitle: agent.title || target.title || 'Cursor',
           agentType: 'cursor',
@@ -17434,7 +17662,9 @@ class ProxyEngine extends EventEmitter {
           cursor_agent_title: agent.title || null,
           cursor_workspace_key: agent.workspace_key || null,
           cursor_native_status: runtime.nativeStatus,
+          cursor_native_working: runtime.nativeWorking,
           cursor_active_thread_key: agent.id,
+          cursor_message_observation_seq: observationSequence,
           accumulated_messages: initialMessages,
           cursor_agent_histories: runtime._cursorAgentHistories,
           activity,
@@ -17454,8 +17684,10 @@ class ProxyEngine extends EventEmitter {
       } else {
         const nextWorkspaceName = workspaceMatch?.title || agent.workspace_name || runtime.workspace_name;
         const nextWorkspacePath = workspaceMatch?.path || runtime.workspace_path || null;
-        const nextActivity = cursorNativeActivity(agent);
+        const nextActivity = cursorNativeActivity(agent, runtime.activity);
+        const nextNativeWorking = agent.native_working === true;
         const activityChanged = runtime.nativeStatus !== (agent.native_status || '')
+          || runtime.nativeWorking !== nextNativeWorking
           || runtime.activity?.kind !== nextActivity.kind
           || runtime.activity?.label !== nextActivity.label;
         const metaChanged = runtime.chat_title !== agent.title
@@ -17469,6 +17701,7 @@ class ProxyEngine extends EventEmitter {
         runtime._targetUrl = target.url || runtime._targetUrl || '';
         runtime.last_seen_at = new Date().toISOString();
         runtime._cursorNativeActive = agent.active === true;
+        runtime.nativeWorking = nextNativeWorking;
         runtime.cursorWorkspaceKey = agent.workspace_key || runtime.cursorWorkspaceKey || null;
         runtime._lastThreadList = eligible.slice();
         runtime._lastThreadListSig = JSON.stringify(eligible.map(item => `${item.id}:${item.title}:${!!item.active}:${item.native_status || ''}`));
@@ -17495,10 +17728,19 @@ class ProxyEngine extends EventEmitter {
             cursor_agent_title: agent.title || null,
             cursor_workspace_key: agent.workspace_key || null,
             cursor_native_status: runtime.nativeStatus,
+            cursor_native_working: runtime.nativeWorking,
             activity: runtime.activity,
             status: 'healthy',
           });
           changed = true;
+        }
+        if (!activityChanged) {
+          runtime.activity = nextActivity;
+          if (nextActivity.kind === 'generating' && nextActivity.cursor_evidence_source !== 'continuity_lease') {
+            this._emitActivityObservationHeartbeat(runtime.session_id, runtime, {
+              observedAt: nextActivity.cursor_evidence_at,
+            });
+          }
         }
       }
       runtimeByAgent.set(agent.id, runtime);
@@ -17549,7 +17791,7 @@ class ProxyEngine extends EventEmitter {
         await this._withTimeout(client.Runtime.enable(), 3000, `Runtime.enable cursor ${target.id.substring(0, 8)}`);
       }
       const agents = await this._withTimeout(
-        require('./cursor-selectors').readCursorAgentList(client.Runtime),
+        this._readCursorAgentInventory(target.id, client.Runtime),
         3000,
         `Cursor agent inventory ${target.id.substring(0, 8)}`,
       );
@@ -17560,6 +17802,22 @@ class ProxyEngine extends EventEmitter {
       if (ownsClient) await this._safeClose(client);
       throw error;
     }
+  }
+
+  _readCursorAgentInventory(targetId, Runtime) {
+    if (!this._cursorAgentInventoryReads) this._cursorAgentInventoryReads = new Map();
+    const key = String(targetId || 'cursor-global');
+    const existing = this._cursorAgentInventoryReads.get(key);
+    if (existing) return existing;
+    const pending = Promise.resolve()
+      .then(() => require('./cursor-selectors').readCursorAgentList(Runtime))
+      .finally(() => {
+        if (this._cursorAgentInventoryReads.get(key) === pending) {
+          this._cursorAgentInventoryReads.delete(key);
+        }
+      });
+    this._cursorAgentInventoryReads.set(key, pending);
+    return pending;
   }
 
   async _refreshCursorVirtualTargets() {
@@ -17575,7 +17833,7 @@ class ProxyEngine extends EventEmitter {
         _cdpHost: owner._cdpHost || null,
       };
       const agents = await this._withTimeout(
-        require('./cursor-selectors').readCursorAgentList(owner.client.Runtime),
+        this._readCursorAgentInventory(owner.targetId, owner.client.Runtime),
         2000,
         `Cursor virtual inventory ${owner.targetId.substring(0, 8)}`,
       );
@@ -19460,6 +19718,10 @@ module.exports = {
   normalizeCursorWorkspaceToken,
   resolveCursorWorkspacePath,
   cursorNativeActivity,
+  cursorHasAuthoritativeWorkingSignal,
+  cursorAgentEligible,
+  CURSOR_WORKING_CONTINUITY_LEASE_MS,
+  CURSOR_NATIVE_OBSERVED_SOURCE,
   validateAttachmentPayload,
   shouldImmediatelyStreamCursorAssistant,
   shouldImmediatelyStreamAntigravityV2Assistant,

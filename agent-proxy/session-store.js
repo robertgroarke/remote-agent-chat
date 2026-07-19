@@ -63,6 +63,7 @@ const COALESCED_UPDATE_KEYS = new Set([
   'accumulated_messages',
   'cursor_agent_histories',
   'cursor_active_thread_key',
+  'cursor_message_observation_seq',
   'codex_desktop_active_thread_key',
   'codex_desktop_active_thread_title',
 ]);
