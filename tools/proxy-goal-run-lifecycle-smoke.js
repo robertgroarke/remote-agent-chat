@@ -322,6 +322,66 @@ async function main() {
   });
   assert.strictEqual(evidenceSession.activity.observed_at, new Date(NOW + 5_000).toISOString(),
     'non-evidentiary summary discarded or refreshed the last activity observation');
+  const heartbeatFramesBefore = engine.sent.length;
+  assert.strictEqual(engine._emitActivityObservationHeartbeat(evidenceSession.session_id, evidenceSession, {
+    observedAt: new Date(NOW + 9_999).toISOString(),
+  }), false, 'producer heartbeat ignored the bounded coalescing interval');
+  assert.strictEqual(engine._emitActivityObservationHeartbeat(evidenceSession.session_id, evidenceSession, {
+    observedAt: new Date(NOW + 10_000).toISOString(),
+  }), true, 'live producer observation did not refresh active evidence');
+  assert.strictEqual(evidenceSession.activity.observed_at, new Date(NOW + 10_000).toISOString());
+  assert.strictEqual(engine.sent.length, heartbeatFramesBefore + 1);
+  const idleHeartbeatSession = {
+    session_id: 'idle-heartbeat-fixture',
+    status: 'healthy',
+    activity: { kind: 'idle', label: '', updated_at: new Date(NOW).toISOString() },
+  };
+  assert.strictEqual(engine._emitActivityObservationHeartbeat(idleHeartbeatSession.session_id, idleHeartbeatSession, {
+    observedAt: new Date(NOW + 60_000).toISOString(),
+  }), false, 'an idle producer observation created active freshness');
+  const cursorHeartbeatSession = {
+    session_id: 'cursor-heartbeat-fixture',
+    agentType: 'cursor_cli',
+    status: 'healthy',
+    activity: { kind: 'generating', label: 'Cursor CLI running', updated_at: new Date(NOW).toISOString() },
+  };
+  const cursorFramesBefore = engine.sent.length;
+  assert.strictEqual(engine._setCursorCliActivity(cursorHeartbeatSession.session_id, cursorHeartbeatSession, {
+    kind: 'generating', label: 'Cursor CLI running', updated_at: new Date(NOW).toISOString(),
+  }, { producerObserved: true, observedAt: new Date(NOW + 5_000).toISOString() }), true);
+  assert.strictEqual(engine._setCursorCliActivity(cursorHeartbeatSession.session_id, cursorHeartbeatSession, {
+    kind: 'generating', label: 'Cursor CLI running', updated_at: new Date(NOW).toISOString(),
+  }, { producerObserved: true, observedAt: new Date(NOW + 9_999).toISOString() }), false);
+  assert.strictEqual(engine._setCursorCliActivity(cursorHeartbeatSession.session_id, cursorHeartbeatSession, {
+    kind: 'generating', label: 'Cursor CLI running', updated_at: new Date(NOW).toISOString(),
+  }, { producerObserved: true, observedAt: new Date(NOW + 10_000).toISOString() }), true);
+  assert.strictEqual(engine.sent.length, cursorFramesBefore + 2,
+    'Cursor CLI producer observations were not coalesced to the heartbeat interval');
+
+  const ownerOnlyEngine = harness();
+  ownerOnlyEngine._codexCliGoalMonitorConnectionFactory = () => ({
+    on() {}, async start() {}, async getGoal() { return { goal: null }; }, async stop() {},
+  });
+  ownerOnlyEngine._codexCliGoalMonitorOwnerProbe = async () => ({
+    state: 'confirmed', checked_at_ms: NOW + 10_000, pid: 4321,
+  });
+  const ownerOnlySession = {
+    session_id: 'owner-only-working-fixture',
+    agentType: 'codex_cli',
+    cliSessionId: '019f6b9c-31c1-72c1-8f80-7ff60b163160',
+    codexCliExternalActive: true,
+    status: 'healthy',
+    activity: { kind: 'generating', label: 'Working', updated_at: new Date(NOW).toISOString() },
+  };
+  ownerOnlyEngine.sessions.set(ownerOnlySession.session_id, ownerOnlySession);
+  assert.strictEqual(await ownerOnlyEngine._auditCodexCliGoalController(
+    ownerOnlySession.session_id,
+    ownerOnlySession,
+    { force: true, nowMs: NOW + 10_000 },
+  ), true, 'exact owner observation did not refresh an ordinary active Codex CLI session');
+  assert.strictEqual(ownerOnlySession.activity.observed_at, new Date(NOW + 10_000).toISOString());
+  assert.strictEqual(ownerOnlyEngine.sent.length, 1);
+  await ownerOnlyEngine._stopCodexCliGoalMonitor();
 
   const controllerEngine = harness();
   let controllerStatus = 'active';
@@ -405,6 +465,10 @@ async function main() {
     rotation_twin_demoted_without_delete: true,
     fresh_append_status_emitted: true,
     non_evidentiary_summary_preserved_observation: true,
+    active_producer_heartbeat_bounded: true,
+    idle_producer_heartbeat_rejected: true,
+    cursor_cli_heartbeat_bounded: true,
+    exact_owner_activity_heartbeat: true,
     diagnostics_redacted: true,
   };
   const outputIndex = process.argv.indexOf('--output');

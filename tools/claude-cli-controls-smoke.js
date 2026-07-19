@@ -59,9 +59,9 @@ const claudeCli = require('../agent-proxy/claude-cli');
     assert.match(proxySource, /session\.agentType === 'claude_cli'[\s\S]*?continue;/);
     assert.match(proxySource, /if \(this\._claudeCliPollTimer\)[\s\S]*?clearInterval\(this\._claudeCliPollTimer\)/);
     assert.doesNotMatch(proxySource, /messages\.length > 0 \? null : this\._claudeCliTrustPrompt/);
-    assert.match(proxySource, /stopNativeClaudeWindow\(sessionData\.nativeClaudeWindowChild\)/);
+    assert.match(proxySource, /trusted Claude workspace for \$\{sid\}; native window remains operator-action-only/);
     assert.match(proxySource, /sessionData\.nativeClaudeWindowChild = child/);
-    assert.match(proxySource, /sessionData\._claudeCliInterrupted = true;[\s\S]*?stopNativeClaudeWindow\(sessionData\[childKey\]\)/);
+    assert.match(proxySource, /sessionData\._claudeCliInterrupted = true;[\s\S]*?claudeCli\.stopNativeClaudeWindow\(sessionData\[childKey\]\)/);
     assert.match(proxySource, /const wasInterrupted = session\._claudeCliInterrupted === true/);
     assert.match(proxySource, /_sendClaudeCliMessage\(session, content, sessionId\)[\s\S]*?if \(session\.messageQueue\?\.length\)[\s\S]*?await this\._processMessageQueue\(sessionId\)/);
     assert.match(proxySource, /const hasGitWorkspace = hasWorkspace && this\._isGitWorkspace\(workspacePath\)/);
@@ -79,7 +79,7 @@ const claudeCli = require('../agent-proxy/claude-cli');
     assert.match(claudeSource, /Could not find a valid Claude Code native executable/);
     assert.match(claudeSource, /const nativeCommand = command === 'cmd\.exe' \? \(spawnArgs\[3\]/);
 
-    console.log('PASS claude-cli controls: durable trust, owned native replacement, config persistence, and isolated lifecycle polling');
+    console.log('PASS claude-cli controls: durable trust, operator-only native launch, config persistence, and isolated lifecycle polling');
   } finally {
     fs.rmSync(tempRoot, { recursive: true, force: true });
   }

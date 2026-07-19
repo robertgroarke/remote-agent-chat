@@ -832,6 +832,10 @@ const CODEX_CLI_OWNER_MISSING_GRACE_MS = Math.min(120_000, Math.max(
   5_000,
   parseInt(process.env.CODEX_CLI_OWNER_MISSING_GRACE_MS || '30000', 10) || 30_000,
 ));
+const ACTIVITY_OBSERVATION_HEARTBEAT_MS = 5_000;
+const ACTIVE_ACTIVITY_KINDS = new Set([
+  'thinking', 'generating', 'reading_files', 'running_command', 'applying_patch', 'working',
+]);
 const VSCODE_CODEX_NATIVE_DEADLINE_RECEIPT_GRACE_MS = 15000;
 
 // ─── Cursor CLI history streaming constants ─────────────────────────────────
@@ -11021,6 +11025,8 @@ class ProxyEngine extends EventEmitter {
       session.activity = activity;
       sessionStore.updateSession(sessionId, { activity });
       this._sendToRelay(proto.proxyStatus(sessionId, session.status || 'healthy', activity));
+    } else if (session._claudeCliChild) {
+      this._emitActivityObservationHeartbeat(sessionId, session);
     }
     await this._handleSessionErrorPromptState(
       sessionId,
@@ -11054,6 +11060,30 @@ class ProxyEngine extends EventEmitter {
       goal,
       goal_run: goalRun,
     });
+  }
+
+  _emitActivityObservationHeartbeat(sessionId, session, {
+    observedAt = new Date().toISOString(),
+    minIntervalMs = ACTIVITY_OBSERVATION_HEARTBEAT_MS,
+  } = {}) {
+    if (!sessionId || !session?.activity) return false;
+    const health = String(session.status || '').trim().toLowerCase();
+    if (['disconnected', 'dead', 'archived'].includes(health)) return false;
+    const kind = String(session.activity.kind || '').trim().toLowerCase();
+    if (session.activity.generating !== true && !ACTIVE_ACTIVITY_KINDS.has(kind)) return false;
+    const observedAtMs = Date.parse(observedAt);
+    if (!Number.isFinite(observedAtMs)) return false;
+    const previousObservedAtMs = Math.max(
+      Date.parse(session.activity.observed_at || '') || 0,
+      Date.parse(session.activity.updated_at || session.activity.updatedAt || '') || 0,
+    );
+    const boundedIntervalMs = Math.max(1_000, Number(minIntervalMs) || ACTIVITY_OBSERVATION_HEARTBEAT_MS);
+    if (previousObservedAtMs > 0 && observedAtMs - previousObservedAtMs < boundedIntervalMs) return false;
+    const nextActivity = { ...session.activity, observed_at: observedAt };
+    session.activity = nextActivity;
+    sessionStore.updateSession(sessionId, { activity: nextActivity });
+    this._sendToRelay(proto.proxyStatus(sessionId, session.status || 'healthy', nextActivity));
+    return true;
   }
 
   _canonicalGoalForSession(sessionId, session, observedGoal, source = '') {
@@ -11308,9 +11338,9 @@ class ProxyEngine extends EventEmitter {
         }
         return false;
       }
-
       if (goalSettled.status === 'rejected') {
         const error = goalSettled.reason;
+        let ownerHeartbeat = false;
         if (session.activity?.goal && session.activity?.goal_run?.lease_active === true) {
           this._setCodexCliActivity(sessionId, session, session.activity, {
             source: 'codex_cli_goal_controller',
@@ -11320,6 +11350,10 @@ class ProxyEngine extends EventEmitter {
             ownerState: 'ambiguous',
             liveLeaseProof: false,
           });
+        } else if (!session.activity?.goal) {
+          ownerHeartbeat = this._emitActivityObservationHeartbeat(sessionId, session, {
+            observedAt: new Date(owner.checked_at_ms || Date.now()).toISOString(),
+          });
         }
         const logNow = Date.now();
         if (!session._lastCodexCliGoalMonitorErrorAtMs
@@ -11327,14 +11361,18 @@ class ProxyEngine extends EventEmitter {
           session._lastCodexCliGoalMonitorErrorAtMs = logNow;
           this._log('warn', `[goal-run] controller query failed harness=codex_cli code=${error?.code || error?.name || 'unknown'}`);
         }
-        return false;
+        return ownerHeartbeat;
       }
       const result = goalSettled.value;
       if (this.sessions?.get(sessionId) !== session) return false;
       const observedAt = new Date().toISOString();
       const nativeGoal = result?.goal || null;
       if (!nativeGoal) {
-        if (!session.activity?.goal || session.activity?.goal_run?.lease_active !== true) return false;
+        if (!session.activity?.goal || session.activity?.goal_run?.lease_active !== true) {
+          return this._emitActivityObservationHeartbeat(sessionId, session, {
+            observedAt: new Date(owner.checked_at_ms || Date.now()).toISOString(),
+          });
+        }
         return this._setCodexCliActivity(sessionId, session, session.activity, {
           source: 'codex_cli_goal_controller',
           goalSource: 'codex_cli_goal_controller',
@@ -13338,14 +13376,24 @@ class ProxyEngine extends EventEmitter {
     }];
   }
 
-  _setCursorCliActivity(sessionId, session, activity) {
-    const observedActivity = activity || { kind: 'idle', label: '', updated_at: new Date().toISOString() };
+  _setCursorCliActivity(sessionId, session, activity, { producerObserved = false, observedAt = null } = {}) {
+    const observedActivityBase = activity || { kind: 'idle', label: '', updated_at: new Date().toISOString() };
+    const observedActivity = producerObserved
+      ? { ...observedActivityBase, observed_at: observedAt || new Date().toISOString() }
+      : observedActivityBase;
     const nextActivity = session._cursorCliInterrupted === true
       ? { kind: 'idle', label: 'Interrupted', updated_at: session.activity?.updated_at || new Date().toISOString() }
       : observedActivity;
     const prevSig = this._activitySemanticSignature(session.activity || null);
-    const nextSig = this._activitySemanticSignature(nextActivity);
-    if (prevSig === nextSig) return false;
+    const nextSig = this._activitySemanticSignature({
+      ...nextActivity,
+      observed_at: session.activity?.observed_at,
+    });
+    if (prevSig === nextSig) {
+      return producerObserved
+        ? this._emitActivityObservationHeartbeat(sessionId, session, { observedAt: observedActivity.observed_at })
+        : false;
+    }
     session.activity = nextActivity;
     if (nextActivity.thinkingContent) session.thinkingContent = nextActivity.thinkingContent;
     else session.thinkingContent = '';
@@ -14108,7 +14156,11 @@ class ProxyEngine extends EventEmitter {
       session,
       this._cursorCliMessageDeltaEnabled() && session._cursorCliChild
         ? fallbackActivity
-        : (summaryActivity || fallbackActivity)
+        : (summaryActivity || fallbackActivity),
+      {
+        producerObserved: !!session._cursorCliChild || transcriptMaybeChanged,
+        observedAt: new Date(now).toISOString(),
+      },
     );
   }
 
@@ -14214,7 +14266,10 @@ class ProxyEngine extends EventEmitter {
     const observedActivity = ownedTurnCompleted && summaryActivity?.kind !== 'idle'
       ? { ...summaryActivity, kind: 'idle', label: '', updated_at: ownedTurnCompletedAt || new Date().toISOString() }
       : (summaryActivity || fallbackActivity);
-    this._setCodexCliActivity(sessionId, session, observedActivity, lifecycleContext);
+    const activityChanged = this._setCodexCliActivity(sessionId, session, observedActivity, lifecycleContext);
+    if (!activityChanged && (session._codexCliChild || session._codexAppServerTurn)) {
+      this._emitActivityObservationHeartbeat(sessionId, session, { observedAt: new Date(now).toISOString() });
+    }
   }
 
   async _pollSessionContinue(sessionId, session) {
@@ -14560,6 +14615,8 @@ class ProxyEngine extends EventEmitter {
       if ((prevKind === 'generating' || prevKind === 'thinking') && kind === 'idle') {
         this._processMessageQueue(sessionId);
       }
+    } else {
+      this._emitActivityObservationHeartbeat(sessionId, session, { observedAt: newActivity.updated_at });
     }
 
     // ── Permission dialog ──
@@ -14807,6 +14864,8 @@ class ProxyEngine extends EventEmitter {
       if ((prevKind === 'generating' || prevKind === 'thinking') && kind === 'idle') {
         this._processMessageQueue(sessionId);
       }
+    } else {
+      this._emitActivityObservationHeartbeat(sessionId, session, { observedAt: newActivity.updated_at });
     }
 
     await this._handlePermissionDialogState(sessionId, session, perm);
@@ -15928,6 +15987,8 @@ class ProxyEngine extends EventEmitter {
         if ((prevKind === 'generating' || prevKind === 'thinking') && kind === 'idle') {
           this._processMessageQueue(sessionId);
         }
+      } else {
+        this._emitActivityObservationHeartbeat(sessionId, session, { observedAt });
       }
 
 

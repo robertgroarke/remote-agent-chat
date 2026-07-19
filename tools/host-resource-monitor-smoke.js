@@ -396,6 +396,62 @@ async function main() {
   sharedCadenceMonitor.unsubscribe('shared-second');
   sharedCadenceMonitor.stop();
 
+  let forcedNow = 5_000_000;
+  let forcedCollectionCount = 0;
+  const forcedCaptureTimes = [];
+  const forcedReceipts = [];
+  const forcedCadenceMonitor = new HostResourceMonitor({
+    getSessions: () => sessions,
+    collectRaw: async () => {
+      forcedCollectionCount += 1;
+      return rawFixture();
+    },
+    onSnapshot: (snapshot, requestId) => forcedReceipts.push({ snapshot, requestId }),
+    systemSampler: {
+      capture: () => {
+        forcedCaptureTimes.push(forcedNow);
+        return {
+          cpu_percent: 50,
+          memory_available_bytes: 6 * 1024 ** 3,
+          uptime_seconds: 86400,
+        };
+      },
+    },
+    now: () => forcedNow,
+    monotonicNow: () => forcedNow,
+    detailIntervalMs: 5_000,
+    totalMemoryBytes: 16 * 1024 ** 3,
+    logicalCpuCount: 8,
+    machineLabel: 'fixture-host',
+  });
+  forcedCadenceMonitor.history.subscribe('forced-cadence');
+  const forcedBaseline = await forcedCadenceMonitor._sample();
+  forcedCadenceMonitor._recordHistory(forcedBaseline.snapshot, forcedBaseline.detailCollected);
+  forcedCadenceMonitor.systemTimer = setInterval(() => {}, 60_000);
+  forcedCadenceMonitor.systemTimer.unref?.();
+  forcedNow += 400;
+  const forcedReceipt = await forcedCadenceMonitor.refresh({ force: true, requestId: 'force-detail' });
+  assert.strictEqual(forcedReceipt, forcedBaseline.snapshot,
+    'forced detail request did not acknowledge with the cached safe snapshot');
+  assert.equal(forcedReceipts.at(-1)?.requestId, 'force-detail');
+  assert.equal(forcedCadenceMonitor.forceDetailPending, true);
+  assert.deepStrictEqual(forcedCaptureTimes, [5_000_000],
+    'forced detail request inserted a fast capture between system ticks');
+  assert.equal(forcedCollectionCount, 1,
+    'forced detail request collected immediately instead of joining the shared tick');
+  forcedNow += 600;
+  await forcedCadenceMonitor._systemTick();
+  assert.deepStrictEqual(forcedCaptureTimes, [5_000_000, 5_001_000]);
+  assert.equal(forcedCollectionCount, 2, 'queued detail was not collected on the next system tick');
+  assert.equal(forcedCadenceMonitor.forceDetailPending, false);
+  assert.equal(forcedCadenceMonitor.lastSnapshot.sample_interval_ms, 1_000);
+  forcedNow += 1_000;
+  await forcedCadenceMonitor._systemTick();
+  assert.deepStrictEqual(forcedCaptureTimes, [5_000_000, 5_001_000, 5_002_000]);
+  assert.equal(forcedCollectionCount, 2,
+    'forced detail queue changed the normal five-second detail cadence after it was consumed');
+  forcedCadenceMonitor.stop();
+
   let warmStops = 0;
   let warmPid = 42424;
   const leaseMonitor = new HostResourceMonitor({
@@ -451,6 +507,7 @@ async function main() {
     detail_cadence_anchored_to_collection_start: true,
     system_cadence_anchored_to_capture_start: true,
     joining_subscriber_reuses_shared_cadence: true,
+    forced_detail_queued_on_shared_tick: true,
     cached_identity_preserved: true,
     schema_version: snapshot.schema_version,
     sample_sequence: snapshot.sample_sequence,

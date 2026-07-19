@@ -68,10 +68,24 @@ export function classifyFleetActivity(activity, needsAttention = false, options 
   const goalState = normalizedGoalState(activity);
   const goalRun = canonicalGoalRun(activity);
   const runLifecycle = String(goalRun?.lifecycle || '').trim().toLowerCase();
-  if (needsAttention || FLEET_ATTENTION_KINDS.has(kind) || FLEET_ATTENTION_GOAL_STATES.has(goalState)
+  if (needsAttention || FLEET_ATTENTION_KINDS.has(kind)
       || FLEET_ATTENTION_GOAL_RUN_STATES.has(runLifecycle)) {
     return 'needs_attention';
   }
+  const activeExecutionProof = activity?.generating === true || FLEET_ACTIVE_KINDS.has(kind);
+  // Native goal metadata can lag a resumed turn (for example, a lineage that
+  // was rotated while blocked). A confirmed current execution lease plus a
+  // live producer activity is stronger evidence than that older goal state.
+  // Explicit prompt/blocked activity and blocked goal-run lifecycle checks
+  // above still win, so a released or genuinely blocked row remains attention.
+  if (goalRun?.lease_active === true
+      && goalRun.owner_state === 'confirmed'
+      && FLEET_WORKING_GOAL_RUN_STATES.has(runLifecycle)
+      && activeExecutionProof
+      && fleetActivityIsFresh(activity, options)) {
+    return 'working_goal';
+  }
+  if (FLEET_ATTENTION_GOAL_STATES.has(goalState)) return 'needs_attention';
   if (goalRun && runLifecycle === 'unknown_disconnected') return 'stale';
   if (goalRun && FLEET_TERMINAL_GOAL_RUN_STATES.has(runLifecycle)) return 'idle';
   if (FLEET_TERMINAL_GOAL_STATES.has(goalState)) return 'idle';
@@ -93,8 +107,7 @@ export function classifyFleetActivity(activity, needsAttention = false, options 
   // bounded freshness window expires.
   if (kind === 'idle' && goalState !== 'active') return 'idle';
   if (!fleetActivityIsFresh(activity, options)) return 'stale';
-  const hasExecutionProof = activity?.generating === true || FLEET_ACTIVE_KINDS.has(kind);
-  if (hasExecutionProof) return 'working';
+  if (activeExecutionProof) return 'working';
   return 'idle';
 }
 

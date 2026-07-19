@@ -629,6 +629,7 @@ class HostResourceMonitor {
     this.lastHistorySequence = 0;
     this.inFlight = null;
     this.systemTimer = null;
+    this.forceDetailPending = false;
     this.idleTimer = null;
     this.stopped = false;
   }
@@ -648,8 +649,16 @@ class HostResourceMonitor {
 
   async _systemTick(options = {}) {
     if (this.stopped || this.history.retainedCount() === 0) return;
+    const forceDetail = options.forceDetail === true || this.forceDetailPending;
+    const ownsSample = !this.inFlight;
+    if (forceDetail) {
+      // Consume a queued request only when this tick owns a new sample. If the
+      // preceding detail collection is still in flight, _sample() will reuse
+      // that promise and the next one-second boundary must retain the request.
+      this.forceDetailPending = !ownsSample;
+    }
     try {
-      const sampled = await this._sample(options);
+      const sampled = await this._sample({ ...options, forceDetail });
       this._recordHistory(sampled.snapshot, sampled.detailCollected);
     } catch (error) {
       this.log('warn', `[resources] Lightweight system sample failed: ${error?.message || 'unknown error'}`);
@@ -693,6 +702,7 @@ class HostResourceMonitor {
   _shutdownInactiveSampler() {
     clearInterval(this.systemTimer);
     this.systemTimer = null;
+    this.forceDetailPending = false;
     this.lastSnapshot = null;
     this.lastDetailRaw = null;
     this.lastFastRaw = null;
@@ -867,6 +877,15 @@ class HostResourceMonitor {
     const requestId = safeText(options.requestId, 80) || null;
     const now = this.now();
     this._touchLease();
+    if (options.force === true && this.systemTimer && this.history.activeCount() > 0 && this.lastSnapshot) {
+      // Capture-detail is an interaction on the shared monitoring lane, not a
+      // second sampler. Queue its detail read for the next existing one-second
+      // tick and acknowledge immediately with the last safe snapshot.
+      this.forceDetailPending = true;
+      const cached = options.aggregateOnly === true ? aggregateOnlySnapshot(this.lastSnapshot) : this.lastSnapshot;
+      this.onSnapshot(cached, requestId);
+      return cached;
+    }
     if (!options.force && this.lastSnapshot && now - this.lastCollectedAt < this.minIntervalMs) {
       const cached = options.aggregateOnly === true ? aggregateOnlySnapshot(this.lastSnapshot) : this.lastSnapshot;
       this.onSnapshot(cached, requestId);
@@ -887,6 +906,7 @@ class HostResourceMonitor {
     clearInterval(this.systemTimer);
     clearTimeout(this.idleTimer);
     this.systemTimer = null;
+    this.forceDetailPending = false;
     this.idleTimer = null;
     const stopPromise = this.warmCollector?.stop();
     this.lastSnapshot = null;

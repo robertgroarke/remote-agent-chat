@@ -16,6 +16,7 @@ const styles = read('frontend/styles.css');
 const bundle = read('frontend/dist/bundle.js');
 const indexHtml = read('frontend/index.html');
 const serviceWorker = read('frontend/sw.js');
+const fleetActivity = read('frontend/fleet-activity.js');
 
 for (const forbidden of [
   'TRANSCRIPT_RENDER_TAIL_LIMIT',
@@ -57,23 +58,26 @@ assert(!app.includes('Open this Claude CLI session in a native command window'),
   'native-window labels must name the selected CLI harness');
 assert.match(app, /Open this \$\{agentTypeLabel\(activeSessionMeta\?\.agent_type\)/,
   'native-window labels must derive the visible harness name');
-assert.match(app, /function formatGoalElapsed\(goal, nowMs\)[\s\S]*?goal\?\.state \|\| goal\?\.status/,
-  'goal elapsed time must continue from canonical goal state');
-const goalFormatterSource = app.match(/function formatGoalElapsed\(goal, nowMs\) \{[\s\S]*?\n\}/)?.[0];
-assert(goalFormatterSource, 'goal elapsed formatter source is missing');
-const testGoalElapsed = new Function('formatClockDuration', `${goalFormatterSource}; return formatGoalElapsed;`)(
-  (seconds, { includeSeconds = false } = {}) => {
-    const minutes = Math.floor(seconds / 60);
-    const remainder = Math.floor(seconds % 60);
-    return includeSeconds ? `${minutes}m ${String(remainder).padStart(2, '0')}s` : `${minutes}m`;
-  },
-);
+assert.match(app, /fleetGoalElapsedSeconds\(goal, goalRun, nowMs\)/,
+  'goal elapsed time must consume the shared Fleet lifecycle projection');
+const timestampSource = fleetActivity.match(/function timestampMs\(value\) \{[\s\S]*?\n\}/)?.[0];
+const goalFormatterSource = fleetActivity.match(/export function fleetGoalElapsedSeconds\(goal, goalRun = null, nowMs = Date\.now\(\)\) \{[\s\S]*?\n\}/)?.[0];
+assert(timestampSource && goalFormatterSource, 'shared goal elapsed formatter source is missing');
+const testGoalElapsed = new Function(
+  `${timestampSource}; ${goalFormatterSource.replace('export ', '')}; return fleetGoalElapsedSeconds;`,
+)();
 const goalNow = Date.now();
 assert.strictEqual(
-  testGoalElapsed(
-    { state: 'active', time_used_seconds: 521, updated_at: new Date(goalNow - 7 * 86400000).toISOString() },
-    goalNow,
-  ),
+  (() => {
+    const seconds = testGoalElapsed(
+      { state: 'active', time_used_seconds: 521, updated_at: new Date(goalNow - 7 * 86400000).toISOString() },
+      null,
+      goalNow,
+    );
+    const minutes = Math.floor(seconds / 60);
+    const remainder = Math.floor(seconds % 60);
+    return `${minutes}m ${String(remainder).padStart(2, '0')}s`;
+  })(),
   '10088m 41s',
   'active goal elapsed formatter must remain persistent while the agent is idle',
 );

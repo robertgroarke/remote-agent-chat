@@ -180,6 +180,63 @@ try {
   assertHierarchy(baselineWeb, fixture);
   assert.deepStrictEqual(baselineAndroid, baselineWeb);
 
+  const producerFixture = { session_id: 'producer-heartbeat-fixture', agent_type: 'codex_cli' };
+  let producerActivity = { kind: 'generating', generating: true, updated_at: new Date(NOW_MS).toISOString() };
+  const assertProducerState = (nowMs, expected) => {
+    const options = { connected: true, health: 'healthy', nowMs, requireFreshness: true };
+    const activities = { [producerFixture.session_id]: producerActivity };
+    const webSidebarState = web.sidebarSessionState(producerFixture, { activities, ...options });
+    const androidSidebarState = android.sidebarSessionState(producerFixture, { activities, ...options });
+    const webFleetState = webFleet.classifyFleetActivity(producerActivity, false, options);
+    const androidFleetState = androidFleet.classifyFleetActivity(producerActivity, false, options);
+    assert.deepStrictEqual(
+      [webSidebarState, androidSidebarState, webFleetState, androidFleetState],
+      [expected, expected, expected, expected],
+    );
+  };
+  assertProducerState(NOW_MS + 4_999, 'working');
+  producerActivity = { ...producerActivity, observed_at: new Date(NOW_MS + 5_000).toISOString() };
+  assertProducerState(NOW_MS + 19_999, 'working');
+  assertProducerState(NOW_MS + 20_001, 'stale');
+
+  const laggedBlockedGoal = {
+    kind: 'generating',
+    generating: true,
+    updated_at: FRESH_AT,
+    goal: { state: 'blocked', fingerprint: 'lagged-blocked-goal', generation: 1 },
+    goal_run: {
+      schema_version: 1,
+      run_id: 'lagged-blocked-run',
+      goal_fingerprint: 'lagged-blocked-goal',
+      goal_generation: 1,
+      lifecycle: 'running_turn',
+      lease_active: true,
+      owner_state: 'confirmed',
+      transition_seq: 2,
+    },
+  };
+  const freshnessOptions = { connected: true, health: 'healthy', nowMs: NOW_MS, requireFreshness: true };
+  assert.strictEqual(webFleet.classifyFleetActivity(laggedBlockedGoal, false, freshnessOptions), 'working_goal');
+  assert.strictEqual(androidFleet.classifyFleetActivity(laggedBlockedGoal, false, freshnessOptions), 'working_goal');
+  assert.strictEqual(webFleet.classifyFleetActivity(laggedBlockedGoal, false, {
+    ...freshnessOptions,
+    nowMs: NOW_MS + 15_001,
+  }), 'needs_attention');
+  assert.strictEqual(androidFleet.classifyFleetActivity(laggedBlockedGoal, false, {
+    ...freshnessOptions,
+    nowMs: NOW_MS + 15_001,
+  }), 'needs_attention');
+  assert.strictEqual(webFleet.classifyFleetActivity(laggedBlockedGoal, true, freshnessOptions), 'needs_attention');
+  assert.strictEqual(webFleet.classifyFleetActivity({
+    ...laggedBlockedGoal,
+    kind: 'blocked',
+  }, false, freshnessOptions), 'needs_attention');
+  assert.strictEqual(webFleet.classifyFleetActivity({
+    ...laggedBlockedGoal,
+    kind: 'idle',
+    goal_run: { ...laggedBlockedGoal.goal_run, lifecycle: 'blocked_limited', lease_active: false },
+  }, false, freshnessOptions), 'needs_attention');
+
   const workingObjects = baselineWeb.working.map(id => fixture.sessions.find(session => idOf(session) === id));
   const initialLedger = web.createSidebarWorkingLedger(workingObjects.slice(0, 3));
   const reordered = web.reconcileSidebarWorkingLedger(initialLedger, workingObjects.slice(0, 3).reverse());
@@ -255,6 +312,10 @@ try {
 
   const appSource = fs.readFileSync(path.join(ROOT, 'frontend', 'app.jsx'), 'utf8');
   const androidSource = fs.readFileSync(path.join(ROOT, 'android-app', 'screens', 'SessionListScreen.jsx'), 'utf8');
+  assert.ok((appSource.match(/requireFreshness:\s*true/g) || []).length >= 2,
+    'Web Fleet and Sidebar must both enforce producer freshness');
+  assert.ok((androidSource.match(/requireFreshness:\s*true/g) || []).length >= 2,
+    'Android Fleet and Sidebar must both enforce producer freshness');
   assert.ok(appSource.indexOf('{workingSessions.length > 0') < appSource.indexOf('{pinnedSessions.length > 0'));
   assert.match(appSource, /\.\.\.workingSessions, \.\.\.recentSessions, \.\.\.pinnedSessions, \.\.\.sessionGroups/);
   assert.match(appSource, /menuOpen: !!card\.querySelector/);
@@ -275,6 +336,11 @@ try {
     authoritative_edges: edgeEvidence,
     web_android_state_parity: true,
     web_android_hierarchy_parity: true,
+    fleet_sidebar_freshness_policy_parity: true,
+    producer_heartbeat_kept_working: true,
+    stalled_producer_demoted_together_ms: 15_001,
+    lagged_blocked_goal_with_confirmed_execution: 'working_goal',
+    explicit_blocked_activity_remains_attention: true,
     search_working_first: true,
     collapsed_workspace_working_visible: true,
     visible_windows: 0,

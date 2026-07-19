@@ -61,15 +61,19 @@ function isOllamaUsageTarget(target) {
   if (target?.type !== 'page') return false;
   try {
     const url = new URL(target.url);
+    // Signed-in ollama.com redirects /settings/usage to /settings, which
+    // renders the same Usage section; accept both paths.
     return url.protocol === 'https:'
       && url.hostname === 'ollama.com'
-      && /^\/settings\/usage\/?$/.test(url.pathname);
+      && /^\/settings(\/usage)?\/?$/.test(url.pathname);
   } catch {
     return false;
   }
 }
 
-const EXTRACT_USAGE_EXPRESSION = `(() => {
+// String.raw so the regex escapes below (\r, \s, \$, \., \n) reach the page
+// verbatim instead of being cooked by template-literal escape processing.
+const EXTRACT_USAGE_EXPRESSION = String.raw`(() => {
   const sourceReceipt = {
     ready_state: document.readyState,
     visibility_state: document.visibilityState,

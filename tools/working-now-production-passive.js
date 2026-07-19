@@ -142,6 +142,27 @@ function sessionHash(sessionId) {
   return sha256(`session\0${sessionId}`).slice(0, 16);
 }
 
+function redactedActivityState(sessionId, session, state, nowMs) {
+  const activity = session?.activity || {};
+  const observedAtMs = Math.max(
+    Date.parse(activity.observed_at || '') || 0,
+    Date.parse(activity.updated_at || activity.updatedAt || '') || 0,
+  );
+  const goalState = String(activity.goal?.state || activity.goal?.status || '').trim().toLowerCase();
+  const lifecycle = lifecycleSnapshot(session);
+  return {
+    session_hash: sessionHash(sessionId),
+    agent_type: String(session?.agent_type || session?.agentType || 'unknown'),
+    state: state || 'missing',
+    activity_kind: String(activity.kind || 'unknown'),
+    goal_state: goalState || null,
+    goal_run_lifecycle: lifecycle?.lifecycle || null,
+    lease_active: lifecycle?.lease_active === true,
+    owner_state: lifecycle?.owner_state || null,
+    observation_age_ms: observedAtMs > 0 ? Math.max(0, nowMs - observedAtMs) : null,
+  };
+}
+
 function compileClassifier(sourceRoot) {
   const esbuild = require(require.resolve('esbuild', {
     paths: [path.join(sourceRoot, 'frontend')],
@@ -536,6 +557,11 @@ async function main(argv = process.argv.slice(2)) {
       && focusChanges === 0 && selectionChanges === 0 && urlChanges === 0
       && maxAnchorDriftPx === 0 && maxScrollDriftPx === 0 && maxLayoutShift === 0
       && fleetTruthPass;
+    const classifiedSessions = [...sessions.entries()]
+      .map(([id, session]) => redactedActivityState(id, session, stateBySession.get(id), now))
+      .filter(row => row.state !== 'idle' || row.lease_active)
+      .sort((left, right) => left.session_hash.localeCompare(right.session_hash))
+      .slice(0, 128);
     let verdict = status;
     if (status === 'complete') {
       verdict = durationGate && relayLifecyclePass && domContinuityPass && pageBuildCurrent
@@ -572,6 +598,7 @@ async function main(argv = process.argv.slice(2)) {
         duplicate_proxy_alarms: duplicateProxyAlarms,
         working_count: previousRelayWorking.size,
         goal_leases: [...sessions.values()].filter(row => lifecycleSnapshot(row)?.lease_active).length,
+        classified_sessions: classifiedSessions,
         membership_edges: relayEdges,
         lifecycle_transitions: lifecycleTransitions,
         unexplained_goal_edges: unexplainedRelayGoalEdges,

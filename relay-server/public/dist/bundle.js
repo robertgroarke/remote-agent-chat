@@ -1,34 +1,34 @@
-(()=>{var pf=Object.create;var Mu=Object.defineProperty;var mf=Object.getOwnPropertyDescriptor;var ff=Object.getOwnPropertyNames;var gf=Object.getPrototypeOf,hf=Object.prototype.hasOwnProperty;var _f=(e,t)=>()=>(t||e((t={exports:{}}).exports,t),t.exports);var bf=(e,t,n,s)=>{if(t&&typeof t=="object"||typeof t=="function")for(let a of ff(t))!hf.call(e,a)&&a!==n&&Mu(e,a,{get:()=>t[a],
-enumerable:!(s=mf(t,a))||s.enumerable});return e};var vf=(e,t,n)=>(n=e!=null?pf(gf(e)):{},bf(t||!e||!e.__esModule?Mu(n,"default",{value:e,enumerable:!0}):n,e));var $p=_f((ly,Tp)=>{"use strict";var Np=new Set(["codex","codex_cli","codex-desktop"]),Bh=new Set(["thinking","generatin\
+(()=>{var mf=Object.create;var Mu=Object.defineProperty;var ff=Object.getOwnPropertyDescriptor;var gf=Object.getOwnPropertyNames;var hf=Object.getPrototypeOf,_f=Object.prototype.hasOwnProperty;var bf=(e,t)=>()=>(t||e((t={exports:{}}).exports,t),t.exports);var vf=(e,t,n,s)=>{if(t&&typeof t=="object"||typeof t=="function")for(let a of gf(t))!_f.call(e,a)&&a!==n&&Mu(e,a,{get:()=>t[a],
+enumerable:!(s=ff(t,a))||s.enumerable});return e};var yf=(e,t,n)=>(n=e!=null?mf(hf(e)):{},vf(t||!e||!e.__esModule?Mu(n,"default",{value:e,enumerable:!0}):n,e));var Ep=bf((ly,$p)=>{"use strict";var Sp=new Set(["codex","codex_cli","codex-desktop"]),Bh=new Set(["thinking","generatin\
 g","reading_files","running_command","applying_patch","working"]),Fh=new Set(["active","in_progress","in-progress","work\
-ing","running"]),Hh=new Set(["pending","queued","todo","not_started","not-started"]),Sp=new Set(["completed","complete",
-"done","passed","success","succeeded"]),Uh=new Set([...Sp,"cancelled","canceled","failed","skipped"]),Wh=new Set(["","ac\
-tive","idle","ready","thinking","generating","working","busy","connected"]),Cp=240,zh=32,Gh=48,Kh=/^(?=.*\d)(?:(?:\d+)\s*d\s*)?(?:(?:\d+)\s*h\s*)?(?:(?:\d+)\s*m\s*)?(?:(?:\d+)\s*s)?$/i,
+ing","running"]),Hh=new Set(["pending","queued","todo","not_started","not-started"]),Cp=new Set(["completed","complete",
+"done","passed","success","succeeded"]),Uh=new Set([...Cp,"cancelled","canceled","failed","skipped"]),Wh=new Set(["","ac\
+tive","idle","ready","thinking","generating","working","busy","connected"]),xp=240,zh=32,Gh=48,Kh=/^(?=.*\d)(?:(?:\d+)\s*d\s*)?(?:(?:\d+)\s*h\s*)?(?:(?:\d+)\s*m\s*)?(?:(?:\d+)\s*s)?$/i,
 Vh=/^[+-]?\d+\s*[dhms]\b/i,Yh=/^(?:just now|today|yesterday|(?:\d+|an?|one)\s+(?:seconds?|secs?|minutes?|mins?|hours?|hrs?|days?|weeks?|months?|years?)\s+ago)$/i,
 Xh=/^(?:pursuing goal|paused goal|goal (?:paused|blocked|usage limited|rate limited|limited|budget limited|achieved|cancelled|canceled|stopped|failed)|idle|ready|connected|awaiting live update)$/i,
 Qh=/^(?:no (?:recent message|current work|data|activity)(?: reported)?|unavailable|unknown|not available)$/i,Jh=/^(?:remote agent chat|(?:antigravity|claude(?: code)?|cline|codex|continue|cursor|gemini|roo code)\s+(?:harness|workspace))$/i,
-kp=Object.freeze({active:"active",running:"active",working:"active",pursuing:"active",pursuing_goal:"active",paused:"pau\
+wp=Object.freeze({active:"active",running:"active",working:"active",pursuing:"active",pursuing_goal:"active",paused:"pau\
 sed",pause:"paused",paused_goal:"paused",blocked:"blocked",goal_blocked:"blocked",needs_attention:"blocked",waiting_for_user:"\
 blocked",usagelimited:"usageLimited",usage_limited:"usageLimited",goal_usage_limited:"usageLimited",rate_limited:"usageL\
 imited",goal_rate_limited:"usageLimited",budgetlimited:"budgetLimited",budget_limited:"budgetLimited",goal_limited:"budg\
 etLimited",goal_budget_limited:"budgetLimited",complete:"complete",completed:"complete",achieved:"complete",goal_achieved:"\
 complete",cancelled:"cancelled",canceled:"cancelled",stopped:"cancelled",goal_cancelled:"cancelled",goal_canceled:"cance\
-lled",goal_stopped:"cancelled",failed:"failed",failure:"failed",goal_failed:"failed"});function xp(e){return String(e||"").
-trim().toLowerCase()}function Ap(e,t){return t&&typeof t.goal_lifecycle=="boolean"?t.goal_lifecycle:Np.has(xp(e))}function bi(e){
+lled",goal_stopped:"cancelled",failed:"failed",failure:"failed",goal_failed:"failed"});function Ap(e){return String(e||"").
+trim().toLowerCase()}function Rp(e,t){return t&&typeof t.goal_lifecycle=="boolean"?t.goal_lifecycle:Sp.has(Ap(e))}function vi(e){
 if(typeof e=="number"&&Number.isFinite(e)&&e>0)return e;let t=Date.parse(String(e||""));return Number.isFinite(t)?t:0}function Bn(...e){
-for(let t of e){let n=bi(t);if(n)return new Date(n).toISOString()}return null}function Zh(e){return/(?:\bbearer\s+[a-z0-9._~+/=-]{8,}|\b(?:api[_ -]?key|password|passwd|secret|access[_ -]?token|refresh[_ -]?token)\s*[:=]\s*\S+|\bsk-[a-z0-9_-]{8,})/i.
-test(e)}function Rp(e){let t=String(e??"").replace(/\s+/g," ").trim();return t?Kh.test(t)?"duration_only":Vh.test(t)?"du\
+for(let t of e){let n=vi(t);if(n)return new Date(n).toISOString()}return null}function Zh(e){return/(?:\bbearer\s+[a-z0-9._~+/=-]{8,}|\b(?:api[_ -]?key|password|passwd|secret|access[_ -]?token|refresh[_ -]?token)\s*[:=]\s*\S+|\bsk-[a-z0-9_-]{8,})/i.
+test(e)}function Mp(e){let t=String(e??"").replace(/\s+/g," ").trim();return t?Kh.test(t)?"duration_only":Vh.test(t)?"du\
 ration_malformed":Yh.test(t)?"age_only":Xh.test(t)?"status_only":Qh.test(t)?"placeholder_only":Jh.test(t)?"surface_label\
-_only":"":"empty"}function jt(e,t=Cp){if(typeof e!="string"&&typeof e!="number")return"";let n=String(e).replace(/[\u0000-\u001f\u007f]+/g,
-" ").replace(/```[\s\S]*?```/g," ").replace(/\s+/g," ").trim();return!n||Zh(n)||Rp(n)||/^[{[]\s*["']?[\w.-]+["']?\s*:/.test(
+_only":"":"empty"}function jt(e,t=xp){if(typeof e!="string"&&typeof e!="number")return"";let n=String(e).replace(/[\u0000-\u001f\u007f]+/g,
+" ").replace(/```[\s\S]*?```/g," ").replace(/\s+/g," ").trim();return!n||Zh(n)||Mp(n)||/^[{[]\s*["']?[\w.-]+["']?\s*:/.test(
 n)||/^(?:powershell|pwsh|cmd(?:\.exe)?|bash|sh|zsh|fish)\s+-/i.test(n)?"":(n=n.replace(/^(?:[-*•]\s+|#{1,6}\s+)/,"").trim(),
-n.slice(0,t).trim())}function Mp(e){let t=String(e||"").trim().replace(/([a-z0-9])([A-Z])/g,"$1_$2").toLowerCase().replace(
-/[^a-z0-9]+/g,"_").replace(/^_+|_+$/g,"");return t&&(kp[t]||kp[t.replace(/_/g,"")])||"unknown"}function cl(e){for(let t of[
-e?.state,e?.status,e?.raw_state,e?.native_state]){let n=Mp(t);if(n!=="unknown")return n}return"unknown"}function hi(e){return String(
-e?.state||e?.status||"").trim().toLowerCase()}function wp(e){return jt(e?.subject||e?.text||e?.content||e?.description||
+n.slice(0,t).trim())}function Tp(e){let t=String(e||"").trim().replace(/([a-z0-9])([A-Z])/g,"$1_$2").toLowerCase().replace(
+/[^a-z0-9]+/g,"_").replace(/^_+|_+$/g,"");return t&&(wp[t]||wp[t.replace(/_/g,"")])||"unknown"}function cl(e){for(let t of[
+e?.state,e?.status,e?.raw_state,e?.native_state]){let n=Tp(t);if(n!=="unknown")return n}return"unknown"}function _i(e){return String(
+e?.state||e?.status||"").trim().toLowerCase()}function Np(e){return jt(e?.subject||e?.text||e?.content||e?.description||
 e?.label)}function ll(e,t){let n=Number(t),s=Number(e);return!Number.isInteger(n)||n<=0||!Number.isInteger(s)||s<0?null:
 {completed:Math.min(s,n),total:n}}function e_(e){let t=Number(e?.progress_percent??e?.percent_complete??e?.percent??e?.progress);
-return Number.isFinite(t)?Math.max(0,Math.min(100,t<=1?t*100:t)):null}function _i(e,t={}){if(!e||typeof e!="object")return null;
+return Number.isFinite(t)?Math.max(0,Math.min(100,t<=1?t*100:t)):null}function bi(e,t={}){if(!e||typeof e!="object")return null;
 let n=String(e.kind||"").trim().toLowerCase().replace(/[^a-z_]/g,"").slice(0,24);if(!n||n==="goal"&&t.goalCapable===!1)return null;
 let s=jt(e.label,zh),a=jt(e.text),i=jt(e.source,Gh).replace(/\s+/g,"_").toLowerCase();if(!s||!a||!i)return null;let c=n===
 "goal"?cl(e):"unknown";if(n==="goal"&&c==="unknown")return null;let u=ll(e.completed,e.total),p=Number(e.percent);return{
@@ -36,13 +36,13 @@ kind:n,label:s,text:a,source:i,updated_at:Bn(e.updated_at)||null,...u||{},...Num
 min(100,p))}:{},...n==="goal"?{state:c}:e.state?{state:jt(e.state,32).toLowerCase()}:{},...e.diagnostic_reason?{diagnostic_reason:String(
 e.diagnostic_reason).slice(0,64)}:{}}}function t_(e){let t=Array.isArray(e)?e:[];for(let n=t.length-1;n>=0;n-=1){let s=t[n];
 if(String(s?.role||"").toLowerCase()!=="user")continue;let a=jt(s?.content||s?.text);if(a)return{text:a,updated_at:Bn(s?.
-timestamp,s?.created_at,s?.ts,s?.server_ts)}}return null}function il(e,t){let n=xp(e);return n==="claude"||n==="claude_c\
+timestamp,s?.created_at,s?.ts,s?.server_ts)}}return null}function il(e,t){let n=Ap(e);return n==="claude"||n==="claude_c\
 li"||n==="claude-desktop"?t>1?"Tasks":"Task":["antigravity","antigravity_panel","antigravity-v2","gemini","continue","co\
 ntinue_yolo","roo_code","cline"].includes(n)?"Task":t>1?"Tasks":"Plan"}function n_(e,t){let n=t?.task_list,s=Array.isArray(
-n?.tasks)?n.tasks:[],a=s.filter(b=>wp(b));if(a.length>0){let b=a.find(A=>Fh.has(hi(A))),y=a.find(A=>Hh.has(hi(A))),S=b||
+n?.tasks)?n.tasks:[],a=s.filter(b=>Np(b));if(a.length>0){let b=a.find(A=>Fh.has(_i(A))),y=a.find(A=>Hh.has(_i(A))),S=b||
 y;if(S){let A=Number(n.total),N=Number.isInteger(A)&&A>0?A:s.length,h=Number(n.completed),d=Number.isInteger(h)&&h>=0?h:
-s.filter(v=>Sp.has(hi(v))).length;return{kind:"plan",label:il(e,N),text:wp(S),source:"task_list",updated_at:Bn(S.updated_at,
-S.updatedAt,n.updated_at,t.updated_at),...ll(d,N)}}}let i=t?.step,c=hi(i),u=typeof i=="object"?i?.text||i?.content||i?.description||
+s.filter(v=>Cp.has(_i(v))).length;return{kind:"plan",label:il(e,N),text:Np(S),source:"task_list",updated_at:Bn(S.updated_at,
+S.updatedAt,n.updated_at,t.updated_at),...ll(d,N)}}}let i=t?.step,c=_i(i),u=typeof i=="object"?i?.text||i?.content||i?.description||
 i?.label||i?.name:i,p=jt(u);return p&&!Uh.has(c)?{kind:"plan",label:il(e,1),text:p,source:"step",updated_at:Bn(i?.updated_at,
 i?.updatedAt,t.updated_at)}:null}function s_(e){let t=e?.current;if(!t||typeof t!="object")return null;let n=jt(t.label||
 t.title||t.name);if(!n)return null;let s=String(t.kind||"").trim().toLowerCase(),a=["response","thinking","generating","\
@@ -56,33 +56,33 @@ updated_at,t?.timestamp,t?.created_at)}:null}function o_(e){let t=jt(e?.label,16
 function i_(e,t){if(!t||!e?.goal||typeof e.goal!="object")return null;let n=e.goal,s=jt(n.objective||n.text);if(!s)return null;
 let a=cl(n);if(a==="unknown")return null;let i=ll(n.completed,n.total),c=e_(n);return{kind:"goal",label:"Goal",text:s,source:"\
 goal",updated_at:Bn(n.updated_at,n.observed_at,e.updated_at),...i||{},...c==null?{}:{percent:c},state:a}}function c_(e,t){
-if(!e)return t;if(!t)return e;let n=bi(e.updated_at);return bi(t.updated_at)>n&&n>0?t:e}function l_(e={}){let t=e.activity&&
-typeof e.activity=="object"?e.activity:{},n=Ap(e.agentType,e.capabilities);if(e.preferProvided!==!1){let S=_i(t.work_context,
-{goalCapable:n});if(S)return S}let s=i_(t,n);if(s)return _i(s,{goalCapable:n});let a=n_(e.agentType,t),i=s_(t),c=a_(e.agentType,
+if(!e)return t;if(!t)return e;let n=vi(e.updated_at);return vi(t.updated_at)>n&&n>0?t:e}function l_(e={}){let t=e.activity&&
+typeof e.activity=="object"?e.activity:{},n=Rp(e.agentType,e.capabilities);if(e.preferProvided!==!1){let S=bi(t.work_context,
+{goalCapable:n});if(S)return S}let s=i_(t,n);if(s)return bi(s,{goalCapable:n});let a=n_(e.agentType,t),i=s_(t),c=a_(e.agentType,
 t),u=r_(e.latestUserRequest),p=o_(t),b=Bh.has(String(t.kind||"").toLowerCase()),y=a||c;return b&&i&&(y=c_(y,i)),y||(y=i||
 c||u||p),!y&&u&&(y=u),y||(y={kind:"empty",label:"Current work",text:"Current work unavailable",source:"none",updated_at:Bn(
-t.updated_at),diagnostic_reason:"no_authoritative_work_context"}),_i(y,{goalCapable:n})}Tp.exports={CODEX_GOAL_AGENT_TYPES:Np,
-MAX_CONTEXT_TEXT:Cp,boundedDisplayText:jt,coherentGoalState:cl,goalLifecycleSupported:Ap,latestUserRequestFromMessages:t_,
-normalizeFleetWorkContext:_i,normalizeGoalState:Mp,projectFleetWorkContext:l_,rejectedDisplayTextReason:Rp,timestampMs:bi}});var yf=new Set(["js","jsx","ts","tsx","py","json","md","css","html","htm","sh","bash","yaml","yml","txt","env","csv","xm\
+t.updated_at),diagnostic_reason:"no_authoritative_work_context"}),bi(y,{goalCapable:n})}$p.exports={CODEX_GOAL_AGENT_TYPES:Sp,
+MAX_CONTEXT_TEXT:xp,boundedDisplayText:jt,coherentGoalState:cl,goalLifecycleSupported:Rp,latestUserRequestFromMessages:t_,
+normalizeFleetWorkContext:bi,normalizeGoalState:Tp,projectFleetWorkContext:l_,rejectedDisplayTextReason:Mp,timestampMs:vi}});var kf=new Set(["js","jsx","ts","tsx","py","json","md","css","html","htm","sh","bash","yaml","yml","txt","env","csv","xm\
 l","sql","go","rs","java","c","cpp","h","hpp","rb","php","swift","kt","scala","r","m","tf","toml","ini","cfg","conf","lo\
-g","gitignore","dockerfile","makefile","vue","svelte","graphql","gql"]),kf={js:"javascript",jsx:"jsx",ts:"typescript",tsx:"\
+g","gitignore","dockerfile","makefile","vue","svelte","graphql","gql"]),wf={js:"javascript",jsx:"jsx",ts:"typescript",tsx:"\
 tsx",py:"python",rb:"ruby",sh:"bash",bash:"bash",rs:"rust",kt:"kotlin",tf:"hcl",md:"markdown",yml:"yaml",yaml:"yaml",graphql:"\
-graphql",gql:"graphql"};function za(e){let t=e.split(".").pop().toLowerCase();return kf[t]||t}function $u(e){let t=e.split(
-".").pop().toLowerCase();return yf.has(t)}var Tu={claude:"Claude Code",claude_cli:"Claude Code CLI",codex:"Codex",codex_cli:"\
+graphql",gql:"graphql"};function za(e){let t=e.split(".").pop().toLowerCase();return wf[t]||t}function $u(e){let t=e.split(
+".").pop().toLowerCase();return kf.has(t)}var Tu={claude:"Claude Code",claude_cli:"Claude Code CLI",codex:"Codex",codex_cli:"\
 Codex CLI",cursor_cli:"Cursor CLI",gemini:"Gemini",continue:"Continue",continue_yolo:"Continue YOLO",roo_code:"Roo Code",
 cline:"Cline",antigravity:"Antigravity",antigravity_panel:"Antigravity Chat","codex-desktop":"Codex Desktop",cursor:"Cur\
-sor","claude-desktop":"Claude Desktop"},wf=/^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
+sor","claude-desktop":"Claude Desktop"},Nf=/^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
 function Eu(e,t){if(e&&typeof e=="object"){let p=Tu[e.agent_type]||e.display_name||e.agent_type||"Agent",b=e.workspace_name||
-e.window_title||"";return b?p+" \u2014 "+b:p}let n=t||e;if(typeof n!="string")return"Agent";if(wf.test(n))return"Agent S\
+e.window_title||"";return b?p+" \u2014 "+b:p}let n=t||e;if(typeof n!="string")return"Agent";if(Nf.test(n))return"Agent S\
 ession";let s=n.split("-"),a=s[0],i=s[1]||"",c=s[2]||"",u=i?" (win "+i+c+")":"";return(Tu[a]||a)+u}function Pe(e){return e.replace(/&/g,"&amp;").replace(/</g,"&lt;").replace(/>/g,"&gt;")}function Zt(e){return Pe(String(
 e)).replace(/"/g,"&quot;")}function Va(e){return/^[A-Za-z]:\\/.test(e)||e.includes("\\")||e.includes("/")||/^[.~]\//.test(
-e)}function Nf(e){let t=0,n=0;return e.split(`
-`).forEach(s=>{/^\+\+\+|^---|^@@/.test(s)||(s.startsWith("+")&&t++,s.startsWith("-")&&n++)}),{adds:t,dels:n}}function Sf(e){
-return/\b(edit|edited|patch|diff|apply_patch|write)\b/i.test(String(e||""))}function Cf(e){let t=String(e||"").replace(/\r\n?/g,
+e)}function Sf(e){let t=0,n=0;return e.split(`
+`).forEach(s=>{/^\+\+\+|^---|^@@/.test(s)||(s.startsWith("+")&&t++,s.startsWith("-")&&n++)}),{adds:t,dels:n}}function Cf(e){
+return/\b(edit|edited|patch|diff|apply_patch|write)\b/i.test(String(e||""))}function xf(e){let t=String(e||"").replace(/\r\n?/g,
 `
 `).split(`
 `).map(n=>n.trimEnd());for(let n of t)if(n){if(/^(diff --git|index )/.test(n)||/^@@/.test(n)||/^---[ \t]/.test(n)||/^\+\+\+[ \t]/.
-test(n))return!0;if(/^[+\- ]/.test(n)){let s=n.slice(1).trim();if(!s||/^[\d\s()+\-]+$/.test(s))continue;return!0}}return!1}function xf(e){let t=(e||"").toLowerCase();return t.includes("bash")||t.includes("run")||t.includes("command")||t.includes(
+test(n))return!0;if(/^[+\- ]/.test(n)){let s=n.slice(1).trim();if(!s||/^[\d\s()+\-]+$/.test(s))continue;return!0}}return!1}function Af(e){let t=(e||"").toLowerCase();return t.includes("bash")||t.includes("run")||t.includes("command")||t.includes(
 "execute")?"dot-bash":t.includes("read")?"dot-read":t.includes("edit")||t.includes("write")||t.includes("patch")?"dot-wr\
 ite":t.includes("search")||t.includes("grep")||t.includes("find")||t.includes("glob")?"dot-search":t.includes("browser")||
 t.includes("web")||t.includes("fetch")?"dot-browser":"dot-default"}function qu(e){let t=String(e||"").split(`
@@ -92,7 +92,7 @@ t.includes("web")||t.includes("fetch")?"dot-browser":"dot-default"}function qu(e
 p.match(/^\[([^\]\n]+)\]\s*$/),S=i?null:p.match(/^(Ran .+|Read .+|Edited file|Edit .+|Analyzed .+|Search(?:ed)? .+|Bash .+)\s*$/),
 A=!i&&p.match(/^(\d+\s+lines?(?:\s+of\s+output)?)$/i);if(y){if(y[1].trim()==="end"){u();return}c(),u(),a={name:y[1].trim(),
 lines:[]};return}if(A){c(),u(),a={name:A[1].trim(),lines:[]};return}if(S){c(),u(),a={name:S[1].trim(),lines:[]};return}a?
-a.lines.push(p):s.push(p),b&&(i=!i)}),c(),u(),n.length>0?n:[{type:"markdown",content:String(e||"")}]}function Sc(e){if(!e)
+a.lines.push(p):s.push(p),b&&(i=!i)}),c(),u(),n.length>0?n:[{type:"markdown",content:String(e||"")}]}function Cc(e){if(!e)
 return!1;let t=String(e).replace(/\r\n?/g,`
 `);if(/^(diff --git|index )/m.test(t)||/^@@/m.test(t)||/^---[ \t]/m.test(t)&&/^\+\+\+[ \t]/m.test(t))return!0;let s=t.split(
 `
@@ -100,32 +100,32 @@ return!1;let t=String(e).replace(/\r\n?/g,`
 p=>/^\+(?!\+\+ )/.test(p)).length,c=s.filter(p=>/^-(?!-- )/.test(p)).length,u=s.filter(p=>/^ /.test(p)).length;return a>=
 3&&i>=1&&c>=1&&u>=1}function Ou(e){let t=e.match(/^\+\+\+[ \t]+(?:[ab]\/)?(.+?)(?:\t.*)?$/m);if(t){let s=t[1].trim();if(s&&
 s!=="/dev/null")return s}let n=e.match(/^---[ \t]+(?:[ab]\/)?(.+?)(?:\t.*)?$/m);if(n){let s=n[1].trim();if(s&&s!=="/dev/\
-null")return s}return null}var Lu=300;function Af(e,t){if(e.length>Lu||t.length>Lu)return null;let n=e.length,s=t.length,
+null")return s}return null}var Lu=300;function Rf(e,t){if(e.length>Lu||t.length>Lu)return null;let n=e.length,s=t.length,
 a=Array.from({length:n+1},()=>new Int32Array(s+1));for(let p=1;p<=n;p++)for(let b=1;b<=s;b++)a[p][b]=e[p-1]===t[b-1]?a[p-
 1][b-1]+1:Math.max(a[p-1][b],a[p][b-1]);let i=[],c=n,u=s;for(;c>0||u>0;)c>0&&u>0&&e[c-1]===t[u-1]?(i.unshift({type:"eq"}),
-c--,u--):u>0&&(c===0||a[c][u-1]>=a[c-1][u])?(i.unshift({type:"ins"}),u--):(i.unshift({type:"del"}),c--);return i}function Rf(e){
+c--,u--):u>0&&(c===0||a[c][u-1]>=a[c-1][u])?(i.unshift({type:"ins"}),u--):(i.unshift({type:"del"}),c--);return i}function Mf(e){
 let t=[],n=0,s=null;for(let a of e)a.type==="del"?(s===null&&(s=n),n++):a.type==="eq"&&(s!==null&&(t.push({start:s,end:n}),
-s=null),n++);return s!==null&&t.push({start:s,end:n}),t}function Mf(e){let t=[],n=0,s=null;for(let a of e)a.type==="ins"?
+s=null),n++);return s!==null&&t.push({start:s,end:n}),t}function Tf(e){let t=[],n=0,s=null;for(let a of e)a.type==="ins"?
 (s===null&&(s=n),n++):a.type==="eq"&&(s!==null&&(t.push({start:s,end:n}),s=null),n++);return s!==null&&t.push({start:s,end:n}),
 t}function Pu(e,t,n){if(!t||!t.length)return e;let s="",a=0,i=0,c=!1,u=0;for(;u<e.length;)if(e[u]==="<"){c&&(s+="</mark>",
 c=!1);let p=e.indexOf(">",u);if(p===-1){s+=e[u++];continue}s+=e.slice(u,p+1),u=p+1,i<t.length&&a>=t[i].start&&a<t[i].end&&
 (s+=`<mark class="${n}">`,c=!0)}else{if(c&&a>=t[i].end&&(s+="</mark>",c=!1,i++),!c&&i<t.length&&a>=t[i].start&&(s+=`<mar\
 k class="${n}">`,c=!0),e[u]==="&"){let p=e.indexOf(";",u+1),b=p!==-1&&p-u<=8?p+1:u+1;s+=e.slice(u,b),u=b}else s+=e[u++];
 a++}return c&&(s+="</mark>"),s}function Iu(e){let t=Du(e);return t.length>0&&t[t.length-1].trim()===""&&t.pop(),t.map((n,s)=>`\
-<span class="code-line"><span class="code-line-num">${s+1}</span>${n}</span>`).join("")}var Tf=/[A-Za-z]:\\[^\n"'`<>]+?\.[A-Za-z0-9._-]+(?:\s+\((?:Lines?|Line)\s+\d+(?:-\d+)?\))?|(?:\.{1,2}[\\/])?(?:[A-Za-z0-9_.-]+[\\/])+[A-Za-z0-9_.-]+\.[A-Za-z0-9._-]+(?:\s+\((?:Lines?|Line)\s+\d+(?:-\d+)?\))?/g;
-function $f(e){let t=String(e||""),n="",s=0;for(let a of t.matchAll(Tf)){let i=a[0],c=a.index||0,u=c+i.length,p=c>0?t[c-
+<span class="code-line"><span class="code-line-num">${s+1}</span>${n}</span>`).join("")}var $f=/[A-Za-z]:\\[^\n"'`<>]+?\.[A-Za-z0-9._-]+(?:\s+\((?:Lines?|Line)\s+\d+(?:-\d+)?\))?|(?:\.{1,2}[\\/])?(?:[A-Za-z0-9_.-]+[\\/])+[A-Za-z0-9_.-]+\.[A-Za-z0-9._-]+(?:\s+\((?:Lines?|Line)\s+\d+(?:-\d+)?\))?/g;
+function Ef(e){let t=String(e||""),n="",s=0;for(let a of t.matchAll($f)){let i=a[0],c=a.index||0,u=c+i.length,p=c>0?t[c-
 1]:"",b=u<t.length?t[u]:"",y=(!p||/[\s([{"'`]/.test(p))&&(!b||/[\s)\]},"'`:;]/.test(b)),S=i.trim();!y||!Va(S)||(n+=Pe(t.
 slice(s,c)),n+=`<button class="inline-file-ref tool-open-file" type="button" title="Open file preview" data-open-path="${Zt(
-S)}" data-copy-path="${Zt(S)}">${Pe(S)}</button>`,s=u)}return n+=Pe(t.slice(s)),n||"&nbsp;"}function Ef(e){let t=String(
+S)}" data-copy-path="${Zt(S)}">${Pe(S)}</button>`,s=u)}return n+=Pe(t.slice(s)),n||"&nbsp;"}function Lf(e){let t=String(
 e||"").replace(/\r\n/g,`
 `).split(`
 `);return t.length>0&&t[t.length-1]===""&&t.pop(),t.map((n,s)=>`<span class="code-line"><span class="code-line-num">${s+
-1}</span>${$f(n)}</span>`).join("")}function wc(e,t){return`<span class="diff-gutter"><span class="diff-gutter-num diff-\
+1}</span>${Ef(n)}</span>`).join("")}function Nc(e,t){return`<span class="diff-gutter"><span class="diff-gutter-num diff-\
 gutter-old">${e??""}</span><span class="diff-gutter-num diff-gutter-new">${t??""}</span></span>`}function Ga(e){return`<\
-span class="diff-gutter"><span class="diff-gutter-num">${e??""}</span></span>`}function Lf(e){let t=0,n=0;for(let s of e)
+span class="diff-gutter"><span class="diff-gutter-num">${e??""}</span></span>`}function Pf(e){let t=0,n=0;for(let s of e)
 if(s.type==="hunk"){let a=s.raw.match(/@@ -(\d+)(?:,\d+)? \+(\d+)(?:,\d+)? @@/);a&&(t=parseInt(a[1],10)-1,n=parseInt(a[2],
 10)-1),s.oldLine=null,s.newLine=null}else s.type==="add"?(s.oldLine=null,s.newLine=++n):s.type==="del"?(s.oldLine=++t,s.
-newLine=null):s.type==="ctx"?(s.oldLine=++t,s.newLine=++n):(s.oldLine=null,s.newLine=null)}function Pf(e,t,n){let s=[],a=u=>n.
+newLine=null):s.type==="ctx"?(s.oldLine=++t,s.newLine=++n):(s.oldLine=null,s.newLine=null)}function qf(e,t,n){let s=[],a=u=>n.
 has(u)?n.get(u):t&&t[u]!=null?t[u]:Pe(e[u].raw.startsWith("+")||e[u].raw.startsWith("-")||e[u].raw.startsWith(" ")?e[u].
 raw.slice(1):e[u].raw),i=u=>t&&t[u]!=null?" diff-hl":"",c=0;for(;c<e.length;){let u=e[c];if(u.type==="meta"){let N=`<spa\
 n class="diff-meta">${Pe(u.raw)}</span>`;s.push({type:"both",html:N}),c++;continue}if(u.type==="hunk"){let N=`<span clas\
@@ -134,7 +134,7 @@ c),hlCls:i(c),oldLine:u.oldLine,newLine:u.newLine}),c++;continue}let p=c;for(;p<
 for(;b<e.length&&e[b].type==="add";)b++;let y=p-c,S=b-p,A=Math.min(y,S);for(let N=0;N<A;N++)s.push({type:"pair",delContent:a(
 c+N),delHlCls:i(c+N),addContent:a(p+N),addHlCls:i(p+N),delOldLine:e[c+N].oldLine,addNewLine:e[p+N].newLine});for(let N=A;N<
 y;N++)s.push({type:"del",content:a(c+N),hlCls:i(c+N),oldLine:e[c+N].oldLine});for(let N=A;N<S;N++)s.push({type:"add",content:a(
-p+N),hlCls:i(p+N),newLine:e[p+N].newLine});c=b>c?b:c+1}return s}function qf(e){let t=[],n=[];for(let s of e)s.type==="bo\
+p+N),hlCls:i(p+N),newLine:e[p+N].newLine});c=b>c?b:c+1}return s}function Of(e){let t=[],n=[];for(let s of e)s.type==="bo\
 th"?(t.push(s.html),n.push(s.html)):s.type==="ctx"?(t.push(`<span class="diff-ctx${s.hlCls}">${Ga(s.oldLine)}${s.content}\
 </span>`),n.push(`<span class="diff-ctx${s.hlCls}">${Ga(s.newLine)}${s.content}</span>`)):s.type==="pair"?(t.push(`<span\
  class="diff-del${s.delHlCls}">${Ga(s.delOldLine)}${s.delContent}</span>`),n.push(`<span class="diff-add${s.addHlCls}">${Ga(
@@ -150,34 +150,34 @@ let c=e.slice(a,i+1),u=c.match(/class="([^"]*)"/);s.push(u?u[1]:""),n+=c,a=i+1}e
 length)&&t.push(n+"</span>".repeat(s.length)),t}function ju(e,t){let n=(()=>{if(!t||typeof hljs>"u")return null;if(hljs.
 getLanguage(t))return t;let d=t.split(".").pop().toLowerCase();return hljs.getLanguage(d)?d:null})(),a=e.split(`
 `).map(d=>/^\+\+\+|^---/.test(d)?{type:"meta",raw:d}:/^@@/.test(d)?{type:"hunk",raw:d}:d.startsWith("+")?{type:"add",raw:d}:
-d.startsWith("-")?{type:"del",raw:d}:{type:"ctx",raw:d});Lf(a);let i=null;if(n)try{let d=a.map(g=>g.type==="meta"||g.type===
+d.startsWith("-")?{type:"del",raw:d}:{type:"ctx",raw:d});Pf(a);let i=null;if(n)try{let d=a.map(g=>g.type==="meta"||g.type===
 "hunk"?"":g.raw.startsWith("+")||g.raw.startsWith("-")||g.raw.startsWith(" ")?g.raw.slice(1):g.raw),v=hljs.highlight(d.join(
 `
 `),{language:n});i=Du(v.value)}catch{i=null}let c=new Map;for(let d=0;d<a.length;){if(a[d].type!=="del"){d++;continue}let v=d;
 for(;v<a.length&&a[v].type==="del";)v++;let g=v;for(;g<a.length&&a[g].type==="add";)g++;let _=v-d,k=g-v;if(_===k&&_>0)for(let T=0;T<
-_;T++){let L=d+T,H=v+T,V=a[L].raw.slice(1),ne=a[H].raw.slice(1),ee=Af(V,ne);if(!ee)continue;let re=ee.filter(Y=>Y.type===
+_;T++){let L=d+T,H=v+T,V=a[L].raw.slice(1),ne=a[H].raw.slice(1),ee=Rf(V,ne);if(!ee)continue;let re=ee.filter(Y=>Y.type===
 "eq").length,z=Math.max(V.length,ne.length);if(z>0&&re/z<.15)continue;let oe=i&&i[L]!=null?i[L]:Pe(V),_e=i&&i[H]!=null?i[H]:
-Pe(ne);c.set(L,Pu(oe,Rf(ee),"diff-word-del")),c.set(H,Pu(_e,Mf(ee),"diff-word-add"))}d=g>d?g:d+1}let u=0,p=0,b=0,y=!1,S=a.
+Pe(ne);c.set(L,Pu(oe,Mf(ee),"diff-word-del")),c.set(H,Pu(_e,Tf(ee),"diff-word-add"))}d=g>d?g:d+1}let u=0,p=0,b=0,y=!1,S=a.
 map((d,v)=>{if(d.type==="meta")return`<span class="diff-meta">${Pe(d.raw)}</span>`;if(d.type==="hunk")return y=!0,b++,`<\
 span class="diff-hunk diff-hunk-btn" data-hunk-id="${b}" role="button" tabindex="0" title="Toggle context lines">${Pe(d.
 raw)}</span>`;let g=d.raw.startsWith("+")||d.raw.startsWith("-")||d.raw.startsWith(" ")?d.raw.slice(1):d.raw,_=c.has(v)?
 c.get(v):i&&i[v]!=null?i[v]:Pe(g),k=i&&i[v]!=null?" diff-hl":"",T=b>0?` data-hunk-ctx="${b}"`:"";return d.type==="add"?(u++,
-`<span class="diff-add${k}"${T}>${wc(null,d.newLine)}${_}</span>`):d.type==="del"?(p++,`<span class="diff-del${k}"${T}>${wc(
-d.oldLine,null)}${_}</span>`):`<span class="diff-ctx${k}"${T}>${wc(d.oldLine,d.newLine)}${_}</span>`}),A=u||p?`<span cla\
-ss="diff-stat-add">+${u}</span><span class="diff-stat-del">-${p}</span>`:"",N=Pf(a,i,c),h=qf(N);return{body:S.join(""),stats:A,
+`<span class="diff-add${k}"${T}>${Nc(null,d.newLine)}${_}</span>`):d.type==="del"?(p++,`<span class="diff-del${k}"${T}>${Nc(
+d.oldLine,null)}${_}</span>`):`<span class="diff-ctx${k}"${T}>${Nc(d.oldLine,d.newLine)}${_}</span>`}),A=u||p?`<span cla\
+ss="diff-stat-add">+${u}</span><span class="diff-stat-del">-${p}</span>`:"",N=qf(a,i,c),h=Of(N);return{body:S.join(""),stats:A,
 splitHtml:h,hasHunks:y}}var Bu='<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke\
 -width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M8 3H5a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h3"/><path d="M1\
-6 3h3a2 2 0 0 1 2 2v14a2 2 0 0 1-2 2h-3"/><line x1="12" y1="3" x2="12" y2="21"/></svg>',Of='<svg width="14" height="14" \
+6 3h3a2 2 0 0 1 2 2v14a2 2 0 0 1-2 2h-3"/><line x1="12" y1="3" x2="12" y2="21"/></svg>',If='<svg width="14" height="14" \
 viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><c\
-ircle cx="11" cy="11" r="8"/><line x1="21" y1="21" x2="16.65" y2="16.65"/></svg>',If='<svg class="copy-icon" width="14" \
+ircle cx="11" cy="11" r="8"/><line x1="21" y1="21" x2="16.65" y2="16.65"/></svg>',Df='<svg class="copy-icon" width="14" \
 height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoi\
 n="round"><rect x="9" y="9" width="13" height="13" rx="2" ry="2"></rect><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9\
-a2 2 0 0 1 2 2v1"></path></svg>',Df='<svg class="check-icon" width="14" height="14" viewBox="0 0 24 24" fill="none" stro\
+a2 2 0 0 1 2 2v1"></path></svg>',jf='<svg class="check-icon" width="14" height="14" viewBox="0 0 24 24" fill="none" stro\
 ke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round" style="display:none"><polyline point\
 s="20 6 9 17 4 12"></polyline></svg>';var Fu=new marked.Renderer;Fu.code=function(e,t){let n=typeof e=="object"?e.text||e.raw||"":e||"",a=(typeof e=="object"?
-e.lang||"":t||"").split(/\s/)[0].toLowerCase()||"text",i=a==="diff"||a==="patch"||Sc(n),c=!i&&(a==="text"||a==="markdown"),
+e.lang||"":t||"").split(/\s/)[0].toLowerCase()||"text",i=a==="diff"||a==="patch"||Cc(n),c=!i&&(a==="text"||a==="markdown"),
 u,p="",b="",y="",S=null;if(i){b=Ou(n)||"";let H=b?za(b):null;S=ju(n,H),u=S.body,p=S.stats,y=S.splitHtml||""}else if(c)u=
-Ef(n);else try{u=hljs.getLanguage(a)?hljs.highlight(n,{language:a}).value:hljs.highlightAuto(n).value}catch{u=Pe(n)}let A=n;
+Lf(n);else try{u=hljs.getLanguage(a)?hljs.highlight(n,{language:a}).value:hljs.highlightAuto(n).value}catch{u=Pe(n)}let A=n;
 !i&&!c&&(u=Iu(u));let N=i||a==="text"?"":a,h=b?`<button class="diff-filepath" title="Open file preview" data-copy-path="${Zt(
 b)}" data-open-path="${Zt(b)}">${Pe(b)}</button>`:"",d=y?`<button class="diff-split-toggle" title="Toggle side-by-side v\
 iew">${Bu}</button>`:"",v=i&&S&&S.hasHunks?'<button class="diff-ctx-collapse-all" title="Collapse/expand all context lin\
@@ -193,8 +193,8 @@ button>`,L=i?"":` data-raw="${Zt(A)}"`;return`<div class="code-block${i?" diff-b
       ${d}
       ${_}
       ${T}
-      <button class="code-search-btn" title="Search in block">${Of}</button>
-      <button class="code-copy" title="Copy code">${If}${Df}<span class="copy-label">Copy</span></button>
+      <button class="code-search-btn" title="Search in block">${If}</button>
+      <button class="code-copy" title="Copy code">${Df}${jf}<span class="copy-label">Copy</span></button>
     </div>
     <div class="code-search-bar" hidden>
       <input class="code-search-input" type="text" placeholder="Search\u2026" aria-label="Search in code block">
@@ -205,9 +205,9 @@ button>`,L=i?"":` data-raw="${Zt(A)}"`;return`<div class="code-block${i?" diff-b
     </div>
     <pre><code class="hljs${i?" diff-code":""}"${L}>${u}</code></pre>
     ${y}
-  </div>`};marked.use({renderer:Fu,breaks:!0,gfm:!0});function jf(e,t){let n=(e||"").toLowerCase();if(n==="bash"||n==="r\
+  </div>`};marked.use({renderer:Fu,breaks:!0,gfm:!0});function Bf(e,t){let n=(e||"").toLowerCase();if(n==="bash"||n==="r\
 un"||n==="execute"||n==="shell"){let a=t.find(i=>i.trim());return a?a.trim().substring(0,80):""}let s=t.find(a=>a.trim());
-return s&&Va(s.trim())?s.trim():s?s.trim().substring(0,60):""}function Bf(e,t,n){let s=String(t||"").replace(/\n+$/,"").
+return s&&Va(s.trim())?s.trim():s?s.trim().substring(0,60):""}function Ff(e,t,n){let s=String(t||"").replace(/\n+$/,"").
 split(`
 `),a=s.find(re=>re.trim()),i=a&&Va(a.trim())?a.trim():"",c=(re,z="")=>{let oe=String(re||"").trim();if(!oe)return"";let _e=[
 "tool-path",z,Va(oe)?"tool-open-file":""].filter(Boolean).join(" ");return Va(oe)?`<button class="${_e}" type="button" t\
@@ -215,17 +215,17 @@ itle="Open file preview" data-open-path="${Zt(oe)}" data-copy-path="${Zt(oe)}">$
 oe)}</span>`},u=s.filter((re,z,oe)=>!(z===oe.length-1&&oe[z]==="")).length,p=/^\d+\s+lines?(?:\s+of\s+output)?$/i.test(e.
 trim()),b=s.some(re=>re.trim()),y=p&&u===0||!b,A=/^Bash\b/i.test(e.trim())&&s.every(re=>{let z=re.trim();return!z||/^\$\s+/.
 test(z)}),N=!b,h=s.join(`
-`),d=Nf(t),v=Sc(t)||Sf(e)&&(d.adds||d.dels),g=v&&Ou(t)||i,_=v&&g?za(g):null,k=(()=>{if(!v)return h;let re=h,z=re.match(/```(?:diff|patch)?\s*\n([\s\S]*?)```\s*$/m);
+`),d=Sf(t),v=Cc(t)||Cf(e)&&(d.adds||d.dels),g=v&&Ou(t)||i,_=v&&g?za(g):null,k=(()=>{if(!v)return h;let re=h,z=re.match(/```(?:diff|patch)?\s*\n([\s\S]*?)```\s*$/m);
 z&&(re=z[1]);let oe=re.split(`
 `),_e=0;for(;_e<oe.length;){let Y=oe[_e];if(Y.startsWith("+")||Y.startsWith("-")||Y.startsWith("@@")||Y.startsWith(" "))
 break;_e++}return oe.slice(_e).join(`
-`)})(),T=v&&Cf(k),L=T?ju(k,_):null,H=d.adds||d.dels?`<span class="tool-stat-add">+${d.adds}</span><span class="tool-stat\
+`)})(),T=v&&xf(k),L=T?ju(k,_):null,H=d.adds||d.dels?`<span class="tool-stat-add">+${d.adds}</span><span class="tool-stat\
 -del">-${d.dels}</span>`:"",V=v?(()=>{for(let re of s){let z=re.trim();if(z&&!z.startsWith("```")&&!z.startsWith("+")&&!z.
-startsWith("-")&&!z.startsWith("@@")&&!z.startsWith(" "))return z}return""})():"",ne=N&&!g?V||jf(e,s):V||"",ee=!y&&(T||!v);
+startsWith("-")&&!z.startsWith("@@")&&!z.startsWith(" "))return z}return""})():"",ne=N&&!g?V||Bf(e,s):V||"",ee=!y&&(T||!v);
 return`<section class="tool-section${N?" collapsed":""}" data-tool-index="${n}">
     <button class="tool-toggle" type="button" aria-expanded="${N?"false":"true"}">
       <span class="tool-chevron">${ee?N?"\u25B8":"\u25BE":""}</span>
-      <span class="tool-dot ${xf(e)}">\u25CF</span>
+      <span class="tool-dot ${Af(e)}">\u25CF</span>
       <span class="tool-toggle-main">
         ${(()=>{let re=e.indexOf(" ");if(re>0){let z=e.substring(0,re),oe=e.substring(re+1).trim();return`<span class="t\
 ool-name">${Pe(z)}</span>${c(oe)}`}return`<span class="tool-name">${Pe(e)}</span>`})()}
@@ -253,11 +253,11 @@ tton>':""}
           </div>`:(()=>{let re=Hu(h);if(re)return Uu(re,n+"_b");let z=h.trim();return z.startsWith("```")?`<div class="t\
 ool-body-md">${marked.parse(z)}</div>`:`<pre class="tool-body-pre"><code>${Pe(h)}</code></pre>`})()}
     </div>`:""}
-  </section>`}var Ff=/^IN\n\n?```([^\n]*)\n([\s\S]*?)\n```\n\n?OUT(?:\n\n?```([^\n]*)\n([\s\S]*?)\n```)?[\s]*$/,Hf=/^IN\n([\s\S]*?)(?:\nOUT\n([\s\S]*))?$/;
+  </section>`}var Hf=/^IN\n\n?```([^\n]*)\n([\s\S]*?)\n```\n\n?OUT(?:\n\n?```([^\n]*)\n([\s\S]*?)\n```)?[\s]*$/,Uf=/^IN\n([\s\S]*?)(?:\nOUT\n([\s\S]*))?$/;
 function Hu(e){if(!e)return null;let t=e.replace(/\r\n/g,`
 `);if(!t.startsWith(`IN
-`))return null;let n=t.match(Ff);if(n)return{inLang:n[1]||"",inText:n[2]||"",outLang:n[3]||"",outText:n[4]||""};let s=t.
-match(Hf);return s?{inLang:"",inText:(s[1]||"").trim(),outLang:"",outText:(s[2]||"").trim()}:null}function Uu(e,t){let n=(e.
+`))return null;let n=t.match(Hf);if(n)return{inLang:n[1]||"",inText:n[2]||"",outLang:n[3]||"",outText:n[4]||""};let s=t.
+match(Uf);return s?{inLang:"",inText:(s[1]||"").trim(),outLang:"",outText:(s[2]||"").trim()}:null}function Uu(e,t){let n=(e.
 inText||"").trimEnd().split(`
 `),s=(e.outText||"").trimEnd().split(`
 `),a=(c,u)=>{let p=Pe(u.join(`
@@ -266,7 +266,7 @@ ol-io-row">
       <span class="tool-io-label">${c}</span>
       <div class="tool-io-content">${b||`<code class="tool-io-code">${p}</code>`}</div>
     </div>`},i=s.length===0||s.length===1&&!s[0].trim();return`<div class="tool-io-block" data-tool-index="${t}">${a("IN",
-n)}${i?"":a("OUT",s)}</div>`}function Uf(e){let t=String(e||"").replace(/\r\n/g,`
+n)}${i?"":a("OUT",s)}</div>`}function Wf(e){let t=String(e||"").replace(/\r\n/g,`
 `);if(!t.trim())return null;let n=t.split(`
 `),s=/^\s*(\d+)\s+file(?:\(s\)|s?)\s+changed(?:\s+in\s+this\s+conversation)?/i,a=n.findIndex(g=>s.test(g));if(a===-1)return null;
 let i=n[a].trim(),c=i.match(s);if(!c)return null;let u=g=>{let _=String(g||"").match(/\+(\d+)\s+(?:\u00c2\u00b7|·|-|\s)\s*-?(\d+)/);
@@ -280,7 +280,7 @@ H[3])||0}),S="",A=g}if(y.length===0)return null;let N=p?.adds??y.reduce((g,_)=>g
 _.dels,0),d=n.slice(0,a).join(`
 `).replace(/\s+$/g,""),v=n.slice(A+1).join(`
 `).replace(/^\s+/g,"");return{count:Number(c[1])||y.length,title:i.replace(/\s+\+\d+.*$/,"").trim(),adds:N,dels:h,entries:y,
-beforeText:d,afterText:v}}function Wf(e,t){let n=e.entries.map(s=>`<div class="file-changes-item">
+beforeText:d,afterText:v}}function zf(e,t){let n=e.entries.map(s=>`<div class="file-changes-item">
       <span class="file-changes-path">${Pe(s.filepath)}</span>
       <span class="file-changes-stats"><span class="diff-stat-add">+${s.adds}</span><span class="diff-stat-del">-${s.dels}\
 </span></span>
@@ -295,7 +295,7 @@ beforeText:d,afterText:v}}function Wf(e,t){let n=e.entries.map(s=>`<div class="f
       </span>
     </button>
     ${e.entries.length?`<div class="file-changes-list">${n}</div>`:""}
-  </section>`}function zf(e,t){let n;try{n=JSON.parse(e)}catch{return null}if(!n||!Array.isArray(n.items)||!n.items.length)
+  </section>`}function Gf(e,t){let n;try{n=JSON.parse(e)}catch{return null}if(!n||!Array.isArray(n.items)||!n.items.length)
 return null;let s=n.title||"Subagents",a=n.items.map((i,c)=>{let u=String(i.status||"unknown").toLowerCase(),p=u==="runn\
 ing"?'<span class="subagent-spinner" aria-hidden="true"></span>':u==="done"?'<span class="subagent-icon subagent-icon-do\
 ne" aria-hidden="true">&#10003;</span>':u==="failed"?'<span class="subagent-icon subagent-icon-fail" aria-hidden="true">\
@@ -310,18 +310,18 @@ agent-status-${Pe(u)}">
     <div class="subagents-header"><span class="subagents-icon" aria-hidden="true">&#9783;</span><span class="subagents-t\
 itle">${Pe(s)}</span></div>
     <ul class="subagents-list">${a}</ul>
-  </section>`}function Gf(e){let t=String(e||"").match(/^Task Completed\s*\n+([\s\S]*?)\s*$/);return t?{content:t[1].replace(
-/HAS_CHANGES\s*$/i,"").trimEnd(),wrap:!0}:{content:e,wrap:!1}}function Kf(e){return`<section class="task-completed-secti\
+  </section>`}function Kf(e){let t=String(e||"").match(/^Task Completed\s*\n+([\s\S]*?)\s*$/);return t?{content:t[1].replace(
+/HAS_CHANGES\s*$/i,"").trimEnd(),wrap:!0}:{content:e,wrap:!1}}function Vf(e){return`<section class="task-completed-secti\
 on">
     <div class="task-completed-header">
       <span class="task-completed-icon" aria-hidden="true">&#10003;</span>
       <span class="task-completed-title">Task Completed</span>
     </div>
     <div class="task-completed-body">${e}</div>
-  </section>`}function Vf(e){let t=[],n=/^~~~subagents\s*\n([\s\S]*?)\n~~~\s*$/gm;return{content:String(e||"").replace(n,
-(a,i)=>{let c=zf(i,t.length)||"";return t.push(c),`\0SUBAGENTS_BLOCK_${t.length-1}\0`}),blocks:t}}function Yf(e){let{content:t,
-wrap:n}=Gf(e);e=t;let{content:s,blocks:a}=Vf(e);e=s;let c=qu(e).map((y,S)=>{try{if(y.type==="tool")return Bf(y.name,y.content,
-S);let A=Hu(y.content);if(A)return Uu(A,S);let N=Uf(y.content);if(N){let h=Wf(N,S),d=(N.beforeText||"").trim()?marked.parse(
+  </section>`}function Yf(e){let t=[],n=/^~~~subagents\s*\n([\s\S]*?)\n~~~\s*$/gm;return{content:String(e||"").replace(n,
+(a,i)=>{let c=Gf(i,t.length)||"";return t.push(c),`\0SUBAGENTS_BLOCK_${t.length-1}\0`}),blocks:t}}function Xf(e){let{content:t,
+wrap:n}=Kf(e);e=t;let{content:s,blocks:a}=Yf(e);e=s;let c=qu(e).map((y,S)=>{try{if(y.type==="tool")return Ff(y.name,y.content,
+S);let A=Hu(y.content);if(A)return Uu(A,S);let N=Wf(y.content);if(N){let h=zf(N,S),d=(N.beforeText||"").trim()?marked.parse(
 N.beforeText):"",v=(N.afterText||"").trim()?marked.parse(N.afterText):"";return d+h+v}return(y.content||"").trim()?marked.
 parse(y.content||""):""}catch(A){return'<pre style="color:var(--red,#f26d78);font-size:11px">[render error: '+Pe(String(
 A))+"]</pre><pre>"+Pe(y.content||"")+"</pre>"}}).join("");a.length&&(c=c.replace(/\s*SUBAGENTS_BLOCK_(\d+)\s*/g,(y,S)=>a[Number(
@@ -335,14 +335,14 @@ textContent,10)||0;return y.id=`diff-file-${S}`,{filepath:N,adds:v,dels:g,id:`di
 ummary-name">${Pe(v)}</span><span class="diff-stat-add">+${d.adds}</span><span class="diff-stat-del">-${d.dels}</span></\
 a>`}).join(""),N=`<span class="diff-summary-totals"><span class="diff-summary-count">${b.length} files</span><span class\
 ="diff-stat-add">+${y}</span><span class="diff-stat-del">-${S}</span></span>`,h=document.createElement("div");h.className=
-"diff-summary-bar",h.innerHTML=A+N,u.insertBefore(h,u.firstChild)}return n?Kf(u.innerHTML):u.innerHTML}function Xf(e){let t=[],
+"diff-summary-bar",h.innerHTML=A+N,u.insertBefore(h,u.firstChild)}return n?Vf(u.innerHTML):u.innerHTML}function Qf(e){let t=[],
 n=0,s=document.createTreeWalker(e,NodeFilter.SHOW_TEXT,null),a;for(;a=s.nextNode();){if(a.parentElement&&a.parentElement.
 classList.contains("code-line-num"))continue;let i=a.nodeValue.length;t.push({node:a,start:n,end:n+i}),n+=i}return{text:t.
 map(i=>i.node.nodeValue).join(""),ranges:t}}function zo(e){if(!e)return;let t=e.querySelector("code");if(!t)return;t.querySelectorAll(
 "mark.code-search-mark").forEach(s=>{let a=s.parentNode;a&&(a.replaceChild(document.createTextNode(s.textContent),s),a.normalize())});
-let n=e.querySelector(".code-search-count");n&&(n.textContent=""),delete e._searchState}function Qf(e){if(!e)return;zo(e);
+let n=e.querySelector(".code-search-count");n&&(n.textContent=""),delete e._searchState}function Jf(e){if(!e)return;zo(e);
 let t=e.querySelector(".code-search-input"),n=t?t.value:"";if(!n)return;let s=e.querySelector("code");if(!s)return;let{text:a,
-ranges:i}=Xf(s),c=a.toLowerCase(),u=n.toLowerCase(),p=[],b=0;for(;b<a.length;){let A=c.indexOf(u,b);if(A===-1)break;p.push(
+ranges:i}=Qf(s),c=a.toLowerCase(),u=n.toLowerCase(),p=[],b=0;for(;b<a.length;){let A=c.indexOf(u,b);if(A===-1)break;p.push(
 A),b=A+n.length}if(!p.length){let A=e.querySelector(".code-search-count");A&&(A.textContent="0 / 0");return}let y=[];for(let A=p.
 length-1;A>=0;A--){let N=p[A],h=N+n.length,d=i.filter(v=>v.end>N&&v.start<h);for(let v=d.length-1;v>=0;v--){let g=d[v],_=Math.
 max(0,N-g.start),k=Math.min(g.node.nodeValue.length,h-g.start),T=g.node,L=T.nodeValue,H=document.createElement("mark");H.
@@ -353,24 +353,24 @@ textContent=y.length?`1 / ${y.length}`:"0 / 0"),y.length&&(y[0].classList.add("c
 rest"}))}function Wo(e,t){if(!e||!e._searchState)return;let{marks:n}=e._searchState;if(!n.length)return;n[e._searchState.
 current].classList.remove("current"),e._searchState.current=(e._searchState.current+t+n.length)%n.length;let s=n[e._searchState.
 current];s.classList.add("current"),s.scrollIntoView({block:"nearest"});let a=e.querySelector(".code-search-count");a&&(a.
-textContent=`${e._searchState.current+1} / ${n.length}`)}function Jf(e){let t=[],n=0;for(;n<e.length;)(n===0||e[n-1]===`\
+textContent=`${e._searchState.current+1} / ${n.length}`)}function Zf(e){let t=[],n=0;for(;n<e.length;)(n===0||e[n-1]===`\
 
 `)&&e[n]==="`"&&e[n+1]==="`"&&e[n+2]==="`"?(t.push(n),n+=3):n++;if(t.length%2===0)return null;let s=t[t.length-1],a=e.slice(
 s+3),i=a.indexOf(`
 `);if(i===-1)return{lang:"text",code:""};let u=a.slice(0,i).trim().split(/\s/)[0].toLowerCase()||"text",p=a.slice(i+1);return{
-lang:u,code:p}}var Ka=new Map,Br=null,Es=new Map,Nc=0,Zf=256,eg=8*1024*1024;function tg(e){let t=String(e||""),n=2166136261;
-for(let s=0;s<t.length;s+=1)n^=t.charCodeAt(s),n=Math.imul(n,16777619);return(n>>>0).toString(36)}function ng(e,t){let n=e?.
+lang:u,code:p}}var Ka=new Map,Br=null,Es=new Map,Sc=0,eg=256,tg=8*1024*1024;function ng(e){let t=String(e||""),n=2166136261;
+for(let s=0;s<t.length;s+=1)n^=t.charCodeAt(s),n=Math.imul(n,16777619);return(n>>>0).toString(36)}function sg(e,t){let n=e?.
 closest?.(".message")||e;if(!n||typeof IntersectionObserver>"u")return t(),()=>{};Br||(Br=new IntersectionObserver(a=>{for(let i of a){
 if(!i.isIntersecting)continue;let c=Ka.get(i.target);if(c){Ka.delete(i.target),Br.unobserve(i.target);for(let u of c)u()}}},
 {root:null,rootMargin:"35% 0px",threshold:0}));let s=Ka.get(n);return s||(s=new Set,Ka.set(n,s),Br.observe(n)),s.add(t),
-()=>{let a=Ka.get(n);a&&(a.delete(t),!(a.size>0)&&(Ka.delete(n),Br?.unobserve(n)))}}function sg(e,t){let n=String(e||""),
-s=`${t||"content"}${n.length}${tg(n)}`,a=Es.get(s);if(a&&a.content===n)return Es.delete(s),Es.set(s,a),a.html;let i=Yf(
+()=>{let a=Ka.get(n);a&&(a.delete(t),!(a.size>0)&&(Ka.delete(n),Br?.unobserve(n)))}}function ag(e,t){let n=String(e||""),
+s=`${t||"content"}${n.length}${ng(n)}`,a=Es.get(s);if(a&&a.content===n)return Es.delete(s),Es.set(s,a),a.html;let i=Xf(
 n),c=typeof DOMPurify<"u"?DOMPurify.sanitize(i,{ADD_DATA_URI_TAGS:["img"],ALLOW_DATA_ATTR:!0}):i,u=(n.length+c.length)*2;
-for(Es.set(s,{content:n,html:c,bytes:u}),Nc+=u;Es.size>Zf||Nc>eg;){let p=Es.keys().next().value,b=Es.get(p);Es.delete(p),
-Nc-=b?.bytes||0}return c}function Ya({content:e,monospace:t=!1,onOpenPath:n=null,autoExpandLongCodeBlocks:s=!1,deferUntilVisible:a=!1,
+for(Es.set(s,{content:n,html:c,bytes:u}),Sc+=u;Es.size>eg||Sc>tg;){let p=Es.keys().next().value,b=Es.get(p);Es.delete(p),
+Sc-=b?.bytes||0}return c}function Ya({content:e,monospace:t=!1,onOpenPath:n=null,autoExpandLongCodeBlocks:s=!1,deferUntilVisible:a=!1,
 cacheIdentity:i=""}){let c=React.useRef(null),u=React.useRef(null),p=React.useRef(n),[b,y]=React.useState(!a);return p.current=
-n,React.useEffect(()=>{if(!a){y(!0);return}if(!b)return ng(c.current,()=>y(!0))},[a,b]),React.useEffect(()=>{if(!c.current||
-!b||e===u.current)return;let S=u.current;if(S!==null&&e.startsWith(S)){let d=Jf(e);if(d&&!Sc(d.code)){let v=c.current.querySelectorAll(
+n,React.useEffect(()=>{if(!a){y(!0);return}if(!b)return sg(c.current,()=>y(!0))},[a,b]),React.useEffect(()=>{if(!c.current||
+!b||e===u.current)return;let S=u.current;if(S!==null&&e.startsWith(S)){let d=Zf(e);if(d&&!Cc(d.code)){let v=c.current.querySelectorAll(
 ".code-block:not(.diff-block)"),_=(v.length>0?v[v.length-1]:null)?.querySelector(":scope > pre"),k=_?.querySelector("cod\
 e");if(k){let T=_.scrollTop,L;try{L=typeof hljs<"u"&&hljs.getLanguage(d.lang)?hljs.highlight(d.code,{language:d.lang}).value:
 Pe(d.code)}catch{L=Pe(d.code)}k.innerHTML=Iu(L),k.dataset.raw=d.code,_.scrollTop=T,u.current=e;return}}}let A={toolCollapsed:{},
@@ -381,7 +381,7 @@ fileChangesIndex]=d.classList.contains("collapsed")}),c.current.querySelectorAll
 d.scrollTop}),c.current.querySelectorAll(".diff-block, .tool-diff-block").forEach((d,v)=>{d.querySelectorAll(".diff-hunk\
 -btn").forEach(_=>{A.ctxHidden[`${v}:${_.dataset.hunkId}`]=_.classList.contains("diff-hunk-ctx-collapsed")});let g=d.querySelector(
 ".diff-ctx-collapse-all");g&&(A.ctxCollapseActive[v]=g.classList.contains("active"))})),u.current=e,c.current.innerHTML=
-sg(e,i),c.current.querySelectorAll(".tool-section[data-tool-index]").forEach(d=>{let v=d.dataset.toolIndex;if(!(v in A.toolCollapsed))
+ag(e,i),c.current.querySelectorAll(".tool-section[data-tool-index]").forEach(d=>{let v=d.dataset.toolIndex;if(!(v in A.toolCollapsed))
 return;let g=A.toolCollapsed[v],_=d.classList.contains("collapsed");if(g!==_){d.classList.toggle("collapsed",g);let k=d.
 querySelector(".tool-body"),T=d.querySelector(".tool-chevron"),L=d.querySelector(".tool-toggle");k&&(k.hidden=g),T&&(T.textContent=
 g?"\u25B8":"\u25BE"),L&&L.setAttribute("aria-expanded",g?"false":"true")}}),c.current.querySelectorAll(".file-changes-se\
@@ -426,7 +426,7 @@ toggle("code-wrap",v);let _=g.querySelector(".code-wrap-toggle");_&&(_.textConte
  word wrap":"Enable word wrap",_.classList.toggle("active",v))})}}),c.current.querySelectorAll(".code-search-btn").forEach(
 d=>{d.onclick=()=>{let v=d.closest(".code-block");if(!v)return;let g=v.querySelector(".code-search-bar"),_=v.querySelector(
 ".code-search-input");if(!g)return;!g.hidden?(zo(v),g.hidden=!0,d.classList.remove("active")):(g.hidden=!1,d.classList.add(
-"active"),_&&_.focus())}}),c.current.querySelectorAll(".code-search-input").forEach(d=>{d.oninput=()=>Qf(d.closest(".cod\
+"active"),_&&_.focus())}}),c.current.querySelectorAll(".code-search-input").forEach(d=>{d.oninput=()=>Jf(d.closest(".cod\
 e-block")),d.onkeydown=v=>{let g=d.closest(".code-block");v.key==="Enter"&&(v.shiftKey?Wo(g,-1):Wo(g,1),v.preventDefault()),
 v.key==="Escape"&&(zo(g),g.querySelector(".code-search-bar").hidden=!0,g.querySelector(".code-search-btn").classList.remove(
 "active"))}}),c.current.querySelectorAll(".code-search-next").forEach(d=>{d.onclick=()=>Wo(d.closest(".code-block"),1)}),
@@ -450,12 +450,12 @@ for(;g&&g!==document.body;){let k=window.getComputedStyle(g);if(k.overflowY==="a
 "auto"||k.overflow==="scroll"){v=g;break}g=g.parentElement}let _=new IntersectionObserver(k=>{k.forEach(T=>{if(!T.isIntersecting)
 return;let L=T.target.id;h.querySelectorAll(".diff-summary-chip").forEach(H=>{H.classList.toggle("active",H.dataset.target===
 L)})})},{root:v,threshold:.1});d.forEach(k=>_.observe(k)),N=()=>_.disconnect()}}return()=>{N&&N()}},[e,s,i,b]),React.createElement(
-"div",{className:`message-body${t?" monospace-body":""}`,ref:c,"data-rich-content-ready":b?"true":"false"})}function Cc(e,t=null,n=Date.now()){return{sessionId:e,messageId:null,blockIndex:0,seq:-1,content:"",open:!0,startedAtMs:n,
+"div",{className:`message-body${t?" monospace-body":""}`,ref:c,"data-rich-content-ready":b?"true":"false"})}function xc(e,t=null,n=Date.now()){return{sessionId:e,messageId:null,blockIndex:0,seq:-1,content:"",open:!0,startedAtMs:n,
 clientMessageId:t}}function Wu(e,t,n=!1){if(!e||String(e.content||"").length>0||n)return!1;let s=String(t?.kind||"idle").
 toLowerCase();return["idle","waiting_for_user","completed","done","failed","error","interrupted"].includes(s)}function zu(e,t,n=Date.
 now()){let s=t?.session_id||t?.session||"",a=t?.message_id||"",i=Number(t?.block_index),c=Number(t?.seq);return!s||!a||!Number.
 isSafeInteger(i)||i<0||!Number.isSafeInteger(c)||c<0?{accepted:!1,code:"invalid_identity",stream:e||null}:t.op==="block_\
-open"?c!==0?{accepted:!1,code:"invalid_open_sequence",stream:e||null}:{accepted:!0,stream:{...Cc(s,e?.clientMessageId||null,
+open"?c!==0?{accepted:!1,code:"invalid_open_sequence",stream:e||null}:{accepted:!0,stream:{...xc(s,e?.clientMessageId||null,
 e?.startedAtMs||n),messageId:a,blockIndex:i,seq:c}}:!e||e.messageId!==a||e.blockIndex!==i||!e.open?{accepted:!1,code:"st\
 ream_not_open",stream:e||null}:c!==e.seq+1?{accepted:!1,code:"sequence_gap",stream:e}:t.op==="append"?typeof t.append!="\
 string"||t.append.length===0?{accepted:!1,code:"invalid_append",stream:e}:{accepted:!0,stream:{...e,seq:c,content:`${e.content||
@@ -467,7 +467,7 @@ In(e.timestamp)||In(e.ts)||null}function Qa(e){if(!e||typeof e!="object")return 
 iso&&e.timestamp_ms===t.epoch_ms&&Number(e.ts)===t.epoch_seconds?e:{...e,ts:t.epoch_seconds,timestamp:t.iso,timestamp_ms:t.
 epoch_ms}}function Ku(e){if(!Array.isArray(e))return[];let t=!1,n=e.map(s=>{let a=Qa(s);return a!==s&&(t=!0),a});return t?
 n:e}function Gu(e,t){return new Intl.DateTimeFormat("en-US-u-ca-gregory",{year:"numeric",...t?{timeZone:t}:{}}).format(e)}
-function xc(e,t=new Date,n=void 0,s=void 0){let a=e&&typeof e=="object"&&Number.isFinite(e.epoch_ms)?e:In(e);if(!a)return"";
+function Ac(e,t=new Date,n=void 0,s=void 0){let a=e&&typeof e=="object"&&Number.isFinite(e.epoch_ms)?e:In(e);if(!a)return"";
 let i=new Date(a.epoch_ms),c={...Gu(i,s)===Gu(t,s)?{}:{year:"numeric"},month:"short",day:"numeric",hour:"numeric",minute:"\
 2-digit",...s?{timeZone:s}:{}};return new Intl.DateTimeFormat(n,c).format(i)}function Vu(e,t=void 0,n=void 0){let s=e&&typeof e==
 "object"&&Number.isFinite(e.epoch_ms)?e:In(e);return s?`${new Intl.DateTimeFormat(t,{dateStyle:"full",timeStyle:"long",...n?
@@ -476,34 +476,34 @@ s?.state_seq);if(!Number.isSafeInteger(i)||i<0)return!0;let c=String(s?.state_ep
 (n=c);let u=String(a||s?.type||"state"),p=e.get(u);if(p?.epoch===c&&i<=p.seq)return!1;for(e.has(u)&&e.delete(u),e.set(u,
 {epoch:c,seq:i});e.size>t;)e.delete(e.keys().next().value);return!0},size(){return e.size}}}var Go=/(?:!\[[^\]]*\]\([^)]*\)|\[File:\s*[^\]]+\]|\b(?:image|screenshot|screen\s*shot|capture)[\w .()[\]-]*\.(?:png|jpe?g|gif|webp|bmp|svg)\b)/gi,
 Ko=/(?:[A-Za-z]:[\\/]|\\\\[^\\/\s]+[\\/]|\/(?:Users|home|mnt|var|tmp|etc|opt|workspace|workspaces)\/)[^\s"'`<>)]{2,}/gi,
-ag=/^(?=.*\d)(?:(?:\d+)\s*d\s*)?(?:(?:\d+)\s*h\s*)?(?:(?:\d+)\s*m\s*)?(?:(?:\d+)\s*s)?$/i,rg=/^[+-]?\d+\s*[dhms]\b/i,og=/^(?:just now|today|yesterday|(?:\d+|an?|one)\s+(?:seconds?|secs?|minutes?|mins?|hours?|hrs?|days?|weeks?|months?|years?)\s+ago)$/i,
-ig=/^(?:pursuing goal|paused goal|goal (?:paused|blocked|usage limited|rate limited|limited|budget limited|achieved|cancelled|canceled|stopped|failed)|idle|ready|connected|awaiting live update)$/i,
-cg=/^(?:no (?:recent message|current work|data|activity)(?: reported)?|unavailable|unknown|not available)$/i,lg=/^(?:(?:antigravity|claude(?: code)?|cline|codex|continue|cursor|gemini|roo code)\s+(?:harness|workspace))$/i,
+rg=/^(?=.*\d)(?:(?:\d+)\s*d\s*)?(?:(?:\d+)\s*h\s*)?(?:(?:\d+)\s*m\s*)?(?:(?:\d+)\s*s)?$/i,og=/^[+-]?\d+\s*[dhms]\b/i,ig=/^(?:just now|today|yesterday|(?:\d+|an?|one)\s+(?:seconds?|secs?|minutes?|mins?|hours?|hrs?|days?|weeks?|months?|years?)\s+ago)$/i,
+cg=/^(?:pursuing goal|paused goal|goal (?:paused|blocked|usage limited|rate limited|limited|budget limited|achieved|cancelled|canceled|stopped|failed)|idle|ready|connected|awaiting live update)$/i,
+lg=/^(?:no (?:recent message|current work|data|activity)(?: reported)?|unavailable|unknown|not available)$/i,ug=/^(?:(?:antigravity|claude(?: code)?|cline|codex|continue|cursor|gemini|roo code)\s+(?:harness|workspace))$/i,
 Xu=new Set(["agent","agentmanager","agentsession","antigravity","antigravitychat","antigravityv2","claude","claudecli","\
 claudecode","claudecodecli","claudedesktop","cline","codex","codexcli","codexdesktop","connected","connectedsession","co\
 ntinue","continueyolo","cursor","cursoragent","cursorcli","cursoride","gemini","geminicodeassist","newchat","newconversa\
 tion","other","proceed","resume","roocode","session","unknown","attachment","file","image","screenshot","disregardthatla\
 stmessage","ignorethatlastmessage"]);function Ja(e){return typeof e=="string"?e:Array.isArray(e)?e.map(Ja).filter(Boolean).
 join(`
-`):!e||typeof e!="object"?"":Ja(e.text||e.content||e.markdown||e.value||"")}function Ac(){Go.lastIndex=0,Ko.lastIndex=0}
-function ug(e){let t=Ja(e).replace(/\s+/g," ").trim();return t?ag.test(t)?"duration_only":rg.test(t)?"duration_malformed":
-og.test(t)?"age_only":ig.test(t)?"status_only":cg.test(t)?"placeholder_only":lg.test(t)?"surface_label_only":"":"empty"}
-function Ls(e){let t=Ja(e).replace(/\s+/g," ").trim();if(!t||ug(t)||/^\[(?:attachment|file|image|screenshot)(?:\s*:[^\]]*)?\]$/i.
+`):!e||typeof e!="object"?"":Ja(e.text||e.content||e.markdown||e.value||"")}function Rc(){Go.lastIndex=0,Ko.lastIndex=0}
+function dg(e){let t=Ja(e).replace(/\s+/g," ").trim();return t?rg.test(t)?"duration_only":og.test(t)?"duration_malformed":
+ig.test(t)?"age_only":cg.test(t)?"status_only":lg.test(t)?"placeholder_only":ug.test(t)?"surface_label_only":"":"empty"}
+function Ls(e){let t=Ja(e).replace(/\s+/g," ").trim();if(!t||dg(t)||/^\[(?:attachment|file|image|screenshot)(?:\s*:[^\]]*)?\]$/i.
 test(t)||/^new\s+(?:antigravity|claude|codex|continue|cursor|gemini|roo)(?:\s+(?:agent|chat|cli|code|desktop|ide|panel))*\s+(?:chat|conversation|session|thread)$/i.
-test(t))return!0;let n=Go.test(t)||Ko.test(t);if(Ac(),n){let a=t.replace(Go," ").replace(Ko," ").replace(/\b(?:read|open|view|inspect|check|review|show|load|attach|attached|upload|uploaded|file|image|screenshot)\b/gi,
-" ").replace(/[^a-z0-9]+/gi,"").trim();if(Ac(),a.length<12)return!0}let s=t.toLowerCase().replace(/[^a-z0-9]+/g,"").replace(
+test(t))return!0;let n=Go.test(t)||Ko.test(t);if(Rc(),n){let a=t.replace(Go," ").replace(Ko," ").replace(/\b(?:read|open|view|inspect|check|review|show|load|attach|attached|upload|uploaded|file|image|screenshot)\b/gi,
+" ").replace(/[^a-z0-9]+/gi,"").trim();if(Rc(),a.length<12)return!0}let s=t.toLowerCase().replace(/[^a-z0-9]+/g,"").replace(
 /^remoteagent(?:chat)?/,"");return s?Xu.has(s)?!0:(s=s.replace(/(?:new|production|session|chat|smoke|test|probe|verification|fixture|extension|ext|ide|app|panel|pane)$/g,
 ""),Xu.has(s)):!/[\p{L}\p{N}]/u.test(t)}function Zu(e){let t=Ja(e);if(!t)return"";let n=t.replace(/<goal_context>[\s\S]*?<\/goal_context>/gi,
 " ").replace(/```[\s\S]*?```/g," ").replace(Go," ").replace(Ko," ").replace(/<[^>\n]{1,120}>/g," ").replace(/`([^`]+)`/g,
-"$1").replace(/^\s*(?:user|assistant|codex|claude|tool result)\s*[:\-]\s*/i,"").replace(/\s+/g," ").trim();return Ac(),!n||
+"$1").replace(/^\s*(?:user|assistant|codex|claude|tool result)\s*[:\-]\s*/i,"").replace(/\s+/g," ").trim();return Rc(),!n||
 Ls(n)||/^(?:thinking|working|tool result|tool:|exit code|wall time|read|open|view|inspect|check|review|show|load|attach|attached|uploaded|file|image|screenshot)\b/i.
-test(n)&&n.split(/\s+/).length<=4||/^[^\p{L}\p{N}]+$/u.test(n)?"":n.slice(0,80).trim()}function dg(e){let t=Array.isArray(
+test(n)&&n.split(/\s+/).length<=4||/^[^\p{L}\p{N}]+$/u.test(n)?"":n.slice(0,80).trim()}function pg(e){let t=Array.isArray(
 e)?e:[];for(let n of t){if(String(n?.role||"").toLowerCase()!=="user")continue;let s=Zu(n?.content||n?.content_blocks);if(s)
-return s}return""}var Qu=Object.freeze({fallback:0,route:.5,message:1,summary:2,custom:3,native:4}),pg=Object.freeze(["c\
+return s}return""}var Qu=Object.freeze({fallback:0,route:.5,message:1,summary:2,custom:3,native:4}),mg=Object.freeze(["c\
 odex_desktop_active_thread_title","cursor_agent_title","native_chat_title","session_title","thread_title","conversation_\
 title","title","display_title","summary","chat_title","chat_title_source","thread_name","conversation_name","custom_disp\
 lay_name","is_new_chat_draft","is_list_view"]);function Ju(e){return Ja(e).replace(/\s+/g," ").trim()}function ed(e){return!e||
-typeof e!="object"?{}:Object.fromEntries(pg.filter(t=>Object.prototype.hasOwnProperty.call(e,t)).map(t=>[t,e[t]]))}function Rc(e,t="",n=[],s=""){
+typeof e!="object"?{}:Object.fromEntries(mg.filter(t=>Object.prototype.hasOwnProperty.call(e,t)).map(t=>[t,e[t]]))}function Mc(e,t="",n=[],s=""){
 let a=e&&typeof e=="object"?e:{},c=[["codex_desktop_active_thread_title",a.codex_desktop_active_thread_title],["cursor_a\
 gent_title",a.cursor_agent_title],["native_chat_title",a.native_chat_title],["session_title",a.session_title],["thread_t\
 itle",a.thread_title],["conversation_title",a.conversation_title],["title",a.title],["display_title",a.display_title],["\
@@ -512,32 +512,32 @@ map(([S,A])=>({field:S,title:Ju(A)})).find(S=>S.title&&!Ls(S.title));if(c)return
 native",field:c.field};let u=Ju(t);if(u&&!Ls(u))return{title:u.slice(0,80).trim(),source:"custom",field:"custom_display_\
 name"};let b=[["chat_title",a.chat_title_source==="summary"?a.chat_title:""],["summary",a.summary],["derived_message_tit\
 le",s]].map(([S,A])=>({field:S,title:Zu(A)})).find(S=>S.title);if(b)return{title:b.title,source:"summary",field:b.field};
-let y=dg(n);return y?{title:y,source:"message",field:"first_meaningful_user_message"}:{title:"New chat",source:"fallback",
+let y=pg(n);return y?{title:y,source:"message",field:"first_meaningful_user_message"}:{title:"New chat",source:"fallback",
 field:"new_chat"}}function td(e,t){if(!e?.title)return t;if(!t?.title)return e;let n=Qu[e.source]??0;return(Qu[t.source]??
-0)>=n?t:e}function nd(e,t="",n=[],s=""){return Rc(e,t,n,s).title}var mg=/(?:\bbearer\s+[a-z0-9._~+/=-]{8,}|\b(?:api[_ -]?key|password|passwd|secret|access[_ -]?token|refresh[_ -]?token)\s*[:=]\s*\S+|\bsk-[a-z0-9_-]{8,})/i,
-fg=/(?:[A-Za-z]:[\\/]|\\\\[^\\/\s]+[\\/]|\/(?:Users|home|mnt|var|tmp|etc|opt|workspace|workspaces)\/)[^\s"'<>)]{2,}/i;function gg(e){
+0)>=n?t:e}function nd(e,t="",n=[],s=""){return Mc(e,t,n,s).title}var fg=/(?:\bbearer\s+[a-z0-9._~+/=-]{8,}|\b(?:api[_ -]?key|password|passwd|secret|access[_ -]?token|refresh[_ -]?token)\s*[:=]\s*\S+|\bsk-[a-z0-9_-]{8,})/i,
+gg=/(?:[A-Za-z]:[\\/]|\\\\[^\\/\s]+[\\/]|\/(?:Users|home|mnt|var|tmp|etc|opt|workspace|workspaces)\/)[^\s"'<>)]{2,}/i;function hg(e){
 let t=0;for(let n of String(e||"")){let s=n.codePointAt(0);t+=s<=127?1:s<=2047?2:s<=65535?3:4}return t}function kn(e,t=96){
 if(typeof e!="string"&&typeof e!="number")return"";let n=String(e).replace(/[\u0000-\u001f\u007f]+/g," ").replace(/\s+/g,
-" ").trim();return!n||mg.test(n)||fg.test(n)?"":n.slice(0,t).trim()}function Vo(e){if(e==null||e==="")return null;let t=typeof e==
+" ").trim();return!n||fg.test(n)||gg.test(n)?"":n.slice(0,t).trim()}function Vo(e){if(e==null||e==="")return null;let t=typeof e==
 "number"&&Number.isFinite(e)?e:NaN,n=Number.isFinite(t)?t>0&&t<1e12?t*1e3:t:Date.parse(String(e));return Number.isFinite(
-n)&&n>0?new Date(n).toISOString():null}function hg(e){let t=String(e||"").trim().toLowerCase().replace(/[^a-z]/g,"");return{
+n)&&n>0?new Date(n).toISOString():null}function _g(e){let t=String(e||"").trim().toLowerCase().replace(/[^a-z]/g,"");return{
 active:"active",paused:"paused",blocked:"blocked",usagelimited:"usageLimited",ratelimited:"usageLimited",budgetlimited:"\
 budgetLimited",complete:"complete",completed:"complete",cancelled:"cancelled",canceled:"cancelled",failed:"failed",idle:"\
-idle",working:"working"}[t]||null}function Mc(e){if(!e||typeof e!="object"||Number(e.schema_version)!==1)return null;let t={
+idle",working:"working"}[t]||null}function Tc(e){if(!e||typeof e!="object"||Number(e.schema_version)!==1)return null;let t={
 schema_version:1,parser_version:kn(e.parser_version,32)||"fleet-summary-v1",session_key:kn(e.session_key,40),session_generation:Math.
 max(1,Number(e.session_generation)||1),thread_key:kn(e.thread_key,40),thread_generation:Math.max(1,Number(e.thread_generation)||
 1),producer_seq:Math.max(0,Number(e.producer_seq)||0),summary_seq:Math.max(0,Number(e.summary_seq)||0),title:kn(e.title,
 80)||null,title_source:kn(e.title_source,24)||null,title_confidence:["authoritative","derived","unknown"].includes(e.title_confidence)?
 e.title_confidence:"unknown",latest_user_request:kn(e.latest_user_request)||null,latest_user_request_at:Vo(e.latest_user_request_at),
 current_work:kn(e.current_work)||null,current_work_source:kn(e.current_work_source,32)||null,current_work_kind:kn(e.current_work_kind,
-24)||null,current_work_state:hg(e.current_work_state),current_work_at:Vo(e.current_work_at),last_role:["user","assistant"].
+24)||null,current_work_state:_g(e.current_work_state),current_work_at:Vo(e.current_work_at),last_role:["user","assistant"].
 includes(e.last_role)?e.last_role:null,last_message_at:Vo(e.last_message_at),last_snippet:kn(e.last_snippet)||null,message_count:Math.
 max(0,Number(e.message_count)||0),user_count:Math.max(0,Number(e.user_count)||0),assistant_count:Math.max(0,Number(e.assistant_count)||
 0),other_count:Math.max(0,Number(e.other_count)||0),role_imbalance:["balanced","assistant_without_user","user_without_as\
 sistant"].includes(e.role_imbalance)?e.role_imbalance:"balanced",rejected_candidate_reason:kn(e.rejected_candidate_reason,
-48)||null,fresh_at:Vo(e.fresh_at)};return!t.session_key||!t.thread_key||gg(JSON.stringify(t))>1024?null:t}function sd(e){
-return e?.title_confidence==="authoritative"?3:e?.title_confidence==="derived"?2:e?.title?1:0}function ad(e,t){let n=Mc(
-e),s=Mc(t);if(!s)return{summary:n,accepted:!1,changed:!1,reason:"invalid"};if(!n)return{summary:{...s,summary_seq:Math.max(
+48)||null,fresh_at:Vo(e.fresh_at)};return!t.session_key||!t.thread_key||hg(JSON.stringify(t))>1024?null:t}function sd(e){
+return e?.title_confidence==="authoritative"?3:e?.title_confidence==="derived"?2:e?.title?1:0}function ad(e,t){let n=Tc(
+e),s=Tc(t);if(!s)return{summary:n,accepted:!1,changed:!1,reason:"invalid"};if(!n)return{summary:{...s,summary_seq:Math.max(
 1,s.summary_seq)},accepted:!0,changed:!0,reason:"initial"};if(s.session_generation<n.session_generation)return{summary:n,
 accepted:!1,changed:!1,reason:"older_session_generation"};if(s.session_generation===n.session_generation&&s.session_key!==
 n.session_key)return{summary:n,accepted:!1,changed:!1,reason:"session_identity_mismatch"};if(s.session_generation===n.session_generation&&
@@ -551,7 +551,7 @@ atest_user_request_at","current_work","current_work_source","current_work_kind",
 last_role","last_message_at","last_snippet","fresh_at"])(s[p]==null||s[p]==="")&&(c[p]=n[p]);for(let p of["message_count",
 "user_count","assistant_count","other_count"])c[p]=Math.max(n[p]||0,s[p]||0)}c.summary_seq=Math.max(n.summary_seq||0,s.summary_seq||
 0);let u=JSON.stringify(n)!==JSON.stringify(c);return{summary:u?c:n,accepted:!0,changed:u,reason:u?"upgraded":"unchanged"}}
-function rd(e){let t=Mc(e);if(!t)return{};let n=t.current_work?{kind:t.current_work_kind||"activity",label:t.current_work_kind===
+function rd(e){let t=Tc(e);if(!t)return{};let n=t.current_work?{kind:t.current_work_kind||"activity",label:t.current_work_kind===
 "goal"?"Goal":t.current_work_kind==="request"?"Request":"Current work",text:t.current_work,source:t.current_work_source||
 "fleet_summary",updated_at:t.current_work_at,...t.current_work_state?{state:t.current_work_state}:{}}:null;return{fleet_summary:t,
 ...t.title?{chat_title:t.title,chat_title_source:t.title_source}:{},...t.latest_user_request?{last_user_request:{text:t.
@@ -562,92 +562,93 @@ isArray(e)||Array.isArray(t)){if(!Array.isArray(e)||!Array.isArray(t)||e.length!
 1)if(!en(e[a],t[a]))return!1;return!0}let n=Object.keys(e),s=Object.keys(t);if(n.length!==s.length)return!1;for(let a of n)
 if(!Object.prototype.hasOwnProperty.call(t,a)||!en(e[a],t[a]))return!1;return!0}function Yo(e=[]){let t=[],n=[],s=Object.
 create(null),a=Object.create(null);for(let i of Array.isArray(e)?e:[]){let c=id(i);if(!c||Object.prototype.hasOwnProperty.
-call(s,c))continue;a[c]=t.length,n.push(c);let u=$c(null,i);s[c]=u,t.push(u)}return{byId:s,indexById:a,order:n,list:t}}function Tc(e){
-return e?.is_new_chat_draft===!0}function $c(e,t){if(!t||typeof t!="object")return t;if(Tc(t)){let i={...t};for(let c of[
+call(s,c))continue;a[c]=t.length,n.push(c);let u=Ec(null,i);s[c]=u,t.push(u)}return{byId:s,indexById:a,order:n,list:t}}function $c(e){
+return e?.is_new_chat_draft===!0}function Ec(e,t){if(!t||typeof t!="object")return t;if($c(t)){let i={...t};for(let c of[
 "fleet_summary","fleet_work_context","last_user_request","last_snippet","last_message_at"])delete i[c];return i}let n=ad(
 e?.fleet_summary,t.fleet_summary).summary;if(!n)return t;let s=rd(n),a={...t,...s};return s.fleet_work_context&&a.activity&&
 typeof a.activity=="object"&&!a.activity.work_context&&(a.activity={...a.activity,work_context:s.fleet_work_context}),a}
-function cd(e,t){return!e||typeof e!="object"||!t||typeof t!="object"||Tc(t)||Ls(e.chat_title)||!Ls(t.chat_title)?t:{...t,
+function cd(e,t){return!e||typeof e!="object"||!t||typeof t!="object"||$c(t)||Ls(e.chat_title)||!Ls(t.chat_title)?t:{...t,
 chat_title:e.chat_title,chat_title_source:e.chat_title_source||t.chat_title_source||null}}function Fr(e,t){let n=e?.byId?
 e:Yo(),s=Array.isArray(t)?t:[],a=[],i=[],c=Object.create(null),u=Object.create(null),p=s.length!==n.list.length;for(let b of s){
-let y=id(b);if(!y||Object.prototype.hasOwnProperty.call(c,y))continue;let S=n.byId[y],A=cd(S,$c(S,b)),N=S!==void 0&&en(S,
+let y=id(b);if(!y||Object.prototype.hasOwnProperty.call(c,y))continue;let S=n.byId[y],A=cd(S,Ec(S,b)),N=S!==void 0&&en(S,
 A)?S:A;u[y]=a.length,i.push(y),c[y]=N,a.push(N),(!Object.is(N,S)||n.order[a.length-1]!==y)&&(p=!0)}return(a.length!==s.length||
 a.length!==n.list.length)&&(p=!0),p?{byId:c,indexById:u,order:i,list:a}:n}function ld(e,t){let n=e?.byId?e:Yo(),s=t?.session_id||
 t?.session||"";if(!s||!Object.prototype.hasOwnProperty.call(n.byId,s))return n;let a=n.byId[s],i=a&&typeof a=="object"?a:
-{session_id:s},c=t?.patch&&typeof t.patch=="object"?t.patch:{},u=Array.isArray(t?.removed_fields)?t.removed_fields:[],p=Tc(
+{session_id:s},c=t?.patch&&typeof t.patch=="object"?t.patch:{},u=Array.isArray(t?.removed_fields)?t.removed_fields:[],p=$c(
 c),b=!p&&!Ls(i.chat_title)&&(!Object.prototype.hasOwnProperty.call(c,"chat_title")||Ls(c.chat_title)),y=i;for(let[h,d]of Object.
 entries(c))od.has(h)||h==="session_id"||h==="id"||b&&(h==="chat_title"||h==="chat_title_source")||en(y[h],d)||(y===i&&(y=
 {...i}),y[h]=d);for(let h of u)typeof h!="string"||od.has(h)||h==="session_id"||h==="id"||b&&(h==="chat_title"||h==="cha\
 t_title_source")||Object.prototype.hasOwnProperty.call(y,h)&&(y===i&&(y={...i}),delete y[h]);if(p&&!Object.prototype.hasOwnProperty.
-call(c,"chat_title")&&(y===i&&(y={...i}),y.chat_title=null,y.chat_title_source=null),y=cd(i,$c(i,y)),en(y,i))return n;y.
+call(c,"chat_title")&&(y===i&&(y={...i}),y.chat_title=null,y.chat_title_source=null),y=cd(i,Ec(i,y)),en(y,i))return n;y.
 session_id=s;let S=n.indexById[s],A=n.list.slice();A[S]=y;let N=Object.assign(Object.create(null),n.byId);return N[s]=y,
-{byId:N,indexById:n.indexById,order:n.order,list:A}}var ud=10,rt=new Map,Hr=new Map,_g=Object.freeze([]);function Ur(e){return String(e||"").trim()}function dd(e){let t=Ur(e);if(!t||!rt.has(t))return null;let n=rt.get(t);return rt.delete(t),rt.set(t,n),n}function pd(e){
-let t=Ur(e);return t&&rt.get(t)||_g}function md(e,t){let n=Ur(e);if(!n||typeof t!="function")return()=>{};let s=Hr.get(n)||
-new Set;return s.add(t),Hr.set(n,s),()=>{let a=Hr.get(n);a&&(a.delete(t),a.size===0&&Hr.delete(n))}}function Ec(e){let t=Hr.
+{byId:N,indexById:n.indexById,order:n.order,list:A}}var ud=10,rt=new Map,Hr=new Map,bg=Object.freeze([]);function Ur(e){return String(e||"").trim()}function dd(e){let t=Ur(e);if(!t||!rt.has(t))return null;let n=rt.get(t);return rt.delete(t),rt.set(t,n),n}function pd(e){
+let t=Ur(e);return t&&rt.get(t)||bg}function md(e,t){let n=Ur(e);if(!n||typeof t!="function")return()=>{};let s=Hr.get(n)||
+new Set;return s.add(t),Hr.set(n,s),()=>{let a=Hr.get(n);a&&(a.delete(t),a.size===0&&Hr.delete(n))}}function Lc(e){let t=Hr.
 get(e);t&&[...t].forEach(n=>n())}function fd(e,t,n=ud){let s=Ur(e);if(!s||!Array.isArray(t))return[];let a=Ku(t),i=rt.get(s);rt.delete(s),rt.set(s,a);let c=[],
-u=Math.max(1,Number(n)||ud);for(;rt.size>u;){let p=rt.keys().next().value;rt.delete(p),c.push(p)}return i!==a&&Ec(s),c.forEach(
-Ec),c}function gd(e){let t=Ur(e);return!t||!rt.has(t)?!1:(rt.delete(t),Ec(t),!0)}function bg(){return Object.fromEntries(
-[...rt.entries()])}function hd(e){let t=bg(),n=typeof e=="function"?e(t):e;if(!n||n===t||typeof n!="object")return t;let s=new Set(
+u=Math.max(1,Number(n)||ud);for(;rt.size>u;){let p=rt.keys().next().value;rt.delete(p),c.push(p)}return i!==a&&Lc(s),c.forEach(
+Lc),c}function gd(e){let t=Ur(e);return!t||!rt.has(t)?!1:(rt.delete(t),Lc(t),!0)}function vg(){return Object.fromEntries(
+[...rt.entries()])}function hd(e){let t=vg(),n=typeof e=="function"?e(t):e;if(!n||n===t||typeof n!="object")return t;let s=new Set(
 Object.keys(n));return Object.keys(t).forEach(a=>{s.has(a)||gd(a)}),Object.entries(n).forEach(([a,i])=>{Array.isArray(i)&&
-t[a]!==i&&fd(a,i)}),n}var Lc=new Proxy({},{get(e,t){if(typeof t=="string")return rt.get(t)},ownKeys(){return[...rt.keys()]},
+t[a]!==i&&fd(a,i)}),n}var Pc=new Proxy({},{get(e,t){if(typeof t=="string")return rt.get(t)},ownKeys(){return[...rt.keys()]},
 getOwnPropertyDescriptor(e,t){if(typeof t=="string"&&rt.has(t))return{configurable:!0,enumerable:!0,value:rt.get(t)}},set(e,t,n){
-return typeof t!="string"||!Array.isArray(n)?!1:(fd(t,n),!0)},deleteProperty(e,t){return typeof t=="string"?gd(t):!1}});var vg=new Set(["thinking","generating","reading_files","running_command","applying_patch","working"]),yg=new Set(["wait\
-ing_for_user","needs_attention","blocked","rate_limited","usage_limited","budget_limited","failed","error"]),kg=new Set(
-["blocked","usagelimited","budgetlimited","failed"]),wg=new Set(["complete","completed","cancelled","canceled"]),Ng=new Set(
+return typeof t!="string"||!Array.isArray(n)?!1:(fd(t,n),!0)},deleteProperty(e,t){return typeof t=="string"?gd(t):!1}});var yg=new Set(["thinking","generating","reading_files","running_command","applying_patch","working"]),kg=new Set(["wait\
+ing_for_user","needs_attention","blocked","rate_limited","usage_limited","budget_limited","failed","error"]),wg=new Set(
+["blocked","usagelimited","budgetlimited","failed"]),Ng=new Set(["complete","completed","cancelled","canceled"]),_d=new Set(
 ["starting","running_turn","checkpoint_pending_continuation","verifying"]),Sg=new Set(["waiting_for_user","blocked_limit\
 ed"]),Cg=new Set(["paused","completed_cancelled_failed","unknown_disconnected"]),qc=15e3;function xg(e){return String(e?.
-goal?.state||e?.goal?.status||"").trim().toLowerCase().replace(/[^a-z]/g,"")}function _d(e){let t=e?.goal,n=e?.goal_run;
+goal?.state||e?.goal?.status||"").trim().toLowerCase().replace(/[^a-z]/g,"")}function bd(e){let t=e?.goal,n=e?.goal_run;
 return!t||!n||n.schema_version!==1||!n.run_id||!n.goal_fingerprint||!Number.isFinite(Number(n.goal_generation))||String(
 n.goal_fingerprint)!==String(t.fingerprint||"")||Number(n.goal_generation)!==Math.max(1,Number(t.generation)||1)?null:n}
 function na(e){if(typeof e=="number"&&Number.isFinite(e))return e;let t=Date.parse(String(e||""));return Number.isFinite(
-t)?t:0}function Qo(e){return Math.max(na(e?.transport?.client_received_at_ms),na(e?.transport?.relay_forwarded_at_ms),na(
-e?.observed_at),na(e?.updatedAt),na(e?.updated_at))}function Pc(e,t={}){if(t.connected===!1||String(t.health||"").toLowerCase()===
-"disconnected"||t.fresh===!1)return!1;if(t.requireFreshness!==!0)return!0;let n=Qo(e);if(!n)return!1;let s=Number.isFinite(
-Number(t.nowMs))?Number(t.nowMs):Date.now(),a=Math.max(1e3,Number(t.freshnessMs)||qc);return s-n<=a}function Jo(e,t=!1,n={}){
-let s=String(e?.kind||"").trim().toLowerCase(),a=xg(e),i=_d(e),c=String(i?.lifecycle||"").trim().toLowerCase();return t||
-yg.has(s)||kg.has(a)||Sg.has(c)?"needs_attention":i&&c==="unknown_disconnected"?"stale":i&&Cg.has(c)||wg.has(a)?"idle":i?.
-lease_active===!0&&Ng.has(c)?"working_goal":i&&a==="active"||a==="active"?Pc(e,n)?"between_goal_turns":"stale":s==="idle"&&
-a!=="active"?"idle":Pc(e,n)?e?.generating===!0||vg.has(s)?"working":"idle":"stale"}function Zo(e,t={}){let n=_d(e),s=String(
+t)?t:0}function Jo(e){return Math.max(na(e?.transport?.client_received_at_ms),na(e?.transport?.relay_forwarded_at_ms),na(
+e?.observed_at),na(e?.updatedAt),na(e?.updated_at))}function Xo(e,t={}){if(t.connected===!1||String(t.health||"").toLowerCase()===
+"disconnected"||t.fresh===!1)return!1;if(t.requireFreshness!==!0)return!0;let n=Jo(e);if(!n)return!1;let s=Number.isFinite(
+Number(t.nowMs))?Number(t.nowMs):Date.now(),a=Math.max(1e3,Number(t.freshnessMs)||qc);return s-n<=a}function Zo(e,t=!1,n={}){
+let s=String(e?.kind||"").trim().toLowerCase(),a=xg(e),i=bd(e),c=String(i?.lifecycle||"").trim().toLowerCase();if(t||kg.
+has(s)||Sg.has(c))return"needs_attention";let u=e?.generating===!0||yg.has(s);return i?.lease_active===!0&&i.owner_state===
+"confirmed"&&_d.has(c)&&u&&Xo(e,n)?"working_goal":wg.has(a)?"needs_attention":i&&c==="unknown_disconnected"?"stale":i&&Cg.
+has(c)||Ng.has(a)?"idle":i?.lease_active===!0&&_d.has(c)?"working_goal":i&&a==="active"||a==="active"?Xo(e,n)?"between_g\
+oal_turns":"stale":s==="idle"&&a!=="active"?"idle":Xo(e,n)?u?"working":"idle":"stale"}function ei(e,t={}){let n=bd(e),s=String(
 n?.lifecycle||"").trim().toLowerCase();return!n||n.lease_active!==!0?"":s==="checkpoint_pending_continuation"?"Waiting f\
 or next goal turn":s==="verifying"||t.connected===!1||String(t.health||"").toLowerCase()==="disconnected"?"Reconnecting":
-s==="starting"?"Starting goal":s==="running_turn"?"Working":"Goal loop active"}function bd(e){return e==="working_goal"?
+s==="starting"?"Starting goal":s==="running_turn"?"Working":"Goal loop active"}function vd(e){return e==="working_goal"?
 "Working on goal":e==="working"?"Working":e==="between_goal_turns"?"Between goal turns":e==="needs_attention"?"Needs att\
-ention":e==="stale"?"Stale":"Idle"}function sa(e){return e==="working_goal"||e==="working"}function vd(e,t=null,n=Date.now()){
+ention":e==="stale"?"Stale":"Idle"}function sa(e){return e==="working_goal"||e==="working"}function yd(e,t=null,n=Date.now()){
 if(!e||typeof e!="object")return 0;let s=Math.max(0,Number(e.time_used_seconds??e.timeUsedSeconds??0)||0),a=na(e.updated_at||
 e.updatedAt),i=String(e.state||e.status||"").toLowerCase()==="active",c=t&&t.lease_active!==!0?na(t.lease_observed_at||t.
 observed_at):Number(n),u=c>0?Math.min(Number(n)||c,c):a,p=i&&a>0?Math.max(0,Math.floor((u-a)/1e3)):0;return Math.floor(s+
-p)}function Xo(e){let t=Number(e);return Number.isFinite(t)&&t>0?t:null}function yd(e,t=Date.now()){if(!e||typeof e!="ob\
-ject")return null;let n=Xo(e.proxy_emitted_at_ms),s=Xo(e.relay_received_at_ms),a=Xo(e.relay_forwarded_at_ms),i=Xo(t)||Date.
+p)}function Qo(e){let t=Number(e);return Number.isFinite(t)&&t>0?t:null}function kd(e,t=Date.now()){if(!e||typeof e!="ob\
+ject")return null;let n=Qo(e.proxy_emitted_at_ms),s=Qo(e.relay_received_at_ms),a=Qo(e.relay_forwarded_at_ms),i=Qo(t)||Date.
 now();return{proxy_emitted_at_ms:n,relay_received_at_ms:s,relay_forwarded_at_ms:a,client_received_at_ms:i,latency_ms:n==
-null?null:Math.max(0,i-n)}}function kd(e,t=Date.now()){let n=Number(e?.transport?.latency_ms);if(Number.isFinite(n))return`${Math.
-round(n)} ms`;let s=Qo(e);if(!s)return"Awaiting live update";let a=Math.max(0,Number(t)-s);return a<1e3?"Observed just n\
+null?null:Math.max(0,i-n)}}function wd(e,t=Date.now()){let n=Number(e?.transport?.latency_ms);if(Number.isFinite(n))return`${Math.
+round(n)} ms`;let s=Jo(e);if(!s)return"Awaiting live update";let a=Math.max(0,Number(t)-s);return a<1e3?"Observed just n\
 ow":a<6e4?`Observed ${Math.floor(a/1e3)}s ago`:a<36e5?`Observed ${Math.floor(a/6e4)}m ago`:`Observed ${Math.floor(a/36e5)}\
-h ago`}var Ag=Object.freeze(["goal_completed","goal_attention","provider_usage_threshold"]),Rg=new Set(Ag),wd=Object.freeze({goal_completed:"\
-goal_completed",goal_attention:"goal_attention",provider_usage_threshold:"provider_usage_warning"}),Sd="remote-agent-cha\
-t:semantic-notifications:v1",Mg="remote-agent-chat:semantic-notification-claim:v1:",Cd=256,Tg=10080*60*1e3;function ei(e){
+h ago`}var Ag=Object.freeze(["goal_completed","goal_attention","provider_usage_threshold"]),Rg=new Set(Ag),Nd=Object.freeze({goal_completed:"\
+goal_completed",goal_attention:"goal_attention",provider_usage_threshold:"provider_usage_warning"}),Cd="remote-agent-cha\
+t:semantic-notifications:v1",Mg="remote-agent-chat:semantic-notification-claim:v1:",xd=256,Tg=10080*60*1e3;function ti(e){
 if(!e||typeof e!="object"||e.type!=="semantic_notification")return null;let t=String(e.event_type||"").trim(),n=String(e.
 dedupe_key||"").trim(),s=String(e.session_id||e.session||"").trim();if(!Rg.has(t)||!n||!s)return null;let a=String(e.category||
-wd[t]).trim();return a!==wd[t]?null:{...e,type:"semantic_notification",event_type:t,category:a,dedupe_key:n,session_id:s,
+Nd[t]).trim();return a!==Nd[t]?null:{...e,type:"semantic_notification",event_type:t,category:a,dedupe_key:n,session_id:s,
 session:s,title:String(e.title||"").trim()||(t==="goal_completed"?"Goal completed":t==="provider_usage_threshold"?"Provi\
 der usage warning":"Goal needs attention"),body:String(e.body||"").trim(),created_at:e.created_at||new Date().toISOString()}}
-function Ic(e,t,n=100){let s=new Map;return[...Array.isArray(e)?e:[],...Array.isArray(t)?t:[t]].map(ei).filter(Boolean).
-forEach(a=>s.set(a.dedupe_key,a)),[...s.values()].slice(-Math.max(1,Number(n)||100))}function xd(e,t={}){let n=ei(e);return!!n&&
-t?.[n.category]===!0}function Oc(e,t){try{let n=JSON.parse(e?.getItem(Sd)||"{}");return Object.fromEntries(Object.entries(
-n||{}).filter(([,s])=>Number(s)>t-Tg).slice(-Cd))}catch{return{}}}function Nd(e,t,n){let s=Oc(e,n);if(s[t])return!1;s[t]=
-n;let a=Object.entries(s).slice(-Cd);try{e?.setItem(Sd,JSON.stringify(Object.fromEntries(a)))}catch{}return!0}function $g(e){
+function Ic(e,t,n=100){let s=new Map;return[...Array.isArray(e)?e:[],...Array.isArray(t)?t:[t]].map(ti).filter(Boolean).
+forEach(a=>s.set(a.dedupe_key,a)),[...s.values()].slice(-Math.max(1,Number(n)||100))}function Ad(e,t={}){let n=ti(e);return!!n&&
+t?.[n.category]===!0}function Oc(e,t){try{let n=JSON.parse(e?.getItem(Cd)||"{}");return Object.fromEntries(Object.entries(
+n||{}).filter(([,s])=>Number(s)>t-Tg).slice(-xd))}catch{return{}}}function Sd(e,t,n){let s=Oc(e,n);if(s[t])return!1;s[t]=
+n;let a=Object.entries(s).slice(-xd);try{e?.setItem(Cd,JSON.stringify(Object.fromEntries(a)))}catch{}return!0}function $g(e){
 return new Promise(t=>setTimeout(t,e))}async function Eg(e,t,n){if(!e)return!0;if(Oc(e,n)[t])return!1;let s=`${Mg}${encodeURIComponent(
 t).slice(0,320)}`,a=`${n}:${Math.random().toString(36).slice(2)}`;try{if(e.setItem(s,JSON.stringify({token:a,at:n})),await $g(
-20),JSON.parse(e.getItem(s)||"{}").token!==a||!Nd(e,t,n))return!1;let c=Oc(e,n)[t]===n;return c&&e.removeItem(s),c}catch{
-return Nd(e,t,n)}}async function Ad(e,{storage:t=typeof localStorage<"u"?localStorage:null,locks:n=typeof navigator<"u"?
-navigator.locks:null,now:s=()=>Date.now()}={}){let a=ei(e);if(!a)return!1;let i=()=>Eg(t,a.dedupe_key,s());return n?.request?
+20),JSON.parse(e.getItem(s)||"{}").token!==a||!Sd(e,t,n))return!1;let c=Oc(e,n)[t]===n;return c&&e.removeItem(s),c}catch{
+return Sd(e,t,n)}}async function Rd(e,{storage:t=typeof localStorage<"u"?localStorage:null,locks:n=typeof navigator<"u"?
+navigator.locks:null,now:s=()=>Date.now()}={}){let a=ti(e);if(!a)return!1;let i=()=>Eg(t,a.dedupe_key,s());return n?.request?
 n.request(`rac-semantic:${a.dedupe_key}`,{mode:"exclusive"},i):i()}async function aa(e,t,{channel:n="web-in-app",reasonCode:s="",
-clientId:a="web-app"}={}){let i=ei(e);if(!i||!["claimed","displayed","suppressed"].includes(t)||typeof fetch!="function")
+clientId:a="web-app"}={}){let i=ti(e);if(!i||!["claimed","displayed","suppressed"].includes(t)||typeof fetch!="function")
 return!1;try{return(await fetch("/api/notifications/semantic-receipts",{method:"POST",credentials:"same-origin",keepalive:!0,
 headers:{"Content-Type":"application/json"},body:JSON.stringify({dedupe_key:i.dedupe_key,stage:t,channel:n,...s?{reason_code:s}:
-{},client_id:a})})).ok}catch{return!1}}function Rd(e,t,n=""){if(!t)return"";let s=e||{};return n&&(s[n]||[]).some(a=>a?._cid===t)?n:Object.keys(s).find(a=>(s[a]||
-[]).some(i=>i?._cid===t))||""}function Md(e,t,n,s){if(!t||!n||typeof s!="function")return e;let a=e?.[n]||[],i=!1,c=a.map(
+{},client_id:a})})).ok}catch{return!1}}function Md(e,t,n=""){if(!t)return"";let s=e||{};return n&&(s[n]||[]).some(a=>a?._cid===t)?n:Object.keys(s).find(a=>(s[a]||
+[]).some(i=>i?._cid===t))||""}function Td(e,t,n,s){if(!t||!n||typeof s!="function")return e;let a=e?.[n]||[],i=!1,c=a.map(
 u=>{if(u?._cid!==t)return u;let p=s(u);return p!==u&&(i=!0),p});return i?{...e,[n]:c}:e}function Lg(e){let t=Number(e);return!Number.isSafeInteger(t)||t<=0?0:t}function Pg(e){return String(e?.navigation_session_id||
-e?.session_id||e?.session||"")}function Td(e={}){let t=Math.max(1,Number(e.maxEntries)||512),n=new Map;function s(a,i){for(n.
+e?.session_id||e?.session||"")}function $d(e={}){let t=Math.max(1,Number(e.maxEntries)||512),n=new Map;function s(a,i){for(n.
 delete(a),n.set(a,i);n.size>t;)n.delete(n.keys().next().value)}return{accept(a){let i=Pg(a),c=Lg(a?.navigation_epoch);if(!i||
 !c)return!0;let u=n.get(i)||0;return c<u?!1:(s(i,c),!0)},latest(a){return n.get(String(a||""))||0},get size(){return n.size}}}var qg=new Set(["user","assistant","tool","tool_result","permission","permission_prompt","question","question_prompt","e\
 rror","system"]);function pt(e){return typeof e=="string"?e:String(e?.session_id||e?.id||"")}function Og(e){let t=String(
@@ -664,7 +665,7 @@ t?.at??t?.timestamp??e.last_message_at),a=Og(t?.kind??e.last_message_kind),i=Dg(
 kind,last_message_source:t.source}:{}}function Bg(e,t){let n=Za(e),s=Za(t);if(n&&!s)return-1;if(!n&&s)return 1;if(!n&&!s)
 return pt(e).localeCompare(pt(t));if(n.atMs!==s.atMs)return s.atMs-n.atMs;let a=s.id.localeCompare(n.id);return a!==0?a:
 pt(e).localeCompare(pt(t))}function Fg(e){return(Array.isArray(e)?e:[]).filter(t=>!!pt(t)&&!!Za(t)).slice().sort(Bg)}function Dc(e){
-return e instanceof Set?e:!e||typeof e[Symbol.iterator]!="function"?new Set:new Set(Array.from(e,t=>String(t||"")))}function $d(e,t={}){
+return e instanceof Set?e:!e||typeof e[Symbol.iterator]!="function"?new Set:new Set(Array.from(e,t=>String(t||"")))}function Ed(e,t={}){
 let n=Dc(t.workingSessionIds),s=Dc(t.pinnedSessionIds),a=Dc(t.excludedSessionIds),i=Number.isSafeInteger(t.limit)&&t.limit>=
 0?t.limit:5,c=new Set,u=[];for(let g of Array.isArray(e)?e:[]){let _=pt(g);!_||c.has(_)||a.has(_)||(c.add(_),u.push(g))}
 let p=u.filter(g=>n.has(pt(g))),b=u.filter(g=>!n.has(pt(g))),y=Fg(b).slice(0,i),S=new Set(y.map(pt)),A=b.filter(g=>!S.has(
@@ -677,7 +678,7 @@ totalPercent"],cpu_user_percent:["cpu","userPercent"],cpu_privileged_percent:["c
 "receiveBps"],network_send_bps:["network","sendBps"],network_receive_pps:["network","receivePps"],network_send_pps:["net\
 work","sendPps"]});function Je(e,t=0){let n=Number(e);return Number.isFinite(n)?n:t}function _t(e){if(e==null||e==="")return null;
 let t=Number(e);return Number.isFinite(t)&&t>=0?t:null}function fe(e){return Math.max(0,Je(e))}function Lt(e){return Math.
-max(0,Math.min(100,Je(e)))}function ti(e){let t=String(e??"0");return/^\d+$/.test(t)?t:"0"}function Wr(e){let t=Date.parse(
+max(0,Math.min(100,Je(e)))}function ni(e){let t=String(e??"0");return/^\d+$/.test(t)?t:"0"}function Wr(e){let t=Date.parse(
 String(e||""));return Number.isFinite(t)?t:0}function Ug(e,t){let n=Math.max(0,Math.round(Je(e?.pid))),s=e?.start_time?String(
 e.start_time):"",a=String(e?.stable_key||`${n||"process"}:${s||t}`),i=String(e?.attribution_level||(e?.attributed?"runti\
 me":"unattributed"));return{key:a,stableKey:a,parentKey:e?.parent_key?String(e.parent_key):"",pid:n,parentPid:Math.max(0,
@@ -691,8 +692,8 @@ e?.private_bytes??e?.memory_bytes),commitBytes:fe(e?.commit_bytes??e?.private_by
 e?.io_write_bps),ioReadOps:fe(e?.io_read_ops),ioWriteOps:fe(e?.io_write_ops),threadCount:Math.max(0,Math.round(Je(e?.thread_count))),
 handleCount:Math.max(0,Math.round(Je(e?.handle_count))),uptimeSeconds:e?.uptime_seconds==null?null:fe(e.uptime_seconds),
 childCount:Math.max(0,Math.round(Je(e?.child_count))),selectedAs:Array.isArray(e?.selected_as)?e.selected_as.map(String):
-[],selectedParentPresent:e?.selected_parent_present!==!1,counterTotals:{ioReadBytes:ti(e?.counter_totals?.io_read_bytes),
-ioWriteBytes:ti(e?.counter_totals?.io_write_bytes),ioReadOperations:ti(e?.counter_totals?.io_read_operations),ioWriteOperations:ti(
+[],selectedParentPresent:e?.selected_parent_present!==!1,counterTotals:{ioReadBytes:ni(e?.counter_totals?.io_read_bytes),
+ioWriteBytes:ni(e?.counter_totals?.io_write_bytes),ioReadOperations:ni(e?.counter_totals?.io_read_operations),ioWriteOperations:ni(
 e?.counter_totals?.io_write_operations)}}}function Wg(e,t){return{id:String(e?.id||`disk-${t}`),label:String(e?.label||`\
 Disk ${t+1}`),kind:String(e?.kind||"unknown"),readBps:fe(e?.read_bps),writeBps:fe(e?.write_bps),readIops:fe(e?.read_iops),
 writeIops:fe(e?.write_iops),busyPercent:Lt(e?.busy_percent),readLatencyMs:fe(e?.read_latency_ms),writeLatencyMs:fe(e?.write_latency_ms),
@@ -701,7 +702,7 @@ available:e?.available!==!1}}function zg(e,t){return{id:String(e?.id||`adapter-$
 1}`),kind:String(e?.kind||"unknown"),physicalDefault:e?.physical_default===!0,receiveBps:fe(e?.receive_bps),sendBps:fe(e?.
 send_bps),receivePps:fe(e?.receive_pps),sendPps:fe(e?.send_pps),linkSpeedBps:fe(e?.link_speed_bps),utilizationPercent:Lt(
 e?.utilization_percent),receiveErrors:fe(e?.receive_errors),sendErrors:fe(e?.send_errors),receiveDiscards:fe(e?.receive_discards),
-sendDiscards:fe(e?.send_discards),available:e?.available!==!1}}function Pd(e){if(!e||typeof e!="object")return{available:!1,
+sendDiscards:fe(e?.send_discards),available:e?.available!==!1}}function qd(e){if(!e||typeof e!="object")return{available:!1,
 status:"waiting",schemaVersion:0,source:"",capturedAt:"",capturedAtMs:0,sampleSequence:0,sampleIntervalMs:0,droppedGapCount:0,
 machineLabel:"",system:null,processes:[],attributedProcesses:[],sampling:null,privacy:null,capabilities:null,error:null,
 lastGoodCapturedAt:"",lastGoodCapturedAtMs:0};let t=e.system&&typeof e.system=="object"?e.system:null,n=t?.cpu&&typeof t.
@@ -732,8 +733,8 @@ attributedProcesses:u.filter(y=>y.attributed),sampling:e.sampling&&typeof e.samp
 privacy&&typeof e.privacy=="object"?e.privacy:null,capabilities:e.capabilities&&typeof e.capabilities=="object"?e.capabilities:
 null,error:e.error&&typeof e.error=="object"?e.error:null,lastGoodCapturedAt:b,lastGoodCapturedAtMs:Wr(b)}}function Bc(e,t=0){
 let n=e.filter(Number.isFinite).sort((a,i)=>a-i);if(!n.length)return t;let s=Math.floor(n.length/2);return n.length%2?n[s]:
-(n[s-1]+n[s])/2}function ni(e){let t=Math.max(Number.EPSILON,Number(e)||0),n=10**Math.floor(Math.log10(t)),s=t/n;return(s<=
-1?1:s<=2?2:s<=2.5?2.5:s<=5?5:10)*n}function si(e){if(!e||typeof e!="object")return null;let t=Number(e.sample_sequence);
+(n[s-1]+n[s])/2}function si(e){let t=Math.max(Number.EPSILON,Number(e)||0),n=10**Math.floor(Math.log10(t)),s=t/n;return(s<=
+1?1:s<=2?2:s<=2.5?2.5:s<=5?5:10)*n}function ai(e){if(!e||typeof e!="object")return null;let t=Number(e.sample_sequence);
 if(!Number.isSafeInteger(t)||t<1)return null;let n=e.frame_kind==="system"?e:e.system||{},s=n.cpu||{},a=n.memory||{},i=n.
 disk||{},c=n.network||{};return{sampleSequence:t,capturedAt:String(e.captured_at||""),capturedAtMs:Wr(e.captured_at),monotonicMs:fe(
 e.monotonic_ms),sampleIntervalMs:fe(e.sample_interval_ms),droppedGapCount:Math.max(0,Math.round(Je(e.dropped_gap_count))),
@@ -743,7 +744,7 @@ readBps:_t(i.read_bps),writeBps:_t(i.write_bps),readIops:_t(i.read_iops),writeIo
 c.receive_bps),sendBps:_t(c.send_bps),receivePps:_t(c.receive_pps),sendPps:_t(c.send_pps)}}}function tr(e,t={}){let n=Array.
 isArray(e)?e:[],s=new Map,a=0,i=0,c=0;for(let J of n){let W=Number(J?.sample_sequence);!Number.isSafeInteger(W)||W<1||(W<
 c&&(i+=1),c=Math.max(c,W),s.has(W)?a+=1:s.set(W,J))}let p=[...s.values()].sort((J,W)=>J.sample_sequence-W.sample_sequence).
-map(J=>({frame:J,point:si(J)})).filter(J=>J.point),b=p.find(J=>J.point.capturedAtMs>0&&J.point.monotonicMs>0)||null,y=p.
+map(J=>({frame:J,point:ai(J)})).filter(J=>J.point),b=p.find(J=>J.point.capturedAtMs>0&&J.point.monotonicMs>0)||null,y=p.
 map(J=>{let W=b&&J.point.monotonicMs>0?b.point.capturedAtMs+J.point.monotonicMs-b.point.monotonicMs:0;return{...J,chartTimeMs:W>
 0?W:J.point.capturedAtMs}}),S=[];for(let J=1;J<y.length;J+=1){let W=y[J].chartTimeMs-y[J-1].chartTimeMs;W>0&&W<=1e4&&S.push(
 W)}let A=y.map(J=>J.point.sampleIntervalMs).filter(J=>J>0),N=Math.max(1,Math.round(Bc(S,Bc(A,1e3))||1e3)),h=Math.max(2500,
@@ -768,23 +769,23 @@ chart_time_ms:J.chartTimeMs,gap_before:J.gapBefore,gap_reason:J.gapReason})),poi
 chartTimeMs,gapBefore:J.gapBefore,gapReason:J.gapReason})),gaps:v,status:oe,cadenceMs:N,staleAfterMs:re,latestAgeMs:ee,nowMs:V,
 startMs:d[0]?.chartTimeMs||0,endMs:d.at(-1)?.chartTimeMs||0,elapsedMs:_e,expectedCount:he,receivedCount:n.length,validCount:d.
 filter(J=>J.point.status==="fresh").length,droppedCount:Math.max(X,Math.max(0,he-d.length)),gapCount:v.length,duplicateCount:a+
-_,outOfOrderCount:i+k,invalidTimestampCount:g,clockDiscontinuityCount:T,monotonicResetCount:L}}function Ed(e,t,n){let s=e.
+_,outOfOrderCount:i+k,invalidTimestampCount:g,clockDiscontinuityCount:T,monotonicResetCount:L}}function Ld(e,t,n){let s=e.
 map(a=>({capturedAtMs:a.capturedAtMs,value:t==="cpu"?a.cpu.totalPercent:a.memory.usedPercent})).filter(a=>a.capturedAtMs>
-0&&a.value!==null);return s.length<2||s.at(-1).capturedAtMs-s[0].capturedAtMs<15e3?!1:s.every(a=>a.value>=n)}function Ld(e,t){
-return Ed(e,t,95)?"critical":Ed(e,t,85)?"warning":"normal"}function qd(e,t={}){let n=qs([],e,60),s=n.map(si).filter(Boolean),
+0&&a.value!==null);return s.length<2||s.at(-1).capturedAtMs-s[0].capturedAtMs<15e3?!1:s.every(a=>a.value>=n)}function Pd(e,t){
+return Ld(e,t,95)?"critical":Ld(e,t,85)?"warning":"normal"}function Od(e,t={}){let n=qs([],e,60),s=n.map(ai).filter(Boolean),
 a=s.at(-1)||null,i=Number.isFinite(Number(t.nowMs))?Number(t.nowMs):Date.now(),c=t.connected!==!1,u=String(t.subscriptionStatus||
 ""),p=a?.cpu.totalPercent??null,b=a?.memory.usedPercent??null,y=a?.status==="fresh"&&p!==null&&b!==null,S=a?.capturedAtMs>
 0?Math.max(0,i-a.capturedAtMs):1/0,A=Math.max(1e3,a?.sampleIntervalMs||1e3),N=Math.max(2500,A*2),h="waiting";!c||u==="re\
 connecting"?h="reconnecting":y?S>N?h="stale":h="live":h=t.error?"unavailable":"waiting";let d=a?.capturedAtMs?a.capturedAtMs-
-15e3:1/0,v=s.filter(H=>H.capturedAtMs>=d),g=y?Ld(v,"cpu"):"normal",_=y?Ld(v,"memory"):"normal",k=h==="live"&&(g==="criti\
+15e3:1/0,v=s.filter(H=>H.capturedAtMs>=d),g=y?Pd(v,"cpu"):"normal",_=y?Pd(v,"memory"):"normal",k=h==="live"&&(g==="criti\
 cal"||_==="critical")?"critical":h==="live"&&(g==="warning"||_==="warning")?"warning":h,T=n.at(-1)||null,L=T?.frame_kind===
 "system"?T:T?.system||null;return{status:h,attention:k,point:a,frames:n,cpuPercent:p,memoryPercent:b,cpuLevel:g,memoryLevel:_,
 ageMs:S,ageSeconds:Number.isFinite(S)?Math.max(0,Math.round(S/1e3)):null,staleAfterMs:N,sampleSequence:a?.sampleSequence||
 0,capturedAt:a?.capturedAt||"",memoryUsedBytes:_t(L?.memory?.used_bytes),memoryTotalBytes:_t(L?.memory?.total_bytes)}}function qs(e,t,n=900){
 let s=new Map;[...Array.isArray(e)?e:[],...Array.isArray(t)?t:[t]].forEach(i=>{let c=Number(i?.sample_sequence);!Number.
 isSafeInteger(c)||c<1||s.has(c)||s.set(c,i)});let a=Math.max(1,Math.min(900,Number(n)||900));return[...s.entries()].sort(
-(i,c)=>i[0]-c[0]).slice(-a).map(([,i])=>i)}function Ps(e,t){let n=e?.sampleSequence?e:si(e),s=Hg[t];return!n||!s?null:_t(
-s.reduce((a,i)=>a?.[i],n))}function Fc(e,t){let n=(Array.isArray(e)?e:[]).map(_=>({frame:_,point:_?.sampleSequence?_:si(
+(i,c)=>i[0]-c[0]).slice(-a).map(([,i])=>i)}function Ps(e,t){let n=e?.sampleSequence?e:ai(e),s=Hg[t];return!n||!s?null:_t(
+s.reduce((a,i)=>a?.[i],n))}function Fc(e,t){let n=(Array.isArray(e)?e:[]).map(_=>({frame:_,point:_?.sampleSequence?_:ai(
 _),value:Ps(_,t),timeMs:Number(_?.chartTimeMs??_?.chart_time_ms)||Wr(_?.capturedAt??_?.captured_at),gapBefore:_?.gapBefore===
 !0||_?.gap_before===!0})).filter(_=>_.point&&_.value!==null&&_.timeMs>0).sort((_,k)=>_.timeMs-k.timeMs||_.point.sampleSequence-
 k.point.sampleSequence);if(!n.length)return{current:null,min:null,average:null,sampleAverage:null,timeWeightedAverage:null,
@@ -795,33 +796,33 @@ k,0)/s.length,u=n.slice(1).map((_,k)=>_.timeMs-n[k].timeMs).filter(_=>_>0),p=Mat
 y+=(k.value+T.value)/2*L,S+=L}let N=S>0?y/S:c,h=u.length?Math.min(...u):0,d=u.length?Math.max(...u):0,v=h>0&&d/h>1.2,g=a[Math.
 max(0,Math.ceil(a.length*.95)-1)];return{current:s.at(-1),min:Math.min(...s),average:v?N:c,sampleAverage:c,timeWeightedAverage:N,
 averageMethod:v?"time-weighted":"sample",max:Math.max(...s),p95:s.length>=20?g:null,provisionalP95:g,p95Ready:s.length>=
-20,peakSequence:i.point.sampleSequence,count:s.length,elapsedMs:n.length>1?n.at(-1).timeMs-n[0].timeMs:0,cadenceMs:p,gapCount:A}}function Od(e,t,n=240){let a=tr(e,{nowMs:Number.MAX_SAFE_INTEGER,paused:!0}).points;if(!a.length)return[];let i=Math.max(
+20,peakSequence:i.point.sampleSequence,count:s.length,elapsedMs:n.length>1?n.at(-1).timeMs-n[0].timeMs:0,cadenceMs:p,gapCount:A}}function Id(e,t,n=240){let a=tr(e,{nowMs:Number.MAX_SAFE_INTEGER,paused:!0}).points;if(!a.length)return[];let i=Math.max(
 1,Math.round(Number(n)||240)),c=a.length<=i?1:Math.ceil(a.length/i),u=[];for(let p=0;p<a.length;p+=c){let b=a.slice(p,p+
 c),y=Fc(b,t);u.push({startSequence:b[0].sampleSequence,endSequence:b.at(-1).sampleSequence,capturedAtStartMs:b[0].chartTimeMs,
 capturedAtEndMs:b.at(-1).chartTimeMs,chartTimeMs:b.at(-1).chartTimeMs,current:y.current,min:y.min,average:y.average,max:y.
 max,first:Ps(b[0],t),last:Ps(b.at(-1),t),p95:y.p95,provisionalP95:y.provisionalP95,peakSequence:y.peakSequence,count:y.count,
-gap:b.some(S=>S.gapBefore)})}return u}function Id(e,t="live",n={}){let s=Number.isFinite(Number(n.nowMs))?Number(n.nowMs):
+gap:b.some(S=>S.gapBefore)})}return u}function Dd(e,t="live",n={}){let s=Number.isFinite(Number(n.nowMs))?Number(n.nowMs):
 Date.now(),i=tr(e,{...n,nowMs:s}).frames,c=er[t]??er.live;return!i.length||c===1/0?i:i.filter(u=>Number(u.chart_time_ms)>=
 s-c&&Number(u.chart_time_ms)<=s)}function Hc(e,t=0,n={}){if(n.percent)return{maximum:100,minimum:0,step:25,ticks:[0,25,50,
-75,100]};let s=Math.max(0,Number(e)||0),a=Math.max(0,Number(t)||0);if(a>0&&s<=a*.95&&s>=a*.65){let b=ni(a/4),y=Math.max(
+75,100]};let s=Math.max(0,Number(e)||0),a=Math.max(0,Number(t)||0);if(a>0&&s<=a*.95&&s>=a*.65){let b=si(a/4),y=Math.max(
 2,Math.round(a/b)+1);return{maximum:a,minimum:0,step:b,ticks:Array.from({length:y},(S,A)=>Math.min(a,b*A))}}let i=Math.max(
-1,s*1.1),c=ni(i/4),u=Math.ceil(i/c)*c,p=Math.round(u/c)+1;return p<4&&(c=ni(i/3),u=Math.ceil(i/c)*c,p=Math.round(u/c)+1),
-p>6&&(c=ni(i/5),u=Math.ceil(i/c)*c,p=Math.round(u/c)+1),{maximum:u,minimum:0,step:c,ticks:Array.from({length:Math.max(2,
-p)},(b,y)=>Math.min(u,c*y))}}function Dd(e,t,n=5){let s=Number(e),a=Number(t),i=Math.max(2,Math.min(6,Math.round(Number(
+1,s*1.1),c=si(i/4),u=Math.ceil(i/c)*c,p=Math.round(u/c)+1;return p<4&&(c=si(i/3),u=Math.ceil(i/c)*c,p=Math.round(u/c)+1),
+p>6&&(c=si(i/5),u=Math.ceil(i/c)*c,p=Math.round(u/c)+1),{maximum:u,minimum:0,step:c,ticks:Array.from({length:Math.max(2,
+p)},(b,y)=>Math.min(u,c*y))}}function jd(e,t,n=5){let s=Number(e),a=Number(t),i=Math.max(2,Math.min(6,Math.round(Number(
 n)||5)));return!Number.isFinite(s)||!Number.isFinite(a)||a<=s?[]:Array.from({length:i},(c,u)=>{let p=s+(a-s)*u/(i-1),b=new Date(
 p),y=new Date(s).toDateString()!==new Date(a).toDateString();return{timeMs:p,fraction:u/(i-1),label:b.toLocaleString([],
 y?{month:"short",day:"numeric",hour:"2-digit",minute:"2-digit"}:{hour:"2-digit",minute:"2-digit",second:"2-digit"}),accessibleLabel:b.
 toLocaleString([],{year:"numeric",month:"long",day:"numeric",hour:"2-digit",minute:"2-digit",second:"2-digit",timeZoneName:"\
 short"})}})}function Uc(e,t,n){let s=Number(e?.chartTimeMs??e?.chart_time_ms)||Wr(e?.capturedAt??e?.captured_at),a=Number(
 t),i=Number(n);return!(s>0)||!Number.isFinite(a)||!Number.isFinite(i)||i<=a?0:Math.max(0,Math.min(1,(s-a)/(i-a)))}function Dn(e){let t=fe(e);if(t<1024)return`${Math.round(t)} B`;let n=["KiB","MiB","GiB","TiB"],s=t/1024,a=0;for(;s>=1024&&
-a<n.length-1;)s/=1024,a+=1;let i=s>=100?0:s>=10?1:2;return`${s.toFixed(i)} ${n[a]}`}function jn(e){return`${Dn(e)}/s`}function jd(e){
+a<n.length-1;)s/=1024,a+=1;let i=s>=100?0:s>=10?1:2;return`${s.toFixed(i)} ${n[a]}`}function jn(e){return`${Dn(e)}/s`}function Bd(e){
 return e==null?"\u2014":`${Je(e).toFixed(Je(e)>=10?1:2)}%`}function Wc(e,t=Date.now()){let n=Date.parse(e||"");if(!Number.
 isFinite(n))return"Waiting for local sample";let s=Math.max(0,Math.round((t-n)/1e3));return s<2?"Updated now":s<60?`Upda\
 ted ${s}s ago`:`Updated ${Math.floor(s/60)}m ago`}function zc(e){let t=typeof e=="number"?e:Date.parse(String(e||""));return Number.
 isFinite(t)?new Date(t).toLocaleTimeString([],{hour:"2-digit",minute:"2-digit",second:"2-digit"}):"Unknown time"}function Gc(e){
 let t=typeof e=="number"?e:Date.parse(String(e||""));return Number.isFinite(t)?new Date(t).toLocaleString([],{year:"nume\
 ric",month:"short",day:"numeric",hour:"2-digit",minute:"2-digit",second:"2-digit",timeZoneName:"short"}):"Unknown date a\
-nd time"}var Bd=Object.freeze({unavailable:6,auth_required:5,rate_limited:4,stale:3,refreshing:2,fresh:1});function Is(e){let t=Number(
+nd time"}var Fd=Object.freeze({unavailable:6,auth_required:5,rate_limited:4,stale:3,refreshing:2,fresh:1});function Is(e){let t=Number(
 e);return Number.isFinite(t)?Math.max(0,t):null}function mt(e){let t=Number(e);return Number.isFinite(t)?t:null}function tn(e){
 if(!e||typeof e!="object"||e.amount==null||e.amount==="")return null;let t=mt(e.amount);return t==null?null:{amount:t,currency:String(
 e.currency||"USD"),sourceField:String(e.source_field||""),semantics:String(e.semantics||""),directlyReported:e.directly_reported===
@@ -883,7 +884,7 @@ e?.financials),localRuntime:Kg(e?.local_runtime),cloudUsage:Vg(e?.cloud_usage),r
 0),harnessTypes:Array.isArray(e?.mapped_harness_types)?e.mapped_harness_types.map(String).sort():[]};return s.tone=Qg(s),
 s.maximumUsedPercent=n.length>0?Math.max(...n.map(a=>a.usedPercent)):null,s}function Kc(e){let t=Array.isArray(e?.snapshots)?
 e.snapshots:[],n=new Map;t.map(Jg).forEach(N=>{let h=n.get(N.key),d=Date.parse(h?.capturedAt||"")||0,v=Date.parse(N.capturedAt||
-"")||0;(!h||v>=d)&&n.set(N.key,N)});let s=[...n.values()].sort((N,h)=>(Bd[h.status]||0)-(Bd[N.status]||0)||(h.maximumUsedPercent??
+"")||0;(!h||v>=d)&&n.set(N.key,N)});let s=[...n.values()].sort((N,h)=>(Fd[h.status]||0)-(Fd[N.status]||0)||(h.maximumUsedPercent??
 -1)-(N.maximumUsedPercent??-1)||N.providerName.localeCompare(h.providerName)||N.accountLabel.localeCompare(h.accountLabel)),
 a=new Set(s.map(N=>N.providerId)),i=s.filter(N=>N.windows.length>0||N.credits||N.resetCredits||N.financials||N.localRuntime||
 N.cloudUsage).length,c=s.filter(N=>["warning","critical"].includes(N.tone)&&N.maximumUsedPercent<100).length,u=s.filter(
@@ -909,7 +910,7 @@ String(e.last_good_generated_at):"",detail:e.detail&&typeof e.detail=="object"?{
 detail.next_cursor==null?"":String(e.detail.next_cursor),truncated:e.detail.truncated===!0,collections:Os(e.detail.collections)}:
 null}}function nr(e,t,n,s){e.has(t)||e.set(t,Object.fromEntries(s.map(i=>[i,n[i]])));let a=e.get(t);a.input=(Number(a.input)||
 0)+(Number(n.input)||0),a.cached=(Number(a.cached)||0)+(Number(n.cached)||0),a.output=(Number(a.output)||0)+(Number(n.output)||
-0),a.cost_usd=(Number(a.cost_usd)||0)+(Number(n.cost_usd)||0),a.records=(Number(a.records)||0)+(Number(n.records)||0)}function Fd(e,t={}){
+0),a.cost_usd=(Number(a.cost_usd)||0)+(Number(n.cost_usd)||0),a.records=(Number(a.records)||0)+(Number(n.records)||0)}function Hd(e,t={}){
 if(!e)return null;let n=Math.max(1,Math.min(365,Number(t.days)||1)),s=Date.parse(`${e.range?.until||new Date().toISOString().
 slice(0,10)}T00:00:00.000Z`),a=s-(n-1)*24*60*60*1e3,i=e.dailyBreakdown.filter(b=>{let y=Date.parse(`${b.day}T00:00:00.00\
 0Z`);return Number.isFinite(y)&&y>=a&&y<=s&&(!t.project||b.project===t.project)&&(!t.providerId||b.provider_id===t.providerId)}),
@@ -922,7 +923,7 @@ records:u.records,byProvider:p(c.provider),byModel:p(c.model),byProject:p(c.proj
 function Dt(e){let t=Number(e);return Number.isFinite(t)?`${Number.isInteger(t)?t:t.toFixed(2).replace(/0+$/,"").replace(
 /\.$/,"")}%`:"Unavailable"}function Gr(e){let t=Number(e);return!Number.isFinite(t)||t<0?"Unavailable":t<1e6?`${Math.round(
 t/1e3)} us`:t<1e9?`${(t/1e6).toFixed(1).replace(/\.0$/,"")} ms`:`${(t/1e9).toFixed(2).replace(/0+$/,"").replace(/\.$/,"")}\
- s`}function Hd(e){let t=Number(e);return!Number.isFinite(t)||t<0?"Unavailable":`${t.toFixed(2).replace(/0+$/,"").replace(
+ s`}function Ud(e){let t=Number(e);return!Number.isFinite(t)||t<0?"Unavailable":`${t.toFixed(2).replace(/0+$/,"").replace(
 /\.$/,"")} tokens/s`}function sr(e,t=Date.now()){let n=Date.parse(e||"");if(!Number.isFinite(n))return"Not yet refreshed";
 let s=Math.max(0,Math.floor((t-n)/1e3));if(s<10)return"Updated just now";if(s<60)return`Updated ${s}s ago`;let a=Math.floor(
 s/60);return a<60?`Updated ${a}m ago`:`Updated ${Math.floor(a/60)}h ${a%60}m ago`}function oa(e,t=Date.now()){let n=Date.
@@ -942,31 +943,31 @@ e.includedSpend)}),e.bonusSpend&&t.push({id:"bonus-spend",label:"Bonus spend buc
 t.push({id:"plan-limit",label:"Reported plan limit",value:ra(e.planLimit)}),e.reportedSpend&&!e.allowanceRemaining&&t.push(
 {id:"allowance-remaining",label:"Available allowance",value:"Not reported by provider"}),e.poolClassification?.status===
 "unavailable"&&t.push({id:"pool-classification",label:"First/third-party pools",value:e.poolClassification.warning||"Not\
- reported by provider"}),t}var{useState:Re,useEffect:Qc,useRef:Ae,useCallback:Pt}=React;var zd=1024*1024,eh=15e3,th=1,nh=15e3,sh=Object.freeze({queued:1e4,accepted:3e4,launch_accepted:3e4,delivered:3e4,steered:3e4}),
-Gd=[250,500,1e3,2e3,3e3],ri=512,ah=new Set(["history","history_snapshot","history_chunk","transcript_resync_required","c\
-hat_list"]);function cs(e,t,n,s=ri){let a={...e||{}};Object.prototype.hasOwnProperty.call(a,t)&&delete a[t],a[t]=n;let i=Object.
-keys(a),c=i.length-Math.max(1,Number(s)||ri);for(let u=0;u<c;u+=1)delete a[i[u]];return a}function rh(e){let n=(e instanceof
+ reported by provider"}),t}var{useState:Re,useEffect:Qc,useRef:Ae,useCallback:Pt}=React;var Gd=1024*1024,eh=15e3,th=1,nh=15e3,sh=Object.freeze({queued:1e4,accepted:3e4,launch_accepted:3e4,delivered:3e4,steered:3e4}),
+Kd=[250,500,1e3,2e3,3e3],oi=512,ah=new Set(["history","history_snapshot","history_chunk","transcript_resync_required","c\
+hat_list"]);function cs(e,t,n,s=oi){let a={...e||{}};Object.prototype.hasOwnProperty.call(a,t)&&delete a[t],a[t]=n;let i=Object.
+keys(a),c=i.length-Math.max(1,Number(s)||oi);for(let u=0;u<c;u+=1)delete a[i[u]];return a}function rh(e){let n=(e instanceof
 Map?[...e.values()]:Object.values(e||{})).filter(a=>a&&typeof a=="object"),s=n.filter(a=>a.aggregateOnly!==!0).length;return{
 active:n.length>0,aggregateOnly:s===0,consumerCount:n.length,detailConsumerCount:s}}function Ds(e,t){let n=Object.entries(
 t||{});if(!n.length)return e;let s=!1,a={...e};return n.forEach(([i,c])=>{Object.is(e[i],c)||en(e[i]??null,c??null)||(a[i]=
 c,s=!0)}),s?a:e}function oh(e,t,n){return(e==="history_snapshot"||e==="history")&&!t?.partial&&(!t?.mode||t.mode==="full")?
-!1:!!(t?.partial||t?.mode==="tail"||n?.mode==="chunked"||n?.partial)}function oi(e){return e?e.source_message_id?`source\
+!1:!!(t?.partial||t?.mode==="tail"||n?.mode==="chunked"||n?.partial)}function ii(e){return e?e.source_message_id?`source\
 ${e.source_message_id}`:e.native_source_id?`native${e.native_source_id}`:e.id!=null?`id${e.id}`:e.server_message_id!=
 null?`server${e.server_message_id}`:e.sequence!=null&&e.ts!=null?`seq${e.sequence}${e.ts}${e.role||""}`:e.client_message_id?
-`client${e.client_message_id}`:e.client_msg_id?`client${e.client_msg_id}`:"":""}function ih(e,t){if(!e||!t)return!1;let n=oi(
-e),s=oi(t);return n&&s?n===s:e.role===t.role&&String(e.content||"")===String(t.content||"")}function Kd(e,t){let n=Array.
+`client${e.client_message_id}`:e.client_msg_id?`client${e.client_msg_id}`:"":""}function ih(e,t){if(!e||!t)return!1;let n=ii(
+e),s=ii(t);return n&&s?n===s:e.role===t.role&&String(e.content||"")===String(t.content||"")}function Vd(e,t){let n=Array.
 isArray(e)?e:[],s=(Array.isArray(t)?t:[]).filter(i=>i?._optimistic&&i?._cid);if(s.length===0)return n;let a=[...n];return s.
 forEach(i=>{let c=a.findIndex(u=>u?.role==="user"&&(u.client_message_id===i._cid||u.client_msg_id===i._cid||String(u.content||
 "")===String(i.content||"")));if(c>=0){let u=a[c]?.status;a[c]={...a[c],_cid:i._cid,_optimistic:!0,_delivered:i._delivered||
 a[c]._delivered||u==="delivered"||u==="agent_started",_agentStarted:i._agentStarted||a[c]._agentStarted||u==="agent_star\
-ted",_sendError:u==="failed"?a[c].failure_code||i._sendError||"Send failed":i._sendError||null}}else a.push(i)}),a}function Vd(e,t){
+ted",_sendError:u==="failed"?a[c].failure_code||i._sendError||"Send failed":i._sendError||null}}else a.push(i)}),a}function Yd(e,t){
 let n=Array.isArray(e)?e:[],s=Array.isArray(t)?t:[];if(!n.length)return s;if(!s.length)return n;let a=Math.min(n.length,
 s.length);for(let i=a;i>=1;i--){let c=!0;for(let u=0;u<i;u++)if(!ih(n[n.length-i+u],s[u])){c=!1;break}if(c)return i===s.
 length?n:[...n,...s.slice(i)]}return null}function Kr(e){let t=Array.isArray(e)?e:[],n=s=>{let a=String(s?.content||"");
 return/\*\*(?:Claude Code|Codex|Cursor) CLI is waiting for a native transcript\.\*\*/i.test(a)&&/placeholder will be replaced with the real CLI chat history/i.
-test(a)};return!t.some(n)||!t.some(s=>!n(s))?t:t.filter(s=>!n(s))}function Xd(e,t){let n=e?.agent_type||e?.agentType||"";
+test(a)};return!t.some(n)||!t.some(s=>!n(s))?t:t.filter(s=>!n(s))}function Qd(e,t){let n=e?.agent_type||e?.agentType||"";
 if(n!=="codex_cli"&&n!=="cursor_cli"||!Array.isArray(t)||t.length!==1)return!1;let s=t[0];return s?.role!=="assistant"?!1:
-/\*\*(?:Codex|Cursor) CLI is waiting for a native transcript\.\*\*/.test(String(s.content||""))}function Yd(e,t={}){let n={},
+/\*\*(?:Codex|Cursor) CLI is waiting for a native transcript\.\*\*/.test(String(s.content||""))}function Xd(e,t={}){let n={},
 s={},a={};return(e||[]).forEach(i=>{if(!i||typeof i!="object"||!i.session_id||!i.activity)return;let c=i.activity.kind||
 "working",u=i.activity.label||(c==="idle"?"":"Working");n[i.session_id]={kind:c,label:u,updatedAt:i.activity.updated_at||
 null,observed_at:i.activity.observed_at||t[i.session_id]?.observed_at||null,startedAt:i.activity.started_at||null,interruptHint:i.
@@ -975,25 +976,25 @@ null,current:i.activity.current||null,step:i.activity.step||null,usage:i.activit
 null,context_card:i.activity.context_card||null,thinkingContent:i.activity.thinking?.text||i.activity.thinkingContent||"",
 transport:i.activity.transport||t[i.session_id]?.transport||null},s[i.session_id]=i.activity.thinking?.text||i.activity.
 thinkingContent||"",a[i.session_id]=["thinking","generating","running_command","applying_patch","reading_files","working"].
-includes(c)?u:!1}),{activities:n,thinkingContent:s,thinking:a}}function Qd(){let[e,t]=Re(()=>Yo()),n=e.list,s=Pt(r=>{t(m=>{
-let C=typeof r=="function"?r(m.list):r;return Fr(m,C)})},[]),a=Lc,i=hd,[c,u]=Re({}),[p,b]=Re({}),[y,S]=Re(!1),[A,N]=Re({
+includes(c)?u:!1}),{activities:n,thinkingContent:s,thinking:a}}function Jd(){let[e,t]=Re(()=>Yo()),n=e.list,s=Pt(r=>{t(m=>{
+let C=typeof r=="function"?r(m.list):r;return Fr(m,C)})},[]),a=Pc,i=hd,[c,u]=Re({}),[p,b]=Re({}),[y,S]=Re(!1),[A,N]=Re({
 state:"connecting",rttMs:null,lastAckAt:null}),[h,d]=Re({}),[v,g]=Re({}),[_,k]=Re({}),[T,L]=Re({}),[H,V]=Re({}),[ne,ee]=Re(
 {}),[re,z]=Re({}),[oe,_e]=Re([]),[Y,ve]=Re({}),[he,X]=Re(null),[me,J]=Re({}),[W,G]=Re({}),[$,P]=Re({}),[B,te]=Re([]),[ce,
 ie]=Re({}),[be,Ne]=Re({}),[Se,Ee]=Re({}),[xe,Ie]=Re({}),[Ke,de]=Re({}),[Ze,D]=Re({}),[se,ke]=Re({}),[q,et]=Re({}),[yt,xt]=Re(
-{}),[Hn,ds]=Re({}),[Ri,lr]=Re({}),[Mi,so]=Re([]),[Ti,ao]=Re([]),[$i,ur]=Re(null),[ro,oo]=Re(null),[Ei,pa]=Re(null),[Li,ma]=Re(
-null),[dr,Un]=Re(null),[io,qt]=Re(null),[Wn,Sn]=Re(null),[pr,zn]=Re([]),[Pi,ps]=Re([]),[qi,Fs]=Re({id:"",status:"idle",aggregateOnly:!0,
-resumed:!1,consumerCount:0,detailConsumerCount:0}),[Oi,Hs]=Re({}),[Ii,mr]=Re([]),sn=Ae({}),ms=Ae({}),At=Ae({}),fs=Ae({}),
+{}),[Hn,ds]=Re({}),[Mi,lr]=Re({}),[Ti,so]=Re([]),[$i,ao]=Re([]),[Ei,ur]=Re(null),[ro,oo]=Re(null),[Li,pa]=Re(null),[Pi,ma]=Re(
+null),[dr,Un]=Re(null),[io,qt]=Re(null),[Wn,Sn]=Re(null),[pr,zn]=Re([]),[qi,ps]=Re([]),[Oi,Fs]=Re({id:"",status:"idle",aggregateOnly:!0,
+resumed:!1,consumerCount:0,detailConsumerCount:0}),[Ii,Hs]=Re({}),[Di,mr]=Re([]),sn=Ae({}),ms=Ae({}),At=Ae({}),fs=Ae({}),
 fr=Ae({}),ot=Ae({}),gs=Ae({}),f=Ae({}),nt=Ae(null),fa=Ae([]),gr=Ae(0),co=Ae(0),Gn=Ae(null),Us=Ae(null),an=Ae(null),Cn=Ae(
-null),lo=Ae(0),ft=Ae(1e4),ga=Ae(3e4),Kn=Ae([]),Ws=Ae(null),ha=Ae(null),Rt=Ae(Yu()),zs=Ae(Td()),uo=Ae(0),rn=Ae({}),Vn=Ae(
+null),lo=Ae(0),ft=Ae(1e4),ga=Ae(3e4),Kn=Ae([]),Ws=Ae(null),ha=Ae(null),Rt=Ae(Yu()),zs=Ae($d()),uo=Ae(0),rn=Ae({}),Vn=Ae(
 0),hs=Ae({}),it=Ae({}),Ve=Ae({}),gt=Ae({}),Gs=Ae({}),_a=Ae(!1),on=Ae(new Map),cn=Ae(null),ct=Ae({}),Ot=Ae(null),Bt=Ae(new Map),
 kt=Ae(new Map),st=Ae({active:!1,aggregateOnly:!0,consumerCount:0,detailConsumerCount:0}),ze=Ae(""),ba=Ae(!0),wt=Ae(""),va=Ae(
 0),Yn=Ae({system:"",detail:""}),Mt=Ae({system:0,detail:0}),ln=Ae({system:0,detail:0});function tt(r){return!!dd(r)}function po(r,m,C=null){
 if(ct.current={...ct.current,[r]:m},Bt.current.set(r,{stream:m,streamTrace:C}),Ot.current!=null)return;let O=typeof requestAnimationFrame==
 "function"?requestAnimationFrame:l=>setTimeout(l,16);Ot.current=O(()=>{Ot.current=null;let l=[...Bt.current.entries()];Bt.
 current.clear(),l.length&&(Hs(x=>{let E={...x};return l.forEach(([F,Z])=>{E[F]=Z.stream}),E}),l.forEach(([x,E])=>{E.streamTrace&&
-Oe({stream_trace:E.streamTrace},x)}))})}function mo(r,m=null){if(!r||ct.current[r]?.open)return;let O=Cc(r,m);ct.current=
+Oe({stream_trace:E.streamTrace},x)}))})}function mo(r,m=null){if(!r||ct.current[r]?.open)return;let O=xc(r,m);ct.current=
 {...ct.current,[r]:O},Hs(l=>({...l,[r]:O}))}function ya(r){if(!r||!ct.current[r])return;let m={...ct.current};delete m[r],
-ct.current=m,Bt.current.delete(r),Hs(C=>{if(!C[r])return C;let O={...C};return delete O[r],O})}function Di(){ct.current=
+ct.current=m,Bt.current.delete(r),Hs(C=>{if(!C[r])return C;let O={...C};return delete O[r],O})}function ji(){ct.current=
 {},Bt.current.clear(),Hs({})}function fo(){let r=cn.current;cn.current=null,r&&(r.kind==="idle"&&typeof cancelIdleCallback==
 "function"?cancelIdleCallback(r.id):clearTimeout(r.id))}function go(){if(cn.current||on.current.size===0)return;let r=()=>{
 cn.current=null;let m=on.current.entries().next();if(m.done)return;let[C,O]=m.value;on.current.delete(C),ha.current?.(O),
@@ -1039,13 +1040,13 @@ heartbeat_timeout_ms)||3e4),wa(m),Us.current=setInterval(()=>wa(m),ft.current)}f
 requestId!==r.request_id)return;an.current&&clearTimeout(an.current),an.current=null,Cn.current=null;let C=Math.max(0,Date.
 now()-m.sentAt),O=C<=500?"healthy":C<=2e3?"slow":"poor";N({state:O,rttMs:C,lastAckAt:Date.now()})}function xn(r){let m=ms.
 current[r];m&&clearTimeout(m),delete ms.current[r]}function lt(r,m){if(r){if(!Object.prototype.hasOwnProperty.call(At.current,
-r)&&Object.keys(At.current).length>=ri){let C=Object.keys(At.current)[0];xn(C),delete fs.current[C]}At.current=cs(At.current,
-r,m),ee(C=>cs(C,r,m))}}function An(r,m){!r||!m||(fs.current=cs(fs.current,r,m))}function Rn(r,m,C){r&&i(O=>{let l=Rd(O,r,
-m||fs.current[r]||"");return l?(An(r,l),Md(O,r,l,C)):O})}function pn(r,m,C=""){r&&At.current[r]!=="agent_started"&&(xn(r),
+r)&&Object.keys(At.current).length>=oi){let C=Object.keys(At.current)[0];xn(C),delete fs.current[C]}At.current=cs(At.current,
+r,m),ee(C=>cs(C,r,m))}}function An(r,m){!r||!m||(fs.current=cs(fs.current,r,m))}function Rn(r,m,C){r&&i(O=>{let l=Md(O,r,
+m||fs.current[r]||"");return l?(An(r,l),Td(O,r,l,C)):O})}function pn(r,m,C=""){r&&At.current[r]!=="agent_started"&&(xn(r),
 lt(r,"failed"),Rn(r,C,O=>({...O,_sendError:m||"Send failed"})))}function Ge(r,m,C){xn(r);let O=sh[m];O&&(ms.current[r]=setTimeout(
 ()=>{delete ms.current[r],At.current[r]===m&&pn(r,C)},O))}Qc(()=>{f.current=$},[$]),Qc(()=>{fr.current=me},[me]);function mn(r,m){
 return`${r}:${m}`}function Ht(r,m){!Object.prototype.hasOwnProperty.call(ot.current,r)&&Object.keys(ot.current).length>=
-ri&&Vs(Object.keys(ot.current)[0]),ot.current=cs(ot.current,r,m),xt(ot.current)}function Vs(r){let m=gs.current[r];m&&clearTimeout(
+oi&&Vs(Object.keys(ot.current)[0]),ot.current=cs(ot.current,r,m),xt(ot.current)}function Vs(r){let m=gs.current[r];m&&clearTimeout(
 m),delete gs.current[r]}function Ys(r,m){let C=ot.current[r];if(!C||!["pending","awaiting_config"].includes(C.status))return;
 Vs(r);let l={...f.current[C.sessionId]||{},[C.configKey]:C.previousValue};f.current={...f.current,[C.sessionId]:l},P(x=>({
 ...x,[C.sessionId]:{...x[C.sessionId]||{},[C.configKey]:C.previousValue}})),Ht(r,{...C,status:"failed",error:m||"Control\
@@ -1062,14 +1063,14 @@ eb-sub-${Date.now()}-${++gr.current}`,sessions:fa.current})),st.current.active&&
 m.onclose=()=>{if(Zn(),Object.entries(ot.current).forEach(([l,x])=>{["pending","awaiting_config"].includes(x?.status)&&Ys(
 l,"Connection changed before the native setting was confirmed. Retry after reconnecting.")}),Object.values(it.current).forEach(
 l=>clearTimeout(l)),it.current={},Object.keys(Ve.current).forEach(l=>{Ve.current[l]={...Ve.current[l]||{},inFlight:!1}}),
-b({}),Di(),S(!1),N({state:"offline",rttMs:null,lastAckAt:null}),st.current.active&&Fs(l=>({...l,status:"reconnecting"})),
-nt.current!==m)return;let C=co.current++,O=Gd[Math.min(C,Gd.length-1)];Gn.current=setTimeout(()=>{Gn.current=null,Mn()},
+b({}),ji(),S(!1),N({state:"offline",rttMs:null,lastAckAt:null}),st.current.active&&Fs(l=>({...l,status:"reconnecting"})),
+nt.current!==m)return;let C=co.current++,O=Kd[Math.min(C,Kd.length-1)];Gn.current=setTimeout(()=>{Gn.current=null,Mn()},
 O)},m.onmessage=C=>{let O;try{O=JSON.parse(C.data)}catch{return}O.stream_trace&&typeof O.stream_trace=="object"&&(O.stream_trace=
 {...O.stream_trace,browser_received_at_ms:Date.now()}),ha.current(O)}},[we,Tt]);Qc(()=>(Mn(),()=>{Gn.current&&clearTimeout(
 Gn.current),Zn(),Object.values(ms.current).forEach(m=>clearTimeout(m)),ms.current={},Object.values(gs.current).forEach(m=>clearTimeout(
 m)),gs.current={},fo(),Ot.current!=null&&(typeof cancelAnimationFrame=="function"?cancelAnimationFrame(Ot.current):clearTimeout(
 Ot.current),Ot.current=null),Bt.current.clear();let r=nt.current;nt.current=null;try{r?.close()}catch{}}),[Mn]);function es(r){
-let m=Yd(r);L(C=>Ds(C,Yd(r,C).activities)),k(C=>Ds(C,m.thinkingContent)),g(C=>Ds(C,m.thinking))}function Tn(r){let m=new Set(
+let m=Xd(r);L(C=>Ds(C,Xd(r,C).activities)),k(C=>Ds(C,m.thinkingContent)),g(C=>Ds(C,m.thinking))}function Tn(r){let m=new Set(
 (r||[]).map(l=>l&&typeof l=="object"?l.session_id:l).filter(Boolean)),C=l=>{let x=!1,E={...l};return Object.keys(E).forEach(
 F=>{m.has(F)||(delete E[F],x=!0)}),x?E:l};Object.keys(sn.current).forEach(l=>{m.has(l)||(clearTimeout(sn.current[l]),delete sn.
 current[l])}),[rn,hs,Ve,gt,Gs].forEach(l=>{Object.keys(l.current).forEach(x=>{m.has(x)||delete l.current[x]})}),Object.keys(
@@ -1093,7 +1094,7 @@ lder":m.mode==="around"?"around":"tail",l=m.source||"relay_sqlite",x=O==="around
 m.before_offset??null,F=m.beforeId??m.before_id??null,Z=m.aroundId??m.around_id??null,K=`${O}${l}${E??""}${F??""}${Z??
 ""}`,ge=Ve.current[C]||{},pe=Date.now();if(ge.inFlight&&O!=="around"||O==="older"&&ge.lastRequestSig===K&&pe-Number(ge.lastRequestAt||
 0)<1500)return;let De=`histchunk-${Date.now()}-${++Vn.current}`,He=Math.max(256*1024,Math.min(16*1024*1024,Number(m.chunkBytes||
-m.chunk_bytes||zd)||zd));if(O!=="older"){let Ce=Number(m.retryAttempt||0)>0?ge.baselineMessageKeys:null,Le=Array.isArray(
+m.chunk_bytes||Gd)||Gd));if(O!=="older"){let Ce=Number(m.retryAttempt||0)>0?ge.baselineMessageKeys:null,Le=Array.isArray(
 Ce)?Ce:(a[C]||[]).map(Ut).filter(Boolean);clearTimeout(it.current[C]),Ve.current[C]={source:l,chunkBytes:He,limit:m.limit||
 null,inFlight:!0,mode:O,replace:x,baselineMessageKeys:Le,lastRequestSig:K,lastRequestAt:pe}}else Ve.current[C]={...Ve.current[C]||
 {},source:l,chunkBytes:He,limit:m.limit||Ve.current[C]?.limit||null,inFlight:!0,mode:O,lastRequestSig:K,lastRequestAt:pe};
@@ -1111,9 +1112,9 @@ native${r.native_source_id}`;if(r.id!=null)return`id${r.id}`;if(r.server_messa
 if(r.sequence!=null&&r.ts!=null)return`seq${r.sequence}${r.ts}${r.role||""}`;if(r.client_msg_id)return`client${r.client_msg_id}`;
 let m=Array.isArray(r.content_blocks)?JSON.stringify(r.content_blocks):"";return`${r.role||""}${r.content||""}${m}`}function ks(r,m,C){
 let O=Array.isArray(r)?r:[],l=Array.isArray(m)?m:[];if(C==="older"){let K=new Set(O.map(Ut)),ge=[];return l.forEach(pe=>{
-let De=Ut(pe);K.has(De)||(K.add(De),ge.push(pe))}),ge.length?[...ge,...O]:O}let x=Vd(O,l);if(x)return x;let E=new Set(O.
+let De=Ut(pe);K.has(De)||(K.add(De),ge.push(pe))}),ge.length?[...ge,...O]:O}let x=Yd(O,l);if(x)return x;let E=new Set(O.
 map(Ut)),F=[...O],Z=0;return l.forEach(K=>{let ge=Ut(K);E.has(ge)||(E.add(ge),F.push(K),Z++)}),Z?F:O}function br(r,m){let C=Array.
-isArray(r)?r:[],O=Array.isArray(m)?m:[];if(!C.length)return O;if(!O.length)return C;let l=Vd(C,O);if(l)return l;let x=new Set(
+isArray(r)?r:[],O=Array.isArray(m)?m:[];if(!C.length)return O;if(!O.length)return C;let l=Yd(C,O);if(l)return l;let x=new Set(
 C.map(Ut)),E=[...C],F=0;return O.forEach(Z=>{let K=Ut(Z);x.has(K)||(x.add(K),E.push(Z),F++)}),F?E:C}function Sa(r,m,C,O){
 let l=Array.isArray(r)?r:[],x=Array.isArray(m)?m:[],E=new Set(Array.isArray(C?.baselineMessageKeys)?C.baselineMessageKeys:
 []);if((C?.source==="native"||O==="codex_cli_jsonl"||O==="cursor_cli_jsonl")&&E.size>x.length)return l;let Z=l.filter(K=>{
@@ -1151,7 +1152,7 @@ hread",session_id:r,request_id:m}),m}function vr(r){let m=`panel-${Date.now()}-$
 return we({type:"open_panel",session_id:r,request_id:m}),m}function Gt(r,m){let C=`native-${Date.now()}-${Math.random().
 toString(36).slice(2,7)}`;return we({type:"open_native_window",session_id:r,request_id:C,operator_user_gesture:m?.isTrusted===
 !0}),C}function yr(r){let m=`chatlist-${Date.now()}-${Math.random().toString(36).slice(2,7)}`;return we({type:"chat_list",
-session_id:r,request_id:m}),m}function ji(r,m){let C=`switch-${Date.now()}-${Math.random().toString(36).slice(2,7)}`;return we(
+session_id:r,request_id:m}),m}function Bi(r,m){let C=`switch-${Date.now()}-${Math.random().toString(36).slice(2,7)}`;return we(
 {type:"switch_chat",session_id:r,chat_id:m,request_id:C}),C}function bo(r){let m=`newchat-${Date.now()}-${Math.random().
 toString(36).slice(2,7)}`;return we({type:"new_chat",session_id:r,request_id:m}),m}function Ca(r){let m=`threads-${Date.
 now()}-${Math.random().toString(36).slice(2,7)}`;return we({type:"thread_list",session_id:r,request_id:m}),m}function Xs(r,m){
@@ -1159,28 +1160,28 @@ let C=`swthread-${Date.now()}-${Math.random().toString(36).slice(2,7)}`;return I
 thread_id:m,request_id:C}),C}function xa(r){let m=`term-${Date.now()}-${Math.random().toString(36).slice(2,7)}`;return we(
 {type:"terminal_output",session_id:r,request_id:m}),m}function kr(r,m){let C=`termin-${Date.now()}-${Math.random().toString(
 36).slice(2,7)}`;return we({type:"terminal_input",session_id:r,request_id:C,text:m}),C}function wr(r){let m=`diff-${Date.
-now()}-${Math.random().toString(36).slice(2,7)}`;return we({type:"file_changes",session_id:r,request_id:m}),m}function Bi(r,m,C){
+now()}-${Math.random().toString(36).slice(2,7)}`;return we({type:"file_changes",session_id:r,request_id:m}),m}function Fi(r,m,C){
 let O=`filechg-${Date.now()}-${Math.random().toString(36).slice(2,7)}`;return we({type:"file_change_response",session_id:r,
 change_id:m,action:C,request_id:O}),O}function vo(r,m){let C=`dir-${Date.now()}-${Math.random().toString(36).slice(2,7)}`;
 return we({type:"list_directory",session_id:r,request_id:C,path:m||"."}),C}function Nr(r,m){let C=`file-${Date.now()}-${Math.
 random().toString(36).slice(2,7)}`;return we({type:"read_file",session_id:r,request_id:C,path:m}),C}function Aa(r){let m=`\
 skills-${Date.now()}-${Math.random().toString(36).slice(2,7)}`;return we({type:"skill_list",session_id:r,request_id:m}),
-m}function Fi(r){let m=`automation-${Date.now()}-${Math.random().toString(36).slice(2,7)}`;return we({type:"automation_v\
+m}function Hi(r){let m=`automation-${Date.now()}-${Math.random().toString(36).slice(2,7)}`;return we({type:"automation_v\
 iew_action",session_id:r,request_id:m}),m}function _n(r,m,C,O){let l=`attach-${Date.now()}-${Math.random().toString(36).
-slice(2,7)}`;return we({type:"send_attachment",session_id:r,request_id:l,data:m,mime_type:C,filename:O}),l}function Hi(r,m){
+slice(2,7)}`;return we({type:"send_attachment",session_id:r,request_id:l,data:m,mime_type:C,filename:O}),l}function Ui(r,m){
 let C=`swws-${Date.now()}-${Math.random().toString(36).slice(2,7)}`;return ht(r,"workspace","file_access_scope",m,{type:"\
 switch_workspace",folder_path:m},C)}function bn(r){let m=`branches-${Date.now()}-${Math.random().toString(36).slice(2,7)}`;
-return we({type:"branch_list",session_id:r,request_id:m}),m}function Ui(r,m){let C=`swbranch-${Date.now()}-${Math.random().
+return we({type:"branch_list",session_id:r,request_id:m}),m}function Wi(r,m){let C=`swbranch-${Date.now()}-${Math.random().
 toString(36).slice(2,7)}`;return we({type:"switch_branch",session_id:r,branch_name:m,request_id:C}),C}function xs(r,m){let C=`\
 newbranch-${Date.now()}-${Math.random().toString(36).slice(2,7)}`;return we({type:"create_branch",session_id:r,branch_name:m,
 request_id:C}),C}function yo(r,m,C={}){let O=`launch-${Date.now()}-${Math.random().toString(36).slice(2,7)}`;return ve(l=>cs(
 l,O,{status:"launching",agentType:r})),we({type:"launch_session",agent_type:r,workspace_path:m||void 0,model_id:C.model_id||
-void 0,permission_mode:C.permission_mode||void 0,effort:C.effort||void 0,request_id:O}),O}function Wi(r,m,C,O={}){let l=`\
+void 0,permission_mode:C.permission_mode||void 0,effort:C.effort||void 0,request_id:O}),O}function zi(r,m,C,O={}){let l=`\
 resume-${Date.now()}-${Math.random().toString(36).slice(2,7)}`;return ve(x=>cs(x,l,{status:"launching",agentType:m})),we(
 {type:"resume_session",source_session:r,agent_type:m||"claude",workspace_path:C||void 0,cli_session_id:O.cli_session_id||
 void 0,model_id:O.model_id||void 0,permission_mode:O.permission_mode||void 0,request_id:l}),l}function ko(r,m){we(m?{type:"\
 dismiss_session",session:r}:{type:"close_session",session:r})}function wo(r,m,C=""){let O=C||`cmsg-${Date.now()}-${Math.
-random().toString(36).slice(2,8)}`;An(O,r);let l=C?(Lc[r]||[]).find(E=>E._cid===O):null,x=Xa(l)?.iso||new Date().toISOString();
+random().toString(36).slice(2,8)}`;An(O,r);let l=C?(Pc[r]||[]).find(E=>E._cid===O):null,x=Xa(l)?.iso||new Date().toISOString();
 return i(E=>{let F=E[r]||[],Z=C&&F.some(K=>K._cid===O);return{...E,[r]:Z?F.map(K=>K._cid===O?{...K,content:m,_optimistic:!0,
 _delivered:!1,_agentStarted:!1,_sendError:null}:K):[...F,Qa({role:"user",content:m,_cid:O,_optimistic:!0,created_at:x})]}}),
 nt.current?.readyState===WebSocket.OPEN?(lt(O,"queued"),Ge(O,"queued","Timed out waiting for relay acceptance."),we({type:"\
@@ -1278,7 +1279,7 @@ delete it.current[l],Na(l,{mode:"tail",source:"relay_sqlite",replace:!0});return
 let l=r.session||r.session_id;if(!l||r.request_id&&rn.current[l]&&rn.current[l]!==r.request_id)return;let x=n.find(pe=>(typeof pe==
 "object"?pe.session_id:pe)===l),E=gn(x);if(x&&typeof x=="object"&&x.is_list_view&&r.messages?.length>0&&!E){b(pe=>{if(!pe[l])
 return pe;let De={...pe};return delete De[l],De});return}!r.partial&&(!r.mode||r.mode==="full")&&ya(l);let F=r.messages||
-[],Z=c[l]||null,K=!!Gs.current[l]&&F.length>0,ge=!K&&oh(m,r,Z);i(pe=>{let De=ge?br(pe[l],F):F,He=Kr(Kd(De,pe[l]));return He===
+[],Z=c[l]||null,K=!!Gs.current[l]&&F.length>0,ge=!K&&oh(m,r,Z);i(pe=>{let De=ge?br(pe[l],F):F,He=Kr(Vd(De,pe[l]));return He===
 pe[l]?pe:{...pe,[l]:He}}),u(pe=>{let De={...ge?pe[l]||{}:{},partial:!!r.partial||!!(ge&&pe[l]?.partial),loaded:ge?Math.max(
 Number(pe[l]?.loaded||0),Number(r.loaded_messages??F.length)||F.length,(a[l]||[]).length):Number(r.loaded_messages??F.length)||
 F.length,total:Number(r.total_messages??pe[l]?.total??F.length)||F.length,limit:r.limit||null,mode:ge?pe[l]?.mode||"chun\
@@ -1290,7 +1291,7 @@ length===0)){b(Ce=>{if(!Ce[l])return Ce;let Le={...Ce};return delete Le[l],Le}),
 clearTimeout(it.current[l]),delete it.current[l],u(Ce=>({...Ce,[l]:{...Ce[l]||{},error:String(r.error?.message||r.error||
 "Transcript history could not be loaded.")}}));return}let F=r.mode==="older"?"older":r.mode==="around"?"around":"tail",Z=r.
 cursor||{},K=Z.next_before_offset??null,ge=Z.next_before_id??null,pe=!!(r.partial&&(K!=null||ge!=null)),De=Array.isArray(
-r.messages)?r.messages:[],He=F==="around"||F==="tail"&&r.replace===!0,Nt=(He?De:ks(a[l],De,F)).length;i(Ce=>{let Le=Kr(Kd(
+r.messages)?r.messages:[],He=F==="around"||F==="tail"&&r.replace===!0,Nt=(He?De:ks(a[l],De,F)).length;i(Ce=>{let Le=Kr(Vd(
 He?Sa(Ce[l],De,x,r.source):ks(Ce[l],De,F),Ce[l]));return Le===Ce[l]?Ce:{...Ce,[l]:Le}}),u(Ce=>{let Le={...Ce[l]||{},partial:pe,
 loaded:He?Number(r.loaded_messages??Nt)||Nt:Math.max(Number(Ce[l]?.loaded||0),Number(r.loaded_messages||0),Nt),total:Number(
 r.total_messages||Ce[l]?.total||Nt)||Nt,limit:null,mode:"chunked",source:r.source||"native",cursor:Z,bytes_total:Z.total_bytes||
@@ -1309,7 +1310,7 @@ kind||(E?"thinking":"working"),label:F,updatedAt:r.activity?.updated_at||null,ob
 startedAt:r.activity?.started_at||null,interruptHint:r.activity?.interrupt_hint||"",goal:r.activity?.goal||null,goal_run:r.
 activity?.goal_run||null,thinking:r.activity?.thinking||null,current:r.activity?.current||null,step:r.activity?.step||null,
 usage:r.activity?.usage||null,task_list:r.activity?.task_list||null,context_card:r.activity?.context_card||null,thinkingContent:r.
-activity?.thinking?.text||r.activity?.thinkingContent||"",transport:yd(r.activity_trace)}:!1;if(E){clearTimeout(sn.current[l]),
+activity?.thinking?.text||r.activity?.thinkingContent||"",transport:kd(r.activity_trace)}:!1;if(E){clearTimeout(sn.current[l]),
 g(ge=>Object.is(ge[l],F)?ge:{...ge,[l]:F}),L(ge=>Ds(ge,{[l]:Z}));let K=r.activity?.thinking?.text??r.thinking_content??r.
 activity?.thinkingContent;K!=null&&k(ge=>Object.is(ge[l],K)?ge:{...ge,[l]:K})}else x==="idle"?(clearTimeout(sn.current[l]),
 g(K=>K[l]===!1?K:{...K,[l]:!1}),L(K=>{let ge=Z;return Object.is(K[l],ge)?K:{...K,[l]:ge}}),k(K=>K[l]===""?K:{...K,[l]:""})):
@@ -1403,31 +1404,31 @@ native_source_id}:{},...pe.source_cursor?{source_cursor:pe.source_cursor}:{},...
 null?{server_message_id:pe.server_message_id}:{},...pe.client_message_id?{client_message_id:pe.client_message_id}:{},...pe.
 status?{status:pe.status}:{},...pe.sequence!=null?{sequence:pe.sequence}:{},...pe.created_at!=null?{created_at:pe.created_at}:
 {},...pe.timestamp!=null?{timestamp:pe.timestamp}:{},...pe.ts!=null?{ts:pe.ts}:{},_delivered:$t._delivered||ge,_agentStarted:$t.
-_agentStarted||K==="agent_started",_cid:$t._cid,_optimistic:$t._optimistic}),{...He,[l]:Kr(Le)}}}let Nt=oi(pe);return We.
-some(Ce=>Nt?oi(Ce)===Nt:Ce.role===x&&Ce.content===E)?He:{...He,[l]:Kr([...We,{...pe,...x==="user"&&Z?{_cid:Z}:{},_delivered:x===
+_agentStarted||K==="agent_started",_cid:$t._cid,_optimistic:$t._optimistic}),{...He,[l]:Kr(Le)}}}let Nt=ii(pe);return We.
+some(Ce=>Nt?ii(Ce)===Nt:Ce.role===x&&Ce.content===E)?He:{...He,[l]:Kr([...We,{...pe,...x==="user"&&Z?{_cid:Z}:{},_delivered:x===
 "user"&&ge,_agentStarted:x==="user"&&K==="agent_started"}])}}),x==="assistant"&&l!==Ws.current&&d(He=>({...He,[l]:(He[l]||
 0)+1}));let De=jc(r);Object.keys(De).length>0&&s(He=>He.map(We=>(typeof We=="string"?We:We?.session_id)===l?{...typeof We==
-"object"?We:{},session_id:l,...De}:We));return}}}}return ha.current=Ao,{sessions:n,messages:a,provisionalStreams:Oi,historyMeta:c,
+"object"?We:{},session_id:l,...De}:We));return}}}}return ha.current=Ao,{sessions:n,messages:a,provisionalStreams:Ii,historyMeta:c,
 historyLoading:p,connected:y,connectionHealth:A,unread:h,setUnread:d,thinking:v,thinkingContent:_,activities:T,health:H,
 deliveryStates:ne,launchStates:Y,justLaunched:he,setJustLaunched:X,permissionPrompts:me,respondToPrompt:ws,errorPrompts:W,
 respondToErrorPrompt:$n,interruptSession:Ns,agentConfigs:$,configControlStates:yt,requestAgentConfig:Wt,setAgentModel:ns,
 setAgentEffort:hn,setAgentPermissionMode:Ss,setAutoApprovePermissions:zt,setAntigravityMode:Cs,setCodexConfig:En,newThread:Ye,
-openPanel:vr,openNativeWindow:Gt,requestChatList:yr,switchChat:ji,newChat:bo,chatLists:ce,requestThreadList:Ca,switchThread:Xs,
-threadLists:be,switchWorkspace:Hi,requestTerminalOutput:xa,sendTerminalInput:kr,terminalOutputs:Se,requestFileChanges:wr,
-respondToFileChange:Bi,fileChanges:xe,sendAttachment:_n,send:we,sendToSession:wo,steerMessage:So,discardQueuedMessage:Co,
+openPanel:vr,openNativeWindow:Gt,requestChatList:yr,switchChat:Bi,newChat:bo,chatLists:ce,requestThreadList:Ca,switchThread:Xs,
+threadLists:be,switchWorkspace:Ui,requestTerminalOutput:xa,sendTerminalInput:kr,terminalOutputs:Se,requestFileChanges:wr,
+respondToFileChange:Fi,fileChanges:xe,sendAttachment:_n,send:we,sendToSession:wo,steerMessage:So,discardQueuedMessage:Co,
 editQueuedMessage:xo,queuedMessages:re,scheduledSends:oe,scheduleSend:Sr,cancelScheduledSend:Ra,refreshScheduledSends:Kt,
-launchSession:yo,resumeSession:Wi,closeSession:ko,activeSessionRef:Ws,restoreCachedTranscript:tt,setSessionSubscriptions:_o,
-workspaces:B,branchLists:Ke,requestBranchList:bn,switchBranch:Ui,createBranch:xs,skillLists:Ze,requestSkillList:Aa,automationViews:se,
-showCodexAutomation:Fi,controlResults:q,directoryListings:Hn,requestDirectoryListing:vo,fileContents:Ri,requestFileContent:Nr,
-requestHistory:_r,requestHistoryChunk:Na,duplicateProxyAlarms:Mi,nightlyValidationFailures:Ti,latestAppUpdateValidation:$i,
-providerUsage:ro,providerUsageRefreshReceipt:Ei,requestProviderUsageRefresh:_s,providerUsageResetReceipt:Li,consumeProviderUsageResetCredit:Xn,
+launchSession:yo,resumeSession:zi,closeSession:ko,activeSessionRef:Ws,restoreCachedTranscript:tt,setSessionSubscriptions:_o,
+workspaces:B,branchLists:Ke,requestBranchList:bn,switchBranch:Wi,createBranch:xs,skillLists:Ze,requestSkillList:Aa,automationViews:se,
+showCodexAutomation:Hi,controlResults:q,directoryListings:Hn,requestDirectoryListing:vo,fileContents:Mi,requestFileContent:Nr,
+requestHistory:_r,requestHistoryChunk:Na,duplicateProxyAlarms:Ti,nightlyValidationFailures:$i,latestAppUpdateValidation:Ei,
+providerUsage:ro,providerUsageRefreshReceipt:Li,requestProviderUsageRefresh:_s,providerUsageResetReceipt:Pi,consumeProviderUsageResetCredit:Xn,
 providerUsageCostDetail:dr,requestProviderUsageCostDetail:Ks,hostResources:io,hostResourceError:Wn,hostResourceHistory:pr,
-hostResourceDetails:Pi,hostResourceSubscription:qi,subscribeHostResources:bs,unsubscribeHostResources:ho,requestHostResourceRefresh:hr,
-clearHostResources:Qn,semanticNotifications:Ii}}function ch(e){return typeof e=="string"?e:e?.session_id||e?.id||""}function Jd(e){let t=Number(e?.pin_order);return Number.
-isSafeInteger(t)&&t>0?t:0}function lh(e){return e?.pinned===!0||Jd(e)>0}function Zd(e,t={}){let n=[],s=[];for(let a of Array.
-isArray(e)?e:[]){let i=ch(a),c=i?t[i]:null;lh(c)?n.push({session:a,id:i,order:Jd(c)}):s.push(a)}return n.sort((a,i)=>(a.
+hostResourceDetails:qi,hostResourceSubscription:Oi,subscribeHostResources:bs,unsubscribeHostResources:ho,requestHostResourceRefresh:hr,
+clearHostResources:Qn,semanticNotifications:Di}}function ch(e){return typeof e=="string"?e:e?.session_id||e?.id||""}function Zd(e){let t=Number(e?.pin_order);return Number.
+isSafeInteger(t)&&t>0?t:0}function lh(e){return e?.pinned===!0||Zd(e)>0}function ep(e,t={}){let n=[],s=[];for(let a of Array.
+isArray(e)?e:[]){let i=ch(a),c=i?t[i]:null;lh(c)?n.push({session:a,id:i,order:Zd(c)}):s.push(a)}return n.sort((a,i)=>(a.
 order||Number.MAX_SAFE_INTEGER)-(i.order||Number.MAX_SAFE_INTEGER)||a.id.localeCompare(i.id)),{pinned:n.map(a=>a.session),
-unpinned:s}}var Zc="remote-agent-chat:group-aliases:v1",li=Object.freeze({"^remoteagent":"Remote Agent Chat"}),uh=new Set(["thinking",
+unpinned:s}}var Zc="remote-agent-chat:group-aliases:v1",ui=Object.freeze({"^remoteagent":"Remote Agent Chat"}),uh=new Set(["thinking",
 "generating","running_command","applying_patch","reading_files","working"]),dh=new Set(["validator","test","fixture","pr\
 obe","e2e","throwaway"]),ph=[/(?:^|\/)cursor-test(?:\/|$)/i,/(?:^|\/)remote-agent-(?=[^/]*(?:-(?:test|fixture|probe|e2e|validator|validation|throwaway|switch-anchor)(?:-|\/|$)))[^/]+(?:\/|$)/i,
 /(?:^|\/)rac-(?=[^/]*(?:-(?:test|fixture|probe|e2e|validator|validation|throwaway)(?:-|\/|$)))[^/]+(?:\/|$)/i,/(?:^|\/)reply-with-exactly-rac-[^/]*(?:\/|$)/i];
@@ -1438,14 +1439,14 @@ String(e.session_kind||e.session_class||"").trim().toLowerCase()))return!0;let t
 e.display_name,e.window_title,e.chat_title].filter(Boolean).join("/").toLowerCase();return/(?:^|[\s/_-])(?:validator|fixture|throwaway)(?:$|[\s/_-])/i.
 test(n)}function ia(e){if(typeof e=="number"&&Number.isFinite(e))return e;let t=Date.parse(String(e||""));return Number.
 isFinite(t)?t:0}function mh(e){return(Array.isArray(e)?e:[]).reduce((t,n)=>Math.max(t,ia(n?.ts??n?.timestamp??n?.created_at??
-n?.updated_at)),0)}function np(e,t={}){let n=wn(e),s=t.activities?.[n]||(typeof e=="object"?e.activity:null)||{kind:"idl\
+n?.updated_at)),0)}function sp(e,t={}){let n=wn(e),s=t.activities?.[n]||(typeof e=="object"?e.activity:null)||{kind:"idl\
 e"},i=!!t.thinking?.[n]&&!s.generating?{...s,kind:uh.has(String(s.kind||"").toLowerCase())?s.kind:"thinking",generating:!0}:
-s,c=!!t.pendingPrompts?.[n]||!!t.errorPrompts?.[n]||typeof e=="object"&&e.rate_limit_active===!0;return Jo(i,c,{connected:t.
+s,c=!!t.pendingPrompts?.[n]||!!t.errorPrompts?.[n]||typeof e=="object"&&e.rate_limit_active===!0;return Zo(i,c,{connected:t.
 connected,health:t.health?.[n]||t.healthMap?.[n],nowMs:t.nowMs,freshnessMs:t.freshnessMs,requireFreshness:t.requireFreshness===
-!0})}function sp(e,t={}){let n=[],s=[],a={};for(let i of Array.isArray(e)?e:[]){let c=wn(i);if(!c)continue;let u=np(i,t);
+!0})}function ap(e,t={}){let n=[],s=[],a={};for(let i of Array.isArray(e)?e:[]){let c=wn(i);if(!c)continue;let u=sp(i,t);
 a[c]=u,(sa(u)?n:s).push(i)}return{working:n,nonWorking:s,states:a}}function tl(e,t={}){let n=Array.isArray(e)?e:[],s=n.map(
 wn).filter(Boolean);return{version:1,revision:Number(t.revision||0),sessionOrder:s,fallbackSessionById:Object.fromEntries(
-n.map(a=>[wn(a),a]).filter(([a])=>a))}}function ap(e,t,n={}){let s=Array.isArray(t)?t:[],a=Object.fromEntries(s.map(A=>[
+n.map(a=>[wn(a),a]).filter(([a])=>a))}}function rp(e,t,n={}){let s=Array.isArray(t)?t:[],a=Object.fromEntries(s.map(A=>[
 wn(A),A]).filter(([A])=>A)),i=Object.keys(a),c=e?.version===1?e:tl(s,n),u=Array.isArray(c.sessionOrder)?c.sessionOrder:[];
 if(!(i.length!==u.length||i.some(A=>!u.includes(A))))return{ledger:c,sessions:u.map(A=>a[A]||c.fallbackSessionById?.[A]).
 filter(Boolean),structuralChanged:!1,deferred:!1};if(n.freezeStructure)return{ledger:c,sessions:u.map(A=>a[A]||c.fallbackSessionById?.[A]).
@@ -1453,80 +1454,80 @@ filter(Boolean),structuralChanged:!0,deferred:!0};let b=new Set(i),y=u.filter(A=
 y.push(A);let S={version:1,revision:Number(c.revision||0)+1,sessionOrder:y,fallbackSessionById:Object.fromEntries(y.map(
 A=>[A,a[A]||c.fallbackSessionById?.[A]]).filter(([,A])=>!!A))};return{ledger:S,sessions:y.map(A=>a[A]||S.fallbackSessionById[A]).
 filter(Boolean),structuralChanged:!0,deferred:!1}}function fh(e,t={}){let n=wn(e),s=t.activities?.[n]||(typeof e=="objec\
-t"?e.activity:null)||null,a=np(e,t),i=a==="needs_attention",c=sa(a),u=Math.max(ia(t.lastMessageAt?.[n]),mh(t.messages?.[n])),
+t"?e.activity:null)||null,a=sp(e,t),i=a==="needs_attention",c=sa(a),u=Math.max(ia(t.lastMessageAt?.[n]),mh(t.messages?.[n])),
 p=Math.max(ia(s?.updatedAt??s?.updated_at),ia(s?.startedAt??s?.started_at),ia(typeof e=="object"?e.last_message_at:null),
 ia(typeof e=="object"?e.last_seen_at:null),ia(typeof e=="object"?e.created_at:null));return{id:n,tier:i?2:c&&t.rankWorking!==
-!1?1:0,recency:u||p}}function rp(e,t={}){let n=new Map((t.previousGroupOrder||[]).map((u,p)=>[u,p])),s=new Map((t.previousSessionOrder||
+!1?1:0,recency:u||p}}function op(e,t={}){let n=new Map((t.previousGroupOrder||[]).map((u,p)=>[u,p])),s=new Map((t.previousSessionOrder||
 []).map((u,p)=>[u,p])),a=(u,p)=>n.has(u)?n.get(u):n.size+p,i=(u,p)=>s.has(u)?s.get(u):s.size+p,c=(Array.isArray(e)?e:[]).
 map((u,p)=>{let b=(u.sessions||[]).map((y,S)=>({session:y,sessionIndex:S,...fh(y,t)})).sort((y,S)=>S.tier-y.tier||S.recency-
 y.recency||i(y.id,y.sessionIndex)-i(S.id,S.sessionIndex)||y.id.localeCompare(S.id));return{group:{...u,sessions:b.map(y=>y.
 session)},groupIndex:p,tier:b.reduce((y,S)=>Math.max(y,S.tier),0),recency:b.reduce((y,S)=>Math.max(y,S.recency),0)}});return c.
 sort((u,p)=>p.tier-u.tier||p.recency-u.recency||a(u.group.key,u.groupIndex)-a(p.group.key,p.groupIndex)||u.group.key.localeCompare(
-p.group.key)),c.map(u=>u.group)}function op(e){return{groupOrder:(e||[]).map(t=>t.key),sessionOrder:(e||[]).flatMap(t=>(t.
-sessions||[]).map(wn))}}function ip(e){return(e||[]).flatMap(t=>(t.sessions||[]).map(n=>`${t.key}:${wn(n)}`)).sort().join(
-"|")}function Jc(e){return String(e?.key||"unscoped")}function ui(e){let t={},n={},s={};for(let a of e||[]){let i=Jc(a);
+p.group.key)),c.map(u=>u.group)}function ip(e){return{groupOrder:(e||[]).map(t=>t.key),sessionOrder:(e||[]).flatMap(t=>(t.
+sessions||[]).map(wn))}}function cp(e){return(e||[]).flatMap(t=>(t.sessions||[]).map(n=>`${t.key}:${wn(n)}`)).sort().join(
+"|")}function Jc(e){return String(e?.key||"unscoped")}function di(e){let t={},n={},s={};for(let a of e||[]){let i=Jc(a);
 s[i]={...a,sessions:[]};for(let c of a.sessions||[]){let u=wn(c);u&&(t[u]=c,n[u]=i)}}return{sessionById:t,groupBySession:n,
 groupMeta:s}}function gh(e){return{groupOrder:[...e?.groupOrder||[]],sessionOrder:[...e?.sessionOrder||[]]}}function hh(e,t){
 return(e?.groupOrder||[]).join("|")===(t?.groupOrder||[]).join("|")&&(e?.sessionOrder||[]).join("|")===(t?.sessionOrder||
-[]).join("|")}function _h(e,t={},n=null){return op(rp(e,{...t,previousGroupOrder:n?.groupOrder||t.previousGroupOrder,previousSessionOrder:n?.
-sessionOrder||t.previousSessionOrder}))}function Vr(e,t={}){let n=rp(e,t),s=ui(n),a=op(n);return{version:1,revision:Number(
+[]).join("|")}function _h(e,t={},n=null){return ip(op(e,{...t,previousGroupOrder:n?.groupOrder||t.previousGroupOrder,previousSessionOrder:n?.
+sessionOrder||t.previousSessionOrder}))}function Vr(e,t={}){let n=op(e,t),s=di(n),a=ip(n);return{version:1,revision:Number(
 t.revision||0),groupOrder:a.groupOrder,sessionOrder:a.sessionOrder,historicalGroupOrder:a.groupOrder,historicalSessionOrder:a.
 sessionOrder,historicalGroupBySession:s.groupBySession,groupBySession:s.groupBySession,groupMeta:s.groupMeta,fallbackSessionById:s.
-sessionById,sourceMembership:ip(e)}}function ii(e,t){let n=ui(t),s=new Map((e?.groupOrder||[]).map(a=>[a,[]]));for(let a of e?.
+sessionById,sourceMembership:cp(e)}}function ci(e,t){let n=di(t),s=new Map((e?.groupOrder||[]).map(a=>[a,[]]));for(let a of e?.
 sessionOrder||[]){let i=e.groupBySession?.[a];if(!i||!s.has(i))continue;let c=n.sessionById[a]||e.fallbackSessionById?.[a];
 c&&s.get(i).push(c)}return(e?.groupOrder||[]).map(a=>({...n.groupMeta[a]||e.groupMeta?.[a]||{key:a},key:a,sessions:s.get(
-a)||[]})).filter(a=>a.sessions.length>0)}function ep(e,t,n={}){let s=_h(t,n,e);if(!hh(gh(e),s))return!0;let a=ui(t);return Object.
-entries(a.groupBySession).some(([i,c])=>e.groupBySession?.[i]!==c)}function cp(e,t,n={}){let s=e?.version===1?e:Vr(t,n),
-a=ip(t);if((s.sessionOrder||[]).length===0&&a){let v=Vr(t,{...n,revision:Number(s.revision||0)+1});return{ledger:v,groups:ii(
-v,t),orderChanged:!1,structuralChanged:!0,deferred:!1}}if(a===s.sourceMembership)return{ledger:s,groups:ii(s,t),orderChanged:ep(
-s,t,n),structuralChanged:!1,deferred:!1};if(n.freezeStructure)return{ledger:s,groups:ii(s,t),orderChanged:!0,structuralChanged:!0,
-deferred:!0};let i=ui(t),c=new Set(Object.keys(i.sessionById)),u=[...s.historicalSessionOrder||s.sessionOrder||[]],p=[...s.
+a)||[]})).filter(a=>a.sessions.length>0)}function tp(e,t,n={}){let s=_h(t,n,e);if(!hh(gh(e),s))return!0;let a=di(t);return Object.
+entries(a.groupBySession).some(([i,c])=>e.groupBySession?.[i]!==c)}function lp(e,t,n={}){let s=e?.version===1?e:Vr(t,n),
+a=cp(t);if((s.sessionOrder||[]).length===0&&a){let v=Vr(t,{...n,revision:Number(s.revision||0)+1});return{ledger:v,groups:ci(
+v,t),orderChanged:!1,structuralChanged:!0,deferred:!1}}if(a===s.sourceMembership)return{ledger:s,groups:ci(s,t),orderChanged:tp(
+s,t,n),structuralChanged:!1,deferred:!1};if(n.freezeStructure)return{ledger:s,groups:ci(s,t),orderChanged:!0,structuralChanged:!0,
+deferred:!0};let i=di(t),c=new Set(Object.keys(i.sessionById)),u=[...s.historicalSessionOrder||s.sessionOrder||[]],p=[...s.
 historicalGroupOrder||s.groupOrder||[]],b={...s.historicalGroupBySession||s.groupBySession||{}};for(let v of t||[]){let g=Jc(
 v);p.includes(g)||p.push(g);for(let _ of v.sessions||[]){let k=wn(_);k&&!u.includes(k)&&(u.push(k),b[k]=g)}}let y={},S=[],
 A=[],N={...s.groupMeta||{}},h={};for(let v of u)c.has(v)&&(S.push(v),y[v]=s.groupBySession?.[v]||b[v]||i.groupBySession[v],
 h[v]=i.sessionById[v]);for(let v of t||[]){let g=Jc(v);for(let _ of v.sessions||[]){let k=wn(_);!k||y[k]||(S.push(k),y[k]=
 g,h[k]=_,N[g]={...v,sessions:[]})}}for(let v of p)S.some(g=>y[g]===v)&&A.push(v);for(let v of S){let g=y[v];A.includes(g)||
 A.push(g)}let d={version:1,revision:Number(s.revision||0)+1,groupOrder:A,sessionOrder:S,historicalGroupOrder:p,historicalSessionOrder:u,
-historicalGroupBySession:b,groupBySession:y,groupMeta:N,fallbackSessionById:h,sourceMembership:a};return{ledger:d,groups:ii(
-d,t),orderChanged:ep(d,t,n),structuralChanged:!0,deferred:!1}}function lp(e,t,n={}){return Vr(t,{...n,previousGroupOrder:e?.
-groupOrder,previousSessionOrder:e?.sessionOrder,revision:Number(e?.revision||0)+1})}function ci(e){let t=String(e||"").trim().
+historicalGroupBySession:b,groupBySession:y,groupMeta:N,fallbackSessionById:h,sourceMembership:a};return{ledger:d,groups:ci(
+d,t),orderChanged:tp(d,t,n),structuralChanged:!0,deferred:!1}}function up(e,t,n={}){return Vr(t,{...n,previousGroupOrder:e?.
+groupOrder,previousSessionOrder:e?.sessionOrder,revision:Number(e?.revision||0)+1})}function li(e){let t=String(e||"").trim().
 replace(/\\/g,"/").replace(/\/+$/,"");return!t||t.toLowerCase()==="unknown"||!/^(?:[A-Za-z]:\/|\/\/|\/)/.test(t)?null:{key:t.
-toLowerCase(),path:t}}function up(e){return String(e||"").replace(/\\/g,"/").replace(/\/+$/,"").split("/").filter(Boolean).
-pop()||"Unscoped"}function bh(e,t){return e===t||e.startsWith(`${t}/`)}function vh(e){return up(e).toLowerCase().replace(
-/[^a-z0-9]+/g,"")}function tp(e){return`alias:${String(e||"").trim().toLowerCase().replace(/[^a-z0-9]+/g,"-")}`}function di(e){
-let t=e&&typeof e=="object"&&!Array.isArray(e)?e:{};return Object.fromEntries(Object.entries({...li,...t}).filter(([n,s])=>String(
+toLowerCase(),path:t}}function dp(e){return String(e||"").replace(/\\/g,"/").replace(/\/+$/,"").split("/").filter(Boolean).
+pop()||"Unscoped"}function bh(e,t){return e===t||e.startsWith(`${t}/`)}function vh(e){return dp(e).toLowerCase().replace(
+/[^a-z0-9]+/g,"")}function np(e){return`alias:${String(e||"").trim().toLowerCase().replace(/[^a-z0-9]+/g,"-")}`}function pi(e){
+let t=e&&typeof e=="object"&&!Array.isArray(e)?e:{};return Object.fromEntries(Object.entries({...ui,...t}).filter(([n,s])=>String(
 n).trim()&&String(s).trim()).map(([n,s])=>[String(n).trim(),String(s).trim()]))}function yh(e,t,n){let s=t&&typeof t=="o\
-bject"&&(t.group_alias||t.project_group)||null;if(typeof s=="string"&&s.trim()){let i=s.trim();return{key:tp(i),title:i}}
-if(!e)return null;let a=vh(e.path);for(let[i,c]of Object.entries(di(n)))try{if(new RegExp(i,"i").test(a))return{key:tp(c),
-title:c}}catch{}return null}function nl(e,t={},n=li){let s=Array.isArray(e)?e:[],a=s.map(u=>ci(u&&typeof u=="object"?u.project_root:
+bject"&&(t.group_alias||t.project_group)||null;if(typeof s=="string"&&s.trim()){let i=s.trim();return{key:np(i),title:i}}
+if(!e)return null;let a=vh(e.path);for(let[i,c]of Object.entries(pi(n)))try{if(new RegExp(i,"i").test(a))return{key:np(c),
+title:c}}catch{}return null}function nl(e,t={},n=ui){let s=Array.isArray(e)?e:[],a=s.map(u=>li(u&&typeof u=="object"?u.project_root:
 null)).filter(Boolean).sort((u,p)=>p.key.length-u.key.length),i=[],c=new Map;for(let u of s){let p=typeof u=="string"?u:
-u?.session_id||u?.id,b=p?t[p]:null,y=ci(u&&typeof u=="object"?u.project_root:null),S=ci(u&&typeof u=="object"?u.workspace_path:
-null)||ci(b?.file_access_scope),A=!y&&S?a.find(g=>bh(S.key,g.key)):null,N=y||A||S,h=yh(N,u,n),d=h?.key||N?.key||"unscope\
-d",v=c.get(d);v||(v={key:d,label:h?.title||(N?up(N.path):"Unscoped"),path:N?.path||null,sessions:[]},c.set(d,v),i.push(v)),
+u?.session_id||u?.id,b=p?t[p]:null,y=li(u&&typeof u=="object"?u.project_root:null),S=li(u&&typeof u=="object"?u.workspace_path:
+null)||li(b?.file_access_scope),A=!y&&S?a.find(g=>bh(S.key,g.key)):null,N=y||A||S,h=yh(N,u,n),d=h?.key||N?.key||"unscope\
+d",v=c.get(d);v||(v={key:d,label:h?.title||(N?dp(N.path):"Unscoped"),path:N?.path||null,sessions:[]},c.set(d,v),i.push(v)),
 v.sessions.push(u)}return i}var kh=new Set(["claude","claude_cli","claude-desktop","codex","codex_cli","codex-desktop","cursor","cursor_cli","gemini",
-"continue","continue_yolo","roo_code","cline","antigravity","antigravity_panel","antigravity-v2"]);function dp(e,t={},n="\
+"continue","continue_yolo","roo_code","cline","antigravity","antigravity_panel","antigravity-v2"]);function pp(e,t={},n="\
 unknown",s=!0){let a=typeof e=="string"?e:String(e?.session_id||e?.id||""),i=String(typeof e=="object"?e?.agent_type||t?.
 agent_type||"":t?.agent_type||""),c=t?.capabilities||{};return!!a&&!!s&&kh.has(i)&&n!=="disconnected"&&e?.disconnected!==
-!0&&e?.is_list_view!==!0&&c.send!==!1&&c.send_message!==!1&&c.message_send!==!1}function pp(e,t=()=>!0){let n=Array.isArray(
+!0&&e?.is_list_view!==!0&&c.send!==!1&&c.send_message!==!1&&c.message_send!==!1}function mp(e,t=()=>!0){let n=Array.isArray(
 e?.session_ids)?e.session_ids:[],s=[...new Set(n.map(u=>String(u||"").trim()).filter(Boolean))],a=typeof e?.content=="st\
 ring"?e.content.trim():"";if(s.length<1||s.length>20)return{ok:!1,error:"Select between 1 and 20 sessions"};if(!a||a.length>
 65536)return{ok:!1,error:"Prompt must contain 1-65536 characters"};let i=`SEND TO ${s.length} SESSIONS`;if(e?.confirmation!==
 i)return{ok:!1,error:"Broadcast confirmation does not match the selected session count"};let c=s.filter(u=>!t(u));return c.
 length?{ok:!1,error:"One or more selected sessions cannot receive messages",unsupported:c}:{ok:!0,sessionIds:s,content:a,
-confirmation:i}}function mp(e){return Object.fromEntries(e.map(t=>[t,{status:"queued",error:null}]))}var{useEffect:fp,useLayoutEffect:wh,useRef:pi,useState:sl}=React,ca=12,gp=10,al=360,hp=210,Nh=450;function Sh(e,t,n){return Math.
+confirmation:i}}function fp(e){return Object.fromEntries(e.map(t=>[t,{status:"queued",error:null}]))}var{useEffect:gp,useLayoutEffect:wh,useRef:mi,useState:sl}=React,ca=12,hp=10,al=360,_p=210,Nh=450;function Sh(e,t,n){return Math.
 min(Math.max(e,t),Math.max(t,n))}function Ch(e){return`title-disclosure-${String(e||"title").replace(/[^a-z0-9_-]+/gi,"-")}`}
-function mi({title:e,disclosureKey:t,kind:n="title",wrapperClassName:s,triggerClassName:a,disclosureClassName:i,triggerLabel:c,
-triggerTag:u="button"}){let p=pi(null),b=pi(null),y=pi(null),S=pi({focused:!1,hovered:!1,latched:!1}),[A,N]=sl(!1),[h,d]=sl(
+function fi({title:e,disclosureKey:t,kind:n="title",wrapperClassName:s,triggerClassName:a,disclosureClassName:i,triggerLabel:c,
+triggerTag:u="button"}){let p=mi(null),b=mi(null),y=mi(null),S=mi({focused:!1,hovered:!1,latched:!1}),[A,N]=sl(!1),[h,d]=sl(
 !1),[v,g]=sl(null),_=Ch(`${n}-${t}`),k=u;function T(){let z=S.current;N(z.focused||z.hovered||z.latched)}function L({restoreFocus:z=!1}={}){
 S.current={focused:!1,hovered:!1,latched:!1},d(!1),g(null),N(!1),z&&p.current?.focus({preventScroll:!0})}function H(){S.
-current.latched=!0,d(!0),N(!0)}function V(){y.current&&(clearTimeout(y.current),y.current=null)}fp(()=>()=>V(),[]),fp(()=>{
+current.latched=!0,d(!0),N(!0)}function V(){y.current&&(clearTimeout(y.current),y.current=null)}gp(()=>()=>V(),[]),gp(()=>{
 if(!A||!h)return;let z=oe=>{p.current?.contains(oe.target)||b.current?.contains(oe.target)||L()};return document.addEventListener(
 "pointerdown",z,!0),()=>document.removeEventListener("pointerdown",z,!0)},[A,h]),wh(()=>{if(!A)return;let z=null,oe=()=>{
 z=null;let Y=p.current,ve=b.current;if(!Y||!ve)return;let he=Y.getBoundingClientRect();if(he.bottom<=0||he.top>=window.innerHeight||
 he.right<=0||he.left>=window.innerWidth){L();return}let X=window.innerWidth,me=window.innerHeight,J=document.querySelector(
 ".sidebar")?.getBoundingClientRect(),W=window.matchMedia?.("(pointer: coarse)")?.matches===!0||X<=640,G=Math.max(he.right,
-J?.right||he.right),$=X-G-gp-ca,P=ve.getBoundingClientRect().height;if(!W&&$>=hp){let B=Math.min(al,$),te=Sh(he.top,ca,me-
-P-ca);g({mode:"right",left:G+gp,top:te,width:B});return}g({mode:"sheet",bottom:ca,left:ca,width:Math.min(al,X-ca*2)})},_e=()=>{
+J?.right||he.right),$=X-G-hp-ca,P=ve.getBoundingClientRect().height;if(!W&&$>=_p){let B=Math.min(al,$),te=Sh(he.top,ca,me-
+P-ca);g({mode:"right",left:G+hp,top:te,width:B});return}g({mode:"sheet",bottom:ca,left:ca,width:Math.min(al,X-ca*2)})},_e=()=>{
 z===null&&(z=requestAnimationFrame(oe))};return _e(),window.addEventListener("resize",_e),document.addEventListener("scr\
 oll",_e,!0),()=>{z!==null&&cancelAnimationFrame(z),window.removeEventListener("resize",_e),document.removeEventListener(
 "scroll",_e,!0)}},[A,e]);let ne={ref:p,className:a,role:u==="button"?void 0:"button",type:u==="button"?"button":void 0,tabIndex:u===
@@ -1540,8 +1541,8 @@ H())}},ee=v||{mode:"measuring",left:-1e4,top:ca,width:al},re=A&&ReactDOM.createP
 className:`title-disclosure-portal ${i||""}`.trim(),role:"tooltip","data-title-disclosure-for":t,"data-title-disclosure-\
 kind":n,"data-placement":ee.mode,style:{left:`${ee.left}px`,top:ee.top==null?"auto":`${ee.top}px`,bottom:ee.bottom==null?
 "auto":`${ee.bottom}px`,width:ee.mode==="sheet"?`${ee.width}px`:"max-content",maxWidth:`${ee.width}px`,minWidth:`${Math.
-min(hp,ee.width)}px`}},e),document.body);return React.createElement("div",{className:s},React.createElement(k,{...ne},e),
-re)}var _p={schema_version:1,asset_set_version:"2026-07-16.1",retrieved_date:"2026-07-16",policy:{purpose:"First-party provi\
+min(_p,ee.width)}px`}},e),document.body);return React.createElement("div",{className:s},React.createElement(k,{...ne},e),
+re)}var bp={schema_version:1,asset_set_version:"2026-07-16.1",retrieved_date:"2026-07-16",policy:{purpose:"First-party provi\
 der identification in Remote Agent Chat usage surfaces.",brand_use:"Identification only; no endorsement is implied. Prov\
 ider marks remain subject to each owner's brand and trademark terms and are not relicensed by this repository.",network:"\
 Applications render only vendored files. No provider mark is hotlinked at runtime.",svg_safety:"Every SVG is reduced to \
@@ -1607,9 +1608,9 @@ lama-light.png",dark_tint:"CSS invert(1)"},android:{light:"ollama-light.png",dar
 monochrome:"official black raster with deterministic white theme tint"},files:[{file:"ollama-light.png",media_type:"imag\
 e/png",sha256:"5c5528504c307d34af504f39bc4e7007d2f6f31ee00dab699cc91584d1af8aca",source_sha256:"5c5528504c307d34af504f39\
 bc4e7007d2f6f31ee00dab699cc91584d1af8aca",transformations:["renamed only","white dark-theme treatment is applied at rend\
-er time without modifying source pixels"]}]}]};var Ah=Object.freeze(Object.fromEntries(_p.providers.map(e=>[e.provider_id,Object.freeze({accessibleName:e.accessible_name,
+er time without modifying source pixels"]}]}]};var Ah=Object.freeze(Object.fromEntries(bp.providers.map(e=>[e.provider_id,Object.freeze({accessibleName:e.accessible_name,
 light:`/provider-assets/${e.render.web.light}`,dark:`/provider-assets/${e.render.web.dark}`,darkTint:e.render.web.dark_tint||
-""})])));function Rh(e){return Ah[String(e||"")]||null}function fi({providerId:e,providerName:t}){let n=Rh(e),[s,a]=React.
+""})])));function Rh(e){return Ah[String(e||"")]||null}function gi({providerId:e,providerName:t}){let n=Rh(e),[s,a]=React.
 useState(!1);React.useEffect(()=>a(!1),[e]);let i=n?.accessibleName||String(t||"Unknown provider");return!n||s?React.createElement(
 "span",{className:"usage-dashboard-provider-mark usage-dashboard-provider-mark-fallback","data-provider-mark-id":e,role:"\
 img","aria-label":`${i} provider mark unavailable`},React.createElement("span",{"aria-hidden":"true"},i)):React.createElement(
@@ -1622,9 +1623,9 @@ codex",claude:"anthropic-claude","claude-desktop":"anthropic-claude",claude_cli:
 c-claude",cursor:"cursor",cursor_cli:"cursor",antigravity:"google-antigravity",antigravity_panel:"google-antigravity","a\
 ntigravity-v2":"google-antigravity",gemini:"google-antigravity",ollama:"ollama-local"}),Th=Object.freeze({"openai-codex":"\
 OpenAI Codex","anthropic-claude":"Anthropic Claude",cursor:"Cursor","google-antigravity":"Google Antigravity","ollama-lo\
-cal":"Ollama"});function bt(e,t=160){return String(e??"").replace(/\s+/g," ").trim().slice(0,t)}function gi(e){return bt(
+cal":"Ollama"});function bt(e,t=160){return String(e??"").replace(/\s+/g," ").trim().slice(0,t)}function hi(e){return bt(
 e).toLowerCase().replace(/[^a-z0-9]+/g,"")}function Yr(e){let t=Number(e);return Number.isFinite(t)?t:null}function $h(e,t){
-return bt(e?.agent_type||e?.agentType||t?.agent_type||t?.agentType,80)}function vp(e,t){return bt(e?.usage_billing_provider_id||
+return bt(e?.agent_type||e?.agentType||t?.agent_type||t?.agentType,80)}function yp(e,t){return bt(e?.usage_billing_provider_id||
 e?.billing_provider_id||e?.provider_usage?.provider_id||t?.usage_billing_provider_id||t?.billing_provider_id,80)}function Eh(e,t){
 return bt(e?.usage_account_fingerprint||e?.provider_account_fingerprint||e?.provider_usage?.account_fingerprint||t?.usage_account_fingerprint,
 96)}function Lh(e,t){return bt(e?.usage_quota_domain||e?.provider_quota_domain||e?.provider_usage?.quota_domain||t?.usage_quota_domain,
@@ -1635,11 +1636,11 @@ toLowerCase();return/claude|anthropic/.test(a)?"Anthropic":/gemini|google/.test(
 test(a)?"OpenAI":/ollama|qwen|gemma|llama|mistral/.test(a)?"Ollama/runtime-defined":e.id?"Unknown model vendor":"Not rep\
 orted"}function Oh(e,t){let n=bt(e?.usage_runtime_kind||e?.ollama_runtime_kind||e?.model_runtime_kind||t?.usage_runtime_kind||
 t?.ollama_runtime_kind||t?.model_runtime_kind,32).toLowerCase();return n==="local"||n==="cloud"?n:""}function Ih(e,t){if(!e.
-id||!t)return!1;let n=[gi(e.id),gi(e.label)].filter(Boolean),s=[gi(t.id),gi(t.label)].filter(Boolean);return s.length===
+id||!t)return!1;let n=[hi(e.id),hi(e.label)].filter(Boolean),s=[hi(t.id),hi(t.label)].filter(Boolean);return s.length===
 0?!1:s.some(a=>n.some(i=>i===a||i.includes(a)||a.includes(i)))}function rl(e){let t=Yr(e?.remainingPercent);if(t!=null)return t;
-let n=Yr(e?.usedPercent);return n==null?null:100-n}function bp(e,t){let n=rl(e),s=rl(t);if(n!=null&&s!=null&&n!==s)return n-
+let n=Yr(e?.usedPercent);return n==null?null:100-n}function vp(e,t){let n=rl(e),s=rl(t);if(n!=null&&s!=null&&n!==s)return n-
 s;if(n!=null)return-1;if(s!=null)return 1;let a=Yr(e?.durationMinutes),i=Yr(t?.durationMinutes);return a!=null&&i!=null&&
-a!==i?a-i:bt(e?.label).localeCompare(bt(t?.label))}function Dh(e,t,n){let s=$h(e,t),a=Ph(e,t),i=vp(e,t)||Mh[s]||"";return{
+a!==i?a-i:bt(e?.label).localeCompare(bt(t?.label))}function Dh(e,t,n){let s=$h(e,t),a=Ph(e,t),i=yp(e,t)||Mh[s]||"";return{
 supported:!!i,state:i?"unavailable":"unsupported",tone:"unavailable",message:i?"Usage account unavailable":"No provider \
 usage mapping",billingProviderId:i,billingProviderName:Th[i]||i||"Provider",providerMarkId:i,harnessSurface:s,modelId:a.
 id,modelLabel:a.label,modelVendor:qh(a,e,t),accountFingerprint:"",accountLabel:"",quotaDomain:"",plan:"",mappingConfidence:"\
@@ -1648,14 +1649,14 @@ le",40),source:"",error:null,applicableWindows:[],headerWindows:[],credits:null,
 runtimeKind:i==="ollama-local"?Oh(e,t):""}}function jh(e,t,n,s){let a=Array.isArray(s?.entries)?s.entries:[],i=Eh(t,n),c=Lh(
 t,n),u=e.billingProviderId?a.filter(p=>p?.providerId===e.billingProviderId):a.filter(p=>Array.isArray(p?.harnessTypes)&&
 p.harnessTypes.includes(e.harnessSurface));return i&&(u=u.filter(p=>p?.accountFingerprint===i)),c&&(u=u.filter(p=>p?.quotaDomain===
-c)),u.length===1?{entry:u[0],confidence:i||c?"explicit_account":vp(t,n)?"explicit_provider":"unique_provider_account"}:u.
+c)),u.length===1?{entry:u[0],confidence:i||c?"explicit_account":yp(t,n)?"explicit_provider":"unique_provider_account"}:u.
 length>1?{entry:null,confidence:"ambiguous",candidates:u}:{entry:null,confidence:i||c?"linked_account_unavailable":"unav\
-ailable",candidates:u}}function yp(e,t,n,s=Date.now()){let a=Dh(e,t,n);if(!a.supported)return a;let i=jh(a,e,t,n);if(!i.
+ailable",candidates:u}}function kp(e,t,n,s=Date.now()){let a=Dh(e,t,n);if(!a.supported)return a;let i=jh(a,e,t,n);if(!i.
 entry)return{...a,state:i.confidence==="ambiguous"?"ambiguous":"unavailable",message:i.confidence==="ambiguous"?"Usage a\
 ccount ambiguous":"Usage account unavailable",mappingConfidence:i.confidence};let c=i.entry,u=Date.parse(c.staleAfter||""),
 b=Number.isFinite(u)&&u<=s&&c.status==="fresh"?"stale":bt(c.status||"unavailable",40),y={id:a.modelId,label:a.modelLabel},
 S=Array.isArray(c.windows)?c.windows.filter(T=>T&&T.usedPercent!=null):[],A=S.filter(T=>T.modelScope&&Ih(y,T.modelScope)).
-sort(bp),N=S.filter(T=>!T.modelScope).sort(bp),h=[...A,...N],d=A.length>0?[A[0],N[0]].filter(Boolean):N.slice(0,2),v=a.runtimeKind;
+sort(vp),N=S.filter(T=>!T.modelScope).sort(vp),h=[...A,...N],d=A.length>0?[A[0],N[0]].filter(Boolean):N.slice(0,2),v=a.runtimeKind;
 if(a.billingProviderId==="ollama-local"){if(!v)return{...a,billingProviderName:c.providerName||a.billingProviderName,accountFingerprint:c.
 accountFingerprint,accountLabel:c.accountLabel,quotaDomain:c.quotaDomain,plan:c.plan,mappingConfidence:i.confidence,capturedAt:c.
 capturedAt,staleAfter:c.staleAfter,freshness:b,source:c.source,state:"ambiguous",message:"Ollama runtime unavailable",cloudUsage:c.
@@ -1672,9 +1673,9 @@ accountLabel:c.accountLabel,quotaDomain:c.quotaDomain,plan:c.plan,mappingConfide
 staleAfter:c.staleAfter,freshness:b,source:c.source,error:c.error,applicableWindows:h,headerWindows:d,credits:c.credits,
 financials:c.financials,cloudUsage:c.cloudUsage,localRuntime:c.localRuntime}}function ol(e){let t=bt(e?.label||"Usage",60),
 n=rl(e);return{label:t,usedPercent:Yr(e?.usedPercent),remainingPercent:n,compactValue:n==null?"Unavailable":`${Math.max(
-0,Math.round(n))}% left`,reset:bt(e?.resetDescription||e?.resetsAt,120),tone:bt(e?.tone||"unavailable",24)}}var rm=vf($p()),{goalLifecycleSupported:d_,latestUserRequestFromMessages:p_,projectFleetWorkContext:m_}=rm.default,{useState:ue,
-useRef:Me,useEffect:Te,useLayoutEffect:us}=React,Ep="remote-agent-chat:drafts:v1",Lp="remote-agent-chat:show-test-sessio\
-ns:v1",f_=120,g_=500,h_=160,__=256*1024,Pp=Object.freeze([]),b_=[{command:"/plan",detail:"Outline the implementation app\
+0,Math.round(n))}% left`,reset:bt(e?.resetDescription||e?.resetsAt,120),tone:bt(e?.tone||"unavailable",24)}}var om=yf(Ep()),{goalLifecycleSupported:d_,latestUserRequestFromMessages:p_,projectFleetWorkContext:m_}=om.default,{useState:ue,
+useRef:Me,useEffect:Te,useLayoutEffect:us}=React,Lp="remote-agent-chat:drafts:v1",Pp="remote-agent-chat:show-test-sessio\
+ns:v1",f_=120,g_=500,h_=160,__=256*1024,qp=Object.freeze([]),b_=[{command:"/plan",detail:"Outline the implementation app\
 roach and major steps."},{command:"/review",detail:"Review the current changes for bugs, regressions, and missing tests."},
 {command:"/fix",detail:"Implement or repair the current issue."},{command:"/summarize",detail:"Summarize the current sta\
 te and important changes."}],Nn={claude:{name:"Claude Code",color:"#cc785c",abbr:"CC",logo:"/logo-claude-in-ag.svg"},claude_cli:{
@@ -1695,14 +1696,14 @@ if(Array.isArray(e))return e.map(t=>typeof t=="string"?t:!t||typeof t!="object"?
 content=="string"?t.content:typeof t.url=="string"?t.url:typeof t.image_url=="string"?t.image_url:"").filter(Boolean).join(
 " ");if(e&&typeof e=="object"){if(typeof e.text=="string")return e.text;if(typeof e.content=="string")return e.content;if(typeof e.
 url=="string")return e.url;if(typeof e.image_url=="string")return e.image_url;try{return JSON.stringify(e)}catch{return""}}
-return""}function om(e){let t=typeof e=="string"?e:ae(e),n=2166136261;for(let s=0;s<t.length;s++)n^=t.charCodeAt(s),n=Math.
+return""}function im(e){let t=typeof e=="string"?e:ae(e),n=2166136261;for(let s=0;s<t.length;s++)n^=t.charCodeAt(s),n=Math.
 imul(n,16777619);return(n>>>0).toString(36)}function Cl(e,t=0){if(!e||typeof e!="object")return`empty:${t}`;if(e._cid)return`\
 cid:${e._cid}`;if(e.source_message_id)return`source:${e.source_message_id}`;if(e.native_source_id)return`native:${e.native_source_id}`;
 if(e.id!=null)return`id:${e.id}`;if(e.server_message_id!=null)return`server:${e.server_message_id}`;if(e.client_msg_id)return`\
 client:${e.client_msg_id}`;if(e.sequence!=null)return`seq:${e.sequence}`;let n=Ct(e.content)||no(e.content_blocks),s=Array.
-isArray(e.content_blocks)?JSON.stringify(e.content_blocks):"";return["body",e.role||"",e.ts||"",om(`${n}
+isArray(e.content_blocks)?JSON.stringify(e.content_blocks):"";return["body",e.role||"",e.ts||"",im(`${n}
 ${s}`)].join(":")}function k_(e){let t=Ct(e?.content)||no(e?.content_blocks),n=Array.isArray(e?.content_blocks)?JSON.stringify(
-e.content_blocks):"";return om(`${t}
+e.content_blocks):"";return im(`${t}
 ${n}`)}function w_(e){return e?.role==="user"?"user":cr(e?.content_blocks)[0]?.type||"markdown"}function ul(e){return(Array.
 isArray(e)?e:[]).map((n,s)=>Cl(n,s))}function nn(e,t){if(!e)return;let n=e.style.scrollBehavior;e.style.scrollBehavior="\
 auto",e.scrollTop=t,requestAnimationFrame(()=>{e.style.scrollBehavior==="auto"&&(e.style.scrollBehavior=n)})}function N_(e){
@@ -1715,7 +1716,7 @@ ${a}
 \`\`\``}}return n==="file_change"?{...t,type:"file_changes"}:n==="tool"?{...t,type:"tool_call"}:n==="tool_output"||n==="\
 result"?{...t,type:"tool_result"}:n==="thought"?{...t,type:"thinking"}:n==="task_list"?{...t,type:"plan"}:n==="queue"||n===
 "queued"?{...t,type:"queued_message"}:n==="banner"||n==="notification"?{...t,type:"notice"}:n==="worked"||n==="activity"?
-{...t,type:"status"}:t}):[]}function im(e){if(!e||typeof e!="object")return"";let t=[e.workdir?`cwd: ${e.workdir}`:null,
+{...t,type:"status"}:t}):[]}function cm(e){if(!e||typeof e!="object")return"";let t=[e.workdir?`cwd: ${e.workdir}`:null,
 e.command?`$ ${e.command}`:null,e.stdout||null,e.stderr?`stderr:
 ${e.stderr}`:null,e.exit_code!=null?`exit code: ${e.exit_code}`:null].filter(Boolean);if(t.length)return t.join(`
 
@@ -1727,7 +1728,7 @@ s.removed!=null?`-${s.removed}`:""].filter(Boolean).join(" ")).filter(Boolean).j
 state||s?.status||"pending").trim();return a?`[${i}] ${a}`:""}).filter(Boolean).join(`
 `);return[e.content||"",n].filter(Boolean).join(`
 `)}return e.content||e.text||e.markdown||e.title||e.label||""}function C_(e){return e?S_(e.content)?!0:cr(e.content_blocks).
-some(t=>Ct(im(t)).trim().length>0):!1}function no(e){return cr(e).map(t=>Ct(im(t))).filter(Boolean).join(`
+some(t=>Ct(cm(t)).trim().length>0):!1}function no(e){return cr(e).map(t=>Ct(cm(t))).filter(Boolean).join(`
 
 `)}function js({actions:e}){return!Array.isArray(e)||e.length===0?null:React.createElement("div",{className:"content-blo\
 ck-actions"},e.map((t,n)=>React.createElement("span",{key:t.id||n,className:`content-block-action-label${t.unsupported?"\
@@ -1807,62 +1808,62 @@ summary:React.createElement(React.Fragment,null,React.createElement("span",{clas
 createElement(js,{actions:d.actions})):g==="prompt"||g==="error"?React.createElement("div",{key:v,className:`content-blo\
 ck content-block-${g}`},React.createElement("div",{className:"content-block-title"},_||g),k&&h(k,v),React.createElement(
 js,{actions:d.actions})):React.createElement("div",{key:v,className:"content-block content-block-markdown"},h(k||_,v))}))}
-function dl(e){let t=Ct(e).trim();return!(!t||t.length<4||/^[\s*._|`~•·▌]+$/.test(t)||!/[A-Za-z0-9]/.test(t))}function Ci({
+function dl(e){let t=Ct(e).trim();return!(!t||t.length<4||/^[\s*._|`~•·▌]+$/.test(t)||!/[A-Za-z0-9]/.test(t))}function xi({
 message:e=null,instant:t=null}){let n=t==null?Xa(e):In(t);if(!n)return React.createElement("span",{className:"message-ti\
 mestamp message-timestamp-unknown","aria-label":"Sent time unknown",title:"Sent time unknown"},"Time unknown");let s=Vu(
-n);return React.createElement("time",{className:"message-timestamp",dateTime:n.iso,title:s,"aria-label":`Sent ${s}`},xc(
+n);return React.createElement("time",{className:"message-timestamp",dateTime:n.iso,title:s,"aria-label":`Sent ${s}`},Ac(
 n))}function T_(e){return typeof e=="string"&&/^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.
-test(e)}function qp(e){if(!e)return _l;let t=e.split("-")[0].toLowerCase();return Nn[t]||_l}function ua(e){let t=ae(e).toLowerCase();
+test(e)}function Op(e){if(!e)return _l;let t=e.split("-")[0].toLowerCase();return Nn[t]||_l}function ua(e){let t=ae(e).toLowerCase();
 return t?t.includes("roo code")||t.includes("roo_code")||t.includes("roo-cline")?"roo_code":t.includes("cline")||t.includes(
 "claude-dev")?"cline":t.includes("continue yolo")||t.includes("continue_yolo")?"continue_yolo":t.includes("continue")?"c\
 ontinue":t.includes("codex cli")||t.includes("codex_cli")?"codex_cli":t.includes("codex desktop")?"codex-desktop":t.includes(
 "cursor cli")||t.includes("cursor_cli")?"cursor_cli":/\bcursor\b/.test(t)||t==="cursor"||t.includes("cursor ide")?"curso\
 r":t.includes("codex")?"codex":t.includes("claude code")||t.includes("claude")?"claude":t.includes("antigravity chat")||
 t.includes("antigravity_panel")?"antigravity_panel":t.includes("antigravity-v2")||t.includes("antigravity v2")?"antigrav\
-ity-v2":null:null}function Op(e){if(e&&typeof e=="object"){let t=e.agent_type;return Nn[t]?t:ua(e.display_name)||ua(e.agent_type)||
+ity-v2":null:null}function Ip(e){if(e&&typeof e=="object"){let t=e.agent_type;return Nn[t]?t:ua(e.display_name)||ua(e.agent_type)||
 ua(e.session_title)||ua(e.window_title)||ua(e.chat_title)||ua(e.session_id)}if(typeof e=="string"){let t=e.split("-")[0].
 toLowerCase();return Nn[t]?t:ua(e)}return null}function $e(e){return typeof e=="string"?e:e?.session_id}function ir(e,t){
-if(e&&typeof e=="object"){let s=Op(e);return Nn[s]||qp(e.session_id)}let n=Op(e);return Nn[n]||qp(e)}function or(e,t,n){
+if(e&&typeof e=="object"){let s=Ip(e);return Nn[s]||Op(e.session_id)}let n=Ip(e);return Nn[n]||Op(e)}function or(e,t,n){
 if(e&&typeof e=="object"){let i=H_(e,n),c=n?.file_access_scope?n.file_access_scope.replace(/\\/g,"/").split("/").filter(
 Boolean).pop():null,u=e.agent_type==="antigravity_panel"&&e.panel_title?` / ${e.panel_title}`:"",p=(i?.label||e.workspace_name||
 c||e.window_title||e.workspace_path||t||"Session")+u;return e.chat_title&&!p.includes("/")?`${p} / ${e.chat_title}`:p}let s=t||
-e;return typeof s!="string"?"Session":T_(s)?"Connected session":s.split("-").slice(1).join("-")||s}function cm(e){let t=ae(
-e).replace(/\\/g,"/").replace(/\/+$/,"").trim();return t?t.split("/").filter(Boolean).pop()||t:""}function Ai(e){return ae(
-e).replace(/\\/g,"/").replace(/\/+$/,"").trim()}function lm(e){let t=Ai(e);return/^[A-Za-z]:\//.test(t)||t.startsWith("/\
-/")||t.startsWith("/")}function $_(e){let t=Ai(e).toLowerCase();return/^[a-z]:\/users\/[^/]+$/.test(t)||/^[a-z]:\/users\/[^/]+\/documents$/.
-test(t)||/^\/users\/[^/]+$/.test(t)||/^\/users\/[^/]+\/documents$/.test(t)||/^\/home\/[^/]+$/.test(t)}function E_(e){let t=Ai(
+e;return typeof s!="string"?"Session":T_(s)?"Connected session":s.split("-").slice(1).join("-")||s}function lm(e){let t=ae(
+e).replace(/\\/g,"/").replace(/\/+$/,"").trim();return t?t.split("/").filter(Boolean).pop()||t:""}function Ri(e){return ae(
+e).replace(/\\/g,"/").replace(/\/+$/,"").trim()}function um(e){let t=Ri(e);return/^[A-Za-z]:\//.test(t)||t.startsWith("/\
+/")||t.startsWith("/")}function $_(e){let t=Ri(e).toLowerCase();return/^[a-z]:\/users\/[^/]+$/.test(t)||/^[a-z]:\/users\/[^/]+\/documents$/.
+test(t)||/^\/users\/[^/]+$/.test(t)||/^\/users\/[^/]+\/documents$/.test(t)||/^\/home\/[^/]+$/.test(t)}function E_(e){let t=Ri(
 e),n=t.match(/^[A-Za-z]:\/Users\/([^/]+)(?:\/|$)/i);if(n)return n[1];let s=t.match(/^\/(?:Users|home)\/([^/]+)(?:\/|$)/i);
 return s?s[1]:""}function L_(e,t){let n=E_(t);return!!n&&ae(e).trim().toLowerCase()===n.toLowerCase()}function xl(e){return ae(
 e).replace(/\s+\(Workspace\)$/i,"").replace(/\s+-\s+(?:Visual Studio Code|Code|Cursor|Antigravity)(?:\s*\[[^\]]+\]|\s+(?:Administrator|Admin))?$/i,
-"").trim()}function um(e){let t=ae(e).trim();return/^(?:Visual Studio Code|Code|Cursor|Antigravity)(?:\s*\[[^\]]+\]|\s+(?:Administrator|Admin))?$/i.
+"").trim()}function dm(e){let t=ae(e).trim();return/^(?:Visual Studio Code|Code|Cursor|Antigravity)(?:\s*\[[^\]]+\]|\s+(?:Administrator|Admin))?$/i.
 test(t)}function P_(e){return/\s+-\s+(?:Visual Studio Code|Code|Cursor|Antigravity)(?:\s*\[[^\]]+\]|\s+(?:Administrator|Admin))?\s*$/i.
-test(ae(e))}function dm(e){let t=ae(e).trim();if(!t)return[];let n=t.split(/\s+-\s+/).map(s=>xl(s)).filter(Boolean);for(;n.
-length&&um(n[n.length-1]);)n.pop();return n}var q_=/\b(?:image|screenshot|screen\s*shot|capture)[\w .()[\]-]*\.(?:png|jpe?g|gif|webp|bmp|svg)(?:\b|[\s._-]*\d{2,}(?:\s*[x\u00d7]\s*\d{2,})?|[\s._-]*[a-z0-9]{3,})/i,
-O_=/(?:[A-Za-z]:[\\/]|\\\\[^\\/\s]+[\\/]|\/(?:Users|home|mnt|var|tmp|etc|opt|workspace|workspaces)\/)[^\s"'`<>)]{2,}/i,pm=new Set(
+test(ae(e))}function pm(e){let t=ae(e).trim();if(!t)return[];let n=t.split(/\s+-\s+/).map(s=>xl(s)).filter(Boolean);for(;n.
+length&&dm(n[n.length-1]);)n.pop();return n}var q_=/\b(?:image|screenshot|screen\s*shot|capture)[\w .()[\]-]*\.(?:png|jpe?g|gif|webp|bmp|svg)(?:\b|[\s._-]*\d{2,}(?:\s*[x\u00d7]\s*\d{2,})?|[\s._-]*[a-z0-9]{3,})/i,
+O_=/(?:[A-Za-z]:[\\/]|\\\\[^\\/\s]+[\\/]|\/(?:Users|home|mnt|var|tmp|etc|opt|workspace|workspaces)\/)[^\s"'`<>)]{2,}/i,mm=new Set(
 ["agent","agent manager","agent session","antigravity","antigravity chat","antigravity v2","claude","claude code","codex",
-"codex cli","codex desktop","connected session","other","session","unknown"]),I_=new Set(Array.from(pm,e=>e.replace(/[^a-z0-9]+/g,
-"")));function mm(e){let t=xl(e);if(!t)return"";let n=cm(t),s=/[-_]/.test(n),a=n.replace(/[-_]+/g," ");return(s||!/\s/.test(
-n))&&(a=a.replace(/([a-z])([A-Z])/g,"$1 $2")),a.replace(/\s+/g," ").trim()}function D_(e){let t=mm(e).toLowerCase();if(!t||
-/^window\s+\d+$/.test(t)||um(t)||pm.has(t))return!0;let n=t.replace(/[^a-z0-9]+/g,"");return I_.has(n)}function j_(e,t){
-return ae(e).toLowerCase()===ae(t).toLowerCase()}function Al(e,t){let n=mm(e);return D_(n)?null:{label:n,key:ae(t||n).replace(
-/\\/g,"/").replace(/\/+$/,"").toLowerCase()}}function Ip(e){let t=Ai(e);return!t||!lm(t)||$_(t)?null:Al(cm(t),t)}function Dp(e){
-let t=dm(e);return t.length<2?null:Al(t[t.length-1],t[t.length-1])}function B_(e){let t=ae(e);if(P_(t))return null;let n=xl(
-e);return!n||lm(n)||dm(n).length>=2?null:Al(n,n)}function F_(e){let t=ae(e).toLowerCase().trim();return[t,t.replace(/\s+/g,
-"-"),t.replace(/\s+/g,"")].filter(Boolean)}function jp(e,t=[]){let n=e.map(a=>ae(a).toLowerCase()).filter(Boolean),s=[...t].
+"codex cli","codex desktop","connected session","other","session","unknown"]),I_=new Set(Array.from(mm,e=>e.replace(/[^a-z0-9]+/g,
+"")));function fm(e){let t=xl(e);if(!t)return"";let n=lm(t),s=/[-_]/.test(n),a=n.replace(/[-_]+/g," ");return(s||!/\s/.test(
+n))&&(a=a.replace(/([a-z])([A-Z])/g,"$1 $2")),a.replace(/\s+/g," ").trim()}function D_(e){let t=fm(e).toLowerCase();if(!t||
+/^window\s+\d+$/.test(t)||dm(t)||mm.has(t))return!0;let n=t.replace(/[^a-z0-9]+/g,"");return I_.has(n)}function j_(e,t){
+return ae(e).toLowerCase()===ae(t).toLowerCase()}function Al(e,t){let n=fm(e);return D_(n)?null:{label:n,key:ae(t||n).replace(
+/\\/g,"/").replace(/\/+$/,"").toLowerCase()}}function Dp(e){let t=Ri(e);return!t||!um(t)||$_(t)?null:Al(lm(t),t)}function jp(e){
+let t=pm(e);return t.length<2?null:Al(t[t.length-1],t[t.length-1])}function B_(e){let t=ae(e);if(P_(t))return null;let n=xl(
+e);return!n||um(n)||pm(n).length>=2?null:Al(n,n)}function F_(e){let t=ae(e).toLowerCase().trim();return[t,t.replace(/\s+/g,
+"-"),t.replace(/\s+/g,"")].filter(Boolean)}function Bp(e,t=[]){let n=e.map(a=>ae(a).toLowerCase()).filter(Boolean),s=[...t].
 sort((a,i)=>i.label.length-a.label.length);for(let a of s){let i=F_(a.label);if(n.some(c=>i.some(u=>u&&c.includes(u))))return a}
-return null}function H_(e,t,n=[]){if(!e||typeof e!="object")return null;let s=jp([e.window_title,e.workspace_name,e.chat_title,
-e.session_title],n),a=[Ip(e.workspace_path),Ip(t?.file_access_scope),s,Dp(e.window_title),Dp(e.workspace_name),L_(e.workspace_name,
+return null}function H_(e,t,n=[]){if(!e||typeof e!="object")return null;let s=Bp([e.window_title,e.workspace_name,e.chat_title,
+e.session_title],n),a=[Dp(e.workspace_path),Dp(t?.file_access_scope),s,jp(e.window_title),jp(e.workspace_name),L_(e.workspace_name,
 e.workspace_path)?null:B_(e.workspace_name)].filter(Boolean);if(a.length>0){let u=a[0];return n.find(p=>j_(p.label,u.label))||
 u}let i=[e.chat_title,e.session_title,e.title,e.display_title,e.window_title,e.workspace_name].map(u=>ae(u).toLowerCase()).
-filter(Boolean),c=jp(i,n);return c||null}function U_(e){return Ct(e).replace(/!\[[^\]]*\]\((?:data:image\/[^)]+|\/uploads\/[^)]+|[^)]*\.(?:png|jpe?g|gif|webp|bmp|svg))\)/gi,
+filter(Boolean),c=Bp(i,n);return c||null}function U_(e){return Ct(e).replace(/!\[[^\]]*\]\((?:data:image\/[^)]+|\/uploads\/[^)]+|[^)]*\.(?:png|jpe?g|gif|webp|bmp|svg))\)/gi,
 " ").replace(/\[File:\s*[^\]]+\]/gi," ").replace(O_," ").replace(q_," ").replace(/<goal_context>[\s\S]*?<\/goal_context>/gi,
 " ").replace(/<[^>\n]{1,80}>/g," ").replace(/```[\s\S]*?```/g," ").replace(/`([^`]+)`/g,"$1").replace(/^\s*(?:user|assistant|codex|claude|tool result)\s*[:\-]\s*/i,
-"").replace(/\s+/g," ").trim()}function Zr(e,t,n,s=[]){return nd(e,e&&typeof e=="object"?e.custom_display_name:"",s)}function Bp(e){
+"").replace(/\s+/g," ").trim()}function Zr(e,t,n,s=[]){return nd(e,e&&typeof e=="object"?e.custom_display_name:"",s)}function Fp(e){
 if(!e||typeof e!="object")return null;if(e.workspace_path)return ae(e.workspace_path).toLowerCase();let t=ae(e.workspace_name||
-e.window_title||"");return t&&t.split(" / ")[0].trim().toLowerCase()||null}function W_(e,t){let n=$e(t),s=Bp(t);return s&&
-(e||[]).find(a=>a&&typeof a=="object"&&a.agent_type==="antigravity_panel"&&$e(a)!==n&&Bp(a)===s)||null}function z_(e){return!e||
+e.window_title||"");return t&&t.split(" / ")[0].trim().toLowerCase()||null}function W_(e,t){let n=$e(t),s=Fp(t);return s&&
+(e||[]).find(a=>a&&typeof a=="object"&&a.agent_type==="antigravity_panel"&&$e(a)!==n&&Fp(a)===s)||null}function z_(e){return!e||
 typeof e!="object"?"":[e.panel_title||null,e.panel_model||null,e.panel_mode||null].filter(Boolean).join(" \xB7 ")}function G_(e){return e==="claude"?"claude-document":e==="codex_cli"?"codex-terminal":e==="cursor"?"cursor-cards":e==="c\
-odex-desktop"||e==="codex"?"codex-thread":"unified-flow"}function Fp(e){return e==="codex_cli"?"codex-cli":e==="codex"||
+odex-desktop"||e==="codex"?"codex-thread":"unified-flow"}function Hp(e){return e==="codex_cli"?"codex-cli":e==="codex"||
 e==="codex-desktop"?"codex":e==="claude"||e==="claude_cli"?"claude":e==="cursor"||e==="cursor_cli"?"cursor":"default"}function K_(e,t){
 let n=ae(e).toLowerCase().replace(/\s+/g," ").trim(),s=ae(t).toLowerCase().replace(/\s+/g," ").trim();if(!s)return 0;let a=n.
 indexOf(s);if(a>=0)return 2e3-Math.min(a,500)-Math.max(0,n.length-s.length)*.01;let i=0,c=0,u=-1;for(let p of s){if(p===
@@ -1875,18 +1876,18 @@ item.working-+!!s.item.working||a.score-s.score||s.sidebarIndex-a.sidebarIndex).
 Element?!!e.closest('input, textarea, select, [contenteditable="true"], [role="textbox"]'):!1}function Y_(e,t){if(!e||!t||
 e.sessionId!==t.sessionId)return 0;let n=Math.max(0,Number(t.messageCount||0)-Number(e.messageCount||0)),s=!!t.provisionalId&&
 (t.provisionalId!==e.provisionalId||Number(t.provisionalLength||0)>Number(e.provisionalLength||0));return n+(s&&n===0?1:
-0)}function X_(e,t,n=!1){let[s,a]=React.useState(()=>Vr(e,t)),i=React.useMemo(()=>cp(s,e,{...t,freezeStructure:n}),[s,e,
-t,n]);React.useEffect(()=>{i.ledger!==s&&a(i.ledger)},[s,i]);let c=React.useCallback(()=>{a(u=>lp(u,e,t))},[e,t]);return{
-groups:i.groups,orderChanged:i.orderChanged,sortNow:c,revision:i.ledger.revision}}function Hp(e){return!e||typeof e!="ob\
+0)}function X_(e,t,n=!1){let[s,a]=React.useState(()=>Vr(e,t)),i=React.useMemo(()=>lp(s,e,{...t,freezeStructure:n}),[s,e,
+t,n]);React.useEffect(()=>{i.ledger!==s&&a(i.ledger)},[s,i]);let c=React.useCallback(()=>{a(u=>up(u,e,t))},[e,t]);return{
+groups:i.groups,orderChanged:i.orderChanged,sortNow:c,revision:i.ledger.revision}}function Up(e){return!e||typeof e!="ob\
 ject"?"":e.visible_pane_visible?[e.visible_pane_title||null,e.visible_pane_location==="right"?"Right Pane":null].filter(
-Boolean).join(" \xB7 "):z_(e)}function fm(e){let t=ae(e);return t?t.replace(/^Gemini\s+/i,"G ").replace(/^Claude\s+/i,"").
-replace(/\s*\(Thinking\)\s*/i,"").replace(/\s*\(Medium\)\s*/i,"").replace(/\s+/g," ").trim():""}function gm(e,t=3){return!Array.
-isArray(e)||e.length===0?"":e.slice(0,t).map(n=>{let s=n?.percent_used;if(s==null)return null;let a=fm(n?.model);return a?
+Boolean).join(" \xB7 "):z_(e)}function gm(e){let t=ae(e);return t?t.replace(/^Gemini\s+/i,"G ").replace(/^Claude\s+/i,"").
+replace(/\s*\(Thinking\)\s*/i,"").replace(/\s*\(Medium\)\s*/i,"").replace(/\s+/g," ").trim():""}function hm(e,t=3){return!Array.
+isArray(e)||e.length===0?"":e.slice(0,t).map(n=>{let s=n?.percent_used;if(s==null)return null;let a=gm(n?.model);return a?
 `${a} ${s}%`:null}).filter(Boolean).join(" \xB7 ")}function pl(e){return e?Nn[e]?.name||e:""}function to(e){let t=ae(e).
 trim();if(!t)return"";if(!/^\d{4}-\d{2}-\d{2}T/.test(t))return t;let n=new Date(t);return Number.isNaN(n.getTime())?t:n.
 toLocaleString([],{weekday:"short",hour:"numeric",minute:"2-digit"})}function Q_({session:e,config:t,providerUsage:n,onOpenUsage:s}){
 let[a,i]=React.useState(!1),[c,u]=React.useState(Date.now()),p=React.useRef(null),b=React.useRef(null),y=React.useMemo(()=>Kc(
-n),[n]),S=React.useMemo(()=>yp(e,t,y,c),[e,t,y,c]),A=S.headerWindows.map(ol);if(React.useEffect(()=>{if(!a)return;u(Date.
+n),[n]),S=React.useMemo(()=>kp(e,t,y,c),[e,t,y,c]),A=S.headerWindows.map(ol);if(React.useEffect(()=>{if(!a)return;u(Date.
 now());let g=setInterval(()=>u(Date.now()),3e4);return()=>clearInterval(g)},[a]),React.useEffect(()=>{if(!a)return;let g=(T=!1)=>{
 i(!1),T&&requestAnimationFrame(()=>p.current?.focus({preventScroll:!0}))},_=T=>{p.current?.contains(T.target)||b.current?.
 contains(T.target)||g(!1)},k=T=>{T.key==="Escape"&&(T.preventDefault(),g(!0))};return document.addEventListener("pointer\
@@ -1896,7 +1897,7 @@ let N=S.state==="local"?"Local":S.state==="exhausted"?"Limit":A[0]?.compactValue
 v=()=>{i(!1),s()};return React.createElement("div",{className:`session-usage-mini tone-${S.tone} state-${S.state}`,"data\
 -testid":"session-usage-mini"},React.createElement("button",{ref:p,type:"button",className:"session-usage-mini-trigger",
 "aria-expanded":a,"aria-controls":"session-usage-popover",title:`${S.billingProviderName}: ${N}`,onClick:()=>i(g=>!g)},React.
-createElement(fi,{providerId:S.providerMarkId,providerName:S.billingProviderName}),React.createElement("span",{className:"\
+createElement(gi,{providerId:S.providerMarkId,providerName:S.billingProviderName}),React.createElement("span",{className:"\
 session-usage-mini-rows"},S.state==="local"?React.createElement("span",{className:"session-usage-mini-row"},React.createElement(
 "strong",null,"Local"),React.createElement("em",null,"no plan limit")):A.length>0?A.map((g,_)=>React.createElement("span",
 {className:`session-usage-mini-row ${g.tone}`,key:`${g.label}:${_}`},React.createElement("strong",null,g.label),React.createElement(
@@ -1905,7 +1906,7 @@ session-usage-mini-rows"},S.state==="local"?React.createElement("span",{classNam
 able"},React.createElement("strong",null,"Usage"),React.createElement("em",null,S.state==="ambiguous"?"ambiguous":"unava\
 ilable"))),React.createElement("span",{className:"session-usage-mini-compact"},N)),a&&React.createElement("div",{ref:b,id:"\
 session-usage-popover",className:"session-usage-popover",role:"dialog","aria-modal":"false","aria-label":"Session usage \
-details"},React.createElement("div",{className:"session-usage-popover-heading"},React.createElement(fi,{providerId:S.providerMarkId,
+details"},React.createElement("div",{className:"session-usage-popover-heading"},React.createElement(gi,{providerId:S.providerMarkId,
 providerName:S.billingProviderName}),React.createElement("span",null,React.createElement("strong",null,S.billingProviderName),
 React.createElement("small",null,S.plan||S.message||"Usage details")),React.createElement("button",{type:"button",onClick:()=>{
 i(!1),p.current?.focus({preventScroll:!0})},"aria-label":"Close usage details"},"\xD7")),React.createElement("dl",{className:"\
@@ -1930,14 +1931,14 @@ session-usage-popover-financial"},React.createElement("strong",null,"Credits / o
 h),d.map(g=>React.createElement("span",{key:g.id},g.label,": ",g.value))),React.createElement("div",{className:"session-\
 usage-popover-source"},React.createElement("span",null,S.source||"Source unavailable"," \xB7 ",sr(S.capturedAt,c)),React.
 createElement("span",null,"Generation ",S.generation," \xB7 ",S.freshness)),React.createElement("button",{type:"button",
-className:"session-usage-open-dashboard",onClick:v},"Open Usage & limits")))}function hm(e){return!e||typeof e!="object"?
+className:"session-usage-open-dashboard",onClick:v},"Open Usage & limits")))}function _m(e){return!e||typeof e!="object"?
 "":ae(e.host_label||(e.host_type==="vscode"?"VS Code":e.host_type==="antigravity_ide"?"Antigravity IDE":""))}var J_={healthy:"\
-#3fb950",degraded:"#d29922",disconnected:"#f85149"},Up={thinking:{icon:"\u25CC",tone:"thinking"},generating:{icon:"\u2726",
+#3fb950",degraded:"#d29922",disconnected:"#f85149"},Wp={thinking:{icon:"\u25CC",tone:"thinking"},generating:{icon:"\u2726",
 tone:"thinking"},reading_files:{icon:"\u229E",tone:"info"},running_command:{icon:">",tone:"info"},applying_patch:{icon:"\
 \u0394",tone:"info"},waiting_for_user:{icon:"?",tone:"idle"},idle:{icon:"\xB7",tone:"idle"},working:{icon:"\u2022",tone:"\
 info"}};function eo({agentType:e,compact:t=!1,animate:n=!0}){let s=String(e||"default").toLowerCase(),a=n?"":" static";return s===
 "claude"||s==="claude_cli"?React.createElement("span",{className:`native-activity-spinner claude${t?" compact":""}${a}`},
-n?React.createElement(mb,null):React.createElement("span",{className:"claude-spinner-icon"},Si[0])):s==="codex"||s==="co\
+n?React.createElement(mb,null):React.createElement("span",{className:"claude-spinner-icon"},Ci[0])):s==="codex"||s==="co\
 dex-desktop"||s==="codex_cli"?React.createElement("span",{className:`native-activity-spinner codex${t?" compact":""}${a}`,
 "aria-label":"Working"},"\u25CC"):s==="cursor"?React.createElement("span",{className:`native-activity-spinner cursor${t?
 " compact":""}${a}`,"aria-label":"Generating"},React.createElement("i",null),React.createElement("i",null),React.createElement(
@@ -1970,9 +1971,9 @@ delivery launch-accepted",title:"Native launch accepted; user-turn receipt pendi
 title:"Received by relay; native receipt pending","aria-label":"Relay accepted; native receipt pending"},"\u2713"):React.
 createElement("span",{className:"delivery recorded",title:"Recorded \u2014 native delivery receipt unknown","aria-label":"\
 Recorded; native delivery receipt unknown"},"Recorded")}function eb(e,t=!1){let[n,s]=React.useState(()=>tl(e)),a=React.useMemo(
-()=>ap(n,e,{freezeStructure:t}),[n,e,t]);return React.useEffect(()=>{a.ledger!==n&&s(a.ledger)},[n,a]),{sessions:a.sessions,
+()=>rp(n,e,{freezeStructure:t}),[n,e,t]);return React.useEffect(()=>{a.ledger!==n&&s(a.ledger)},[n,a]),{sessions:a.sessions,
 revision:a.ledger.revision,deferred:a.deferred}}function tb(e,t){let[n,s]=React.useState(Date.now());return React.useEffect(
-()=>{let a=Date.now(),c=[...Object.values(e||{}),...Array.isArray(t)?t.map(p=>p?.activity):[]].reduce((p,b)=>{let y=Qo(b),
+()=>{let a=Date.now(),c=[...Object.values(e||{}),...Array.isArray(t)?t.map(p=>p?.activity):[]].reduce((p,b)=>{let y=Jo(b),
 S=y?y+qc:0;return S<=a?p:p===0?S:Math.min(p,S)},0);if(!c)return;let u=setTimeout(()=>s(Date.now()),Math.max(25,c-a+25));
 return()=>clearTimeout(u)},[e,t,n]),n}function nb({stream:e,activeAgent:t,monospace:n}){let s=Me(null),a=Me("");return us(
 ()=>{let i=s.current;if(!i)return;let c=String(e?.content||""),u=a.current;if(c.startsWith(u)){let p=c.slice(u.length);p&&
@@ -1983,7 +1984,7 @@ ta","data-message-role":"assistant","data-message-timestamp":In(e?.startedAtMs)?
 ge transcript-agent-badge",style:{color:t.color,borderColor:t.color+"55",background:t.color+"18"}},t.logo?React.createElement(
 "img",{src:t.logo,alt:t.abbr,className:"agent-badge-logo"}):t.abbr)),React.createElement("div",{className:"assistant-con\
 tent"},React.createElement("div",{className:"message-role"},React.createElement("span",{className:"message-role-label"},
-t.name),React.createElement(Ci,{instant:e?.startedAtMs})),React.createElement("div",{className:"provisional-stream-text",
+t.name),React.createElement(xi,{instant:e?.startedAtMs})),React.createElement("div",{className:"provisional-stream-text",
 ref:s}),e?.open&&React.createElement("span",{className:"provisional-stream-caret","aria-label":"Streaming response"})))}
 function sb({msg:e,messageKey:t,activeAgent:n,assistantMonospace:s,autoExpandLongCodeBlocks:a,onOpenPath:i,agentType:c,preview:u,
 fileContents:p,onClosePreview:b,deliveryState:y,onSteer:S,onRetry:A,richContentEager:N,searchMatch:h=!1}){let d=Ct(e.content)||
@@ -1994,7 +1995,7 @@ ta-message-id":e.id||void 0,"data-message-role":"user","data-message-block-type"
 essage-source-id":k||void 0,"data-message-timestamp":g?.iso||"unknown"},React.createElement("div",{className:"user-gutte\
 r"},React.createElement("div",{className:"user-glyph"})),React.createElement("div",{className:"user-content"},React.createElement(
 "div",{className:"message-role"},React.createElement("span",{className:"message-role-label"},"You"),React.createElement(
-Ci,{message:e}),React.createElement(Z_,{msg:e,deliveryStates:H,onSteer:S,onRetry:A})),/!\[[^\]]*\]\((?:data:|\/uploads\/)/.
+xi,{message:e}),React.createElement(Z_,{msg:e,deliveryStates:H,onSteer:S,onRetry:A})),/!\[[^\]]*\]\((?:data:|\/uploads\/)/.
 test(v)?React.createElement("div",{className:"user-text"},React.createElement(Ya,{content:v,deferUntilVisible:!N,cacheIdentity:`${t}\
 :user`})):React.createElement("div",{className:"user-text"},d)))}return React.createElement("div",{className:`message as\
 sistant transcript-virtual-row${s?" monospace":""}${h?" search-match":""}`,"data-message-key":t,"data-message-id":e.id||
@@ -2003,15 +2004,15 @@ void 0,"data-message-timestamp":g?.iso||"unknown"},React.createElement("div",{cl
 "div",{className:"agent-badge transcript-agent-badge",style:{color:n.color,borderColor:n.color+"55",background:n.color+"\
 18"}},n.logo?React.createElement("img",{src:n.logo,alt:n.abbr,className:"agent-badge-logo"}):n.abbr)),React.createElement(
 "div",{className:"assistant-content"},React.createElement("div",{className:"message-role"},React.createElement("span",{className:"\
-message-role-label"},n.name),React.createElement(Ci,{message:e})),_?React.createElement(M_,{blocks:e.content_blocks,monospace:s,
+message-role-label"},n.name),React.createElement(xi,{message:e})),_?React.createElement(M_,{blocks:e.content_blocks,monospace:s,
 autoExpandLongCodeBlocks:a,onOpenPath:H=>i(t,H),agentType:c,richContentEager:N,richContentCacheIdentity:t}):React.createElement(
 Ya,{content:Ct(e.content),monospace:s,autoExpandLongCodeBlocks:a,onOpenPath:H=>i(t,H),deferUntilVisible:!N,cacheIdentity:`${t}\
-:assistant`}),u&&React.createElement(Wb,{sessionId:u.sessionId,filePath:u.path,fileContents:p,onClose:b})))}function Wp(e){
+:assistant`}),u&&React.createElement(Wb,{sessionId:u.sessionId,filePath:u.path,fileContents:p,onClose:b})))}function zp(e){
 return e?`${e.sessionId}${e.messageKey}${e.path}`:""}function yl(e){return[e?.name,e?.color,e?.abbr,e?.logo||""].join(
 "")}function ab(e,t){return e.msg===t.msg&&e.messageKey===t.messageKey&&e.assistantMonospace===t.assistantMonospace&&e.
 autoExpandLongCodeBlocks===t.autoExpandLongCodeBlocks&&e.agentType===t.agentType&&yl(e.activeAgent)===yl(t.activeAgent)&&
-Wp(e.preview)===Wp(t.preview)&&e.fileContents===t.fileContents&&e.deliveryState===t.deliveryState&&e.onRetry===t.onRetry&&
-e.richContentEager===t.richContentEager&&e.searchMatch===t.searchMatch}var rb=React.memo(sb,ab),ob=100,vi=1200,ls=32;function zp(e){
+zp(e.preview)===zp(t.preview)&&e.fileContents===t.fileContents&&e.deliveryState===t.deliveryState&&e.onRetry===t.onRetry&&
+e.richContentEager===t.richContentEager&&e.searchMatch===t.searchMatch}var rb=React.memo(sb,ab),ob=100,yi=1200,ls=32;function Gp(e){
 let t=Ct(e?.content)||no(e?.content_blocks),n=Math.max(1,ae(t).split(`
 `).length);if(e?.role==="user")return Math.min(180,40+Math.max(0,n-1)*18);let s=Math.ceil(ae(t).length/100),a=cr(e?.content_blocks).
 length*28;return Math.min(420,68+Math.max(n,s)*18+a)}function ml(e,t){let n=0,s=Math.max(0,e.length-1);for(;n<s;){let a=Math.
@@ -2024,7 +2025,7 @@ n);u.current!==n&&(c.current.clear(),u.current=n);let p=React.useRef([0]),b=Reac
 useRef(0),A=React.useRef(0),N=React.useRef({sessionId:null,keys:[],prefix:[0]}),h=React.useRef(0),d=React.useRef(0),v=React.
 useRef(null),g=React.useRef(null),_=React.useRef(0),k=React.useRef(0),[T,L]=React.useState(0),[H,V]=React.useState({sessionId:null,
 start:0,end:0}),ne=React.useMemo(()=>e.map((W,G)=>`${n||""}${Cl(W,G)}`),[e,n]),ee=React.useMemo(()=>{let W=new Array(e.
-length+1);W[0]=0;for(let G=0;G<e.length;G+=1){let $=c.current.get(ne[G]);W[G+1]=W[G]+($||zp(e[G]))}return W},[e,ne,T]);p.
+length+1);W[0]=0;for(let G=0;G<e.length;G+=1){let $=c.current.get(ne[G]);W[G+1]=W[G]+($||Gp(e[G]))}return W},[e,ne,T]);p.
 current=ee;let re=React.useCallback(()=>{if(y.current)return;let W=t.current;if(!a||!W)return;let G=W.getBoundingClientRect(),
 $=G.top,P=Array.from(W.querySelectorAll(".transcript-window-row[data-window-index]")),B=P.find(ce=>{let ie=ce.getBoundingClientRect();
 return ie.top>=$&&ie.top<G.bottom})||P.find(ce=>ce.getBoundingClientRect().bottom>$)||P[0];if(!B)return;let te=Number(B.
@@ -2032,7 +2033,7 @@ dataset.windowIndex);!Number.isInteger(te)||!ne[te]||(b.current={sessionId:n,key
 top-$})},[t,a,ne,n]),z=React.useCallback(()=>{v.current=null,g.current=null,_.current&&clearTimeout(_.current),_.current=
 0},[]),oe=React.useCallback(()=>{let W=t.current;if(!a||!W)return;let G=y.current;if(G?.sessionId===n){let xe=ne.indexOf(
 G.key);if(xe>=0){V(Ie=>Ie.sessionId===n&&Ie.start===xe&&Ie.end===Math.min(e.length,xe+ls)?Ie:{sessionId:n,start:xe,end:Math.
-min(e.length,xe+ls)});return}}re();let $=p.current,P=Math.max(0,W.scrollTop-vi),B=W.scrollTop+W.clientHeight+vi,te=Math.
+min(e.length,xe+ls)});return}}re();let $=p.current,P=Math.max(0,W.scrollTop-yi),B=W.scrollTop+W.clientHeight+yi,te=Math.
 max(0,ml($,P)-1),ce=Math.min(e.length,ml($,B)+2),ie=ce>=e.length?Math.max(0,e.length-ls):te,be=ce,Ne=g.current,Se=Ne?ne.
 indexOf(Ne):v.current;Se>=0&&(v.current=Se);let Ee=Se;Number.isInteger(Ee)&&Ee>=0&&Ee<e.length&&(ie=Math.min(ie,Math.max(
 0,Ee-ls)),be=Math.max(be,Math.min(e.length,Ee+ls+1))),React.startTransition(()=>{V(xe=>xe.sessionId===n&&xe.start===ie&&
@@ -2054,11 +2055,11 @@ scrollTop+be))}A.current=requestAnimationFrame($)};return $(),S.current&&clearTi
 y.current=null,S.current=0,A.current&&cancelAnimationFrame(A.current),A.current=0,z(),re()},1500),()=>{G=!1,A.current&&cancelAnimationFrame(
 A.current),A.current=0}},[re,t,a,ne,z,n]),React.useLayoutEffect(()=>{if(!a){z();return}let W=t.current;if(!W)return;oe();
 let G=()=>{re();let $=g.current,P=$?ne.indexOf($):v.current;P>=0&&(v.current=P);let B=P,te=p.current;if(Number.isInteger(
-B)&&B>=0&&B<e.length){let ce=te[B]||0,ie=te[B+1]||ce,be=W.scrollTop,Ne=be+W.clientHeight;(ie<be-vi||ce>Ne+vi)&&z()}d.current||
+B)&&B>=0&&B<e.length){let ce=te[B]||0,ie=te[B+1]||ce,be=W.scrollTop,Ne=be+W.clientHeight;(ie<be-yi||ce>Ne+yi)&&z()}d.current||
 (d.current=requestAnimationFrame(()=>{d.current=0,oe()}))};return W.addEventListener("scroll",G,{passive:!0}),()=>{W.removeEventListener(
 "scroll",G),d.current&&cancelAnimationFrame(d.current),d.current=0}},[re,a,s,n,ne,e.length,oe,z]),React.useLayoutEffect(
 ()=>{a&&oe()},[a,ee,oe]);let _e=React.useCallback((W,G,$)=>{if(!i.current)return;let P=Math.max(1,Math.ceil($)),B=c.current.
-get(G)||zp(e[W]);if(Math.abs(P-B)<1)return;c.current.set(G,P);let te=t.current,ce=te?ml(p.current,te.scrollTop):0;W<ce&&
+get(G)||Gp(e[W]);if(Math.abs(P-B)<1)return;c.current.set(G,P);let te=t.current,ce=te?ml(p.current,te.scrollTop):0;W<ce&&
 (k.current+=P-B),!h.current&&(h.current=requestAnimationFrame(()=>{if(h.current=0,!i.current){k.current=0;return}let ie=t.
 current,be=k.current;k.current=0,ie&&Math.abs(be)>=1&&nn(ie,Math.max(0,ie.scrollTop+be)),L(Ne=>Ne+1)}))},[t,e]);React.useLayoutEffect(
 ()=>{a||!h.current||(cancelAnimationFrame(h.current),h.current=0,k.current=0)},[a]),React.useEffect(()=>()=>{h.current&&
@@ -2098,7 +2099,7 @@ hasBlockingPrompt:p,blockingPromptLabel:b,muted:y,pinned:S,workspaceLabel:A,rece
 onSelect:v,onClose:g,onManage:_,onPinChange:k,onAutomations:T,showAutomationsActive:L,onSkills:H,showSkillsActive:V}){let ne=$e(
 e),ee=ir(e,i),re=or(e,ne,i),z=Zr(e,ne,i,u),oe=[z,re||ee.name].filter(Boolean).join(" - "),_e=J_[t]||"#444c56",Y=e?.rate_limited_until||
 null,ve=e?.rate_limit_active===!0,he=e?.percent_used,X=e?.agent_type==="antigravity"||e?.agent_type==="antigravity_panel",
-me=X?gm(e?.antigravity_quota_models,3):"",J=Zo(c,{health:t}),W=s?J||c?.label||"Working":null,G=hm(e),$=A?`${ee.name} / ${A}`:
+me=X?hm(e?.antigravity_quota_models,3):"",J=ei(c,{health:t}),W=s?J||c?.label||"Working":null,G=_m(e),$=A?`${ee.name} / ${A}`:
 ee.name,P=N?In(N):null;return React.createElement("div",{className:`session-card${a?" active":""}${ve?" rate-limited":""}${S?
 " pinned":""}`,"data-session-id":ne,"data-last-message-at":P?.iso||void 0,onClick:v,onKeyDown:B=>{B.target!==B.currentTarget||
 !["Enter"," "].includes(B.key)||(B.preventDefault(),v())},tabIndex:0,"aria-label":`${z}. ${re||ee.name}`,title:oe||ne},React.
@@ -2113,14 +2114,14 @@ createElement("span",{className:"session-card-perm-badge",title:b||"Action requi
 "span",{className:"session-card-perm-badge",title:"Usage limited"},"\u23F3"),!p&&!ve&&s&&React.createElement("span",{className:"\
 session-card-native-status",title:W||"Thinking\u2026"},React.createElement(eo,{agentType:e?.agent_type,compact:!0,animate:!1})),
 !s&&!p&&!ve&&n>0&&React.createElement("span",{className:"session-card-badge"},n>99?"99+":n))),React.createElement("div",
-{className:"session-card-body"},React.createElement(mi,{title:z,disclosureKey:ne,kind:"session",wrapperClassName:"sessio\
+{className:"session-card-body"},React.createElement(fi,{title:z,disclosureKey:ne,kind:"session",wrapperClassName:"sessio\
 n-title-details",triggerClassName:"session-card-name",disclosureClassName:"session-title-disclosure",triggerLabel:`Show \
 full title: ${z}`,triggerTag:"div"}),React.createElement("div",{className:`session-card-sub${p?" perm-active":""}${P?" h\
 as-recent-message":""}`},React.createElement("span",{className:"session-card-sub-context"},p?`${$} \xB7 ${b||"Action req\
 uired"}`:ve?`${$} \xB7 \u23F3 Usage limited${Y&&Y!=="unknown"?` \xB7 resets ${to(Y)}`:" \xB7 reset unknown"}`:me?`${$} \xB7\
  ${me}`:X&&he!=null?`${$} \xB7 \u{1F4CA} ${he}% used${Y&&Y!=="unknown"?` \xB7 ${Y}`:""}`:he>=75?`${$} \xB7 \u{1F4CA} ${he}\
 % used${Y&&Y!=="unknown"?` \xB7 resets ${to(Y)}`:""}`:W?`${$} \xB7 ${W}`:G?`${$} \xB7 ${G}`:$),P&&React.createElement(React.
-Fragment,null,React.createElement("span",{"aria-hidden":"true"}," \xB7 "),React.createElement("time",{dateTime:P.iso},xc(
+Fragment,null,React.createElement("span",{"aria-hidden":"true"}," \xB7 "),React.createElement("time",{dateTime:P.iso},Ac(
 P))))),React.createElement("div",{className:"session-card-right"},React.createElement("details",{className:"session-card\
 -menu",open:h,onToggle:B=>d?.(B.currentTarget.open),onClick:B=>B.stopPropagation()},React.createElement("summary",{className:"\
 session-card-manage",title:"Session actions","aria-label":`Session actions for ${z}`},"\u22EF"),React.createElement("div",
@@ -2128,37 +2129,37 @@ session-card-manage",title:"Session actions","aria-label":`Session actions for $
 menuitem",onClick:()=>k?.(!S)},S?"Unpin chat":"Pin chat"),React.createElement("button",{role:"menuitem",onClick:()=>_&&_()},
 "Manage session"),T&&React.createElement("button",{role:"menuitem",className:L?"active":"",onClick:()=>T()},"Automations"),
 H&&React.createElement("button",{role:"menuitem",className:V?"active":"",onClick:()=>H()},"Skills"),React.createElement(
-"button",{role:"menuitem",className:"danger",onClick:()=>g&&g()},"Close session")))))}function Gp(e){let t=Array.isArray(
+"button",{role:"menuitem",className:"danger",onClick:()=>g&&g()},"Close session")))))}function Kp(e){let t=Array.isArray(
 e)?e:[];if(!t.length)return"0";let n=t[0],s=t[t.length-1];return[t.length,n?.role||"",ae(n?.content).slice(0,120),s?.role||
-"",ae(s?.content).slice(0,120)].join("")}function Kp(e){return e?[e.model_id||"",e.effort||"",e.permission_mode||"",e.file_access_scope||
-""].join(""):""}function Vp(e){return e?[e.kind||"",e.label||"",e.goal?.status||"",e.goal?.label||"",e.goal_run?.lifecycle||
+"",ae(s?.content).slice(0,120)].join("")}function Vp(e){return e?[e.model_id||"",e.effort||"",e.permission_mode||"",e.file_access_scope||
+""].join(""):""}function Yp(e){return e?[e.kind||"",e.label||"",e.goal?.status||"",e.goal?.label||"",e.goal_run?.lifecycle||
 "",e.goal_run?.lease_active===!0?"leased":"released",e.goal_run?.transition_id||""].join(""):""}function db(e,t){return e.
 session===t.session&&e.health===t.health&&e.unread===t.unread&&e.isThinking===t.isThinking&&e.isActive===t.isActive&&e.hasBlockingPrompt===
 t.hasBlockingPrompt&&e.blockingPromptLabel===t.blockingPromptLabel&&e.muted===t.muted&&e.pinned===t.pinned&&e.workspaceLabel===
 t.workspaceLabel&&e.recentMessageAt===t.recentMessageAt&&e.menuOpen===t.menuOpen&&e.showAutomationsActive===t.showAutomationsActive&&
-e.showSkillsActive===t.showSkillsActive&&Kp(e.agentConfig)===Kp(t.agentConfig)&&Vp(e.activity)===Vp(t.activity)&&Gp(e.sessionMessages)===
-Gp(t.sessionMessages)}var pb=React.memo(ub,db),Yp=["\xB7","\u2722","*","\u2736","\u273B","\u273D"],Si=[...Yp,...[...Yp].
+e.showSkillsActive===t.showSkillsActive&&Vp(e.agentConfig)===Vp(t.agentConfig)&&Yp(e.activity)===Yp(t.activity)&&Kp(e.sessionMessages)===
+Kp(t.sessionMessages)}var pb=React.memo(ub,db),Xp=["\xB7","\u2722","*","\u2736","\u273B","\u273D"],Ci=[...Xp,...[...Xp].
 reverse()];function mb(){let[e,t]=React.useState(0),[n,s]=React.useState(()=>typeof window<"u"&&typeof window.matchMedia==
 "function"&&window.matchMedia("(prefers-reduced-motion: reduce)").matches);return React.useEffect(()=>{if(typeof window>
 "u"||typeof window.matchMedia!="function")return;let a=window.matchMedia("(prefers-reduced-motion: reduce)"),i=c=>s(c.matches);
 return s(a.matches),a.addEventListener?.("change",i),()=>a.removeEventListener?.("change",i)},[]),React.useEffect(()=>{if(n){
-t(0);return}let a=Si.length*3,i=setInterval(()=>{if(a-=1,a<=0){clearInterval(i),t(0);return}t(c=>(c+1)%Si.length)},120);
-return()=>clearInterval(i)},[n]),React.createElement("span",{className:"claude-spinner-icon"},Si[e])}function Xp(e,t){let n=e?
+t(0);return}let a=Ci.length*3,i=setInterval(()=>{if(a-=1,a<=0){clearInterval(i),t(0);return}t(c=>(c+1)%Ci.length)},120);
+return()=>clearInterval(i)},[n]),React.createElement("span",{className:"claude-spinner-icon"},Ci[e])}function Qp(e,t){let n=e?
 new Date(e).getTime():0;if(!Number.isFinite(n)||n<=0)return"";let s=Math.max(0,Math.floor((t-n)/1e3));return Rl(s,{includeSeconds:!0})}
 function Rl(e,{includeSeconds:t=!1}={}){if(e=Math.max(0,Math.floor(Number(e)||0)),e<60)return`${e}s`;let n=Math.floor(e/
 60),s=e%60;if(n<60)return t?`${n}m ${String(s).padStart(2,"0")}s`:`${n}m`;let a=Math.floor(n/60),i=n%60;return a>=24?`${Math.
 floor(a/24)}d ${String(a%24).padStart(2,"0")}h ${String(i).padStart(2,"0")}m${t?` ${String(s).padStart(2,"0")}s`:""}`:`${a}\
-h ${String(i).padStart(2,"0")}m${t?` ${String(s).padStart(2,"0")}s`:""}`}function _m(e,t,n=null){return e?Rl(vd(e,n,t),{
-includeSeconds:!0}):""}function fb({activity:e,thinkingText:t,agentType:n,pinned:s=!1}){let a=e?.kind||"working",i=Up[a]||
-Up.working,c=e?.goal||null,u=i.tone==="thinking"||i.tone==="info",b=(c?.state||c?.status)==="active"&&(!e?.goal_run||e.goal_run.
+h ${String(i).padStart(2,"0")}m${t?` ${String(s).padStart(2,"0")}s`:""}`}function bm(e,t,n=null){return e?Rl(yd(e,n,t),{
+includeSeconds:!0}):""}function fb({activity:e,thinkingText:t,agentType:n,pinned:s=!1}){let a=e?.kind||"working",i=Wp[a]||
+Wp.working,c=e?.goal||null,u=i.tone==="thinking"||i.tone==="info",b=(c?.state||c?.status)==="active"&&(!e?.goal_run||e.goal_run.
 lease_active===!0),y=!!(e?.thinking||e?.current),S=String(t||e?.thinkingContent||"").trim(),A=n==="claude"||n==="claude_\
 cli",N=e?.thinking||(!y&&(a==="thinking"||A)?{text:S,since:e?.startedAt||e?.updatedAt||null}:null),h=e?.current||(!y&&!N&&
 u?{kind:a==="running_command"?"tool":"answer",label:e?.label||(a==="running_command"?"Running command":"Working"),partial:S,
 since:e?.startedAt||e?.updatedAt||null}:null),d=e?.step||null,v=e?.usage||null,[g,_]=React.useState(Date.now()),k=N?N.since||
 e?.startedAt||e?.updatedAt:null,T=h?h.since||e?.startedAt||e?.updatedAt:null,L=oe=>!!oe&&Number.isFinite(new Date(oe).getTime()),
 H=b&&L(c?.updated_at)||L(k)||L(T);React.useEffect(()=>{if(!H)return;let oe=setInterval(()=>_(Date.now()),1e3);return()=>clearInterval(
-oe)},[H,c?.updated_at,k,T]);let V=e?.interruptHint||e?.interrupt_hint||"",ne=c?_m(c,g,e?.goal_run):"",ee=String(c?.text||
-c?.objective||"").trim(),re=N?Xp(k,g):"",z=h?Xp(T,g):"";return!c&&!N&&!h&&!d&&!v?null:React.createElement("div",{className:`\
+oe)},[H,c?.updated_at,k,T]);let V=e?.interruptHint||e?.interrupt_hint||"",ne=c?bm(c,g,e?.goal_run):"",ee=String(c?.text||
+c?.objective||"").trim(),re=N?Qp(k,g):"",z=h?Qp(T,g):"";return!c&&!N&&!h&&!d&&!v?null:React.createElement("div",{className:`\
 live-status-stack${s?" pinned":""}`,"data-testid":"live-status-stack"},h&&React.createElement("div",{className:`live-cur\
 rent-status ${h.kind||"answer"}`,"data-live-channel":"current"},React.createElement("div",{className:"live-current-tool-\
 heading"},h.kind==="tool"?React.createElement("span",{className:"live-status-icon"},"\u25B6"):React.createElement(eo,{agentType:n,
@@ -2201,11 +2202,11 @@ l"},i)),c&&React.createElement("div",{className:"cline-context-usage"},c)),n!=nu
 cline-context-meter",title:`${e.percent_used}% of context window used`},React.createElement("div",{className:"cline-cont\
 ext-meter-fill",style:{width:`${n}%`}})))}function Fn(e,t){return e?.choice_id||e?.id||e?.value||`choice-${t}`}function Xr(e,t){
 return e?.label||e?.title||e?.text||e?.name||Fn(e,t)}function Ml(e,t){let n=new Set(Array.isArray(t)?t:[t]);return(Array.
-isArray(e?.content_blocks)?e.content_blocks:[]).find(s=>n.has(s?.type))||null}function Qp(e){return Ml(e,"prompt")?.content||
-e?.prompt_text||e?.message||e?.text||"Agent requires permission to continue."}function bm(e){let t=Math.max(0,Math.ceil(
+isArray(e?.content_blocks)?e.content_blocks:[]).find(s=>n.has(s?.type))||null}function Jp(e){return Ml(e,"prompt")?.content||
+e?.prompt_text||e?.message||e?.text||"Agent requires permission to continue."}function vm(e){let t=Math.max(0,Math.ceil(
 e/1e3)),n=Math.floor(t/60),s=t%60;return`${n}:${String(s).padStart(2,"0")}`}function _b(e,t){return e?.deadline_at?t<=0?
 "Native deadline elapsed \xB7 awaiting receipt":`${e.auto_resolution_policy==="native"?"Native auto-resolution in":"Resp\
-onse deadline in"} ${bm(t)}`:""}function bb({prompt:e,sessionId:t,agentType:n,onRespond:s,onDismissFocus:a}){let[i,c]=React.
+onse deadline in"} ${vm(t)}`:""}function bb({prompt:e,sessionId:t,agentType:n,onRespond:s,onDismissFocus:a}){let[i,c]=React.
 useState(Date.now()),[u,p]=React.useState({}),[b,y]=React.useState({}),[S,A]=React.useState({}),[N,h]=React.useState(""),
 [d,v]=React.useState(null),[g,_]=React.useState(!1);React.useEffect(()=>{let P=setInterval(()=>c(Date.now()),500);return()=>clearInterval(
 P)},[]),React.useEffect(()=>{p({}),y({}),A({}),h(""),v(null),_(!1)},[e?.prompt_id]);let k=Math.max(0,Number(e?.timeout_ms)||
@@ -2213,7 +2214,7 @@ P)},[]),React.useEffect(()=>{p({}),y({}),A({}),h(""),v(null),_(!1)},[e?.prompt_i
 L),V=H?Math.max(0,L-i):k>0?Math.max(0,k-(i-T)):0,ne=Array.isArray(e?.choices)?e.choices:[],ee=e?.submitting_choice_id||null,
 re=e?.type==="question_prompt"&&e?.lifecycle!=="open",z=e?.default_choice||null,oe=(e?.kind==="question"||e?.type==="que\
 stion_prompt")&&Array.isArray(e?.questions)?e.questions.filter(P=>P&&typeof P=="object"):[],_e=oe.length>0,Y=n==="claude"&&
-!_e,ve=ae(e?.command).trim(),he=ae(e?.title).trim()||(ve?"Allow this action?":Qp(e)),X=ae(e?.description).trim(),me=Y&&e?.
+!_e,ve=ae(e?.command).trim(),he=ae(e?.title).trim()||(ve?"Allow this action?":Jp(e)),X=ae(e?.description).trim(),me=Y&&e?.
 alternate_instruction_supported===!0,J=oe.flatMap(P=>(Array.isArray(P.choices)?P.choices:[]).map((B,te)=>({question:P,choiceId:Fn(
 B,te)}))).slice(0,9),W=(P,B)=>{p(te=>{let ce=Array.isArray(te[P.question_id])?te[P.question_id]:[],ie=P.multi_select?ce.
 includes(B)?ce.filter(be=>be!==B):[...ce,B]:[B];return{...te,[P.question_id]:ie}})},G=oe.every(P=>{let B=Array.isArray(P.
@@ -2241,9 +2242,9 @@ laude"},he),ve&&React.createElement("pre",{className:"permission-command-claude"
 permission-body permission-body-claude"},X)):React.createElement(React.Fragment,null,React.createElement("div",{className:"\
 permission-eyebrow"},_e?"Question":"Permission Required"),React.createElement("div",{className:"permission-title"},_e?ae(
 e?.title,"Answer the native question"):`Agent Paused In ${t?or(t,t):"Active Session"}`),!_e&&React.createElement("div",{
-className:"permission-body"},Qp(e)),React.createElement("div",{className:"permission-meta"},H&&React.createElement("span",
+className:"permission-body"},Jp(e)),React.createElement("div",{className:"permission-meta"},H&&React.createElement("span",
 {className:"permission-timer"},_b(e,V)),!H&&k>0&&React.createElement("span",{className:"permission-timer"},"Auto-choice \
-in ",bm(V)),z&&React.createElement("span",{className:"permission-default"},"Default: ",z))),e?.error&&React.createElement(
+in ",vm(V)),z&&React.createElement("span",{className:"permission-default"},"Default: ",z))),e?.error&&React.createElement(
 "div",{className:"permission-error"},e.error),React.createElement("div",{className:`permission-actions${_e?" permission-\
 question-list":""}`},_e?oe.map((P,B)=>React.createElement("fieldset",{className:"permission-question",key:P.question_id||
 B},React.createElement("legend",null,ae(P.header||P.label,`Question ${B+1}`)),ae(P.message).trim()&&React.createElement(
@@ -2278,7 +2279,7 @@ button",className:"permission-question-submit",disabled:!G||!!ee||re,onClick:$},
 t answers")),e?.type==="question_prompt"&&e?.cancel_supported===!0&&React.createElement("button",{type:"button",className:"\
 permission-question-cancel",disabled:!!ee||re,onClick:()=>s(t,e.prompt_id,null,{action:"cancel"})},"Cancel")),React.createElement(
 "div",{className:"permission-keyboard-help"},Y?ae(e?.cancel_hint,"Esc to cancel"):`1\u20139 select \xB7 Enter submit \xB7 Esc ${e?.
-cancel_supported===!0?"cancel":"return to composer"}`)))}function xi(e){return ae(e?.label,"Action")}function rr(e){return!!e&&
+cancel_supported===!0?"cancel":"return to composer"}`)))}function Ai(e){return ae(e?.label,"Action")}function rr(e){return!!e&&
 e.blocking!==!1&&e.display_mode!=="inline"}function vb({prompt:e,sessionId:t,onRespond:n}){let s=Ml(e,["error","notice"]),
 a=Array.isArray(e?.actions)?e.actions:s?.actions||[],i=e?.submitting_action_id||null,c=ae(e?.error_output||s?.error_output).
 trim();return React.createElement("div",{className:"permission-overlay"},React.createElement("div",{className:"permissio\
@@ -2288,8 +2289,8 @@ createElement("div",{className:"permission-body"},ae(s?.content||e?.message,"The
 nse.")),c&&React.createElement("div",{className:"error-prompt-output-wrap"},React.createElement("div",{className:"error-\
 prompt-output-label"},"Error Output"),React.createElement("pre",{className:"error-prompt-output"},c)),e?.error&&React.createElement(
 "div",{className:"permission-error"},e.error),React.createElement("div",{className:"permission-actions"},a.map(u=>{let p=ae(
-u?.action_id),b=i===p;return React.createElement("button",{key:p||xi(u),className:`permission-action error-prompt-action${b?
-" pending":""}`,disabled:!!i,onClick:y=>n(t,e.prompt_id,p,y)},React.createElement("span",null,xi(u)),b&&React.createElement(
+u?.action_id),b=i===p;return React.createElement("button",{key:p||Ai(u),className:`permission-action error-prompt-action${b?
+" pending":""}`,disabled:!!i,onClick:y=>n(t,e.prompt_id,p,y)},React.createElement("span",null,Ai(u)),b&&React.createElement(
 "span",{className:"permission-action-state"},"Sending..."))}))))}function yb({prompt:e,sessionId:t,onRespond:n}){let s=Ml(
 e,["error","notice"]),a=Array.isArray(e?.actions)?e.actions:s?.actions||[],i=e?.submitting_action_id||null,c=ae(e?.error_output||
 s?.error_output).trim();return React.createElement("div",{className:"inline-error-prompt"},React.createElement("div",{className:"\
@@ -2297,9 +2298,9 @@ inline-error-prompt-body"},React.createElement("div",{className:"inline-error-pr
 x requires attention")),React.createElement("div",{className:"inline-error-prompt-message"},ae(s?.content||e?.message,"T\
 here was an error handling the model response.")),c&&React.createElement("pre",{className:"inline-error-prompt-output"},
 c),e?.error&&React.createElement("div",{className:"permission-error"},e.error)),React.createElement("div",{className:"in\
-line-error-prompt-actions"},a.map(u=>{let p=ae(u?.action_id),b=i===p;return React.createElement("button",{key:p||xi(u),className:`\
+line-error-prompt-actions"},a.map(u=>{let p=ae(u?.action_id),b=i===p;return React.createElement("button",{key:p||Ai(u),className:`\
 permission-action error-prompt-action${b?" pending":""}`,disabled:!!i,onClick:y=>n(t,e.prompt_id,p,y)},React.createElement(
-"span",null,xi(u)),b&&React.createElement("span",{className:"permission-action-state"},"Sending..."))})))}function kb({launchStates:e,
+"span",null,Ai(u)),b&&React.createElement("span",{className:"permission-action-state"},"Sending..."))})))}function kb({launchStates:e,
 onLaunch:t,onResume:n,onClose:s,workspaces:a,showTestSessions:i=!1}){let[c,u]=React.useState("new"),[p,b]=React.useState(
 "claude"),[y,S]=React.useState(""),[A,N]=React.useState(""),[h,d]=React.useState("deepseek-v4-pro:cloud"),[v,g]=React.useState(
 "gpt-5.5"),[_,k]=React.useState("grok-4.5-fast-high"),[T,L]=React.useState(null),[H,V]=React.useState([]),[ne,ee]=React.
@@ -2357,7 +2358,7 @@ ermissions",label:"Bypass permissions"},{value:"dontAsk",label:"Do not ask"},{va
 RR"},{value:"YOLO",label:"YOLO"},{value:"Ask",label:"Ask"},{value:"Auto-approve",label:"Auto-approve"}],cline:[{value:"Y\
 OLO",label:"YOLO"}],codex_cli:[{value:"read-only",label:"Read only"},{value:"workspace-write",label:"Workspace write"},{
 value:"danger-full-access",label:"Full access"}],cursor_cli:[{value:"default",label:"Default"},{value:"force",label:"For\
-ce (Yolo)"},{value:"plan",label:"Plan"},{value:"ask",label:"Ask"}],codex:[],gemini:[]};function vm(e){return e==="codex_\
+ce (Yolo)"},{value:"plan",label:"Plan"},{value:"ask",label:"Ask"}],codex:[],gemini:[]};function ym(e){return e==="codex_\
 cli"?"workspace-write":e==="cursor_cli"?"force":e==="continue_yolo"||e==="roo_code"||e==="cline"?"ask":"default"}var kl=[
 {id:"default",label:"Auto"},{id:"claude-opus-4-6",label:"Claude Opus 4.6"},{id:"claude-sonnet-4-6",label:"Claude Sonnet \
 4.6"},{id:"claude-opus-4-5",label:"Claude Opus 4.5"},{id:"claude-sonnet-4-5",label:"Claude Sonnet 4.5"},{id:"claude-haik\
@@ -2375,28 +2376,28 @@ igh)"},{id:"claude-opus-4-8-thinking-high",label:"Claude Opus 4.8 (Thinking High
 .5"},{id:"composer-2.5-fast",label:"Composer 2.5 Fast"},{id:"gpt-5.5-high",label:"GPT-5.5 (High)"},{id:"gpt-5.3-codex",label:"\
 GPT-5.3 Codex"}],El=[{id:"Planning",label:"Planning"},{id:"Fast",label:"Fast"}],Nb=[{id:"Architect",label:"Architect"},{
 id:"Code",label:"Code"},{id:"Ask",label:"Ask"},{id:"Debug",label:"Debug"},{id:"Orchestrator",label:"Orchestrator"}],Sb=[
-{id:"Plan",label:"Plan"},{id:"Act",label:"Act"}],ym=[{id:"Gemini 3.1 Pro (High)",label:"Gemini 3.1 Pro (High)"},{id:"Gem\
+{id:"Plan",label:"Plan"},{id:"Act",label:"Act"}],km=[{id:"Gemini 3.1 Pro (High)",label:"Gemini 3.1 Pro (High)"},{id:"Gem\
 ini 3.1 Pro (Low)",label:"Gemini 3.1 Pro (Low)"},{id:"Gemini 3 Flash",label:"Gemini 3 Flash"},{id:"Claude Sonnet 4.6 (Th\
 inking)",label:"Claude Sonnet 4.6 (Thinking)"},{id:"Claude Opus 4.6 (Thinking)",label:"Claude Opus 4.6 (Thinking)"},{id:"\
-GPT-OSS 120B (Medium)",label:"GPT-OSS 120B (Medium)"}],km=[{id:"Default",label:"Default"},{id:"2.5 Flash",label:"Gemini \
+GPT-OSS 120B (Medium)",label:"GPT-OSS 120B (Medium)"}],wm=[{id:"Default",label:"Default"},{id:"2.5 Flash",label:"Gemini \
 2.5 Flash"},{id:"2.5 Pro",label:"Gemini 2.5 Pro"},{id:"3 Flash Preview",label:"Gemini 3 Flash Preview"},{id:"3.1 Pro Pre\
-view",label:"Gemini 3.1 Pro Preview"}];function Jp(e,t){return Array.isArray(t?.available_models)&&t.available_models.length>
+view",label:"Gemini 3.1 Pro Preview"}];function Zp(e,t){return Array.isArray(t?.available_models)&&t.available_models.length>
 0?t.available_models.map(n=>typeof n=="string"?{id:n,label:n}:n):e==="continue_yolo"||e==="continue"||e==="roo_code"||e===
-"cline"?[]:e==="claude_cli"?kl:e==="codex_cli"?Tl:e==="cursor_cli"?$l:e==="antigravity"||e==="antigravity_panel"?ym:e===
-"gemini"?km:kl}function Qr(e,t){return Array.isArray(t?.available_modes)&&t.available_modes.length>0?t.available_modes.map(
+"cline"?[]:e==="claude_cli"?kl:e==="codex_cli"?Tl:e==="cursor_cli"?$l:e==="antigravity"||e==="antigravity_panel"?km:e===
+"gemini"?wm:kl}function Qr(e,t){return Array.isArray(t?.available_modes)&&t.available_modes.length>0?t.available_modes.map(
 n=>typeof n=="string"?{id:n,label:n}:n):e==="roo_code"?Nb:e==="cline"?Sb:e==="antigravity"||e==="antigravity_panel"?El:[]}
 function wl(e,t){return Array.isArray(t?.available_permission_modes)&&t.available_permission_modes.length>0?t.available_permission_modes.
 map(n=>typeof n=="string"?{value:n,label:n}:{value:n.id||n.value,label:n.label||n.id||n.value}).filter(n=>n.value):wb[e]||
 []}function Cb(e){let t="=".repeat((4-e.length%4)%4),n=(e+t).replace(/-/g,"+").replace(/_/g,"/"),s=atob(n);return Uint8Array.
 from([...s].map(a=>a.charCodeAt(0)))}var Ll=Object.freeze({permission_required:!0,agent_ready:!0,turn_ready:!1,goal_completed:!1,
 goal_attention:!0,provider_usage_warning:!0,agent_error:!0,session_offline:!0,rate_limit_cleared:!0,completion_sound:!1,
-completion_haptic:!1}),xb=Object.freeze(Object.fromEntries(Object.keys(Ll).map(e=>[e,!1]))),yi=null,Zp=0;function Pl(){if(typeof window>
-"u")return null;let e=window.AudioContext||window.webkitAudioContext;return e?(yi||(yi=new e),yi.state==="suspended"&&yi.
-resume().catch(()=>{}),yi):null}function em(e="completion"){let t=Date.now();if(t-Zp<600)return!1;let n=Pl();if(!n||n.state!==
-"running")return!1;Zp=t;let s=n.createOscillator(),a=n.createGain(),i=n.currentTime;return s.type="sine",s.frequency.setValueAtTime(
+completion_haptic:!1}),xb=Object.freeze(Object.fromEntries(Object.keys(Ll).map(e=>[e,!1]))),ki=null,em=0;function Pl(){if(typeof window>
+"u")return null;let e=window.AudioContext||window.webkitAudioContext;return e?(ki||(ki=new e),ki.state==="suspended"&&ki.
+resume().catch(()=>{}),ki):null}function tm(e="completion"){let t=Date.now();if(t-em<600)return!1;let n=Pl();if(!n||n.state!==
+"running")return!1;em=t;let s=n.createOscillator(),a=n.createGain(),i=n.currentTime;return s.type="sine",s.frequency.setValueAtTime(
 e==="prompt"?740:620,i),s.frequency.exponentialRampToValueAtTime(e==="prompt"?880:760,i+.11),a.gain.setValueAtTime(1e-4,
 i),a.gain.exponentialRampToValueAtTime(.035,i+.012),a.gain.exponentialRampToValueAtTime(1e-4,i+.14),s.connect(a),a.connect(
-n.destination),s.start(i),s.stop(i+.15),!0}function tm(e,t){return e!==t?!0:typeof document>"u"?!1:document.visibilityState!==
+n.destination),s.start(i),s.stop(i+.15),!0}function nm(e,t){return e!==t?!0:typeof document>"u"?!1:document.visibilityState!==
 "visible"||!document.hasFocus()}function Ab({onClose:e,onPreferencesChange:t}){let n=Ll,[s,a]=ue(n),[i,c]=ue(!0),[u,p]=ue(
 null),[b,y]=ue(""),[S,A]=ue("checking"),[N,h]=ue(!1);async function d(){c(!0),y("");try{let T=await fetch("/api/preferen\
 ces/notifications",{credentials:"same-origin"}),L=await T.json().catch(()=>({}));if(!T.ok)throw new Error(L.error||"Unab\
@@ -2519,7 +2520,7 @@ e?.antigravity_quota_models)?e.antigravity_quota_models:[],P=e?.active_quota_mod
 te=t?.conversation_mode||"unknown",ce=t?.mode&&t.mode!=="unknown"?t.mode:te,ie=typeof t?.auto_approve_permissions=="bool\
 ean"?t.auto_approve_permissions:!!e?.auto_approve_permissions,be=t?.effort||null,Ne=t?.next_send_effort||"",Se=t?.file_access_scope||
 "unknown",Ee=wl(Y,t),xe=Qr(Y,t),Ie=Y==="claude"||Y==="claude_cli"?kl:Y==="codex_cli"?Tl:Y==="cursor_cli"?$l:Y==="antigra\
-vity"||Y==="antigravity_panel"?ym:Y==="gemini"?km:[];t?.available_models&&Array.isArray(t.available_models)&&t.available_models.
+vity"||Y==="antigravity_panel"?km:Y==="gemini"?wm:[];t?.available_models&&Array.isArray(t.available_models)&&t.available_models.
 length>0&&(Ie=t.available_models.map(q=>typeof q=="string"?{id:q,label:q}:q)),React.useEffect(()=>{v&&s(v)},[v]);function Ke(q){
 !q||q===(he?W:J)||a(v,q)}function de(q){!q||q===B||c(v,q)}function Ze(q){!q||q===(he?Ne:be)||i&&i(v,q)}function D(q){!q||
 q===ce||p&&p(v,q)}function se(q){ie!==!!q&&u&&u(v,!!q)}function ke(q,et=!1){if(!(!q||q===t?.permission_profile)){if(q===
@@ -2547,7 +2548,7 @@ React.createElement("span",{className:`settings-value small${t?.next_send_model_
 style:{alignItems:"flex-start"}},React.createElement("span",{className:"settings-label"},"Quotas"),React.createElement("\
 div",{style:{display:"flex",flexDirection:"column",gap:6,flex:1,minWidth:0}},e?.available_ai_credits!=null&&React.createElement(
 "span",{className:"settings-value"},"AI credits: ",e.available_ai_credits),React.createElement("div",{style:{display:"fl\
-ex",flexWrap:"wrap",gap:6}},$.map((q,et)=>{let yt=q?.percent_used,xt=fm(q?.model),Hn=yt>=90?"#f85149":yt>=75?"#d29922":"\
+ex",flexWrap:"wrap",gap:6}},$.map((q,et)=>{let yt=q?.percent_used,xt=gm(q?.model),Hn=yt>=90?"#f85149":yt>=75?"#d29922":"\
 #8b949e",ds=!!P&&P===q?.model;return React.createElement("span",{key:q?.model||`quota-${et}`,className:"composer-hint",title:q?.
 refreshes_in?`${q.model} \xB7 resets in ${q.refreshes_in}`:q?.model||"",style:{color:Hn,border:`1px solid ${ds?Hn:"#3036\
 3d"}`,borderRadius:999,padding:"2px 8px",background:ds?`${Hn}18`:"rgba(110,118,129,0.08)"}},xt," ",yt!=null?`${yt}%`:"n/\
@@ -2562,7 +2563,7 @@ ce)&&React.createElement("option",{value:ce},ce)),V?.status==="ok"&&React.create
 ne-ok"},"Saved")),(Y==="claude"||Y==="claude_cli"||Y==="codex_cli"||Y==="cursor_cli"||Y==="continue_yolo"||Jr(Y))&&React.
 createElement("div",{className:"settings-row"},React.createElement("span",{className:"settings-label"},"Permission mode"),
 ve.permission_mode_change&&Ee.length>0?React.createElement("select",{className:"settings-perm-select",value:B==="unknown"?
-vm(Y):B,disabled:_(T),onChange:q=>de(q.target.value)},Ee.map(q=>React.createElement("option",{key:q.value,value:q.value},
+ym(Y):B,disabled:_(T),onChange:q=>de(q.target.value)},Ee.map(q=>React.createElement("option",{key:q.value,value:q.value},
 q.label)),!Ee.some(q=>q.value===B)&&B!=="unknown"&&React.createElement("option",{value:B},B)):React.createElement("span",
 {className:`settings-value${B==="unknown"?" dim":""}`},B),T?.status==="ok"&&React.createElement("span",{className:"setti\
 ngs-inline-ok"},"Saved")),Y==="codex_cli"&&t?.approval_policy&&React.createElement("div",{className:"settings-row"},React.
@@ -2747,7 +2748,7 @@ type==="directory")return gl.directory;let t=e.name.split(".").pop().toLowerCase
 return e==null?"":e<1024?`${e} B`:e<1024*1024?`${(e/1024).toFixed(1)} KB`:`${(e/(1024*1024)).toFixed(1)} MB`}var jb=new Set(
 ["md","txt","json","js","jsx","ts","tsx","py","html","css","yml","yaml","toml","sh","bat","ps1","cfg","conf","ini","xml",
 "csv","log","env","gitignore","dockerignore","sql","rs","go","java","c","cpp","h","hpp","rb","php","swift","kt","scala",
-"r","lua","vim","zsh","bash","fish"]);function nm(e){let t=e.split(".").pop().toLowerCase();return jb.has(t)||e.startsWith(
+"r","lua","vim","zsh","bash","fish"]);function sm(e){let t=e.split(".").pop().toLowerCase();return jb.has(t)||e.startsWith(
 ".")}function Bb(e){return e.toLowerCase().endsWith(".md")}function Fb({path:e,content:t,truncated:n,onBack:s}){let a=React.
 useMemo(()=>{if(!t)return"";try{let u=marked.parse(t);return DOMPurify.sanitize(u)}catch{return`<pre>${DOMPurify.sanitize(
 t)}</pre>`}},[t]),i=React.useRef(null);React.useEffect(()=>{i.current&&i.current.querySelectorAll("pre code").forEach(u=>{
@@ -2785,8 +2786,8 @@ React.createElement("div",{className:"file-browser-body"},b.length===0?React.cre
 r-empty"},"Empty directory"):React.createElement("div",{className:"file-browser-list"},y!=="."&&React.createElement("div",
 {className:"file-browser-entry",onClick:()=>{let A=S.slice(0,-1).join("/")||".";s(A)}},React.createElement("span",{className:"\
 file-entry-icon"},"\u{1F4C1}"),React.createElement("span",{className:"file-entry-name"},"..")),b.map(A=>React.createElement(
-"div",{key:A.name,className:`file-browser-entry${A.type==="directory"?" is-dir":""}${nm(A.name)?" is-viewable":""}`,onClick:()=>{
-if(A.type==="directory"){let N=y==="."?A.name:`${y}/${A.name}`;s(N)}else if(nm(A.name)){let N=y==="."?A.name:`${y}/${A.name}`;
+"div",{key:A.name,className:`file-browser-entry${A.type==="directory"?" is-dir":""}${sm(A.name)?" is-viewable":""}`,onClick:()=>{
+if(A.type==="directory"){let N=y==="."?A.name:`${y}/${A.name}`;s(N)}else if(sm(A.name)){let N=y==="."?A.name:`${y}/${A.name}`;
 a(N)}}},React.createElement("span",{className:"file-entry-icon"},Ib(A)),React.createElement("span",{className:"file-entr\
 y-name"},A.name),React.createElement("span",{className:"file-entry-meta"},A.type==="file"&&Db(A.size)))))))}var Gb={daily:"\
 Daily",weekdays:"Weekdays",weekly:"Weekly",custom:"Custom"},Nl={"Status reports":"\u{1F4CA}","Release prep":"\u{1F680}",
@@ -2878,7 +2879,7 @@ ane-section-title"},"Details"),s.map((i,c)=>React.createElement("div",{key:`${i.
 -pane-row"},React.createElement("span",null,i.label),React.createElement("strong",null,i.value)))),e.action_label&&React.
 createElement("button",{className:"codex-automation-pane-action",onClick:t},e.action_label))}function ar(e){return new Intl.
 NumberFormat([],{notation:"compact",maximumFractionDigits:1}).format(Math.max(0,Number(e)||0))}function Qb({cost:e,detailState:t,
-onRequestDetail:n}){let[s,a]=React.useState(1),[i,c]=React.useState(""),u=React.useMemo(()=>Fd(e,{days:s,project:i}),[e,
+onRequestDetail:n}){let[s,a]=React.useState(1),[i,c]=React.useState(""),u=React.useMemo(()=>Hd(e,{days:s,project:i}),[e,
 s,i]),p=t?.status==="ready"?t.detail:null,b=!!p&&Number(p.query?.days)===s&&String(p.query?.project||"")===i&&(!e?.generatedAt||
 String(p.generated_at||"")===e.generatedAt),y=t?.status==="loading"&&Number(t.query?.days)===s&&String(t.query?.project||
 "")===i&&String(t.query?.cursor||"0")==="0",S=b&&String(p.pagination?.cursor||"0")==="0",A=b?{costUsd:Math.max(0,Number(
@@ -2985,7 +2986,7 @@ outcome}`:"",n.error?` (${n.error})`:""),React.createElement(Qb,{cost:p.estimate
 React.createElement("div",{className:"usage-dashboard-grid"},p.entries.map(h=>{let d=Yc(h.credits),v=Xc(h.financials),g=h.
 credits?.resets_at?oa(h.credits.resets_at,b):"";return React.createElement("details",{open:!0,className:`usage-dashboard\
 -card ${h.tone}`,key:h.key,"data-provider-id":h.providerId,"data-account-fingerprint":h.accountFingerprint},React.createElement(
-"summary",{className:"usage-dashboard-card-summary"},React.createElement(fi,{providerId:h.providerId,providerName:h.providerName}),
+"summary",{className:"usage-dashboard-card-summary"},React.createElement(gi,{providerId:h.providerId,providerName:h.providerName}),
 React.createElement("span",{className:"usage-dashboard-card-title"},React.createElement("strong",null,h.providerName),React.
 createElement("span",null,h.accountLabel,h.plan?` \xB7 ${h.plan}`:"")),React.createElement("span",{className:`usage-dash\
 board-status ${h.status}`},S(h.status))),React.createElement("div",{className:"usage-dashboard-card-body"},React.createElement(
@@ -3036,7 +3037,7 @@ dashboard-credit-row","data-testid":"ollama-owned-request-metrics"},React.create
 "strong",null,"Latest owned request"),h.localRuntime.latestRequest.model,React.createElement("small",null,h.localRuntime.
 latestRequest.surface.replace(/_/g," ")," - ",sr(h.localRuntime.latestRequest.capturedAt,b))),React.createElement("span",
 null,React.createElement("strong",null,"Tokens"),h.localRuntime.latestRequest.promptTokens," prompt - ",h.localRuntime.latestRequest.
-responseTokens," output",React.createElement("small",null,Hd(h.localRuntime.latestRequest.tokensPerSecond))),React.createElement(
+responseTokens," output",React.createElement("small",null,Ud(h.localRuntime.latestRequest.tokensPerSecond))),React.createElement(
 "span",null,React.createElement("strong",null,"Total / load"),Gr(h.localRuntime.latestRequest.totalDurationNs)," / ",Gr(
 h.localRuntime.latestRequest.loadDurationNs),React.createElement("small",null,"terminal response metrics")),React.createElement(
 "span",null,React.createElement("strong",null,"Prompt / eval"),Gr(h.localRuntime.latestRequest.promptEvalDurationNs)," /\
@@ -3057,22 +3058,22 @@ source.replace(/_/g," "):"not available",h.latencyMs!=null?` \xB7 ${h.latencyMs}
 "div",{className:"usage-dashboard-empty"},React.createElement("strong",null,p.collectionState==="ready"?"The completed s\
 can found no provider usage.":"Provider usage is not available yet."),React.createElement("span",null,p.collectionState===
 "ready"?"Connect a supported Codex, Claude Code, Antigravity, or Cursor session, or start local Ollama, then refresh.":"\
-Quota totals remain unknown until a provider collection completes."))))}var ki=640,hl=220,vt=Object.freeze({left:54,right:14,
+Quota totals remain unknown until a provider collection completes."))))}var wi=640,hl=220,vt=Object.freeze({left:54,right:14,
 top:12,bottom:32});function Bs(e){let t=Math.max(.04,Math.min(1,Number(e?.end)-Number(e?.start)||1)),n=Math.max(0,Math.min(
 1-t,Number(e?.start)||0));return{start:n,end:n+t}}function Zb(e,t,n,s){let a="",i=!1;return e.forEach(c=>{let u=c[t];if(c.
-gap||u==null||!Number.isFinite(u)){i=!1;return}a+=`${i?"L":"M"}${n(c).toFixed(2)},${s(u).toFixed(2)} `,i=!0}),a.trim()}function wi({
+gap||u==null||!Number.isFinite(u)){i=!1;return}a+=`${i?"L":"M"}${n(c).toFixed(2)},${s(u).toFixed(2)} `,i=!0}),a.trim()}function Ni({
 title:e,description:t,frames:n,series:s,percentScale:a=!1,viewport:i,onViewportChange:c,crosshairSequence:u,onCrosshairChange:p,
 range:b="live",nowMs:y=Date.now(),paused:S=!1,subscriptionStatus:A="live"}){let N=React.useRef(null),h=React.useRef(new Map),
-d=React.useRef(null),v=React.useRef(0),[g,_]=React.useState({}),[k,T]=React.useState({mode:"auto",fixedMax:null}),L=ki-vt.
+d=React.useRef(null),v=React.useRef(0),[g,_]=React.useState({}),[k,T]=React.useState({mode:"auto",fixedMax:null}),L=wi-vt.
 left-vt.right,H=hl-vt.top-vt.bottom,V=tr(n,{nowMs:y,paused:S,connected:A!=="reconnecting",subscriptionStatus:A}),ne=V.frames,
 ee=Bs(i),re=er[b]??er.live,z=S&&V.endMs||y,oe=re===1/0?V.startMs||z-er.live:z-re,_e=Math.max(1,z-oe),Y=oe+_e*ee.start,ve=oe+
 _e*ee.end,he=ne.filter(D=>Number(D.chart_time_ms)>=Y&&Number(D.chart_time_ms)<=ve),X=s.map(D=>{let se=D.frames?tr(D.frames,
 {nowMs:y,paused:!0}).frames:he,ke=D.frames?se.filter(q=>Number(q.chart_time_ms)>=Y&&Number(q.chart_time_ms)<=ve):se;return{
-...D,visibleFrames:ke,samples:Od(ke,D.metric,180)}}),me=X.filter(D=>!g[D.key]),J=Math.max(0,...me.flatMap(D=>D.samples.map(
+...D,visibleFrames:ke,samples:Id(ke,D.metric,180)}}),me=X.filter(D=>!g[D.key]),J=Math.max(0,...me.flatMap(D=>D.samples.map(
 se=>se.max||0))),W=Hc(J,v.current,{percent:a});!a&&k.mode==="auto"&&(v.current=W.maximum);let G=k.mode==="fixed"&&k.fixedMax?
 Hc(k.fixedMax,k.fixedMax,{percent:a}):W,$=G.maximum,P=D=>vt.left+Uc(D,Y,ve)*L,B=D=>vt.top+H-Math.max(0,Math.min($,D))/Math.
 max(1,$)*H,te=he.find(D=>D.sample_sequence===u)||he.at(-1)||null,ce=te?vt.left+Uc(te,Y,ve)*L:null,ie=s[0]?.format||(D=>String(
-D)),be=Dd(Y,ve,typeof window<"u"&&window.innerWidth<=600?4:5),Ne=V.status[0]?.toUpperCase()+V.status.slice(1);function Se(D){
+D)),be=jd(Y,ve,typeof window<"u"&&window.innerWidth<=600?4:5),Ne=V.status[0]?.toUpperCase()+V.status.slice(1);function Se(D){
 let se=N.current?.getBoundingClientRect();return se?.width?Math.max(0,Math.min(1,(D.clientX-se.left)/se.width)):.5}function Ee(D){
 if(!he.length)return 0;let se=Y+(ve-Y)*D;return he.reduce((ke,q)=>Math.abs(Number(q.chart_time_ms)-se)<Math.abs(Number(ke.
 chart_time_ms)-se)?q:ke,he[0]).sample_sequence}function xe(D,se=.5){let ke=Bs(i),q=Math.max(.04,Math.min(1,(ke.end-ke.start)*
@@ -3106,12 +3107,12 @@ createElement("button",{type:"button",key:D.key,"aria-pressed":!g[D.key],onClick
 React.createElement("i",{className:`marker marker-${se%3}`,style:{"--series-color":D.color}}),D.label))),React.createElement(
 "div",{className:"host-resource-chart-canvas",ref:N,role:"group",tabIndex:"0","aria-label":`${e}. Drag to pan, wheel or \
 pinch to zoom, arrow keys move the synchronized crosshair, shift plus arrows pan, plus and minus zoom.`,onPointerDown:Ie,
-onPointerMove:Ke,onPointerUp:de,onPointerCancel:de,onKeyDown:Ze},React.createElement("svg",{viewBox:`0 0 ${ki} ${hl}`,"a\
+onPointerMove:Ke,onPointerUp:de,onPointerCancel:de,onKeyDown:Ze},React.createElement("svg",{viewBox:`0 0 ${wi} ${hl}`,"a\
 ria-hidden":"true"},V.gaps.filter(D=>D.endMs>=Y&&D.startMs<=ve).map((D,se)=>{let ke=vt.left+Math.max(0,(D.startMs-Y)/Math.
 max(1,ve-Y))*L,q=vt.left+Math.min(1,(D.endMs-Y)/Math.max(1,ve-Y))*L;return React.createElement("rect",{key:`${D.reason}-${se}`,
 className:"host-resource-chart-gap",x:ke,y:vt.top,width:Math.max(2,q-ke),height:H})}),[...G.ticks].reverse().map(D=>{let se=B(
 D);return React.createElement(React.Fragment,{key:D},React.createElement("line",{className:"host-resource-chart-grid",x1:vt.
-left,x2:ki-vt.right,y1:se,y2:se}),React.createElement("text",{className:"host-resource-chart-y-label",textAnchor:"end",x:vt.
+left,x2:wi-vt.right,y1:se,y2:se}),React.createElement("text",{className:"host-resource-chart-y-label",textAnchor:"end",x:vt.
 left-7,y:se+4},ie(D)))}),be.map((D,se)=>{let ke=vt.left+D.fraction*L;return React.createElement("text",{key:D.timeMs,className:"\
 host-resource-chart-x-label","aria-label":D.accessibleLabel,textAnchor:se===0?"start":se===be.length-1?"end":"middle",x:ke,
 y:hl-7},D.label)}),me.flatMap(D=>D.samples.map(se=>se.gap||se.min==null||se.max==null?null:React.createElement("line",{key:`${D.
@@ -3121,7 +3122,7 @@ strokeDasharray:D.dashed||se%3===1?"7 4":se%3===2?"2 4":void 0,d:Zb(D.samples,"a
 length<10?D.visibleFrames.map(ke=>{let q=Ps(ke,D.metric);return q==null?null:React.createElement("circle",{key:`${D.key}\
 -point-${ke.sample_sequence}`,className:`host-resource-chart-point marker-${se%3}`,cx:P(ke),cy:B(q),r:"3",stroke:D.color})}):
 []),ce!=null&&React.createElement("line",{className:"host-resource-chart-crosshair",x1:ce,x2:ce,y1:vt.top,y2:vt.top+H})),
-te&&React.createElement("div",{className:`host-resource-chart-tooltip ${ce>ki/2?"flip":""}`,role:"status"},React.createElement(
+te&&React.createElement("div",{className:`host-resource-chart-tooltip ${ce>wi/2?"flip":""}`,role:"status"},React.createElement(
 "strong",null,Gc(te.chart_time_ms)," / seq ",te.sample_sequence),React.createElement("span",null,Math.max(0,Math.round((y-
 Number(te.chart_time_ms))/1e3)),"s old / ",te.sample_interval_ms||V.cadenceMs," ms / ",Ne," / source ",te.status||"unkno\
 wn"),X.map(D=>React.createElement("span",{key:D.key},React.createElement("i",{style:{background:D.color}}),D.label,": ",
@@ -3146,7 +3147,7 @@ agentLabel||N.name).localeCompare(h.agentLabel||h.name)||N.pid-h.pid:s==="memory
 s==="read"?h.ioReadBps-N.ioReadBps||N.pid-h.pid:s==="write"?h.ioWriteBps-N.ioWriteBps||N.pid-h.pid:h.cpuHostPercent-N.cpuHostPercent||
 N.pid-h.pid,y=new Map;u.forEach(N=>{let h=p.has(N.parentKey)?N.parentKey:"";y.set(h,[...y.get(h)||[],N])});let S=[];function A(N,h){
 (y.get(N)||[]).sort(b).forEach(d=>{S.push({process:d,depth:h}),a[d.stableKey]!==!1&&A(d.stableKey,h+1)})}return A("",0),
-S}function sm(e,t,n=44,s=16){let a=(Array.isArray(e)?e:[]).map(i=>Ps(i,t)).filter(i=>i!==null);return a.length<2?"":a.map(
+S}function am(e,t,n=44,s=16){let a=(Array.isArray(e)?e:[]).map(i=>Ps(i,t)).filter(i=>i!==null);return a.length<2?"":a.map(
 (i,c)=>{let u=c/(a.length-1)*n,p=s-Math.max(0,Math.min(100,i))/100*s;return`${c?"L":"M"}${u.toFixed(2)},${p.toFixed(2)}`}).
 join(" ")}function tv({connected:e,error:t,history:n,subscription:s,onOpen:a,onRefresh:i,onSubscribe:c,onUnsubscribe:u}){
 let p="(min-width: 900px)",[b,y]=React.useState(()=>typeof window<"u"&&typeof window.matchMedia=="function"?window.matchMedia(
@@ -3156,7 +3157,7 @@ nction")return;let T=window.matchMedia(p),L=()=>y(T.matches);return L(),typeof T
 L)}},[]),React.useEffect(()=>{if(b)return c(!0,"global-strip"),()=>u("global-strip")},[b,c,u]),React.useEffect(()=>{if(!b)
 return;let T=()=>A(Date.now()),L=setInterval(T,1e3),H=()=>{document.visibilityState==="visible"&&(T(),i(!1))};return document.
 addEventListener("visibilitychange",H),()=>{clearInterval(L),document.removeEventListener("visibilitychange",H)}},[b,i]);
-let N=React.useMemo(()=>qd(n,{connected:e,error:!!t,nowMs:S,subscriptionStatus:s?.status}),[e,t,n,S,s?.status]);if(!b)return null;
+let N=React.useMemo(()=>Od(n,{connected:e,error:!!t,nowMs:S,subscriptionStatus:s?.status}),[e,t,n,S,s?.status]);if(!b)return null;
 let h=T=>(T==null?"\u2014":String(Math.round(T))).padStart(3,"\u2007"),d=T=>T==="critical"?"!!":T==="warning"?"!":"",v=N.
 status==="stale"?`stale ${N.ageSeconds}s`:N.status,g=N.memoryUsedBytes!==null&&N.memoryTotalBytes!==null?`${Dn(N.memoryUsedBytes)}\
  of ${Dn(N.memoryTotalBytes)}`:"memory totals unavailable",_=N.point?`Host CPU ${N.cpuPercent?.toFixed(1)??"unknown"}%; \
@@ -3175,15 +3176,15 @@ ource-divider","aria-hidden":"true"},"\xB7"),React.createElement("span",{classNa
 React.createElement("span",{className:"label"},"RAM","\xA0"),React.createElement("span",{className:"value"},h(N.memoryPercent)),
 React.createElement("span",{className:"unit"},"%"),React.createElement("span",{className:"attention-mark"},d(N.memoryLevel))),
 React.createElement("svg",{className:"global-host-resource-sparkline",viewBox:"0 0 44 16","aria-hidden":"true"},React.createElement(
-"path",{className:"cpu",d:sm(N.frames,"cpu_total_percent")}),React.createElement("path",{className:"memory",d:sm(N.frames,
+"path",{className:"cpu",d:am(N.frames,"cpu_total_percent")}),React.createElement("path",{className:"memory",d:am(N.frames,
 "memory_used_percent")})),React.createElement("span",{className:"global-host-resource-state"},v)))}function nv({snapshot:e,
-error:t,history:n,details:s,subscription:a,onBack:i,onRefresh:c,onSubscribe:u,onUnsubscribe:p}){let b=React.useMemo(()=>Pd(
+error:t,history:n,details:s,subscription:a,onBack:i,onRefresh:c,onSubscribe:u,onUnsubscribe:p}){let b=React.useMemo(()=>qd(
 e),[e]),[y,S]=React.useState(Date.now()),[A,N]=React.useState("live"),[h,d]=React.useState(null),[v,g]=React.useState(null),
 [_,k]=React.useState({start:0,end:1}),[T,L]=React.useState(0),[H,V]=React.useState(!1),[ne,ee]=React.useState(""),[re,z]=React.
 useState("all"),[oe,_e]=React.useState("cpu"),[Y,ve]=React.useState({}),[he,X]=React.useState("");React.useEffect(()=>(u(
 H,"dashboard"),()=>p("dashboard")),[H,u,p]),React.useEffect(()=>{let de=setInterval(()=>S(Date.now()),1e3);return()=>clearInterval(
 de)},[]);let me=React.useMemo(()=>h==null?n:n.filter(de=>de.sample_sequence<=h),[n,h]),J=h==null?y:v||y,W=React.useMemo(
-()=>Id(me,A,{nowMs:J,paused:h!=null,subscriptionStatus:a?.status,connected:a?.status!=="reconnecting",error:!!t}),[me,A,
+()=>Dd(me,A,{nowMs:J,paused:h!=null,subscriptionStatus:a?.status,connected:a?.status!=="reconnecting",error:!!t}),[me,A,
 J,h,a?.status,t]),G=React.useMemo(()=>tr(me,{nowMs:J,paused:h!=null,subscriptionStatus:a?.status,connected:a?.status!=="\
 reconnecting",error:!!t}),[me,J,h,a?.status,t]),$=React.useRef("");React.useEffect(()=>{if(!["delayed","stale"].includes(
 G.status)||h!=null){$.current="";return}let de=`${G.status}:${G.points.at(-1)?.sampleSequence||0}`;$.current!==de&&($.current=
@@ -3193,7 +3194,7 @@ re,oe,Y),[b.processes,ne,re,oe,Y]),ie=b.processes.find(de=>de.stableKey===he)||n
 y).replace(/^Updated\s+/i,""):"not yet available",Ne=React.useMemo(()=>he?s.flatMap(de=>{let Ze=(de.processes||[]).find(
 D=>D.stable_key===he);return Ze?[{frame_kind:"system",sample_sequence:de.sample_sequence,captured_at:de.captured_at,sample_interval_ms:de.
 sample_interval_ms,dropped_gap_count:de.dropped_gap_count,status:de.status,cpu:{total_percent:Ze.cpu_host_percent},disk:{
-read_bps:Ze.io_read_bps,write_bps:Ze.io_write_bps}}]:[]}):[],[s,he]),Se=de=>de==null?"\u2014":jd(de),Ee=de=>de==null?"\u2014":
+read_bps:Ze.io_read_bps,write_bps:Ze.io_write_bps}}]:[]}):[],[s,he]),Se=de=>de==null?"\u2014":Bd(de),Ee=de=>de==null?"\u2014":
 jn(de),xe={live:"Live",delayed:"Delayed",reconnecting:"Reconnecting",paused:"Paused",stale:"Stale",waiting:"Waiting",unavailable:"\
 Unavailable"}[G.status]||"Unavailable",Ie=[{key:"cpu-total",metric:"cpu_total_percent",label:"Total",color:"#58a6ff",format:Se},
 {key:"cpu-user",metric:"cpu_user_percent",label:"User",color:"#3fb950",format:Se},{key:"cpu-kernel",metric:"cpu_privileg\
@@ -3232,15 +3233,15 @@ round(P.memory.commitPercent),"%")),React.createElement("div",null,React.createE
 "span",null,"disk I/O"),React.createElement("small",null,"Read ",jn(P.disk.readBps)," / write ",jn(P.disk.writeBps)," / ",
 Math.round(P.disk.busyPercent),"% busy")),React.createElement("div",null,React.createElement("strong",null,jn(te)),React.
 createElement("span",null,"network I/O"),React.createElement("small",null,"Receive ",jn(P.network.receiveBps)," / send ",
-jn(P.network.sendBps)))),React.createElement("div",{className:"host-resource-charts"},React.createElement(wi,{title:"CPU",
+jn(P.network.sendBps)))),React.createElement("div",{className:"host-resource-charts"},React.createElement(Ni,{title:"CPU",
 description:"Total outline; User and Kernel component overlays (%)",frames:W,series:Ie,percentScale:!0,viewport:_,onViewportChange:k,
 crosshairSequence:T,onCrosshairChange:L,range:A,nowMs:J,paused:h!=null,subscriptionStatus:a?.status}),React.createElement(
-wi,{title:"Memory",description:"Physical used and committed (%)",frames:W,series:[{key:"memory-used",metric:"memory_used\
+Ni,{title:"Memory",description:"Physical used and committed (%)",frames:W,series:[{key:"memory-used",metric:"memory_used\
 _percent",label:"Physical used",color:"#bc8cff",format:Se},{key:"memory-commit",metric:"memory_commit_percent",label:"Co\
 mmitted",color:"#f778ba",format:Se}],percentScale:!0,viewport:_,onViewportChange:k,crosshairSequence:T,onCrosshairChange:L,
-range:A,nowMs:J,paused:h!=null,subscriptionStatus:a?.status}),React.createElement(wi,{title:"Disk",description:"Aggregat\
+range:A,nowMs:J,paused:h!=null,subscriptionStatus:a?.status}),React.createElement(Ni,{title:"Disk",description:"Aggregat\
 e throughput (IEC bytes/s); isolate unequal series in the legend",frames:W,series:Ke,viewport:_,onViewportChange:k,crosshairSequence:T,
-onCrosshairChange:L,range:A,nowMs:J,paused:h!=null,subscriptionStatus:a?.status}),React.createElement(wi,{title:"Network",
+onCrosshairChange:L,range:A,nowMs:J,paused:h!=null,subscriptionStatus:a?.status}),React.createElement(Ni,{title:"Network",
 description:"Physical-default receive and send (IEC bytes/s)",frames:W,series:[{key:"network-receive",metric:"network_re\
 ceive_bps",label:"Receive",color:"#3fb950",format:Ee},{key:"network-send",metric:"network_send_bps",label:"Send",color:"\
 #d29922",format:Ee}],viewport:_,onViewportChange:k,crosshairSequence:T,onCrosshairChange:L,range:A,nowMs:J,paused:h!=null,
@@ -3298,7 +3299,7 @@ aps remain visible; unavailable samples are not interpolated.")))}function sv(e)
 t))return Math.max(0,Math.min(100,t));let n=Number(e?.completed),s=Number(e?.total);return Number.isInteger(n)&&Number.isInteger(
 s)&&s>0?Math.max(0,Math.min(100,n/s*100)):null}function av(e,t){let n=ae(e?.last_snippet).trim();if(n)return n.replace(/\s+/g,
 " ").slice(0,180);let s=Array.isArray(t)?t:[];for(let a=s.length-1;a>=0;a-=1){let i=U_(s[a]?.content||no(s[a]?.content_blocks));
-if(i)return i.slice(0,180)}return"No recent message reported."}function rv(e,t){if(e?.goal)return _m(e.goal,t,e.goal_run);
+if(i)return i.slice(0,180)}return"No recent message reported."}function rv(e,t){if(e?.goal)return bm(e.goal,t,e.goal_run);
 let n=Date.parse(e?.startedAt||e?.started_at||e?.since||"");return Number.isFinite(n)?Rl(Math.max(0,(t-n)/1e3),{includeSeconds:!0}):
 "live"}function ov(e,t,n=20){let s=e.filter(a=>t[a]?.canReceiveBroadcast).slice(0,n);return s.length===e.length&&s.every(
 (a,i)=>a===e[i])?e:s}function iv({sessions:e,activities:t,thinking:n,permissionPrompts:s,errorPrompts:a,messages:i,agentConfigs:c,
@@ -3308,16 +3309,16 @@ useState(""),[re,z]=React.useState({});React.useEffect(()=>{let $=setInterval(()
 $)},[]);let oe=React.useMemo(()=>(e||[]).map($=>{let P=$e($),te=Object.prototype.hasOwnProperty.call(t,P)?t[P]||{kind:"i\
 dle",label:""}:$?.activity||{kind:"idle",label:""},ce=s[P]||(rr(a[P])?a[P]:null),ie=u[P]||null,be=!!ce||$?.rate_limit_active===
 !0||["goal_attention","provider_usage_threshold"].includes(ie?.kind),Ne=c[P]||{},Se=$?.agent_type,xe=d_(Se,Ne.capabilities)?
-te:{...te,goal:null},Ie=n[P]&&!xe?.kind?{...xe,kind:"thinking"}:xe,Ke=Jo(Ie,be,{connected:b,health:p[P],nowMs:h,requireFreshness:!0}),
-de=Ke==="needs_attention",Ze=sa(Ke),D=Zo(xe,{connected:b,health:p[P]}),se=ir($,Ne),ke=m_({agentType:Se,capabilities:Ne.capabilities,
+te:{...te,goal:null},Ie=n[P]&&!xe?.kind?{...xe,kind:"thinking"}:xe,Ke=Zo(Ie,be,{connected:b,health:p[P],nowMs:h,requireFreshness:!0}),
+de=Ke==="needs_attention",Ze=sa(Ke),D=ei(xe,{connected:b,health:p[P]}),se=ir($,Ne),ke=m_({agentType:Se,capabilities:Ne.capabilities,
 activity:xe,latestUserRequest:$?.last_user_request||p_(i[P]||[])}),q=ke.kind==="goal"&&xe?.goal||null,et=ae(xe?.kind).replace(
 /_/g," "),yt=Number($?.percent_used),xt=$?.rate_limited_until&&$.rate_limited_until!=="unknown"?to($.rate_limited_until):
 "",Hn=$?.rate_limit_active===!0?`Usage limited${xt?` \xB7 resets ${xt}`:" \xB7 reset unknown"}`:Number.isFinite(yt)&&yt>=
 75?`Usage ${Math.round(yt)}% used${xt?` \xB7 resets ${xt}`:""}`:"";return{id:P,session:$,agent:se,activity:xe,attention:de,
-working:Ze,state:Ke,goal:q,config:Ne,stateLabel:$?.rate_limit_active===!0?"Usage limited":bd(Ke),title:Zr($,P,Ne,i[P]||[]),
+working:Ze,state:Ke,goal:q,config:Ne,stateLabel:$?.rate_limit_active===!0?"Usage limited":vd(Ke),title:Zr($,P,Ne,i[P]||[]),
 status:ce?ae(ce.title).trim()||"Action required":Hn||D||ae(te?.label).trim()||(Ke==="idle"?q?"Goal paused":"Idle":et||(q?
-"Goal active":"Working")),workContext:ke,progress:sv(ke),snippet:av($,i[P]||[]),health:p[P]||"unknown",canReceiveBroadcast:dp(
-$,c[P],p[P]||"unknown",b),freshness:kd(te,h),activityLatencyMs:Number.isFinite(Number(te?.transport?.latency_ms))?Math.round(
+"Goal active":"Working")),workContext:ke,progress:sv(ke),snippet:av($,i[P]||[]),health:p[P]||"unknown",canReceiveBroadcast:pp(
+$,c[P],p[P]||"unknown",b),freshness:wd(te,h),activityLatencyMs:Number.isFinite(Number(te?.transport?.latency_ms))?Math.round(
 Number(te.transport.latency_ms)):null}}).filter(Boolean).sort(($,P)=>Number(P.attention)-Number($.attention)||Number(P.working)-
 Number($.working)||$.title.localeCompare(P.title)),[e,t,n,s,a,i,c,u,p,b,h]),_e=React.useMemo(()=>oe.filter($=>v||$.state!==
 "idle"||$.goal),[oe,v]),Y=oe.filter($=>$.state==="needs_attention").length,ve=oe.filter($=>$.working).length,he=oe.filter(
@@ -3327,8 +3328,8 @@ k($=>ov($,me))},[me,_]),React.useEffect(()=>{Object.keys(re).length!==0&&z($=>{l
 ([te,ce])=>{let ie=y[ce.clientMessageId]||ce.status,be=["offline_queued","busy_queued","steered"].includes(ie)?"queued":
 ie,Ne=["queued","accepted","launch_accepted","delivered","agent_started","failed"].includes(be)?be:ce.status;B[te]=Ne===
 ce.status?ce:{...ce,status:Ne},B[te]!==ce&&(P=!0)}),P?B:$})},[y]);function W($){ee(""),k(P=>P.includes($)?P.filter(B=>B!==
-$):P.length<20?[...P,$]:P)}function G(){let $=pp({session_ids:_,content:T,confirmation:H},te=>!!me[te]?.canReceiveBroadcast);
-if(!$.ok){ee($.error);return}let P=mp($.sessionIds),B={};$.sessionIds.forEach(te=>{let ce=S(te,$.content);B[te]={...P[te],
+$):P.length<20?[...P,$]:P)}function G(){let $=mp({session_ids:_,content:T,confirmation:H},te=>!!me[te]?.canReceiveBroadcast);
+if(!$.ok){ee($.error);return}let P=fp($.sessionIds),B={};$.sessionIds.forEach(te=>{let ce=S(te,$.content);B[te]={...P[te],
 clientMessageId:ce,title:me[te]?.title||te}}),z(B),L(""),V(""),ee("")}return React.createElement("div",{className:"fleet\
 -view","data-testid":"fleet-view"},React.createElement("div",{className:"automations-header fleet-view-header"},React.createElement(
 "button",{className:"automations-back",onClick:A,title:"Back to sessions"},"\u2190"),React.createElement("div",{className:"\
@@ -3448,26 +3449,26 @@ setCodexConfig:Y,newThread:ve,openPanel:he,openNativeWindow:X,requestChatList:me
 switchThread:P,threadLists:B,switchWorkspace:te,requestTerminalOutput:ce,sendTerminalInput:ie,terminalOutputs:be,requestFileChanges:Ne,
 respondToFileChange:Se,fileChanges:Ee,sendAttachment:xe,send:Ie,sendToSession:Ke,steerMessage:de,discardQueuedMessage:Ze,
 editQueuedMessage:D,queuedMessages:se,scheduledSends:ke,scheduleSend:q,cancelScheduledSend:et,launchSession:yt,resumeSession:xt,
-closeSession:Hn,activeSessionRef:ds,restoreCachedTranscript:Ri,setSessionSubscriptions:lr,workspaces:Mi,branchLists:so,requestBranchList:Ti,
-switchBranch:ao,createBranch:$i,skillLists:ur,requestSkillList:ro,automationViews:oo,showCodexAutomation:Ei,controlResults:pa,
-directoryListings:Li,requestDirectoryListing:ma,fileContents:dr,requestFileContent:Un,requestHistory:io,requestHistoryChunk:qt,
-duplicateProxyAlarms:Wn,nightlyValidationFailures:Sn,latestAppUpdateValidation:pr,providerUsage:zn,providerUsageRefreshReceipt:Pi,
-requestProviderUsageRefresh:ps,providerUsageResetReceipt:qi,consumeProviderUsageResetCredit:Fs,providerUsageCostDetail:Oi,
-requestProviderUsageCostDetail:Hs,hostResources:Ii,hostResourceError:mr,hostResourceHistory:sn,hostResourceDetails:ms,hostResourceSubscription:At,
-subscribeHostResources:fs,unsubscribeHostResources:fr,requestHostResourceRefresh:ot,semanticNotifications:gs}=Qd(),[f,nt]=ue(
+closeSession:Hn,activeSessionRef:ds,restoreCachedTranscript:Mi,setSessionSubscriptions:lr,workspaces:Ti,branchLists:so,requestBranchList:$i,
+switchBranch:ao,createBranch:Ei,skillLists:ur,requestSkillList:ro,automationViews:oo,showCodexAutomation:Li,controlResults:pa,
+directoryListings:Pi,requestDirectoryListing:ma,fileContents:dr,requestFileContent:Un,requestHistory:io,requestHistoryChunk:qt,
+duplicateProxyAlarms:Wn,nightlyValidationFailures:Sn,latestAppUpdateValidation:pr,providerUsage:zn,providerUsageRefreshReceipt:qi,
+requestProviderUsageRefresh:ps,providerUsageResetReceipt:Oi,consumeProviderUsageResetCredit:Fs,providerUsageCostDetail:Ii,
+requestProviderUsageCostDetail:Hs,hostResources:Di,hostResourceError:mr,hostResourceHistory:sn,hostResourceDetails:ms,hostResourceSubscription:At,
+subscribeHostResources:fs,unsubscribeHostResources:fr,requestHostResourceRefresh:ot,semanticNotifications:gs}=Jd(),[f,nt]=ue(
 null),fa=React.useCallback(o=>md(f,o),[f]),gr=React.useCallback(()=>pd(f),[f]),co=React.useSyncExternalStore(fa,gr,gr),[
 Gn,Us]=ue({}),[an,Cn]=ue({}),[lo,ft]=ue(!1),[ga,Kn]=ue(""),[Ws,ha]=ue(""),[Rt,zs]=ue(null),[uo,rn]=ue({}),[Vn,hs]=ue(xb),
 [it,Ve]=ue(!1),gt=Me(null),Gs=Me({}),_a=Me(!1),[on,cn]=ue(!1),[ct,Ot]=ue(!1),[Bt,kt]=ue(!1),[st,ze]=ue(!1),[ba,wt]=ue(!1),
-[va,Yn]=ue(!1),[Mt,ln]=ue(""),[tt,po]=ue({}),[mo,ya]=ue(!1),[Di,fo]=ue(""),[go,ka]=ue(!1),[we,_s]=ue(!1),[Xn,Ks]=ue(!1),
+[va,Yn]=ue(!1),[Mt,ln]=ue(""),[tt,po]=ue({}),[mo,ya]=ue(!1),[ji,fo]=ue(""),[go,ka]=ue(!1),[we,_s]=ue(!1),[Xn,Ks]=ue(!1),
 [hr,Qn]=ue(""),[Tt,Ft]=ue(0),[Jn,bs]=ue(!1),[ho,_o]=ue({}),[Zn,wa]=ue(null),un=Me({sessionId:null,expiresAt:0}),dn=Me(null),
 [xn,lt]=ue(!1),[An,Rn]=ue(0),[pn,Ge]=ue(!1),[mn,Ht]=ue(!0),[Vs,Ys]=ue({}),[ht,fn]=ue(!1),[Mn,es]=ue({}),[Tn,vs]=ue({}),[
 ys,ts]=ue({}),[_r,Na]=ue(!1),[Ut,ks]=ue(!1),[br,Sa]=ue(!1),[gn,It]=ue(!1),[ws,$n]=ue(!1),[Ns,Wt]=ue(!1),[ns,hn]=ue(!1),[
-Ss,zt]=ue(!1),[Cs,En]=ue(!1),[Ye,vr]=ue(null),[Gt,yr]=ue(!1),[ji,bo]=ue("."),[Ca,Xs]=ue(null),[xa,kr]=ue(null),wr=Me(null),
-[Bi,vo]=ue(0),Nr=Me(null),[Aa,Fi]=ue(()=>{try{return localStorage.getItem("remote-agent-chat-theme")||"dark"}catch{return"\
-dark"}}),[_n,Hi]=ue(()=>{try{let o=JSON.parse(localStorage.getItem("remote-agent-chat:collapsed-directories:v1")||"[]");
-return Array.isArray(o)?Object.fromEntries(o.map(w=>[String(w),!0])):{}}catch{return{}}}),[bn,Ui]=ue(()=>{try{return localStorage.
-getItem(Lp)==="1"}catch{return!1}});Te(()=>{try{localStorage.setItem(Lp,bn?"1":"0")}catch{}},[bn]);let[xs]=ue(()=>{try{let o=JSON.
-parse(localStorage.getItem(Zc)||"{}");return di(o)}catch{return di(li)}});Te(()=>{try{localStorage.setItem(Zc,JSON.stringify(
+Ss,zt]=ue(!1),[Cs,En]=ue(!1),[Ye,vr]=ue(null),[Gt,yr]=ue(!1),[Bi,bo]=ue("."),[Ca,Xs]=ue(null),[xa,kr]=ue(null),wr=Me(null),
+[Fi,vo]=ue(0),Nr=Me(null),[Aa,Hi]=ue(()=>{try{return localStorage.getItem("remote-agent-chat-theme")||"dark"}catch{return"\
+dark"}}),[_n,Ui]=ue(()=>{try{let o=JSON.parse(localStorage.getItem("remote-agent-chat:collapsed-directories:v1")||"[]");
+return Array.isArray(o)?Object.fromEntries(o.map(w=>[String(w),!0])):{}}catch{return{}}}),[bn,Wi]=ue(()=>{try{return localStorage.
+getItem(Pp)==="1"}catch{return!1}});Te(()=>{try{localStorage.setItem(Pp,bn?"1":"0")}catch{}},[bn]);let[xs]=ue(()=>{try{let o=JSON.
+parse(localStorage.getItem(Zc)||"{}");return pi(o)}catch{return pi(ui)}});Te(()=>{try{localStorage.setItem(Zc,JSON.stringify(
 xs))}catch{}},[xs]),Te(()=>{fetch("/api/preferences/sessions",{credentials:"same-origin"}).then(o=>o.ok?o.json():Promise.
 reject(new Error("Session settings unavailable"))).then(o=>{po(o.preferences||{}),ya(!0)}).catch(()=>{})},[]),Te(()=>{let o=!0;
 return fetch("/api/preferences/notifications",{credentials:"same-origin"}).then(w=>w.ok?w.json():Promise.reject(new Error(
@@ -3477,14 +3478,14 @@ once:!0}),document.addEventListener("keydown",o,{once:!0}),()=>{document.removeE
 "keydown",o)}},[Vn.completion_sound]);async function yo(o,w){let M=await fetch(`/api/preferences/sessions/${encodeURIComponent(
 o)}`,{method:"PUT",credentials:"same-origin",headers:{"Content-Type":"application/json"},body:JSON.stringify({preference:w})}),
 R=await M.json().catch(()=>({}));if(!M.ok)throw new Error(R.error||"Unable to save session settings.");return po(U=>({...U,
-[o]:R.preference})),R.preference?.archived&&f===o&&nt(null),R.preference}async function Wi(o,w){let M=await fetch(`/api/\
+[o]:R.preference})),R.preference?.archived&&f===o&&nt(null),R.preference}async function zi(o,w){let M=await fetch(`/api/\
 sessions/${encodeURIComponent(o)}/export?format=${encodeURIComponent(w)}`,{credentials:"same-origin"});if(!M.ok){let Qe=await M.
 json().catch(()=>({}));throw new Error(Qe.error||"Unable to export session.")}let U=(M.headers.get("Content-Disposition")||
 "").match(/filename\*=UTF-8''([^;]+)/i)?.[1],Q=`session.${w==="json"?"json":"md"}`;if(U)try{Q=decodeURIComponent(U)}catch{}
 let le=URL.createObjectURL(await M.blob()),ye=document.createElement("a");ye.href=le,ye.download=Q,ye.hidden=!0,document.
 body.appendChild(ye),ye.click(),ye.remove(),setTimeout(()=>URL.revokeObjectURL(le),1e3)}Te(()=>{try{let o=Object.keys(_n).
 filter(w=>_n[w]);localStorage.setItem("remote-agent-chat:collapsed-directories:v1",JSON.stringify(o))}catch{}},[_n]);let ko=React.
-useCallback(o=>{Hi(w=>({...w,[o]:!w[o]}))},[]),wo=Me(de);Te(()=>{wo.current=de},[de]);let No=React.useCallback((o,w)=>{f&&
+useCallback(o=>{Ui(w=>({...w,[o]:!w[o]}))},[]),wo=Me(de);Te(()=>{wo.current=de},[de]);let No=React.useCallback((o,w)=>{f&&
 wo.current(f,o,w)},[f]),So=Me(Ke);Te(()=>{So.current=Ke},[Ke]);let Co=React.useCallback(o=>{!f||!o?._cid||So.current(f,o.
 content,o._cid)},[f]),xo=Me(Un);Te(()=>{xo.current=Un},[Un]);let ss=React.useMemo(()=>[...e||[]].map(o=>{let w=$e(o),M=tt[w];
 return M?.display_name?typeof o=="object"?{...o,custom_display_name:M.display_name}:{session_id:w,custom_display_name:M.
@@ -3492,37 +3493,37 @@ display_name}:o}),[e,tt]),Kt=React.useMemo(()=>new Set(ss.filter(el).map($e)),[s
 o)),[ss]),Ra=bn?ss:Sr,Oe=React.useMemo(()=>Ra.filter(o=>!tt[$e(o)]?.archived),[Ra,tt]),Ao=React.useMemo(()=>Sr.filter(o=>!tt[$e(
 o)]?.archived),[Sr,tt]),r=tb(S,Oe),m=React.useMemo(()=>({activities:S,thinking:b,pendingPrompts:g,errorPrompts:Object.fromEntries(
 Object.entries(k||{}).filter(([,o])=>rr(o))),health:A,connected:i,nowMs:r,requireFreshness:!0}),[S,b,g,k,A,i,r]),{working:C,
-states:O}=React.useMemo(()=>sp(Oe,m),[Oe,m]),l=Me(null),x=Me(null),E=Me(null),[F,Z]=ue(!1),K=React.useCallback(()=>{E.current&&
+states:O}=React.useMemo(()=>ap(Oe,m),[Oe,m]),l=Me(null),x=Me(null),E=Me(null),[F,Z]=ue(!1),K=React.useCallback(()=>{E.current&&
 clearTimeout(E.current),E.current=null,Z(!0)},[]),ge=React.useCallback((o=0)=>{E.current&&clearTimeout(E.current),E.current=
 setTimeout(()=>{E.current=null,Z(!1)},o)},[]);React.useEffect(()=>{let o=()=>ge(80);return window.addEventListener("poin\
 terup",o,!0),window.addEventListener("pointercancel",o,!0),()=>{window.removeEventListener("pointerup",o,!0),window.removeEventListener(
 "pointercancel",o,!0),E.current&&clearTimeout(E.current)}},[ge]);let{sessions:pe,revision:De}=eb(C,F),He=React.useMemo(()=>new Set(
-pe.map($e)),[pe]),{pinned:We}=React.useMemo(()=>Zd(Oe,tt),[Oe,tt]),Nt=React.useMemo(()=>new Set(We.map($e)),[We]),Ce=React.
-useMemo(()=>$d(Oe,{workingSessionIds:He,pinnedSessionIds:Nt}),[Oe,He,Nt]),Le=Ce.recent,$t=React.useMemo(()=>new Set(Le.map(
-$e)),[Le]),vn=Ce.pinned,Nm=React.useMemo(()=>nl(Ce.remaining,H,xs),[Ce.remaining,H,xs]),Ma=React.useMemo(()=>Object.fromEntries(
-nl(Oe,H,xs).flatMap(o=>o.sessions.map(w=>[$e(w),o.label]))),[Oe,H,xs]),Sm=React.useMemo(()=>({...m,messages:t,rankWorking:!1}),
-[m,t]),{groups:ql,orderChanged:Ro,sortNow:Ol,revision:Cm}=X_(Nm,Sm,F),as=React.useMemo(()=>ql.filter(o=>o.sessions.length>
-0),[ql]),xm=React.useMemo(()=>new Set(as.flatMap(o=>o.sessions.map($e))),[as]),Am=React.useCallback(()=>{let o=l.current,
+pe.map($e)),[pe]),{pinned:We}=React.useMemo(()=>ep(Oe,tt),[Oe,tt]),Nt=React.useMemo(()=>new Set(We.map($e)),[We]),Ce=React.
+useMemo(()=>Ed(Oe,{workingSessionIds:He,pinnedSessionIds:Nt}),[Oe,He,Nt]),Le=Ce.recent,$t=React.useMemo(()=>new Set(Le.map(
+$e)),[Le]),vn=Ce.pinned,Sm=React.useMemo(()=>nl(Ce.remaining,H,xs),[Ce.remaining,H,xs]),Ma=React.useMemo(()=>Object.fromEntries(
+nl(Oe,H,xs).flatMap(o=>o.sessions.map(w=>[$e(w),o.label]))),[Oe,H,xs]),Cm=React.useMemo(()=>({...m,messages:t,rankWorking:!1}),
+[m,t]),{groups:ql,orderChanged:Ro,sortNow:Ol,revision:xm}=X_(Sm,Cm,F),as=React.useMemo(()=>ql.filter(o=>o.sessions.length>
+0),[ql]),Am=React.useMemo(()=>new Set(as.flatMap(o=>o.sessions.map($e))),[as]),Rm=React.useCallback(()=>{let o=l.current,
 w=f?o?.querySelector(`[data-session-id="${CSS.escape(f)}"]`):null;x.current=w?{sessionId:f,top:w.getBoundingClientRect().
 top}:null,Ol()},[f,Ol]),ut=ga.trim().toLowerCase(),Il=React.useMemo(()=>Object.fromEntries(Oe.map(o=>{let w=$e(o),M=ir(o,
 H[w]);return[w,[Zr(o,w,H[w],t[w]||[]),or(o,w,H[w]),Ma[w]||"Unscoped",tt[w]?.pinned?"Pinned":"",M.name,o?.agent_type,o?.workspace_name,
 o?.workspace_path,w].filter(Boolean).join(" ").toLowerCase()]})),[Oe,H,t,Ma,tt]),As=React.useCallback(o=>ut?o.filter(w=>(Il[$e(
 w)]||"").includes(ut)):o,[ut,Il]),Ta=React.useMemo(()=>As(pe),[As,pe]),$a=React.useMemo(()=>As(Le),[As,Le]),Ea=React.useMemo(
 ()=>As(vn),[As,vn]),Dl=React.useMemo(()=>as.map(o=>({...o,sessions:As(o.sessions)})).filter(o=>o.sessions.length>0),[As,
-as]),jl=React.useMemo(()=>[...pe,...Le,...vn,...as.flatMap(o=>o.sessions)],[pe,Le,vn,as]),zi=React.useMemo(()=>{let o=new Set;
-return Oe.filter(w=>{let M=$e(w);return!M||o.has(M)?!1:(o.add(M),!0)})},[Oe]),Rm=React.useMemo(()=>new Set(zi.map($e)),[
-zi]),Mm=React.useMemo(()=>[`working:${pe.map($e).sort().join(",")}`,`recent:${Le.map($e).sort().join(",")}`,`pinned:${vn.
+as]),jl=React.useMemo(()=>[...pe,...Le,...vn,...as.flatMap(o=>o.sessions)],[pe,Le,vn,as]),Gi=React.useMemo(()=>{let o=new Set;
+return Oe.filter(w=>{let M=$e(w);return!M||o.has(M)?!1:(o.add(M),!0)})},[Oe]),Mm=React.useMemo(()=>new Set(Gi.map($e)),[
+Gi]),Tm=React.useMemo(()=>[`working:${pe.map($e).sort().join(",")}`,`recent:${Le.map($e).sort().join(",")}`,`pinned:${vn.
 map($e).sort().join(",")}`,...as.map(o=>`${o.key}:${o.sessions.map($e).sort().join(",")}`).sort()].join("|"),[pe,Le,vn,as]),
 Rs=Me(new Map),Mo=Me(null),Qs=Me(null);us(()=>{let o=l.current;if(!o)return;let w=Qs.current||document.activeElement,M=w instanceof
 Element?w.closest("[data-sidebar-card-host]"):null,R=new Set;for(let U of o.querySelectorAll("[data-sidebar-card-slot]")){
 let Q=U.getAttribute("data-sidebar-card-slot")||"",le=Rs.current.get(Q);if(!(!Q||!le)&&(R.add(Q),le.parentElement!==U)){
 let ye=M===le&&w?.isConnected;U.appendChild(le),ye&&document.activeElement!==w&&w.isConnected&&w.focus({preventScroll:!0})}}
-Qs.current=null;for(let[U,Q]of Rs.current)R.has(U)||Rm.has(U)||(Q.remove(),Rs.current.delete(U));return()=>{let U=document.
+Qs.current=null;for(let[U,Q]of Rs.current)R.has(U)||Mm.has(U)||(Q.remove(),Rs.current.delete(U));return()=>{let U=document.
 activeElement,Q=U instanceof Element?U.closest("[data-sidebar-card-host]"):null;Qs.current=Q?U:null;let le=Mo.current;le||
 (le=document.createElement("div"),le.setAttribute("data-sidebar-card-pool",""),Object.assign(le.style,{position:"fixed",
 left:"-10000px",top:"-10000px",width:"1px",height:"1px",overflow:"hidden",pointerEvents:"none"}),document.body.appendChild(
 le),Mo.current=le);for(let ye of Rs.current.values())le.appendChild(ye);Qs.current?.isConnected&&document.activeElement!==
-Qs.current&&Qs.current.focus({preventScroll:!0})}},[Mm]),Te(()=>()=>{for(let o of Rs.current.values())o.remove();Rs.current.
+Qs.current&&Qs.current.focus({preventScroll:!0})}},[Tm]),Te(()=>()=>{for(let o of Rs.current.values())o.remove();Rs.current.
 clear(),Mo.current?.remove(),Mo.current=null,Qs.current=null},[]);let Js=React.useCallback(o=>o.reduce((w,M)=>{let R=$e(
 M);return w.unread+=Kt.has(R)?0:u[R]||0,w.hasPrompt=w.hasPrompt||!!g[R]||!!rr(k[R]),w.working=w.working||sa(O[R]),w},{unread:0,
 hasPrompt:!1,working:!1}),[Kt,u,g,k,O]),Cr=React.useMemo(()=>Js(Ta),[Js,Ta]),La=React.useMemo(()=>Js($a),[Js,$a]),Pa=React.
@@ -3552,23 +3553,23 @@ le")===Q.focusTitle)?.focus({preventScroll:!0})},U=()=>{let Q=o.getBoundingClien
 "[data-session-id]")),ye=document.activeElement?.closest?.("[data-session-id]"),Qe=le.find(Jt=>{let $s=Jt.getBoundingClientRect();
 return $s.bottom>Q.top&&$s.top<Q.bottom}),je=ye||Qe||le[0];return je?{sessionId:je.dataset.sessionId,top:je.getBoundingClientRect().
 top,focusTitle:ye&&document.activeElement?.getAttribute?.("title")||null,menuOpen:!!je.querySelector("details.session-ca\
-rd-menu[open]")}:null};return M||R(),To.current=U(),()=>{To.current=U()}},[f,De,Cm]);let I=React.useMemo(()=>Oe.find(o=>$e(
-o)===f),[Oe,f]),Ln=f?co:Pp,dt=f&&n[f]||null,Bl=Xd(I,Ln),$o=f?S[f]:null,Fl=f&&y[f]||"",Gi=f&&g[f]||null,Ki=f&&k[f]||null,
+rd-menu[open]")}:null};return M||R(),To.current=U(),()=>{To.current=U()}},[f,De,xm]);let I=React.useMemo(()=>Oe.find(o=>$e(
+o)===f),[Oe,f]),Ln=f?co:qp,dt=f&&n[f]||null,Bl=Qd(I,Ln),$o=f?S[f]:null,Fl=f&&y[f]||"",Ki=f&&g[f]||null,Vi=f&&k[f]||null,
 Hl=React.useMemo(()=>{let o=$o&&typeof $o=="object"?$o:null,w=o?.goal||null,M=Array.isArray(o?.task_list?.tasks)?o.task_list.
 tasks.map(R=>`${R.state||""}:${R.text||R.title||R.label||""}`).join("|"):"";return[Fl,o?.kind||"",o?.label||"",o?.updatedAt||
 "",o?.startedAt||"",o?.interruptHint||"",o?.thinkingContent||"",w?.status||"",w?.label||"",w?.objective||"",w?.time_used_seconds??
-w?.timeUsedSeconds??"",w?.updated_at||"",M,Gi?.id||Gi?.request_id||"",Ki?.id||Ki?.request_id||"",dt?.messageId||"",dt?.content?.
-length||0,dt?.open?"open":"closed"].join("")},[$o,Fl,Gi,Ki,dt]),Eo={sessionId:f,messageCount:Ln.length,provisionalId:dt?.
-messageId||"",provisionalLength:dt?.content?.length||0},Tm=Me(null),Vt=Me(null),Lo=Me(!0),Yt=Me(!0),Ul=Me(0),qa=Me(0),xr=Me(
-0),Ar=Me(0),Vi=Me(null),Yi=Me(null),Wl=Me(""),zl=Me(f),Rr=Me({sessionId:null,keys:[],scrollTop:0,scrollHeight:0,clientHeight:0,
-atBottom:!0}),Xi=Me(null),Mr=Me(0),Pn=Me(null),$m=Me(null),Qi=Me(Eo),Ji=Me(Eo),Tr=Me({}),Oa=Me({sessionId:null,index:0,scratch:""}),
-Zi=Me(i),ec=Me({}),Gl=Me({});Qi.current=Eo,us(()=>{zl.current=f},[f]),Te(()=>{let o=M=>{try{sessionStorage.setItem("agen\
+w?.timeUsedSeconds??"",w?.updated_at||"",M,Ki?.id||Ki?.request_id||"",Vi?.id||Vi?.request_id||"",dt?.messageId||"",dt?.content?.
+length||0,dt?.open?"open":"closed"].join("")},[$o,Fl,Ki,Vi,dt]),Eo={sessionId:f,messageCount:Ln.length,provisionalId:dt?.
+messageId||"",provisionalLength:dt?.content?.length||0},$m=Me(null),Vt=Me(null),Lo=Me(!0),Yt=Me(!0),Ul=Me(0),qa=Me(0),xr=Me(
+0),Ar=Me(0),Yi=Me(null),Xi=Me(null),Wl=Me(""),zl=Me(f),Rr=Me({sessionId:null,keys:[],scrollTop:0,scrollHeight:0,clientHeight:0,
+atBottom:!0}),Qi=Me(null),Mr=Me(0),Pn=Me(null),Em=Me(null),Ji=Me(Eo),Zi=Me(Eo),Tr=Me({}),Oa=Me({sessionId:null,index:0,scratch:""}),
+ec=Me(i),tc=Me({}),Gl=Me({});Ji.current=Eo,us(()=>{zl.current=f},[f]),Te(()=>{let o=M=>{try{sessionStorage.setItem("agen\
 t-chat:last-window-error",JSON.stringify({message:M?.error?.message||M?.message||"Unknown window error",stack:M?.error?.
 stack||"",at:new Date().toISOString()}))}catch{}},w=M=>{try{let R=M?.reason;sessionStorage.setItem("agent-chat:last-prom\
 ise-error",JSON.stringify({message:R?.message||ae(R,"Unhandled promise rejection"),stack:R?.stack||"",at:new Date().toISOString()}))}catch{}};
 return window.addEventListener("error",o),window.addEventListener("unhandledrejection",w),()=>{window.removeEventListener(
-"error",o),window.removeEventListener("unhandledrejection",w)}},[]),Te(()=>{try{let o=localStorage.getItem(Ep);o&&Us(JSON.
-parse(o))}catch{}},[]),Te(()=>{try{localStorage.setItem(Ep,JSON.stringify(Gn))}catch{}},[Gn]),Te(()=>{try{localStorage.setItem(
+"error",o),window.removeEventListener("unhandledrejection",w)}},[]),Te(()=>{try{let o=localStorage.getItem(Lp);o&&Us(JSON.
+parse(o))}catch{}},[]),Te(()=>{try{localStorage.setItem(Lp,JSON.stringify(Gn))}catch{}},[Gn]),Te(()=>{try{localStorage.setItem(
 "remote-agent-chat-theme",Aa)}catch{}document.documentElement.setAttribute("data-theme",Aa)},[Aa]),Te(()=>{if(!f&&Oe.length>
 0){let o=new URLSearchParams(window.location.search).get("session"),w=o?Oe.find(U=>$e(U)===o):null,M=w||Oe[0],R=$e(M);R&&
 (qn(R,M),w&&window.history.replaceState({},"",window.location.pathname))}},[Oe,f]),Te(()=>{if(!("serviceWorker"in navigator))
@@ -3576,77 +3577,77 @@ return;let o=w=>{if(w.data?.type!=="push_notification_clicked")return;let M=w.da
 M);M&&R&&qn(M,R)};return navigator.serviceWorker.addEventListener("message",o),()=>navigator.serviceWorker.removeEventListener(
 "message",o)},[Oe]),Te(()=>{if(!d)return;let o=Oe.find(w=>(typeof w=="string"?w:w?.session_id)===d);o&&(qn(d,o),v(null))},
 [d,Oe]),Te(()=>{let o=Vt.current;if(!o)return;let w=null,M=()=>{Ul.current=Date.now()+1200,qa.current=0,xr.current+=1,Yt.
-current&&(Ji.current=Qi.current,Rn(0))},R=je=>{je.deltaY<-1&&M()},U=je=>{let Jt=o.getBoundingClientRect();je.clientX>=Jt.
+current&&(Zi.current=Ji.current,Rn(0))},R=je=>{je.deltaY<-1&&M()},U=je=>{let Jt=o.getBoundingClientRect();je.clientX>=Jt.
 right-16&&M()},Q=je=>{w=je.touches?.[0]?.clientY??null},le=je=>{let Jt=je.touches?.[0]?.clientY??null;w!=null&&Jt!=null&&
 Jt-w>4&&M()},ye=je=>{["ArrowUp","PageUp","Home"].includes(je.key)&&M()},Qe=()=>{let je=o.scrollHeight-o.scrollTop-o.clientHeight<
 80,Jt=Date.now(),$s=Jt<Ul.current,Dr=Jt<qa.current;Lo.current=je,je?Yt.current=!0:$s&&!Dr&&(Yt.current=!1,Ar.current=0),
-$s&&!Dr&&o.scrollTop<160&&Vi.current?.(),lt(!je&&!Yt.current),Rr.current={...Rr.current,scrollTop:o.scrollTop,scrollHeight:o.
+$s&&!Dr&&o.scrollTop<160&&Yi.current?.(),lt(!je&&!Yt.current),Rr.current={...Rr.current,scrollTop:o.scrollTop,scrollHeight:o.
 scrollHeight,clientHeight:o.clientHeight,atBottom:je||Yt.current}};return o.addEventListener("scroll",Qe,{passive:!0}),o.
 addEventListener("wheel",R,{passive:!0}),o.addEventListener("touchstart",Q,{passive:!0}),o.addEventListener("touchmove",
 le,{passive:!0}),o.addEventListener("pointerdown",U,{passive:!0}),window.addEventListener("keydown",ye),()=>{o.removeEventListener(
 "scroll",Qe),o.removeEventListener("wheel",R),o.removeEventListener("touchstart",Q),o.removeEventListener("touchmove",le),
 o.removeEventListener("pointerdown",U),window.removeEventListener("keydown",ye)}},[f]);function Po(o,w=2){let M=f,R=xr.current+
 1;xr.current=R;let U=()=>{let ye=Vt.current;return!ye||zl.current!==M||xr.current!==R?!1:(qa.current=Date.now()+800,Yt.current=
-!0,Ji.current=Qi.current,nn(ye,ye.scrollHeight),Lo.current=!0,lt(!1),Rn(0),Rr.current={sessionId:M,keys:o,scrollTop:ye.scrollTop,
+!0,Zi.current=Ji.current,nn(ye,ye.scrollHeight),Lo.current=!0,lt(!1),Rn(0),Rr.current={sessionId:M,keys:o,scrollTop:ye.scrollTop,
 scrollHeight:ye.scrollHeight,clientHeight:ye.clientHeight,atBottom:!0},!0)};U();let Q=Math.max(0,w),le=()=>{Q<=0||(Q-=1,
-U()&&requestAnimationFrame(le))};Q>0&&requestAnimationFrame(le)}function Em(){if(!Vt.current)return;let w=ul(Ln);Ar.current=
+U()&&requestAnimationFrame(le))};Q>0&&requestAnimationFrame(le)}function Lm(){if(!Vt.current)return;let w=ul(Ln);Ar.current=
 Date.now()+5e3,Po(w,4)}us(()=>{let o=Vt.current;if(!o)return;let w=ul(Ln),M=Rr.current||{},R=M.sessionId===f,U=Array.isArray(
 M.keys)?M.keys:[],Q=U[0]||null,le=U[U.length-1]||null,ye=Q?w.indexOf(Q):-1,Qe=le?w.indexOf(le):-1,je=!!(R&&w.length===U.
-length&&w.every((kc,jr)=>kc===U[jr])),Jt=(Number(M.scrollHeight)||0)-(Number(M.scrollTop)||0)-(Number(M.clientHeight)||0),
-$s=Date.now()<Ar.current,Dr=$s||Yt.current||M.atBottom!==!1||Jt<120,df=!!(R&&U.length&&ye>0&&Qe>=ye);if(!(je&&!$s&&!Dr))
-if(!R)kr(null),Po(w,3);else if(df){if(Yt.current=!1,Ar.current=0,o.dataset.transcriptWindowed!=="true"){let kc=o.scrollHeight-
-(Number(M.scrollHeight)||0);qa.current=Date.now()+500,nn(o,Math.max(0,(Number(M.scrollTop)||0)+kc));let jr=Yi.current,xu=jr?
+length&&w.every((wc,jr)=>wc===U[jr])),Jt=(Number(M.scrollHeight)||0)-(Number(M.scrollTop)||0)-(Number(M.clientHeight)||0),
+$s=Date.now()<Ar.current,Dr=$s||Yt.current||M.atBottom!==!1||Jt<120,pf=!!(R&&U.length&&ye>0&&Qe>=ye);if(!(je&&!$s&&!Dr))
+if(!R)kr(null),Po(w,3);else if(pf){if(Yt.current=!1,Ar.current=0,o.dataset.transcriptWindowed!=="true"){let wc=o.scrollHeight-
+(Number(M.scrollHeight)||0);qa.current=Date.now()+500,nn(o,Math.max(0,(Number(M.scrollTop)||0)+wc));let jr=Xi.current,xu=jr?
 Array.from(o.querySelectorAll(".message[data-message-key]")).find(Au=>Au.dataset.messageKey===jr.messageKey):null;if(xu){
 let Ru=xu.getBoundingClientRect().top-o.getBoundingClientRect().top-jr.viewportOffset;Math.abs(Ru)>=.5&&nn(o,Math.max(0,
-o.scrollTop+Ru))}Yi.current=null}}else Dr&&Po(w,3);let Uo=o.scrollHeight-o.scrollTop-o.clientHeight<80;Lo.current=Uo,lt(
-!Uo&&!Yt.current),Rn(Uo||Yt.current?0:Y_(Ji.current,Eo)),Rr.current={sessionId:f,keys:w,scrollTop:o.scrollTop,scrollHeight:o.
+o.scrollTop+Ru))}Xi.current=null}}else Dr&&Po(w,3);let Uo=o.scrollHeight-o.scrollTop-o.clientHeight<80;Lo.current=Uo,lt(
+!Uo&&!Yt.current),Rn(Uo||Yt.current?0:Y_(Zi.current,Eo)),Rr.current={sessionId:f,keys:w,scrollTop:o.scrollTop,scrollHeight:o.
 scrollHeight,clientHeight:o.clientHeight,atBottom:Uo||Yt.current}},[f,Ln,Hl]),Te(()=>{f&&ne(f)},[f]),Te(()=>{_o(o=>{let w=Object.
-keys(o).filter(R=>!b[R]);if(w.length===0)return o;let M={...o};return w.forEach(R=>delete M[R]),M})},[b]),Te(()=>{!Zi.current&&
-i&&at("Reconnected"),Zi.current&&!i&&at("Disconnected \u2014 reconnecting..."),Zi.current=i},[i]);function at(o){ha(o),setTimeout(
-()=>ha(""),3e3)}function Lm(o){let w=Oe.find(M=>$e(M)===o);return w?Zr(w,o,H[o],t[o]||[]):o}function Kl(o,w,M,R=""){gt.current&&
-clearTimeout(gt.current),zs({sessionId:o,kind:w,title:M,detail:R||Lm(o)}),gt.current=setTimeout(()=>{gt.current=null,zs(
+keys(o).filter(R=>!b[R]);if(w.length===0)return o;let M={...o};return w.forEach(R=>delete M[R]),M})},[b]),Te(()=>{!ec.current&&
+i&&at("Reconnected"),ec.current&&!i&&at("Disconnected \u2014 reconnecting..."),ec.current=i},[i]);function at(o){ha(o),setTimeout(
+()=>ha(""),3e3)}function Pm(o){let w=Oe.find(M=>$e(M)===o);return w?Zr(w,o,H[o],t[o]||[]):o}function Kl(o,w,M,R=""){gt.current&&
+clearTimeout(gt.current),zs({sessionId:o,kind:w,title:M,detail:R||Pm(o)}),gt.current=setTimeout(()=>{gt.current=null,zs(
 null)},8e3)}function Vl(){gt.current&&clearTimeout(gt.current),gt.current=null,zs(null)}Te(()=>()=>{gt.current&&clearTimeout(
 gt.current)},[]),Te(()=>{let o=Gs.current,w=g||{},M=Object.keys(o).filter(R=>!w[R]);M.length>0&&(rn(R=>{let U={...R};return M.
 forEach(Q=>{U[Q]?.kind==="prompt"&&delete U[Q]}),U}),zs(R=>R?.kind==="prompt"&&M.includes(R.sessionId)?null:R)),Object.entries(
 w).forEach(([R,U])=>{let Q=U?.prompt_id||U?.request_id||U?.id||"prompt",le=o[R],ye=le?.prompt_id||le?.request_id||le?.id||
-null;if(Q===ye||(_a.current&&Vn.completion_sound&&tm(R,f)&&em("prompt"),R===f))return;let Qe=U?.type==="question_prompt"||
+null;if(Q===ye||(_a.current&&Vn.completion_sound&&nm(R,f)&&tm("prompt"),R===f))return;let Qe=U?.type==="question_prompt"||
 U?.kind==="question"?"Question needs an answer":"Permission needs attention";rn(je=>({...je,[R]:{kind:"prompt",promptId:Q}})),
 Kl(R,"prompt",Qe)}),Gs.current=w,_a.current=!0},[g,f,Vn.completion_sound]),Te(()=>{!f||Rt?.sessionId!==f||(gt.current&&clearTimeout(
 gt.current),gt.current=null,zs(null))},[f,Rt?.sessionId]),Te(()=>{if(!it||!mo)return;let o=!1;async function w(){for(let M of gs||
-[]){let R=M.session_id||M.session;if(!xd(M,Vn)){aa(M,"suppressed",{reasonCode:"client_preference"});continue}if(tt[R]?.muted){
-aa(M,"suppressed",{reasonCode:"session_muted"});continue}if(!tm(R,f)){aa(M,"suppressed",{reasonCode:"focused_session"});
-continue}let U=await Ad(M);if(o)continue;if(!U){aa(M,"suppressed",{reasonCode:"client_duplicate"});continue}aa(M,"claime\
-d");let Q=M.event_type;Vn.completion_sound&&em(Q==="goal_attention"||Q==="provider_usage_threshold"?"prompt":"completion"),
+[]){let R=M.session_id||M.session;if(!Ad(M,Vn)){aa(M,"suppressed",{reasonCode:"client_preference"});continue}if(tt[R]?.muted){
+aa(M,"suppressed",{reasonCode:"session_muted"});continue}if(!nm(R,f)){aa(M,"suppressed",{reasonCode:"focused_session"});
+continue}let U=await Rd(M);if(o)continue;if(!U){aa(M,"suppressed",{reasonCode:"client_duplicate"});continue}aa(M,"claime\
+d");let Q=M.event_type;Vn.completion_sound&&tm(Q==="goal_attention"||Q==="provider_usage_threshold"?"prompt":"completion"),
 R!==f&&rn(ye=>({...ye,[R]:{kind:Q,dedupeKey:M.dedupe_key,createdAt:M.created_at||new Date().toISOString()}})),Kl(R,Q,M.title,
 M.body),(typeof requestAnimationFrame=="function"?requestAnimationFrame:ye=>setTimeout(ye,16))(()=>{o||aa(M,"displayed")})}}
-return w().catch(()=>{}),()=>{o=!0}},[gs,f,tt,Vn,it,mo]);function Ia(o,w){o&&Us(M=>({...M,[o]:w}))}function tc(o,w){o&&Cn(
-M=>{let R={...M};if(w===null)return delete R[o],R;let U=R[o]||[];return Array.isArray(w)?R[o]=w:R[o]=[...U,w],R})}function Pm(o,w){
-o&&Cn(M=>{let R={...M},U=[...R[o]||[]];return U.splice(w,1),U.length===0?delete R[o]:R[o]=U,R})}async function nc(o,w,M,R){
+return w().catch(()=>{}),()=>{o=!0}},[gs,f,tt,Vn,it,mo]);function Ia(o,w){o&&Us(M=>({...M,[o]:w}))}function nc(o,w){o&&Cn(
+M=>{let R={...M};if(w===null)return delete R[o],R;let U=R[o]||[];return Array.isArray(w)?R[o]=w:R[o]=[...U,w],R})}function qm(o,w){
+o&&Cn(M=>{let R={...M},U=[...R[o]||[]];return U.splice(w,1),U.length===0?delete R[o]:R[o]=U,R})}async function sc(o,w,M,R){
 let U=await fetch("/upload",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({filename:R,content:w,
-mimeType:M})});if(!U.ok)throw new Error("Upload failed");let{url:Q}=await U.json();return tc(o,{name:R,url:Q,isText:!1,mimeType:M}),
-Q}function Yl(o,w,M,R){let U=xe(o,w,M,R);return ec.current[U]={sessionId:o,filename:R,mimeType:M,base64:w,createdAt:Date.
+mimeType:M})});if(!U.ok)throw new Error("Upload failed");let{url:Q}=await U.json();return nc(o,{name:R,url:Q,isText:!1,mimeType:M}),
+Q}function Yl(o,w,M,R){let U=xe(o,w,M,R);return tc.current[U]={sessionId:o,filename:R,mimeType:M,base64:w,createdAt:Date.
 now()},at(`Sending image to Codex: ${R}`),U}Te(()=>{let o=Object.entries(pa||{});for(let[w,M]of o){if(!w.startsWith("att\
-ach-")||Gl.current[w])continue;Gl.current[w]=!0;let R=ec.current[w];if(delete ec.current[w],!!R){if(M?.result==="ok"){at(
-`Image attached to Codex: ${R.filename}`);continue}(async()=>{try{await nc(R.sessionId,R.base64,R.mimeType,R.filename),at(
+ach-")||Gl.current[w])continue;Gl.current[w]=!0;let R=tc.current[w];if(delete tc.current[w],!!R){if(M?.result==="ok"){at(
+`Image attached to Codex: ${R.filename}`);continue}(async()=>{try{await sc(R.sessionId,R.base64,R.mimeType,R.filename),at(
 `Direct image attach failed \u2014 added ${R.filename} as a file link draft`)}catch{let U=M?.error?.message||M?.error?.code||
 "unknown error";at(`Image attach failed: ${U}`)}})()}}},[pa]);function Da(o){let w=o?.agent_type;return{limit:y_(w),...w===
 "codex_cli"||w==="cursor_cli"?{chunkBytes:__}:{}}}function pv(o){let w=Oe.find(M=>$e(M)===o);return Da(w)}function qn(o,w){
-let M=ds.current===o;Ri(o),nt(o),ds.current=o,Oa.current={sessionId:o,index:(Tr.current[o]||[]).length,scratch:""},p(R=>({
+let M=ds.current===o;Mi(o),nt(o),ds.current=o,Oa.current={sessionId:o,index:(Tr.current[o]||[]).length,scratch:""},p(R=>({
 ...R,[o]:0})),rn(R=>{if(!R[o])return R;let U={...R};return delete U[o],U}),Rt?.sessionId===o&&Vl(),ft(!1),Ot(!1),Ge(!1),
-fn(!1),En(!1),M&&setTimeout(()=>io(o,Da(w)),0)}function qm(o){let w=o?.session_id,M=Number(o?.message_id);if(!w||!Number.
+fn(!1),En(!1),M&&setTimeout(()=>io(o,Da(w)),0)}function Om(o){let w=o?.session_id,M=Number(o?.message_id);if(!w||!Number.
 isSafeInteger(M)||M<=0)return;let R=Oe.find(U=>$e(U)===w)||{session_id:w,workspace_path:o.workspace_path||null,project_root:o.
 project_root||null,workspace_name:o.workspace_name||null,agent_type:o.agent_type||null,status:"history"};Fe.cancelRouteRestore(),
-Xi.current=null,vr({sessionId:w,messageId:M}),qn(w,R),En(!1)}async function Om(o){let w=Array.from(o.target.files||[]);if(w.
+Qi.current=null,vr({sessionId:w,messageId:M}),qn(w,R),En(!1)}async function Im(o){let w=Array.from(o.target.files||[]);if(w.
 length!==0){o.target.value="";for(let M of w){if(M.size>2*1024*1024){at(`${M.name}: too large (max 2 MB)`);continue}if($u(
-M.name)&&M.size<500*1024)await new Promise((R,U)=>{let Q=new FileReader;Q.onload=le=>{tc(f,{name:M.name,content:le.target.
+M.name)&&M.size<500*1024)await new Promise((R,U)=>{let Q=new FileReader;Q.onload=le=>{nc(f,{name:M.name,content:le.target.
 result,isText:!0}),R()},Q.onerror=()=>{at(`Failed to read ${M.name}`),R()},Q.readAsText(M)});else{cn(!0);try{await new Promise(
 (R,U)=>{let Q=new FileReader;Q.onload=async le=>{let ye=le.target.result.split(",")[1];(j?.capabilities||{}).send_attachment&&
-M.type.startsWith("image/")?Yl(f,ye,M.type,M.name):(await nc(f,ye,M.type,M.name),at(`Uploaded: ${M.name}`)),R()},Q.onerror=
-()=>{at(`Failed to read ${M.name}`),R()},Q.readAsDataURL(M)})}catch{at(`Upload failed: ${M.name}`)}finally{cn(!1)}}}}}async function Im(o){
+M.type.startsWith("image/")?Yl(f,ye,M.type,M.name):(await sc(f,ye,M.type,M.name),at(`Uploaded: ${M.name}`)),R()},Q.onerror=
+()=>{at(`Failed to read ${M.name}`),R()},Q.readAsDataURL(M)})}catch{at(`Upload failed: ${M.name}`)}finally{cn(!1)}}}}}async function Dm(o){
 let M=Array.from(o.clipboardData?.items||[]).find(le=>le.type.startsWith("image/"));if(!M||(o.preventDefault(),!f))return;
 let R=M.getAsFile();if(!R)return;if(R.size>2*1024*1024){at("Image too large (max 2 MB)");return}let U=R.type==="image/jp\
 eg"?"jpg":"png",Q=`screenshot-${Date.now()}.${U}`;cn(!0);try{await new Promise(le=>{let ye=new FileReader;ye.onload=async Qe=>{
-let je=Qe.target.result.split(",")[1];(j?.capabilities||{}).send_attachment?Yl(f,je,R.type,Q):(await nc(f,je,R.type,Q),at(
+let je=Qe.target.result.split(",")[1];(j?.capabilities||{}).send_attachment?Yl(f,je,R.type,Q):(await sc(f,je,R.type,Q),at(
 "Screenshot attached")),le()},ye.onerror=()=>{at("Failed to read clipboard image"),le()},ye.readAsDataURL(R)})}catch{at(
 "Paste upload failed")}finally{cn(!1)}}function Xl(){if(Ts)return;let o=f&&Gn[f]||"",w=f?an[f]||[]:[],M=o.trim();if(!M&&
 w.length===0||!f)return;let R="";if(w.length>0?(R=w.map(Q=>{if(Q.isText){let le=za(Q.name);return`\`${Q.name}\`
@@ -3657,43 +3658,43 @@ ${Q.content}
 `),M&&(R+=`
 
 ${M}`)):R=M,Ke(f,R),M){let U=Tr.current[f]||[],Q=U[U.length-1]===M?U:[...U,M].slice(-100);Tr.current[f]=Q,Oa.current={sessionId:f,
-index:Q.length,scratch:""}}es(U=>({...U,[f]:!1})),ts(U=>({...U,[f]:Math.min(U[f]||0,(t[f]||[]).length)})),Ia(f,""),tc(f,
-null),Ot(!1),Pn.current?.focus()}function sc(){dn.current&&clearTimeout(dn.current),dn.current=null,un.current={sessionId:null,
-expiresAt:0},wa(null)}function Dm(){if(!f)return;let o=Date.now()+2500;un.current={sessionId:f,expiresAt:o},wa(f),dn.current&&
+index:Q.length,scratch:""}}es(U=>({...U,[f]:!1})),ts(U=>({...U,[f]:Math.min(U[f]||0,(t[f]||[]).length)})),Ia(f,""),nc(f,
+null),Ot(!1),Pn.current?.focus()}function ac(){dn.current&&clearTimeout(dn.current),dn.current=null,un.current={sessionId:null,
+expiresAt:0},wa(null)}function jm(){if(!f)return;let o=Date.now()+2500;un.current={sessionId:f,expiresAt:o},wa(f),dn.current&&
 clearTimeout(dn.current),dn.current=setTimeout(()=>{un.current.sessionId===f&&un.current.expiresAt===o&&(un.current={sessionId:null,
-expiresAt:0},dn.current=null,wa(null))},2500)}function ac(){if(!f||!b[f]||ho[f]){sc();return}sc(),_o(o=>({...o,[f]:!0})),
-L(f)}Te(()=>()=>{dn.current&&clearTimeout(dn.current)},[]),Te(()=>{Zn&&(Zn!==f||!b[Zn])&&sc()},[f,b,Zn]);function jm(o){
+expiresAt:0},dn.current=null,wa(null))},2500)}function rc(){if(!f||!b[f]||ho[f]){ac();return}ac(),_o(o=>({...o,[f]:!0})),
+L(f)}Te(()=>()=>{dn.current&&clearTimeout(dn.current)},[]),Te(()=>{Zn&&(Zn!==f||!b[Zn])&&ac()},[f,b,Zn]);function Bm(o){
 if((o.metaKey||o.ctrlKey)&&o.key.toLowerCase()==="k"){o.preventDefault(),Pn.current?.focus();return}if(o.key==="Escape"){
 if(ct){Ot(!1);return}if(Ts)return;qo&&!ja&&(o.preventDefault(),un.current.sessionId===f&&un.current.expiresAt>=Date.now()?
-ac():Dm());return}if(o.key==="Enter"&&!o.shiftKey&&un.current.sessionId===f&&un.current.expiresAt>=Date.now()){o.preventDefault(),
-ac();return}let w=f?Tr.current[f]||[]:[],M=Oa.current,R=M.sessionId===f&&M.index>=0&&M.index<w.length;if(o.key==="ArrowU\
+rc():jm());return}if(o.key==="Enter"&&!o.shiftKey&&un.current.sessionId===f&&un.current.expiresAt>=Date.now()){o.preventDefault(),
+rc();return}let w=f?Tr.current[f]||[]:[],M=Oa.current,R=M.sessionId===f&&M.index>=0&&M.index<w.length;if(o.key==="ArrowU\
 p"&&w.length>0&&(On===""||R)){o.preventDefault();let U=M.sessionId===f?M:{sessionId:f,index:w.length,scratch:On};U.index=
 Math.max(0,U.index-1),Oa.current=U,Ia(f,w[U.index]);return}if(o.key==="ArrowDown"&&R){o.preventDefault();let U=Math.min(
 w.length,M.index+1);Oa.current={...M,index:U},Ia(f,U===w.length?M.scratch:w[U]);return}if(o.key==="Tab"&&ct&&Io.length>0){
 o.preventDefault(),Cu(Io[0].command);return}o.key==="Enter"&&!o.shiftKey&&(o.preventDefault(),Xl())}let qo=f?!!b[f]:!1,ja=f?
-!!ho[f]:!1,On=f&&Gn[f]||"",rc=f?an[f]||[]:[],$r=React.useCallback(()=>{let o=Pn.current;if(!o)return;let w=Math.max(42,Math.
+!!ho[f]:!1,On=f&&Gn[f]||"",oc=f?an[f]||[]:[],$r=React.useCallback(()=>{let o=Pn.current;if(!o)return;let w=Math.max(42,Math.
 floor(window.innerHeight*.4));o.style.height="auto";let M=Math.max(42,Math.min(o.scrollHeight,w));o.style.height=`${M}px`,
 o.style.overflowY=o.scrollHeight>w?"auto":"hidden"},[]);us(()=>{$r()},[f,On,$r]),Te(()=>(window.addEventListener("resize",
 $r),()=>window.removeEventListener("resize",$r)),[$r]);let Zs=Ln,Ql=f&&Mn[f]&&ys[f]||0,Ue=React.useMemo(()=>{let o=Math.
-min(Ql,Zs.length);return o<=0?Zs:o>=Zs.length?Pp:Zs.slice(o)},[Zs,Ql]),os=React.useMemo(()=>Ue.filter(o=>C_(o)),[Ue]),oc=!gn&&
-!ws&&!Ns&&!ns&&!Ss&&!Cs,Fe=cb({messages:os,containerRef:Vt,sessionId:f,routeActive:oc}),Ms=React.useCallback(()=>{let o=Vt.
-current;if(!o)return;let w=o.scrollHeight-o.scrollTop-o.clientHeight<80;Xi.current={sessionId:f,scrollTop:o.scrollTop,scrollHeight:o.
-scrollHeight,clientHeight:o.clientHeight,atBottom:w},Fe.prepareForRouteChange()},[f,Fe.prepareForRouteChange]);us(()=>{if(!oc||
-Fe.enabled)return;let o=Xi.current;if(!Vt.current||o?.sessionId!==f)return;let M=()=>{let R=Vt.current;if(!R||o.sessionId!==
+min(Ql,Zs.length);return o<=0?Zs:o>=Zs.length?qp:Zs.slice(o)},[Zs,Ql]),os=React.useMemo(()=>Ue.filter(o=>C_(o)),[Ue]),ic=!gn&&
+!ws&&!Ns&&!ns&&!Ss&&!Cs,Fe=cb({messages:os,containerRef:Vt,sessionId:f,routeActive:ic}),Ms=React.useCallback(()=>{let o=Vt.
+current;if(!o)return;let w=o.scrollHeight-o.scrollTop-o.clientHeight<80;Qi.current={sessionId:f,scrollTop:o.scrollTop,scrollHeight:o.
+scrollHeight,clientHeight:o.clientHeight,atBottom:w},Fe.prepareForRouteChange()},[f,Fe.prepareForRouteChange]);us(()=>{if(!ic||
+Fe.enabled)return;let o=Qi.current;if(!Vt.current||o?.sessionId!==f)return;let M=()=>{let R=Vt.current;if(!R||o.sessionId!==
 f)return;let U=o.atBottom?R.scrollHeight:Math.min(o.scrollTop,Math.max(0,R.scrollHeight-R.clientHeight));qa.current=Date.
 now()+800,nn(R,U)};return M(),Mr.current=requestAnimationFrame(()=>{Mr.current=0,M()}),()=>{Mr.current&&cancelAnimationFrame(
-Mr.current),Mr.current=0}},[f,oc,Fe.enabled]),Te(()=>{if(wm)return window.__RAC_TRANSCRIPT_WINDOW__={total:os.length,scrollToIndex:Fe.
+Mr.current),Mr.current=0}},[f,ic,Fe.enabled]),Te(()=>{if(Nm)return window.__RAC_TRANSCRIPT_WINDOW__={total:os.length,scrollToIndex:Fe.
 scrollToIndex},()=>{window.__RAC_TRANSCRIPT_WINDOW__?.scrollToIndex===Fe.scrollToIndex&&delete window.__RAC_TRANSCRIPT_WINDOW__}},
 [os.length,Fe.scrollToIndex]);let Et=f&&g[f]||null,Er=f&&k[f]||null,Lr=rr(Er)?Er:null,Jl=Er&&!rr(Er)?Er:null,Ts=Et||Lr,mv=Et?
 Et.type==="question_prompt"?"Question required":"Permission required":Lr?ae(Lr.title,"Action required"):null;us(()=>{let o=Vt.
 current;if(!o)return;let w=Et?`${f||""}\0${Et.prompt_id||Et.request_id||Et.id||"prompt"}`:"",M=Wl.current;Wl.current=w,w?
 (xr.current+=1,Ar.current=0,Yt.current=!1,qa.current=Date.now()+800,nn(o,0),Lo.current=o.scrollHeight-o.clientHeight<80,
-lt(!1),Rn(0)):M&&Po(ul(Ln),3)},[f,Et?.prompt_id,Hl,Ln]);let Bm=!!(On.trim()||rc.length>0)&&!!f&&!on&&!Ts,Zl=i?c?.state||
-"connecting":"offline",Fm=c?.rttMs!=null?` \xB7 ${c.rttMs} ms`:"",eu=Object.entries(u).reduce((o,[w,M])=>Kt.has(w)?o:o+Number(
+lt(!1),Rn(0)):M&&Po(ul(Ln),3)},[f,Et?.prompt_id,Hl,Ln]);let Fm=!!(On.trim()||oc.length>0)&&!!f&&!on&&!Ts,Zl=i?c?.state||
+"connecting":"offline",Hm=c?.rttMs!=null?` \xB7 ${c.rttMs} ms`:"",eu=Object.entries(u).reduce((o,[w,M])=>Kt.has(w)?o:o+Number(
 M||0),0),Oo=Object.keys(uo).filter(o=>o!==f&&!Kt.has(o)).length,tu=pr?.completed_at?Date.now()-Date.parse(pr.completed_at):
 Number.POSITIVE_INFINITY,Xt=tu>=0&&tu<=1440*60*1e3?pr:null,Ba=Xt?Sn.filter(o=>o.run_id!==Xt.run_id):Sn,Pr=Wn.length>0||Ba.
-length>0||!!Xt,Hm=On.startsWith("/")?On.slice(1).trim().toLowerCase():"",Io=On.startsWith("/")?b_.filter(o=>o.command.slice(
-1).includes(Hm)):[];us(()=>{let o=wr.current;if(!Pr||!o){vo(0);return}let w=()=>vo(Math.ceil(o.getBoundingClientRect().height));
+length>0||!!Xt,Um=On.startsWith("/")?On.slice(1).trim().toLowerCase():"",Io=On.startsWith("/")?b_.filter(o=>o.command.slice(
+1).includes(Um)):[];us(()=>{let o=wr.current;if(!Pr||!o){vo(0);return}let w=()=>vo(Math.ceil(o.getBoundingClientRect().height));
 if(w(),typeof ResizeObserver>"u")return;let M=new ResizeObserver(w);return M.observe(o),()=>M.disconnect()},[Pr,Wn.length,
 Ba.length,Xt?.run_id]);let j=f&&H[f]||null,nu=f?Object.values(V||{}).filter(o=>o.sessionId===f):[],su=nu.find(o=>o.status===
 "pending"||o.status==="awaiting_config")||null,Do=nu.find(o=>o.status==="failed")||null,Qt=f&&s[f]||null,Fa=f&&a[f]||null;
@@ -3709,53 +3710,53 @@ le=>le?.sessionId===f&&String(le?.messageId)===String(Ye.messageId)?null:le)},5e
 "Matched message could not be loaded"))},100);return()=>{clearInterval(U),R&&clearTimeout(R)}},[f,Ye?.sessionId,Ye?.messageId,
 t[f],os,Fe.scrollToIndex]),Te(()=>{lr(f?[f]:[])},[f,lr]),Te(()=>{if(!f||!i||!Bl)return;let o=Da(I);qt(f,{...o,mode:"tail",
 source:"native"})},[f,i,Bl]);let Be=I?.agent_type==="antigravity-v2",qr=f?G[f]||[]:[],Ha=f?Vs[f]:null,au=React.useMemo(()=>Be&&
-Ha?.id?qr.map(o=>!o?.kind||o.kind==="chat"?{...o,active:o.id===Ha.id}:o):qr,[qr,Be,Ha?.id]),ic=!!(f&&Object.prototype.hasOwnProperty.
-call(G,f)),ru=au.filter(o=>!o?.kind||o.kind==="chat").length,Um=!!(f&&Be&&!Gt),cc=I?.agent_type==="antigravity"||I?.agent_type===
+Ha?.id?qr.map(o=>!o?.kind||o.kind==="chat"?{...o,active:o.id===Ha.id}:o):qr,[qr,Be,Ha?.id]),cc=!!(f&&Object.prototype.hasOwnProperty.
+call(G,f)),ru=au.filter(o=>!o?.kind||o.kind==="chat").length,Wm=!!(f&&Be&&!Gt),lc=I?.agent_type==="antigravity"||I?.agent_type===
 "antigravity_panel"||I?.agent_type==="antigravity-v2",yn=I?W_(Oe,I):null,ou=I?.agent_type==="codex"&&I?.visible_pane_visible?
-{pane_agent:I.visible_pane_agent||null,summary:Hp(I),sourceSession:I}:null,Wm=yn?{pane_agent:yn.panel_agent||null,summary:Hp(
-yn),sourceSession:yn}:null,jo=ou||Wm,zm=jo?.summary||"",Gm=jo?.pane_agent||null,iu=zm||pl(Gm)||or(jo?.sourceSession,$e(jo?.
-sourceSession)),cu=iu,lc=!!(I&&I.agent_type==="codex"&&I.visible_pane_visible&&I.visible_pane_agent==="codex"),Km=!!(I&&
-I.agent_type==="codex"&&I.visible_pane_visible&&I.visible_pane_agent&&I.visible_pane_agent!=="codex"),Xe=ir(I||f,j),uc=f?
-Ma[f]:"",is=I&&typeof I=="object"?I.workspace_path:"",lu=is?is.split(/[\\/]/).filter(Boolean).pop()||is:"",Vm=lu||(uc&&uc!==
-"Unscoped"?uc:"")||ae(I?.workspace_name)||"Unscoped",uu=Me(new Map),dc=React.useMemo(()=>Be&&Ha?.title?{...I||{},native_chat_title:Ha.
-title}:I,[I,Be,Ha?.title]),pc=React.useMemo(()=>{if(!f)return{title:"Agent Chat",source:"fallback",field:"no_session"};let o=Rc(
-dc,dc?.custom_display_name||"",Ln),w=td(uu.current.get(f),o);return uu.current.set(f,w),w},[f,dc,Ln]),mc=pc.title,Bo=f?oo[f]:
-null,Ym=!!(Xe?.name==="Codex"&&I&&I.agent_type==="codex"&&(Km&&yn||!ou&&yn&&(yn.panel_agent==="antigravity_panel"||cu))),
-du=!!j?.capabilities?.new_thread,Xm=I?.agent_type==="codex-desktop",Qm=I?.agent_type==="cursor",pu=Xm||Qm,fc=pu?"New cha\
-t":"New thread",mu=I&&typeof I=="object"?I.machine_label:"",fu=hm(I),gu=React.useMemo(()=>{for(let o=Ue.length-1;o>=0;o--)
-if(Ue[o]?.role==="user")return Ue[o];return null},[Ue]),gc=gu?Ct(gu.content).replace(/\s+/g," ").trim():"",ea=f?A[f]||I?.
+{pane_agent:I.visible_pane_agent||null,summary:Up(I),sourceSession:I}:null,zm=yn?{pane_agent:yn.panel_agent||null,summary:Up(
+yn),sourceSession:yn}:null,jo=ou||zm,Gm=jo?.summary||"",Km=jo?.pane_agent||null,iu=Gm||pl(Km)||or(jo?.sourceSession,$e(jo?.
+sourceSession)),cu=iu,uc=!!(I&&I.agent_type==="codex"&&I.visible_pane_visible&&I.visible_pane_agent==="codex"),Vm=!!(I&&
+I.agent_type==="codex"&&I.visible_pane_visible&&I.visible_pane_agent&&I.visible_pane_agent!=="codex"),Xe=ir(I||f,j),dc=f?
+Ma[f]:"",is=I&&typeof I=="object"?I.workspace_path:"",lu=is?is.split(/[\\/]/).filter(Boolean).pop()||is:"",Ym=lu||(dc&&dc!==
+"Unscoped"?dc:"")||ae(I?.workspace_name)||"Unscoped",uu=Me(new Map),pc=React.useMemo(()=>Be&&Ha?.title?{...I||{},native_chat_title:Ha.
+title}:I,[I,Be,Ha?.title]),mc=React.useMemo(()=>{if(!f)return{title:"Agent Chat",source:"fallback",field:"no_session"};let o=Mc(
+pc,pc?.custom_display_name||"",Ln),w=td(uu.current.get(f),o);return uu.current.set(f,w),w},[f,pc,Ln]),fc=mc.title,Bo=f?oo[f]:
+null,Xm=!!(Xe?.name==="Codex"&&I&&I.agent_type==="codex"&&(Vm&&yn||!ou&&yn&&(yn.panel_agent==="antigravity_panel"||cu))),
+du=!!j?.capabilities?.new_thread,Qm=I?.agent_type==="codex-desktop",Jm=I?.agent_type==="cursor",pu=Qm||Jm,gc=pu?"New cha\
+t":"New thread",mu=I&&typeof I=="object"?I.machine_label:"",fu=_m(I),gu=React.useMemo(()=>{for(let o=Ue.length-1;o>=0;o--)
+if(Ue[o]?.role==="user")return Ue[o];return null},[Ue]),hc=gu?Ct(gu.content).replace(/\s+/g," ").trim():"",ea=f?A[f]||I?.
 status||"unknown":"",hu=React.useCallback(o=>{let w=ae(o).replace(/\s+\((?:Lines?|Line)\s+\d+(?:-\d+)?\)\s*$/i,"").replace(
 /^["'`]+|["'`]+$/g,"").trim();if(!w)return"";let M=w.replace(/\\/g,"/"),R=ae(is).replace(/\\/g,"/").replace(/\/+$/,"");if(/^[A-Za-z]:\//.
 test(M)||M.startsWith("//")){if(!R)return"";let U=M.toLowerCase(),Q=R.toLowerCase();return U===Q?".":U.startsWith(Q+"/")?
-M.slice(R.length+1):""}return M.replace(/^\.\/+/,"").replace(/^\/+/,"")},[is]),hc=React.useCallback((o,w)=>{if(!f)return;
+M.slice(R.length+1):""}return M.replace(/^\.\/+/,"").replace(/^\/+/,"")},[is]),_c=React.useCallback((o,w)=>{if(!f)return;
 let M=hu(w);if(!M){at("File is outside the current workspace");return}kr(R=>R&&R.sessionId===f&&R.messageKey===o&&R.path===
 M?null:{sessionId:f,messageKey:o,path:M}),xo.current(f,M)},[f,hu]),_u=React.useCallback(()=>kr(null),[]),qe=f?S[f]!==void 0?
-S[f]:I&&typeof I=="object"?I.activity:null:null,_c=qe?.context_card||null,Jm=!!(f&&gc&&!((I?.agent_type==="cline"||I?.agent_type===
-"roo_code")&&_c)),Or=["claude_cli","codex_cli","cursor_cli"].includes(I?.agent_type),bu=React.useMemo(()=>{for(let o=Ue.
+S[f]:I&&typeof I=="object"?I.activity:null:null,bc=qe?.context_card||null,Zm=!!(f&&hc&&!((I?.agent_type==="cline"||I?.agent_type===
+"roo_code")&&bc)),Or=["claude_cli","codex_cli","cursor_cli"].includes(I?.agent_type),bu=React.useMemo(()=>{for(let o=Ue.
 length-1;o>=0;o--)if(Ue[o]?.role==="assistant")return Ue[o];return null},[Ue]),Ua=f?(y[f]||"").trim():"",vu=bu?Ct(bu.content).
-trim():"",Zm=!!(qe&&!qe?.thinking&&!qe?.current&&!qe?.task_list&&dl(Ua)),yu=!!(f&&!dt&&qe&&(qe.kind==="thinking"||qe.kind===
-"generating")&&!qe?.thinking&&!qe?.current&&!Zm&&dl(Ua)&&(I?.agent_type==="codex"||I?.agent_type==="codex-desktop"||I?.agent_type===
+trim():"",ef=!!(qe&&!qe?.thinking&&!qe?.current&&!qe?.task_list&&dl(Ua)),yu=!!(f&&!dt&&qe&&(qe.kind==="thinking"||qe.kind===
+"generating")&&!qe?.thinking&&!qe?.current&&!ef&&dl(Ua)&&(I?.agent_type==="codex"||I?.agent_type==="codex-desktop"||I?.agent_type===
 "cursor"||I?.agent_type==="antigravity_panel")&&Ua!==vu&&!vu.includes(Ua)),ku=!!(qe&&(qe?.goal||qe?.thinking||qe?.current||
-qe?.step||qe?.usage||qe?.task_list||qe.kind!=="idle"||dl(Ua||qe.thinkingContent||""))),bc=!!(f&&Qt?.partial&&Number(Qt.total||
-0)>Number(Qt.loaded||Ue.length||0)),wu=Number(Qt?.loaded||Ue.length||0),ef=Number(Qt?.total||wu||0);function Nu(){if(!f)
+qe?.step||qe?.usage||qe?.task_list||qe.kind!=="idle"||dl(Ua||qe.thinkingContent||""))),vc=!!(f&&Qt?.partial&&Number(Qt.total||
+0)>Number(Qt.loaded||Ue.length||0)),wu=Number(Qt?.loaded||Ue.length||0),tf=Number(Qt?.total||wu||0);function Nu(){if(!f)
 return;if(!Fe.prepareForPrepend()){let w=Vt.current,M=w?.getBoundingClientRect(),R=M?.top||0,U=w?Array.from(w.querySelectorAll(
 ".message[data-message-key]")):[],Q=U.find(le=>{let ye=le.getBoundingClientRect();return ye.top>=R&&ye.top<M.bottom})||U.
-find(le=>le.getBoundingClientRect().bottom>R)||U[0]||null;Yi.current=Q?{messageKey:Q.dataset.messageKey,viewportOffset:Q.
+find(le=>le.getBoundingClientRect().bottom>R)||U[0]||null;Xi.current=Q?{messageKey:Q.dataset.messageKey,viewportOffset:Q.
 getBoundingClientRect().top-R}:null}let o=I?.agent_type==="codex_cli"||I?.agent_type==="cursor_cli"?"native":"relay_sqli\
 te";qt(f,{mode:Qt?.cursor?"older":"tail",source:o,userInitiated:!0,beforeOffset:Qt?.cursor?.next_before_offset,beforeId:Qt?.
-cursor?.next_before_id,...Da(I)})}Te(()=>(Vi.current=bc&&!Fa?Nu:null,()=>{Vi.current=null}),[f,I?.agent_type,Fa,bc,Qt?.cursor?.
-next_before_offset,Qt?.cursor?.next_before_id]);function tf(){if(!f)return;let o=I?.agent_type==="codex_cli"||I?.agent_type===
-"cursor_cli"?"native":"relay_sqlite";qt(f,{...Da(I),mode:"tail",source:o,userInitiated:!0})}let nf=!!(f&&(Ue.length>0||yu||
-dt)),sf=yl(Xe),af=React.useMemo(()=>os.slice(Fe.start,Fe.end).map((o,w)=>{let M=Fe.start+w,R=Cl(o,M),U=Ye?.sessionId===f&&
+cursor?.next_before_id,...Da(I)})}Te(()=>(Yi.current=vc&&!Fa?Nu:null,()=>{Yi.current=null}),[f,I?.agent_type,Fa,vc,Qt?.cursor?.
+next_before_offset,Qt?.cursor?.next_before_id]);function nf(){if(!f)return;let o=I?.agent_type==="codex_cli"||I?.agent_type===
+"cursor_cli"?"native":"relay_sqlite";qt(f,{...Da(I),mode:"tail",source:o,userInitiated:!0})}let sf=!!(f&&(Ue.length>0||yu||
+dt)),af=yl(Xe),rf=React.useMemo(()=>os.slice(Fe.start,Fe.end).map((o,w)=>{let M=Fe.start+w,R=Cl(o,M),U=Ye?.sessionId===f&&
 String(o?.id)===String(Ye?.messageId),Q=Fe.enabled||U||M>=Math.max(0,os.length-48),le=xa?.sessionId===f&&xa?.messageKey===
-R?xa:null,ye=React.createElement(rb,{key:R,msg:o,messageKey:R,activeAgent:Xe,assistantMonospace:Or,autoExpandLongCodeBlocks:cc,
-onOpenPath:hc,agentType:I?.agent_type,preview:le,fileContents:dr,onClosePreview:_u,deliveryState:o._cid?N[o._cid]:null,onSteer:No,
+R?xa:null,ye=React.createElement(rb,{key:R,msg:o,messageKey:R,activeAgent:Xe,assistantMonospace:Or,autoExpandLongCodeBlocks:lc,
+onOpenPath:_c,agentType:I?.agent_type,preview:le,fileContents:dr,onClosePreview:_u,deliveryState:o._cid?N[o._cid]:null,onSteer:No,
 onRetry:Co,richContentEager:Q,searchMatch:U});return Fe.enabled?React.createElement(ib,{key:R,index:M,messageKey:`${f||""}\
-${R}`,onMeasure:Fe.onMeasure},ye):ye}),[os,Fe.start,Fe.end,Fe.enabled,Fe.onMeasure,f,Ye?.sessionId,Ye?.messageId,sf,Or,
-cc,hc,I?.agent_type,xa,dr,_u,N,No,Co]),Wa=j?.capabilities?.thread_list,Ir=!!I?.is_new_chat_draft,rf=!!(f&&(I?.agent_type===
-"codex-desktop"||I?.agent_type==="cursor")&&Wa&&(B[f]?.length>0||Mn[f]||Ir)&&!Gt),of=React.useMemo(()=>{let o=[...B[f]||
+${R}`,onMeasure:Fe.onMeasure},ye):ye}),[os,Fe.start,Fe.end,Fe.enabled,Fe.onMeasure,f,Ye?.sessionId,Ye?.messageId,af,Or,
+lc,_c,I?.agent_type,xa,dr,_u,N,No,Co]),Wa=j?.capabilities?.thread_list,Ir=!!I?.is_new_chat_draft,of=!!(f&&(I?.agent_type===
+"codex-desktop"||I?.agent_type==="cursor")&&Wa&&(B[f]?.length>0||Mn[f]||Ir)&&!Gt),cf=React.useMemo(()=>{let o=[...B[f]||
 []];if(o.length===0)return o;let w=Tn[f],M=w?o.findIndex(U=>U.id===w):-1,R=M>=0?M:o.findIndex(U=>U.active);if(R>0){let[U]=o.
-splice(R,1);o.unshift(U)}return o},[f,B,Tn]),cf=React.useMemo(()=>{let o=Tn[f],w=(B[f]||[]).find(U=>U?.active),M=w?.cache_key||
+splice(R,1);o.unshift(U)}return o},[f,B,Tn]),lf=React.useMemo(()=>{let o=Tn[f],w=(B[f]||[]).find(U=>U?.active),M=w?.cache_key||
 w?.id,R=Mn[f]||Ir?"draft":"";return`${f||"none"}:${R||o||M||"default"}`},[f,B,Tn,Mn,Ir]),Su=Ue.length===0;React.useEffect(
 ()=>{f&&Wa&&Su&&$(f)},[f,Wa,Su]),React.useEffect(()=>{if(!(f&&Be&&i))return;me(f);let o=[600,1800,4200].map(U=>setTimeout(
 ()=>{typeof document<"u"&&document.hidden||me(f)},U)),w=()=>{typeof document<"u"&&document.hidden||me(f)},M=setInterval(
@@ -3768,29 +3769,29 @@ o)},[f,I?.agent_type,Wa,ht]),React.useEffect(()=>{if(!f)return;let o=ys[f]||0,w=
 ys,Zs.length]),React.useEffect(()=>{!f||Ue.length===0||es(o=>o[f]?{...o,[f]:!1}:o)},[f,Ue.length]),React.useEffect(()=>{
 if(!f)return;let o=B[f]||[],w=Tn[f];w&&o.some(M=>M.id===w&&M.active)&&vs(M=>{let R={...M};return delete R[f],R})},[f,B,Tn]);
 function Fo(o=f){o&&(es(w=>({...w,[o]:!0})),vs(w=>{let M={...w};return delete M[o],M}),ts(w=>({...w,[o]:(t[o]||[]).length})),
-fn(!1),ve(o))}function vc(o,w){o&&w&&(es(M=>({...M,[o]:!1})),vs(M=>({...M,[o]:w})),ts(M=>({...M,[o]:0})),P(o,w))}function ta(o=f){
+fn(!1),ve(o))}function yc(o,w){o&&w&&(es(M=>({...M,[o]:!1})),vs(M=>({...M,[o]:w})),ts(M=>({...M,[o]:0})),P(o,w))}function ta(o=f){
 o&&(Ht(!0),Ge(!1),Ys(w=>({...w,[o]:{id:"__agv2:new_conversation",title:"New Conversation",kind:"nav",at:Date.now()}})),W(
-o))}function yc(o,w=f){if(!(w&&o))return;Ht(!0),Ge(!1);let M=(G[w]||[]).find(U=>U?.id===o),R=o==="__agv2:new_conversatio\
+o))}function kc(o,w=f){if(!(w&&o))return;Ht(!0),Ge(!1);let M=(G[w]||[]).find(U=>U?.id===o),R=o==="__agv2:new_conversatio\
 n"?"New Conversation":o==="__agv2:conversation_history"?"Conversation History":o==="__agv2:scheduled_tasks"?"Scheduled T\
 asks":"Antigravity v2";if(Ys(U=>({...U,[w]:{id:o,title:M?.title||R,kind:M?.kind||"chat",at:Date.now()}})),o==="__agv2:ne\
-w_conversation"){ta(w);return}J(w,o)}function lf(o){f&&(Oa.current={sessionId:f,index:(Tr.current[f]||[]).length,scratch:o},
+w_conversation"){ta(w);return}J(w,o)}function uf(o){f&&(Oa.current={sessionId:f,index:(Tr.current[f]||[]).length,scratch:o},
 Ia(f,o),Ot(o.startsWith("/")))}function Cu(o){if(!f)return;let M={"/plan":`${o} Outline the implementation approach and \
 major steps.`,"/review":`${o} Review the current changes for bugs, regressions, and missing tests.`,"/fix":`${o} Impleme\
 nt or repair the current issue.`,"/summarize":`${o} Summarize the current state and important changes.`}[o]||`${o} `;Ia(
-f,M),Ot(!1),requestAnimationFrame(()=>Pn.current?.focus())}function uf(o,w=!1,M=""){let R=$e(o),U=$t.has(R)?Za(o):null,Q=Rs.
+f,M),Ot(!1),requestAnimationFrame(()=>Pn.current?.focus())}function df(o,w=!1,M=""){let R=$e(o),U=$t.has(R)?Za(o):null,Q=Rs.
 current.get(R);return Q||(Q=document.createElement("div"),Q.className="sidebar-card-host",Q.setAttribute("data-sidebar-c\
 ard-host",R),Rs.current.set(R,Q)),ReactDOM.createPortal(React.createElement(pb,{session:o,health:A[R],unread:Kt.has(R)?0:
-u[R]||0,isThinking:!!b[R]||!!Zo(S[R],{health:A[R]}),isActive:R===f,agentConfig:H[R]||null,activity:S[R]||null,sessionMessages:t[R]||
+u[R]||0,isThinking:!!b[R]||!!ei(S[R],{health:A[R]}),isActive:R===f,agentConfig:H[R]||null,activity:S[R]||null,sessionMessages:t[R]||
 [],hasBlockingPrompt:!!g[R]||!!rr(k[R]),blockingPromptLabel:g[R]?g[R].type==="question_prompt"?"Question required":"Perm\
 ission required":k[R]?.title||"Action required",muted:!!tt[R]?.muted,pinned:w,workspaceLabel:M,recentMessageAt:U?.at||null,
-menuOpen:Di===R,onMenuToggle:le=>fo(ye=>le?R:ye===R?"":ye),onPinChange:le=>yo(R,{pinned:le}).catch(ye=>{at(ye?.message||
+menuOpen:ji===R,onMenuToggle:le=>fo(ye=>le?R:ye===R?"":ye),onPinChange:le=>yo(R,{pinned:le}).catch(ye=>{at(ye?.message||
 `Unable to ${le?"pin":"unpin"} chat`)}),onSelect:()=>qn(R,o),onManage:()=>{ln(R),wt(!0),ze(!1),kt(!1)},onClose:()=>{let le=A[R]===
 "disconnected"||!A[R],ye=le?"Remove session from the list?":`Close session "${R}"?`;window.confirm(ye)&&Hn(R,le)},onAutomations:o?.
 agent_type==="codex-desktop"?()=>{gn||Ms(),It(le=>!le),$n(!1),zt(!1),Wt(!1),hn(!1),ft(!1)}:void 0,showAutomationsActive:gn,
 onSkills:o?.agent_type==="codex-desktop"?()=>{ws||Ms(),$n(le=>!le),It(!1),zt(!1),Wt(!1),hn(!1),ft(!1),ur[R]||ro(R)}:void 0,
 showSkillsActive:ws}),Q,R)}function Ho(o,w=!0){let M=$e(o);return React.createElement("div",{key:M,className:`sidebar-ca\
 rd-slot${w?"":" sidebar-card-slot-filtered"}`,"data-sidebar-card-slot":M,"aria-hidden":w?void 0:"true",inert:w?void 0:""})}
-return React.createElement("div",{className:`app${Pr?" has-system-banner":""}`,style:Pr?{"--system-banner-height":`${Bi}\
+return React.createElement("div",{className:`app${Pr?" has-system-banner":""}`,style:Pr?{"--system-banner-height":`${Fi}\
 px`}:void 0},Xn&&React.createElement("div",{className:"quick-switcher-overlay",onMouseDown:o=>{o.target===o.currentTarget&&
 (Ks(!1),Qn(""),Ft(0),requestAnimationFrame(()=>Pn.current?.focus()))}},React.createElement("div",{className:"quick-switc\
 her",role:"dialog","aria-modal":"true","aria-label":"Switch session"},React.createElement("div",{className:"quick-switch\
@@ -3843,10 +3844,10 @@ React.createElement("input",{type:"search",value:ga,onChange:o=>Kn(o.target.valu
 abel":"Filter sidebar sessions",autoComplete:"off",spellCheck:"false"}),ga&&React.createElement("button",{type:"button",
 onClick:()=>Kn(""),"aria-label":"Clear sidebar filter",title:"Clear filter"},"x")),React.createElement("div",{className:`\
 sidebar-order-control${Ro?" changed":""}`,"aria-hidden":!Ro,"aria-live":"polite"},React.createElement("span",null,"Order\
- changed"),React.createElement("button",{type:"button",onClick:Am,disabled:!Ro,tabIndex:Ro?0:-1},"Sort now")),st&&React.
+ changed"),React.createElement("button",{type:"button",onClick:Rm,disabled:!Ro,tabIndex:Ro?0:-1},"Sort now")),st&&React.
 createElement(Ab,{onClose:()=>ze(!1),onPreferencesChange:o=>{hs({...o,turn_ready:!1}),Ve(!0)}}),ba&&React.createElement(
-Rb,{sessions:Ra,preferences:tt,initialSessionId:Mt,onSave:yo,onExport:Wi,onClose:()=>wt(!1)}),Bt&&React.createElement(kb,
-{launchStates:h,onLaunch:(o,w,M)=>yt(o,w,M),onResume:(o,w,M,R)=>xt(o,w,M,R),onClose:()=>kt(!1),workspaces:Mi,showTestSessions:bn}),
+Rb,{sessions:Ra,preferences:tt,initialSessionId:Mt,onSave:yo,onExport:zi,onClose:()=>wt(!1)}),Bt&&React.createElement(kb,
+{launchStates:h,onLaunch:(o,w,M)=>yt(o,w,M),onResume:(o,w,M,R)=>xt(o,w,M,R),onClose:()=>kt(!1),workspaces:Ti,showTestSessions:bn}),
 React.createElement("div",{className:"session-list",ref:l,onPointerDown:K,onPointerUp:()=>ge(80),onPointerCancel:()=>ge(
 80),onScroll:()=>{K(),ge(180)}},Oe.length===0&&!Bt&&React.createElement("div",{className:"session-empty"},"No agents con\
 nected"),Oe.length>0&&ut&&Ta.length===0&&$a.length===0&&Ea.length===0&&Dl.length===0&&React.createElement("div",{className:"\
@@ -3885,19 +3886,19 @@ session-group${w?" collapsed":""}${ut&&R.length===0?" sidebar-group-filtered":""
 {className:"session-group-header"},React.createElement("button",{type:"button",className:"session-group-toggle",title:`${w?
 "Expand":"Collapse"} ${o.label}`,"aria-label":`${w?"Expand":"Collapse"} ${o.label}`,"aria-expanded":!w,onClick:()=>ko(o.
 key)},React.createElement("span",{className:"session-group-caret","aria-hidden":"true"},w?">":"v")),React.createElement(
-mi,{title:o.label,disclosureKey:o.key,kind:"group",wrapperClassName:"session-group-title-details",triggerClassName:"sess\
+fi,{title:o.label,disclosureKey:o.key,kind:"group",wrapperClassName:"session-group-title-details",triggerClassName:"sess\
 ion-group-name",disclosureClassName:"session-group-disclosure",triggerLabel:`Show full group name: ${o.label}`}),React.createElement(
 "span",{className:"session-group-status-slot"},U.hasPrompt&&React.createElement("span",{className:"session-group-alert",
 title:"Action required"},"!"),U.working&&React.createElement("span",{className:"session-group-working",title:"Session wo\
 rking"}),U.unread>0&&React.createElement("span",{className:"session-group-unread",title:`${U.unread} unread`},U.unread>99?
 "99+":U.unread),React.createElement("span",{className:"session-group-count"},ut?R.length:o.sessions.length))),React.createElement(
 "div",{className:"session-group-items","aria-hidden":w},React.createElement("div",{className:"session-group-items-inner"},
-o.sessions.map(Q=>Ho(Q,!ut||R.includes(Q))))))}),zi.map(o=>{let w=$e(o);return uf(o,!!tt[w]?.pinned,xm.has(w)?"":Ma[w]||
+o.sessions.map(Q=>Ho(Q,!ut||R.includes(Q))))))}),Gi.map(o=>{let w=$e(o);return df(o,!!tt[w]?.pinned,Am.has(w)?"":Ma[w]||
 "Unscoped")})),React.createElement("div",{className:"sidebar-footer"},React.createElement("span",{className:`status-dot ${Zl}`}),
 React.createElement("span",{className:"sidebar-footer-health"},React.createElement("span",null,i?`Relay ${Zl}`:"Reconnec\
-ting\u2026"),React.createElement("span",{className:"sidebar-footer-rtt"},i&&Fm.replace(/^\s*·\s*/,"")||"\xA0")),React.createElement(
+ting\u2026"),React.createElement("span",{className:"sidebar-footer-rtt"},i&&Hm.replace(/^\s*·\s*/,"")||"\xA0")),React.createElement(
 "button",{type:"button",className:`sidebar-footer-action test-session-toggle${bn?" active":""}`,title:bn?"Hide test sess\
-ions":`Show test sessions (${Kt.size})`,"aria-label":bn?"Hide test sessions":"Show test sessions","aria-pressed":bn,onClick:()=>Ui(
+ions":`Show test sessions (${Kt.size})`,"aria-label":bn?"Hide test sessions":"Show test sessions","aria-pressed":bn,onClick:()=>Wi(
 o=>!o)},"T",Kt.size>99?"99+":Kt.size||""),React.createElement("button",{type:"button",className:`sidebar-footer-action${Ns?
 " active":""}`,title:"Usage and limits","aria-label":"Usage and limits",onClick:()=>{Ns||Ms(),Wt(o=>!o),hn(!1),It(!1),$n(
 !1),kt(!1),ze(!1),wt(!1),zt(!1),En(!1),ft(!1)}},"\u25D4"),React.createElement("button",{type:"button",className:`sidebar\
@@ -3913,27 +3914,27 @@ Ss||Cs?" automations-active":""}`},React.createElement(tv,{connected:i,error:mr,
 onSubscribe:fs,onUnsubscribe:fr,onOpen:()=>{ns||Ms(),hn(!0),Wt(!1),zt(!1),It(!1),$n(!1),kt(!1),ze(!1),wt(!1),En(!1),ft(!1)}}),
 gn&&React.createElement(Yb,{sessions:e,onBack:()=>It(!1)}),ws&&React.createElement(lv,{skills:ur[f]||null,onRefresh:()=>f&&
 ro(f),onBack:()=>$n(!1)}),va&&f&&React.createElement(Mb,{sessionId:f,initialContent:On,jobs:ke.filter(o=>o.session_id===
-f),onSchedule:q,onCancel:et,onCreated:()=>Ia(f,""),onClose:()=>Yn(!1)}),Ns&&React.createElement(Jb,{usage:zn,refreshReceipt:Pi,
-resetReceipt:qi,costDetail:Oi,onBack:()=>Wt(!1),onRefresh:ps,onConsumeResetCredit:Fs,onRequestCostDetail:Hs}),ns&&React.
-createElement(nv,{snapshot:Ii,error:mr,history:sn,details:ms,subscription:At,onBack:()=>hn(!1),onRefresh:ot,onSubscribe:fs,
+f),onSchedule:q,onCancel:et,onCreated:()=>Ia(f,""),onClose:()=>Yn(!1)}),Ns&&React.createElement(Jb,{usage:zn,refreshReceipt:qi,
+resetReceipt:Oi,costDetail:Ii,onBack:()=>Wt(!1),onRefresh:ps,onConsumeResetCredit:Fs,onRequestCostDetail:Hs}),ns&&React.
+createElement(nv,{snapshot:Di,error:mr,history:sn,details:ms,subscription:At,onBack:()=>hn(!1),onRefresh:ot,onSubscribe:fs,
 onUnsubscribe:fr}),Ss&&React.createElement(iv,{sessions:Ao,activities:S,thinking:b,permissionPrompts:g,errorPrompts:k,messages:t,
 agentConfigs:H,sessionAttention:uo,health:A,connected:i,deliveryStates:N,onBroadcastSend:Ke,onBack:()=>zt(!1),onSelectSession:(o,w)=>{
-qn(o,w),zt(!1)}}),Cs&&React.createElement(cv,{onBack:()=>En(!1),onOpenResult:qm}),!gn&&!ws&&!Ns&&!ns&&!Ss&&!Cs&&React.createElement(
+qn(o,w),zt(!1)}}),Cs&&React.createElement(cv,{onBack:()=>En(!1),onOpenResult:Om}),!gn&&!ws&&!Ns&&!ns&&!Ss&&!Cs&&React.createElement(
 React.Fragment,null,React.createElement("div",{className:"topbar"},React.createElement("button",{className:"hamburger",onClick:()=>ft(
 o=>!o)},"\u2630",eu>0&&React.createElement("span",{className:"hamburger-badge"},eu),Oo>0&&React.createElement("span",{className:"\
 hamburger-attention",title:`${Oo} session${Oo===1?"":"s"} need attention`,"aria-label":`${Oo} sessions need attention`},
 "!")),React.createElement("div",{className:"topbar-context"},f?React.createElement(React.Fragment,null,React.createElement(
-"div",{className:"topbar-title-row",role:"group","aria-label":`${Xe.name} chat: ${mc}`},React.createElement("div",{className:"\
+"div",{className:"topbar-title-row",role:"group","aria-label":`${Xe.name} chat: ${fc}`},React.createElement("div",{className:"\
 agent-badge topbar-agent-badge",style:{color:Xe.color,borderColor:Xe.color+"55",background:Xe.color+"18"}},Xe.logo?React.
 createElement("img",{src:Xe.logo,alt:Xe.abbr,className:"agent-badge-logo"}):Xe.abbr),React.createElement("div",{className:"\
 topbar-title-group",style:{color:Xe.color}},React.createElement("div",{className:"topbar-title-projection","data-chat-ti\
-tle-source":pc.source,"data-chat-title-field":pc.field},React.createElement(mi,{title:mc,disclosureKey:`topbar-${f}`,kind:"\
+tle-source":mc.source,"data-chat-title-field":mc.field},React.createElement(fi,{title:fc,disclosureKey:`topbar-${f}`,kind:"\
 chat",wrapperClassName:"topbar-title-details",triggerClassName:"topbar-title",disclosureClassName:"topbar-title-disclosu\
-re",triggerLabel:`Show full chat title: ${mc}`,triggerTag:"div"})),React.createElement("div",{className:"topbar-subtitle",
-title:is||void 0},React.createElement("span",{className:"topbar-workspace-icon"},"\u2302"),Vm,j?.branch&&j.branch!=="unk\
+re",triggerLabel:`Show full chat title: ${fc}`,triggerTag:"div"})),React.createElement("div",{className:"topbar-subtitle",
+title:is||void 0},React.createElement("span",{className:"topbar-workspace-icon"},"\u2302"),Ym,j?.branch&&j.branch!=="unk\
 nown"&&React.createElement("button",{className:`topbar-branch-btn${br?" active":""}`,title:`Branch: ${j.branch}`,onClick:()=>{
-let o=!br;Sa(o),o&&Ti(f)}},React.createElement("span",{className:"topbar-branch-icon"},"\u2442"),j.branch)))),React.createElement(
-"div",{className:"topbar-meta"},React.createElement("button",{className:"theme-toggle-btn",onClick:()=>Fi(o=>o==="light"?
+let o=!br;Sa(o),o&&$i(f)}},React.createElement("span",{className:"topbar-branch-icon"},"\u2442"),j.branch)))),React.createElement(
+"div",{className:"topbar-meta"},React.createElement("button",{className:"theme-toggle-btn",onClick:()=>Hi(o=>o==="light"?
 "dark":"light"),title:"Toggle Light/Dark Mode"},Aa==="light"?"\u{1F319}":"\u2600\uFE0F"),React.createElement("span",{className:`\
 context-pill topbar-relay-status ${i?"ok":"warn"}`,title:i?"Relay connected":"Relay disconnected \u2014 reconnecting"},i?
 "relay live":"reconnecting"),React.createElement("span",{className:`context-pill topbar-proxy-health ${ea==="healthy"?"o\
@@ -3942,8 +3943,8 @@ k":ea==="degraded"?"warn":ea==="disconnected"?"error":""}`,title:`Proxy: ${ea||"
 ing"),mu&&React.createElement("span",{className:"context-pill",title:"Remote machine"},mu),fu&&React.createElement("span",
 {className:"context-pill",title:"Native editor host"},fu),React.createElement(Q_,{session:I,config:j,providerUsage:zn,onOpenUsage:()=>{
 Ms(),Wt(!0),hn(!1),zt(!1)}}),I?.agent_type==="codex"&&I?.visible_pane_visible&&React.createElement("span",{className:`co\
-ntext-pill ${lc?"ok":"warn"}`,title:lc?"This Codex session is the visible right-hand pane":`Visible right-hand pane is ${iu}`},
-lc?"right pane live":`right pane: ${pl(I.visible_pane_agent)||"other"}`),Ue.length>0&&React.createElement("span",{className:"\
+ntext-pill ${uc?"ok":"warn"}`,title:uc?"This Codex session is the visible right-hand pane":`Visible right-hand pane is ${iu}`},
+uc?"right pane live":`right pane: ${pl(I.visible_pane_agent)||"other"}`),Ue.length>0&&React.createElement("span",{className:"\
 context-pill",title:"Messages in this session"},Ue.length," msg",Ue.length!==1?"s":""),(j?.capabilities?.chat_list||Be)&&
 React.createElement("button",{className:`context-pill chat-list-toggle${(Be?mn:pn)?" active":""}`,title:Be?`${mn?"Hide":
 "Show"} Agent Manager projects and conversations`:"View conversations",onClick:()=>{if(Be){Ht(w=>!w),Ge(!1),me(f);return}
@@ -3962,32 +3963,32 @@ on in a native command window`,onClick:o=>X(f,o)},"native"),qo&&qe?.label&&qe.la
 "span",{className:"context-pill thinking",title:qe.label},qe.label.length>40?qe.label.substring(0,40)+"\u2026":qe.label))):
 React.createElement("div",{className:"topbar-title-group"},React.createElement("div",{className:"topbar-title"},"Agent C\
 hat"),React.createElement("div",{className:"topbar-subtitle"},"Select a session to inspect its transcript and status")))),
-(I?.agent_type==="cline"||I?.agent_type==="roo_code")&&_c&&React.createElement("div",{className:`cline-context-strip ${I?.
-agent_type==="roo_code"?"roo-context-strip":""}`},React.createElement(hb,{card:_c,tone:I?.agent_type==="roo_code"?"roo":
+(I?.agent_type==="cline"||I?.agent_type==="roo_code")&&bc&&React.createElement("div",{className:`cline-context-strip ${I?.
+agent_type==="roo_code"?"roo-context-strip":""}`},React.createElement(hb,{card:bc,tone:I?.agent_type==="roo_code"?"roo":
 "cline"})),br&&f&&j?.capabilities?.branch_list&&React.createElement(Pb,{branchData:so[f]||null,sessionId:f,currentBranch:j?.
-branch,onSwitch:o=>{ao(f,o),Sa(!1)},onCreate:o=>{$i(f,o),Sa(!1)},onClose:()=>Sa(!1)}),Gt&&f&&j?.capabilities?.file_browser&&
-React.createElement(zb,{sessionId:f,listing:Li[f],fileContents:dr,viewingFile:Ca,onNavigate:o=>{bo(o),Xs(null),ma(f,o)},
-onOpenFile:o=>{Xs(o),Un(f,o)},onBackToListing:()=>Xs(null),onRefresh:()=>{Ca?Un(f,Ca):ma(f,ji)},onClose:()=>{yr(!1),Xs(null)}}),
+branch,onSwitch:o=>{ao(f,o),Sa(!1)},onCreate:o=>{Ei(f,o),Sa(!1)},onClose:()=>Sa(!1)}),Gt&&f&&j?.capabilities?.file_browser&&
+React.createElement(zb,{sessionId:f,listing:Pi[f],fileContents:dr,viewingFile:Ca,onNavigate:o=>{bo(o),Xs(null),ma(f,o)},
+onOpenFile:o=>{Xs(o),Un(f,o)},onBackToListing:()=>Xs(null),onRefresh:()=>{Ca?Un(f,Ca):ma(f,Bi)},onClose:()=>{yr(!1),Xs(null)}}),
 React.createElement("div",{className:`messages-wrap${Bo?.visible?" has-automation-pane":""}`,style:Gt?{display:"none"}:void 0},
-rf&&React.createElement(Lb,{threads:of,activeThreadId:Tn[f]||null,showDraftTab:!!Mn[f]||Ir,newLabel:fc,onSwitch:o=>vc(f,
-o),onNew:()=>Fo(f),onOpenHistory:()=>{$(f),fn(!0)}}),Jm&&React.createElement("div",{className:"last-user-banner",title:gc},
+of&&React.createElement(Lb,{threads:cf,activeThreadId:Tn[f]||null,showDraftTab:!!Mn[f]||Ir,newLabel:gc,onSwitch:o=>yc(f,
+o),onNew:()=>Fo(f),onOpenHistory:()=>{$(f),fn(!0)}}),Zm&&React.createElement("div",{className:"last-user-banner",title:hc},
 React.createElement("span",{className:"last-user-banner-icon"},"\u21B5"),React.createElement("span",{className:"last-use\
-r-banner-text"},gc)),Ym&&React.createElement("div",{className:"rate-limit-overlay warning"},React.createElement("span",{
+r-banner-text"},hc)),Xm&&React.createElement("div",{className:"rate-limit-overlay warning"},React.createElement("span",{
 className:"rate-limit-icon"},"\u2318"),React.createElement("span",{className:"rate-limit-text"},"The visible right-hand \
 pane for this workspace is showing ",React.createElement("strong",null,cu||or(yn,$e(yn))),", not this transcript."),React.
 createElement("button",{className:"context-pill",onClick:()=>qn($e(yn),yn),title:"Switch to the live right-hand pane ses\
-sion"},"View live pane")),Um&&React.createElement("div",{className:`agv2-session-nav${mn?"":" collapsed"}`},React.createElement(
+sion"},"View live pane")),Wm&&React.createElement("div",{className:`agv2-session-nav${mn?"":" collapsed"}`},React.createElement(
 "div",{className:"agv2-session-nav-header"},React.createElement("div",{className:"agv2-session-nav-copy"},React.createElement(
 "span",{className:"agv2-session-nav-title"},"Agent Manager"),React.createElement("span",{className:"agv2-session-nav-met\
 a"},ru," conversation",ru===1?"":"s")),React.createElement("button",{className:"agv2-session-nav-btn",type:"button",onClick:()=>me(
 f),title:"Refresh Agent Manager conversations"},"Refresh"),React.createElement("button",{className:"agv2-session-nav-btn",
 type:"button",onClick:()=>{Ht(o=>!o),me(f)},title:mn?"Hide Agent Manager conversations":"Show Agent Manager conversation\
-s"},mn?"Hide":"Show")),mn&&React.createElement(fl,{items:au,embedded:!0,loading:!ic,onNavigate:o=>yc(o),onNew:()=>ta(f)})),
-xn&&!Ts&&React.createElement("button",{className:"jump-to-newest",onClick:Em},An>0?`\u2193 ${An} new`:"\u2193 Jump to Newest"),
+s"},mn?"Hide":"Show")),mn&&React.createElement(fl,{items:au,embedded:!0,loading:!cc,onNavigate:o=>kc(o),onNew:()=>ta(f)})),
+xn&&!Ts&&React.createElement("button",{className:"jump-to-newest",onClick:Lm},An>0?`\u2193 ${An} new`:"\u2193 Jump to Newest"),
 React.createElement("div",{className:`messages harness-theme harness-theme-${ae(I?.agent_type||"default").replace(/[^a-z0-9_-]/gi,
 "-")}`,"data-agent-type":I?.agent_type||"default","data-layout":G_(I?.agent_type),"data-transcript-windowed":Fe.enabled?
-"true":"false","data-total-message-count":os.length,"data-window-start":Fe.start,"data-window-end":Fe.end,key:cf,ref:Vt},
-nf&&React.createElement("div",{className:"messages-flex-spacer"}),Et&&React.createElement(bb,{prompt:Et,sessionId:f,agentType:I?.
+"true":"false","data-total-message-count":os.length,"data-window-start":Fe.start,"data-window-end":Fe.end,key:lf,ref:Vt},
+sf&&React.createElement("div",{className:"messages-flex-spacer"}),Et&&React.createElement(bb,{prompt:Et,sessionId:f,agentType:I?.
 agent_type,onRespond:_,onDismissFocus:()=>Pn.current?.focus()}),Lr&&!Et&&React.createElement(vb,{prompt:Lr,sessionId:f,onRespond:T}),
 (I?.rate_limit_active||I?.percent_used!=null&&I.percent_used>=75)&&React.createElement("div",{className:`rate-limit-over\
 lay${I?.rate_limit_active||I?.percent_used>=90?" critical":I?.percent_used>=75?" warning":""}`},React.createElement("spa\
@@ -3996,33 +3997,33 @@ limit-text"},I?.rate_limit_active?React.createElement(React.Fragment,null,"Rate 
 "unknown"?React.createElement(React.Fragment,null," \u2014 resets ",React.createElement("strong",null,to(I.rate_limited_until))):
 null):React.createElement(React.Fragment,null,"Used ",React.createElement("strong",null,I.percent_used,"%")," of session\
  limit",I.rate_limited_until&&I.rate_limited_until!=="unknown"?React.createElement(React.Fragment,null," \xB7 resets ",React.
-createElement("strong",null,to(I.rate_limited_until))):null))),bc&&React.createElement("div",{className:"history-tail-ba\
-nner"},React.createElement("span",null,"Showing latest ",wu.toLocaleString()," of ",ef.toLocaleString()," messages"),React.
+createElement("strong",null,to(I.rate_limited_until))):null))),vc&&React.createElement("div",{className:"history-tail-ba\
+nner"},React.createElement("span",null,"Showing latest ",wu.toLocaleString()," of ",tf.toLocaleString()," messages"),React.
 createElement("button",{type:"button",onClick:Nu,disabled:!!Fa},Fa?"Loading older messages...":"Load older messages")),f?
 Ue.length===0&&!dt&&Wa&&I?.is_list_view&&B[f]?.length>0&&!Mn[f]&&!Ir?React.createElement("div",{className:"thread-picker\
 -empty"},React.createElement("div",{className:"thread-picker-header"},"Select a chat"),React.createElement("div",{className:"\
 thread-picker-list"},B[f].map((o,w)=>React.createElement("button",{key:o.cache_key||o.id||w,className:`thread-picker-ite\
-m${o.active?" active":""}`,onClick:()=>{vc(f,o.id)},title:o.title},React.createElement("span",{className:"thread-picker-\
+m${o.active?" active":""}`,onClick:()=>{yc(f,o.id)},title:o.title},React.createElement("span",{className:"thread-picker-\
 title"},o.title||"Untitled"),o.age&&React.createElement("span",{className:"thread-picker-age"},o.age)))),React.createElement(
 "button",{className:"thread-picker-new",onClick:()=>Fo(f)},"+ New Thread")):Ue.length===0&&!dt&&Be&&I?.is_list_view?React.
 createElement("div",{className:"thread-picker-empty agv2-picker-empty"},React.createElement("div",{className:"thread-pic\
 ker-header"},"Choose a conversation or start a new one"),mn?null:G[f]?.length>0?React.createElement(fl,{items:G[f]||[],embedded:!0,
-loading:!ic,onNavigate:o=>yc(o),onNew:()=>ta(f)}):React.createElement("button",{className:"thread-picker-new",onClick:()=>ta(
+loading:!cc,onNavigate:o=>kc(o),onNew:()=>ta(f)}):React.createElement("button",{className:"thread-picker-new",onClick:()=>ta(
 f)},"+ New Conversation")):Ue.length===0&&!dt&&Be&&G[f]?.length>0?React.createElement("div",{className:"thread-picker-em\
 pty agv2-picker-empty"},React.createElement("div",{className:"thread-picker-header"},"Select an Antigravity project or c\
-onversation"),!mn&&React.createElement(fl,{items:G[f]||[],embedded:!0,loading:!ic,onNavigate:o=>yc(o),onNew:()=>ta(f)})):
+onversation"),!mn&&React.createElement(fl,{items:G[f]||[],embedded:!0,loading:!cc,onNavigate:o=>kc(o),onNew:()=>ta(f)})):
 Ue.length===0&&!dt&&I?.is_list_view&&G[f]?.length>0?React.createElement("div",{className:"thread-picker-empty"},React.createElement(
 "div",{className:"thread-picker-header"},"Select a conversation or type a new message"),React.createElement("div",{className:"\
 thread-picker-list"},G[f].map((o,w)=>React.createElement("button",{key:o.id||w,className:`thread-picker-item${o.active?"\
  active":""}`,onClick:()=>J(f,o.id),title:o.title},React.createElement("span",{className:"thread-picker-title"},o.title||
 "Untitled"))))):Ue.length===0&&!dt&&Qt?.error?React.createElement("div",{className:"empty-state history-error-state"},React.
 createElement("div",{className:"icon"},"\u26A0"),React.createElement("div",null,Qt.error),React.createElement("button",{
-type:"button",className:"thread-picker-new",onClick:tf},"Retry transcript")):Ue.length===0&&!dt&&Fa?React.createElement(
+type:"button",className:"thread-picker-new",onClick:nf},"Retry transcript")):Ue.length===0&&!dt&&Fa?React.createElement(
 "div",{className:"empty-state history-loading-state"},React.createElement("span",{className:"new-session-spinner"}),React.
 createElement("div",null,Fa.mode==="older"?"Loading older messages...":"Loading latest messages...")):Ue.length===0&&!dt?
 React.createElement("div",{className:"empty-state"},React.createElement("div",{className:"icon"},"\u{1F4AC}"),React.createElement(
 "div",null,"No messages yet")):React.createElement(React.Fragment,null,Fe.enabled&&React.createElement("div",{className:"\
-transcript-window-spacer top","data-testid":"transcript-window-top-spacer",style:{height:`${Fe.topSpacerHeight}px`}}),af,
+transcript-window-spacer top","data-testid":"transcript-window-top-spacer",style:{height:`${Fe.topSpacerHeight}px`}}),rf,
 Fe.enabled&&React.createElement("div",{className:"transcript-window-spacer bottom","data-testid":"transcript-window-bott\
 om-spacer",style:{height:`${Fe.bottomSpacerHeight}px`}})):React.createElement("div",{className:"empty-state"},React.createElement(
 "div",{className:"icon"},"\u{1F916}"),React.createElement("div",null,"Select an agent session")),dt&&React.createElement(
@@ -4032,9 +4033,9 @@ own"},React.createElement("div",{className:"assistant-gutter"},React.createEleme
 ipt-agent-badge",style:{color:Xe.color,borderColor:Xe.color+"55",background:Xe.color+"18"}},Xe.logo?React.createElement(
 "img",{src:Xe.logo,alt:Xe.abbr,className:"agent-badge-logo"}):Xe.abbr)),React.createElement("div",{className:"assistant-\
 content"},React.createElement("div",{className:"message-role"},React.createElement("span",{className:"message-role-label"},
-Xe.name),React.createElement(Ci,{instant:qe?.started_at||qe?.updated_at})),React.createElement(Ya,{content:Ua,monospace:Or,
-autoExpandLongCodeBlocks:cc,onOpenPath:o=>hc("live-draft",o)}))),Jl&&!Et&&React.createElement(yb,{prompt:Jl,sessionId:f,
-onRespond:T}),React.createElement("div",{ref:Tm})),React.createElement(Xb,{view:Bo,onShow:()=>f&&Ei(f)})),(qe?.task_list||
+Xe.name),React.createElement(xi,{instant:qe?.started_at||qe?.updated_at})),React.createElement(Ya,{content:Ua,monospace:Or,
+autoExpandLongCodeBlocks:lc,onOpenPath:o=>_c("live-draft",o)}))),Jl&&!Et&&React.createElement(yb,{prompt:Jl,sessionId:f,
+onRespond:T}),React.createElement("div",{ref:$m})),React.createElement(Xb,{view:Bo,onShow:()=>f&&Li(f)})),(qe?.task_list||
 ku)&&!Gt&&React.createElement("div",{className:"transcript-live-footer","data-testid":"transcript-live-footer"},qe?.task_list&&
 !qe?.step&&React.createElement("div",{className:"session-tasklist-strip"},React.createElement(gb,{taskList:qe.task_list,
 sessionId:f})),ku&&React.createElement("div",{className:"composer-live-status-strip"},React.createElement(fb,{activity:qe,
@@ -4043,31 +4044,31 @@ onRequestRefresh:ne,onSetModel:(o,w)=>ee(o,w),onSetEffort:(o,w)=>re(o,w),onSetPe
 o,w),onSetMode:(o,w)=>_e&&_e(o,w),onSetCodexConfig:o=>Y(f,o),onSwitchWorkspace:(o,w)=>te(o,w),onClose:()=>ka(!1)}),!1,pn&&
 f&&j?.capabilities?.chat_list&&!Be&&React.createElement($b,{chats:G[f]||[],sessionId:f,onSwitch:o=>{J(f,o),Ge(!1)},onNew:()=>{
 W(f),Ge(!1)},onClose:()=>Ge(!1)}),ht&&f&&j?.capabilities?.thread_list&&React.createElement(Eb,{threads:B[f]||[],sessionId:f,
-newLabel:fc,onSwitch:o=>{vc(f,o),fn(!1)},onNew:()=>{Fo(f),fn(!1)},onClose:()=>fn(!1)}),!Gt&&_r&&f&&(j?.capabilities?.terminal_output||
+newLabel:gc,onSwitch:o=>{yc(f,o),fn(!1)},onNew:()=>{Fo(f),fn(!1)},onClose:()=>fn(!1)}),!Gt&&_r&&f&&(j?.capabilities?.terminal_output||
 j?.capabilities?.terminal_input)&&React.createElement(qb,{entries:be[f]||[],canRead:!!j?.capabilities?.terminal_output,canInput:!!j?.
 capabilities?.terminal_input,onRefresh:()=>ce(f),onSend:o=>ie(f,o),controlResults:pa,onClose:()=>Na(!1)}),!Gt&&Ut&&f&&j?.
 capabilities?.file_changes&&React.createElement(Ob,{entries:Ee[f]||[],onRefresh:()=>Ne(f),onAccept:o=>Se(f,o,"accept"),onReject:o=>Se(
-f,o,"reject"),onClose:()=>ks(!1)}),React.createElement("div",{className:`input-area composer-skin-${Fp(I?.agent_type)}`,
-"data-composer-skin":Fp(I?.agent_type),style:Gt?{display:"none"}:void 0},React.createElement("label",{className:`attach-\
+f,o,"reject"),onClose:()=>ks(!1)}),React.createElement("div",{className:`input-area composer-skin-${Hp(I?.agent_type)}`,
+"data-composer-skin":Hp(I?.agent_type),style:Gt?{display:"none"}:void 0},React.createElement("label",{className:`attach-\
 btn ${!f||!i||Ts?"disabled":""}`,title:"Attach file"},React.createElement("svg",{width:"18",height:"18",viewBox:"0 0 24 \
 24",fill:"none",stroke:"currentColor",strokeWidth:"2",strokeLinecap:"round",strokeLinejoin:"round"},React.createElement(
 "path",{d:"M21.44 11.05l-9.19 9.19a6 6 0 0 1-8.49-8.49l9.19-9.19a4 4 0 0 1 5.66 5.66l-9.2 9.19a2 2 0 0 1-2.83-2.83l8.49-\
-8.48"})),React.createElement("input",{type:"file",hidden:!0,multiple:!0,ref:$m,onChange:Om,disabled:!f||!i||!!Ts})),React.
-createElement("div",{className:"input-col"},rc.length>0&&React.createElement("div",{className:"file-chips"},rc.map((o,w)=>React.
+8.48"})),React.createElement("input",{type:"file",hidden:!0,multiple:!0,ref:Em,onChange:Im,disabled:!f||!i||!!Ts})),React.
+createElement("div",{className:"input-col"},oc.length>0&&React.createElement("div",{className:"file-chips"},oc.map((o,w)=>React.
 createElement("div",{key:w,className:"file-chip"},React.createElement("span",null,"\u{1F4C4} ",o.name,o.isText?"":" (upl\
-oaded)"),React.createElement("button",{onClick:()=>Pm(f,w)},"\xD7")))),ct&&Io.length>0&&React.createElement("div",{className:"\
+oaded)"),React.createElement("button",{onClick:()=>qm(f,w)},"\xD7")))),ct&&Io.length>0&&React.createElement("div",{className:"\
 slash-menu"},Io.map(o=>React.createElement("button",{key:o.command,type:"button",className:"slash-item",onClick:()=>Cu(o.
 command)},React.createElement("span",{className:"slash-command"},o.command),React.createElement("span",{className:"slash\
 -detail"},o.detail)))),f&&(se[f]||[]).length>0&&React.createElement("div",{className:"queued-bar"},(se[f]||[]).map(o=>React.
 createElement(lb,{key:o.cid,qm:o,onSteer:()=>de(f,o.cid,o.content,o.nativeIndex),onDiscard:()=>Ze(f,o.cid),onEdit:w=>D(f,
-o.cid,w)}))),React.createElement("div",{className:"textarea-row"},React.createElement("textarea",{ref:Pn,value:On,onChange:o=>lf(
-o.target.value),onKeyDown:jm,onPaste:Im,placeholder:Ts?`Resolve the ${Et?.type==="question_prompt"?"question":Et?"permis\
+o.cid,w)}))),React.createElement("div",{className:"textarea-row"},React.createElement("textarea",{ref:Pn,value:On,onChange:o=>uf(
+o.target.value),onKeyDown:Bm,onPaste:Dm,placeholder:Ts?`Resolve the ${Et?.type==="question_prompt"?"question":Et?"permis\
 sion prompt":"error prompt"} above to continue`:f?window.innerWidth<600?"Enter message\u2026":"Message\u2026 (/ for commands)":
 "Select a session",disabled:!f||!!Ts,rows:1}),React.createElement("div",{className:"textarea-btns"},f&&React.createElement(
 "button",{className:`composer-gear-btn schedule-send-btn${va?" active":""}`,onClick:()=>Yn(o=>!o),title:"Schedule this m\
 essage","aria-label":"Schedule message"},"\u25F7"),f&&React.createElement("button",{className:`composer-gear-btn${we?" a\
 ctive":""}`,onClick:()=>_s(o=>!o),title:"Toggle settings"},"\u2699"),du&&React.createElement("button",{className:"compos\
-er-gear-btn mobile-hide",onClick:()=>Fo(f),title:fc},"\u270E"),(j?.capabilities?.chat_list||Be)&&React.createElement("bu\
+er-gear-btn mobile-hide",onClick:()=>Fo(f),title:gc},"\u270E"),(j?.capabilities?.chat_list||Be)&&React.createElement("bu\
 tton",{className:`composer-gear-btn mobile-hide${(Be?mn:pn)?" active":""}`,onClick:()=>{if(Be){Ht(w=>!w),Ge(!1),me(f);return}
 let o=!pn;Ge(o),o&&me(f)},title:Be?"Agent Manager conversations":"Chat history"},"\u2630"),j?.capabilities?.thread_list&&
 React.createElement("button",{className:`composer-gear-btn mobile-hide${ht?" active":""}`,onClick:()=>{let o=!ht;fn(o),o&&
@@ -4076,8 +4077,8 @@ ear-btn mobile-hide",onClick:()=>he(f),title:"Open panel"},"\u229E"),j?.capabili
 "button",{className:"composer-gear-btn mobile-hide",onClick:o=>X(f,o),title:"Open native command window"},"cmd"),j?.capabilities?.
 new_chat&&React.createElement("button",{className:"composer-gear-btn mobile-hide",onClick:()=>Be?ta(f):W(f),title:Be?"Ne\
 w Antigravity conversation":"New chat"},"+"),qo?React.createElement("button",{className:`stop-btn${ja?" pending":""}`,title:ja?
-"Interrupting\u2026":"Interrupt agent",disabled:ja,onClick:ac},ja?React.createElement("span",{className:"stop-btn-spinne\
-r"}):"\u25A0"):React.createElement("button",{className:"send-btn",onClick:Xl,disabled:!Bm,title:i?"Send":"Queue until re\
+"Interrupting\u2026":"Interrupt agent",disabled:ja,onClick:rc},ja?React.createElement("span",{className:"stop-btn-spinne\
+r"}):"\u25A0"):React.createElement("button",{className:"send-btn",onClick:Xl,disabled:!Fm,title:i?"Send":"Queue until re\
 connected"},on?"\u2026":"\u2191"))),React.createElement("div",{className:"composer-meta"},Zn===f&&qo&&!ja&&React.createElement(
 "span",{className:"interrupt-confirm-inline",role:"status","aria-live":"polite"},"Press Esc again or Enter to interrupt"),
 (bl(I?.agent_type)||Jr(I?.agent_type))&&j?.mode&&j.mode!=="unknown"&&React.createElement("span",{className:"composer-hin\
@@ -4088,7 +4089,7 @@ t",style:{color:"#d29922"}},j.mode),(bl(I?.agent_type)||Jr(I?.agent_type))&&j?.m
 nset"),I?.agent_type==="antigravity-v2"&&j?.model_id&&j.model_id!=="unknown"&&React.createElement("span",{className:"com\
 poser-hint",style:{color:"#8b949e"}},j.model_id),(I?.agent_type==="antigravity"||I?.agent_type==="antigravity_panel")&&(Array.
 isArray(I?.antigravity_quota_models)&&I.antigravity_quota_models.length>0?React.createElement("span",{className:"compose\
-r-hint",style:{color:"#8b949e"}},gm(I.antigravity_quota_models,4)):I?.percent_used!=null?React.createElement("span",{className:"\
+r-hint",style:{color:"#8b949e"}},hm(I.antigravity_quota_models,4)):I?.percent_used!=null?React.createElement("span",{className:"\
 composer-hint",style:{color:I.percent_used>=90?"#f85149":I.percent_used>=75?"#d29922":"#8b949e"}},"Quota ",I.percent_used,
 "%",I?.rate_limited_until&&I.rate_limited_until!=="unknown"?` \xB7 ${I.rate_limited_until}`:""):null),React.createElement(
 "span",{className:"composer-hint"},"Enter send"),React.createElement("span",{className:"composer-hint"},"Shift+Enter new\
@@ -4105,8 +4106,8 @@ ntrol":"model"},React.createElement("span",{className:"composer-setting-key"},I?
 "observed_and_next_send"?"Next model":"Model"),React.createElement("select",{className:"composer-setting-select",value:I?.
 agent_type==="codex_cli"&&j?.config_semantics==="observed_and_next_send"?j.next_send_model_id||"":j?.model_id||"default",
 onChange:o=>ee(f,o.target.value)},I?.agent_type==="codex_cli"&&j?.config_semantics==="observed_and_next_send"&&React.createElement(
-"option",{value:"",disabled:!0},"Choose model\u2026"),Jp(I?.agent_type,j).map(o=>React.createElement("option",{key:o.id,
-value:o.id},o.label)),j?.model_id&&!Jp(I?.agent_type,j).some(o=>o.id===j.model_id)&&j.model_id!=="unknown"&&j.config_semantics!==
+"option",{value:"",disabled:!0},"Choose model\u2026"),Zp(I?.agent_type,j).map(o=>React.createElement("option",{key:o.id,
+value:o.id},o.label)),j?.model_id&&!Zp(I?.agent_type,j).some(o=>o.id===j.model_id)&&j.model_id!=="unknown"&&j.config_semantics!==
 "observed_and_next_send"&&React.createElement("option",{value:j.model_id},j.model_id)),I?.agent_type==="codex_cli"&&j?.config_semantics===
 "observed_and_next_send"&&React.createElement("span",{className:"composer-hint"},j.next_send_model_status||"unset"))),(I?.
 agent_type==="antigravity"||I?.agent_type==="antigravity_panel")&&React.createElement("label",{className:"composer-setti\
@@ -4120,7 +4121,7 @@ Qr(I?.agent_type,j).map(o=>React.createElement("option",{key:o.id,value:o.id},o.
 I?.agent_type,j).some(o=>o.id===j.mode)&&React.createElement("option",{value:j.mode},j.mode))),j?.capabilities?.permission_mode_change&&
 React.createElement("label",{className:"composer-setting-label","data-control":"permission"},React.createElement("span",
 {className:"composer-setting-key"},I?.agent_type==="codex_cli"?"Access":"Permission"),React.createElement("select",{className:"\
-composer-setting-select",value:j.permission_mode||vm(I?.agent_type),onChange:o=>z(f,o.target.value),title:"Permission mo\
+composer-setting-select",value:j.permission_mode||ym(I?.agent_type),onChange:o=>z(f,o.target.value),title:"Permission mo\
 de"},wl(I?.agent_type||"claude",j).map(o=>React.createElement("option",{key:o.value,value:o.value},o.label)),j.permission_mode&&
 !wl(I?.agent_type,j).some(o=>o.value===j.permission_mode)&&j.permission_mode!=="unknown"&&React.createElement("option",{
 value:j.permission_mode},j.permission_mode))),(I?.agent_type==="claude_cli"||I?.agent_type==="codex_cli"||I?.agent_type===
@@ -4188,12 +4189,12 @@ createElement("span",{className:`attention-toast-icon ${Rt.kind}`,"aria-hidden":
 tion","provider_usage_threshold"].includes(Rt.kind)?"!":"\u2713"),React.createElement("span",{className:"attention-toast\
 -copy"},React.createElement("strong",null,Rt.title),React.createElement("span",null,Rt.detail)),React.createElement("but\
 ton",{type:"button",onClick:()=>{let o=Oe.find(w=>$e(w)===Rt.sessionId);o&&qn(Rt.sessionId,o),Vl()}},"Jump")),React.createElement(
-"div",{className:`toast ${Ws?"visible":""}`},Ws))}var wm=(()=>{try{return new URLSearchParams(window.location.search).get("render_profile")==="1"}catch{return!1}})();function dv(e,t,n,s,a,i){
+"div",{className:`toast ${Ws?"visible":""}`},Ws))}var Nm=(()=>{try{return new URLSearchParams(window.location.search).get("render_profile")==="1"}catch{return!1}})();function dv(e,t,n,s,a,i){
 let c=window.__RAC_RENDER_PROFILER__||(window.__RAC_RENDER_PROFILER__=[]);c.push({id:e,phase:t,route:document.querySelector(
 '[data-testid="fleet-view"]')?"fleet":document.querySelector('[data-testid="usage-dashboard"]')?"usage":document.querySelector(
 '[data-testid="host-resource-dashboard"]')?"host-resources":document.querySelector(".messages")?"chat":"other",actual_duration_ms:Number(
 n.toFixed(3)),base_duration_ms:Number(s.toFixed(3)),start_time_ms:Number(a.toFixed(3)),commit_time_ms:Number(i.toFixed(3))}),
-c.length>2e3&&c.splice(0,c.length-2e3)}var am=React.createElement(Sl,null,React.createElement(uv,null));ReactDOM.createRoot(
-document.getElementById("root")).render(wm?React.createElement(React.Profiler,{id:"AgentChatRoot",onRender:dv},am):am);"serviceWorker"in navigator&&window.addEventListener("load",function(){navigator.serviceWorker.register("/sw.js").catch(
+c.length>2e3&&c.splice(0,c.length-2e3)}var rm=React.createElement(Sl,null,React.createElement(uv,null));ReactDOM.createRoot(
+document.getElementById("root")).render(Nm?React.createElement(React.Profiler,{id:"AgentChatRoot",onRender:dv},rm):rm);"serviceWorker"in navigator&&window.addEventListener("load",function(){navigator.serviceWorker.register("/sw.js").catch(
 function(e){console.warn("SW registration failed:",e)})});(window.navigator.standalone===!0||window.matchMedia("(display\
 -mode: standalone)").matches)&&document.body.classList.add("pwa-standalone");})();
