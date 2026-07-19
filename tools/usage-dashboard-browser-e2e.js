@@ -65,6 +65,8 @@ if (requestedStormMs > 0) {
   }
 }
 let providerRefreshRequests = 0;
+const providerRefreshMessages = [];
+const providerUsageWatchStates = [];
 let costDetailRequests = 0;
 let resetCreditRequests = 0;
 let lastResetCreditRequest = null;
@@ -77,8 +79,13 @@ let currentProviderUsage = null;
 function providerUsageFixture() {
   const capturedAt = fixtureCapturedAt;
   const staleAfter = fixtureStaleAfter;
-  const snapshot = (providerId, providerName, accountFingerprint, plan, harnessTypes, sessionCount, windows, extra = {}) => ({
-    schema_version: 4,
+  const snapshot = (providerId, providerName, accountFingerprint, plan, harnessTypes, sessionCount, windows, extra = {}) => {
+    const fastMs = providerId === 'anthropic-claude' ? 75_000
+      : providerId === 'google-antigravity' ? 300_000
+        : providerId === 'ollama-local' ? 90_000 : 60_000;
+    const idleMs = providerId === 'google-antigravity' ? 600_000 : 300_000;
+    return ({
+    schema_version: 5,
     provider_id: providerId,
     provider_name: providerName,
     quota_domain: `${providerId}-plan`,
@@ -92,7 +99,17 @@ function providerUsageFixture() {
     status: 'fresh',
     captured_at: capturedAt,
     stale_after: staleAfter,
-    next_refresh_at: extra.nextRefreshAt || null,
+    next_refresh_at: extra.nextRefreshAt || new Date(Date.now() + fastMs).toISOString(),
+    cadence_class: providerId === 'google-antigravity' ? 'guarded_cache' : 'cheap_local',
+    refresh_interval_ms: fastMs,
+    fast_refresh_interval_ms: fastMs,
+    idle_refresh_interval_ms: idleMs,
+    watch_boost_active: true,
+    last_attempt_at: capturedAt,
+    last_success_at: capturedAt,
+    consecutive_misses: 0,
+    stale_reason: null,
+    manual_refresh_allowed_at: capturedAt,
     windows: windows.map(([id, label, used, scope = null, modelId = null]) => {
       const duration = id === 'five_hour' || label === '5-hour' || label === 'Current session' || label === 'Session' ? 300 : 10080;
       return enrichUsageWindow({
@@ -114,11 +131,13 @@ function providerUsageFixture() {
     session_count: sessionCount,
     mapped_harness_types: harnessTypes,
   });
+  };
   return {
-    schema_version: 4,
+    schema_version: 5,
     generation: 7,
     generated_at: capturedAt,
     poll_interval_ms: 300000,
+    cadence_mode: 'watching',
     in_flight: false,
     snapshots: [
       snapshot('anthropic-claude', 'Anthropic Claude', 'acct_11111111111111111111', 'Claude Max', ['claude', 'claude_cli'], 13, [
@@ -364,11 +383,14 @@ async function main() {
         send({ type: 'history_delta', session: sessionId, session_id: sessionId, request_id: message.request_id, messages: [] });
       } else if (message.type === 'provider_usage_refresh') {
         providerRefreshRequests += 1;
-        send({ type: 'provider_usage_refresh_receipt', request_id: message.request_id, status: 'accepted' });
+        providerRefreshMessages.push(message);
+        send({ type: 'provider_usage_refresh_receipt', request_id: message.request_id, provider_id: message.provider_id || null, status: 'accepted' });
         if (respondToProviderRefresh) {
           send({ type: 'provider_usage_snapshot', protocol_version: 1, snapshot: currentProviderUsage });
-          send({ type: 'provider_usage_refresh_receipt', request_id: message.request_id, status: 'completed', generation: 7, cost_status: 'ready' });
+          send({ type: 'provider_usage_refresh_receipt', request_id: message.request_id, provider_id: message.provider_id || null, status: 'completed', generation: 7, cost_status: 'ready' });
         }
+      } else if (message.type === 'provider_usage_watch') {
+        providerUsageWatchStates.push(message.active === true);
       } else if (message.type === 'provider_usage_reset_credit_consume') {
         resetCreditRequests += 1;
         lastResetCreditRequest = message;
@@ -436,6 +458,8 @@ async function main() {
     };
 
     await loadFixture({ width: 1280, height: 900 });
+    await page.waitForTimeout(50);
+    assert(providerUsageWatchStates.includes(true), 'opening the Usage view must activate live cadence');
     assert.equal(await page.locator('.usage-dashboard-card').count(), 4, 'six old surfaces must become four provider-account cards');
     await page.waitForFunction(() => {
       const images = [...document.querySelectorAll('.usage-dashboard-provider-mark-image')];
@@ -449,6 +473,11 @@ async function main() {
     );
     await assert.doesNotReject(async () => {
       const codex = page.locator('[data-provider-id="openai-codex"]');
+      await codex.getByText('Live cadence 60s', { exact: true }).waitFor();
+      await codex.getByRole('button', { name: 'Refresh OpenAI Codex usage now' }).click();
+      await codex.getByText('Refresh completed', { exact: true }).waitFor();
+      assert.strictEqual(providerRefreshMessages.at(-1)?.provider_id, 'openai-codex');
+      if (screenshotDir) await codex.screenshot({ path: path.join(screenshotDir, 'provider-card-live-cadence-desktop.png') });
       await codex.getByText('13 mapped sessions').waitFor();
       await codex.getByText('5-hour', { exact: true }).waitFor();
       await codex.getByText('Weekly', { exact: true }).waitFor();
@@ -486,6 +515,32 @@ async function main() {
       await ollama.getByText(/Auto-reloadOff/).waitFor();
       await ollama.getByText(/Local runtime0 loaded \/ 13 installed/).waitFor();
     });
+    providerRefreshRequests = 0;
+    const forcedStale = providerUsageFixture();
+    forcedStale.generation = 8;
+    forcedStale.generated_at = new Date().toISOString();
+    const staleCodex = forcedStale.snapshots.find(account => account.provider_id === 'openai-codex');
+    staleCodex.status = 'stale';
+    staleCodex.captured_at = new Date(Date.now() - 3 * 60_000).toISOString();
+    staleCodex.last_success_at = staleCodex.captured_at;
+    staleCodex.consecutive_misses = 2;
+    staleCodex.stale_reason = 'two_consecutive_misses';
+    staleCodex.error = { code: 'forced_fixture_failure', message: 'Fixture refresh failed.', retry_after_ms: 0 };
+    broadcastProviderUsage(forcedStale);
+    await page.waitForTimeout(150);
+    const staleCodexText = await page.locator('[data-provider-id="openai-codex"]').innerText();
+    assert.match(staleCodexText, /Stale - Updated (?:2|3)m ago/,
+      `two-miss stale age was not visible: ${staleCodexText.slice(0, 500)}`);
+    if (screenshotDir) await page.locator('[data-provider-id="openai-codex"]')
+      .screenshot({ path: path.join(screenshotDir, 'provider-card-two-miss-stale-desktop.png') });
+    if (screenshotDir) await page.locator('[data-provider-id="openai-codex"] .usage-dashboard-card-summary')
+      .screenshot({ path: path.join(screenshotDir, 'provider-card-two-miss-stale-summary.png') });
+    if (screenshotDir) await page.locator('[data-provider-id="openai-codex"] .usage-dashboard-card-meta')
+      .screenshot({ path: path.join(screenshotDir, 'provider-card-two-miss-stale-age.png') });
+    const restoredFresh = providerUsageFixture();
+    restoredFresh.generation = 9;
+    restoredFresh.generated_at = new Date().toISOString();
+    broadcastProviderUsage(restoredFresh);
     await page.getByRole('heading', { name: 'Local estimated API-equivalent cost' }).waitFor();
     await page.getByRole('rowheader', { name: 'Codex · gpt-5.6-sol' }).waitFor();
     await page.getByText('Fallback pricing', { exact: true }).waitFor();
@@ -999,7 +1054,7 @@ async function main() {
       session_header_mobile_popover_390: mobilePopoverGeometry,
       antigravity_billing_model_separation: true,
       session_header_formal_storm: sessionHeaderStorm,
-      schema_version: 4,
+      schema_version: 5,
       ollama_cloud_and_local: true,
       ollama_zero_balance_exact: true,
       predictive_pace_windows: await page.locator('.usage-pace').count(),
@@ -1020,7 +1075,11 @@ async function main() {
       reset_credit_approved: lastResetCreditRequest?.approved === true,
       reset_credit_outcome: 'reset',
       real_reset_credit_consumed: false,
-      visual_controls_triggered_provider_calls: 0,
+      visual_controls_triggered_provider_calls: 1,
+      usage_watch_states: providerUsageWatchStates,
+      subscription_aware_live_cadence: providerUsageWatchStates.includes(true),
+      per_card_refresh_provider_id: 'openai-codex',
+      two_miss_stale_age_visible: true,
       provider_lifecycle_without_false_zero: true,
       cost_lifecycle_without_false_zero: true,
       cost_failure_preserved_quota_cards: true,

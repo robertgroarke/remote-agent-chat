@@ -69,6 +69,11 @@ const {
 } = require('../shared/fleet-summary');
 const { LatestSessionOperationQueue } = require('./latest-session-operation-queue');
 const { normalizeNavigationEpoch } = require('../relay-server/navigation-epoch');
+const {
+  applyWriteCapabilityGate,
+  isWriteCommand,
+  validationGateForAgentType,
+} = require('./harness-revalidation');
 
 const SERIALIZED_NAVIGATION = Symbol('serializedNavigation');
 const PRIORITY_RELAY_CONTROL = Symbol('priorityRelayControl');
@@ -80,6 +85,8 @@ const PRIORITY_RELAY_TYPES = new Set([
   'switch_chat',
   'switch_thread',
   'interrupt',
+  'agent_interrupt',
+  'agent_goal_control',
   'question_response',
   'permission_response',
   'error_prompt_action',
@@ -575,13 +582,14 @@ function cursorNativeActivity(agent, previous = null, options = {}) {
   const transcriptWorking = options.correlatedTranscriptWorking === true;
 
   if (needsAttention) {
-    return {
+    const capabilities = {
       kind: 'needs_attention',
       label: 'Needs attention',
       updated_at: transitionAt('needs_attention'),
       cursor_evidence_at: now,
       cursor_evidence_source: 'native_status',
     };
+    return applyWriteCapabilityGate(capabilities, agentType);
   }
   if (terminal) {
     return {
@@ -1569,11 +1577,31 @@ class ProxyEngine extends EventEmitter {
       && fs.existsSync(workspacePath)
     );
     const hasGitWorkspace = hasWorkspace && this._isGitWorkspace(workspacePath);
+    const interruptMethods = {
+      claude: 'native_stop',
+      claude_cli: 'owned_process_tree',
+      codex_cli: 'turn_interrupt_or_owned_process_tree',
+      cursor_cli: 'owned_process_tree',
+      codex: 'native_stop',
+      gemini: 'native_stop',
+      continue: 'native_stop',
+      continue_yolo: 'native_stop',
+      'antigravity-v2': 'native_stop',
+      'claude-desktop': 'native_stop',
+      'codex-desktop': 'native_stop',
+      cursor: 'native_stop',
+      roo_code: 'native_stop',
+      cline: 'native_stop',
+    };
+    const interruptMethod = interruptMethods[agentType] || null;
     return {
-      interrupt:              ['claude', 'claude_cli', 'codex_cli', 'cursor_cli', 'codex', 'gemini', 'continue', 'continue_yolo', 'antigravity', 'antigravity_panel', 'claude-desktop', 'codex-desktop', 'cursor', 'roo_code', 'cline'].includes(agentType),
+      interrupt:              !!interruptMethod,
+      interrupt_method:       interruptMethod,
+      interrupt_gate:         interruptMethod ? null : 'no_verified_session_scoped_stop',
       // Goal lifecycle is an explicit Codex-family contract. Consumers must
       // ignore stray goal-shaped fields from every other harness.
       goal_lifecycle:         isCodex || isCodexCli,
+      goal_pause_resume:      isCodex || isCodexCli,
       set_model:              ['claude', 'claude_cli', 'codex_cli', 'cursor_cli', 'antigravity', 'antigravity_panel', 'gemini', 'continue', 'continue_yolo', 'cursor'].includes(agentType) || isClineLike,
       // Cursor 3.5 Agents UI has no reliable Ask/Edit/Agent/Composer page-level toggle in CDP probes.
       set_mode:               agentType === 'antigravity' || isClineLike,
@@ -4810,6 +4838,33 @@ class ProxyEngine extends EventEmitter {
       return result;
     }
 
+    if (isWriteCommand(type)) {
+      const sessionId = msg.session_id || msg.session;
+      const session = sessionId ? this.sessions.get(sessionId) : null;
+      const gate = validationGateForAgentType(session?.agentType);
+      if (session && gate.gated) {
+        const error = {
+          code: 'pending_revalidation',
+          message: gate.reason,
+          retryable: true,
+          revalidation_harness: gate.harness,
+          revalidation_version: gate.installed_version,
+        };
+        if ((type === 'send' || type === 'send_message') && msg.client_message_id) {
+          this._sendToRelay(proto.proxySendResult(sessionId, msg.client_message_id, 'failed', error));
+        } else {
+          this._sendToRelay(proto.agentControlResult(
+            sessionId,
+            msg.request_id || msg.client_message_id || null,
+            type,
+            'failed',
+            error,
+          ));
+        }
+        return;
+      }
+    }
+
     if (['new_chat', 'new_thread', 'switch_chat', 'switch_thread'].includes(type)
         && !msg[SERIALIZED_NAVIGATION]) {
       const sessionId = msg.session_id || msg.session;
@@ -4938,18 +4993,43 @@ class ProxyEngine extends EventEmitter {
 
     if (type === 'heartbeat_ack') return;
 
+    if (type === 'provider_usage_watch') {
+      this._providerUsage.setWatching(msg.active === true).catch(error => {
+        this._log('warn', `[usage] Watch cadence update failed: ${error?.message || 'unknown error'}`);
+      });
+      return;
+    }
+
     if (type === 'provider_usage_refresh') {
       const requestId = typeof msg.request_id === 'string' ? msg.request_id.slice(0, 80) : null;
+      const providerId = typeof msg.provider_id === 'string' ? msg.provider_id.slice(0, 80) : null;
+      if (providerId && msg.force === true) {
+        const claim = this._providerUsage.claimManualRefresh(providerId);
+        if (!claim.ok) {
+          this._sendToRelay({
+            type: 'provider_usage_refresh_receipt',
+            protocol_version: proto.PROTOCOL_VERSION,
+            request_id: requestId,
+            provider_id: providerId,
+            status: 'error',
+            code: claim.code,
+            retry_after_ms: claim.retryAfterMs,
+          });
+          return;
+        }
+      }
       const coalesced = !!this._providerUsage.inFlight;
       this._providerUsage.refresh({
         force: msg.force === true,
         reason: 'client',
         waitForCost: false,
+        providerId,
       }).then(snapshot => {
         this._sendToRelay({
           type: 'provider_usage_refresh_receipt',
           protocol_version: proto.PROTOCOL_VERSION,
           request_id: requestId,
+          provider_id: providerId,
           status: 'completed',
           coalesced,
           generation: Number(snapshot?.generation) || 0,
@@ -4961,6 +5041,7 @@ class ProxyEngine extends EventEmitter {
           type: 'provider_usage_refresh_receipt',
           protocol_version: proto.PROTOCOL_VERSION,
           request_id: requestId,
+          provider_id: providerId,
           status: 'error',
           code: String(error?.code || 'refresh_failed').replace(/[^a-z0-9_.-]/gi, '_').slice(0, 60),
         });
@@ -5227,6 +5308,34 @@ class ProxyEngine extends EventEmitter {
       return;
     }
 
+    if (type === 'agent_goal_control') {
+      const sid = msg.session_id || msg.session;
+      const sessionData = this.sessions.get(sid);
+      if (!sessionData) {
+        this._sendToRelay(proto.agentControlResult(sid, msg.request_id, 'agent_goal_control', 'failed', {
+          code: 'session_unknown', message: `No active session: ${sid}`, native_attempted: false, retryable: true,
+        }));
+        return;
+      }
+      const capabilities = this._buildCapabilities(sessionData.agentType, sessionData.workspace_path);
+      if (capabilities.goal_pause_resume !== true) {
+        this._sendToRelay(proto.agentControlResult(sid, msg.request_id, 'agent_goal_control', 'failed', {
+          code: 'goal_control_unsupported', message: 'This session has no verified native goal control', native_attempted: false, retryable: false,
+        }));
+        return;
+      }
+      return this._controlCodexGoal(sid, sessionData, msg).then(details => {
+        this._sendToRelay(proto.agentControlResult(sid, msg.request_id, 'agent_goal_control', 'ok', details));
+      }).catch(error => {
+        this._sendToRelay(proto.agentControlResult(sid, msg.request_id, 'agent_goal_control', 'failed', {
+          code: error?.code || 'goal_control_failed',
+          message: error?.message || 'Goal control failed',
+          native_attempted: error?.native_attempted === true,
+          retryable: error?.retryable !== false,
+        }));
+      });
+    }
+
     if (type === 'agent_interrupt') {
       const sid = msg.session_id || msg.session;
       const sessionData = this.sessions.get(sid);
@@ -5237,7 +5346,17 @@ class ProxyEngine extends EventEmitter {
         return;
       }
 
+      const interruptCapability = this._buildCapabilities(sessionData.agentType, sessionData.workspace_path);
+      if (interruptCapability.interrupt !== true) {
+        this._sendToRelay(proto.agentControlResult(sid, msg.request_id, 'agent_interrupt', 'failed', {
+          code: 'interrupt_unsupported', message: interruptCapability.interrupt_gate || 'No verified session-scoped stop exists',
+          native_attempted: false, retryable: false,
+        }));
+        return;
+      }
+
       this._log('info', `[ctrl] agent_interrupt for ${sid} (${sessionData.agentType})`);
+      const retainedGoal = sessionData.activity?.goal || null;
       if (sessionData.agentType === 'claude_cli' || sessionData.agentType === 'codex_cli' || sessionData.agentType === 'cursor_cli') {
         if (sessionData.agentType === 'codex_cli' && sessionData._codexAppServerTurn) {
           const turn = sessionData._codexAppServerTurn;
@@ -5245,12 +5364,17 @@ class ProxyEngine extends EventEmitter {
           Promise.resolve(turn.interrupt())
             .then(() => {
               if (this.sessions.get(sid) !== sessionData) return;
-              const activity = { kind: 'idle', label: 'Interrupted', updated_at: new Date().toISOString() };
+              const activity = {
+                kind: 'idle', label: 'Interrupted', updated_at: new Date().toISOString(),
+                ...(retainedGoal ? { goal: retainedGoal } : {}),
+              };
               sessionData.activity = activity;
               sessionData.waitingForAssistant = false;
               sessionStore.updateSession(sid, { activity, codex_cli_interrupted: true });
               this._sendToRelay(proto.proxyStatus(sid, sessionData.status || 'healthy', activity));
-              this._sendToRelay(proto.agentControlResult(sid, msg.request_id, 'agent_interrupt', 'ok'));
+              this._sendToRelay(proto.agentControlResult(sid, msg.request_id, 'agent_interrupt', 'ok', {
+                native_acknowledged: true, method: 'codex_app_server_turn_interrupt', native_operations: 1,
+              }));
             })
             .catch(error => {
               sessionData._codexCliInterrupted = false;
@@ -5296,8 +5420,17 @@ class ProxyEngine extends EventEmitter {
         } else if (sessionData[childKey]) {
           try { sessionData[childKey].kill(); } catch {}
           sessionData[childKey] = null;
+        } else {
+          this._sendToRelay(proto.agentControlResult(sid, msg.request_id, 'agent_interrupt', 'failed', {
+            code: 'interrupt_unavailable', message: 'No RAC-owned native turn or child process is running',
+            native_attempted: false, retryable: true,
+          }));
+          return;
         }
-        const activity = { kind: 'idle', label: 'Interrupted', updated_at: new Date().toISOString() };
+        const activity = {
+          kind: 'idle', label: 'Interrupted', updated_at: new Date().toISOString(),
+          ...(retainedGoal ? { goal: retainedGoal } : {}),
+        };
         sessionData.activity = activity;
         sessionStore.updateSession(sid, {
           activity,
@@ -5305,9 +5438,35 @@ class ProxyEngine extends EventEmitter {
           ...(sessionData.agentType === 'cursor_cli' ? { cursor_cli_interrupted: true } : {}),
         });
         this._sendToRelay(proto.proxyStatus(sid, sessionData.status || 'healthy', activity));
-        this._sendToRelay(proto.agentControlResult(sid, msg.request_id, 'agent_interrupt', 'ok'));
+        this._sendToRelay(proto.agentControlResult(sid, msg.request_id, 'agent_interrupt', 'ok', {
+          native_acknowledged: true, method: 'owned_process_tree_stop', native_operations: 1,
+        }));
         return;
       }
+      const interruptAndVerify = async client => {
+        const result = await selectors.interruptAgent(client.Runtime, sessionData.agentType, sid, client);
+        if (!result?.ok) return result;
+        let consecutiveIdleObservations = 0;
+        for (let attempt = 0; attempt < 40; attempt += 1) {
+          const observed = await selectors.detectThinking(client.Runtime, sessionData.agentType);
+          if (observed?.thinking !== true) {
+            consecutiveIdleObservations += 1;
+            if (consecutiveIdleObservations >= 2) {
+              return { ...result, ok: true, native_acknowledged: true, native_operations: 1 };
+            }
+          } else {
+            consecutiveIdleObservations = 0;
+          }
+          await sleep(100);
+        }
+        return {
+          ok: false,
+          code: 'interrupt_not_acknowledged',
+          detail: 'The native surface still reports an in-flight turn after Stop',
+          native_attempted: true,
+          retryable: true,
+        };
+      };
       const interruptPromise = (async () => {
         if (sessionData.agentType === 'cursor' && sessionData._cursorVirtual) {
           const activated = await this._ensureCursorVirtualSessionActive(sessionData);
@@ -5316,28 +5475,34 @@ class ProxyEngine extends EventEmitter {
           }
         }
         return this._isEphemeralIframeAgent(sessionData.agentType)
-          ? this._withEphemeralIframeClient(sessionData, client =>
-              selectors.interruptAgent(client.Runtime, sessionData.agentType, sid, client)
-            , 'interrupt')
-          : selectors.interruptAgent(sessionData.client.Runtime, sessionData.agentType, sid, sessionData.client);
+          ? this._withEphemeralIframeClient(sessionData, client => interruptAndVerify(client), 'interrupt')
+          : interruptAndVerify(sessionData.client);
       })();
       interruptPromise
         .then((result) => {
-          if (result.ok) {
-            const activity = { kind: 'idle', label: 'Interrupted', updated_at: new Date().toISOString() };
+          if (result.ok && result.native_acknowledged === true) {
+            const activity = {
+              kind: 'idle', label: 'Interrupted', updated_at: new Date().toISOString(),
+              ...(retainedGoal ? { goal: retainedGoal } : {}),
+            };
             sessionData._activityEpoch = (sessionData._activityEpoch || 0) + 1;
             sessionData._interruptSettled = true;
             sessionData.activity = activity;
             sessionData.waitingForAssistant = false;
             if (this._isCodexSurface(sessionData.agentType)) {
-              selectors.setCodexCachedThinking(sid, { thinking: false, label: '', goal: null });
+              selectors.setCodexCachedThinking(sid, { thinking: false, label: '', goal: retainedGoal });
             }
             sessionStore.updateSession(sid, { activity });
             this._sendToRelay(proto.proxyStatus(sid, sessionData.status || 'healthy', activity));
-            this._sendToRelay(proto.agentControlResult(sid, msg.request_id, 'agent_interrupt', 'ok'));
+            this._sendToRelay(proto.agentControlResult(sid, msg.request_id, 'agent_interrupt', 'ok', {
+              native_acknowledged: true,
+              method: result.method || 'native_stop',
+              native_operations: Number(result.native_operations) || 1,
+            }));
           } else {
             this._sendToRelay(proto.agentControlResult(sid, msg.request_id, 'agent_interrupt', 'failed', {
               code: result.code || 'interrupt_failed', message: result.detail || 'Interrupt failed',
+              native_attempted: result.native_attempted === true, retryable: result.retryable !== false,
             }));
           }
         })
@@ -11822,6 +11987,157 @@ class ProxyEngine extends EventEmitter {
     sessionStore.updateSession(sessionId, { activity: attention });
     this._sendToRelay(proto.proxyStatus(sessionId, session.status || 'healthy', attention));
     return true;
+  }
+
+  async _controlCodexGoal(sessionId, session, message) {
+    const action = String(message?.action || '').trim().toLowerCase();
+    if (!['pause', 'resume'].includes(action)) {
+      throw Object.assign(new Error('Goal action must be pause or resume'), {
+        code: 'invalid_goal_action', native_attempted: false, retryable: false,
+      });
+    }
+    if (!['codex', 'codex-desktop', 'codex_cli'].includes(session?.agentType)) {
+      throw Object.assign(new Error('This harness has no Codex goal lifecycle'), {
+        code: 'goal_control_unsupported', native_attempted: false, retryable: false,
+      });
+    }
+    if (this.sessions.get(sessionId) !== session) {
+      throw Object.assign(new Error('The session changed before goal control'), {
+        code: 'goal_session_changed', native_attempted: false, retryable: true,
+      });
+    }
+    const currentGoal = session.activity?.goal || null;
+    if (!currentGoal) {
+      throw Object.assign(new Error('This thread has no goal'), {
+        code: 'goal_not_found', native_attempted: false, retryable: false,
+      });
+    }
+    const currentGeneration = Math.max(1, Number(currentGoal.generation) || 1);
+    const requestedGeneration = Math.max(0, Number(message.goal_generation) || 0);
+    if (!requestedGeneration || requestedGeneration !== currentGeneration
+        || (message.goal_fingerprint && message.goal_fingerprint !== currentGoal.fingerprint)) {
+      throw Object.assign(new Error('The goal generation changed before control'), {
+        code: 'stale_goal_generation', native_attempted: false, retryable: true,
+      });
+    }
+    const expectedBefore = action === 'pause' ? 'active' : 'paused';
+    const expectedAfter = action === 'pause' ? 'paused' : 'active';
+    const currentState = String(currentGoal.state || currentGoal.status || '').toLowerCase();
+    if (currentState !== expectedBefore) {
+      throw Object.assign(new Error(`The goal is no longer ${expectedBefore}`), {
+        code: 'native_goal_changed', native_attempted: false, retryable: true,
+      });
+    }
+    const objective = String(currentGoal.objective || currentGoal.text || '').trim();
+    const tokenBudget = currentGoal.token_budget ?? currentGoal.tokenBudget ?? null;
+    let result;
+    let nativeVersion = null;
+    if (session.agentType === 'codex_cli') {
+      const threadId = String(session.cliSessionId || '').trim();
+      if (!threadId) {
+        throw Object.assign(new Error('The owned Codex thread identity is unavailable'), {
+          code: 'goal_thread_missing', native_attempted: false, retryable: true,
+        });
+      }
+      const factory = this._codexCliGoalControlConnectionFactory
+        || this._codexCliGoalDecisionConnectionFactory
+        || (options => new CodexAppServerConnection(options));
+      const connection = factory({
+        sessionId,
+        cwd: session.workspace_path || process.cwd(),
+        clientName: 'remote-agent-chat-goal-control',
+        clientVersion: '1.0.0',
+        requestTimeoutMs: Math.max(1000, Number(process.env.CODEX_CLI_APP_SERVER_TIMEOUT_MS) || 120000),
+      });
+      try {
+        const started = await connection.start();
+        nativeVersion = started?.version || null;
+        result = await connection.controlGoal(threadId, action, { objective, tokenBudget });
+      } finally {
+        await connection.stop();
+      }
+    } else {
+      result = await selectors.controlCodexGoal(session.client.Runtime, session.agentType, action, { objective, tokenBudget });
+    }
+    if (!result?.ok || result.native_acknowledged !== true
+        || result.native_operations !== 1
+        || result.transcript_messages_appended !== 0) {
+      throw Object.assign(new Error(result?.detail || 'The native goal action was not acknowledged'), {
+        code: result?.code || 'goal_action_not_acknowledged',
+        native_attempted: result?.native_attempted !== false,
+        retryable: result?.retryable !== false,
+      });
+    }
+    if (this.sessions.get(sessionId) !== session) {
+      throw Object.assign(new Error('The session changed after native goal control'), {
+        code: 'goal_session_changed', native_attempted: true, retryable: true,
+      });
+    }
+    let canonicalGoal;
+    if (session.agentType === 'codex_cli') {
+      canonicalGoal = this._canonicalCodexCliControllerGoal(
+        sessionId,
+        session,
+        result.after,
+        new Date().toISOString(),
+      );
+    } else {
+      canonicalGoal = this._canonicalGoalForSession(
+        sessionId,
+        session,
+        { ...result.after, raw_state: expectedAfter },
+        session.agentType === 'codex-desktop' ? 'codex_desktop_dom' : 'codex_extension_dom',
+      );
+    }
+    if (!canonicalGoal || String(canonicalGoal.state || canonicalGoal.status || '').toLowerCase() !== expectedAfter
+        || String(canonicalGoal.objective || canonicalGoal.text || '').trim() !== objective
+        || (canonicalGoal.token_budget ?? canonicalGoal.tokenBudget ?? null) !== tokenBudget) {
+      throw Object.assign(new Error('Authoritative goal readback did not preserve identity'), {
+        code: 'goal_identity_changed', native_attempted: true, retryable: false,
+      });
+    }
+    const observedAt = new Date().toISOString();
+    const nextActivity = this._applyGoalRunLifecycle(sessionId, session, {
+      ...(session.activity || {}),
+      kind: expectedAfter === 'paused' ? 'idle' : (session.activity?.kind || 'idle'),
+      label: expectedAfter === 'paused' ? '' : (session.activity?.label || ''),
+      goal: canonicalGoal,
+      updated_at: observedAt,
+    }, {
+      source: session.agentType === 'codex_cli' ? 'codex_cli_goal_controller'
+        : (session.agentType === 'codex-desktop' ? 'codex_desktop_dom' : 'codex_extension_dom'),
+      nativeEventAt: observedAt,
+      observedAt,
+      evidenceType: 'native_goal_control_receipt',
+      liveLeaseProof: expectedAfter === 'active',
+      ownerState: expectedAfter === 'active' ? 'confirmed' : 'ambiguous',
+      explicitStop: expectedAfter === 'paused',
+    });
+    session._activityEpoch = Number(session._activityEpoch || 0) + 1;
+    session.activity = nextActivity;
+    if (session.agentType !== 'codex_cli') {
+      selectors.setCodexCachedThinking(sessionId, {
+        thinking: expectedAfter === 'active' && session.thinking === true,
+        label: session.thinkingLabel || '',
+        goal: canonicalGoal,
+      });
+    }
+    sessionStore.updateSession(sessionId, { activity: nextActivity });
+    this._sendToRelay(proto.proxyStatus(sessionId, session.status || 'healthy', nextActivity));
+    return {
+      native_acknowledged: true,
+      action,
+      before_status: expectedBefore,
+      after_status: expectedAfter,
+      goal_generation: currentGeneration,
+      goal_fingerprint: canonicalGoal.fingerprint,
+      objective_hash: canonicalGoal.objective_hash || null,
+      native_operations: 1,
+      transcript_messages_appended: 0,
+      transport: session.agentType === 'codex_cli' ? 'codex_app_server' : result.method,
+      ...(nativeVersion ? { codex_cli_version: nativeVersion } : {}),
+      goal: canonicalGoal,
+    };
   }
 
   async _answerCodexCliGoalDecision(sessionId, session, prompt, identity, rawResponse) {

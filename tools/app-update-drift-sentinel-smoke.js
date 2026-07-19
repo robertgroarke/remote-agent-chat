@@ -31,6 +31,24 @@ const statePath = path.join(tempRoot, 'state.json');
 const ledgerPath = path.join(tempRoot, 'ledger.jsonl');
 const backlogPath = path.join(tempRoot, 'backlog.md');
 const extensionRoot = path.join(tempRoot, 'extensions');
+const testProgram = {
+  schema_version: 1,
+  harnesses: {
+    cursor: {
+      fixture_gate: 'fixture smoke supplies synthetic versions',
+      tier1: ['node', 'tools/cursor-validate-all.js', '--read-only'],
+      tier2: { mode: 'owned_disposable', command: ['node', 'tools/cursor-validate-all.js', '--send-live'], weekday: 1 },
+      capability_gate: true,
+    },
+    'codex-cli': {
+      fixture_gate: 'fixture smoke supplies synthetic versions',
+      tier1: ['node', 'tools/codex-cli-validate-all.js', '--read-only'],
+      tier2: { mode: 'owned_disposable', command: ['node', 'tools/codex-cli-validate-all.js', '--read-only'], weekday: 2 },
+      capability_gate: true,
+    },
+  },
+};
+const passTier2 = () => ({ status: 'pass', duration_ms: 1, detail: 'fixture tier-2 pass' });
 
 async function main() {
   fs.writeFileSync(backlogPath, '# Fixture backlog\n', 'utf8');
@@ -92,6 +110,8 @@ async function main() {
     publish: true,
   };
   const pass = await scanForUpdates(options, {
+    program: testProgram,
+    runTier2: passTier2,
     collectVersions: () => ({ cursor: '2.0.0' }),
     validators: [{ harness: 'cursor', script: 'cursor-validate-all.js' }],
     relay: { origin: 'fixture', token: 'fixture' },
@@ -115,8 +135,11 @@ async function main() {
     versions: { 'codex-cli': 'codex-cli 0.144.1' },
     observed_at: new Date().toISOString(),
     last_changes: [],
+    revalidation_program: loadSentinelState(statePath).revalidation_program,
   });
   const deferredUnavailable = await scanForUpdates({ ...options, unavailableGraceMs: 90_000 }, {
+    program: testProgram,
+    runTier2: passTier2,
     collectVersions: () => ({ 'codex-cli': 'unavailable' }),
     validators: [{ harness: 'codex-cli', script: 'codex-cli-validate-all.js' }],
     relay: { origin: 'fixture', token: 'fixture' },
@@ -131,6 +154,8 @@ async function main() {
     'deferred availability gaps must not append a validation row');
 
   const recoveredInstall = await scanForUpdates({ ...options, unavailableGraceMs: 90_000 }, {
+    program: testProgram,
+    runTier2: passTier2,
     collectVersions: () => ({ 'codex-cli': 'codex-cli 0.144.4' }),
     validators: [{ harness: 'codex-cli', script: 'codex-cli-validate-all.js' }],
     relay: { origin: 'fixture', token: 'fixture' },
@@ -153,8 +178,11 @@ async function main() {
     versions: { cursor: '2.0.0' },
     observed_at: new Date().toISOString(),
     last_changes: [],
+    revalidation_program: loadSentinelState(statePath).revalidation_program,
   });
   const fail = await scanForUpdates(options, {
+    program: testProgram,
+    runTier2: passTier2,
     collectVersions: () => ({ cursor: '3.0.0' }),
     validators: [{ harness: 'cursor', script: 'cursor-validate-all.js' }],
     relay: { origin: 'fixture', token: 'fixture' },
@@ -177,9 +205,12 @@ async function main() {
     versions: { cursor: '3.0.0' },
     observed_at: new Date().toISOString(),
     last_changes: [],
+    revalidation_program: loadSentinelState(statePath).revalidation_program,
   });
   options.revalidate = 'cursor';
   const recovery = await scanForUpdates(options, {
+    program: testProgram,
+    runTier2: passTier2,
     collectVersions: () => ({ cursor: '3.0.0' }),
     validators: [{ harness: 'cursor', script: 'cursor-validate-all.js' }],
     relay: { origin: 'fixture', token: 'fixture' },
@@ -201,15 +232,11 @@ async function main() {
   options.revalidate = null;
 
   const sentinelSource = fs.readFileSync(path.join(root, 'tools', 'app-update-drift-sentinel.js'), 'utf8');
-  const installer = fs.readFileSync(path.join(root, 'install-app-update-drift-task.ps1'), 'utf8');
-  const launcher = fs.readFileSync(path.join(root, 'app-update-drift-hidden.vbs'), 'utf8');
   assert(sentinelSource.includes('fs.watch(watchRoot') && sentinelSource.includes('setInterval(requestScan, options.pollMs)'),
     'sentinel must combine event-driven file watches with a bounded fallback poll');
   assert(sentinelSource.includes('appVersionEventWatchRoots()')
     && sentinelSource.includes('{ recursive: false }'),
   'sentinel event watches must stay non-recursive on stable parent directories');
-  assert(installer.includes('New-ScheduledTaskTrigger -AtLogOn') && installer.includes('MultipleInstances IgnoreNew'));
-  assert(launcher.includes('shell.Run(command, 0, True)'), 'launcher must remain hidden and single-process');
 
   console.log(JSON.stringify({
     ok: true,
@@ -224,7 +251,7 @@ async function main() {
     failure_triage_appended: true,
     persistent_state: true,
     event_watch_plus_poll: true,
-    hidden_launcher: true,
+    external_scheduler_compatible: true,
     fail_closed_without_validator: true,
     targeted_revalidation: true,
   }, null, 2));

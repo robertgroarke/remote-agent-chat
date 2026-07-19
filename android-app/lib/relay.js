@@ -34,6 +34,7 @@ export class RelayClient {
     this._hostResourceSubscriptionId = '';
     this._hostResourceSubscribeRequestId = '';
     this._hostResourceSequence = 0;
+    this._controlConnectionId = '';
     this.stopped        = false;
   }
 
@@ -76,6 +77,7 @@ export class RelayClient {
       try {
         const msg = JSON.parse(e.data);
         if (msg.type === 'connection_ack') {
+          this._controlConnectionId = String(msg.connection_id || '');
           this._heartbeatIntervalMs = Math.max(1_000, Number(msg.heartbeat_interval_ms) || DEFAULT_HEARTBEAT_MS);
           this._heartbeatTimeoutMs = Math.max(
             this._heartbeatIntervalMs * 2,
@@ -216,8 +218,33 @@ export class RelayClient {
     return requestId;
   }
 
-  interrupt(sessionId) {
-    this._send({ type: 'agent_interrupt', session_id: sessionId });
+  interrupt(sessionId, options = {}) {
+    const requestId = `interrupt-${Date.now()}-${Math.random().toString(36).slice(2, 7)}`;
+    this._send({
+      type: 'agent_interrupt',
+      session_id: sessionId,
+      request_id: requestId,
+      connection_id: this._controlConnectionId,
+      session_generation: Math.max(0, Number(options.sessionGeneration) || 0),
+      turn_generation: Math.max(0, Number(options.turnGeneration) || 0),
+    });
+    return requestId;
+  }
+
+  controlGoal(sessionId, action, goal, options = {}) {
+    const requestId = `goal-${action}-${Date.now()}-${Math.random().toString(36).slice(2, 7)}`;
+    this._send({
+      type: 'agent_goal_control',
+      session_id: sessionId,
+      request_id: requestId,
+      action,
+      connection_id: this._controlConnectionId,
+      session_generation: Math.max(0, Number(options.sessionGeneration) || 0),
+      goal_generation: Math.max(0, Number(goal?.generation) || 0),
+      goal_transition_seq: Math.max(0, Number(goal?.transition_seq) || 0),
+      goal_fingerprint: String(goal?.fingerprint || ''),
+    });
+    return requestId;
   }
 
   respondToPermission(sessionId, promptId, choiceId, details = {}, prompt = null) {
@@ -483,15 +510,24 @@ export class RelayClient {
 
   // ── Lifecycle ──────────────────────────────────────────────────────────────
 
-  requestProviderUsageRefresh(force = false) {
+  requestProviderUsageRefresh(force = false, providerId = null) {
     const requestId = `provider-usage-${Date.now()}-${Math.random().toString(36).slice(2, 7)}`;
     this._send({
       type: 'provider_usage_refresh',
       protocol_version: 1,
       force: force === true,
+      ...(providerId ? { provider_id: providerId } : {}),
       request_id: requestId,
     });
     return requestId;
+  }
+
+  setProviderUsageWatching(active) {
+    this._send({
+      type: 'provider_usage_watch',
+      protocol_version: 1,
+      active: active === true,
+    });
   }
 
   consumeProviderUsageResetCredit() {

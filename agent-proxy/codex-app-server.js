@@ -229,6 +229,44 @@ class CodexAppServerConnection extends EventEmitter {
     return this.request('thread/goal/clear', { threadId });
   }
 
+  async controlGoal(threadId, action, expected = {}) {
+    if (!['pause', 'resume'].includes(action)) {
+      fail('invalid_goal_action', 'Goal action must be pause or resume');
+    }
+    const before = (await this.getGoal(threadId))?.goal;
+    if (!before) fail('goal_not_found', 'The Codex thread has no goal');
+    const beforeStatus = action === 'pause' ? 'active' : 'paused';
+    const afterStatus = action === 'pause' ? 'paused' : 'active';
+    if (before.status !== beforeStatus) {
+      fail('native_goal_changed', `The Codex goal is no longer ${beforeStatus}`);
+    }
+    if (expected.objective != null && String(before.objective || '') !== String(expected.objective)) {
+      fail('native_goal_changed', 'The Codex goal objective changed');
+    }
+    const beforeTokenBudget = before.tokenBudget ?? before.token_budget ?? null;
+    const setResult = await this.setGoal(threadId, afterStatus, {
+      objective: before.objective,
+      ...(beforeTokenBudget != null ? { tokenBudget: beforeTokenBudget } : {}),
+    });
+    const after = (await this.getGoal(threadId))?.goal || setResult?.goal;
+    if (!after || after.status !== afterStatus) {
+      fail('goal_action_not_acknowledged', `Codex did not report goal status ${afterStatus}`);
+    }
+    const afterTokenBudget = after.tokenBudget ?? after.token_budget ?? null;
+    if (after.objective !== before.objective || afterTokenBudget !== beforeTokenBudget) {
+      fail('goal_identity_changed', 'Goal control changed the objective or token budget');
+    }
+    return {
+      ok: true,
+      native_acknowledged: true,
+      action,
+      before,
+      after,
+      native_operations: 1,
+      transcript_messages_appended: 0,
+    };
+  }
+
   async readRateLimits() {
     return this.request('account/rateLimits/read', {});
   }

@@ -752,13 +752,14 @@ discarded before persistence and never cross the relay boundary.
   "type": "provider_usage_snapshot",
   "protocol_version": 1,
   "snapshot": {
-    "schema_version": 3,
+    "schema_version": 5,
     "generation": 42,
     "generated_at": "2026-07-14T12:00:00.000Z",
     "poll_interval_ms": 300000,
+    "cadence_mode": "watching",
     "in_flight": false,
     "snapshots": [{
-      "schema_version": 3,
+      "schema_version": 5,
       "provider_id": "openai-codex",
       "provider_name": "OpenAI Codex",
       "quota_domain": "codex-plan",
@@ -770,6 +771,16 @@ discarded before persistence and never cross the relay boundary.
       "status": "fresh",
       "captured_at": "2026-07-14T12:00:00.000Z",
       "stale_after": "2026-07-14T12:10:00.000Z",
+      "next_refresh_at": "2026-07-14T12:01:00.000Z",
+      "cadence_class": "cheap_local",
+      "refresh_interval_ms": 60000,
+      "fast_refresh_interval_ms": 60000,
+      "idle_refresh_interval_ms": 300000,
+      "watch_boost_active": true,
+      "last_attempt_at": "2026-07-14T12:00:00.000Z",
+      "last_success_at": "2026-07-14T12:00:00.000Z",
+      "consecutive_misses": 0,
+      "stale_reason": null,
       "windows": [{
         "id": "codex-primary",
         "label": "5-hour",
@@ -794,9 +805,21 @@ discarded before persistence and never cross the relay boundary.
 
 Allowed account statuses are `fresh`, `stale`, `refreshing`, `auth_required`,
 `rate_limited`, and `unavailable`. Fetch throttling (`rate_limited`) is not plan exhaustion;
-only a native window at 100% is exhausted. A failed refresh keeps last-good windows visible
-as `stale` and attaches the current sanitized error separately. Missing or malformed values
-remain unavailable and must not be synthesized as zero usage.
+only a native window at 100% is exhausted. One failed refresh retains bounded last-good data;
+two consecutive failures change that account to `stale`, preserve its explicit capture age,
+and attach the current sanitized error separately. Missing or malformed values remain
+unavailable and must not be synthesized as zero usage.
+
+While at least one Web or Android Usage view is open, clients maintain a disconnect-safe watch:
+
+```json
+{ "type": "provider_usage_watch", "protocol_version": 1, "active": true }
+```
+
+The proxy polls cheap local sources on jittered 60-90 second intervals while watched and returns
+them to five-minute idle intervals after the last watcher closes. Guarded sources remain slower;
+the local cost scan is never amplified by watch state. Every account reports its truthful active
+interval and `next_refresh_at`.
 
 Web and Android clients may request an asynchronous refresh without blocking initial paint:
 
@@ -805,14 +828,16 @@ Web and Android clients may request an asynchronous refresh without blocking ini
   "type": "provider_usage_refresh",
   "protocol_version": 1,
   "request_id": "provider-usage-42",
-  "force": true
+  "force": true,
+  "provider_id": "cursor"
 }
 ```
 
-The relay forwards this frame only to authenticated live proxies. The proxy enforces one
-single-flight request per provider and a five-minute cache/routine cadence, so dashboard-open
-and reconnect refreshes inside that interval reuse the latest result. An explicit manual
-refresh bypasses the cache but not an active single-flight or provider backoff/`Retry-After`.
+The relay forwards this frame only to authenticated live proxies. Omitting `provider_id` requests
+the legacy all-provider refresh; each Usage card supplies its provider ID. The proxy enforces
+single-flight collection plus a 30-second per-provider manual-action limit. An explicit manual
+refresh bypasses the routine deadline but not an active single-flight or provider
+backoff/`Retry-After`.
 Relevant native limit/clear events explicitly refresh the authoritative window after the
 event while retaining the same single-flight/backoff boundary.
 
@@ -828,6 +853,7 @@ jobs, so valid quota may publish while a slower cost scan remains `scanning`.
   "type": "provider_usage_refresh_receipt",
   "protocol_version": 1,
   "request_id": "provider-usage-42",
+  "provider_id": "cursor",
   "status": "completed",
   "coalesced": false,
   "generation": 43,
@@ -2460,7 +2486,10 @@ Sent by browser to relay to stop a running agent generation.
   "type": "agent_interrupt",
   "protocol_version": 1,
   "request_id": "intr_abc",
-  "session_id": "sess_123"
+  "session_id": "sess_123",
+  "connection_id": "relay-issued-connection-uuid",
+  "session_generation": 4,
+  "turn_generation": 19
 }
 ```
 
@@ -2468,14 +2497,55 @@ Required fields:
 
 - `session_id`
 - `request_id`: used to correlate the `agent_control_result` response
+- `connection_id`: the exact relay-issued browser connection generation
+- `session_generation`: the native session-owner generation from `session_list`
+- `turn_generation`: the authoritative in-flight turn generation from `session_list`
 
 Rules:
 
-- Relay routes to proxy.
-- Proxy clicks the Stop/Interrupt button in the agent's DOM.
-- On success, proxy emits `agent_control_result` with `result: "ok"` and a `proxy_status` update.
-- If the agent is not currently generating (no Stop button present), proxy emits `agent_control_result` with `error_code: "agent_not_active"`.
-- The browser should disable the interrupt button and show a pending state until `agent_control_result` arrives or `isThinking` clears.
+- Relay rejects stale connection, session-owner, and turn generations before forwarding.
+- Relay atomically coalesces the same semantic stop across tabs/devices to one proxy request and
+  correlates the terminal receipt back to every claimant. A resolved double-click replays the
+  receipt without another native operation.
+- DOM-backed adapters activate only the selected session's Stop/Interrupt control and require two
+  consecutive authoritative idle observations. CLI adapters stop only an RAC-owned app-server
+  turn or child process tree; they never inject keys into a TUI.
+- Success requires `native_acknowledged: true` and exactly one native operation. A nominal success
+  without the native acknowledgment becomes `native_receipt_missing`; a 15-second native timeout
+  becomes retryable `native_control_timeout`.
+- Interrupt retains any active goal, emits an idle status for the stopped turn, and never emits a
+  completion event. A missing owned turn/control fails truthfully without fabricating idle.
+- Web and Android disable the initiating control until its correlated terminal receipt arrives.
+
+### `agent_goal_control`
+
+Sent by Web or Android to pause or resume an existing Codex-family goal. It cannot create a goal.
+
+```json
+{
+  "type": "agent_goal_control",
+  "protocol_version": 1,
+  "request_id": "goal_abc",
+  "session_id": "sess_123",
+  "action": "pause",
+  "connection_id": "relay-issued-connection-uuid",
+  "session_generation": 4,
+  "goal_generation": 7,
+  "goal_transition_seq": 3,
+  "goal_fingerprint": "goal-fingerprint"
+}
+```
+
+Rules:
+
+- `action` is `pause` only from authoritative `active`, or `resume` only from `paused`.
+- The relay validates all identity fields, then applies the same cross-client atomic claim and
+  replay rules as `agent_interrupt`.
+- Codex CLI uses native app-server goal get/set/readback. Codex VS Code and Desktop use the
+  selected native DOM control and read back the authoritative state.
+- A successful transition performs exactly one native write, preserves the objective and token
+  budget, appends zero transcript messages, and emits no completion event.
+- A goal-less thread advertises no goal action. Stale or mismatched identity fails closed.
 
 ### `agent_config_request`
 
@@ -2604,8 +2674,10 @@ Sent by proxy to relay when agent configuration is read on connect, on request, 
   ],
   "capabilities": {
     "interrupt": true,
+    "interrupt_method": "native_stop",
     "set_model": true,
     "goal_lifecycle": true,
+    "goal_pause_resume": true,
     "permission_mode_change": false,
     "permission_dialogs": true
   },
@@ -2671,8 +2743,11 @@ Optional fields:
 
 | Key | Meaning |
 |---|---|
-| `interrupt` | proxy can find and click the Stop button |
+| `interrupt` | session has a verified, session-scoped stop ladder |
+| `interrupt_method` | native adapter class: `native_stop`, `owned_process_tree`, or `turn_interrupt_or_owned_process_tree` |
+| `interrupt_gate` | truthful gate when no safe session-scoped stop exists; currently `no_verified_session_scoped_stop` |
 | `goal_lifecycle` | harness exposes a trustworthy native goal lifecycle; currently Codex, Codex CLI, and Codex Desktop only |
+| `goal_pause_resume` | existing Codex-family goals support native pause/resume with authoritative identity readback |
 | `set_model` | proxy can open the model selector and change it |
 | `permission_mode_change` | proxy can change the permission mode setting |
 | `permission_dialogs` | proxy polls for and can answer permission dialogs |
@@ -2711,6 +2786,11 @@ Success example:
   "session_id": "sess_123",
   "command": "agent_interrupt",
   "result": "ok",
+  "native_acknowledged": true,
+  "details": {
+    "native_acknowledged": true,
+    "native_operations": 1
+  },
   "server_ts": "2026-03-19T10:25:06.000Z"
 }
 ```
@@ -2742,7 +2822,10 @@ Required fields:
 
 Rules:
 
-- `agent_control_result` is always point-to-point (originating browser only), never broadcast.
+- `agent_control_result` is never broadcast. Ordinary controls are point-to-point; an atomically
+  coalesced goal/interrupt operation produces one separately correlated receipt for each claimant.
+- `agent_interrupt` and `agent_goal_control` may report success only with top-level
+  `native_acknowledged: true`. Missing acknowledgment is converted to a retryable failure.
 - For `agent_set_model`: `agent_control_result` confirms the command was received and attempted; the confirming `agent_config` event is what the browser should use to update the displayed model.
 - For `set_codex_config`, success means exact selected-frame read-back already matched and the
   corresponding authoritative `agent_config` was emitted first. Successful sanitized data is
@@ -2998,16 +3081,14 @@ to the authenticated relay API.
 
 - `GET /api/maintenance/validation` returns the latest persisted result for each harness.
 - `PUT /api/maintenance/validation` accepts a single `validation` object containing
-  `harness`, `status` (`pass`, `fail`, or `timed_out`), `app_version`, `validator`, `run_id`,
+  `harness`, `status` (`pass`, `fail`, `timed_out`, or an explicit `gated` tier-2 row), `app_version`, `validator`, `run_id`,
   `duration_ms`, optional `exit_code`, bounded `detail`, and ISO `completed_at`.
 - The relay broadcasts `nightly_validation_status` with `validations` and the non-passing
   `failures` subset after each update.
 - `connection_ack.nightly_validation_failures` restores persistent warnings after web or
   Android reconnect. A later passing result for a harness removes it from the warning.
 
-Only the eleven auto-discovered validation harness IDs are accepted: `antigravity-v2`,
-`claude-cli`, `claude`, `codex-cli`, `codex-desktop`, `continue`, `cursor-cli`, `cursor`,
-`native-golden-approval`, `production-block-inventory`, and `visual-regression`. The relay
+Only allowlisted nightly, app-update, and harness-revalidation IDs are accepted. The relay
 allowlist is contract-checked against nightly discovery so a newly added validator cannot
 silently fail publication. Both endpoints require the same cookie or bearer authentication
 as the other maintenance APIs.
@@ -3042,6 +3123,27 @@ After accepting that kind, the relay persists the latest app-update result and b
 notification preference and a failure through `agent_error`. Web and Android show results
 completed within the last 24 hours. Validator failures also append a checkbox under the
 backlog's `App-update drift sentinel triage` heading.
+
+### Harness revalidation program
+
+`config/harness-revalidation-program.json` binds each supported harness to an installed-version
+fixture, tier-1 validator or explicit gate, guarded tier-2 definition or explicit gate, and proxy
+capability fail-close policy. On version drift, the sentinel persists `pending revalidation for
+<version>` before it starts the validator. The proxy disables write capabilities and rejects write
+commands for that harness while preserving read-only inventory/transcript access. Only a tier-1 plus
+required tier-2 pass for the exact installed version restores writes.
+
+Validation metadata may include `failure_stage`, `fixture_diff`, `tier2_status`,
+`validation_transition`, and bounded `program_health`. The relay persists that metadata and exposes
+the latest matrix through `GET /api/maintenance/validation`,
+`connection_ack.revalidation_program_health`, and `harness_revalidation_status`. Web and Android
+render the matrix, last validated version, last tier-2 result, and next scheduled tier-2 time.
+
+The hidden weekly runner executes on a daily recovery trigger and selects only staggered rows whose
+`next_tier2_at` has elapsed. A `gated` row truthfully records that no owned disposable mutation target
+exists. A configured tier-2 `fail` changes the program record to failed and therefore fail-closes
+writes; a mere explicit no-target gate does not retroactively invalidate an unchanged trusted
+baseline.
 
 ## Error Codes
 

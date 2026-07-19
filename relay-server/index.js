@@ -70,6 +70,7 @@ const { ProviderUsageAuthority, matchingSessionIds } = require('./provider-usage
 const { ScheduledSendStore } = require('./scheduled-sends');
 const { pruneDirectory } = require('./storage-retention');
 const { GoalNotificationCoordinator } = require('./goal-notifications');
+const { ExactlyOnceControlRegistry } = require('./exactly-once-control');
 const {
   NavigationEpochRegistry,
   evaluateNavigationMessage,
@@ -339,10 +340,15 @@ db.exec(`
     duration_ms   INTEGER NOT NULL DEFAULT 0,
     exit_code     INTEGER,
     detail        TEXT NOT NULL DEFAULT '',
+    metadata_json TEXT NOT NULL DEFAULT '{}',
     completed_at  TEXT NOT NULL,
     updated_at    TEXT NOT NULL DEFAULT (datetime('now'))
   );
 `);
+
+if (!db.prepare('PRAGMA table_info(nightly_validation_status)').all().some(info => info.name === 'metadata_json')) {
+  db.exec("ALTER TABLE nightly_validation_status ADD COLUMN metadata_json TEXT NOT NULL DEFAULT '{}'");
+}
 
 // Existing installs predate the complete notification category set.
 for (const column of ['permission_required', 'agent_error', 'session_offline']) {
@@ -394,7 +400,7 @@ function getOrCreateVapidKeys() {
 
 const vapidKeys = getOrCreateVapidKeys();
 webpush.setVapidDetails(
-  'mailto:notifications@your-server',
+  process.env.VAPID_SUBJECT || 'mailto:admin@example.com',
   vapidKeys.publicKey,
   vapidKeys.privateKey,
 );
@@ -408,8 +414,29 @@ const APP_UPDATE_VALIDATION_HARNESSES = new Set([
   ...NIGHTLY_VALIDATION_HARNESSES,
   'gemini', 'roo_code',
 ]);
+const HARNESS_REVALIDATION_HARNESSES = new Set([
+  ...APP_UPDATE_VALIDATION_HARNESSES,
+  'cline',
+  'revalidation-program',
+]);
 
 const LATEST_APP_UPDATE_VALIDATION_KEY = 'latest_app_update_validation';
+const HARNESS_REVALIDATION_HEALTH_KEY = 'harness_revalidation_health';
+
+function harnessRevalidationHealth() {
+  const row = db.prepare('SELECT value FROM relay_settings WHERE key = ?').get(HARNESS_REVALIDATION_HEALTH_KEY);
+  if (!row?.value) return null;
+  try { return JSON.parse(row.value); } catch { return null; }
+}
+
+function saveHarnessRevalidationHealth(value) {
+  if (!value || typeof value !== 'object') return null;
+  const serialized = JSON.stringify(value);
+  if (serialized.length > 128 * 1024) throw new Error('Harness revalidation health exceeds 128 KiB');
+  db.prepare('INSERT OR REPLACE INTO relay_settings (key, value) VALUES (?, ?)')
+    .run(HARNESS_REVALIDATION_HEALTH_KEY, serialized);
+  return value;
+}
 
 function latestAppUpdateValidation() {
   const row = db.prepare('SELECT value FROM relay_settings WHERE key = ?').get(LATEST_APP_UPDATE_VALIDATION_KEY);
@@ -434,10 +461,18 @@ function saveLatestAppUpdateValidation(validation, requested) {
 function nightlyValidationStatuses() {
   return db.prepare(`
     SELECT harness, status, app_version, validator, run_id, duration_ms,
-           exit_code, detail, completed_at
+           exit_code, detail, completed_at, metadata_json
     FROM nightly_validation_status
     ORDER BY harness
-  `).all();
+  `).all().map(row => {
+    const { metadata_json: metadataJson, ...base } = row;
+    try {
+      const metadata = JSON.parse(metadataJson || '{}');
+      return metadata && typeof metadata === 'object' ? { ...base, ...metadata } : base;
+    } catch {
+      return base;
+    }
+  });
 }
 
 function saveNightlyValidationStatus(requested) {
@@ -446,10 +481,28 @@ function saveNightlyValidationStatus(requested) {
   const completedAt = String(requested?.completed_at || '').trim();
   const allowedHarnesses = requested?.kind === 'app_update_validation'
     ? APP_UPDATE_VALIDATION_HARNESSES
+    : ['harness_revalidation_tier2', 'harness_revalidation_program'].includes(requested?.kind)
+      ? HARNESS_REVALIDATION_HARNESSES
     : NIGHTLY_VALIDATION_HARNESSES;
   if (!allowedHarnesses.has(harness)) throw new Error('Unknown validation harness');
-  if (!['pass', 'fail', 'timed_out'].includes(status)) throw new Error('Invalid validation status');
+  if (!['pass', 'fail', 'timed_out', 'gated'].includes(status)) throw new Error('Invalid validation status');
   if (!completedAt || Number.isNaN(Date.parse(completedAt))) throw new Error('Invalid validation completion time');
+  const metadata = {
+    kind: String(requested?.kind || 'nightly_validation').slice(0, 80),
+    tier2_status: requested?.tier2_status ? String(requested.tier2_status).slice(0, 80) : null,
+    failure_stage: requested?.failure_stage ? String(requested.failure_stage).slice(0, 120) : null,
+    fixture_diff: requested?.fixture_diff ? String(requested.fixture_diff).slice(0, 2000) : null,
+    validation_transition: requested?.validation_transition ? String(requested.validation_transition).slice(0, 500) : null,
+    next_tier1_at: requested?.next_tier1_at || null,
+    next_tier2_at: requested?.next_tier2_at || null,
+    last_validated_version: requested?.last_validated_version || null,
+    last_tier2_pass: requested?.last_tier2_pass || null,
+    program_health: requested?.program_health && typeof requested.program_health === 'object'
+      ? requested.program_health
+      : null,
+  };
+  let metadataJson = JSON.stringify(metadata);
+  if (metadataJson.length > 128 * 1024) throw new Error('Validation metadata exceeds 128 KiB');
   const value = {
     harness,
     status,
@@ -460,11 +513,12 @@ function saveNightlyValidationStatus(requested) {
     exit_code: Number.isInteger(requested?.exit_code) ? requested.exit_code : null,
     detail: String(requested?.detail || '').slice(-4000),
     completed_at: new Date(completedAt).toISOString(),
+    ...metadata,
   };
   db.prepare(`
     INSERT INTO nightly_validation_status
-      (harness, status, app_version, validator, run_id, duration_ms, exit_code, detail, completed_at, updated_at)
-    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, datetime('now'))
+      (harness, status, app_version, validator, run_id, duration_ms, exit_code, detail, metadata_json, completed_at, updated_at)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, datetime('now'))
     ON CONFLICT(harness) DO UPDATE SET
       status = excluded.status,
       app_version = excluded.app_version,
@@ -473,11 +527,12 @@ function saveNightlyValidationStatus(requested) {
       duration_ms = excluded.duration_ms,
       exit_code = excluded.exit_code,
       detail = excluded.detail,
+      metadata_json = excluded.metadata_json,
       completed_at = excluded.completed_at,
       updated_at = excluded.updated_at
   `).run(
     value.harness, value.status, value.app_version, value.validator, value.run_id,
-    value.duration_ms, value.exit_code, value.detail, value.completed_at,
+    value.duration_ms, value.exit_code, value.detail, metadataJson, value.completed_at,
   );
   return value;
 }
@@ -1155,6 +1210,10 @@ function relayVisibleMessageId(rowId) {
   return `relay:${String(numeric).padStart(20, '0')}`;
 }
 
+function durableVisibleMessageId(rowId, sourceMessageId = null) {
+  return normalizeSourceMessageId(sourceMessageId) || relayVisibleMessageId(rowId);
+}
+
 function serializeSourceCursor(cursor) {
   if (!cursor || typeof cursor !== 'object' || Array.isArray(cursor)) return null;
   try {
@@ -1253,7 +1312,7 @@ function insertMessage(session, role, content, clientMsgId, status, sequence, ts
   } else {
     info = stmtInsert.run(session, role, content, clientMsgId, status, sequence, blocksJson, sourceMessageId, cursorJson, source);
   }
-  recordLatestVisibleMessageInsert(info, session, role, ts, source);
+  recordLatestVisibleMessageInsert(info, session, role, ts, source, sourceMessageId);
   return info;
 }
 function insertMessageIdempotent(session, role, content, clientMsgId, status, sequence, ts, contentBlocks, sourceMessageId = null, sourceCursor = null, source = null) {
@@ -1265,7 +1324,7 @@ function insertMessageIdempotent(session, role, content, clientMsgId, status, se
   } else {
     info = stmtInsertIdempotent.run(session, role, content, clientMsgId, status, sequence, blocksJson, sourceMessageId, cursorJson, source);
   }
-  recordLatestVisibleMessageInsert(info, session, role, ts, source);
+  recordLatestVisibleMessageInsert(info, session, role, ts, source, sourceMessageId);
   return info;
 }
 function insertHistoryMessage(session, message) {
@@ -2245,8 +2304,8 @@ app.delete('/api/push/web-subscription', requireAnyAuth, pushMutationRateLimit, 
 app.get('/auth/logout', (req, res) => req.logout(() => res.redirect('/auth/google')));
 
 // Auth gate middleware
-const PRIVATE_IPV4_PREFIX = `${['192', '168'].join('.')}.`;
-const LAN_PREFIXES = [PRIVATE_IPV4_PREFIX, '10.', '172.16.', `::ffff:${PRIVATE_IPV4_PREFIX}`, '::ffff:10.'];
+const RFC1918_CLASS_C_PREFIX = `${[192, 168].join('.')}.`;
+const LAN_PREFIXES = [RFC1918_CLASS_C_PREFIX, '10.', '172.16.', `::ffff:${RFC1918_CLASS_C_PREFIX}`, '::ffff:10.'];
 const LOOPBACK_PREFIXES = ['127.', '::1', '::ffff:127.'];
 function isLAN(req) {
   const ip = req.ip || req.connection?.remoteAddress || '';
@@ -2528,6 +2587,7 @@ app.get('/api/maintenance/validation', requireAnyAuth, (req, res) => {
     res.json({
       validations: nightlyValidationStatuses(),
       latest_app_update_validation: latestAppUpdateValidation(),
+      revalidation_program_health: harnessRevalidationHealth(),
     });
   } catch (e) {
     log('error', 'validation', 'Nightly validation status read failed', { err: e.message });
@@ -2539,14 +2599,23 @@ app.put('/api/maintenance/validation', requireAnyAuth, (req, res) => {
   try {
     const requested = req.body?.validation || req.body || {};
     const validation = saveNightlyValidationStatus(requested);
+    const revalidationHealth = saveHarnessRevalidationHealth(requested.program_health);
     const validations = nightlyValidationStatuses();
     const failures = validations.filter(item => item.status !== 'pass');
     broadcastToBrowsers({
       type: 'nightly_validation_status',
       validations,
       failures,
+      ...(revalidationHealth ? { revalidation_program_health: revalidationHealth } : {}),
       server_ts: new Date().toISOString(),
     });
+    if (revalidationHealth) {
+      broadcastToBrowsers({
+        type: 'harness_revalidation_status',
+        program_health: revalidationHealth,
+        server_ts: new Date().toISOString(),
+      });
+    }
     let appUpdateValidation = null;
     if (requested.kind === 'app_update_validation') {
       appUpdateValidation = saveLatestAppUpdateValidation(validation, requested);
@@ -3149,6 +3218,8 @@ app.use('/', requireBrowserOrBearerAuth, express.static(PUBLIC_DIR, {
 const proxySockets    = new Map();  // sessionId → proxy WebSocket
 const sessionProxyId  = new Map();  // sessionId → proxy_id that owns it (A6-05)
 const proxyConnections = new Set(); // all live proxy WebSocket connections (for launch routing)
+const sessionControlGeneration = new Map(); // sessionId -> native owner generation
+const sessionTurnGeneration = new Map(); // sessionId -> authoritative working edge generation
 const proxySessionClaims = new Map(); // proxy WebSocket -> { proxy_id, sessions }
 const browserClients  = new Set();  // all connected browser WebSockets
 const watchdogFailureIncidents = new Map(); // incidentId -> accepted timestamp
@@ -3202,10 +3273,10 @@ function latestVisibleMessageProjection(sessionId) {
   };
 }
 
-function recordLatestVisibleMessageInsert(info, sessionId, role, suppliedTs, source) {
+function recordLatestVisibleMessageInsert(info, sessionId, role, suppliedTs, source, sourceMessageId = null) {
   if (!info || Number(info.changes) <= 0 || !sessionId) return false;
   const kind = canonicalVisibleMessageKind(role);
-  const messageId = relayVisibleMessageId(info.lastInsertRowid);
+  const messageId = durableVisibleMessageId(info.lastInsertRowid, sourceMessageId);
   if (!kind || !messageId) return false;
   let messageAt = Number(suppliedTs);
   if (!Number.isFinite(messageAt) || messageAt <= 0) {
@@ -3248,7 +3319,7 @@ function recomputeLatestVisibleMessage(sessionId) {
     return null;
   }
   const kind = canonicalVisibleMessageKind(row.role);
-  const messageId = relayVisibleMessageId(row.message_row_id);
+  const messageId = durableVisibleMessageId(row.message_row_id, row.source_message_id);
   const messageAt = Number(row.ts);
   if (!kind || !messageId || !Number.isFinite(messageAt) || messageAt <= 0) {
     clearLatestVisibleMessage(sessionId);
@@ -3987,6 +4058,8 @@ class PendingControlRequestMap extends Map {
   }
 }
 const pendingCtrlReqs = new PendingControlRequestMap();
+const exactControlRegistry = new ExactlyOnceControlRegistry({ ttlMs: 60_000, maxEntries: 4096 });
+const exactControlTimers = new Map();
 const navigationEpochs = new NavigationEpochRegistry({ maxEntries: 4096 });
 const NAVIGATION_CONTROL_TYPES = new Set(['new_chat', 'new_thread', 'switch_chat', 'switch_thread']);
 const codexControlRequestBindings = new Map();
@@ -4006,9 +4079,11 @@ const pendingHostResourceSubscriptionRequests = new Map();
 const pendingHostResourceHistoryRequests = new Map();
 const hostResourceSubscriptions = new Map();
 const pendingProviderUsageCostDetailRequests = new Map();
-let activeProviderUsageRefresh = null;
+const activeProviderUsageRefreshes = new Map();
+const providerUsageRefreshesByRequest = new Map();
 let activeProviderUsageResetCredit = null;
 const PROVIDER_USAGE_REQUEST_TIMEOUT_MS = 15_000;
+const PROVIDER_USAGE_IDS = new Set(['openai-codex', 'anthropic-claude', 'google-antigravity', 'cursor', 'ollama-local']);
 const HOST_RESOURCE_REQUEST_TIMEOUT_MS = 12_000;
 const HOST_RESOURCE_REQUEST_MIN_INTERVAL_MS = 2_000;
 const HOST_RESOURCE_SUBSCRIPTION_RE = /^host-sub-[a-f0-9]{32}$/;
@@ -4165,7 +4240,7 @@ const stmtGetLatestVisibleMessage = db.prepare(`
   WHERE session_id = ? AND message_id IS NOT NULL AND message_at > 0
 `);
 const stmtFindLatestVisibleMessageRow = db.prepare(`
-  SELECT id AS message_row_id, role, ts, source
+  SELECT id AS message_row_id, role, ts, source, source_message_id
   FROM messages
   WHERE session = ?
     AND lower(replace(role, '-', '_')) IN
@@ -4864,6 +4939,8 @@ function getSessionListEntry(id) {
       ? {
         session_id: id,
         status: sessionHealth.get(id) || 'healthy',
+        control_generation: Math.max(1, Number(sessionControlGeneration.get(id)) || 1),
+        turn_generation: Math.max(0, Number(sessionTurnGeneration.get(id)) || 0),
         last_seen_at: sessionLastSeen.has(id) ? new Date(sessionLastSeen.get(id)).toISOString() : null,
         ...latestProjection,
       }
@@ -4881,6 +4958,8 @@ function getSessionListEntry(id) {
     ...safeMeta,
     session_id:   id,
     status:       sessionHealth.get(id) || meta.status || 'healthy',
+    control_generation: Math.max(1, Number(sessionControlGeneration.get(id)) || 1),
+    turn_generation: Math.max(0, Number(sessionTurnGeneration.get(id)) || 0),
     last_seen_at: meta.last_seen_at || (sessionLastSeen.has(id) ? new Date(sessionLastSeen.get(id)).toISOString() : null),
     ...latestVisibleMessageProjection(id),
   };
@@ -5233,6 +5312,148 @@ function questionControlFailure(ws, msg, code, message) {
   }));
 }
 
+function exactControlFailure(ws, msg, command, code, message, extra = {}) {
+  if (ws?.readyState !== WebSocket.OPEN) return;
+  ws.send(JSON.stringify({
+    type: 'agent_control_result',
+    protocol_version: PROTOCOL_VERSION,
+    request_id: msg?.request_id || null,
+    session_id: msg?.session_id || msg?.session || null,
+    command,
+    result: 'failed',
+    error: { code, message },
+    retryable: extra.retryable === true,
+    native_attempted: extra.native_attempted === true,
+    server_ts: new Date().toISOString(),
+  }));
+}
+
+function deliverExactControlResult(upstreamRequestId, receipt) {
+  const timer = exactControlTimers.get(upstreamRequestId);
+  if (timer) clearTimeout(timer);
+  exactControlTimers.delete(upstreamRequestId);
+  const resolution = exactControlRegistry.resolve(upstreamRequestId, receipt);
+  if (!resolution) return false;
+  for (const delivery of resolution.deliveries) {
+    if (delivery.client.readyState === WebSocket.OPEN) {
+      delivery.client.send(JSON.stringify(delivery.receipt));
+    }
+  }
+  return true;
+}
+
+function forwardExactlyOnceControl(ws, msg, command) {
+  const rawSessionId = msg.session_id || msg.session;
+  const rawRequestId = msg.request_id;
+  if (!boundedString(rawSessionId, { min: 1, max: 160 })
+      || !boundedString(rawRequestId, { min: 1, max: 120 })) {
+    exactControlFailure(ws, msg, command, 'invalid_request', 'A bounded session and request ID are required.');
+    return;
+  }
+  const sessionId = rawSessionId;
+  const requestId = rawRequestId;
+  if (!msg.connection_id || msg.connection_id !== ws._controlConnectionId) {
+    exactControlFailure(ws, msg, command, 'stale_client_connection', 'This control came from an expired client connection.', { retryable: true });
+    return;
+  }
+  const expectedSessionGeneration = Math.max(0, Number(msg.session_generation) || 0);
+  const currentSessionGeneration = Math.max(1, Number(sessionControlGeneration.get(sessionId)) || 1);
+  if (!expectedSessionGeneration || expectedSessionGeneration !== currentSessionGeneration) {
+    exactControlFailure(ws, msg, command, 'stale_session_generation', 'The native session owner changed. Refresh before retrying.', { retryable: true });
+    return;
+  }
+  const proxyWs = proxySockets.get(sessionId);
+  if (!proxyWs || proxyWs.readyState !== WebSocket.OPEN) {
+    exactControlFailure(ws, msg, command, 'no_proxy_connected', 'Session not connected', { retryable: true });
+    return;
+  }
+  const meta = sessionMeta.get(sessionId) || {};
+  const capabilities = agentConfigs.get(sessionId)?.capabilities || meta.capabilities || {};
+  let key;
+  let payload;
+  if (command === 'agent_goal_control') {
+    const action = msg.action === 'pause' ? 'pause' : msg.action === 'resume' ? 'resume' : null;
+    const goal = meta.activity?.goal || null;
+    const agentType = meta.agent_type || 'unknown';
+    if (!action || capabilities.goal_pause_resume !== true || !goalLifecycleSupported(agentType, capabilities)) {
+      exactControlFailure(ws, msg, command, 'goal_control_unsupported', 'This session has no verified native goal control.');
+      return;
+    }
+    const generation = Math.max(1, Number(goal.generation) || 1);
+    const transitionSeq = Math.max(0, Number(goal.transition_seq) || 0);
+    const state = String(goal.state || goal.status || '').toLowerCase();
+    const expectedState = action === 'pause' ? 'active' : 'paused';
+    if (state !== expectedState
+        || Number(msg.goal_generation) !== generation
+        || Number(msg.goal_transition_seq || 0) !== transitionSeq
+        || !goal.fingerprint
+        || msg.goal_fingerprint !== goal.fingerprint) {
+      exactControlFailure(ws, msg, command, 'stale_goal_generation', 'The authoritative goal changed before this action.', { retryable: true });
+      return;
+    }
+    key = [sessionId, currentSessionGeneration, command, action, generation, transitionSeq, goal.fingerprint].join(':');
+    payload = {
+      type: command,
+      protocol_version: PROTOCOL_VERSION,
+      session_id: sessionId,
+      action,
+      goal_generation: generation,
+      goal_transition_seq: transitionSeq,
+      goal_fingerprint: goal.fingerprint,
+      session_generation: currentSessionGeneration,
+    };
+  } else {
+    const turnGeneration = Math.max(0, Number(sessionTurnGeneration.get(sessionId)) || 0);
+    const kind = String(meta.activity?.kind || sessionActivity.get(sessionId) || '').toLowerCase();
+    const active = ['thinking', 'generating', 'running_command', 'applying_patch', 'reading_files', 'working'].includes(kind);
+    if (capabilities.interrupt !== true) {
+      exactControlFailure(ws, msg, command, 'interrupt_unsupported', capabilities.interrupt_gate || 'No verified session-scoped stop exists.');
+      return;
+    }
+    if (!active || !turnGeneration || Number(msg.turn_generation) !== turnGeneration) {
+      exactControlFailure(ws, msg, command, 'stale_turn_generation', 'No matching in-flight turn remains.', { retryable: true });
+      return;
+    }
+    key = [sessionId, currentSessionGeneration, command, turnGeneration].join(':');
+    payload = {
+      type: command,
+      protocol_version: PROTOCOL_VERSION,
+      session_id: sessionId,
+      turn_generation: turnGeneration,
+      session_generation: currentSessionGeneration,
+    };
+  }
+  const claim = exactControlRegistry.claim({
+    key,
+    requestId,
+    client: ws,
+    context: { sessionId, command, proxyWs },
+  });
+  if (claim.state === 'replay') {
+    ws.send(JSON.stringify(claim.receipt));
+    return;
+  }
+  if (claim.state === 'coalesced') return;
+  const upstreamRequestId = claim.upstreamRequestId;
+  const timer = setTimeout(() => {
+    deliverExactControlResult(upstreamRequestId, {
+      type: 'agent_control_result',
+      protocol_version: PROTOCOL_VERSION,
+      request_id: upstreamRequestId,
+      session_id: sessionId,
+      command,
+      result: 'failed',
+      error: { code: 'native_control_timeout', message: 'The native adapter did not acknowledge this control in time.' },
+      retryable: true,
+      native_attempted: true,
+      server_ts: new Date().toISOString(),
+    });
+  }, 15_000);
+  timer.unref?.();
+  exactControlTimers.set(upstreamRequestId, timer);
+  proxyWs.send(JSON.stringify({ ...payload, request_id: upstreamRequestId }));
+}
+
 // ── Session health management (A2-02) ────────────────────────────────────────
 
 function setHealth(sessionId, health) {
@@ -5338,7 +5559,7 @@ const KNOWN_CLIENT_TYPES = new Set([
   'get_history', 'history_request', 'history_chunk_request',
   'send', 'send_message',
   'launch_session', 'resume_session', 'close_session', 'dismiss_session',
-  'permission_response', 'question_response', 'error_prompt_action', 'agent_interrupt', 'agent_config_request',
+  'permission_response', 'question_response', 'error_prompt_action', 'agent_interrupt', 'agent_goal_control', 'agent_config_request',
   'agent_set_model', 'agent_set_effort', 'agent_set_permission_mode', 'agent_set_auto_approve_permissions',
   'set_codex_config', 'agent_set_mode',
   'new_thread', 'open_panel', 'open_native_window', 'chat_list', 'switch_chat', 'new_chat',
@@ -5348,7 +5569,7 @@ const KNOWN_CLIENT_TYPES = new Set([
   'skill_list', 'automation_view_action', 'list_directory', 'read_file',
   'steer', 'discard_queued', 'edit_queued',
   'automations_list', 'automations_create', 'automations_update', 'automations_delete', 'automations_run',
-  'provider_usage_refresh',
+  'provider_usage_refresh', 'provider_usage_watch',
   'provider_usage_reset_credit_consume',
   'provider_usage_cost_detail_request',
   'host_resource_refresh', 'host_resource_subscribe', 'host_resource_unsubscribe',
@@ -5580,6 +5801,14 @@ function handleProxyConnection(ws, req) {
         heartbeat_timeout_ms:  HEARTBEAT_TIMEOUT_MS,
         ts:                   Date.now(),
       }));
+      const providerUsageWatcherCount = [...browserClients]
+        .filter(client => client._providerUsageWatching === true).length;
+      if (providerUsageWatcherCount > 0) ws.send(JSON.stringify({
+        type: 'provider_usage_watch',
+        protocol_version: PROTOCOL_VERSION,
+        active: true,
+        watcher_count: providerUsageWatcherCount,
+      }));
 
     // ── Application heartbeat (in addition to native ping/pong) ───────────
     } else if (t === 'heartbeat') {
@@ -5629,10 +5858,13 @@ function handleProxyConnection(ws, req) {
       });
 
     } else if (t === 'provider_usage_refresh_receipt') {
-      const active = activeProviderUsageRefresh;
-      if (!active || msg.request_id !== active.upstreamRequestId || active.proxyWs !== ws) return;
+      const active = providerUsageRefreshesByRequest.get(msg.request_id);
+      if (!active || active.proxyWs !== ws) return;
       clearTimeout(active.timer);
-      activeProviderUsageRefresh = null;
+      providerUsageRefreshesByRequest.delete(active.upstreamRequestId);
+      if (activeProviderUsageRefreshes.get(active.refreshKey) === active) {
+        activeProviderUsageRefreshes.delete(active.refreshKey);
+      }
       const status = msg.status === 'completed' ? 'completed' : 'error';
       for (const client of active.clients) {
         if (client.ws.readyState !== WebSocket.OPEN) continue;
@@ -5640,10 +5872,12 @@ function handleProxyConnection(ws, req) {
           type: 'provider_usage_refresh_receipt',
           protocol_version: PROTOCOL_VERSION,
           request_id: client.clientRequestId,
+          provider_id: active.providerId,
           status,
           coalesced: client.initialStatus === 'coalesced' || msg.coalesced === true,
           generation: Math.max(0, Number(msg.generation) || 0),
           cost_status: typeof msg.cost_status === 'string' ? msg.cost_status.slice(0, 40) : null,
+          retry_after_ms: Math.max(0, Number(msg.retry_after_ms) || 0),
           ...(status === 'error' ? { code: String(msg.code || 'refresh_failed').replace(/[^a-z0-9_.-]/gi, '_').slice(0, 60) } : {}),
         }));
       }
@@ -5929,9 +6163,18 @@ function handleProxyConnection(ws, req) {
           log('warn', 'proxy-ws', `Session ${id} re-registered by proxy_id=${snapshotProxyId} (was proxy_id=${existingProxyId}) — last-writer-wins`);
         }
         // Last-writer-wins: adopt the new registration
+        if (existingWs !== ws) {
+          sessionControlGeneration.set(id, Math.max(0, Number(sessionControlGeneration.get(id)) || 0) + 1);
+          sessionTurnGeneration.set(id, 0);
+        }
         proxySockets.set(id, ws);
         sessionProxyId.set(id, snapshotProxyId);
         proxySessions.add(id);
+        const snapshotActivityKind = String((s && typeof s === 'object' ? s.activity?.kind : '') || '').toLowerCase();
+        if (['thinking', 'generating', 'running_command', 'applying_patch', 'reading_files', 'working'].includes(snapshotActivityKind)
+            && !sessionTurnGeneration.get(id)) {
+          sessionTurnGeneration.set(id, 1);
+        }
         if (s && typeof s === 'object') {
           const previousMeta = sessionMeta.get(id) || {};
           const resetTitle = s.is_new_chat_draft === true;
@@ -6122,6 +6365,11 @@ function handleProxyConnection(ws, req) {
         // notifications are emitted only by the semantic lifecycle coordinator.
         const prevKind = sessionActivity.get(id);
         const currKind = (typeof broadcastActivity === 'object' ? broadcastActivity?.kind : broadcastActivity) || null;
+        const activeKinds = new Set(['thinking', 'generating', 'running_command', 'applying_patch', 'reading_files', 'working']);
+        if (activeKinds.has(String(currKind || '').toLowerCase())
+            && !activeKinds.has(String(prevKind || '').toLowerCase())) {
+          sessionTurnGeneration.set(id, Math.max(0, Number(sessionTurnGeneration.get(id)) || 0) + 1);
+        }
         sessionActivity.set(id, currKind);
         if (currKind === 'idle' && prevKind !== 'idle') dispatchIdleScheduledSends(id);
       }
@@ -6598,6 +6846,27 @@ function handleProxyConnection(ws, req) {
     // ── Agent control result (A2-07) ──────────────────────────────────────
     } else if (t === 'agent_control_result') {
       const requestId = msg.request_id;
+      if (['agent_interrupt', 'agent_goal_control'].includes(msg.command)) {
+        if (msg.result === 'ok' && msg.native_acknowledged !== true) {
+          msg = {
+            ...msg,
+            result: 'failed',
+            error: {
+              code: 'native_receipt_missing',
+              message: 'The native adapter did not provide an exact acknowledgement.',
+            },
+            retryable: true,
+            native_attempted: true,
+          };
+        }
+        if (deliverExactControlResult(requestId, msg)) {
+          log('info', 'ctrl', `Exactly-once control result: ${msg.result}`, {
+            request_id: requestId,
+            command: msg.command,
+          });
+          return;
+        }
+      }
       const targetWs  = requestId ? pendingCtrlReqs.get(requestId) : null;
       const codexWaiters = requestId && msg.command === 'set_codex_config'
         ? codexControlRequestWaiters.get(requestId)
@@ -7067,14 +7336,16 @@ function handleProxyConnection(ws, req) {
         }
       }
     }
-    if (activeProviderUsageRefresh?.proxyWs === ws) {
-      const active = activeProviderUsageRefresh;
-      activeProviderUsageRefresh = null;
+    for (const [refreshKey, active] of activeProviderUsageRefreshes) {
+      if (active.proxyWs !== ws) continue;
+      activeProviderUsageRefreshes.delete(refreshKey);
+      providerUsageRefreshesByRequest.delete(active.upstreamRequestId);
       clearTimeout(active.timer);
       for (const client of active.clients) {
         if (client.ws.readyState === WebSocket.OPEN) client.ws.send(JSON.stringify({
           type: 'provider_usage_refresh_receipt',
           request_id: client.clientRequestId,
+          provider_id: active.providerId,
           status: 'error',
           code: 'proxy_disconnected',
         }));
@@ -7112,6 +7383,8 @@ function handleClientConnection(ws, req) {
   startHeartbeat(ws, 'browser');
   const clientPrincipal = authenticatedWebSocketPrincipal(ws, req);
   ws._authenticatedEmail = authenticatedWebSocketEmail(ws, req);
+  ws._controlConnectionId = crypto.randomUUID();
+  ws._providerUsageWatching = false;
   // Full transcript traffic is opt-in. Until the client subscribes, it receives
   // session summaries only; this prevents a reconnect race from replaying every
   // active transcript before the selected-session subscription arrives.
@@ -7131,6 +7404,7 @@ function handleClientConnection(ws, req) {
   const agentConfigMap = getCompactAgentConfigsForAck();
   const nightlyValidationFailures = nightlyValidationStatuses().filter(item => item.status !== 'pass');
   const latestAppUpdate = latestAppUpdateValidation();
+  const revalidationHealth = harnessRevalidationHealth();
   const recentSemanticNotifications = semanticNotificationsForClient(ws);
   ws.send(JSON.stringify({
     type:                 'connection_ack',
@@ -7140,6 +7414,7 @@ function handleClientConnection(ws, req) {
     session_subscriptions: true,
     max_session_subscriptions: MAX_SESSION_SUBSCRIPTIONS,
     state_epoch:          RELAY_STATE_EPOCH,
+    connection_id:        ws._controlConnectionId,
     sessions:             getSessionList(),
     session_health:       Object.fromEntries(sessionHealth),
     ...(pendingLaunchList.length > 0 ? { pending_launches:  pendingLaunchList  } : {}),
@@ -7150,6 +7425,7 @@ function handleClientConnection(ws, req) {
     ...(duplicateProxyAlarms.length > 0 ? { duplicate_proxy_alarms: duplicateProxyAlarms } : {}),
     ...(nightlyValidationFailures.length > 0 ? { nightly_validation_failures: nightlyValidationFailures } : {}),
     ...(latestAppUpdate ? { latest_app_update_validation: latestAppUpdate } : {}),
+    ...(revalidationHealth ? { revalidation_program_health: revalidationHealth } : {}),
     ...(cachedProviderUsage ? { provider_usage: cachedProviderUsage } : {}),
     ...(cachedWorkspaces.length > 0 ? { workspaces: cachedWorkspaces } : {}),
     ...(recentSemanticNotifications.length > 0
@@ -7196,61 +7472,90 @@ function handleClientConnection(ws, req) {
       }));
 
     // ── Selective session subscription ────────────────────────────────────
-    } else if (t === 'provider_usage_refresh') {
-      const clientRequestId = boundedString(msg.request_id, { min: 1, max: 80 }) ? msg.request_id : null;
+    } else if (t === 'provider_usage_watch') {
+      ws._providerUsageWatching = msg.active === true;
+      const watcherCount = [...browserClients].filter(client => client._providerUsageWatching === true).length;
       const proxyWs = [...proxyConnections].find(candidate => (
         candidate._authenticated && candidate.readyState === WebSocket.OPEN
       ));
-      if (!clientRequestId || !proxyWs) {
+      if (proxyWs) proxyWs.send(JSON.stringify({
+        type: 'provider_usage_watch',
+        protocol_version: PROTOCOL_VERSION,
+        active: watcherCount > 0,
+        watcher_count: watcherCount,
+      }));
+
+    } else if (t === 'provider_usage_refresh') {
+      const clientRequestId = boundedString(msg.request_id, { min: 1, max: 80 }) ? msg.request_id : null;
+      const providerId = msg.provider_id == null ? null
+        : boundedString(msg.provider_id, { min: 1, max: 80 }) && PROVIDER_USAGE_IDS.has(msg.provider_id)
+          ? msg.provider_id : false;
+      const proxyWs = [...proxyConnections].find(candidate => (
+        candidate._authenticated && candidate.readyState === WebSocket.OPEN
+      ));
+      if (!clientRequestId || providerId === false || !proxyWs) {
         ws.send(JSON.stringify({
           type: 'provider_usage_refresh_receipt',
           request_id: clientRequestId,
+          provider_id: providerId || null,
           status: 'error',
-          code: clientRequestId ? 'proxy_unavailable' : 'invalid_request_id',
+          code: !clientRequestId ? 'invalid_request_id'
+            : providerId === false ? 'invalid_provider' : 'proxy_unavailable',
         }));
         return;
       }
-      if (activeProviderUsageRefresh && activeProviderUsageRefresh.proxyWs === proxyWs) {
-        activeProviderUsageRefresh.clients.push({ ws, clientRequestId, initialStatus: 'coalesced' });
+      const refreshKey = `${proxyWs._controlConnectionId || 'proxy'}:${providerId || '*'}`;
+      const existing = activeProviderUsageRefreshes.get(refreshKey);
+      if (existing && existing.proxyWs === proxyWs) {
+        existing.clients.push({ ws, clientRequestId, initialStatus: 'coalesced' });
         ws.send(JSON.stringify({
           type: 'provider_usage_refresh_receipt',
           protocol_version: PROTOCOL_VERSION,
           request_id: clientRequestId,
+          provider_id: providerId,
           status: 'coalesced',
         }));
         return;
       }
       const upstreamRequestId = `provider-usage-${Date.now()}-${crypto.randomBytes(6).toString('hex')}`;
       const timer = setTimeout(() => {
-        const active = activeProviderUsageRefresh;
+        const active = activeProviderUsageRefreshes.get(refreshKey);
         if (!active || active.upstreamRequestId !== upstreamRequestId) return;
-        activeProviderUsageRefresh = null;
+        activeProviderUsageRefreshes.delete(refreshKey);
+        providerUsageRefreshesByRequest.delete(upstreamRequestId);
         for (const client of active.clients) {
           if (client.ws.readyState === WebSocket.OPEN) client.ws.send(JSON.stringify({
             type: 'provider_usage_refresh_receipt',
             request_id: client.clientRequestId,
+            provider_id: providerId,
             status: 'error',
             code: 'collector_timeout',
           }));
         }
       }, PROVIDER_USAGE_REQUEST_TIMEOUT_MS);
       timer.unref?.();
-      activeProviderUsageRefresh = {
+      const active = {
         upstreamRequestId,
+        refreshKey,
+        providerId,
         proxyWs,
         clients: [{ ws, clientRequestId, initialStatus: 'accepted' }],
         timer,
       };
+      activeProviderUsageRefreshes.set(refreshKey, active);
+      providerUsageRefreshesByRequest.set(upstreamRequestId, active);
       ws.send(JSON.stringify({
         type: 'provider_usage_refresh_receipt',
         protocol_version: PROTOCOL_VERSION,
         request_id: clientRequestId,
+        provider_id: providerId,
         status: 'accepted',
       }));
       proxyWs.send(JSON.stringify({
         type: 'provider_usage_refresh',
         protocol_version: PROTOCOL_VERSION,
         force: msg.force === true,
+        provider_id: providerId,
         request_id: upstreamRequestId,
       }));
       log('info', 'provider-usage', 'Refresh request forwarded', { proxies: 1 });
@@ -8411,31 +8716,12 @@ function handleClientConnection(ws, req) {
       log('info', 'prompt', 'Error prompt action forwarded', { session: sessionId, prompt_id: promptId, action: msg.action_id });
 
     // ── Agent interrupt (A2-07) ────────────────────────────────────────────
-    } else if (t === 'agent_interrupt') {
-      const sessionId = msg.session_id || msg.session;
-      const requestId = msg.request_id;
-      const proxyWs   = proxySockets.get(sessionId);
-      if (!proxyWs || proxyWs.readyState !== WebSocket.OPEN) {
-        ws.send(JSON.stringify({
-          type:             'agent_control_result',
-          protocol_version: PROTOCOL_VERSION,
-          request_id:       requestId,
-          session_id:       sessionId,
-          command:          'agent_interrupt',
-          result:           'failed',
-          error:            { code: 'no_proxy_connected', message: 'Session not connected' },
-          server_ts:        new Date().toISOString(),
-        }));
-        return;
-      }
-      if (requestId) pendingCtrlReqs.set(requestId, ws);
-      proxyWs.send(JSON.stringify({
-        type:             'agent_interrupt',
-        protocol_version: PROTOCOL_VERSION,
-        request_id:       requestId,
-        session_id:       sessionId,
-      }));
-      log('info', 'ctrl', 'Agent interrupt forwarded', { session: sessionId, request_id: requestId });
+    } else if (t === 'agent_interrupt' || t === 'agent_goal_control') {
+      forwardExactlyOnceControl(ws, msg, t);
+      log('info', 'ctrl', `${t} accepted for validation`, {
+        session: msg.session_id || msg.session,
+        request_id: msg.request_id,
+      });
 
     // ── Agent config request (A2-07) ───────────────────────────────────────
     } else if (t === 'agent_config_request') {
@@ -8803,6 +9089,7 @@ function handleClientConnection(ws, req) {
   ws.on('close', () => {
     log('info', 'client-ws', 'Browser disconnected');
     browserClients.delete(ws);
+    exactControlRegistry.abandonClient(ws);
     pendingBrowserSessionSummaries.delete(ws);
     const hostSubscriptionId = ws._hostResourceSubscriptionId;
     const hostSubscription = hostResourceSubscriptions.get(hostSubscriptionId);
@@ -8848,8 +9135,20 @@ function handleClientConnection(ws, req) {
       clearTimeout(pending.timer);
       pendingProviderUsageCostDetailRequests.delete(requestId);
     }
-    if (activeProviderUsageRefresh) {
-      activeProviderUsageRefresh.clients = activeProviderUsageRefresh.clients.filter(client => client.ws !== ws);
+    for (const active of activeProviderUsageRefreshes.values()) {
+      active.clients = active.clients.filter(client => client.ws !== ws);
+    }
+    if (ws._providerUsageWatching) {
+      const watcherCount = [...browserClients].filter(client => client._providerUsageWatching === true).length;
+      const proxyWs = [...proxyConnections].find(candidate => (
+        candidate._authenticated && candidate.readyState === WebSocket.OPEN
+      ));
+      if (proxyWs) proxyWs.send(JSON.stringify({
+        type: 'provider_usage_watch',
+        protocol_version: PROTOCOL_VERSION,
+        active: watcherCount > 0,
+        watcher_count: watcherCount,
+      }));
     }
   });
 }

@@ -321,8 +321,15 @@ function agentControlResult(sessionId, requestId, command, result, details) {
     result,
     server_ts: new Date().toISOString(),
   };
-  if (result === 'failed' && details) msg.error = details;
-  if (result === 'ok' && details) msg.details = details;
+  if (result === 'failed' && details) {
+    msg.error = details;
+    if (typeof details.native_attempted === 'boolean') msg.native_attempted = details.native_attempted;
+    if (typeof details.retryable === 'boolean') msg.retryable = details.retryable;
+  }
+  if (result === 'ok' && details) {
+    msg.details = details;
+    if (typeof details.native_acknowledged === 'boolean') msg.native_acknowledged = details.native_acknowledged;
+  }
   return msg;
 }
 

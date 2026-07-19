@@ -1,7 +1,7 @@
 'use strict';
 
-const CACHE_NAME = 'agent-chat-build-a63b489cb4c1d948';
-const ASSET_VERSION = 'build-a63b489cb4c1d948';
+const CACHE_NAME = 'agent-chat-build-63393ae4d1562dac';
+const ASSET_VERSION = 'build-63393ae4d1562dac';
 
 const SHELL_ASSETS = [
   '/',

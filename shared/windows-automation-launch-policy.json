@@ -72,6 +72,11 @@
       "file": "tools/codex-desktop-invisible-restart.ps1",
       "classification": "windowless-at-creation",
       "required_guard": "RacCbtGuard"
+    },
+    {
+      "file": "tools/launch-verification-browser-human-signin.ps1",
+      "classification": "operator-action-only",
+      "required_guard": "rac-window-policy: operator-action-only"
     }
   ]
 }

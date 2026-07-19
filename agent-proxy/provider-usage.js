@@ -16,9 +16,17 @@ const {
   sanitizeProviderUsageSnapshot,
 } = require('../relay-server/provider-usage-boundary');
 
-const SCHEMA_VERSION = 4;
+const SCHEMA_VERSION = 5;
 const DEFAULT_POLL_INTERVAL_MS = 5 * 60 * 1000;
 const DEFAULT_STALE_AFTER_MS = 10 * 60 * 1000;
+const DEFAULT_MANUAL_REFRESH_INTERVAL_MS = 30 * 1000;
+const DEFAULT_PROVIDER_CADENCE = Object.freeze({
+  codex: Object.freeze({ cadence_class: 'cheap_local', fast_ms: 60_000, idle_ms: 300_000, guarded_ms: 300_000 }),
+  claude: Object.freeze({ cadence_class: 'cheap_local_guarded_fallback', fast_ms: 75_000, idle_ms: 300_000, guarded_ms: 300_000 }),
+  antigravity: Object.freeze({ cadence_class: 'guarded_cache', fast_ms: 300_000, idle_ms: 600_000, guarded_ms: 300_000 }),
+  cursor: Object.freeze({ cadence_class: 'cheap_local', fast_ms: 60_000, idle_ms: 300_000, guarded_ms: 300_000 }),
+  ollama: Object.freeze({ cadence_class: 'cheap_local_read_only_cdp', fast_ms: 90_000, idle_ms: 300_000, guarded_ms: 300_000 }),
+});
 const MAX_RESPONSE_BYTES = 2 * 1024 * 1024;
 const OLLAMA_RECEIPT_SCHEMA_VERSION = 1;
 const MAX_OLLAMA_REQUEST_RECEIPTS = 32;
@@ -1325,6 +1333,9 @@ async function collectClaude(fingerprintKey, options = {}) {
     return await oauthCollector(fingerprintKey);
   } catch (oauthError) {
     const history = [sourceAttempt('oauth_api', 'failed', { code: oauthError?.code || 'unavailable' })];
+    if (options.allowCliFallback === false) {
+      throw oauthError;
+    }
     try {
       return await cliCollector(fingerprintKey, history);
     } catch (cliError) {
@@ -1758,6 +1769,25 @@ class ProviderUsageRegistry {
     this.machineLabel = options.machineLabel || os.hostname();
     this.pollIntervalMs = Math.max(60_000, Number(options.pollIntervalMs) || DEFAULT_POLL_INTERVAL_MS);
     this.staleAfterMs = Math.max(this.pollIntervalMs, Number(options.staleAfterMs) || DEFAULT_STALE_AFTER_MS);
+    this.manualRefreshIntervalMs = Math.max(5_000,
+      Number(options.manualRefreshIntervalMs) || DEFAULT_MANUAL_REFRESH_INTERVAL_MS);
+    this.jitterRatio = Math.max(0, Math.min(0.2, Number(options.jitterRatio ?? 0.08) || 0));
+    const legacyCadenceOverride = options.pollIntervalMs != null && options.providerCadence == null;
+    this.providerCadence = new Map(Object.keys(PROVIDERS).map(key => {
+      const defaults = DEFAULT_PROVIDER_CADENCE[key];
+      const supplied = options.providerCadence?.[key] || {};
+      const normalizeInterval = (value, fallback) => Math.max(1_000, Number(value) || fallback);
+      const fastMs = legacyCadenceOverride
+        ? this.pollIntervalMs : normalizeInterval(supplied.fast_ms, defaults.fast_ms);
+      const idleMs = legacyCadenceOverride
+        ? this.pollIntervalMs : Math.max(fastMs, normalizeInterval(supplied.idle_ms, defaults.idle_ms));
+      return [key, Object.freeze({
+        cadence_class: safeText(supplied.cadence_class, 60) || defaults.cadence_class,
+        fast_ms: fastMs,
+        idle_ms: idleMs,
+        guarded_ms: normalizeInterval(supplied.guarded_ms, defaults.guarded_ms),
+      })];
+    }));
     this.fingerprintKey = localFingerprintKey(options.fingerprintKey);
     const suppliedCollectors = options.collectors && typeof options.collectors === 'object'
       ? options.collectors
@@ -1768,7 +1798,9 @@ class ProviderUsageRegistry {
       : options.collectAlwaysProviders === true;
     this.collectors = {
       codex: options.collectors?.codex || (() => collectCodex(this.fingerprintKey)),
-      claude: options.collectors?.claude || (() => collectClaude(this.fingerprintKey)),
+      claude: options.collectors?.claude || (context => collectClaude(this.fingerprintKey, {
+        allowCliFallback: context?.allow_guarded === true,
+      })),
       antigravity: options.collectors?.antigravity || (async context => collectAntigravity(
         this.fingerprintKey,
         await this.getAntigravityQuota(context),
@@ -1787,11 +1819,19 @@ class ProviderUsageRegistry {
     this.currentErrors = new Map();
     this.nextAllowedAt = new Map();
     this.failureCounts = new Map();
+    this.lastAttemptAt = new Map();
+    this.lastSuccessAt = new Map();
+    this.nextRoutineAtByProvider = new Map();
+    this.nextGuardedAt = new Map();
+    this.manualAllowedAt = new Map();
+    this.watching = false;
     this.generation = 0;
     this.lastCompletedAt = 0;
     this.nextRoutineAt = 0;
     this.providerInFlight = null;
+    this.inFlightProviderKeys = new Set();
     this.costInFlight = null;
+    this.nextCostRoutineAt = 0;
     this.inFlight = null;
     this.timer = null;
   }
@@ -1808,23 +1848,124 @@ class ProviderUsageRegistry {
     ));
   }
 
+  providerKey(value) {
+    const requested = safeText(value, 80);
+    if (!requested) return null;
+    if (PROVIDERS[requested]) return requested;
+    return Object.entries(PROVIDERS).find(([, provider]) => provider.provider_id === requested)?.[0] || null;
+  }
+
+  cadenceFor(key) {
+    return this.providerCadence.get(key) || DEFAULT_PROVIDER_CADENCE[key];
+  }
+
+  refreshIntervalFor(key) {
+    const cadence = this.cadenceFor(key);
+    return this.watching ? cadence.fast_ms : cadence.idle_ms;
+  }
+
+  nextAnchorFor(key, now = this.now()) {
+    const interval = this.refreshIntervalFor(key);
+    const anchor = (Math.floor(now / interval) + 1) * interval;
+    const jitter = Math.round(interval * this.jitterRatio * ((this.random() * 2) - 1));
+    let next = anchor + jitter;
+    while (next <= now + 999) next += interval;
+    return next;
+  }
+
+  runtimeFields(entry, now = this.now()) {
+    const interval = this.refreshIntervalFor(entry.key);
+    const cadence = this.cadenceFor(entry.key);
+    const lastAttemptAt = this.lastAttemptAt.get(entry.key) || 0;
+    const lastSuccessAt = this.lastSuccessAt.get(entry.key) || 0;
+    const nextAt = this.nextRoutineAtByProvider.get(entry.key)
+      || this.nextAnchorFor(entry.key, now);
+    return {
+      cadence_class: cadence.cadence_class,
+      refresh_interval_ms: interval,
+      fast_refresh_interval_ms: cadence.fast_ms,
+      idle_refresh_interval_ms: cadence.idle_ms,
+      watch_boost_active: this.watching && cadence.fast_ms < cadence.idle_ms,
+      next_refresh_at: new Date(nextAt).toISOString(),
+      last_attempt_at: lastAttemptAt ? new Date(lastAttemptAt).toISOString() : null,
+      last_success_at: lastSuccessAt ? new Date(lastSuccessAt).toISOString() : null,
+      consecutive_misses: this.failureCounts.get(entry.key) || 0,
+      manual_refresh_allowed_at: new Date(this.manualAllowedAt.get(entry.key) || now).toISOString(),
+    };
+  }
+
+  setWatching(active) {
+    const next = active === true;
+    if (this.watching === next) return Promise.resolve(this.snapshot());
+    this.watching = next;
+    const now = this.now();
+    for (const entry of this.activeProviders()) {
+      const cadence = this.cadenceFor(entry.key);
+      const lastSuccess = this.lastSuccessAt.get(entry.key) || 0;
+      if (next && cadence.fast_ms < cadence.idle_ms) {
+        const dueAt = lastSuccess ? lastSuccess + cadence.fast_ms : now;
+        this.nextRoutineAtByProvider.set(entry.key,
+          Math.min(this.nextRoutineAtByProvider.get(entry.key) || dueAt, dueAt));
+      } else if (!next) {
+        this.nextRoutineAtByProvider.set(entry.key, this.nextAnchorFor(entry.key, now));
+      }
+    }
+    this.nextRoutineAt = this._earliestRoutineAt(now);
+    this.emit();
+    this._scheduleTimer();
+    return next
+      ? this.refresh({ reason: 'usage_view_open', waitForCost: false })
+      : Promise.resolve(this.snapshot());
+  }
+
+  _earliestRoutineAt(now = this.now()) {
+    const times = this.activeProviders().map(entry => (
+      this.nextRoutineAtByProvider.get(entry.key) || this.nextAnchorFor(entry.key, now)
+    ));
+    if (this.costScanner) times.push(this.nextCostRoutineAt || this.nextAnchor(now));
+    return times.length ? Math.min(...times) : this.nextAnchor(now);
+  }
+
+  _scheduleTimer() {
+    if (!this.timer) return;
+    clearTimeout(this.timer);
+    const now = this.now();
+    const delay = Math.max(1_000, this._earliestRoutineAt(now) - now);
+    this.timer = setTimeout(async () => {
+      try { await this.refresh({ reason: 'routine' }); } catch {}
+      if (this.timer) this._scheduleTimer();
+    }, delay);
+    this.timer.unref?.();
+  }
+
   snapshot(statusOverride = null) {
     const now = this.now();
     const snapshots = [];
     for (const entry of this.activeProviders()) {
       const failure = this.currentErrors.get(entry.key) || null;
+      const misses = this.failureCounts.get(entry.key) || 0;
+      const runtime = this.runtimeFields(entry, now);
       const identities = this.identitiesByProvider.get(entry.key) || new Set();
       for (const identityKey of identities) {
         const good = this.lastGood.get(identityKey) || null;
         if (!good) continue;
-        const expired = Date.parse(good.stale_after || '') <= now;
+        const lastSuccess = this.lastSuccessAt.get(entry.key) || Date.parse(good.captured_at || '') || 0;
+        const staleAt = lastSuccess + (runtime.refresh_interval_ms * 2);
+        const expired = staleAt <= now;
+        const staleReason = misses >= 2 ? 'two_consecutive_misses'
+          : expired ? 'capture_age_exceeded' : null;
         snapshots.push({
           ...good,
           ...entry.mapped,
+          ...runtime,
+          stale_after: new Date(staleAt).toISOString(),
+          stale_reason: staleReason,
           status: statusOverride === 'refreshing'
             ? 'refreshing'
-            : (failure || expired ? 'stale' : 'fresh'),
-          ...(failure ? { error: failure.error, last_good_captured_at: good.captured_at } : { error: null }),
+            : (staleReason ? 'stale' : 'fresh'),
+          ...(failure && staleReason
+            ? { error: failure.error, last_good_captured_at: good.captured_at }
+            : { error: null }),
         });
       }
       if (identities.size === 0 && failure) {
@@ -1851,6 +1992,8 @@ class ProviderUsageRegistry {
           error: failure.error,
           request_count: 0,
           latency_ms: failure.latency_ms || null,
+          stale_reason: misses >= 2 ? 'two_consecutive_misses' : 'no_last_good',
+          ...runtime,
           ...entry.mapped,
         });
       }
@@ -1860,6 +2003,7 @@ class ProviderUsageRegistry {
       generation: this.generation,
       generated_at: new Date(now).toISOString(),
       poll_interval_ms: this.pollIntervalMs,
+      cadence_mode: this.watching ? 'watching' : 'idle',
       in_flight: statusOverride === 'refreshing' || !!this.providerInFlight || !!this.costInFlight,
       estimated_cost: this.costScanner?.snapshot?.() || null,
       snapshots,
@@ -1900,12 +2044,34 @@ class ProviderUsageRegistry {
 
   async refresh(options = {}) {
     const force = options.force === true;
-    const cacheFresh = !force && this.lastCompletedAt && this.now() < this.nextRoutineAt;
-    if (cacheFresh && !this.providerInFlight && !this.costInFlight) {
-      return this.snapshot();
+    const now = this.now();
+    const requestedKey = this.providerKey(options.providerKey || options.providerId || options.provider_id);
+    if ((options.providerKey || options.providerId || options.provider_id) && !requestedKey) {
+      throw new ProviderUsageError('Unknown provider usage card.', { code: 'invalid_provider' });
     }
-    const active = this.activeProviders();
-    if (active.length === 0 && !this.costScanner) return this.emit();
+    const requestedKeys = requestedKey ? new Set([requestedKey]) : null;
+    if (this.providerInFlight) {
+      const alreadyCovered = !requestedKeys
+        || [...requestedKeys].every(key => this.inFlightProviderKeys.has(key));
+      if (alreadyCovered) return this.providerInFlight.then(() => this.snapshot());
+      return this.providerInFlight.then(() => this.refresh(options));
+    }
+    const allActive = this.activeProviders();
+    const candidates = requestedKeys
+      ? allActive.filter(entry => requestedKeys.has(entry.key))
+      : allActive;
+    const active = candidates.filter(entry => (
+      force
+      || !this.lastAttemptAt.has(entry.key)
+      || (this.nextRoutineAtByProvider.get(entry.key) || 0) <= now
+    ));
+    const costDue = !!this.costScanner && !requestedKey && (
+      (force && options.reason !== 'usage_view_open')
+      || !this.nextCostRoutineAt
+      || this.nextCostRoutineAt <= now
+    );
+    if (active.length === 0 && !costDue) return this.snapshot();
+    if (allActive.length === 0 && !this.costScanner) return this.emit();
     if (options.waitForCost === false && this.costInFlight && this.costAbortController) {
       // A client-correlated provider refresh has a 15-second receipt contract.
       // Stop any older incremental transcript scan at its next bounded yield so
@@ -1915,14 +2081,28 @@ class ProviderUsageRegistry {
     }
     let startedProvider = false;
     let startedCost = false;
-    if (!this.providerInFlight && !cacheFresh) {
+    if (active.length > 0) {
       startedProvider = true;
       const jobs = active.map(async entry => {
         const startedAt = this.now();
+        this.lastAttemptAt.set(entry.key, startedAt);
         const blockedUntil = this.nextAllowedAt.get(entry.key) || 0;
-        if (blockedUntil > startedAt) return;
+        if (blockedUntil > startedAt) {
+          this.nextRoutineAtByProvider.set(entry.key, blockedUntil);
+          return;
+        }
+        const guardedAt = this.nextGuardedAt.get(entry.key) || 0;
+        const allowGuarded = force || guardedAt <= startedAt;
+        if (allowGuarded) {
+          this.nextGuardedAt.set(entry.key, startedAt + this.cadenceFor(entry.key).guarded_ms);
+        }
         try {
-          const collected = await this.collectors[entry.key]({ force, reason: options.reason || 'unspecified' });
+          const collected = await this.collectors[entry.key]({
+            force,
+            reason: options.reason || 'unspecified',
+            allow_guarded: allowGuarded,
+            cadence_class: this.cadenceFor(entry.key).cadence_class,
+          });
           const results = Array.isArray(collected) ? collected : [collected];
           if (results.length === 0) {
             throw new ProviderUsageError('Provider returned no account usage.', { code: 'usage_not_reported' });
@@ -1956,7 +2136,7 @@ class ProviderUsageRegistry {
             const identityKey = `${entry.provider.provider_id}:${fingerprint}:${entry.provider.quota_domain}`;
             nextIdentities.add(identityKey);
             const resultStaleAfterMs = Math.max(
-              this.pollIntervalMs,
+              this.refreshIntervalFor(entry.key) * 2,
               Number(result.stale_after_ms) || this.staleAfterMs,
             );
             this.lastGood.set(identityKey, {
@@ -1974,7 +2154,7 @@ class ProviderUsageRegistry {
               status: 'fresh',
               captured_at: new Date(parsedCapturedAt).toISOString(),
               stale_after: new Date(parsedCapturedAt + resultStaleAfterMs).toISOString(),
-              next_refresh_at: isoTimestamp(result.next_refresh_at),
+              next_refresh_at: null,
               windows,
               credits: result.credits || null,
               financials: result.financials || null,
@@ -1995,31 +2175,41 @@ class ProviderUsageRegistry {
           this.currentErrors.delete(entry.key);
           this.nextAllowedAt.delete(entry.key);
           this.failureCounts.delete(entry.key);
+          this.lastSuccessAt.set(entry.key, this.now());
         } catch (error) {
           const failure = publicError(error);
           this.currentErrors.set(entry.key, { ...failure, latency_ms: this.now() - startedAt });
           const failures = (this.failureCounts.get(entry.key) || 0) + 1;
           this.failureCounts.set(entry.key, failures);
-          const baseDelay = Math.min(this.pollIntervalMs, 15_000 * (2 ** Math.min(5, failures - 1)));
+          const baseDelay = Math.min(this.refreshIntervalFor(entry.key), 15_000 * (2 ** Math.min(5, failures - 1)));
           const jitteredDelay = Math.max(1_000, Math.round(baseDelay * (0.8 + this.random() * 0.4)));
           const delay = error?.retryAfterMs
-            || (failure.status === 'auth_required' ? this.pollIntervalMs : jitteredDelay);
+            || (failure.status === 'auth_required' ? this.refreshIntervalFor(entry.key) : jitteredDelay);
           this.nextAllowedAt.set(entry.key, this.now() + delay);
           this.log('warn', `[usage] ${entry.provider.provider_name}: ${failure.error.code}`);
+        } finally {
+          const scheduled = this.nextAnchorFor(entry.key, this.now());
+          this.nextRoutineAtByProvider.set(entry.key,
+            Math.max(scheduled, this.nextAllowedAt.get(entry.key) || 0));
         }
       });
+      this.inFlightProviderKeys = new Set(active.map(entry => entry.key));
       const providerRun = Promise.all(jobs).then(() => {
         if (this.providerInFlight === providerRun) this.providerInFlight = null;
+        this.inFlightProviderKeys.clear();
         this.lastCompletedAt = this.now();
-        this.nextRoutineAt = this.nextAnchor(this.lastCompletedAt);
+        this.nextRoutineAt = this._earliestRoutineAt(this.lastCompletedAt);
         this.generation += 1;
-        return this.emit();
+        const emitted = this.emit();
+        this._scheduleTimer();
+        return emitted;
       });
       this.providerInFlight = providerRun;
     }
     let deferredCostRun = null;
-    if (this.costScanner && !this.costInFlight && !cacheFresh) {
+    if (costDue && !this.costInFlight) {
       startedCost = true;
+      this.nextCostRoutineAt = this.nextAnchor(now);
       // Provider APIs and the local transcript-cost scan are independent.
       // Let network/CDP quota collection settle first so JSONL aggregation
       // cannot starve its callbacks past the correlated 15-second receipt.
@@ -2049,18 +2239,24 @@ class ProviderUsageRegistry {
     return this.costScanner.detailPage(options);
   }
 
+  claimManualRefresh(providerValue) {
+    const key = this.providerKey(providerValue);
+    if (!key) return { ok: false, code: 'invalid_provider', providerKey: null, retryAfterMs: 0 };
+    const now = this.now();
+    const allowedAt = this.manualAllowedAt.get(key) || 0;
+    if (allowedAt > now) {
+      return { ok: false, code: 'manual_refresh_rate_limited', providerKey: key, retryAfterMs: allowedAt - now };
+    }
+    this.manualAllowedAt.set(key, now + this.manualRefreshIntervalMs);
+    return { ok: true, code: null, providerKey: key, retryAfterMs: 0 };
+  }
+
   start() {
     if (this.timer) return;
+    this.timer = setTimeout(() => {}, 2_147_000_000);
+    this.timer.unref?.();
     this.refresh({ force: true, reason: 'startup' }).catch(() => {});
-    const schedule = () => {
-      const delay = Math.max(1000, this.nextAnchor(this.now()) - this.now());
-      this.timer = setTimeout(async () => {
-        try { await this.refresh({ reason: 'routine' }); } catch {}
-        if (this.timer) schedule();
-      }, delay);
-      this.timer.unref?.();
-    };
-    schedule();
+    this._scheduleTimer();
   }
 
   stop() {
@@ -2072,7 +2268,9 @@ class ProviderUsageRegistry {
 }
 
 module.exports = {
+  DEFAULT_MANUAL_REFRESH_INTERVAL_MS,
   DEFAULT_POLL_INTERVAL_MS,
+  DEFAULT_PROVIDER_CADENCE,
   PROVIDERS,
   ProviderUsageError,
   ProviderUsageRegistry,

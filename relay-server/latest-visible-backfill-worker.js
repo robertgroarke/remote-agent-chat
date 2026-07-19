@@ -29,6 +29,16 @@ function relayMessageId(rowId) {
     : null;
 }
 
+function durableMessageId(row) {
+  const sourceMessageId = typeof row?.source_message_id === 'string'
+    ? row.source_message_id.trim()
+    : '';
+  if (sourceMessageId && sourceMessageId.length <= 256 && !/[\u0000-\u001f\u007f]/.test(sourceMessageId)) {
+    return sourceMessageId;
+  }
+  return relayMessageId(row?.message_row_id);
+}
+
 const dbPath = String(workerData?.dbPath || '');
 const sessionIds = Array.isArray(workerData?.sessionIds)
   ? [...new Set(workerData.sessionIds.map(value => String(value || '').trim()).filter(Boolean))].slice(0, 4096)
@@ -38,7 +48,7 @@ if (!dbPath || sessionIds.length === 0) throw new Error('Latest visible backfill
 const db = new Database(dbPath);
 db.pragma('busy_timeout = 5000');
 const findLatest = db.prepare(`
-  SELECT id AS message_row_id, role, ts, source
+  SELECT id AS message_row_id, role, ts, source, source_message_id
   FROM messages
   WHERE session = ?
     AND lower(replace(role, '-', '_')) IN
@@ -75,7 +85,7 @@ try {
   for (const sessionId of sessionIds) {
     const row = findLatest.get(sessionId);
     const kind = canonicalKind(row?.role);
-    const messageId = relayMessageId(row?.message_row_id);
+    const messageId = durableMessageId(row);
     const messageAt = Number(row?.ts);
     if (!row || !kind || !messageId || !Number.isFinite(messageAt) || messageAt <= 0) continue;
     const result = upsertLatest.run(

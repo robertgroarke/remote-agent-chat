@@ -42,9 +42,14 @@ function oneLine(value, limit = 800) {
 
 function formatTriageEntry(entry, ledgerPath) {
   const completedAt = entry.completed_at || new Date().toISOString();
+  const stage = entry.failure_stage ? `Stage: ${oneLine(entry.failure_stage, 120)}. ` : '';
+  const fixtureDiff = entry.fixture_diff ? `Fixture diff: ${oneLine(entry.fixture_diff, 500)}. ` : '';
+  const playbook = Array.isArray(entry.repair_playbook)
+    ? `Repair: ${oneLine(entry.repair_playbook.join(' -> '), 800)}. `
+    : '';
   return `- [ ] **${completedAt} - ${entry.harness} app update ${entry.previous_app_version} -> ${entry.app_version}: ${String(entry.status).toUpperCase()}** `
     + `Validator \`${entry.validator || 'unavailable'}\` exited ${entry.exit_code ?? 'n/a'} in ${entry.duration_ms || 0} ms. `
-    + `${oneLine(entry.detail)} Ledger: \`${ledgerPath}\`.\n`;
+    + `${stage}${fixtureDiff}${playbook}${oneLine(entry.detail)} Ledger: \`${ledgerPath}\`.\n`;
 }
 
 function appendDriftTriage(backlogPath, entry, ledgerPath) {

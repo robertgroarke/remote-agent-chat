@@ -130,6 +130,8 @@ async function main() {
   relay.stderr.on('data', chunk => logs.push(String(chunk)));
   let proxy;
   let observer;
+  let watcher;
+  let watchReconnectProxy;
   let reconnect;
   let linkAudit;
   let replacementProxy;
@@ -156,6 +158,11 @@ async function main() {
     await waitFor(() => observer.messages.find(message => (
       message.type === 'session_list' && message.sessions?.length === 2
     )), 10000, 'session registration');
+    watcher = await openSocket('/client-ws');
+    watcher.ws.send(JSON.stringify({ type: 'provider_usage_watch', protocol_version: 1, active: true }));
+    await waitFor(() => proxy.messages.find(message => (
+      message.type === 'provider_usage_watch' && message.active === true && message.watcher_count === 1
+    )), 10000, 'usage watch activation');
 
     const snapshot = fixture();
     proxy.ws.send(JSON.stringify({ type: 'provider_usage_snapshot', protocol_version: 1, snapshot }));
@@ -179,6 +186,19 @@ async function main() {
     assert.strictEqual(linkedSessionPatch.patch.usage_billing_provider_id, 'openai-codex');
     assert.strictEqual(linkedSessionPatch.patch.usage_quota_domain, 'codex-plan');
     assert.strictEqual(linkedSessionPatch.patch.usage_mapping_ambiguous, false);
+    watchReconnectProxy = await openSocket('/proxy-ws');
+    watchReconnectProxy.ws.send(JSON.stringify({
+      type: 'connection_hello', protocol_version: 1, peer_role: 'proxy',
+      proxy_id: 'provider-usage-watch-reconnect', machine_label: 'provider-usage-machine',
+    }));
+    await waitFor(() => watchReconnectProxy.messages.find(message => (
+      message.type === 'provider_usage_watch' && message.active === true && message.watcher_count === 1
+    )), 10000, 'usage watch proxy reconnect restore');
+    watchReconnectProxy.ws.close();
+    watcher.ws.close();
+    await waitFor(() => proxy.messages.find(message => (
+      message.type === 'provider_usage_watch' && message.active === false && message.watcher_count === 0
+    )), 10000, 'usage watch disconnect cleanup');
 
     proxy.ws.send(JSON.stringify({ type: 'provider_usage_snapshot', protocol_version: 1, snapshot }));
     await new Promise(resolve => setTimeout(resolve, 150));
@@ -227,6 +247,42 @@ async function main() {
       )), 10000, `completed receipt ${requestId}`);
       assert.strictEqual(completed.generation, 2);
     }
+    observer.ws.send(JSON.stringify({
+      type: 'provider_usage_refresh', protocol_version: 1, force: true,
+      provider_id: 'cursor', request_id: 'refresh-card-e2e',
+    }));
+    const cardRefresh = await waitFor(() => proxy.messages.find(message => (
+      message.type === 'provider_usage_refresh' && message.provider_id === 'cursor'
+    )), 10000, 'per-card refresh forwarding');
+    proxy.ws.send(JSON.stringify({
+      type: 'provider_usage_refresh_receipt', protocol_version: 1,
+      request_id: cardRefresh.request_id, provider_id: 'cursor', status: 'completed',
+      generation: 3, cost_status: 'ready',
+    }));
+    const cardCompleted = await waitFor(() => observer.messages.find(message => (
+      message.type === 'provider_usage_refresh_receipt'
+      && message.request_id === 'refresh-card-e2e' && message.status === 'completed'
+    )), 10000, 'per-card refresh completion');
+    assert.strictEqual(cardCompleted.provider_id, 'cursor');
+    observer.ws.send(JSON.stringify({
+      type: 'provider_usage_refresh', protocol_version: 1, force: true,
+      provider_id: 'cursor', request_id: 'refresh-card-rate-limit-e2e',
+    }));
+    const cardRateRequest = await waitFor(() => proxy.messages.find(message => (
+      message.type === 'provider_usage_refresh' && message.provider_id === 'cursor'
+      && message.request_id !== cardRefresh.request_id
+    )), 10000, 'per-card rate-limit forwarding');
+    proxy.ws.send(JSON.stringify({
+      type: 'provider_usage_refresh_receipt', protocol_version: 1,
+      request_id: cardRateRequest.request_id, provider_id: 'cursor', status: 'error',
+      code: 'manual_refresh_rate_limited', retry_after_ms: 30_000,
+    }));
+    const cardRateLimited = await waitFor(() => observer.messages.find(message => (
+      message.type === 'provider_usage_refresh_receipt'
+      && message.request_id === 'refresh-card-rate-limit-e2e' && message.status === 'error'
+    )), 10000, 'per-card rate-limit receipt');
+    assert.strictEqual(cardRateLimited.provider_id, 'cursor');
+    assert.strictEqual(cardRateLimited.retry_after_ms, 30_000);
 
     observer.ws.send(JSON.stringify({
       type: 'provider_usage_reset_credit_consume', protocol_version: 1,
@@ -558,6 +614,10 @@ async function main() {
       refresh_forwarded_to_authenticated_proxy: true,
       refresh_receipts: ['accepted', 'coalesced', 'completed'],
       concurrent_refreshes_forwarded: 1,
+      usage_watch_activation_and_disconnect_cleanup: true,
+      usage_watch_proxy_reconnect_restore: true,
+      per_card_refresh_provider_id: cardCompleted.provider_id,
+      per_card_rate_limit_receipt: cardRateLimited.code,
       reset_credit_approval_required: true,
       reset_credit_idempotency_uuid: true,
       reset_credit_receipts: ['accepted', 'completed'],
@@ -584,6 +644,8 @@ async function main() {
     }
     process.stdout.write(serialized);
   } finally {
+    try { watcher?.ws.close(); } catch {}
+    try { watchReconnectProxy?.ws.close(); } catch {}
     try { foreignProxy?.ws.close(); } catch {}
     try { replacementProxy?.ws.close(); } catch {}
     try { reconnect?.ws.close(); } catch {}

@@ -14,6 +14,8 @@ const {
   ProxyEngine,
   resolveCursorWorkspacePath,
   cursorNativeActivity,
+  cursorAgentEligible,
+  CURSOR_WORKING_CONTINUITY_LEASE_MS,
 } = require('../agent-proxy/proxy-engine');
 const cursorSelectors = require('../agent-proxy/cursor-selectors');
 
@@ -64,6 +66,59 @@ function agent(id, title, workspaceName, workspaceKey, active = false, status = 
     );
     assert.strictEqual(cursorNativeActivity({ native_status: 'working' }).kind, 'generating');
     assert.strictEqual(cursorNativeActivity({ native_status: 'done-seen' }).kind, 'idle');
+    assert.notStrictEqual(cursorNativeActivity({ native_status: 'incomplete' }).cursor_evidence_source, 'native_terminal',
+      'an incomplete to-do token must not masquerade as a terminal native status');
+    assert.strictEqual(cursorNativeActivity({ active: true, native_status: '' }).kind, 'idle',
+      'selection alone must never classify an idle Cursor chat as Working');
+    const leaseStartMs = 10_000;
+    const authoritativeWorking = cursorNativeActivity(
+      { native_status: 'status-class-drift', native_working: true },
+      null,
+      { nowMs: leaseStartMs },
+    );
+    assert.strictEqual(authoritativeWorking.cursor_evidence_source, 'native_status');
+    assert.strictEqual(
+      cursorNativeActivity({}, authoritativeWorking, {
+        nowMs: leaseStartMs + CURSOR_WORKING_CONTINUITY_LEASE_MS - 1,
+      }).kind,
+      'generating',
+      'a transient native-status gap must retain the bounded Working lease',
+    );
+    assert.strictEqual(
+      cursorNativeActivity({}, authoritativeWorking, {
+        nowMs: leaseStartMs + CURSOR_WORKING_CONTINUITY_LEASE_MS + 1,
+      }).kind,
+      'idle',
+      'a dead Working signal must decay at the bounded lease edge',
+    );
+    const heartbeatRefreshed = {
+      ...authoritativeWorking,
+      observed_at: new Date(leaseStartMs + CURSOR_WORKING_CONTINUITY_LEASE_MS - 1).toISOString(),
+    };
+    assert.strictEqual(
+      cursorNativeActivity({}, heartbeatRefreshed, {
+        nowMs: leaseStartMs + (2 * CURSOR_WORKING_CONTINUITY_LEASE_MS) - 2,
+      }).kind,
+      'generating',
+      'the lease must use the newest authoritative observation heartbeat',
+    );
+    assert.strictEqual(
+      cursorNativeActivity({ native_status: 'done-unseen' }, authoritativeWorking, { nowMs: leaseStartMs + 1 }).kind,
+      'idle',
+      'an authoritative terminal state must bypass the continuity lease',
+    );
+    assert.strictEqual(cursorAgentEligible({
+      id: '55555555-5555-4555-8555-555555555555',
+      active: true,
+      workspace_expanded: false,
+      native_status: '',
+    }), true, 'a selected agent in a collapsed workspace must remain eligible');
+    assert.strictEqual(cursorAgentEligible({
+      id: '66666666-6666-4666-8666-666666666666',
+      active: false,
+      workspace_expanded: false,
+      native_status: 'done-seen',
+    }), false, 'a collapsed finished archive must remain ineligible until already registered');
 
     const ids = [
       '11111111-1111-4111-8111-111111111111',
@@ -123,6 +178,12 @@ function agent(id, title, workspaceName, workspaceKey, active = false, status = 
       'a collapsed finished archive must not become a fresh live session',
     );
 
+    await firstEngine._syncCursorVirtualSessions(firstTarget, firstClient, agents);
+    assert(
+      !Array.from(firstEngine.sessions.values()).some(row => row.cursorAgentId === collapsedWorker.id),
+      'a dead native owner must be removed from the live virtual-session set',
+    );
+
     const secondRuntime = Array.from(firstEngine.sessions.values()).find(row => row.cursorAgentId === ids[1]);
     const originalReadAgentList = cursorSelectors.readCursorAgentList;
     const originalSwitchAgent = cursorSelectors.switchCursorAgent;
@@ -145,7 +206,14 @@ function agent(id, title, workspaceName, workspaceKey, active = false, status = 
     const inactiveHistory = [{ role: 'assistant', content: 'durable inactive transcript' }];
     secondRuntime._cursorNativeActive = false;
     secondRuntime._accumulatedMessages = inactiveHistory.slice();
-    secondRuntime.client.Runtime.evaluate = async () => { throw new Error('inactive history must not read the active DOM'); };
+    let inactiveRuntimeEvaluations = 0;
+    secondRuntime.client.Runtime.evaluate = async () => {
+      inactiveRuntimeEvaluations += 1;
+      throw new Error('inactive history must not read the active DOM');
+    };
+    await firstEngine._pollSession(secondRuntime.session_id);
+    assert.strictEqual(inactiveRuntimeEvaluations, 0,
+      'an inactive virtual row must not compete with the page-owner inventory lane');
     assert.deepStrictEqual(
       JSON.parse(await firstEngine._readSessionMessages(secondRuntime, secondRuntime.session_id)),
       inactiveHistory,
@@ -153,6 +221,33 @@ function agent(id, title, workspaceName, workspaceKey, active = false, status = 
     );
 
     const selectorSource = fs.readFileSync(path.join(__dirname, '..', 'agent-proxy', 'cursor-selectors.js'), 'utf8');
+    const proxySource = fs.readFileSync(path.join(__dirname, '..', 'agent-proxy', 'proxy-engine.js'), 'utf8');
+    assert(selectorSource.includes("[data-agent-status]"), 'Cursor status discovery must retain a structured attribute fallback');
+    assert(selectorSource.includes("[aria-busy=\"true\"]"), 'Cursor status discovery must retain a correlated busy-state fallback');
+    assert(selectorSource.includes('native_status_signals'), 'Cursor audit data must expose every bounded status signal');
+    assert(proxySource.includes("newActivity.cursor_evidence_source !== 'continuity_lease'"),
+      'continuity-only Cursor evidence must never self-renew through the generic heartbeat');
+    assert(proxySource.includes("session.agentType === 'cursor' && !session._cursorVirtual"),
+      'virtual Cursor rows must leave global inventory polling to the page owner');
+
+    let inventoryReads = 0;
+    let releaseInventory;
+    cursorSelectors.readCursorAgentList = async () => {
+      inventoryReads += 1;
+      return new Promise(resolve => { releaseInventory = () => resolve(agents); });
+    };
+    try {
+      const firstInventory = firstEngine._readCursorAgentInventory(firstTarget.id, firstClient.Runtime);
+      const secondInventory = firstEngine._readCursorAgentInventory(firstTarget.id, firstClient.Runtime);
+      await new Promise(resolve => setImmediate(resolve));
+      assert.strictEqual(inventoryReads, 1, 'overlapping page-owner inventory reads must coalesce');
+      releaseInventory();
+      const [firstInventoryResult, secondInventoryResult] = await Promise.all([firstInventory, secondInventory]);
+      assert.deepStrictEqual(firstInventoryResult, agents);
+      assert.deepStrictEqual(secondInventoryResult, agents);
+    } finally {
+      cursorSelectors.readCursorAgentList = originalReadAgentList;
+    }
     const switchSource = selectorSource.slice(
       selectorSource.indexOf('async function switchCursorAgent'),
       selectorSource.indexOf('async function newCursorAgent'),
@@ -183,7 +278,12 @@ function agent(id, title, workspaceName, workspaceKey, active = false, status = 
       stable_restart_ids: true,
       same_workspace_not_collapsed: true,
       native_uuid_control_routing: true,
+      collapsed_selected_eligible_but_idle: true,
+      status_drift_continuity_lease_ms: CURSOR_WORKING_CONTINUITY_LEASE_MS,
+      dead_owner_demoted: true,
       inactive_history_isolated: true,
+      inactive_virtual_poll_evaluations: inactiveRuntimeEvaluations,
+      coalesced_page_owner_inventory: true,
       stable_observer_owner: true,
       path_normalization: ['gwa3-private', 'BotsHub/gwa3', 'remote-agent-chat'],
     }));

@@ -22,6 +22,15 @@ const {
   saveSentinelState,
   validatorForHarness,
 } = require('./app-update-drift');
+const { loadProgram } = require('../agent-proxy/harness-revalidation');
+const {
+  REPAIR_PLAYBOOK,
+  beginRevalidation,
+  coverageForVersions,
+  finalizeRevalidation,
+  runTier2Definition,
+  seedProgramState,
+} = require('./harness-revalidation-program');
 
 const root = path.resolve(__dirname, '..');
 const DEFAULT_STATE = path.join(root, 'data', 'app-update-drift-state.json');
@@ -140,6 +149,29 @@ function missingValidatorEntry(change, runId) {
   };
 }
 
+function coverageFailureEntry(change, runId, coverageRow) {
+  const fixtureDiff = (coverageRow?.issues || ['revalidation program coverage missing']).join('; ');
+  return {
+    schema_version: 1,
+    kind: 'app_update_validation',
+    run_id: runId,
+    harness: change.harness,
+    status: 'fail',
+    previous_app_version: change.previous_version,
+    app_version: change.app_version,
+    validator: 'harness-revalidation-program:coverage',
+    read_only: true,
+    runtime_budget_ms: 0,
+    budget_exhausted: false,
+    duration_ms: 0,
+    exit_code: null,
+    completed_at: new Date().toISOString(),
+    failure_stage: 'fixture_coverage',
+    fixture_diff: fixtureDiff,
+    detail: fixtureDiff,
+  };
+}
+
 function settleUnavailableChanges(changes, priorState, graceMs, nowMs = Date.now()) {
   const ready = [];
   const deferred = [];
@@ -184,14 +216,20 @@ async function scanForUpdates(options, dependencies = {}) {
   const publishValidation = dependencies.publishEntry || publishEntry;
   const appendTriage = dependencies.appendDriftTriage || appendDriftTriage;
   const currentVersions = collect();
+  const program = dependencies.program || loadProgram();
+  const coverage = coverageForVersions(currentVersions, program);
   const priorState = loadSentinelState(options.state);
+  const hadProgramState = Boolean(priorState?.revalidation_program?.harnesses);
   if (!priorState && !options.revalidate) {
+    const revalidationProgram = seedProgramState(null, currentVersions, program,
+      dependencies.now ? dependencies.now() : Date.now());
     saveSentinelState(options.state, {
       versions: currentVersions,
       observed_at: new Date().toISOString(),
       last_changes: [],
+      revalidation_program: revalidationProgram,
     });
-    return { baseline: true, changes: [], failures: 0 };
+    return { baseline: true, changes: [], failures: 0, coverage };
   }
   if (!priorState) throw new Error('Targeted revalidation requires an existing sentinel state');
   let changes = detectVersionChanges(priorState.versions, currentVersions);
@@ -221,22 +259,93 @@ async function scanForUpdates(options, dependencies = {}) {
     pendingUnavailable = settled.pendingUnavailable;
   }
   const relay = options.publish ? (dependencies.relay || resolveRelay(options)) : null;
+  const programState = seedProgramState(
+    priorState,
+    currentVersions,
+    program,
+    dependencies.now ? dependencies.now() : Date.now(),
+  );
   const entries = [];
   const publicationFailures = new Set();
   let failures = 0;
   for (const change of changes) {
     const runId = `app-update-${change.harness}-${new Date().toISOString().replace(/[:.]/g, '-')}`;
     const validator = validatorForHarness(validators, change.harness);
-    const result = validator
-      ? executeValidator(validator, change.app_version, options.timeoutMs, runId)
-      : missingValidatorEntry(change, runId);
+    const definition = program.harnesses[change.harness];
+    const coverageRow = coverage.matrix.find(row => row.harness === change.harness);
+    beginRevalidation(programState, change, coverageRow,
+      dependencies.now ? dependencies.now() : Date.now());
+    // Persist pending before any validator runs. A proxy process observing this
+    // file immediately fail-closes writes for the changed harness.
+    saveSentinelState(options.state, {
+      ...priorState,
+      versions: { ...(priorState.versions || {}), [change.harness]: change.app_version },
+      observed_at: new Date().toISOString(),
+      revalidation_program: programState,
+    });
+    let result;
+    if (!definition || !coverageRow || coverageRow.issues.length > 0) {
+      result = coverageFailureEntry(change, runId, coverageRow);
+    } else if (!validator) {
+      result = missingValidatorEntry(change, runId);
+      result.failure_stage = 'tier-1';
+    } else {
+      result = executeValidator(validator, change.app_version, options.timeoutMs, runId);
+      result.failure_stage = result.status === 'pass' ? null : 'tier-1';
+      if (result.status === 'pass') {
+        const tier2 = dependencies.runTier2
+          ? dependencies.runTier2(change.harness, definition, change)
+          : runTier2Definition(change.harness, definition, { timeoutMs: options.timeoutMs });
+        result.tier2_status = tier2.status;
+        result.tier2_duration_ms = tier2.duration_ms;
+        result.tier2_detail = tier2.detail;
+        if (tier2.status !== 'pass') {
+          result.status = 'fail';
+          result.exit_code = tier2.exit_code ?? result.exit_code;
+          result.failure_stage = 'tier-2';
+          result.detail = `Tier-1 passed; tier-2 ${tier2.status}: ${tier2.detail}`;
+        }
+      }
+    }
     const entry = {
       ...result,
       kind: 'app_update_validation',
       previous_app_version: change.previous_version,
       change_detected_at: new Date().toISOString(),
       revalidation: change.revalidation === true,
+      repair_playbook: REPAIR_PLAYBOOK,
     };
+    if (!entry.tier2_status) entry.tier2_status = 'not_run';
+    if (entry.status === 'pass' && entry.tier2_status === 'pass') {
+      entry.validation_transition = `validated ${change.harness} ${change.previous_version} -> ${change.app_version}`;
+      entry.detail = `${entry.validation_transition}. ${entry.detail || ''}`.trim();
+    }
+    finalizeRevalidation(
+      programState,
+      change,
+      entry,
+      definition,
+      dependencies.now ? dependencies.now() : Date.now(),
+    );
+    entry.program_health = JSON.parse(JSON.stringify({
+      ...programState,
+      coverage_matrix: coverage.matrix,
+    }));
+    saveSentinelState(options.state, {
+      ...priorState,
+      versions: { ...(priorState.versions || {}), [change.harness]: change.app_version },
+      observed_at: new Date().toISOString(),
+      revalidation_program: programState,
+      last_changes: entries.concat(entry).map(item => ({
+        harness: item.harness,
+        previous_app_version: item.previous_app_version,
+        app_version: item.app_version,
+        status: item.status,
+        failure_stage: item.failure_stage || null,
+        completed_at: item.completed_at,
+        revalidation: item.revalidation === true,
+      })),
+    });
     if (options.publish) {
       try {
         await publishValidation(relay, entry);
@@ -269,8 +378,39 @@ async function scanForUpdates(options, dependencies = {}) {
       completed_at: entry.completed_at,
       revalidation: entry.revalidation === true,
     })),
+    revalidation_program: programState,
   });
-  return { baseline: false, changes: entries, deferred, failures };
+  if (options.publish && !hadProgramState && changes.length === 0) {
+    const completedAt = new Date().toISOString();
+    const summary = {
+      schema_version: 1,
+      kind: 'harness_revalidation_program',
+      run_id: `revalidation-program-${completedAt.replace(/[:.]/g, '-')}`,
+      harness: 'revalidation-program',
+      status: coverage.ok ? 'pass' : 'fail',
+      app_version: `program-v${program.schema_version}`,
+      validator: 'tools/app-update-drift-sentinel.js:program-coverage',
+      read_only: true,
+      duration_ms: 0,
+      exit_code: coverage.ok ? 0 : 1,
+      completed_at: completedAt,
+      detail: coverage.ok
+        ? `coverage matrix ${coverage.matrix.length}/${coverage.matrix.length}; nightly tier-1 and staggered weekly tier-2 scheduled`
+        : coverage.matrix.flatMap(row => row.issues.map(issue => `${row.harness}: ${issue}`)).join('; '),
+      program_health: JSON.parse(JSON.stringify({
+        ...programState,
+        coverage_matrix: coverage.matrix,
+      })),
+    };
+    try {
+      await publishValidation(relay, summary);
+    } catch (error) {
+      failures += 1;
+      summary.publication_error = String(error?.message || error).slice(0, 1000);
+    }
+    appendLedgerEntry(options.ledger, summary);
+  }
+  return { baseline: false, changes: entries, deferred, failures, coverage };
 }
 
 async function main(argv = process.argv.slice(2)) {
@@ -351,6 +491,7 @@ module.exports = {
   DEFAULT_UNAVAILABLE_GRACE_MS,
   main,
   missingValidatorEntry,
+  coverageFailureEntry,
   parseArgs,
   revalidationPreviousVersion,
   scanForUpdates,

@@ -5773,7 +5773,7 @@ function UsageCostPanel({ cost, detailState, onRequestDetail }) {
   );
 }
 
-function UsageDashboard({ usage, refreshReceipt, resetReceipt, costDetail, onBack, onRefresh, onConsumeResetCredit, onRequestCostDetail }) {
+function UsageDashboard({ usage, refreshReceipt, resetReceipt, costDetail, onBack, onRefresh, onWatch, onConsumeResetCredit, onRequestCostDetail }) {
   const normalized = React.useMemo(() => normalizeProviderUsage(usage), [usage]);
   const [nowMs, setNowMs] = React.useState(Date.now());
   React.useEffect(() => {
@@ -5781,6 +5781,10 @@ function UsageDashboard({ usage, refreshReceipt, resetReceipt, costDetail, onBac
     const timer = setInterval(() => setNowMs(Date.now()), 30000);
     return () => clearInterval(timer);
   }, [onRefresh, normalized.collectionState]);
+  React.useEffect(() => {
+    onWatch(true);
+    return () => onWatch(false);
+  }, [onWatch]);
   const statusLabel = status => ({
     fresh: 'Fresh', refreshing: 'Refreshing', stale: 'Stale', auth_required: 'Sign in required',
     rate_limited: 'Refresh limited', unavailable: 'Unavailable',
@@ -5850,6 +5854,8 @@ function UsageDashboard({ usage, refreshReceipt, resetReceipt, costDetail, onBac
           const creditReset = entry.credits?.resets_at
             ? formatProviderUsageReset(entry.credits.resets_at, nowMs)
             : '';
+          const cardRefreshReceipt = refreshReceipt?.provider_id === entry.providerId ? refreshReceipt : null;
+          const cardRefreshPending = ['requested', 'accepted', 'coalesced'].includes(cardRefreshReceipt?.status);
           return (
             <details
               open
@@ -5870,9 +5876,21 @@ function UsageDashboard({ usage, refreshReceipt, resetReceipt, costDetail, onBac
                 <div className="usage-dashboard-card-meta">
                   <span>{entry.sessionCount} mapped session{entry.sessionCount === 1 ? '' : 's'}</span>
                   <span>{entry.harnessTypes.length > 0 ? entry.harnessTypes.join(', ') : 'No mapped surfaces'}</span>
-                  <span>{formatProviderUsageAge(entry.capturedAt, nowMs)}</span>
+                  <span>{entry.status === 'stale' ? `Stale - ${formatProviderUsageAge(entry.capturedAt, nowMs)}` : formatProviderUsageAge(entry.capturedAt, nowMs)}</span>
                   {entry.nextRefreshAt && <span>Next refresh {formatProviderUsageReset(entry.nextRefreshAt, nowMs)}</span>}
+                  {entry.refreshIntervalMs > 0 && <span>{entry.watchBoostActive ? `Live cadence ${Math.round(entry.refreshIntervalMs / 1000)}s` : `Idle cadence ${Math.round(entry.refreshIntervalMs / 1000)}s`}</span>}
+                  <button
+                    type="button"
+                    className="usage-card-refresh"
+                    onClick={() => onRefresh(true, entry.providerId)}
+                    disabled={cardRefreshPending}
+                    aria-label={`Refresh ${entry.providerName} usage now`}
+                  >{cardRefreshPending ? 'Refreshing...' : 'Refresh now'}</button>
                 </div>
+                {cardRefreshReceipt && <div className={`usage-refresh-receipt ${cardRefreshReceipt.status}`} role="status">
+                  Refresh {cardRefreshReceipt.status}{cardRefreshReceipt.code ? ` (${cardRefreshReceipt.code})` : ''}
+                  {cardRefreshReceipt.retry_after_ms ? ` - retry in ${Math.ceil(cardRefreshReceipt.retry_after_ms / 1000)}s` : ''}
+                </div>}
                 {entry.windows.length > 0 ? (
                   <div className="usage-dashboard-windows">
                     {entry.windows.map(window => {
@@ -6684,7 +6702,7 @@ function reconcileFleetSelection(previous, entryById, limit = MAX_BROADCAST_SESS
     ? previous : next;
 }
 
-function FleetView({ sessions, activities, thinking, permissionPrompts, errorPrompts, messages, agentConfigs, sessionAttention, health, connected, deliveryStates, onBroadcastSend, onBack, onSelectSession }) {
+function FleetView({ sessions, activities, thinking, permissionPrompts, errorPrompts, messages, agentConfigs, sessionAttention, health, connected, deliveryStates, stopPending, goalControlPending, onBroadcastSend, onInterrupt, onGoalControl, onBack, onSelectSession }) {
   const [nowMs, setNowMs] = React.useState(Date.now());
   const [showIdle, setShowIdle] = React.useState(false);
   const [selectedIds, setSelectedIds] = React.useState([]);
@@ -6735,6 +6753,10 @@ function FleetView({ sessions, activities, thinking, permissionPrompts, errorPro
       latestUserRequest: session?.last_user_request || latestUserRequestFromMessages(messages[id] || []),
     });
     const goal = workContext.kind === 'goal' ? capabilitySafeActivity?.goal || null : null;
+    const goalState = String(goal?.state || goal?.status || '').toLowerCase();
+    const goalAction = goalState === 'active' ? 'pause' : goalState === 'paused' ? 'resume' : null;
+    const turnActive = ['thinking', 'generating', 'running_command', 'applying_patch', 'reading_files', 'working']
+      .includes(String(capabilitySafeActivity?.kind || '').toLowerCase());
     const activityKind = safeString(capabilitySafeActivity?.kind).replace(/_/g, ' ');
     const usagePercent = Number(session?.percent_used);
     const usageReset = session?.rate_limited_until && session.rate_limited_until !== 'unknown'
@@ -6758,6 +6780,11 @@ function FleetView({ sessions, activities, thinking, permissionPrompts, errorPro
       canReceiveBroadcast: sessionSupportsBroadcast(session, agentConfigs[id], health[id] || 'unknown', connected),
       freshness: fleetFreshnessLabel(activity, nowMs),
       activityLatencyMs: Number.isFinite(Number(activity?.transport?.latency_ms)) ? Math.round(Number(activity.transport.latency_ms)) : null,
+      goalAction,
+      canControlGoal: !!(goalAction && goal?.fingerprint && config.capabilities?.goal_pause_resume === true
+        && Number(session?.control_generation) > 0),
+      canInterrupt: !!(turnActive && config.capabilities?.interrupt === true
+        && Number(session?.control_generation) > 0 && Number(session?.turn_generation) > 0),
     };
   }).filter(Boolean).sort((left, right) => (
     Number(right.attention) - Number(left.attention)
@@ -6875,7 +6902,7 @@ function FleetView({ sessions, activities, thinking, permissionPrompts, errorPro
       ) : (
         <div className="fleet-grid">
           {entries.map(entry => (
-            <div role="button" tabIndex={0} className={`fleet-card state-${entry.state}${entry.attention ? ' attention' : ''}${selectedIds.includes(entry.id) ? ' selected' : ''}`} key={entry.id} data-session-id={entry.id} data-activity-state={entry.state} data-activity-lag-ms={entry.activityLatencyMs ?? ''} onClick={() => onSelectSession(entry.id, entry.session)} onKeyDown={event => { if (event.key === 'Enter' || event.key === ' ') onSelectSession(entry.id, entry.session); }}>
+            <div role="button" tabIndex={0} className={`fleet-card state-${entry.state}${entry.attention ? ' attention' : ''}${selectedIds.includes(entry.id) ? ' selected' : ''}`} key={entry.id} data-session-id={entry.id} data-activity-state={entry.state} data-activity-lag-ms={entry.activityLatencyMs ?? ''} onClick={() => onSelectSession(entry.id, entry.session)} onKeyDown={event => { if (event.target === event.currentTarget && (event.key === 'Enter' || event.key === ' ')) onSelectSession(entry.id, entry.session); }}>
               <span className="fleet-card-top">
                 <span className="agent-badge" style={{ color: entry.agent.color, borderColor: entry.agent.color + '55', background: entry.agent.color + '18' }}>
                   {entry.agent.logo ? <img src={entry.agent.logo} alt="" className="agent-badge-logo" /> : entry.agent.abbr}
@@ -6894,6 +6921,25 @@ function FleetView({ sessions, activities, thinking, permissionPrompts, errorPro
                 {entry.working && <time>{fleetElapsed(entry.activity, nowMs)}</time>}
               </span>
               <span className="fleet-freshness" title="Proxy-to-Fleet delivery time">Activity {entry.freshness}</span>
+              {(entry.canControlGoal || entry.canInterrupt) && <span className="fleet-control-actions" role="group" aria-label={`Controls for ${entry.title}`} onClick={event => event.stopPropagation()}>
+                {entry.canControlGoal && <button
+                  type="button"
+                  onClick={() => onGoalControl(entry.id, entry.goalAction, entry.goal, entry.session)}
+                  disabled={!connected || !!goalControlPending?.[entry.id]}
+                  aria-label={`${entry.goalAction === 'pause' ? 'Pause' : 'Resume'} goal for ${entry.title}`}
+                >
+                  {goalControlPending?.[entry.id]
+                    ? (entry.goalAction === 'pause' ? 'Pausing...' : 'Resuming...')
+                    : (entry.goalAction === 'pause' ? 'Pause goal' : 'Resume goal')}
+                </button>}
+                {entry.canInterrupt && <button
+                  type="button"
+                  className="danger"
+                  onClick={() => onInterrupt(entry.id, entry.session)}
+                  disabled={!connected || !!stopPending?.[entry.id]}
+                  aria-label={`Interrupt turn for ${entry.title}`}
+                >{stopPending?.[entry.id] ? 'Interrupting...' : 'Interrupt turn'}</button>}
+              </span>}
               {entry.session?.agent_type === 'codex_cli' && entry.config?.config_semantics === 'observed_and_next_send' && (
                 <span className="fleet-freshness" title="Native observation and pending next-send override">
                   Observed {entry.config.observed_model_id || 'unknown'} / {entry.config.observed_effort || 'unknown'}
@@ -7105,7 +7151,7 @@ class AppErrorBoundary extends React.Component {
 }
 
 function App() {
-  const { sessions, messages, provisionalStreams, historyMeta, historyLoading, connected, connectionHealth, unread, setUnread, thinking, thinkingContent, activities, health, deliveryStates, launchStates, justLaunched, setJustLaunched, permissionPrompts, respondToPrompt, errorPrompts, respondToErrorPrompt, interruptSession, agentConfigs, configControlStates, requestAgentConfig, setAgentModel, setAgentEffort, setAgentPermissionMode, setAutoApprovePermissions, setAntigravityMode, setCodexConfig, newThread, openPanel, openNativeWindow, requestChatList, switchChat, newChat, chatLists, requestThreadList, switchThread, threadLists, switchWorkspace, requestTerminalOutput, sendTerminalInput, terminalOutputs, requestFileChanges, respondToFileChange, fileChanges, sendAttachment, send, sendToSession, steerMessage, discardQueuedMessage, editQueuedMessage, queuedMessages, scheduledSends, scheduleSend, cancelScheduledSend, launchSession, resumeSession, closeSession, activeSessionRef, restoreCachedTranscript, setSessionSubscriptions, workspaces, branchLists, requestBranchList, switchBranch, createBranch, skillLists, requestSkillList, automationViews, showCodexAutomation, controlResults, directoryListings, requestDirectoryListing, fileContents, requestFileContent, requestHistory, requestHistoryChunk, duplicateProxyAlarms, nightlyValidationFailures, latestAppUpdateValidation, providerUsage, providerUsageRefreshReceipt, requestProviderUsageRefresh, providerUsageResetReceipt, consumeProviderUsageResetCredit, providerUsageCostDetail, requestProviderUsageCostDetail, hostResources, hostResourceError, hostResourceHistory, hostResourceDetails, hostResourceSubscription, subscribeHostResources, unsubscribeHostResources, requestHostResourceRefresh, semanticNotifications } = useRelay();
+  const { sessions, messages, provisionalStreams, historyMeta, historyLoading, connected, connectionHealth, unread, setUnread, thinking, thinkingContent, activities, health, deliveryStates, launchStates, justLaunched, setJustLaunched, permissionPrompts, respondToPrompt, errorPrompts, respondToErrorPrompt, interruptSession, controlGoal, agentConfigs, configControlStates, requestAgentConfig, setAgentModel, setAgentEffort, setAgentPermissionMode, setAutoApprovePermissions, setAntigravityMode, setCodexConfig, newThread, openPanel, openNativeWindow, requestChatList, switchChat, newChat, chatLists, requestThreadList, switchThread, threadLists, switchWorkspace, requestTerminalOutput, sendTerminalInput, terminalOutputs, requestFileChanges, respondToFileChange, fileChanges, sendAttachment, send, sendToSession, steerMessage, discardQueuedMessage, editQueuedMessage, queuedMessages, scheduledSends, scheduleSend, cancelScheduledSend, launchSession, resumeSession, closeSession, activeSessionRef, restoreCachedTranscript, setSessionSubscriptions, workspaces, branchLists, requestBranchList, switchBranch, createBranch, skillLists, requestSkillList, automationViews, showCodexAutomation, controlResults, directoryListings, requestDirectoryListing, fileContents, requestFileContent, requestHistory, requestHistoryChunk, duplicateProxyAlarms, nightlyValidationFailures, latestAppUpdateValidation, revalidationProgramHealth, providerUsage, providerUsageRefreshReceipt, requestProviderUsageRefresh, setProviderUsageWatching, providerUsageResetReceipt, consumeProviderUsageResetCredit, providerUsageCostDetail, requestProviderUsageCostDetail, hostResources, hostResourceError, hostResourceHistory, hostResourceDetails, hostResourceSubscription, subscribeHostResources, unsubscribeHostResources, requestHostResourceRefresh, semanticNotifications } = useRelay();
   const [activeSession, setActiveSession] = useState(null);
   const subscribeActiveTranscript = React.useCallback(
     listener => subscribeCachedTranscript(activeSession, listener),
@@ -7148,7 +7194,9 @@ function App() {
   const [quickSwitcherQuery, setQuickSwitcherQuery] = useState('');
   const [quickSwitcherIndex, setQuickSwitcherIndex] = useState(0);
   const [shortcutHelpOpen, setShortcutHelpOpen] = useState(false);
+  const [revalidationLedgerOpen, setRevalidationLedgerOpen] = useState(false);
   const [stopPending, setStopPending]       = useState({});
+  const [goalControlPending, setGoalControlPending] = useState({});
   const [interruptConfirmSession, setInterruptConfirmSession] = useState(null);
   const interruptConfirmRef = useRef({ sessionId: null, expiresAt: 0 });
   const interruptConfirmTimerRef = useRef(null);
@@ -8161,6 +8209,31 @@ function App() {
     });
   }, [thinking]);
 
+  useEffect(() => {
+    const completedStops = Object.entries(stopPending)
+      .filter(([, requestId]) => controlResults[requestId]);
+    const completedGoals = Object.entries(goalControlPending)
+      .filter(([, requestId]) => controlResults[requestId]);
+    if (completedStops.length > 0) {
+      const completedIds = new Set(completedStops.map(([sessionId]) => sessionId));
+      setStopPending(previous => Object.fromEntries(
+        Object.entries(previous).filter(([sessionId]) => !completedIds.has(sessionId)),
+      ));
+    }
+    if (completedGoals.length > 0) {
+      const completedIds = new Set(completedGoals.map(([sessionId]) => sessionId));
+      setGoalControlPending(previous => Object.fromEntries(
+        Object.entries(previous).filter(([sessionId]) => !completedIds.has(sessionId)),
+      ));
+    }
+    const failure = [...completedStops, ...completedGoals]
+      .map(([, requestId]) => controlResults[requestId])
+      .find(receipt => receipt?.result === 'failed');
+    if (failure) showToast(failure.error?.message || (
+      failure.command === 'agent_interrupt' ? 'Interrupt did not apply' : 'Goal control did not apply'
+    ));
+  }, [controlResults, stopPending, goalControlPending]);
+
   // Connection toast
   useEffect(() => {
     if (!prevConnected.current && connected) showToast('Reconnected');
@@ -8619,8 +8692,26 @@ async function uploadBinaryDraft(sessionId, base64, mimeType, filename) {
       return;
     }
     clearInterruptConfirm();
-    setStopPending(prev => ({ ...prev, [activeSession]: true }));
-    interruptSession(activeSession);
+    requestSessionInterrupt(activeSession, activeSessionMeta);
+  }
+
+  function requestSessionInterrupt(sessionId, sessionMeta) {
+    if (!sessionId || stopPending[sessionId]) return null;
+    const requestId = interruptSession(sessionId, {
+      sessionGeneration: sessionMeta?.control_generation,
+      turnGeneration: sessionMeta?.turn_generation,
+    });
+    setStopPending(prev => ({ ...prev, [sessionId]: requestId }));
+    return requestId;
+  }
+
+  function requestGoalControl(sessionId, action, goal, sessionMeta) {
+    if (!sessionId || !goal || goalControlPending[sessionId]) return null;
+    const requestId = controlGoal(sessionId, action, goal, {
+      sessionGeneration: sessionMeta?.control_generation,
+    });
+    setGoalControlPending(prev => ({ ...prev, [sessionId]: requestId }));
+    return requestId;
   }
 
   useEffect(() => () => {
@@ -8819,7 +8910,10 @@ async function uploadBinaryDraft(sessionId, base64, mimeType, filename) {
       stickTranscriptToNewest(scrollIdentityKeysForMessages(activeMessagesForScroll), 3);
     }
   }, [activeSession, activePrompt?.prompt_id, activeLiveScrollVersion, activeMessagesForScroll]);
-  const canSend         = !!(currentInput.trim() || attachedFiles.length > 0) && !!activeSession && !uploading && !activeBlockingPrompt;
+  const activeWriteGate = activeSession
+    ? agentConfigs[activeSession]?.capabilities?.write_capability_gate || null
+    : null;
+  const canSend         = !!(currentInput.trim() || attachedFiles.length > 0) && !!activeSession && !uploading && !activeBlockingPrompt && !activeWriteGate;
   const relayHealthState = connected ? (connectionHealth?.state || 'connecting') : 'offline';
   const relayRttText = connectionHealth?.rttMs != null ? ` · ${connectionHealth.rttMs} ms` : '';
   const unreadTotal     = Object.entries(unread).reduce((total, [sessionId, count]) => (
@@ -8835,7 +8929,12 @@ async function uploadBinaryDraft(sessionId, base64, mimeType, filename) {
   const visibleNightlyValidationFailures = recentAppUpdateValidation
     ? nightlyValidationFailures.filter(item => item.run_id !== recentAppUpdateValidation.run_id)
     : nightlyValidationFailures;
-  const hasSystemBanner = duplicateProxyAlarms.length > 0 || visibleNightlyValidationFailures.length > 0 || !!recentAppUpdateValidation;
+  const revalidationCoverageByHarness = Object.fromEntries(
+    (revalidationProgramHealth?.coverage_matrix || []).map(row => [row.harness, row]),
+  );
+  const revalidationRows = Object.entries(revalidationProgramHealth?.harnesses || {})
+    .sort(([left], [right]) => left.localeCompare(right));
+  const hasSystemBanner = duplicateProxyAlarms.length > 0 || visibleNightlyValidationFailures.length > 0 || !!recentAppUpdateValidation || !!activeWriteGate;
   const slashQuery      = currentInput.startsWith('/') ? currentInput.slice(1).trim().toLowerCase() : '';
   const filteredSlashCommands = currentInput.startsWith('/')
     ? SLASH_COMMANDS.filter(item => item.command.slice(1).includes(slashQuery))
@@ -8852,7 +8951,7 @@ async function uploadBinaryDraft(sessionId, base64, mimeType, filename) {
     const observer = new ResizeObserver(updateHeight);
     observer.observe(banner);
     return () => observer.disconnect();
-  }, [hasSystemBanner, duplicateProxyAlarms.length, visibleNightlyValidationFailures.length, recentAppUpdateValidation?.run_id]);
+  }, [hasSystemBanner, duplicateProxyAlarms.length, visibleNightlyValidationFailures.length, recentAppUpdateValidation?.run_id, activeWriteGate]);
 
   // Resolve display label for the active session
   const activeConfig = activeSession ? (agentConfigs[activeSession] || null) : null;
@@ -9106,6 +9205,21 @@ async function uploadBinaryDraft(sessionId, base64, mimeType, filename) {
         ? activities[activeSession]
         : (activeSessionMeta && typeof activeSessionMeta === 'object' ? activeSessionMeta.activity : null))
     : null;
+  const activeGoal = activeActivity?.goal || null;
+  const activeGoalState = String(activeGoal?.state || activeGoal?.status || '').toLowerCase();
+  const activeGoalAction = activeGoalState === 'active' ? 'pause' : activeGoalState === 'paused' ? 'resume' : null;
+  const activeGoalControlAvailable = !!(
+    activeGoalAction
+    && activeGoal?.fingerprint
+    && activeConfig?.capabilities?.goal_pause_resume === true
+    && Number(activeSessionMeta?.control_generation) > 0
+  );
+  const activeInterruptAvailable = !!(
+    isActiveThinking
+    && activeConfig?.capabilities?.interrupt === true
+    && Number(activeSessionMeta?.control_generation) > 0
+    && Number(activeSessionMeta?.turn_generation) > 0
+  );
   const activeContextCard = activeActivity?.context_card || null;
   const showLastUserBanner = !!(
     activeSession
@@ -9658,9 +9772,52 @@ async function uploadBinaryDraft(sessionId, base64, mimeType, filename) {
           </div>
         </div>
       )}
+      {revalidationLedgerOpen && (
+        <div
+          className="shortcut-help-overlay revalidation-ledger-backdrop"
+          role="presentation"
+          onMouseDown={event => {
+            if (event.target === event.currentTarget) setRevalidationLedgerOpen(false);
+          }}
+        >
+          <div className="revalidation-ledger" role="dialog" aria-modal="true" aria-label="Harness revalidation program health">
+            <div className="shortcut-help-header">
+              <strong>Harness revalidation program</strong>
+              <button type="button" onClick={() => setRevalidationLedgerOpen(false)} aria-label="Close validation health">{'\u00d7'}</button>
+            </div>
+            <p className="revalidation-ledger-summary">
+              Continuous version watch, nightly tier-1, and staggered weekly tier-2. Write controls fail closed after drift until the installed version passes its required tiers.
+            </p>
+            {revalidationRows.length === 0 ? (
+              <div className="revalidation-ledger-empty">Program health has not been published by the updated sentinel yet.</div>
+            ) : (
+              <div className="revalidation-ledger-table-wrap">
+                <table className="revalidation-ledger-table">
+                  <thead><tr><th>Harness</th><th>Version</th><th>Fixture</th><th>Tier 1</th><th>Tier 2</th><th>Write gate</th><th>Next tier 2</th></tr></thead>
+                  <tbody>{revalidationRows.map(([harness, record]) => {
+                    const coverage = revalidationCoverageByHarness[harness] || {};
+                    const tier2 = coverage.tier2 || {};
+                    const tier2Label = record.last_tier2_status
+                      || (tier2.mode === 'gated' ? 'gated' : 'scheduled');
+                    return <tr key={harness}>
+                      <th scope="row">{harness}</th>
+                      <td>{record.installed_version || 'not installed'}</td>
+                      <td>{coverage.fixture ? 'covered' : 'missing'}</td>
+                      <td>{coverage.tier1 ? 'covered' : 'missing'}</td>
+                      <td className={`validation-state-${tier2Label}`}>{tier2Label}</td>
+                      <td className={`validation-state-${record.status || 'pending'}`}>{record.status === 'pass' ? 'available' : record.status || 'pending'}</td>
+                      <td>{record.next_tier2_at ? new Date(record.next_tier2_at).toLocaleString() : 'unscheduled'}</td>
+                    </tr>;
+                  })}</tbody>
+                </table>
+              </div>
+            )}
+          </div>
+        </div>
+      )}
       <div className={`overlay ${sidebarOpen ? 'open' : ''}`} onClick={() => setSidebarOpen(false)} />
       {hasSystemBanner && (
-        <div className={`duplicate-proxy-banner${recentAppUpdateValidation?.status === 'pass' && duplicateProxyAlarms.length === 0 && visibleNightlyValidationFailures.length === 0 ? ' app-update-pass' : ''}`} role={recentAppUpdateValidation?.status === 'pass' && duplicateProxyAlarms.length === 0 && visibleNightlyValidationFailures.length === 0 ? 'status' : 'alert'} ref={systemBannerRef}>
+        <div className={`duplicate-proxy-banner${recentAppUpdateValidation?.status === 'pass' && duplicateProxyAlarms.length === 0 && visibleNightlyValidationFailures.length === 0 && !activeWriteGate ? ' app-update-pass' : ''}`} role={recentAppUpdateValidation?.status === 'pass' && duplicateProxyAlarms.length === 0 && visibleNightlyValidationFailures.length === 0 && !activeWriteGate ? 'status' : 'alert'} ref={systemBannerRef}>
           {duplicateProxyAlarms.length > 0 && <>
             <strong>Duplicate proxy detected.</strong>
             <span>{duplicateProxyAlarms.length} session{duplicateProxyAlarms.length === 1 ? '' : 's'} claimed by multiple proxies. Stop the extra proxy to prevent conflicting controls.</span>
@@ -9673,6 +9830,11 @@ async function uploadBinaryDraft(sessionId, base64, mimeType, filename) {
             <strong>{recentAppUpdateValidation.status === 'pass' ? 'App update validated.' : 'App update drift validation failed.'}</strong>
             <span>{recentAppUpdateValidation.harness} {recentAppUpdateValidation.previous_app_version} -&gt; {recentAppUpdateValidation.app_version}. {recentAppUpdateValidation.status === 'pass' ? 'Harness controls remain available.' : 'A triage item was added to the maturity backlog.'}</span>
           </>}
+          {activeWriteGate && <>
+            <strong>Harness writes paused.</strong>
+            <span>{activeWriteGate}. Read-only transcript access remains available.</span>
+          </>}
+          {revalidationProgramHealth && <button type="button" className="validation-health-link" onClick={() => setRevalidationLedgerOpen(true)}>View program health</button>}
         </div>
       )}
 
@@ -9681,6 +9843,12 @@ async function uploadBinaryDraft(sessionId, base64, mimeType, filename) {
         <div className="sidebar-header">
           <span className="logo">⌬</span>
           <span style={{ flex: 1 }}>Agent Sessions</span>
+          <button
+            className={`new-session-btn notification-settings-btn${revalidationLedgerOpen ? ' active' : ''}`}
+            title="Harness validation health"
+            aria-label="Harness validation health"
+            onClick={() => setRevalidationLedgerOpen(true)}
+          >V</button>
           <button
             className={`new-session-btn notification-settings-btn${shortcutHelpOpen ? ' active' : ''}`}
             title="Keyboard shortcuts (?)"
@@ -10098,6 +10266,7 @@ async function uploadBinaryDraft(sessionId, base64, mimeType, filename) {
             costDetail={providerUsageCostDetail}
             onBack={() => setShowUsageDashboard(false)}
             onRefresh={requestProviderUsageRefresh}
+            onWatch={setProviderUsageWatching}
             onConsumeResetCredit={consumeProviderUsageResetCredit}
             onRequestCostDetail={requestProviderUsageCostDetail}
           />
@@ -10128,7 +10297,11 @@ async function uploadBinaryDraft(sessionId, base64, mimeType, filename) {
             health={health}
             connected={connected}
             deliveryStates={deliveryStates}
+            stopPending={stopPending}
+            goalControlPending={goalControlPending}
             onBroadcastSend={sendToSession}
+            onInterrupt={requestSessionInterrupt}
+            onGoalControl={requestGoalControl}
             onBack={() => setShowFleetView(false)}
             onSelectSession={(sessionId, session) => {
               selectSession(sessionId, session);
@@ -10241,6 +10414,30 @@ async function uploadBinaryDraft(sessionId, base64, mimeType, filename) {
                     providerUsage={providerUsage}
                     onOpenUsage={() => { captureChatRouteScroll(); setShowUsageDashboard(true); setShowHostResourceDashboard(false); setShowFleetView(false); }}
                   />
+                  {activeGoalControlAvailable && (
+                    <button
+                      type="button"
+                      className="context-pill session-control-pill goal-control"
+                      onClick={() => requestGoalControl(activeSession, activeGoalAction, activeGoal, activeSessionMeta)}
+                      disabled={!connected || !!goalControlPending[activeSession]}
+                      aria-label={`${activeGoalAction === 'pause' ? 'Pause' : 'Resume'} goal`}
+                    >
+                      {goalControlPending[activeSession]
+                        ? (activeGoalAction === 'pause' ? 'Pausing goal...' : 'Resuming goal...')
+                        : (activeGoalAction === 'pause' ? 'Pause goal' : 'Resume goal')}
+                    </button>
+                  )}
+                  {activeInterruptAvailable && (
+                    <button
+                      type="button"
+                      className="context-pill session-control-pill interrupt-control"
+                      onClick={() => requestSessionInterrupt(activeSession, activeSessionMeta)}
+                      disabled={!connected || !!stopPending[activeSession]}
+                      aria-label="Interrupt turn"
+                    >
+                      {stopPending[activeSession] ? 'Interrupting...' : 'Interrupt turn'}
+                    </button>
+                  )}
                   {activeSessionMeta?.agent_type === 'codex' && activeSessionMeta?.visible_pane_visible && (
                     <span
                       className={`context-pill ${activeCodexPaneLive ? 'ok' : 'warn'}`}
@@ -10939,7 +11136,7 @@ async function uploadBinaryDraft(sessionId, base64, mimeType, filename) {
                     title={isAntigravityV2 ? 'New Antigravity conversation' : 'New chat'}
                   >+</button>
                 )}
-                {isActiveThinking ? (
+                {activeInterruptAvailable ? (
                   <button
                     className={`stop-btn${isStopPending ? ' pending' : ''}`}
                     title={isStopPending ? 'Interrupting…' : 'Interrupt agent'}

@@ -2,16 +2,20 @@
 'use strict';
 
 const assert = require('assert');
+const { EventEmitter } = require('events');
 const path = require('path');
 const {
   ProviderUsageError,
   ProviderUsageRegistry,
   accountFingerprint,
+  bindCodexAppServerInput,
   collectAntigravity,
   collectClaude,
+  collectOllama,
   normalizedWindow,
   parseClaudeCliUsage,
   readCursorLocalAuth,
+  requestLoopbackJson,
   relativeDurationMs,
 } = require('../agent-proxy/provider-usage');
 const { LocalUsageCostScanner, aggregateRecords } = require('../agent-proxy/usage-costs');
@@ -27,6 +31,24 @@ const { ProviderUsageAuthority } = require('../relay-server/provider-usage-autho
 
 const KEY = 'deterministic-provider-usage-smoke-key';
 const CAPTURED_AT = '2026-07-14T12:00:00.000Z';
+
+function codexAppServerPipeFixture() {
+  const stdin = new EventEmitter();
+  stdin.write = () => true;
+  let captured = null;
+  const send = bindCodexAppServerInput({ stdin }, error => { captured = error; });
+  const pipeError = Object.assign(new Error('fixture pipe closed'), { code: 'EPIPE' });
+  stdin.emit('error', pipeError);
+  assert(captured instanceof ProviderUsageError, 'Codex app-server stdin errors must be handled');
+  assert.strictEqual(captured.code, 'app_server_epipe');
+  captured = null;
+  stdin.write = (_payload, callback) => {
+    callback(pipeError);
+    return false;
+  };
+  send({ id: 1, method: 'initialize' });
+  assert.strictEqual(captured.code, 'app_server_epipe', 'asynchronous stdin write failures must fail closed');
+}
 
 function antigravityResetFixture() {
   assert.strictEqual(relativeDurationMs('4h 30m'), 16_200_000);
@@ -269,6 +291,72 @@ async function screenshotFixture() {
   return { registry, payload };
 }
 
+async function ollamaFixture() {
+  const requests = [];
+  const requester = async pathname => {
+    requests.push(pathname);
+    if (pathname === '/api/ps') return {
+      models: [{
+        name: 'qwen3.5:fixture',
+        size: 4_200_000_000,
+        size_vram: 3_100_000_000,
+        context_length: 32768,
+        expires_at: '2026-07-16T18:00:00.000Z',
+      }],
+    };
+    if (pathname === '/api/tags') return { models: [{ name: 'qwen3.5:fixture' }, { name: 'gemma3:fixture' }] };
+    throw new Error(`unexpected fixture path: ${pathname}`);
+  };
+  const collected = await collectOllama(KEY, {
+    requester,
+    receiptReader: () => [],
+    cloudReader: async () => ({ ok: false, code: 'fixture_unavailable', message: 'Fixture cloud source unavailable.' }),
+  });
+  assert.deepStrictEqual(requests.sort(), ['/api/ps', '/api/tags']);
+  assert.strictEqual(collected.local_runtime.status, 'running');
+  assert.strictEqual(collected.local_runtime.loaded_models_count, 1);
+  assert.strictEqual(collected.local_runtime.installed_models_count, 2);
+  assert.strictEqual(collected.local_runtime.loaded_models[0].context_length, 32768);
+  for (const field of [
+    'prompt_tokens', 'response_tokens', 'total_duration_ns', 'load_duration_ns',
+    'prompt_eval_duration_ns', 'eval_duration_ns',
+  ]) {
+    assert.strictEqual(collected.local_runtime[field], null,
+      `Ollama ${field} must remain unreported without an owned request receipt`);
+  }
+  const registry = new ProviderUsageRegistry({
+    getSessions: () => [],
+    collectors: { ollama: async () => collected },
+    fingerprintKey: KEY,
+  });
+  const payload = await registry.refresh({ force: true });
+  assert.strictEqual(payload.snapshots.length, 1,
+    'an explicitly injected always-on Ollama collector must run without a mapped chat session');
+  assert.strictEqual(payload.snapshots[0].provider_id, 'ollama-local');
+  assert.strictEqual(payload.snapshots[0].session_count, 0);
+  assert.ok(sanitizeProviderUsageSnapshot(payload),
+    `relay sanitizer must accept the Ollama runtime fixture (${providerUsageBoundaryViolation(payload)})`);
+  const absentRegistry = new ProviderUsageRegistry({
+    getSessions: () => [],
+    collectors: {
+      ollama: async () => {
+        throw new ProviderUsageError('Ollama is not running.', { code: 'not_running' });
+      },
+    },
+    fingerprintKey: KEY,
+  });
+  const absent = await absentRegistry.refresh({ force: true });
+  assert.strictEqual(absent.snapshots.length, 1);
+  assert.strictEqual(absent.snapshots[0].provider_id, 'ollama-local');
+  assert.strictEqual(absent.snapshots[0].status, 'unavailable');
+  assert.strictEqual(absent.snapshots[0].error.code, 'not_running');
+  await assert.rejects(
+    requestLoopbackJson('/api/ps', { baseUrl: `http://${[192, 168, 1, 1].join('.')}:11434` }),
+    error => error?.code === 'endpoint_rejected',
+    'Ollama collection must reject every non-loopback endpoint before network I/O',
+  );
+}
+
 async function distinctAccountFixture() {
   const collectors = screenshotCollectors();
   collectors.codex = async () => [
@@ -429,23 +517,33 @@ async function costDetailPaginationFixture() {
 
 async function failureAndBackoffFixtures() {
   const collectors = screenshotCollectors();
+  let now = Date.now();
   const registry = new ProviderUsageRegistry({
     getSessions: () => sessions('codex', 60),
     collectors,
     fingerprintKey: KEY,
     pollIntervalMs: 300000,
     random: () => 0.5,
+    now: () => now,
   });
   await registry.refresh({ force: true });
   collectors.codex = async () => { throw new ProviderUsageError('offline', { code: 'network_error' }); };
   registry.collectors.codex = collectors.codex;
   registry.lastCompletedAt = 0;
   await registry.refresh({ force: true });
+  const firstMiss = registry.snapshot().snapshots[0];
+  assert.strictEqual(firstMiss.status, 'fresh', 'one missed refresh keeps bounded last-good data fresh');
+  assert.strictEqual(firstMiss.consecutive_misses, 1);
+  assert.strictEqual(firstMiss.error, null);
+  now += 16_000;
+  await registry.refresh({ force: true });
   const stale = registry.snapshot().snapshots[0];
   assert.strictEqual(stale.status, 'stale');
+  assert.strictEqual(stale.stale_reason, 'two_consecutive_misses');
+  assert.strictEqual(stale.consecutive_misses, 2);
   assert.ok(stale.windows.length > 0, 'last-known-good windows must survive a fetch failure');
   assert.strictEqual(stale.error.code, 'network_error');
-  assert.ok(registry.nextAllowedAt.get('codex') - Date.now() > 13000, 'network failure must back off');
+  assert.ok(registry.nextAllowedAt.get('codex') - now > 28000, 'repeated network failure must back off');
 
   let rateLimitedCalls = 0;
   const limited = new ProviderUsageRegistry({
@@ -535,11 +633,13 @@ function authorityFixture(payload) {
 }
 
 async function main() {
+  codexAppServerPipeFixture();
   antigravityResetFixture();
   await claudeCliFallbackFixture();
   await hiddenPtyTransportFixture();
   await cursorPythonSqliteFallbackFixture();
   const { payload } = await screenshotFixture();
+  await ollamaFixture();
   costBoundaryMatrixFixture(payload);
   await costDetailPaginationFixture();
   await distinctAccountFixture();

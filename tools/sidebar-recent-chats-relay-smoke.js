@@ -151,8 +151,7 @@ function assertCanonical(target, expectedId = null) {
   assert.strictEqual(target.last_message_at, MESSAGE_AT);
   assert.strictEqual(target.last_message_kind, 'assistant');
   assert.strictEqual(target.last_message_source, 'fixture_stream');
-  assert.match(target.last_message_id, /^relay:\d{20}$/);
-  if (expectedId) assert.strictEqual(target.last_message_id, expectedId);
+  assert.strictEqual(target.last_message_id, expectedId || 'fixture-message-1');
   assert.deepStrictEqual(target.latest_visible_message, {
     id: target.last_message_id,
     at: MESSAGE_AT,
@@ -207,6 +206,20 @@ async function run() {
     }));
     const firstSummary = await client.next(message => message.type === 'session_summary' && message.session_id === TARGET);
     const messageId = assertCanonical(firstSummary);
+
+    // A source-backed streaming replacement may delete/reinsert the SQLite
+    // suffix, but the canonical Recent identity must remain the producer's
+    // durable source ID rather than churn with the relay row ID.
+    proxy.ws.send(JSON.stringify({
+      type: 'history_snapshot', session_id: TARGET, session: TARGET,
+      messages: [{
+        role: 'assistant', content: `${MESSAGE_CONTENT} streamed growth`,
+        created_at: MESSAGE_AT, ts: Date.parse(MESSAGE_AT) / 1000,
+        source_message_id: 'fixture-message-1', source: 'fixture_stream',
+      }],
+    }));
+    const streamedSummary = await client.next(message => message.type === 'session_summary' && message.session_id === TARGET);
+    assertCanonical(streamedSummary, messageId);
 
     // Duplicate ID and older persisted rows cannot replace the canonical identity.
     proxy.ws.send(JSON.stringify({
@@ -277,6 +290,7 @@ async function run() {
       latest_message_id: messageId,
       authoritative_message_at: MESSAGE_AT,
       duplicate_delta_moves: 0,
+      streaming_resync_identity_stable: true,
       older_message_moves: 0,
       status_noise_moves: 0,
       cold_restart_match: true,

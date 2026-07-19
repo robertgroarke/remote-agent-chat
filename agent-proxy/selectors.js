@@ -8268,6 +8268,7 @@ async function interruptAgent(Runtime, agentType, sessionId, cdpClient = null) {
   const normalised = (agentType === 'antigravity' || agentType === 'antigravity_panel') ? 'claude'
     : agentType === 'claude-desktop' ? 'claude'
     : agentType === 'codex-desktop'  ? 'codex'
+    : agentType === 'continue_yolo'  ? 'continue'
     : agentType === 'cline'          ? 'roo_code'
     : agentType; // 'continue', 'gemini', 'claude', 'codex', 'roo_code' pass through
   const sels = STOP_SELECTORS[normalised] || STOP_SELECTORS.claude;
@@ -15489,6 +15490,99 @@ async function readAntigravityModelQuota(Runtime) {
   }
 }
 
+// Pause/resume the goal shown by an owned Codex extension/Desktop surface.
+// The adapter is deliberately DOM-scoped: it requires one visible native goal
+// action, validates the currently rendered goal identity before clicking, and
+// then reads the native surface back until the requested state is authoritative.
+async function controlCodexGoal(Runtime, agentType, action, expected = {}) {
+  if (!['codex', 'codex-desktop'].includes(agentType)) {
+    return { ok: false, native_attempted: false, retryable: false, code: 'goal_control_unsupported', detail: 'Goal controls are Codex-only' };
+  }
+  if (!['pause', 'resume'].includes(action)) {
+    return { ok: false, native_attempted: false, retryable: false, code: 'goal_action_invalid', detail: 'Goal action must be pause or resume' };
+  }
+  const beforeState = action === 'pause' ? 'active' : 'paused';
+  const afterState = action === 'pause' ? 'paused' : 'active';
+  const before = await detectThinking(Runtime, agentType);
+  const observedGoal = before?.goal || null;
+  const observedState = String(observedGoal?.state || observedGoal?.status || '').toLowerCase();
+  const observedObjective = String(observedGoal?.objective || observedGoal?.text || '').trim();
+  const observedTokenBudget = observedGoal?.token_budget ?? observedGoal?.tokenBudget ?? null;
+  const observedGeneration = observedGoal?.generation ?? null;
+  const expectedObjective = String(expected.objective || '').trim();
+  if (!observedGoal || observedState !== beforeState) {
+    return { ok: false, native_attempted: false, retryable: true, code: 'native_goal_changed', detail: `Native goal is not ${beforeState}` };
+  }
+  if (expectedObjective && observedObjective !== expectedObjective) {
+    return { ok: false, native_attempted: false, retryable: false, code: 'native_goal_changed', detail: 'Native goal objective changed' };
+  }
+
+  const evalFn = agentType === 'codex-desktop' ? evalInPage : evalInFrame;
+  const targetLabel = action === 'pause' ? 'Pause goal' : 'Resume goal';
+  let clicked;
+  try {
+    clicked = await evalFn(Runtime, `
+      function visible(el) {
+        if (!el || !el.getBoundingClientRect) return false;
+        var rect = el.getBoundingClientRect();
+        var style = window.getComputedStyle ? window.getComputedStyle(el) : null;
+        return rect.width > 0 && rect.height > 0 && (!style ||
+          (style.display !== 'none' && style.visibility !== 'hidden' && style.opacity !== '0'));
+      }
+      function norm(value) { return String(value || '').replace(/\\s+/g, ' ').trim(); }
+      var wanted = ${JSON.stringify(targetLabel)}.toLowerCase();
+      var buttons = Array.from(d.querySelectorAll('button')).filter(function(button) {
+        if (!visible(button) || button.disabled || button.getAttribute('aria-disabled') === 'true') return false;
+        var labels = [button.innerText, button.textContent, button.getAttribute('aria-label'), button.getAttribute('title')]
+          .map(norm).filter(Boolean).map(function(value) { return value.toLowerCase(); });
+        return labels.indexOf(wanted) !== -1;
+      });
+      if (buttons.length !== 1) return JSON.stringify({ ok: false, code: buttons.length ? 'goal_action_ambiguous' : 'goal_action_missing', count: buttons.length });
+      buttons[0].click();
+      return JSON.stringify({ ok: true });
+    `);
+    if (typeof clicked === 'string') clicked = JSON.parse(clicked);
+  } catch (error) {
+    return { ok: false, native_attempted: false, retryable: true, code: 'goal_action_exception', detail: error.message };
+  }
+  if (!clicked?.ok) {
+    return { ok: false, native_attempted: false, retryable: true, code: clicked?.code || 'goal_action_missing', detail: 'The native goal action is not uniquely available' };
+  }
+
+  for (let attempt = 0; attempt < 50; attempt += 1) {
+    await new Promise(resolve => setTimeout(resolve, 100));
+    const after = await detectThinking(Runtime, agentType);
+    const goal = after?.goal || null;
+    const state = String(goal?.state || goal?.status || '').toLowerCase();
+    const objective = String(goal?.objective || goal?.text || '').trim();
+    if (state === afterState && (!expectedObjective || objective === expectedObjective)) {
+      const tokenBudget = goal?.token_budget ?? goal?.tokenBudget ?? null;
+      const generation = goal?.generation ?? null;
+      if (tokenBudget !== observedTokenBudget
+          || (observedGeneration != null && generation !== observedGeneration)) {
+        return {
+          ok: false,
+          native_attempted: true,
+          retryable: false,
+          code: 'goal_identity_changed',
+          detail: 'Native goal control changed the generation or token budget',
+        };
+      }
+      return {
+        ok: true,
+        native_attempted: true,
+        native_acknowledged: true,
+        native_operations: 1,
+        transcript_messages_appended: 0,
+        before: observedGoal,
+        after: goal,
+        method: agentType === 'codex-desktop' ? 'codex_desktop_goal_dom' : 'codex_extension_goal_dom',
+      };
+    }
+  }
+  return { ok: false, native_attempted: true, retryable: true, code: 'goal_action_not_acknowledged', detail: `Native goal did not become ${afterState}` };
+}
+
 async function readAntigravityInternalQuota(Runtime, forceRefresh = true) {
   try {
     const expression = READ_ANTIGRAVITY_INTERNAL_QUOTA_EXPR.replace(
@@ -16469,6 +16563,7 @@ module.exports = {
   setAgentModel,
   setAgentPermissionMode,
   setAntigravityMode,
+  controlCodexGoal,
   interruptAgent,
   detectPermissionDialog,
   detectCodexDesktopQuestion,

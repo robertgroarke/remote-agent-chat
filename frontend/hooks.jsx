@@ -289,6 +289,7 @@ export function useRelay() {
     const [duplicateProxyAlarms, setDuplicateProxyAlarms] = useState([]);
     const [nightlyValidationFailures, setNightlyValidationFailures] = useState([]);
     const [latestAppUpdateValidation, setLatestAppUpdateValidation] = useState(null);
+    const [revalidationProgramHealth, setRevalidationProgramHealth] = useState(null);
     const [providerUsage, setProviderUsage] = useState(null);
     const [providerUsageRefreshReceipt, setProviderUsageRefreshReceipt] = useState(null);
     const [providerUsageResetReceipt, setProviderUsageResetReceipt] = useState(null);
@@ -313,6 +314,7 @@ export function useRelay() {
     const configControlTimers = useRef({});
     const agentConfigsRef = useRef({});
     const wsRef            = useRef(null);
+    const controlConnectionIdRef = useRef('');
     const sessionSubscriptionsRef = useRef([]);
     const sessionSubscriptionSerial = useRef(0);
     const reconnectAttempt = useRef(0);
@@ -453,16 +455,25 @@ export function useRelay() {
       }
     }, []);
 
-    const requestProviderUsageRefresh = useCallback((force = false) => {
+    const requestProviderUsageRefresh = useCallback((force = false, providerId = null) => {
       const requestId = `provider-usage-${Date.now()}-${Math.random().toString(36).slice(2, 7)}`;
-      setProviderUsageRefreshReceipt({ requestId, status: 'requested' });
+      setProviderUsageRefreshReceipt({ requestId, status: 'requested', provider_id: providerId || null });
       send({
         type: 'provider_usage_refresh',
         protocol_version: 1,
         force: force === true,
+        ...(providerId ? { provider_id: providerId } : {}),
         request_id: requestId,
       });
       return requestId;
+    }, [send]);
+
+    const setProviderUsageWatching = useCallback((active) => {
+      send({
+        type: 'provider_usage_watch',
+        protocol_version: 1,
+        active: active === true,
+      });
     }, [send]);
 
     const consumeProviderUsageResetCredit = useCallback(() => {
@@ -1327,9 +1338,32 @@ export function useRelay() {
       });
     }
 
-    function interruptSession(sessionId) {
+    function interruptSession(sessionId, options = {}) {
       const requestId = `interrupt-${Date.now()}-${Math.random().toString(36).slice(2, 7)}`;
-      send({ type: 'agent_interrupt', session_id: sessionId, request_id: requestId });
+      send({
+        type: 'agent_interrupt',
+        session_id: sessionId,
+        request_id: requestId,
+        connection_id: controlConnectionIdRef.current,
+        session_generation: Math.max(0, Number(options.sessionGeneration) || 0),
+        turn_generation: Math.max(0, Number(options.turnGeneration) || 0),
+      });
+      return requestId;
+    }
+
+    function controlGoal(sessionId, action, goal, options = {}) {
+      const requestId = `goal-${action}-${Date.now()}-${Math.random().toString(36).slice(2, 7)}`;
+      send({
+        type: 'agent_goal_control',
+        session_id: sessionId,
+        request_id: requestId,
+        action,
+        connection_id: controlConnectionIdRef.current,
+        session_generation: Math.max(0, Number(options.sessionGeneration) || 0),
+        goal_generation: Math.max(0, Number(goal?.generation) || 0),
+        goal_transition_seq: Math.max(0, Number(goal?.transition_seq) || 0),
+        goal_fingerprint: String(goal?.fingerprint || ''),
+      });
       return requestId;
     }
 
@@ -1739,7 +1773,10 @@ export function useRelay() {
       if (!navigationEpochGate.current.accept(msg)) return;
       if (t === 'navigation_started') return;
 
-      if (t === 'connection_ack') stateSequenceGate.current.reset(msg.state_epoch);
+      if (t === 'connection_ack') {
+        stateSequenceGate.current.reset(msg.state_epoch);
+        controlConnectionIdRef.current = String(msg.connection_id || '');
+      }
       const stateSessionId = msg.session || msg.session_id || '';
       const stateKey = (t === 'session_list' || t === 'session_snapshot' || t === 'proxy_session_snapshot')
         ? 'session_list'
@@ -2004,6 +2041,7 @@ export function useRelay() {
         setDuplicateProxyAlarms(Array.isArray(msg.duplicate_proxy_alarms) ? msg.duplicate_proxy_alarms : []);
         setNightlyValidationFailures(Array.isArray(msg.nightly_validation_failures) ? msg.nightly_validation_failures : []);
         setLatestAppUpdateValidation(msg.latest_app_update_validation || null);
+        setRevalidationProgramHealth(msg.revalidation_program_health || null);
         if (msg.provider_usage && typeof msg.provider_usage === 'object') {
           setProviderUsage(previous => retainNewerProviderUsage(previous, msg.provider_usage));
         }
@@ -2529,11 +2567,17 @@ export function useRelay() {
 
       if (t === 'nightly_validation_status') {
         setNightlyValidationFailures(Array.isArray(msg.failures) ? msg.failures : []);
+        if (msg.revalidation_program_health) setRevalidationProgramHealth(msg.revalidation_program_health);
         return;
       }
 
       if (t === 'app_update_validation_status') {
         setLatestAppUpdateValidation(msg.validation || null);
+        return;
+      }
+
+      if (t === 'harness_revalidation_status') {
+        setRevalidationProgramHealth(msg.program_health || null);
         return;
       }
 
@@ -3012,7 +3056,7 @@ export function useRelay() {
     // where `sessions` / `messages` would be frozen at initial render values).
     handleRelayMessageRef.current = handleRelayMessage;
 
-    return { sessions, messages, provisionalStreams, historyMeta, historyLoading, connected, connectionHealth, unread, setUnread, thinking, thinkingContent, activities, health, deliveryStates, launchStates, justLaunched, setJustLaunched, permissionPrompts, respondToPrompt, errorPrompts, respondToErrorPrompt, interruptSession, agentConfigs, configControlStates, requestAgentConfig, setAgentModel, setAgentEffort, setAgentPermissionMode, setAutoApprovePermissions, setAntigravityMode, setCodexConfig, newThread, openPanel, openNativeWindow, requestChatList, switchChat, newChat, chatLists, requestThreadList, switchThread, threadLists, switchWorkspace, requestTerminalOutput, sendTerminalInput, terminalOutputs, requestFileChanges, respondToFileChange, fileChanges, sendAttachment, send, sendToSession, steerMessage, discardQueuedMessage, editQueuedMessage, queuedMessages, scheduledSends, scheduleSend, cancelScheduledSend, refreshScheduledSends, launchSession, resumeSession, closeSession, activeSessionRef, restoreCachedTranscript, setSessionSubscriptions, workspaces, branchLists, requestBranchList, switchBranch, createBranch, skillLists, requestSkillList, automationViews, showCodexAutomation, controlResults, directoryListings, requestDirectoryListing, fileContents, requestFileContent, requestHistory, requestHistoryChunk, duplicateProxyAlarms, nightlyValidationFailures, latestAppUpdateValidation, providerUsage, providerUsageRefreshReceipt, requestProviderUsageRefresh, providerUsageResetReceipt, consumeProviderUsageResetCredit, providerUsageCostDetail, requestProviderUsageCostDetail, hostResources, hostResourceError, hostResourceHistory, hostResourceDetails, hostResourceSubscription, subscribeHostResources, unsubscribeHostResources, requestHostResourceRefresh, clearHostResources, semanticNotifications };
+    return { sessions, messages, provisionalStreams, historyMeta, historyLoading, connected, connectionHealth, unread, setUnread, thinking, thinkingContent, activities, health, deliveryStates, launchStates, justLaunched, setJustLaunched, permissionPrompts, respondToPrompt, errorPrompts, respondToErrorPrompt, interruptSession, controlGoal, agentConfigs, configControlStates, requestAgentConfig, setAgentModel, setAgentEffort, setAgentPermissionMode, setAutoApprovePermissions, setAntigravityMode, setCodexConfig, newThread, openPanel, openNativeWindow, requestChatList, switchChat, newChat, chatLists, requestThreadList, switchThread, threadLists, switchWorkspace, requestTerminalOutput, sendTerminalInput, terminalOutputs, requestFileChanges, respondToFileChange, fileChanges, sendAttachment, send, sendToSession, steerMessage, discardQueuedMessage, editQueuedMessage, queuedMessages, scheduledSends, scheduleSend, cancelScheduledSend, refreshScheduledSends, launchSession, resumeSession, closeSession, activeSessionRef, restoreCachedTranscript, setSessionSubscriptions, workspaces, branchLists, requestBranchList, switchBranch, createBranch, skillLists, requestSkillList, automationViews, showCodexAutomation, controlResults, directoryListings, requestDirectoryListing, fileContents, requestFileContent, requestHistory, requestHistoryChunk, duplicateProxyAlarms, nightlyValidationFailures, latestAppUpdateValidation, revalidationProgramHealth, providerUsage, providerUsageRefreshReceipt, requestProviderUsageRefresh, setProviderUsageWatching, providerUsageResetReceipt, consumeProviderUsageResetCredit, providerUsageCostDetail, requestProviderUsageCostDetail, hostResources, hostResourceError, hostResourceHistory, hostResourceDetails, hostResourceSubscription, subscribeHostResources, unsubscribeHostResources, requestHostResourceRefresh, clearHostResources, semanticNotifications };
   }
 
 // (removed window.useRelay — now an ES module export)

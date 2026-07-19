@@ -493,6 +493,9 @@ export default function SessionListScreen({ navigation, route }) {
   const [duplicateProxyAlarms, setDuplicateProxyAlarms] = useState([]);
   const [nightlyValidationFailures, setNightlyValidationFailures] = useState([]);
   const [latestAppUpdateValidation, setLatestAppUpdateValidation] = useState(null);
+  const [revalidationProgramHealth, setRevalidationProgramHealth] = useState(null);
+  const [showValidationHealth, setShowValidationHealth] = useState(false);
+  const [fleetControlPending, setFleetControlPending] = useState({});
   const [providerUsage, setProviderUsage] = useState(null);
   const [providerUsageRefreshReceipt, setProviderUsageRefreshReceipt] = useState(null);
   const [providerUsageResetReceipt, setProviderUsageResetReceipt] = useState(null);
@@ -547,6 +550,7 @@ export default function SessionListScreen({ navigation, route }) {
   const [broadcastReceipts, setBroadcastReceipts] = useState({});
   const [sidebarTranscriptTitles, setSidebarTranscriptTitles] = useState({});
   const clientRef     = useRef(null);
+  const fleetControlPendingRef = useRef({});
   const hostResourceRouteOpenRef = useRef(false);
   const hostResourceAggregateOnlyRef = useRef(false);
   const hostResourceSubscriptionRef = useRef('');
@@ -747,6 +751,8 @@ export default function SessionListScreen({ navigation, route }) {
 
       case '_disconnected':
         setConnected(false);
+        fleetControlPendingRef.current = {};
+        setFleetControlPending({});
         if (msg.reason === 'unauthenticated') {
           signOut().then(() => navigation.replace('Login'));
         }
@@ -790,6 +796,7 @@ export default function SessionListScreen({ navigation, route }) {
         setDuplicateProxyAlarms(Array.isArray(msg.duplicate_proxy_alarms) ? msg.duplicate_proxy_alarms : []);
         setNightlyValidationFailures(Array.isArray(msg.nightly_validation_failures) ? msg.nightly_validation_failures : []);
         setLatestAppUpdateValidation(msg.latest_app_update_validation || null);
+        setRevalidationProgramHealth(msg.revalidation_program_health || null);
         if (msg.provider_usage && typeof msg.provider_usage === 'object') {
           setProviderUsage(previous => retainNewerProviderUsage(previous, msg.provider_usage));
         }
@@ -1149,6 +1156,21 @@ export default function SessionListScreen({ navigation, route }) {
             return rest;
           });
         }
+        if (sid && ['agent_goal_control', 'agent_interrupt'].includes(msg.command)) {
+          const pending = fleetControlPendingRef.current[sid];
+          if (pending?.requestId === msg.request_id) {
+            const next = { ...fleetControlPendingRef.current };
+            delete next[sid];
+            fleetControlPendingRef.current = next;
+            setFleetControlPending(next);
+            if (msg.result === 'failed') {
+              Alert.alert(
+                msg.command === 'agent_goal_control' ? 'Goal control failed' : 'Interrupt failed',
+                msg.error?.message || 'The native control was not acknowledged.',
+              );
+            }
+          }
+        }
         break;
       }
 
@@ -1169,10 +1191,15 @@ export default function SessionListScreen({ navigation, route }) {
 
       case 'nightly_validation_status':
         setNightlyValidationFailures(Array.isArray(msg.failures) ? msg.failures : []);
+        if (msg.revalidation_program_health) setRevalidationProgramHealth(msg.revalidation_program_health);
         break;
 
       case 'app_update_validation_status':
         setLatestAppUpdateValidation(msg.validation || null);
+        break;
+
+      case 'harness_revalidation_status':
+        setRevalidationProgramHealth(msg.program_health || null);
         break;
 
       case 'session_launching': {
@@ -1595,6 +1622,11 @@ export default function SessionListScreen({ navigation, route }) {
     return () => clearInterval(timer);
   }, [showUsageDashboard, normalizedProviderUsage.collectionState]);
   useEffect(() => {
+    if (!showUsageDashboard) return undefined;
+    clientRef.current?.setProviderUsageWatching(true);
+    return () => clientRef.current?.setProviderUsageWatching(false);
+  }, [showUsageDashboard]);
+  useEffect(() => {
     if (!showUsageDashboard || !normalizedProviderUsage.estimatedCost?.detail?.truncated) return;
     if (initialCostDetailMatches) return;
     requestEstimatedCostDetail({ cursor: '0' });
@@ -1631,6 +1663,16 @@ export default function SessionListScreen({ navigation, route }) {
       latestUserRequest: session?.last_user_request || null,
     });
     const goal = workContext.kind === 'goal' ? capabilitySafeActivity?.goal || null : null;
+    const goalState = String(goal?.state || goal?.status || '').toLowerCase();
+    const goalAction = goalState === 'active' ? 'pause' : goalState === 'paused' ? 'resume' : null;
+    const activityKind = String(capabilitySafeActivity?.kind || '').toLowerCase();
+    const turnActive = capabilitySafeActivity?.generating === true
+      || ['thinking', 'generating', 'running_command', 'applying_patch', 'reading_files', 'working'].includes(activityKind);
+    const canControlGoal = !!(goalAction && goal?.fingerprint
+      && session?.capabilities?.goal_pause_resume === true
+      && Number(session?.control_generation) > 0);
+    const canInterrupt = !!(turnActive && session?.capabilities?.interrupt === true
+      && Number(session?.control_generation) > 0 && Number(session?.turn_generation) > 0);
     const usagePercent = Number(session?.percent_used);
     const usageReset = session?.rate_limited_until && session.rate_limited_until !== 'unknown'
       ? String(session.rate_limited_until) : '';
@@ -1648,6 +1690,9 @@ export default function SessionListScreen({ navigation, route }) {
       state,
       stateLabel: session?.rate_limit_active === true ? 'Usage limited' : fleetStateLabel(state),
       goal,
+      goalAction,
+      canControlGoal,
+      canInterrupt,
       badge,
       title: sessionName(session),
       status: usageStatus || (attention ? 'Action required' : (goalSubstate || capabilitySafeActivity?.label || (state === 'idle' ? (goal ? 'Goal paused' : 'Idle') : String(capabilitySafeActivity?.kind || 'Working').replace(/_/g, ' ')))),
@@ -1861,6 +1906,14 @@ export default function SessionListScreen({ navigation, route }) {
           </TouchableOpacity>
           <TouchableOpacity
             style={s.usageButton}
+            onPress={() => setShowValidationHealth(true)}
+            accessibilityRole="button"
+            accessibilityLabel="Harness validation health"
+          >
+            <Text style={s.usageButtonText}>Validate</Text>
+          </TouchableOpacity>
+          <TouchableOpacity
+            style={s.usageButton}
             onPress={() => { setShowFleetView(true); setShowUsageDashboard(false); setShowHostResourceDashboard(false); }}
             accessibilityRole="button"
             accessibilityLabel="Fleet view"
@@ -1885,6 +1938,42 @@ export default function SessionListScreen({ navigation, route }) {
           </TouchableOpacity>
         </View>
       )}
+
+      <Modal
+        visible={showValidationHealth}
+        animationType={reducedMotion ? 'none' : 'slide'}
+        presentationStyle="pageSheet"
+        onRequestClose={() => setShowValidationHealth(false)}
+      >
+        <View style={s.validationModal} accessibilityViewIsModal>
+          <View style={s.usageHeader}>
+            <View style={{ flex: 1 }}>
+              <Text style={s.usageTitle}>Harness validation</Text>
+              <Text style={s.usageSubtitle}>Continuous drift watch, nightly tier 1, staggered weekly tier 2</Text>
+            </View>
+            <TouchableOpacity onPress={() => setShowValidationHealth(false)} accessibilityRole="button" accessibilityLabel="Close validation health">
+              <Text style={s.usageClose}>Close</Text>
+            </TouchableOpacity>
+          </View>
+          <ScrollView contentContainerStyle={s.validationList}>
+            {Object.entries(revalidationProgramHealth?.harnesses || {}).sort(([left], [right]) => left.localeCompare(right)).map(([harness, record]) => {
+              const coverage = (revalidationProgramHealth?.coverage_matrix || []).find(row => row.harness === harness) || {};
+              const tier2Mode = coverage.tier2?.mode === 'gated' ? 'gated' : record.last_tier2_status || 'scheduled';
+              return <View key={harness} style={s.validationCard}>
+                <View style={s.validationCardHeader}>
+                  <Text style={s.validationHarness}>{harness}</Text>
+                  <Text style={[s.validationStatus, record.status === 'pass' ? s.validationPass : s.validationFail]}>{record.status === 'pass' ? 'writes available' : record.status || 'pending'}</Text>
+                </View>
+                <Text style={s.validationMeta}>Version {record.installed_version || 'not installed'}</Text>
+                <Text style={s.validationMeta}>Fixture {coverage.fixture ? 'covered' : 'missing'} / tier 1 {coverage.tier1 ? 'covered' : 'missing'} / tier 2 {tier2Mode}</Text>
+                <Text style={s.validationMeta}>Next tier 2 {record.next_tier2_at ? new Date(record.next_tier2_at).toLocaleString() : 'unscheduled'}</Text>
+                {!!record.reason && <Text style={s.validationReason}>{record.reason}</Text>}
+              </View>;
+            })}
+            {!Object.keys(revalidationProgramHealth?.harnesses || {}).length && <Text style={s.validationEmpty}>Program health has not been published by the updated sentinel yet.</Text>}
+          </ScrollView>
+        </View>
+      </Modal>
 
       <Modal
         visible={showUsageDashboard}
@@ -2095,6 +2184,9 @@ export default function SessionListScreen({ navigation, route }) {
                 ? formatProviderUsageReset(entry.credits.resets_at, providerUsageNowMs)
                 : '';
               const collapsed = !!collapsedProviderUsage[entry.key];
+              const cardRefreshReceipt = providerUsageRefreshReceipt?.provider_id === entry.providerId
+                ? providerUsageRefreshReceipt : null;
+              const cardRefreshPending = ['requested', 'accepted', 'coalesced'].includes(cardRefreshReceipt?.status);
               return (
                 <View
                   key={entry.key}
@@ -2123,9 +2215,29 @@ export default function SessionListScreen({ navigation, route }) {
                   <View style={s.usageMetaRow}>
                     <Text style={s.usageSessions}>{entry.sessionCount} mapped session{entry.sessionCount === 1 ? '' : 's'}</Text>
                     <Text style={s.usageSessions}>{entry.harnessTypes.length ? entry.harnessTypes.join(', ') : 'No mapped surfaces'}</Text>
-                    <Text style={s.usageSessions}>{formatProviderUsageAge(entry.capturedAt, providerUsageNowMs)}</Text>
+                    <Text style={s.usageSessions}>{entry.status === 'stale'
+                      ? `Stale - ${formatProviderUsageAge(entry.capturedAt, providerUsageNowMs)}`
+                      : formatProviderUsageAge(entry.capturedAt, providerUsageNowMs)}</Text>
                     {!!entry.nextRefreshAt && <Text style={s.usageSessions}>Next refresh {formatProviderUsageReset(entry.nextRefreshAt, providerUsageNowMs)}</Text>}
+                    {entry.refreshIntervalMs > 0 && <Text style={s.usageSessions}>{entry.watchBoostActive ? 'Live' : 'Idle'} cadence {Math.round(entry.refreshIntervalMs / 1000)}s</Text>}
+                    <TouchableOpacity
+                      style={[s.usageCardRefresh, cardRefreshPending ? s.usageRefreshDisabled : null]}
+                      disabled={cardRefreshPending}
+                      onPress={() => {
+                        const requestId = clientRef.current?.requestProviderUsageRefresh(true, entry.providerId);
+                        if (requestId) setProviderUsageRefreshReceipt({
+                          requestId, status: 'requested', provider_id: entry.providerId,
+                        });
+                      }}
+                      accessibilityRole="button"
+                      accessibilityLabel={`Refresh ${entry.providerName} usage now`}
+                    ><Text style={s.usageCardRefreshText}>{cardRefreshPending ? 'Refreshing...' : 'Refresh now'}</Text></TouchableOpacity>
                   </View>
+                  {!!cardRefreshReceipt && <View style={s.usageCostState} accessibilityRole="summary">
+                    <Text style={s.usageSessions}>Refresh {cardRefreshReceipt.status}
+                      {cardRefreshReceipt.code ? ` (${cardRefreshReceipt.code})` : ''}
+                      {cardRefreshReceipt.retry_after_ms ? ` - retry in ${Math.ceil(cardRefreshReceipt.retry_after_ms / 1000)}s` : ''}</Text>
+                  </View>}
                   {entry.windows.length > 0 ? (
                     <View style={s.usageWindows}>
                       {entry.windows.map(window => {
@@ -2621,6 +2733,55 @@ export default function SessionListScreen({ navigation, route }) {
                   <Text style={s.fleetStatus} numberOfLines={1}>{entry.status}</Text>
                   {entry.working && <Text style={s.fleetElapsed}>{fleetElapsedLabel(entry.activity, fleetNowMs)}</Text>}
                 </View>
+                {(entry.canControlGoal || entry.canInterrupt) && <View style={s.fleetControlRow}>
+                  {entry.canControlGoal && <TouchableOpacity
+                    style={[s.fleetControlButton, fleetControlPending[entry.id] ? s.fleetControlButtonDisabled : null]}
+                    disabled={!!fleetControlPending[entry.id]}
+                    onPress={event => {
+                      event.stopPropagation && event.stopPropagation();
+                      if (fleetControlPending[entry.id]) return;
+                      const requestId = clientRef.current?.controlGoal(entry.id, entry.goalAction, entry.goal, {
+                        sessionGeneration: entry.session?.control_generation,
+                      });
+                      if (requestId) {
+                        const next = {
+                          ...fleetControlPendingRef.current,
+                          [entry.id]: { requestId, command: 'agent_goal_control' },
+                        };
+                        fleetControlPendingRef.current = next;
+                        setFleetControlPending(next);
+                      }
+                    }}
+                    accessibilityRole="button"
+                    accessibilityLabel={`${entry.goalAction === 'pause' ? 'Pause' : 'Resume'} goal for ${entry.title}`}
+                  >
+                    <Text style={s.fleetControlButtonText}>{fleetControlPending[entry.id]?.command === 'agent_goal_control' ? 'Working...' : entry.goalAction === 'pause' ? 'Pause goal' : 'Resume goal'}</Text>
+                  </TouchableOpacity>}
+                  {entry.canInterrupt && <TouchableOpacity
+                    style={[s.fleetControlButton, s.fleetInterruptButton, fleetControlPending[entry.id] ? s.fleetControlButtonDisabled : null]}
+                    disabled={!!fleetControlPending[entry.id]}
+                    onPress={event => {
+                      event.stopPropagation && event.stopPropagation();
+                      if (fleetControlPending[entry.id]) return;
+                      const requestId = clientRef.current?.interrupt(entry.id, {
+                        sessionGeneration: entry.session?.control_generation,
+                        turnGeneration: entry.session?.turn_generation,
+                      });
+                      if (requestId) {
+                        const next = {
+                          ...fleetControlPendingRef.current,
+                          [entry.id]: { requestId, command: 'agent_interrupt' },
+                        };
+                        fleetControlPendingRef.current = next;
+                        setFleetControlPending(next);
+                      }
+                    }}
+                    accessibilityRole="button"
+                    accessibilityLabel={`Interrupt turn for ${entry.title}`}
+                  >
+                    <Text style={s.fleetControlButtonText}>{fleetControlPending[entry.id]?.command === 'agent_interrupt' ? 'Stopping...' : 'Interrupt turn'}</Text>
+                  </TouchableOpacity>}
+                </View>}
                 <Text style={s.fleetFreshness}>Activity {entry.freshness}</Text>
                 <View
                   style={s.fleetWorkContext}
@@ -3231,6 +3392,17 @@ const s = StyleSheet.create({
   },
   usageButtonActive: { backgroundColor: '#1f3b57', borderColor: '#58a6ff' },
   usageButtonText: { color: '#58a6ff', fontSize: 11, fontWeight: '700' },
+  validationModal: { flex: 1, backgroundColor: '#0b0f14' },
+  validationList: { padding: 12, gap: 10, paddingBottom: 32 },
+  validationCard: { backgroundColor: '#111820', borderColor: '#30363d', borderWidth: 1, borderRadius: 10, padding: 12, gap: 5 },
+  validationCardHeader: { flexDirection: 'row', alignItems: 'center', gap: 10 },
+  validationHarness: { color: '#f0f6fc', fontSize: 15, fontWeight: '700', flex: 1 },
+  validationStatus: { fontSize: 11, fontWeight: '700' },
+  validationPass: { color: '#3fb950' },
+  validationFail: { color: '#f85149' },
+  validationMeta: { color: '#8b949e', fontSize: 12, lineHeight: 17 },
+  validationReason: { color: '#f0d49a', fontSize: 12, lineHeight: 17, marginTop: 3 },
+  validationEmpty: { color: '#8b949e', fontSize: 13, lineHeight: 19, padding: 18, textAlign: 'center' },
   usageModal: { flex: 1, backgroundColor: '#0b0f14' },
   usageHeader: {
     flexDirection: 'row', alignItems: 'center', gap: 12,
@@ -3259,6 +3431,8 @@ const s = StyleSheet.create({
   usageStatus: { borderWidth: 1, borderRadius: 12, fontSize: 10, paddingHorizontal: 7, paddingVertical: 3, textTransform: 'capitalize' },
   usageCollapseMark: { color: '#8b949e', fontSize: 18, width: 14, textAlign: 'center' },
   usageMetaRow: { flexDirection: 'row', flexWrap: 'wrap', gap: 8 },
+  usageCardRefresh: { borderColor: '#30363d', borderRadius: 6, borderWidth: 1, paddingHorizontal: 8, paddingVertical: 3 },
+  usageCardRefreshText: { color: '#58a6ff', fontSize: 11, fontWeight: '600' },
   usageCardBody: { flex: 1, gap: 7 },
   usageCardTop: { flexDirection: 'row', alignItems: 'baseline', justifyContent: 'space-between', gap: 8 },
   usageCardTitle: { color: '#f0f6fc', fontSize: 14, fontWeight: '700' },
@@ -3425,6 +3599,11 @@ const s = StyleSheet.create({
   fleetSelectDisabled: { opacity: 0.5 },
   fleetSelectText: { color: '#8b949e', fontSize: 10, fontWeight: '600' },
   fleetStatusRow: { flexDirection: 'row', alignItems: 'center', gap: 7 },
+  fleetControlRow: { flexDirection: 'row', flexWrap: 'wrap', gap: 8, marginTop: 9 },
+  fleetControlButton: { borderWidth: 1, borderColor: '#388bfd', borderRadius: 7, paddingHorizontal: 10, paddingVertical: 7, backgroundColor: '#0d2138' },
+  fleetInterruptButton: { borderColor: '#d29922', backgroundColor: '#2d210d' },
+  fleetControlButtonDisabled: { opacity: 0.55 },
+  fleetControlButtonText: { color: '#f0f6fc', fontSize: 11, fontWeight: '700' },
   fleetStatus: { color: '#f0f6fc', fontSize: 12, fontWeight: '600', flexShrink: 1 },
   fleetElapsed: { color: '#8b949e', fontSize: 11, fontFamily: Platform.OS === 'ios' ? 'Menlo' : 'monospace', marginLeft: 'auto' },
   fleetAttention: { color: '#d29922', fontSize: 10, borderWidth: 1, borderColor: '#d2992288', borderRadius: 10, paddingHorizontal: 6, paddingVertical: 2 },

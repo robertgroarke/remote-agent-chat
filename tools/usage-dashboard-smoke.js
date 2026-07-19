@@ -10,13 +10,15 @@ const app = fs.readFileSync(path.join(root, 'frontend', 'app.jsx'), 'utf8');
 const hooks = fs.readFileSync(path.join(root, 'frontend', 'hooks.jsx'), 'utf8');
 const styles = fs.readFileSync(path.join(root, 'frontend', 'styles.css'), 'utf8');
 const marks = fs.readFileSync(path.join(root, 'frontend', 'provider-marks.jsx'), 'utf8');
+const androidScreen = fs.readFileSync(path.join(root, 'android-app', 'screens', 'SessionListScreen.jsx'), 'utf8');
+const androidRelay = fs.readFileSync(path.join(root, 'android-app', 'lib', 'relay.js'), 'utf8');
 
 for (const marker of [
   'function SessionUsageMiniMonitor({ session, config, providerUsage, onOpenUsage })',
   'sessionUsageProjection(session, config, normalizedUsage, nowMs)',
   'data-testid="session-usage-mini"',
   'function formatUsageResetLabel(value)',
-  'function UsageDashboard({ usage, refreshReceipt, resetReceipt, costDetail, onBack, onRefresh, onConsumeResetCredit, onRequestCostDetail })',
+  'function UsageDashboard({ usage, refreshReceipt, resetReceipt, costDetail, onBack, onRefresh, onWatch, onConsumeResetCredit, onRequestCostDetail })',
   'normalizeProviderUsage(usage)',
   'data-testid="usage-dashboard"',
   'Warnings start at 75% used.',
@@ -44,6 +46,9 @@ for (const marker of [
   'usage-pace-budgets',
   'usage-cost-table',
   'requestProviderUsageRefresh',
+  'onWatch={setProviderUsageWatching}',
+  'Refresh now',
+  'entry.status === \'stale\'',
   'requestProviderUsageCostDetail',
   'Paginated local cost detail',
   'projection.headerWindows.map(sessionUsageWindowLabel)',
@@ -56,7 +61,23 @@ for (const marker of [
   "t === 'provider_usage_refresh_receipt'",
   "t === 'provider_usage_cost_detail'",
   "type: 'provider_usage_cost_detail_request'",
+  "type: 'provider_usage_watch'",
+  'provider_id: providerId',
 ]) assert(hooks.includes(marker), `missing usage transport marker: ${marker}`);
+
+for (const marker of [
+  'setProviderUsageWatching(true)',
+  'setProviderUsageWatching(false)',
+  "requestProviderUsageRefresh(true, entry.providerId)",
+  "providerUsageRefreshReceipt?.provider_id === entry.providerId",
+  "entry.status === 'stale'",
+  'Refresh now',
+]) assert(androidScreen.includes(marker), `missing Android usage cadence marker: ${marker}`);
+for (const marker of [
+  'requestProviderUsageRefresh(force = false, providerId = null)',
+  'setProviderUsageWatching(active)',
+  "type: 'provider_usage_watch'",
+]) assert(androidRelay.includes(marker), `missing Android usage transport marker: ${marker}`);
 
 for (const marker of [
   '.usage-dashboard-summary',
@@ -108,6 +129,9 @@ const result = {
   provider_lifecycle_without_false_zero: true,
   cost_lifecycle_without_false_zero: true,
   correlated_refresh_receipts: true,
+  subscription_aware_live_cadence: true,
+  per_card_refresh_now: true,
+  web_android_cadence_parity: true,
   paginated_cost_detail: true,
   arbitrary_session_jump_removed: !app.includes('onSelectSession={(sessionId)'),
   official_provider_marks: true,

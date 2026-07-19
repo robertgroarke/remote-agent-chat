@@ -160,6 +160,8 @@ export default function ChatScreen({ route, navigation }) {
   const [historyLoadingOlder, setHistoryLoadingOlder] = useState(false);
   const [historyError, setHistoryError] = useState(null);
   const [controlResults, setControlResults] = useState({});
+  const [interruptPending, setInterruptPending] = useState('');
+  const [goalControlPending, setGoalControlPending] = useState('');
   const [provisionalStream, setProvisionalStream] = useState(null);
   const [highlightedSearchMessageId, setHighlightedSearchMessageId] = useState(
     Number.isSafeInteger(Number(searchMessageId)) ? Number(searchMessageId) : null,
@@ -202,6 +204,8 @@ export default function ChatScreen({ route, navigation }) {
   const provisionalStreamRef = useRef(null);
   const provisionalFrameRef = useRef(null);
   const provisionalPendingRef = useRef(null);
+  const interruptPendingRef = useRef('');
+  const goalControlPendingRef = useRef('');
 
   function publishProvisionalStream(stream) {
     provisionalStreamRef.current = stream;
@@ -233,6 +237,10 @@ export default function ChatScreen({ route, navigation }) {
   }, [sessionId]);
 
   useEffect(() => {
+    interruptPendingRef.current = '';
+    goalControlPendingRef.current = '';
+    setInterruptPending('');
+    setGoalControlPending('');
     setSessionMeta(routeSession && typeof routeSession === 'object'
       ? { ...routeSession, session_id: sessionId }
       : { session_id: sessionId, agent_type: agentType });
@@ -311,6 +319,16 @@ export default function ChatScreen({ route, navigation }) {
   // ── Navigation header ───────────────────────────────────────────────────────
 
   const activityLabel = activity?.label || (activity?.generating ? 'Generating…' : null);
+  const activityKind = String(activity?.kind || '').toLowerCase();
+  const turnActive = activity?.generating === true || ['thinking', 'generating', 'running_command', 'applying_patch', 'reading_files', 'working'].includes(activityKind);
+  const goal = activity?.goal || null;
+  const goalState = String(goal?.state || goal?.status || '').toLowerCase();
+  const goalAction = goalState === 'active' ? 'pause' : goalState === 'paused' ? 'resume' : null;
+  const canControlGoal = !!(goalAction && goal?.fingerprint && agentConfig?.capabilities?.goal_pause_resume === true
+    && Number(sessionMeta?.control_generation) > 0);
+  const canInterrupt = !!(turnActive && agentConfig?.capabilities?.interrupt === true
+    && Number(sessionMeta?.control_generation) > 0 && Number(sessionMeta?.turn_generation) > 0);
+  const writeCapabilityGate = agentConfig?.capabilities?.write_capability_gate || '';
   const normalizedProviderUsage = useMemo(() => normalizeProviderUsage(providerUsage), [providerUsage]);
   const usageProjection = useMemo(() => sessionUsageProjection(
     sessionMeta,
@@ -493,17 +511,11 @@ export default function ChatScreen({ route, navigation }) {
           >
             <Text style={hr.gearText}>⚙</Text>
           </TouchableOpacity>
-          <TouchableOpacity
-            onPress={() => clientRef.current?.interrupt(sessionId)}
-            style={hr.btn}
-            activeOpacity={0.7}
-          >
-            <Text style={hr.btnText}>■ Stop</Text>
-          </TouchableOpacity>
         </View>
       ),
     });
-  }, [navigation, sessionId, liveChatTitle, agentType, agentConfig, activityLabel, usageProjection, usageHeaderRows]);
+  }, [navigation, sessionId, liveChatTitle, agentType, agentConfig, activityLabel, usageProjection, usageHeaderRows,
+    canControlGoal, canInterrupt, goalAction, goal, sessionMeta, goalControlPending, interruptPending]);
 
   // ── Message handler ─────────────────────────────────────────────────────────
 
@@ -930,6 +942,20 @@ export default function ChatScreen({ route, navigation }) {
           setErrorPrompt(prev => prev
             ? { ...prev, submitting_action_id: null, error: msg.error?.message || 'Error prompt action failed' }
             : null);
+        }
+        if (msg.command === 'agent_goal_control' && msg.request_id === goalControlPendingRef.current) {
+          goalControlPendingRef.current = '';
+          setGoalControlPending('');
+          if (msg.result === 'failed') {
+            Alert.alert('Goal control failed', msg.error?.message || 'The native goal state was not acknowledged.');
+          }
+        }
+        if (msg.command === 'agent_interrupt' && msg.request_id === interruptPendingRef.current) {
+          interruptPendingRef.current = '';
+          setInterruptPending('');
+          if (msg.result === 'failed') {
+            Alert.alert('Interrupt failed', msg.error?.message || 'The native turn did not stop.');
+          }
         }
         if (msg.result === 'ok') {
           clientRef.current?.requestAgentConfig(sessionId);
@@ -1412,6 +1438,10 @@ export default function ChatScreen({ route, navigation }) {
   async function handleSend() {
     const text = input.trim();
     if (!text && !attachment) return;
+    if (writeCapabilityGate) {
+      Alert.alert('Harness writes paused', `${writeCapabilityGate}. Read-only transcript access remains available.`);
+      return;
+    }
     setInput('');
     Keyboard.dismiss();
 
@@ -1663,6 +1693,61 @@ export default function ChatScreen({ route, navigation }) {
           </Text>
         </View>
       )}
+      {(canControlGoal || canInterrupt) && (
+        <View style={s.sessionControlBar} accessibilityLabel="Session controls">
+          <View style={s.sessionControlCopy}>
+            <Text style={s.sessionControlEyebrow}>TURN CONTROLS</Text>
+            <Text style={s.sessionControlState} numberOfLines={1}>
+              {canControlGoal
+                ? `Goal ${goalState === 'paused' ? 'paused' : 'active'}`
+                : 'Turn in progress'}
+            </Text>
+          </View>
+          <View style={s.sessionControlActions}>
+            {canControlGoal && <TouchableOpacity
+              onPress={() => {
+                if (goalControlPending) return;
+                const requestId = clientRef.current?.controlGoal(sessionId, goalAction, goal, {
+                  sessionGeneration: sessionMeta?.control_generation,
+                });
+                if (requestId) {
+                  goalControlPendingRef.current = requestId;
+                  setGoalControlPending(requestId);
+                }
+              }}
+              style={[s.sessionControlButton, goalControlPending ? s.sessionControlButtonDisabled : null]}
+              activeOpacity={0.7}
+              disabled={!!goalControlPending}
+              accessibilityRole="button"
+              accessibilityLabel={`${goalAction === 'pause' ? 'Pause' : 'Resume'} goal`}
+            >
+              <Text style={s.sessionControlButtonText}>
+                {goalControlPending ? 'Working...' : goalAction === 'pause' ? 'Pause goal' : 'Resume goal'}
+              </Text>
+            </TouchableOpacity>}
+            {canInterrupt && <TouchableOpacity
+              onPress={() => {
+                if (interruptPending) return;
+                const requestId = clientRef.current?.interrupt(sessionId, {
+                  sessionGeneration: sessionMeta?.control_generation,
+                  turnGeneration: sessionMeta?.turn_generation,
+                });
+                if (requestId) {
+                  interruptPendingRef.current = requestId;
+                  setInterruptPending(requestId);
+                }
+              }}
+              style={[s.sessionControlButton, s.sessionInterruptButton, interruptPending ? s.sessionControlButtonDisabled : null]}
+              activeOpacity={0.7}
+              disabled={!!interruptPending}
+              accessibilityRole="button"
+              accessibilityLabel="Interrupt turn"
+            >
+              <Text style={s.sessionControlButtonText}>{interruptPending ? 'Stopping...' : 'Interrupt turn'}</Text>
+            </TouchableOpacity>}
+          </View>
+        </View>
+      )}
 
       <FlatList
         ref={flatListRef}
@@ -1824,12 +1909,16 @@ export default function ChatScreen({ route, navigation }) {
         </View>
       )}
 
+      {!!writeCapabilityGate && <View style={s.revalidationGate} accessibilityRole="alert">
+        <Text style={s.revalidationGateTitle}>Harness writes paused</Text>
+        <Text style={s.revalidationGateText}>{writeCapabilityGate}. Read-only transcript access remains available.</Text>
+      </View>}
       <View style={s.inputRow}>
         <TouchableOpacity
           style={s.attachBtn}
           onPress={showAttachmentPicker}
           activeOpacity={0.7}
-          disabled={uploading}
+          disabled={uploading || !!writeCapabilityGate}
         >
           <Text style={s.attachBtnText}>📎</Text>
         </TouchableOpacity>
@@ -1846,18 +1935,19 @@ export default function ChatScreen({ route, navigation }) {
           multiline
           maxLength={4000}
           returnKeyType="default"
+          editable={!writeCapabilityGate}
         />
         <TouchableOpacity
-          style={[s.attachBtn, !input.trim() && s.sendBtnDisabled]}
+          style={[s.attachBtn, (!input.trim() || !!writeCapabilityGate) && s.sendBtnDisabled]}
           onPress={() => setScheduleOpen(true)}
-          disabled={!input.trim()}
+          disabled={!input.trim() || !!writeCapabilityGate}
           accessibilityRole="button"
           accessibilityLabel="Schedule message"
         ><Text style={s.attachBtnText}>◷</Text></TouchableOpacity>
         <TouchableOpacity
-          style={[s.sendBtn, (!input.trim() && !attachment || sendPending || uploading || composerBlockedByPrompt) && s.sendBtnDisabled]}
+          style={[s.sendBtn, (!input.trim() && !attachment || sendPending || uploading || composerBlockedByPrompt || !!writeCapabilityGate) && s.sendBtnDisabled]}
           onPress={handleSend}
-          disabled={(!input.trim() && !attachment) || sendPending || uploading || composerBlockedByPrompt}
+          disabled={(!input.trim() && !attachment) || sendPending || uploading || composerBlockedByPrompt || !!writeCapabilityGate}
           activeOpacity={0.7}
         >
           {sendPending || uploading ? (
@@ -2159,6 +2249,33 @@ const s = StyleSheet.create({
     flex:            1,
     backgroundColor: '#0b0f14',
   },
+  sessionControlBar: {
+    minHeight: 54,
+    paddingHorizontal: 12,
+    paddingVertical: 8,
+    borderBottomWidth: 1,
+    borderBottomColor: '#30363d',
+    backgroundColor: '#10161d',
+    flexDirection: 'row',
+    alignItems: 'center',
+    justifyContent: 'space-between',
+    gap: 10,
+  },
+  sessionControlCopy: { flex: 1, minWidth: 0 },
+  sessionControlEyebrow: { color: '#6e7681', fontSize: 9, fontWeight: '700', letterSpacing: 0.7 },
+  sessionControlState: { color: '#c9d1d9', fontSize: 11, fontWeight: '600', marginTop: 2 },
+  sessionControlActions: { flexDirection: 'row', flexWrap: 'wrap', justifyContent: 'flex-end', gap: 7 },
+  sessionControlButton: {
+    borderWidth: 1,
+    borderColor: '#388bfd',
+    borderRadius: 7,
+    paddingHorizontal: 10,
+    paddingVertical: 7,
+    backgroundColor: '#0d2138',
+  },
+  sessionInterruptButton: { borderColor: '#d29922', backgroundColor: '#2d210d' },
+  sessionControlButtonDisabled: { opacity: 0.55 },
+  sessionControlButtonText: { color: '#f0f6fc', fontSize: 11, fontWeight: '700' },
   sessionUsageModal: { flex: 1, backgroundColor: '#0b0f14' },
   sessionUsageHeader: {
     minHeight: 68,
@@ -2370,6 +2487,15 @@ const s = StyleSheet.create({
     fontSize: 16,
     fontWeight: '600',
   },
+  revalidationGate: {
+    backgroundColor: '#4b2e0b',
+    borderTopWidth: 1,
+    borderTopColor: '#d29922',
+    paddingHorizontal: 12,
+    paddingVertical: 8,
+  },
+  revalidationGateTitle: { color: '#f0d49a', fontSize: 12, fontWeight: '700' },
+  revalidationGateText: { color: '#f0d49a', fontSize: 11, lineHeight: 16, marginTop: 2 },
   inputRow: {
     flexDirection:   'row',
     alignItems:      'flex-end',

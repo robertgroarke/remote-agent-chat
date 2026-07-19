@@ -31,7 +31,7 @@ const ARRAY_LIMITS = new Map([
 ]);
 
 const ALLOWED_KEYS = new Set([
-  'schema_version', 'generation', 'generated_at', 'poll_interval_ms', 'in_flight', 'snapshots',
+  'schema_version', 'generation', 'generated_at', 'poll_interval_ms', 'cadence_mode', 'in_flight', 'snapshots',
   'estimated_cost', 'catalog_version', 'range', 'days', 'since', 'until', 'tokens',
   'input', 'cached', 'output', 'cost_usd', 'records', 'by_provider', 'by_model',
   'by_project', 'by_day', 'by_speed', 'daily_breakdown', 'unknown_models', 'scan',
@@ -56,6 +56,9 @@ const ALLOWED_KEYS = new Set([
   'detail', 'total_rows', 'inline_rows', 'page_size', 'next_cursor', 'truncated',
   'collections', 'name', 'returned_rows', 'reason_code', 'reason_path',
   'last_good_generated_at', 'last_good_age_ms', 'next_retry_at', 'refresh_request_id',
+  'cadence_class', 'refresh_interval_ms', 'fast_refresh_interval_ms', 'idle_refresh_interval_ms',
+  'watch_boost_active', 'last_attempt_at', 'last_success_at', 'consecutive_misses',
+  'manual_refresh_allowed_at', 'stale_reason',
   'semantics_version', 'observed_at', 'account_scope', 'amount', 'source_field', 'semantics',
   'directly_reported', 'extra_usage_enabled', 'prepaid_balance', 'extra_usage_spend',
   'extra_usage_cap', 'allowance_remaining', 'reported_spend', 'included_spend',
@@ -134,7 +137,7 @@ function validOptionalArray(value, maxLength) {
 
 function validateSnapshot(snapshot) {
   if (!snapshot || typeof snapshot !== 'object' || Array.isArray(snapshot)) return false;
-  if (![1, 2, 3, 4].includes(snapshot.schema_version)) return false;
+  if (![1, 2, 3, 4, 5].includes(snapshot.schema_version)) return false;
   if (!ALLOWED_PROVIDER_IDS.has(snapshot.provider_id)) return false;
   if (!ALLOWED_STATUSES.has(snapshot.status)) return false;
   if (typeof snapshot.account_fingerprint !== 'string'
@@ -189,7 +192,7 @@ function quotaEnvelope(payload) {
 
 function quotaBoundaryViolation(payload) {
   if (!payload || typeof payload !== 'object' || Array.isArray(payload)) return '$:payload';
-  if (![1, 2, 3, 4].includes(payload.schema_version)) return '$.schema_version';
+  if (![1, 2, 3, 4, 5].includes(payload.schema_version)) return '$.schema_version';
   if (!Array.isArray(payload.snapshots) || payload.snapshots.length > 32) return '$.snapshots';
   const invalidSnapshot = payload.snapshots.findIndex(snapshot => !validateSnapshot(snapshot));
   if (invalidSnapshot >= 0) return `$.snapshots[${invalidSnapshot}]:snapshot`;

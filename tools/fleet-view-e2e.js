@@ -114,7 +114,8 @@ async function captureFleetVisualMatrix(browser, origin, screenshotDir, refreshL
         }).observe({ type: 'layout-shift', buffered: true });
       }, visualCase.theme);
       const page = await context.newPage();
-      await page.goto(origin, { waitUntil: 'networkidle' });
+      await page.goto(origin, { waitUntil: 'domcontentloaded', timeout: 30_000 });
+      await page.getByRole('button', { name: 'Fleet view' }).waitFor({ state: 'attached', timeout: 10_000 });
       if (visualCase.css[0] <= 600) {
         await page.locator('.hamburger').click();
         await page.locator('.sidebar.open').waitFor();
@@ -152,6 +153,11 @@ async function captureFleetVisualMatrix(browser, origin, screenshotDir, refreshL
           indeterminate_goal: document.querySelectorAll('[aria-label="Goal working on goal"].fleet-work-meter.indeterminate').length,
           checkpoint_status: document.querySelector('.fleet-card[data-session-id="fleet-working"] .fleet-card-status strong')?.textContent?.trim() || '',
           verifying_status: document.querySelector('.fleet-card[data-session-id="fleet-goal-two"] .fleet-card-status strong')?.textContent?.trim() || '',
+          control_groups: document.querySelectorAll('.fleet-control-actions').length,
+          pause_controls: document.querySelectorAll('[aria-label^="Pause goal for"]').length,
+          resume_controls: document.querySelectorAll('[aria-label^="Resume goal for"]').length,
+          interrupt_controls: document.querySelectorAll('[aria-label^="Interrupt turn for"]').length,
+          gated_antigravity_controls: document.querySelectorAll('.fleet-card[data-session-id="fleet-antigravity-work"] .fleet-control-actions').length,
           layout_shift: Number((window.__fleetLayoutShift || 0).toFixed(6)),
           theme: document.documentElement.dataset.theme,
         };
@@ -171,6 +177,11 @@ async function captureFleetVisualMatrix(browser, origin, screenshotDir, refreshL
       assert.strictEqual(metrics.indeterminate_goal, 1, `${visualCase.name} lost an indeterminate native goal`);
       assert.strictEqual(metrics.checkpoint_status, 'Waiting for next goal turn', `${visualCase.name} lost the goal checkpoint substate`);
       assert.strictEqual(metrics.verifying_status, 'Reconnecting', `${visualCase.name} lost the goal verification substate`);
+      assert.strictEqual(metrics.control_groups, 5, `${visualCase.name} lost a Fleet control group`);
+      assert.strictEqual(metrics.pause_controls, 2, `${visualCase.name} lost a Pause goal control`);
+      assert.strictEqual(metrics.resume_controls, 1, `${visualCase.name} lost the Resume goal control`);
+      assert.strictEqual(metrics.interrupt_controls, 2, `${visualCase.name} lost an Interrupt turn control`);
+      assert.strictEqual(metrics.gated_antigravity_controls, 0, `${visualCase.name} exposed a gated Antigravity stop`);
       assert.strictEqual(metrics.layout_shift, 0, `${visualCase.name} shifted after the Fleet view settled`);
       assert.strictEqual(metrics.theme, visualCase.theme, `${visualCase.name} used the wrong theme`);
       const screenshot = screenshotDir ? path.join(screenshotDir, `${visualCase.name}.png`) : null;
@@ -282,15 +293,15 @@ async function main() {
     assert(summaryOnlyFleet, 'summary-only Fleet fixture failed to build');
     const summaryOnlyProjection = projectFleetSummary(summaryOnlyFleet);
     const sessions = [
-      { session_id: 'fleet-working', agent_type: 'codex_cli', chat_title: 'Build lane', display_name: 'Build lane', workspace_name: 'Remote Agent Chat', last_snippet: 'Applying the verified dashboard patch.' },
-      { session_id: 'fleet-goal', agent_type: 'claude_cli', chat_title: 'Validation lane', display_name: 'Validation lane', workspace_name: 'Remote Agent Chat', last_snippet: 'Running the mobile parity audit.' },
+      { session_id: 'fleet-working', agent_type: 'codex_cli', chat_title: 'Build lane', display_name: 'Build lane', workspace_name: 'Remote Agent Chat', last_snippet: 'Applying the verified dashboard patch.', capabilities: { goal_lifecycle: true, goal_pause_resume: true, interrupt: true, interrupt_method: 'turn_interrupt_or_owned_process_tree' } },
+      { session_id: 'fleet-goal', agent_type: 'claude_cli', chat_title: 'Validation lane', display_name: 'Validation lane', workspace_name: 'Remote Agent Chat', last_snippet: 'Running the mobile parity audit.', capabilities: { interrupt: true, interrupt_method: 'owned_process_tree' } },
       { session_id: 'fleet-attention', agent_type: 'cursor', chat_title: 'Review lane', display_name: 'Review lane', workspace_name: 'Remote Agent Chat', last_snippet: 'Waiting for approval on the generated diff.' },
-      { session_id: 'fleet-paused', agent_type: 'codex_cli', chat_title: 'Paused lane', display_name: 'Paused lane', workspace_name: 'Remote Agent Chat', last_snippet: 'Goal paused by the operator.' },
+      { session_id: 'fleet-paused', agent_type: 'codex_cli', chat_title: 'Paused lane', display_name: 'Paused lane', workspace_name: 'Remote Agent Chat', last_snippet: 'Goal paused by the operator.', capabilities: { goal_lifecycle: true, goal_pause_resume: true, interrupt: true, interrupt_method: 'turn_interrupt_or_owned_process_tree' } },
       { session_id: 'fleet-idle', agent_type: 'codex-desktop', chat_title: 'Idle lane', display_name: 'Idle lane', workspace_name: 'Remote Agent Chat', last_snippet: 'Finished earlier work.' },
       { session_id: 'fleet-readonly', agent_type: 'codex_cli', chat_title: 'Read-only lane', display_name: 'Read-only lane', workspace_name: 'Remote Agent Chat', last_snippet: 'Choose a thread before sending.', is_list_view: true },
-      { session_id: 'fleet-goal-two', agent_type: 'codex-desktop', chat_title: 'Release lane', display_name: 'Release lane', workspace_name: 'Remote Agent Chat', last_snippet: 'Preparing exact release evidence.' },
-      { session_id: 'fleet-cursor-work', agent_type: 'cursor', chat_title: 'Cursor lane', display_name: 'Cursor lane', workspace_name: 'Remote Agent Chat', last_snippet: 'Reviewing the active diff.' },
-      { session_id: 'fleet-antigravity-work', agent_type: 'antigravity_panel', chat_title: 'Antigravity lane', display_name: 'Antigravity lane', workspace_name: 'Remote Agent Chat', last_snippet: 'Drafting the current response.' },
+      { session_id: 'fleet-goal-two', agent_type: 'codex-desktop', chat_title: 'Release lane', display_name: 'Release lane', workspace_name: 'Remote Agent Chat', last_snippet: 'Preparing exact release evidence.', capabilities: { goal_lifecycle: true, goal_pause_resume: true, interrupt: true, interrupt_method: 'native_stop' } },
+      { session_id: 'fleet-cursor-work', agent_type: 'cursor', chat_title: 'Cursor lane', display_name: 'Cursor lane', workspace_name: 'Remote Agent Chat', last_snippet: 'Reviewing the active diff.', capabilities: { interrupt: true, interrupt_method: 'native_stop' } },
+      { session_id: 'fleet-antigravity-work', agent_type: 'antigravity_panel', chat_title: 'Antigravity lane', display_name: 'Antigravity lane', workspace_name: 'Remote Agent Chat', last_snippet: 'Drafting the current response.', capabilities: { interrupt: false, interrupt_gate: 'no_verified_session_scoped_stop' } },
       { session_id: 'fleet-attention-two', agent_type: 'continue', chat_title: 'Blocked lane', display_name: 'Blocked lane', workspace_name: 'Remote Agent Chat', last_snippet: 'Waiting for an operator choice.' },
       {
         session_id: 'fleet-idle-claude',
@@ -307,8 +318,22 @@ async function main() {
       { session_id: 'fleet-idle-cline', agent_type: 'cline', chat_title: 'Cline idle', display_name: 'Cline idle', workspace_name: 'Remote Agent Chat', last_snippet: 'No current work.' },
     ];
     const broadcastProxyMessages = [];
+    const controlProxyMessages = [];
     proxy.on('message', data => {
       const message = JSON.parse(data.toString());
+      if (message.type === 'agent_goal_control' || message.type === 'agent_interrupt') {
+        controlProxyMessages.push(message);
+        setTimeout(() => proxy.send(JSON.stringify({
+          type: 'agent_control_result', protocol_version: 1, session_id: message.session_id,
+          request_id: message.request_id, command: message.type, result: 'ok', native_acknowledged: true,
+          details: {
+            native_acknowledged: true,
+            native_operations: 1,
+            ...(message.type === 'agent_goal_control' ? { transcript_messages_appended: 0 } : {}),
+          },
+        })), 120);
+        return;
+      }
       if (message.type !== 'send') return;
       broadcastProxyMessages.push(message);
       proxy.send(JSON.stringify({
@@ -321,13 +346,17 @@ async function main() {
       })), 25);
     });
     proxy.send(JSON.stringify({ type: 'session_list', proxy_id: 'fleet-view-e2e', sessions }));
+    sessions.filter(session => session.capabilities).forEach(session => proxy.send(JSON.stringify({
+      type: 'agent_config', protocol_version: 1, session_id: session.session_id,
+      model_id: 'fixture', capabilities: session.capabilities,
+    })));
     const now = Date.now();
     proxy.send(JSON.stringify({
       type: 'status', session: 'fleet-working', thinking: false,
       activity_trace: { proxy_emitted_at_ms: Date.now() },
       activity: {
         kind: 'idle', label: '', started_at: new Date(now - 65_000).toISOString(),
-        goal: { status: 'active', state: 'active', objective: 'Ship fleet dashboard', fingerprint: 'fleet-build-goal', generation: 1, time_used_seconds: 125, updated_at: new Date(now).toISOString() },
+        goal: { status: 'active', state: 'active', objective: 'Ship fleet dashboard', token_budget: 9000, fingerprint: 'fleet-build-goal', generation: 1, transition_seq: 2, time_used_seconds: 125, updated_at: new Date(now).toISOString() },
         goal_run: { schema_version: 1, run_id: 'fleet-build-run', goal_fingerprint: 'fleet-build-goal', goal_generation: 1, lifecycle: 'checkpoint_pending_continuation', lease_active: true, owner_state: 'confirmed', transition_seq: 2, transition_id: 'fleet-build-checkpoint', lease_started_at: new Date(now - 65_000).toISOString() },
         task_list: { tasks: [
           { state: 'completed', text: 'Model fleet state' }, { state: 'completed', text: 'Build web cards' },
@@ -358,7 +387,7 @@ async function main() {
       activity_trace: { proxy_emitted_at_ms: Date.now() },
       activity: {
         kind: 'idle', label: 'Goal paused',
-        goal: { status: 'paused', objective: 'Resume only after operator review', updated_at: new Date(now).toISOString() },
+        goal: { status: 'paused', state: 'paused', objective: 'Resume only after operator review', token_budget: 4000, fingerprint: 'fleet-paused-goal', generation: 1, transition_seq: 1, updated_at: new Date(now).toISOString() },
       },
     }));
     proxy.send(JSON.stringify({
@@ -372,7 +401,7 @@ async function main() {
       activity: { kind: 'thinking', label: 'Waiting for thread selection' },
     }));
     [
-      ['fleet-goal-two', { kind: 'idle', label: '', started_at: new Date(now - 45_000).toISOString(), goal: { status: 'active', state: 'active', objective: 'Ship the verified release', fingerprint: 'fleet-release-goal', generation: 1, progress_percent: 40, updated_at: new Date(now).toISOString() }, goal_run: { schema_version: 1, run_id: 'fleet-release-run', goal_fingerprint: 'fleet-release-goal', goal_generation: 1, lifecycle: 'verifying', lease_active: true, owner_state: 'verifying', transition_seq: 2, transition_id: 'fleet-release-verifying', lease_started_at: new Date(now - 45_000).toISOString() } }],
+      ['fleet-goal-two', { kind: 'idle', label: '', started_at: new Date(now - 45_000).toISOString(), goal: { status: 'active', state: 'active', objective: 'Ship the verified release', token_budget: 12000, fingerprint: 'fleet-release-goal', generation: 1, transition_seq: 2, progress_percent: 40, updated_at: new Date(now).toISOString() }, goal_run: { schema_version: 1, run_id: 'fleet-release-run', goal_fingerprint: 'fleet-release-goal', goal_generation: 1, lifecycle: 'verifying', lease_active: true, owner_state: 'verifying', transition_seq: 2, transition_id: 'fleet-release-verifying', lease_started_at: new Date(now - 45_000).toISOString() } }],
       ['fleet-cursor-work', { kind: 'working', label: 'Reviewing diff', current: { kind: 'tool', label: 'Reviewing active diff', since: new Date(now).toISOString() } }],
       ['fleet-antigravity-work', { kind: 'generating', label: 'Drafting response', current: { kind: 'response', label: 'Drafting the current response', since: new Date(now).toISOString() } }],
       ['fleet-attention-two', { kind: 'blocked', label: 'Operator choice required' }],
@@ -400,7 +429,7 @@ async function main() {
       [
         ['fleet-working', {
           kind: 'idle', label: '', started_at: new Date(refreshedAt - 65_000).toISOString(),
-          goal: { status: 'active', state: 'active', objective: 'Ship fleet dashboard', fingerprint: 'fleet-build-goal', generation: 1, time_used_seconds: 125, updated_at: new Date(refreshedAt).toISOString() },
+          goal: { status: 'active', state: 'active', objective: 'Ship fleet dashboard', token_budget: 9000, fingerprint: 'fleet-build-goal', generation: 1, transition_seq: 2, time_used_seconds: 125, updated_at: new Date(refreshedAt).toISOString() },
           goal_run: { schema_version: 1, run_id: 'fleet-build-run', goal_fingerprint: 'fleet-build-goal', goal_generation: 1, lifecycle: 'checkpoint_pending_continuation', lease_active: true, owner_state: 'confirmed', transition_seq: 2, transition_id: 'fleet-build-checkpoint', lease_started_at: new Date(refreshedAt - 65_000).toISOString() },
           task_list: { tasks: [
             { state: 'completed', text: 'Model fleet state' }, { state: 'completed', text: 'Build web cards' },
@@ -413,7 +442,7 @@ async function main() {
           current: { kind: 'response', label: 'Running the mobile parity audit', since: new Date(refreshedAt).toISOString() },
         }],
         ['fleet-readonly', { kind: 'thinking', label: 'Waiting for thread selection' }],
-        ['fleet-goal-two', { kind: 'idle', label: '', started_at: new Date(refreshedAt - 45_000).toISOString(), goal: { status: 'active', state: 'active', objective: 'Ship the verified release', fingerprint: 'fleet-release-goal', generation: 1, progress_percent: 40, updated_at: new Date(refreshedAt).toISOString() }, goal_run: { schema_version: 1, run_id: 'fleet-release-run', goal_fingerprint: 'fleet-release-goal', goal_generation: 1, lifecycle: 'verifying', lease_active: true, owner_state: 'verifying', transition_seq: 2, transition_id: 'fleet-release-verifying', lease_started_at: new Date(refreshedAt - 45_000).toISOString() } }],
+        ['fleet-goal-two', { kind: 'idle', label: '', started_at: new Date(refreshedAt - 45_000).toISOString(), goal: { status: 'active', state: 'active', objective: 'Ship the verified release', token_budget: 12000, fingerprint: 'fleet-release-goal', generation: 1, transition_seq: 2, progress_percent: 40, updated_at: new Date(refreshedAt).toISOString() }, goal_run: { schema_version: 1, run_id: 'fleet-release-run', goal_fingerprint: 'fleet-release-goal', goal_generation: 1, lifecycle: 'verifying', lease_active: true, owner_state: 'verifying', transition_seq: 2, transition_id: 'fleet-release-verifying', lease_started_at: new Date(refreshedAt - 45_000).toISOString() } }],
         ['fleet-cursor-work', { kind: 'working', label: 'Reviewing diff', current: { kind: 'tool', label: 'Reviewing active diff', since: new Date(refreshedAt).toISOString() } }],
         ['fleet-antigravity-work', { kind: 'generating', label: 'Drafting response', current: { kind: 'response', label: 'Drafting the current response', since: new Date(refreshedAt).toISOString() } }],
         ['fleet-attention-two', { kind: 'blocked', label: 'Operator choice required' }],
@@ -551,15 +580,39 @@ async function main() {
     await page.locator('.fleet-card[data-session-id="fleet-working"]').click();
     await page.locator('[data-testid="fleet-view"]').waitFor({ state: 'detached' });
     assert.equal(await page.locator('.session-card.active[data-session-id="fleet-working"]').count(), 1);
+    assert.equal(await page.getByRole('button', { name: 'Pause goal' }).count(), 1, 'session header lost Pause goal');
     await reopenFleet();
     await page.locator('.fleet-card[data-session-id="fleet-goal"]').focus();
     await page.keyboard.press('Enter');
     await page.locator('[data-testid="fleet-view"]').waitFor({ state: 'detached' });
     assert.equal(await page.locator('.session-card.active[data-session-id="fleet-goal"]').count(), 1);
+    assert.equal(await page.getByRole('button', { name: 'Interrupt turn' }).count(), 1, 'session header lost Interrupt turn');
     await reopenFleet();
     await page.locator('.fleet-card[data-session-id="fleet-readonly"]').tap();
     await page.locator('[data-testid="fleet-view"]').waitFor({ state: 'detached' });
     assert.equal(await page.locator('.session-card.active[data-session-id="fleet-readonly"]').count(), 1);
+    assert.equal(await page.locator('.session-control-pill.goal-control, .session-control-pill.interrupt-control').count(), 0,
+      'goal-less, unsupported session rendered a dead header control');
+
+    await reopenFleet();
+    assert.equal(await page.getByRole('button', { name: 'Pause goal for Build lane' }).count(), 1);
+    assert.equal(await page.getByRole('button', { name: 'Resume goal for Paused lane' }).count(), 1);
+    assert.equal(await page.getByRole('button', { name: 'Interrupt turn for Cursor lane' }).count(), 1);
+    assert.equal(await page.locator('.fleet-card[data-session-id="fleet-antigravity-work"] .fleet-control-actions').count(), 0);
+    const pauseControl = page.getByRole('button', { name: 'Pause goal for Build lane' });
+    await pauseControl.click();
+    assert.equal(await pauseControl.isDisabled(), true, 'goal control did not enter pending state');
+    assert.equal(await pauseControl.innerText(), 'Pausing...');
+    await page.waitForFunction(() => document.querySelector('[aria-label="Pause goal for Build lane"]')?.disabled === false);
+    const interruptControl = page.getByRole('button', { name: 'Interrupt turn for Cursor lane' });
+    await interruptControl.click();
+    assert.equal(await interruptControl.isDisabled(), true, 'interrupt control did not enter pending state');
+    assert.equal(await interruptControl.innerText(), 'Interrupting...');
+    await page.waitForFunction(() => document.querySelector('[aria-label="Interrupt turn for Cursor lane"]')?.disabled === false);
+    assert.deepStrictEqual(controlProxyMessages.map(message => message.type), ['agent_goal_control', 'agent_interrupt']);
+    assert(controlProxyMessages.every(message => Number(message.session_generation) > 0));
+    assert(Number(controlProxyMessages[0].goal_generation) > 0 && controlProxyMessages[0].goal_fingerprint);
+    assert(Number(controlProxyMessages[1].turn_generation) > 0);
 
     const androidSource = fs.readFileSync(path.join(__dirname, '..', 'android-app', 'screens', 'SessionListScreen.jsx'), 'utf8');
     for (const marker of [
@@ -568,7 +621,15 @@ async function main() {
       'Open session', "{'\\u203A'}", 'workContext', "navigation.navigate('Chat'",
       'broadcastSelectedIds', 'Broadcast prompt', 'SEND TO ${broadcastSelectedIds.length} SESSIONS',
       'Broadcast delivery receipts', 'sessionSupportsBroadcast',
+      'fleetControlPending', 'Pause goal', 'Resume goal', 'Interrupt turn',
+      'clientRef.current?.controlGoal', 'clientRef.current?.interrupt',
     ]) assert(androidSource.includes(marker), `Android fleet parity missing ${marker}`);
+    const androidChatSource = fs.readFileSync(path.join(__dirname, '..', 'android-app', 'screens', 'ChatScreen.jsx'), 'utf8');
+    for (const marker of [
+      'sessionControlBar', 'TURN CONTROLS', 'Goal ${goalState', 'Turn in progress',
+      'Pause goal', 'Resume goal', 'Interrupt turn', 'sessionControlButtonDisabled',
+      'goalControlPendingRef.current', 'interruptPendingRef.current',
+    ]) assert(androidChatSource.includes(marker), `Android chat control parity missing ${marker}`);
 
     const result = {
       status: 'PASS',
@@ -597,6 +658,9 @@ async function main() {
       open_action_encoding_safe: true,
       visual_matrix: visualMatrix,
       android_source_parity: true,
+      web_control_groups: 5,
+      web_header_control_states: ['pause', 'interrupt', 'goal-less-hidden'],
+      web_control_receipts: controlProxyMessages.length,
       broadcast_selected_sessions: 2,
       broadcast_exact_confirmation: true,
       broadcast_capability_gate: true,

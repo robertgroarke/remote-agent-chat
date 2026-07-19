@@ -1,0 +1,1 @@
+{"schema_version":1,"harness":"codex-cli","installed_version":"codex-cli 0.144.6","captured_contract":"app-server thread, turn, question and goal RPC contracts","source":"installed app-server schema plus tests/fixtures/codex-app-server"}
