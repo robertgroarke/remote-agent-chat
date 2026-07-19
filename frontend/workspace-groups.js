@@ -260,6 +260,9 @@ function createSidebarOrderLedger(groups, options = {}) {
     revision: Number(options.revision || 0),
     groupOrder: snapshot.groupOrder,
     sessionOrder: snapshot.sessionOrder,
+    historicalGroupOrder: snapshot.groupOrder,
+    historicalSessionOrder: snapshot.sessionOrder,
+    historicalGroupBySession: source.groupBySession,
     groupBySession: source.groupBySession,
     groupMeta: source.groupMeta,
     fallbackSessionById: source.sessionById,
@@ -327,16 +330,32 @@ function reconcileSidebarOrderLedger(ledger, groups, options = {}) {
 
   const source = sidebarSourceIndex(groups);
   const presentIds = new Set(Object.keys(source.sessionById));
+  const historicalSessionOrder = [...(current.historicalSessionOrder || current.sessionOrder || [])];
+  const historicalGroupOrder = [...(current.historicalGroupOrder || current.groupOrder || [])];
+  const historicalGroupBySession = { ...(current.historicalGroupBySession || current.groupBySession || {}) };
+  for (const group of groups || []) {
+    const key = sidebarGroupKey(group);
+    if (!historicalGroupOrder.includes(key)) historicalGroupOrder.push(key);
+    for (const session of group.sessions || []) {
+      const id = sessionIdOf(session);
+      if (id && !historicalSessionOrder.includes(id)) {
+        historicalSessionOrder.push(id);
+        historicalGroupBySession[id] = key;
+      }
+    }
+  }
   const groupBySession = {};
   const sessionOrder = [];
   const groupOrder = [];
   const groupMeta = { ...(current.groupMeta || {}) };
   const fallbackSessionById = {};
 
-  for (const id of current.sessionOrder || []) {
+  for (const id of historicalSessionOrder) {
     if (!presentIds.has(id)) continue;
     sessionOrder.push(id);
-    groupBySession[id] = current.groupBySession?.[id] || source.groupBySession[id];
+    groupBySession[id] = current.groupBySession?.[id]
+      || historicalGroupBySession[id]
+      || source.groupBySession[id];
     fallbackSessionById[id] = source.sessionById[id];
   }
   for (const group of groups || []) {
@@ -350,7 +369,7 @@ function reconcileSidebarOrderLedger(ledger, groups, options = {}) {
       groupMeta[key] = { ...group, sessions: [] };
     }
   }
-  for (const key of current.groupOrder || []) {
+  for (const key of historicalGroupOrder) {
     if (sessionOrder.some(id => groupBySession[id] === key)) groupOrder.push(key);
   }
   for (const id of sessionOrder) {
@@ -363,6 +382,9 @@ function reconcileSidebarOrderLedger(ledger, groups, options = {}) {
     revision: Number(current.revision || 0) + 1,
     groupOrder,
     sessionOrder,
+    historicalGroupOrder,
+    historicalSessionOrder,
+    historicalGroupBySession,
     groupBySession,
     groupMeta,
     fallbackSessionById,

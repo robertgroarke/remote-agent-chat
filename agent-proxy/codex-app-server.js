@@ -216,8 +216,27 @@ class CodexAppServerConnection extends EventEmitter {
     return this.request('thread/goal/get', { threadId });
   }
 
-  async setGoal(threadId, status) {
-    return this.request('thread/goal/set', { threadId, status });
+  async setGoal(threadId, status, options = {}) {
+    if (!threadId) fail('thread_id_required', 'A Codex thread ID is required');
+    const params = { threadId, status };
+    if (options.objective != null) params.objective = options.objective;
+    if (options.tokenBudget != null) params.tokenBudget = options.tokenBudget;
+    return this.request('thread/goal/set', params);
+  }
+
+  async clearGoal(threadId) {
+    if (!threadId) fail('thread_id_required', 'A Codex thread ID is required');
+    return this.request('thread/goal/clear', { threadId });
+  }
+
+  async readRateLimits() {
+    return this.request('account/rateLimits/read', {});
+  }
+
+  async consumeRateLimitResetCredit(creditId = null, idempotencyKey = crypto.randomUUID()) {
+    const params = { idempotencyKey: String(idempotencyKey) };
+    if (creditId != null && String(creditId).trim()) params.creditId = String(creditId).trim();
+    return this.request('account/rateLimitResetCredit/consume', params);
   }
 
   async resolveGoalDecision(threadId, decision) {

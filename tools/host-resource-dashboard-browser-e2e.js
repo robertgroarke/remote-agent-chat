@@ -10,7 +10,7 @@ const { chromium } = require('../frontend/node_modules/playwright-core');
 const { WebSocketServer } = require('../relay-server/node_modules/ws');
 
 const root = path.resolve(__dirname, '..');
-const publicRoot = path.join(root, 'frontend');
+const publicRoot = path.join(root, 'relay-server', 'public');
 const args = process.argv.slice(2);
 const option = name => {
   const index = args.indexOf(name);
@@ -18,6 +18,7 @@ const option = name => {
 };
 const outputPath = option('--output');
 const screenshotDir = option('--screenshot-dir');
+const HOST_RESOURCE_CHART_WIDTH = 640;
 
 const session = {
   session_id: 'host-resource-fixture', agent_type: 'codex_cli', display_name: 'Host resource fixture',
@@ -143,11 +144,23 @@ function detailSnapshot(sequence, aggregateOnly = false) {
 
 const systemHistory = Array.from({ length: 900 }, (_, index) => systemPoint(index + 1));
 const detailHistory = Array.from({ length: 180 }, (_, index) => detailSnapshot((index + 1) * 5));
+const stalledStartedAt = Date.now() - 26_000;
+const stalledSystemHistory = Array.from({ length: 5 }, (_, index) => ({
+  ...systemPoint(index + 1),
+  captured_at: new Date(stalledStartedAt + index * 1_000).toISOString(),
+  monotonic_ms: (index + 1) * 1_000,
+}));
+const stalledDetail = {
+  ...detailSnapshot(5),
+  captured_at: stalledSystemHistory.at(-1).captured_at,
+  monotonic_ms: stalledSystemHistory.at(-1).monotonic_ms,
+};
 
 async function main() {
   const port = await freePort();
   const clientFrames = [];
   const consoleErrors = [];
+  const missingPaths = [];
   const subscriptions = new Map();
   const connections = new Set();
   let subscriptionSerial = 0;
@@ -157,6 +170,9 @@ async function main() {
   let unsubscribeCount = 0;
   let maxSubscriptions = 0;
   let maxSubscriptionsPerConnection = 0;
+  let fixtureMode = 'live';
+  let liveSequence = 900;
+  let liveTimer = null;
   const server = http.createServer((request, response) => {
     if (request.url.startsWith('/api/')) {
       response.writeHead(200, { 'content-type': 'application/json' });
@@ -167,6 +183,7 @@ async function main() {
     const relative = pathname === '/' ? 'index.html' : pathname.replace(/^\/+/, '');
     const filePath = path.resolve(publicRoot, relative);
     if (!filePath.startsWith(`${path.resolve(publicRoot)}${path.sep}`) || !fs.existsSync(filePath) || fs.statSync(filePath).isDirectory()) {
+      missingPaths.push(pathname);
       response.writeHead(404); response.end('not found'); return;
     }
     response.writeHead(200, { 'content-type': contentType(filePath), 'cache-control': 'no-store' });
@@ -204,30 +221,31 @@ async function main() {
         send({ type: 'history_delta', session: sessionId, session_id: sessionId, request_id: message.request_id, messages: [] });
       } else if (message.type === 'host_resource_subscribe') {
         const id = message.resume_subscription_id || `host-sub-${String(++subscriptionSerial).padStart(32, '0')}`;
-        subscriptions.set(id, { aggregateOnly: message.aggregate_only === true, connectionId, ws });
+        subscriptions.set(id, { aggregateOnly: message.aggregate_only === true, connectionId, ws, mode: fixtureMode });
         subscribeCount += 1;
         maxSubscriptions = Math.max(maxSubscriptions, subscriptions.size);
         maxSubscriptionsPerConnection = Math.max(maxSubscriptionsPerConnection,
           [...subscriptions.values()].filter(subscription => subscription.connectionId === connectionId).length);
-        send({ type: 'host_resource_subscription_ack', request_id: message.request_id, subscription_id: id, aggregate_only: message.aggregate_only === true, resumed: !!message.resume_subscription_id, system_points: message.aggregate_only === true ? 60 : 900, detail_points: message.aggregate_only === true ? 0 : 180 });
+        send({ type: 'host_resource_subscription_ack', request_id: message.request_id, subscription_id: id, aggregate_only: message.aggregate_only === true, resumed: !!message.resume_subscription_id, system_points: fixtureMode === 'stalled' ? 5 : message.aggregate_only === true ? 60 : 900, detail_points: fixtureMode === 'stalled' ? 1 : message.aggregate_only === true ? 0 : 180 });
       } else if (message.type === 'host_resource_history_request') {
         const subscription = subscriptions.get(message.subscription_id);
         const aggregateOnly = subscription?.aggregateOnly === true;
-        const source = message.stream === 'detail'
-          ? detailHistory.map(snapshot => aggregateOnly ? detailSnapshot(snapshot.sample_sequence, true) : snapshot)
-          : systemHistory;
+        const source = subscription?.mode === 'stalled'
+          ? message.stream === 'detail' ? [stalledDetail] : stalledSystemHistory
+          : message.stream === 'detail'
+            ? detailHistory.map(snapshot => aggregateOnly ? detailSnapshot(snapshot.sample_sequence, true) : snapshot)
+            : systemHistory;
         const maximum = message.stream === 'detail' ? 8 : 64;
         const points = source.filter(point => point.sample_sequence > Number(message.after_sequence || 0)).slice(0, maximum);
         const next = points.at(-1)?.sample_sequence || Number(message.after_sequence || 0);
         const done = !source.some(point => point.sample_sequence > next);
         send({ type: 'host_resource_history_chunk', request_id: message.request_id, subscription_id: message.subscription_id, chunk: { stream: message.stream, points, after_sequence: message.after_sequence || 0, next_sequence: next, done, retained_points: source.length, aggregate_only: aggregateOnly } });
-        if (message.stream === 'system' && done) {
-          const freshPoint = { ...systemPoint(900), sample_sequence: 901, monotonic_ms: 901_000, captured_at: new Date().toISOString() };
-          setTimeout(() => send({ type: 'host_resource_live', subscription_id: message.subscription_id, point: freshPoint }), 5);
-        }
       } else if (message.type === 'host_resource_refresh') {
         const active = [...subscriptions.values()].filter(subscription => subscription.connectionId === connectionId).at(-1);
-        send({ type: 'host_resource_snapshot', request_id: message.request_id, snapshot: detailSnapshot(900, active?.aggregateOnly === true) });
+        const snapshot = active?.mode === 'stalled'
+          ? stalledDetail
+          : detailSnapshot(liveSequence, active?.aggregateOnly === true);
+        send({ type: 'host_resource_snapshot', request_id: message.request_id, snapshot });
       } else if (message.type === 'host_resource_unsubscribe') {
         subscriptions.delete(message.subscription_id);
         unsubscribeCount += 1;
@@ -242,6 +260,24 @@ async function main() {
     });
   });
   await new Promise((resolve, reject) => server.listen(port, '127.0.0.1', error => error ? reject(error) : resolve()));
+  liveTimer = setInterval(() => {
+    liveSequence += 1;
+    for (const [subscriptionId, subscription] of subscriptions) {
+      if (subscription.mode !== 'live' || subscription.ws.readyState !== subscription.ws.OPEN) continue;
+      subscription.ws.send(JSON.stringify({
+        type: 'host_resource_live',
+        subscription_id: subscriptionId,
+        point: systemPoint(liveSequence),
+      }));
+      if (!subscription.aggregateOnly && liveSequence % 5 === 0) {
+        subscription.ws.send(JSON.stringify({
+          type: 'host_resource_detail',
+          subscription_id: subscriptionId,
+          snapshot: detailSnapshot(liveSequence),
+        }));
+      }
+    }
+  }, 1_000);
 
   let browser;
   try {
@@ -545,11 +581,61 @@ async function main() {
     await dashboard.waitFor({ state: 'visible', timeout: 5000 });
     await dashboard.locator('.host-resource-process-table tbody tr').first().waitFor({ state: 'visible', timeout: 10000 });
     await page.getByRole('button', { name: 'Since open' }).click();
-    await page.waitForFunction(() => document.querySelector('.host-resource-controls')?.textContent.includes('60 samples'), null, { timeout: 10000 });
+    await page.waitForFunction(() => {
+      const text = document.querySelector('.host-resource-controls')?.textContent || '';
+      const count = Number(text.match(/(\d+) raw samples/)?.[1] || 0);
+      return count >= 60;
+    }, null, { timeout: 10000 });
 
     assert.equal(await dashboard.locator('.host-resource-chart').count(), 4, 'four interactive charts must render');
     assert.equal(await dashboard.locator('.host-resource-chart-data').count(), 4, 'each chart must expose an accessible table');
     assert.equal(await dashboard.locator('.host-resource-process-table tbody tr').count(), 3);
+    const rendererContract = await dashboard.evaluate(node => ({
+      charts: [...node.querySelectorAll('.host-resource-chart')].map(chart => {
+        const paths = [...chart.querySelectorAll('.host-resource-chart-line')];
+        const coordinates = paths.flatMap(pathNode => (
+          (pathNode.getAttribute('d') || '').match(/-?\d+(?:\.\d+)?/g) || []
+        ).map(Number));
+        return {
+          yLabels: chart.querySelectorAll('.host-resource-chart-y-label').length,
+          xLabels: chart.querySelectorAll('.host-resource-chart-x-label').length,
+          pathCount: paths.length,
+          pathLengths: paths.map(pathNode => pathNode.getTotalLength()),
+          pathData: paths.map(pathNode => pathNode.getAttribute('d') || ''),
+          strokeWidths: paths.map(pathNode => parseFloat(getComputedStyle(pathNode).strokeWidth)),
+          dashPatterns: paths.map(pathNode => pathNode.getAttribute('stroke-dasharray') || 'solid'),
+          coordinates,
+          quality: chart.querySelector('.host-resource-chart-quality')?.textContent || '',
+          stats: chart.querySelector('.host-resource-chart-stats')?.textContent || '',
+        };
+      }),
+    }));
+    rendererContract.charts.forEach((chart, index) => {
+      assert(chart.yLabels >= 4 && chart.yLabels <= 6, `chart ${index + 1} y-label count ${chart.yLabels}`);
+      assert.equal(chart.xLabels, 5, `chart ${index + 1} must render five desktop time labels`);
+      assert(chart.pathCount >= 2, `chart ${index + 1} must render every enabled series`);
+      assert(chart.pathData.every(Boolean), `chart ${index + 1} emitted an empty path`);
+      assert(chart.pathLengths.every(length => length > 0), `chart ${index + 1} emitted a zero-length path`);
+      assert(chart.strokeWidths.every(width => width >= 2), `chart ${index + 1} stroke fell below 2 px`);
+      assert(chart.coordinates.every(value => Number.isFinite(value) && value >= 0 && value <= HOST_RESOURCE_CHART_WIDTH),
+        `chart ${index + 1} emitted an out-of-bounds/non-finite coordinate`);
+      assert(new Set(chart.dashPatterns).size >= 2, `chart ${index + 1} must distinguish series without color alone`);
+      assert.match(chart.quality, /valid.*expected.*cadence.*gap.*duplicate.*out of order/i);
+      assert.match(chart.stats, /raw.*cadence.*gap.*p95/i);
+    });
+    const rendererReceipt = rendererContract.charts.map(chart => ({
+      y_labels: chart.yLabels,
+      x_labels: chart.xLabels,
+      path_count: chart.pathCount,
+      path_lengths: chart.pathLengths,
+      stroke_widths: chart.strokeWidths,
+      dash_patterns: chart.dashPatterns,
+      coordinate_count: chart.coordinates.length,
+      coordinate_min: Math.min(...chart.coordinates),
+      coordinate_max: Math.max(...chart.coordinates),
+      quality: chart.quality,
+      stats: chart.stats,
+    }));
     const desktop = await dashboard.evaluate(node => ({
       overflow: node.scrollWidth - node.clientWidth,
       chartColumns: getComputedStyle(document.querySelector('.host-resource-charts')).gridTemplateColumns.split(' ').filter(Boolean).length,
@@ -567,6 +653,14 @@ async function main() {
     await firstCanvas.press('ArrowLeft');
     const tooltipAfter = await dashboard.locator('.host-resource-chart-tooltip').first().innerText();
     assert.notEqual(tooltipAfter, tooltipBefore, 'keyboard crosshair must move to an exact prior sample');
+    assert.match(tooltipAfter, /\b(?:UTC|GMT|[A-Z]{2,5})\b.*seq \d+/,
+      'tooltip must include a full zoned timestamp and source sequence');
+    const synchronizedCrosshair = await dashboard.evaluate(node => {
+      const xValues = [...node.querySelectorAll('.host-resource-chart-crosshair')].map(line => Number(line.getAttribute('x1')));
+      return { count: xValues.length, spread: Math.max(...xValues) - Math.min(...xValues) };
+    });
+    assert.equal(synchronizedCrosshair.count, 4, 'the shared crosshair must render on all four charts');
+    assert(synchronizedCrosshair.spread <= 0.01, `shared crosshair spread ${synchronizedCrosshair.spread}`);
     await firstCanvas.hover();
     await page.mouse.wheel(0, -240);
     await page.waitForTimeout(50);
@@ -589,9 +683,15 @@ async function main() {
     assert.match(await autoScale.innerText(), /^Fixed /, 'rate scale must support a fixed read-back');
     await autoScale.click();
 
+    const beforePause = await dashboard.locator('.host-resource-controls').innerText();
     await page.getByRole('button', { name: 'Pause' }).click();
     await page.getByRole('button', { name: 'Resume' }).waitFor();
+    const pausedControls = await dashboard.locator('.host-resource-controls').innerText();
+    await page.waitForTimeout(1_250);
+    assert.equal(await dashboard.locator('.host-resource-controls').innerText(), pausedControls,
+      'pause must freeze the visible window while collection remains bounded in the background');
     await page.getByRole('button', { name: 'Resume' }).click();
+    assert.notEqual(pausedControls, beforePause, 'pause controls must disclose the frozen sequence');
     const processSearch = dashboard.locator('.host-resource-process-controls input');
     await processSearch.fill('worker');
     assert.equal(await dashboard.locator('.host-resource-process-table tbody tr').count(), 1);
@@ -611,10 +711,56 @@ async function main() {
     await dashboard.locator('.host-resource-process-section').waitFor({ state: 'visible', timeout: 10000 });
     const explicitUnsubscribesBeforeFinalDashboardClose = unsubscribeCount;
 
-    if (screenshotDir) {
-      fs.mkdirSync(screenshotDir, { recursive: true });
-      await page.screenshot({ path: path.join(screenshotDir, 'host-resources-1440x900-dark.png'), fullPage: true });
+    if (screenshotDir) fs.mkdirSync(screenshotDir, { recursive: true });
+    const chartVisualMatrix = [];
+    for (const theme of ['light', 'dark']) {
+      await page.evaluate(themeName => {
+        document.documentElement.dataset.theme = themeName;
+        localStorage.setItem('remote-agent-chat-theme', themeName);
+      }, theme);
+      for (const viewportSize of [{ width: 1440, height: 900 }, { width: 1920, height: 1080 }, { width: 390, height: 844 }]) {
+        await page.setViewportSize(viewportSize);
+        for (const zoom of [1, 1.25, 2]) {
+          await page.evaluate(value => { document.body.style.zoom = String(value); }, zoom);
+          await page.waitForTimeout(40);
+          const sample = await dashboard.evaluate((node, expectedXLabels) => ({
+            overflow: node.scrollWidth - node.clientWidth,
+            documentOverflow: document.documentElement.scrollWidth - document.documentElement.clientWidth,
+            xLabelCounts: [...node.querySelectorAll('.host-resource-chart')].map(chart => chart.querySelectorAll('.host-resource-chart-x-label').length),
+            yLabelCounts: [...node.querySelectorAll('.host-resource-chart')].map(chart => chart.querySelectorAll('.host-resource-chart-y-label').length),
+            chartBounds: [...node.querySelectorAll('.host-resource-chart')].map(chart => {
+              const box = chart.getBoundingClientRect();
+              return { left: box.left, right: box.right, width: box.width, height: box.height };
+            }),
+            expectedXLabels,
+          }), viewportSize.width <= 600 ? 4 : 5);
+          assert(sample.overflow <= 1, `${theme} ${viewportSize.width}px ${zoom * 100}% dashboard overflow ${sample.overflow}`);
+          assert(sample.documentOverflow <= 1, `${theme} ${viewportSize.width}px ${zoom * 100}% document overflow ${sample.documentOverflow}`);
+          assert(sample.xLabelCounts.every(count => count === sample.expectedXLabels),
+            `${theme} ${viewportSize.width}px ${zoom * 100}% x-label mismatch ${sample.xLabelCounts.join(',')}`);
+          assert(sample.yLabelCounts.every(count => count >= 4 && count <= 6),
+            `${theme} ${viewportSize.width}px ${zoom * 100}% y-label mismatch ${sample.yLabelCounts.join(',')}`);
+          assert(sample.chartBounds.every(box => box.left >= -1 && box.right <= viewportSize.width + 1),
+            `${theme} ${viewportSize.width}px ${zoom * 100}% chart escaped the viewport`);
+          chartVisualMatrix.push({ theme, ...viewportSize, zoom, ...sample });
+          if (screenshotDir && zoom === 1) {
+            await page.screenshot({ path: path.join(screenshotDir, `host-resources-${viewportSize.width}x${viewportSize.height}-${theme}.png`), fullPage: true });
+          }
+        }
+        await page.evaluate(() => { document.body.style.zoom = ''; });
+      }
     }
+    await page.setViewportSize({ width: 1440, height: 900 });
+    await page.evaluate(() => { document.documentElement.dataset.theme = 'dark'; document.body.style.filter = 'grayscale(1)'; });
+    const colorIndependentSeries = await dashboard.evaluate(node => [...node.querySelectorAll('.host-resource-chart')].map(chart => ({
+      dashPatterns: [...chart.querySelectorAll('.host-resource-chart-line')].map(pathNode => pathNode.getAttribute('stroke-dasharray') || 'solid'),
+      markerShapes: [...chart.querySelectorAll('.host-resource-chart-legend .marker')].map(marker => marker.className),
+    })));
+    assert(colorIndependentSeries.every(chart => new Set(chart.dashPatterns).size >= 2 && new Set(chart.markerShapes).size >= 2),
+      'series must remain distinguishable under color-vision simulation');
+    if (screenshotDir) await page.screenshot({ path: path.join(screenshotDir, 'host-resources-1440x900-dark-grayscale.png'), fullPage: true });
+    await page.evaluate(() => { document.body.style.filter = ''; });
+
     await page.setViewportSize({ width: 390, height: 844 });
     await page.waitForTimeout(100);
     assert.equal(await page.locator('[data-testid="global-desktop-status-rail"]').count(), 0,
@@ -636,10 +782,60 @@ async function main() {
     await page.waitForTimeout(50);
     assert.equal(unsubscribeCount, explicitUnsubscribesBeforeFinalDashboardClose + 1,
       'aggregate/detail mode changes must retain one subscription; the final dashboard consumer release must unsubscribe once');
+
+    fixtureMode = 'stalled';
+    let stalledContext;
+    let stalledProof;
+    try {
+      stalledContext = await browser.newContext({
+        viewport: { width: 1440, height: 900 }, serviceWorkers: 'block', colorScheme: 'light',
+        reducedMotion: 'reduce', ignoreHTTPSErrors: true,
+      });
+      await stalledContext.addInitScript(() => {
+        localStorage.setItem('remote-agent-chat:show-test-sessions:v1', '1');
+        localStorage.setItem('remote-agent-chat-theme', 'light');
+      });
+      const stalledPage = await stalledContext.newPage();
+      stalledPage.on('console', message => { if (message.type() === 'error') consoleErrors.push(`stalled: ${message.text()}`); });
+      stalledPage.on('pageerror', error => consoleErrors.push(`stalled: ${error.message}`));
+      await stalledPage.goto(`http://127.0.0.1:${port}/?session=${session.session_id}`, { waitUntil: 'domcontentloaded', timeout: 15000 });
+      const stalledStrip = stalledPage.locator('[data-testid="global-host-resource-strip"]');
+      await stalledStrip.waitFor({ state: 'visible', timeout: 12000 });
+      await stalledPage.waitForFunction(() => document.querySelector('[data-testid="global-host-resource-strip"]')?.dataset.status === 'stale', null, { timeout: 10000 });
+      await stalledStrip.click();
+      const stalledDashboard = stalledPage.locator('[data-testid="host-resource-dashboard"]');
+      await stalledDashboard.waitFor({ state: 'visible', timeout: 5000 });
+      await stalledPage.waitForFunction(() => /5 raw samples/.test(document.querySelector('.host-resource-controls')?.textContent || ''), null, { timeout: 10000 });
+      stalledProof = await stalledDashboard.evaluate(node => ({
+        status: node.querySelector('.host-resource-status')?.textContent || '',
+        statusClass: node.querySelector('.host-resource-status')?.className || '',
+        meta: node.querySelector('.host-resource-meta')?.textContent || '',
+        rawText: node.querySelector('.host-resource-controls')?.textContent || '',
+        qualityStatuses: [...node.querySelectorAll('.host-resource-chart-quality')].map(entry => entry.className),
+        p95Labels: [...node.querySelectorAll('.host-resource-chart-stats')].map(entry => entry.textContent.match(/p95 collecting \(5\/20\)/g)?.length || 0),
+        gapRects: node.querySelectorAll('.host-resource-chart-gap').length,
+        sparseMarkers: node.querySelectorAll('.host-resource-chart-point').length,
+        tooltip: node.querySelector('.host-resource-chart-tooltip')?.textContent || '',
+      }));
+      assert.equal(stalledProof.status, 'Stale', 'a feed last updated 22+ seconds ago must not remain Live');
+      assert.match(stalledProof.statusClass, /\bstale\b/);
+      assert.match(stalledProof.meta, /5 received.*5 valid.*(?:3\d|[4-9]\d|\d{3,}) expected.*(?:2\d|[3-9]\d|\d{3,}) dropped/i,
+        'stale expected/dropped counts must extend through wall-clock now');
+      assert(stalledProof.qualityStatuses.length === 4 && stalledProof.qualityStatuses.every(value => /\bstale\b/.test(value)),
+        'every chart must expose the same truthful stale state');
+      assert(stalledProof.p95Labels.every(count => count >= 2), 'five samples must show p95 collecting (5/20), never a mature percentile');
+      assert(stalledProof.gapRects >= 4, 'the latest-sample-to-now missing span must be shaded on every chart');
+      assert(stalledProof.sparseMarkers >= 9, 'sparse series must expose visible point markers');
+      assert.match(stalledProof.tooltip, /seq 5.*Stale.*source fresh/i);
+      if (screenshotDir) await stalledPage.screenshot({ path: path.join(screenshotDir, 'host-resources-1440x900-light-stalled-5-samples.png'), fullPage: true });
+    } finally {
+      if (stalledContext) await stalledContext.close().catch(() => {});
+      fixtureMode = 'live';
+    }
     const forbidden = new Set(['send', 'input', 'agent_interrupt', 'agent_config_set', 'agent_control', 'broadcast_send', 'permission_response', 'question_answer', 'terminal_input', 'new_conversation', 'switch_conversation', 'close_session']);
     const mutating = clientFrames.filter(frame => forbidden.has(frame.type));
     assert.deepEqual(mutating, []);
-    assert.deepEqual(consoleErrors, [], `browser errors: ${consoleErrors.join(' | ')}`);
+    assert.deepEqual(consoleErrors, [], `browser errors: ${consoleErrors.join(' | ')}; missing paths: ${[...new Set(missingPaths)].join(', ')}`);
 
     const result = {
       ok: true,
@@ -657,7 +853,10 @@ async function main() {
       two_tab_lifecycle: twoTabLifecycle,
       rapid_mount_lifecycle: rapidMountLifecycle,
       chat_title_geometry_restored: true,
-      desktop, mobile_light: lightMobile, mobile, charts: 4, accessible_tables: 4, keyboard_crosshair: true,
+      desktop, mobile_light: lightMobile, mobile, chart_visual_matrix: chartVisualMatrix,
+      color_independent_series: colorIndependentSeries, renderer_contract: rendererReceipt,
+      stalled_five_sample_proof: stalledProof,
+      charts: 4, accessible_tables: 4, keyboard_crosshair: true,
       wheel_zoom: true, touch_pinch: true, synchronized_viewport: true, pause_resume: true,
       process_tree_rows: 3, process_overlay: true, exact_64_bit_counter: true,
       aggregate_only_labels_removed: true, explicit_unsubscribes: unsubscribeCount,
@@ -673,6 +872,7 @@ async function main() {
     if (outputPath) { fs.mkdirSync(path.dirname(outputPath), { recursive: true }); fs.writeFileSync(outputPath, serialized); }
     process.stdout.write(serialized);
   } finally {
+    if (liveTimer) clearInterval(liveTimer);
     if (browser) await browser.close().catch(() => {});
     await new Promise(resolve => wss.close(() => resolve()));
     await new Promise(resolve => server.close(() => resolve()));

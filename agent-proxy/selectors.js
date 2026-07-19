@@ -9357,6 +9357,198 @@ const READ_ANTIGRAVITY_MODEL_QUOTA_EXPR = `
   });
 `;
 
+// Antigravity 2.1.4 serves its renderer and Connect RPC endpoint from the
+// same loopback origin.  The Models settings page calls these exact methods.
+// Keep credentials inside that renderer: the expression consumes the CSRF
+// value in-context and returns only bounded, normalized quota fields.
+const READ_ANTIGRAVITY_INTERNAL_QUOTA_EXPR = `
+  var appConfig = window.__APP_CONFIG__ || {};
+  var appVersion = String(appConfig.appVersion || '');
+  var productName = String(appConfig.productName || '');
+  if (productName !== 'antigravity' || appVersion !== '2.1.4') {
+    return JSON.stringify({
+      ok: false,
+      code: 'unsupported_app_contract',
+      app_version: appVersion.substring(0, 40),
+    });
+  }
+
+  var csrf = appConfig.csrfToken;
+  if (!csrf) {
+    var csrfCookie = String(document.cookie || '').split('; ').find(function(value) {
+      return value.indexOf('csrfToken=') === 0;
+    });
+    csrf = csrfCookie ? csrfCookie.substring('csrfToken='.length) : '';
+  }
+  if (!csrf) return JSON.stringify({ ok: false, code: 'missing_in_context_csrf' });
+
+  var forceRefresh = __RAC_FORCE_REFRESH__;
+  var before = {
+    visibility: document.visibilityState,
+    focus: document.hasFocus(),
+    url: location.href,
+    title: document.title,
+  };
+  var mutationRecords = 0;
+  var observer = new MutationObserver(function(records) { mutationRecords += records.length; });
+  if (document.documentElement) observer.observe(document.documentElement, {
+    subtree: true,
+    childList: true,
+    attributes: true,
+    characterData: true,
+  });
+
+  function boundedText(value, maxLength) {
+    return String(value || '').replace(/\\s+/g, ' ').trim().substring(0, maxLength);
+  }
+
+  function boundedPercent(value) {
+    if (value == null || value === '') return null;
+    var number = Number(value);
+    if (!Number.isFinite(number)) return null;
+    return Math.max(0, Math.min(100, Math.round(number * 10000) / 100));
+  }
+
+  function resetDescription(value, capturedAt) {
+    var resetAt = Date.parse(value || '');
+    if (!Number.isFinite(resetAt)) return null;
+    var minutes = Math.max(0, Math.ceil((resetAt - capturedAt) / 60000));
+    var days = Math.floor(minutes / 1440);
+    var hours = Math.floor((minutes % 1440) / 60);
+    var remainder = minutes % 60;
+    var parts = [];
+    if (days) parts.push(days + ' day' + (days === 1 ? '' : 's'));
+    if (hours) parts.push(hours + ' hour' + (hours === 1 ? '' : 's'));
+    if (remainder || parts.length === 0) parts.push(remainder + ' minute' + (remainder === 1 ? '' : 's'));
+    return parts.slice(0, 2).join(', ');
+  }
+
+  async function call(method, body) {
+    var controller = new AbortController();
+    var timer = setTimeout(function() { controller.abort(); }, 8000);
+    try {
+      var response = await fetch('/exa.language_server_pb.LanguageServerService/' + method, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          'Connect-Protocol-Version': '1',
+          'x-codeium-csrf-token': csrf,
+        },
+        body: JSON.stringify(body || {}),
+        signal: controller.signal,
+      });
+      if (!response.ok) {
+        var statusError = new Error('rpc_status_' + response.status);
+        statusError.code = 'rpc_status_' + response.status;
+        throw statusError;
+      }
+      try {
+        return await response.json();
+      } catch (_) {
+        var schemaError = new Error('rpc_invalid_json');
+        schemaError.code = 'rpc_invalid_json';
+        throw schemaError;
+      }
+    } finally {
+      clearTimeout(timer);
+    }
+  }
+
+  try {
+    var creditRefresh = forceRefresh
+      ? await Promise.allSettled([call('GetLoadCodeAssist', { forceRefresh: true })])
+      : [];
+    var responses = await Promise.all([
+      call('RetrieveUserQuotaSummary', { forceRefresh: forceRefresh }),
+      call('GetUserStatus', {}),
+    ]);
+    var quotaResponse = responses[0] && responses[0].response;
+    var userStatus = responses[1] && responses[1].userStatus;
+    if (!quotaResponse || !Array.isArray(quotaResponse.groups)) {
+      return JSON.stringify({ ok: false, code: 'quota_schema_mismatch', app_version: appVersion });
+    }
+
+    var capturedAtMs = Date.now();
+    var models = [];
+    quotaResponse.groups.slice(0, 16).forEach(function(group) {
+      var groupName = boundedText(group && group.displayName, 100);
+      if (!groupName || !Array.isArray(group && group.buckets)) return;
+      group.buckets.slice(0, 8).forEach(function(bucket) {
+        var windowName = boundedText(bucket && bucket.displayName, 80);
+        var remainingValue = bucket && bucket.remainingFraction;
+        if (remainingValue == null || remainingValue === '') return;
+        var remainingFraction = Number(remainingValue);
+        if (!windowName || !Number.isFinite(remainingFraction)) return;
+        remainingFraction = Math.max(0, Math.min(1, remainingFraction));
+        var resetTimeMs = Date.parse(bucket && bucket.resetTime || '');
+        var resetAt = Number.isFinite(resetTimeMs) ? new Date(resetTimeMs).toISOString() : null;
+        models.push({
+          model: groupName + ' · ' + windowName,
+          quota_group: groupName,
+          quota_window: windowName,
+          window_kind: boundedText(bucket && bucket.window, 40) || null,
+          refreshes_in: resetDescription(resetAt, capturedAtMs),
+          resets_at: resetAt,
+          percent_remaining: boundedPercent(remainingFraction),
+          percent_used: boundedPercent(1 - remainingFraction),
+          color: null,
+        });
+      });
+    });
+    if (models.length === 0) {
+      return JSON.stringify({ ok: false, code: 'quota_schema_mismatch', app_version: appVersion });
+    }
+
+    var credit = Array.isArray(userStatus && userStatus.userTier && userStatus.userTier.availableCredits)
+      ? userStatus.userTier.availableCredits.find(function(entry) {
+          return String(entry && entry.creditType || '') === 'GOOGLE_ONE_AI';
+        })
+      : null;
+    var availableCredits = credit && credit.creditAmount != null && credit.creditAmount !== ''
+      ? Number(credit.creditAmount)
+      : null;
+    if (!Number.isFinite(availableCredits)) availableCredits = null;
+    var plan = boundedText(
+      userStatus && userStatus.planStatus && userStatus.planStatus.planInfo && userStatus.planStatus.planInfo.planName,
+      80
+    );
+    var tier = boundedText(userStatus && userStatus.userTier && userStatus.userTier.name, 100);
+    var after = {
+      visibility: document.visibilityState,
+      focus: document.hasFocus(),
+      url: location.href,
+      title: document.title,
+    };
+    return JSON.stringify({
+      ok: true,
+      source: 'in_app_api',
+      app_version: appVersion,
+      schema_variant: 'internal_quota_rpc_v2_1_4',
+      percentage_semantics: 'remaining_fraction',
+      plan: plan || null,
+      tier: tier || null,
+      available_ai_credits: availableCredits,
+      models: models,
+      fetched_at: new Date(capturedAtMs).toISOString(),
+      source_receipt: {
+        credit_refresh: creditRefresh.length === 0
+          ? 'not_requested'
+          : (creditRefresh[0].status === 'fulfilled' ? 'ok' : 'unavailable'),
+        page_state_unchanged: JSON.stringify(before) === JSON.stringify(after),
+        dom_mutation_records: mutationRecords,
+      },
+    });
+  } catch (error) {
+    return JSON.stringify({
+      ok: false,
+      code: boundedText(error && (error.code || error.name), 60) || 'internal_api_failed',
+      app_version: appVersion,
+    });
+  } finally {
+    observer.disconnect();
+  }
+`;
+
 const REFRESH_ANTIGRAVITY_MODEL_QUOTA_EXPR = `
   function cleanText(text) {
     return String(text || '').replace(/\\s+/g, ' ').trim();
@@ -15280,6 +15472,20 @@ async function readAntigravityModelQuota(Runtime) {
   }
 }
 
+async function readAntigravityInternalQuota(Runtime, forceRefresh = true) {
+  try {
+    const expression = READ_ANTIGRAVITY_INTERNAL_QUOTA_EXPR.replace(
+      '__RAC_FORCE_REFRESH__',
+      forceRefresh === true ? 'true' : 'false',
+    );
+    const raw = await evalInPage(Runtime, expression, { awaitPromise: true });
+    if (!raw) return null;
+    return JSON.parse(raw);
+  } catch {
+    return null;
+  }
+}
+
 async function refreshAntigravityModelQuota(Runtime) {
   try {
     const raw = await evalInPage(Runtime, REFRESH_ANTIGRAVITY_MODEL_QUOTA_EXPR);
@@ -16300,6 +16506,7 @@ module.exports = {
   readClaudeRateLimit,
   readRateLimit,
   readAntigravityModelQuota,
+  readAntigravityInternalQuota,
   refreshAntigravityModelQuota,
   readCodexNativeQueue,
   readCodexTaskList,

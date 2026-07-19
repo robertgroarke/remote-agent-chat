@@ -230,6 +230,194 @@ try {
   assert.strictEqual(recoveryFrame.source_bytes, 128);
   assert.strictEqual(recoveryFrame.resync_rate_limit_ms, 5000);
 
+  // A long-lived active Codex file must periodically discard old parser
+  // objects instead of retaining every message appended after the first tail.
+  const boundedPath = path.join(root, 'codex-bounded.jsonl');
+  const boundedSessionId = '00000000-0000-4000-8000-000000000104';
+  const largeEvent = index => line({
+    type: 'event_msg',
+    timestamp: new Date(Date.parse('2026-07-13T17:00:00.000Z') + index).toISOString(),
+    payload: { type: index % 2 ? 'agent_message' : 'user_message', message: `bounded-${index}-${'x'.repeat(4000)}` },
+  });
+  fs.writeFileSync(boundedPath, line({
+    type: 'session_meta', timestamp: '2026-07-13T17:00:00.000Z',
+    payload: { id: boundedSessionId, cwd: root, model: 'gpt-5.5' },
+  }) + Array.from({ length: 310 }, (_, index) => largeEvent(index)).join(''), 'utf8');
+  const boundedBaseline = codexCli.readSessionSummary(boundedPath, { preferTailBytes: 1024 * 1024 });
+  fs.appendFileSync(
+    boundedPath,
+    Array.from({ length: 280 }, (_, index) => largeEvent(310 + index)).join(''),
+    'utf8',
+  );
+  const boundedRebase = codexCli.readSessionSummary(boundedPath, { preferTailBytes: 1024 * 1024 });
+  assert.strictEqual(boundedRebase.sourceCursor.mode, 'bounded_rebase');
+  assert(
+    boundedRebase.sourceCursor.retained_window_bytes <= 1024 * 1024,
+    `bounded parser rebase retained ${boundedRebase.sourceCursor.retained_window_bytes} bytes`,
+  );
+
+  // The per-poll transport cost must scale with the append, not with the
+  // multi-megabyte transcript already accepted by the relay.
+  const hotEngine = Object.create(ProxyEngine.prototype);
+  hotEngine._log = () => {};
+  const hotFrames = [];
+  hotEngine._sendProxyMessage = (_sessionId, message) => { hotFrames.push(message); return true; };
+  const hotMessages = Array.from({ length: 1800 }, (_, index) => ({
+    role: index % 2 ? 'assistant' : 'user',
+    content: `hot-${index}-${'h'.repeat(2048)}`,
+    source_message_id: `hot-source-${index}`,
+  }));
+  const hotCursor = { mode: 'baseline_tail', start_offset: 10, end_offset: 5_000_000, file_size: 5_000_000 };
+  const hotSession = {
+    agentType: 'codex_cli',
+    _fileTranscriptState: hotEngine._fileTranscriptState('codex_cli', boundedPath, hotMessages, hotCursor),
+  };
+  let signatureRows = 0;
+  let clonedRows = 0;
+  let identityRows = 0;
+  const originalSignature = hotEngine._transcriptSignature;
+  const originalClone = hotEngine._cloneTranscriptMessages;
+  const originalIds = hotEngine._fileTranscriptMessageIds;
+  hotEngine._transcriptSignature = function measuredSignature(messages) {
+    signatureRows += Array.isArray(messages) ? messages.length : 0;
+    return originalSignature.call(this, messages);
+  };
+  hotEngine._cloneTranscriptMessages = function measuredClone(messages) {
+    clonedRows += Array.isArray(messages) ? messages.length : 0;
+    return originalClone.call(this, messages);
+  };
+  hotEngine._fileTranscriptMessageIds = function measuredIds(agentType, generation, messages, occurrences) {
+    identityRows += Array.isArray(messages) ? messages.length : 0;
+    return originalIds.call(this, agentType, generation, messages, occurrences);
+  };
+  const hotAppend = {
+    role: 'assistant', content: 'bounded O(append) row', source_message_id: 'hot-source-1800',
+  };
+  const hotResult = hotEngine._sendFileBackedTranscriptUpdate(
+    'hot-session',
+    hotSession,
+    [...hotMessages, hotAppend],
+    {
+      agentType: 'codex_cli', filePath: boundedPath,
+      sourceCursor: { mode: 'append', start_offset: 5_000_000, end_offset: 5_001_000, file_size: 5_001_000 },
+      reason: 'large fixture append',
+    },
+  );
+  assert.strictEqual(hotResult.mode, 'append');
+  assert.strictEqual(hotResult.sent, 1);
+  assert(signatureRows <= 2, `append seam serialized ${signatureRows} transcript rows`);
+  assert(clonedRows <= 1, `append cloned ${clonedRows} transcript rows`);
+  assert(identityRows <= 1, `append regenerated ${identityRows} source identities`);
+  assert.strictEqual(
+    hotEngine._fileTranscriptObservationKey(boundedPath, {
+      mode: 'append', end_offset: 5_001_000, file_size: 5_001_000, mtime_ms: 1234,
+    }, [...hotMessages, hotAppend]),
+    hotEngine._fileTranscriptObservationKey(boundedPath, {
+      mode: 'unchanged', end_offset: 5_001_000, file_size: 5_001_000, mtime_ms: 1234,
+    }, [...hotMessages, hotAppend]),
+    'an unchanged reread of one accepted cursor must not trigger another whole-tail comparison',
+  );
+  assert.strictEqual(
+    hotEngine._fileTranscriptObservationKey(boundedPath, null, []),
+    `${boundedPath}\u0000fallback\u00000\u0000empty`,
+    'a registered metadata-only session needs a stable empty observation key',
+  );
+  const largeAppendWork = { signatureRows, clonedRows, identityRows };
+  hotEngine._transcriptSignature = originalSignature;
+  hotEngine._cloneTranscriptMessages = originalClone;
+  hotEngine._fileTranscriptMessageIds = originalIds;
+
+  // A bounded parser-window slide preserves its overlap and emits only new
+  // semantic rows with a continuous logical message index.
+  const slidePrevious = hotMessages.slice(0, 400);
+  const slideCurrent = [...hotMessages.slice(200, 400), hotAppend, {
+    role: 'user', content: 'post-slide row', source_message_id: 'hot-source-1801',
+  }];
+  const slideSession = {
+    agentType: 'codex_cli',
+    _fileTranscriptState: hotEngine._fileTranscriptState('codex_cli', boundedPath, slidePrevious, hotCursor),
+  };
+  hotFrames.length = 0;
+  const slideResult = hotEngine._sendFileBackedTranscriptUpdate(
+    'slide-session', slideSession, slideCurrent,
+    {
+      agentType: 'codex_cli', filePath: boundedPath,
+      sourceCursor: {
+        mode: 'bounded_rebase', start_offset: 4_000_000, end_offset: 5_002_000,
+        file_size: 5_002_000, partial: true,
+      },
+      reason: 'bounded parser window slide',
+    },
+  );
+  assert.strictEqual(slideResult.mode, 'bounded_rebase_append');
+  assert.strictEqual(slideResult.overlap, 200);
+  assert.deepStrictEqual(hotFrames.map(frame => frame.source_cursor.message_index), [400, 401]);
+  assert.strictEqual(slideSession._fileTranscriptState.messages.length, 202);
+  const noOverlapState = slideSession._fileTranscriptState;
+  const noOverlapResult = hotEngine._sendFileBackedTranscriptUpdate(
+    'slide-session', slideSession,
+    [{ role: 'assistant', content: 'disjoint tail', source_message_id: 'disjoint-source' }],
+    {
+      agentType: 'codex_cli', filePath: boundedPath,
+      sourceCursor: { mode: 'bounded_rebase', start_offset: 8_000_000, end_offset: 9_000_000, file_size: 9_000_000 },
+      reason: 'disjoint bounded parser window',
+    },
+  );
+  assert.strictEqual(noOverlapResult.mode, 'bounded_rebase_deferred');
+  assert.strictEqual(slideSession._fileTranscriptState, noOverlapState,
+    'a disjoint partial tail must not replace authoritative transcript state');
+
+  // Automatic recovery must reject an oversized authoritative candidate before
+  // constructing/remapping every source-cursor row, then coalesce retries.
+  const recoveryEngine = Object.create(ProxyEngine.prototype);
+  const recoveryLogs = [];
+  recoveryEngine._log = (level, message) => recoveryLogs.push({ level, message });
+  recoveryEngine._historySnapshotLimitBytes = () => 4 * 1024 * 1024;
+  recoveryEngine._shouldLogLargeHistorySkip = () => true;
+  recoveryEngine._sendProxyMessage = () => true;
+  recoveryEngine._sendHistorySnapshot = () => { throw new Error('oversized recovery reached snapshot construction'); };
+  const oversizedRows = Array.from({ length: 1200 }, (_, index) => ({
+    role: index % 2 ? 'assistant' : 'user',
+    content: `oversized-${index}-${'z'.repeat(4096)}`,
+    source_message_id: `oversized-source-${index}`,
+  }));
+  const oversizedSession = {
+    agentType: 'codex_cli',
+    _fileTranscriptState: recoveryEngine._fileTranscriptState('codex_cli', boundedPath, oversizedRows, hotCursor),
+  };
+  let recoveryStateBuilds = 0;
+  let recoveryRowRemaps = 0;
+  const recoveryStateFactory = recoveryEngine._fileTranscriptState;
+  const recoveryMessageFactory = recoveryEngine._fileTranscriptMessage;
+  recoveryEngine._fileTranscriptState = function measuredRecoveryState(...args) {
+    recoveryStateBuilds += 1;
+    return recoveryStateFactory.apply(this, args);
+  };
+  recoveryEngine._fileTranscriptMessage = function measuredRecoveryMessage(...args) {
+    recoveryRowRemaps += 1;
+    return recoveryMessageFactory.apply(this, args);
+  };
+  const oversizedMutation = oversizedRows.map((message, index) => (
+    index === 0 ? { ...message, content: `${message.content}-mutated` } : message
+  ));
+  const oversizedMutationResult = recoveryEngine._sendFileBackedTranscriptUpdate(
+    'oversized-session', oversizedSession, oversizedMutation,
+    {
+      agentType: 'codex_cli', filePath: boundedPath,
+      sourceCursor: { mode: 'recovery', start_offset: 0, end_offset: 5_003_000, file_size: 5_003_000 },
+      reason: 'oversized fixture mutation',
+    },
+  );
+  assert.strictEqual(oversizedMutationResult.mode, 'resync_oversized');
+  assert.strictEqual(recoveryStateBuilds, 0, 'oversized mutation must be rejected before rebuilding transcript state');
+  recoveryEngine.sessions = new Map([['oversized-session', oversizedSession]]);
+  recoveryEngine._handleTranscriptResyncRequest({
+    type: 'transcript_resync_required', session_id: 'oversized-session',
+    source: 'codex_cli_jsonl', resync_id: '00000000-0000-4000-8000-000000000198', reason: 'cursor_gap',
+  });
+  assert.strictEqual(recoveryRowRemaps, 0, 'oversized relay recovery must be rejected before row remapping');
+  assert(recoveryLogs.some(entry => entry.message.includes('before row remap')));
+
   const result = {
     ok: true,
     parsers: {
@@ -254,6 +442,26 @@ try {
     relay_requested_recovery: {
       resync_id: relayRecoveryFrame.resync_id,
       rows: relayRecoveryFrame.messages.length,
+    },
+    bounded_parser_window: boundedRebase.sourceCursor,
+    large_append_work: {
+      existing_rows: hotMessages.length,
+      appended_rows: hotResult.sent,
+      signature_rows: largeAppendWork.signatureRows,
+      cloned_rows: largeAppendWork.clonedRows,
+      identity_rows: largeAppendWork.identityRows,
+    },
+    bounded_transport_rebase: {
+      overlap_rows: slideResult.overlap,
+      appended_rows: slideResult.sent,
+      retained_rows: slideSession._fileTranscriptState.messages.length,
+      emitted_message_indexes: hotFrames.map(frame => frame.source_cursor.message_index),
+    },
+    oversized_recovery: {
+      result: oversizedMutationResult.mode,
+      state_rebuilds: recoveryStateBuilds,
+      remapped_rows: recoveryRowRemaps,
+      cooldown_ms: oversizedMutationResult.retry_after_ms,
     },
   };
   if (outputPath) {

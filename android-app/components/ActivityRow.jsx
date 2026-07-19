@@ -1,5 +1,6 @@
 import React, { useState, useEffect } from 'react';
 import { View, Text, StyleSheet, Pressable } from 'react-native';
+import { fleetGoalElapsedSeconds } from '../lib/fleet-activity';
 
 const INACTIVE_KINDS = new Set([
   '', 'idle', 'waiting_for_user', 'completed', 'done', 'failed', 'error', 'interrupted',
@@ -36,6 +37,7 @@ export default function ActivityRow({ activity, agentType }) {
       }
     : null);
   const goal = activity?.goal || null;
+  const goalRun = activity?.goal_run || null;
   const step = activity?.step || null;
   const usage = activity?.usage || null;
   const taskList = activity?.task_list || null;
@@ -44,11 +46,11 @@ export default function ActivityRow({ activity, agentType }) {
   const planTasks = Array.isArray(plan?.tasks) ? plan.tasks : [];
 
   useEffect(() => {
-    if (!(active || goal || step || planTasks.length)) return undefined;
+    if (!(active || (goal && (!goalRun || goalRun.lease_active === true)) || step || planTasks.length)) return undefined;
     setNowMs(Date.now());
     const id = setInterval(() => setNowMs(Date.now()), 1_000);
     return () => clearInterval(id);
-  }, [active, startedAt, goal?.updated_at, goal?.status, goal?.state, step?.state, planTasks.length]);
+  }, [active, startedAt, goal?.updated_at, goal?.status, goal?.state, goalRun?.lease_active, step?.state, planTasks.length]);
 
   if (!activity) return null;
 
@@ -58,7 +60,7 @@ export default function ActivityRow({ activity, agentType }) {
 
   const interruptHint = activity.interrupt_hint || activity.interruptHint || '';
   const goalText = String(goal?.text || goal?.objective || '').trim();
-  const goalElapsed = goal ? formatGoalElapsed(goal, nowMs) : '';
+  const goalElapsed = goal ? formatGoalElapsed(goal, nowMs, goalRun) : '';
   const thinkingElapsed = thinking ? formatElapsed(thinking.since || startedAt, nowMs) : '';
   const currentElapsed = current ? formatElapsed(current.since || startedAt, nowMs) : '';
   const nativeGlyph = nativeStatusGlyph(agentType);
@@ -141,7 +143,7 @@ export default function ActivityRow({ activity, agentType }) {
       ) : null}
       {usage ? (
         <View style={[s.channel, s.usageChannel]} accessibilityRole="alert">
-          <Text style={s.usageTitle}>{usage.title || "You're out of Codex and Work usage"}</Text>
+          <Text style={s.usageTitle}>{usage.title || 'Usage limit reached'}</Text>
           <Text style={s.usageDetail}>{usage.detail || (usage.resets_at ? `Your rate limit resets at ${usage.resets_at}.` : 'Usage is currently exhausted.')}</Text>
         </View>
       ) : null}
@@ -173,14 +175,8 @@ function formatElapsed(startedAt, nowMs) {
   return `${hours}h ${String(minutes % 60).padStart(2, '0')}m`;
 }
 
-function formatGoalElapsed(goal, nowMs) {
-  const base = Number(goal?.time_used_seconds ?? goal?.timeUsedSeconds ?? 0) || 0;
-  const updatedMs = goal?.updated_at ? new Date(goal.updated_at).getTime() : 0;
-  const active = (goal?.state || goal?.status) === 'active';
-  const live = active && Number.isFinite(updatedMs) && updatedMs > 0
-    ? Math.max(0, Math.floor((nowMs - updatedMs) / 1_000))
-    : 0;
-  return formatDuration(base + live, true);
+function formatGoalElapsed(goal, nowMs, goalRun = null) {
+  return formatDuration(fleetGoalElapsedSeconds(goal, goalRun, nowMs), true);
 }
 
 function formatDuration(totalSeconds, includeSeconds = false) {

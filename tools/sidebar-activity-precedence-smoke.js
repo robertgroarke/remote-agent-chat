@@ -256,9 +256,9 @@ try {
   const appSource = fs.readFileSync(path.join(ROOT, 'frontend', 'app.jsx'), 'utf8');
   const androidSource = fs.readFileSync(path.join(ROOT, 'android-app', 'screens', 'SessionListScreen.jsx'), 'utf8');
   assert.ok(appSource.indexOf('{workingSessions.length > 0') < appSource.indexOf('{pinnedSessions.length > 0'));
-  assert.match(appSource, /\.\.\.workingSessions, \.\.\.pinnedSessions, \.\.\.sessionGroups/);
+  assert.match(appSource, /\.\.\.workingSessions, \.\.\.recentSessions, \.\.\.pinnedSessions, \.\.\.sessionGroups/);
   assert.match(appSource, /menuOpen: !!card\.querySelector/);
-  assert.match(androidSource, /const sections = \[workingSection, pinnedSection,/);
+  assert.match(androidSource, /const sections = \[workingSection, recentSection, pinnedSection,/);
   assert.match(androidSource, /maintainVisibleContentPosition/);
 
   const result = {

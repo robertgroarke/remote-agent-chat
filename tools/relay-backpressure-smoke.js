@@ -186,6 +186,23 @@ async function main() {
   }, { deferForQuestionLatency: true }), true);
   assert.strictEqual(maintenanceCalls, 2, 'target discovery did not resume after the native question closed');
 
+  let releaseScheduledMaintenance;
+  const scheduledMaintenanceGate = new Promise(resolve => { releaseScheduledMaintenance = resolve; });
+  let scheduledMaintenanceCalls = 0;
+  assert.strictEqual(engine._scheduleBackgroundMaintenanceStep('scheduled smoke maintenance', async () => {
+    scheduledMaintenanceCalls++;
+    await scheduledMaintenanceGate;
+  }), true, 'first background maintenance task should schedule');
+  assert.strictEqual(engine._scheduleBackgroundMaintenanceStep('scheduled smoke maintenance', async () => {
+    scheduledMaintenanceCalls++;
+  }), false, 'same-label background maintenance must remain single-flight');
+  await new Promise(resolve => setImmediate(resolve));
+  assert.strictEqual(scheduledMaintenanceCalls, 1, 'scheduled maintenance should run outside the caller turn');
+  releaseScheduledMaintenance();
+  await engine._backgroundMaintenanceInFlight.get('scheduled smoke maintenance');
+  assert.strictEqual(engine._backgroundMaintenanceInFlight.has('scheduled smoke maintenance'), false,
+    'completed background maintenance must release its single-flight slot');
+
   const desktopQuestionSessionId = 'desktop-question-latency-maintenance';
   engine.sessions.set(desktopQuestionSessionId, {
     session_id: desktopQuestionSessionId,
@@ -214,6 +231,7 @@ async function main() {
     compact_snapshot_bytes: compactSize.bytes,
     aged_large_snapshot_flushed: true,
     question_latency_discovery_gate: true,
+    scheduled_maintenance_single_flight: true,
   };
   const outputIndex = process.argv.indexOf('--output');
   if (outputIndex >= 0 && process.argv[outputIndex + 1]) {

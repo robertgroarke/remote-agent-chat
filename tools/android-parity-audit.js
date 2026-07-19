@@ -41,6 +41,7 @@ const androidFleetWorkContext = read('android-app/lib/fleet-work-context.js');
 const androidRecentChats = read('android-app/lib/recent-chats.js');
 const androidHostResources = read('android-app/lib/host-resources.js');
 const androidProviderUsage = read('android-app/lib/provider-usage.js');
+const androidSessionUsage = read('android-app/lib/session-usage.js');
 const webApp = read('frontend/app.jsx');
 const webStyles = read('frontend/styles.css');
 const webHooks = read('frontend/hooks.jsx');
@@ -48,6 +49,7 @@ const webFleetActivity = read('frontend/fleet-activity.js');
 const relayFleetWorkContext = read('relay-server/fleet-work-context.js');
 const webHostResources = read('frontend/host-resources.js');
 const webProviderUsage = read('frontend/provider-usage.js');
+const webSessionUsage = read('frontend/session-usage.js');
 const webWorkspaceGroups = read('frontend/workspace-groups.js');
 const webRecentChats = read('frontend/recent-chats.js');
 const webSessionTitle = read('frontend/session-title.js');
@@ -207,8 +209,10 @@ assert(hasAll(androidChat, [
 ]), 'Android must persist per-session drafts and expose slash commands');
 assert(hasAll(androidRelay, ['openNativeWindow', "type: 'open_native_window'"]),
   'Android must expose the native-window control protocol');
-assert(hasAll(androidChat, ['hasNativeWindow', 'openNativeWindow(sessionId)']),
+assert(hasAll(androidChat, ['hasNativeWindow', 'openNativeWindow(sessionId, !!event?.nativeEvent)']),
   'Android must capability-gate the native-window control');
+assert(hasAll(androidRelay, ['operator_user_gesture: operatorGesture === true']),
+  'Android native-window controls must require a direct operator press');
 assert(hasAll(androidRelay, ['respondToErrorPrompt', "type: 'error_prompt_action'"]),
   'Android must submit error-prompt actions');
 assert(hasAll(androidChat, ['session_error_prompt', 'session_error_prompt_cleared', 'open_error_prompts']),
@@ -289,7 +293,7 @@ assert(hasAll(webApp, [
 ]));
 assert(hasAll(webApp, [
   "togglePreference('completion_sound')", "playAttentionSound('prompt')",
-  "playAttentionSound(kind === 'goal_attention' ? 'prompt' : 'completion')", 'attentionEventIsUnfocused',
+  "kind === 'goal_attention' || kind === 'provider_usage_threshold'", 'attentionEventIsUnfocused',
 ]), 'Web must offer opt-in, unfocused-only completion/prompt sound');
 assert(hasAll(androidSettings, [
   'PREF_ATTENTION_HAPTIC', "'completion_haptic'", 'Notification haptic',
@@ -300,7 +304,7 @@ assert(hasAll(androidAttentionFeedback, [
 ]), 'Android must suppress initial/duplicate/foreground feedback and vibrate only opt-in attention events');
 assert(hasAll(androidSemanticNotifications, [
   'semantic_notification_ledger_v1', 'processSemanticNotification', 'AppState.currentState',
-  'DeviceEventEmitter.emit', 'preferences_pending', 'goal_completed', 'goal_attention',
+  'DeviceEventEmitter.emit', 'preferences_pending', 'goal_completed', 'goal_attention', 'provider_usage_threshold',
   'refreshAuthoritativeSemanticNotificationPreferences',
 ]), 'Android must consume relay-authorized goal lifecycle notifications exactly once');
 assert(hasAll(androidApp, ['configureNotificationChannels', 'NotificationBanner']));
@@ -336,7 +340,8 @@ assert(hasAll(webHooks, ["t === 'provider_usage_snapshot'", 'msg.provider_usage'
   'Web must restore live provider usage and expose guarded manual refresh');
 assert(hasAll(webApp, [
   'normalizeProviderUsage(usage)', 'Usage & limits', 'Provider-account quotas shared by connected harnesses',
-  'activeUsageSnapshot.remainingPercent', 'Local estimated API-equivalent cost',
+  'SessionUsageMiniMonitor', 'sessionUsageProjection(session, config, normalizedUsage, nowMs)',
+  'Local estimated API-equivalent cost',
   'window.pace.category', 'window.visualPercent',
   'Paginated local cost detail', 'usage-refresh-receipt',
 ]), 'Web must expose the provider-account usage dashboard and retain the active-session chip');
@@ -344,6 +349,12 @@ assert(hasAll(androidRelay, ['requestProviderUsageCostDetail', "type: 'provider_
   'Android must request the same bounded provider cost detail pages as Web');
 assert.strictEqual(androidProviderUsage.replace(/\r\n/g, '\n'), webProviderUsage.replace(/\r\n/g, '\n'),
   'Web and Android provider usage normalization, pace, thresholds, and cost filtering must remain byte-identical');
+assert(hasAll(androidChat, [
+  'sessionUsageProjection(', "case 'provider_usage_snapshot':", 'testID="session-usage-details"',
+  'Billing provider', 'Model vendor', 'Applicable limits', 'Open Usage &amp; limits',
+]), 'Android must expose the active-session mini usage monitor and complete details sheet');
+assert.strictEqual(androidSessionUsage.replace(/\r\n/g, '\n'), webSessionUsage.replace(/\r\n/g, '\n'),
+  'Web and Android session usage mapping and window projection must remain byte-identical');
 assert(hasAll(androidList, [
   "case 'host_resource_subscription_ack':", "case 'host_resource_history_chunk':",
   "case 'host_resource_live':", "case 'host_resource_detail':", "case 'host_resource_error':",
@@ -352,6 +363,8 @@ assert(hasAll(androidList, [
   '<HostResourceChart title="CPU"', '<HostResourceChart title="Memory"',
   '<HostResourceChart title="Disk"', '<HostResourceChart title="Network"',
   'Aggregate-only privacy', 'accessible data table', '64-bit bytes R',
+  'hostResourceTimelineProjection.validCount', 'hostResourceTimelineProjection.expectedCount',
+  'p95 collecting (${stats.count}/20)', 'formatHostResourceTimestampFull',
 ]), 'Android must expose the interactive ephemeral host resource dashboard and subscription lifecycle');
 assert(hasAll(webHooks, [
   "t === 'host_resource_subscription_ack'", "t === 'host_resource_history_chunk'",
@@ -361,7 +374,8 @@ assert(hasAll(webHooks, [
 assert(hasAll(webApp, [
   'function HostResourceDashboard', 'data-testid="host-resource-dashboard"',
   'function HostResourceChart', 'Aggregate-only privacy', 'Accessible data table',
-  '64-bit byte counters',
+  '64-bit byte counters', 'timeline.validCount', 'timeline.expectedCount',
+  'p95 collecting (${stats.count}/20)', 'formatHostResourceTimestampFull',
 ]), 'Web must expose the matching interactive host resource and process dashboard');
 assert(hasAll(androidRelay, [
   'requestHostResourceRefresh', "type: 'host_resource_refresh'", 'subscribeHostResources',
@@ -372,17 +386,21 @@ assert(webHostResources.includes("export * from '../android-app/lib/host-resourc
   && hasAll(androidHostResources, [
     'export function normalizeHostResources', 'export function mergeOrderedHostResourceFrames',
     'export function downsampleHostResourceSeries', 'export function hostResourceIntervalStats',
+    'export function hostResourceTimeline', 'export function hostResourceNiceScale',
+    'export function hostResourceTimeTicks', 'export function hostResourceTimeFraction',
   ]), 'Web must delegate to the Android-local shared host-resource normalization and chart policy');
 assert(hasAll(relayIndex, ['hostResourceSubscriptions', 'sanitizeHostResourceSnapshot', 'pending.proxyWs !== ws'])
   && hasAll(proxyEngine, ["type === 'host_resource_subscribe'", "type === 'host_resource_history_request'"]),
   'Proxy and relay must retain requester-only, proxy-bound host resource subscription routing');
 assert(hasAll(webApp, [
   'function FleetView', 'classifyFleetActivity', 'fleetWorkContextProgress', 'fleetElapsed',
-  'fleetStateLabel(entry.state)', 'Show ${idleCount} idle session', 'data-testid="fleet-view"',
+  "stateLabel: session?.rate_limit_active === true ? 'Usage limited' : fleetStateLabel(state)",
+  'Show ${idleCount} idle session', 'data-testid="fleet-view"',
 ]), 'Web must expose the active-session fleet dashboard');
 assert(hasAll(androidList, [
   'visible={showFleetView}', 'classifyFleetActivity', 'fleetWorkContextProgress', 'fleetElapsedLabel',
-  'fleetStateLabel(entry.state)', 'Show ${fleetIdleCount} idle', 'testID="fleet-view"',
+  "stateLabel: session?.rate_limit_active === true ? 'Usage limited' : fleetStateLabel(state)",
+  'Show ${fleetIdleCount} idle', 'testID="fleet-view"',
 ]), 'Android must expose the matching active-session fleet dashboard');
 assert.strictEqual(normalizeEol(androidFleetActivity), normalizeEol(webFleetActivity),
   'Web and Android must share one byte-identical Fleet activity/freshness policy');
@@ -586,7 +604,7 @@ const rows = [
   ['Session launch and close/dismiss lifecycle', 'PARITY',
     'Both clients launch/resume with correlated ack/failure state, close connected sessions, and dismiss disconnected entries while retaining history.'],
   ['Open native harness window', 'PARITY',
-    'Web and Android capability-gate the same open_native_window request for supported CLI sessions.'],
+    'Web and Android capability-gate the same operator-action-only open_native_window request for supported CLI sessions.'],
   ['Draft persistence and slash-command menu', 'PARITY',
     'Web and Android persist per-session composer drafts and expose the same plan/review/fix/summarize command starters.'],
   ['Bounded history pagination/backfill', 'PARITY',

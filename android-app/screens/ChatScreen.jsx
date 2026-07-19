@@ -4,7 +4,7 @@ import React, {
 import {
   View, FlatList, TextInput, TouchableOpacity,
   Text, StyleSheet, KeyboardAvoidingView, Platform,
-  ActivityIndicator, Keyboard, Image, Alert, Share,
+  ActivityIndicator, Keyboard, Image, Alert, Share, Modal, ScrollView,
 } from 'react-native';
 import * as ImagePicker    from 'expo-image-picker';
 import * as DocumentPicker from 'expo-document-picker';
@@ -43,6 +43,16 @@ import {
   rememberPromptForAttentionFeedback,
 } from '../lib/attention-feedback';
 import { processSemanticNotification } from '../lib/semantic-notifications';
+import ProviderMark from '../components/ProviderMark';
+import {
+  formatProviderCredits,
+  formatProviderUsageAge,
+  formatProviderUsageReset,
+  normalizeProviderUsage,
+  providerFinancialRows,
+  retainNewerProviderUsage,
+} from '../lib/provider-usage';
+import { sessionUsageProjection, sessionUsageWindowLabel } from '../lib/session-usage';
 import {
   resolveSessionChatTitleProjection,
   retainStrongerSessionChatTitleProjection,
@@ -116,6 +126,9 @@ export default function ChatScreen({ route, navigation }) {
   const [unreadCount,   setUnreadCount]   = useState(0);     // new messages while scrolled up
   const [showJumpBtn,   setShowJumpBtn]   = useState(false); // show jump-to-bottom button
   const [agentConfig,   setAgentConfig]   = useState(null);  // per-session config from relay
+  const [providerUsage, setProviderUsage] = useState(null);
+  const [usageDetailsOpen, setUsageDetailsOpen] = useState(false);
+  const [providerUsageNowMs, setProviderUsageNowMs] = useState(Date.now());
   const [settingsOpen,  setSettingsOpen]  = useState(false); // agent settings sheet
   const [scheduleOpen,  setScheduleOpen]  = useState(false); // scheduled message sheet
   const [attachment,    setAttachment]    = useState(null);  // { uri, name, mimeType, isText?, content? }
@@ -298,6 +311,24 @@ export default function ChatScreen({ route, navigation }) {
   // ── Navigation header ───────────────────────────────────────────────────────
 
   const activityLabel = activity?.label || (activity?.generating ? 'Generating…' : null);
+  const normalizedProviderUsage = useMemo(() => normalizeProviderUsage(providerUsage), [providerUsage]);
+  const usageProjection = useMemo(() => sessionUsageProjection(
+    sessionMeta,
+    agentConfig,
+    normalizedProviderUsage,
+    providerUsageNowMs,
+  ), [sessionMeta, agentConfig, normalizedProviderUsage, providerUsageNowMs]);
+  const usageHeaderRows = useMemo(
+    () => usageProjection.headerWindows.map(sessionUsageWindowLabel),
+    [usageProjection.headerWindows],
+  );
+
+  useEffect(() => {
+    if (!usageDetailsOpen) return undefined;
+    setProviderUsageNowMs(Date.now());
+    const timer = setInterval(() => setProviderUsageNowMs(Date.now()), 30000);
+    return () => clearInterval(timer);
+  }, [usageDetailsOpen]);
 
   useLayoutEffect(() => {
     // Derive capabilities from agentType (route param) as primary source,
@@ -326,6 +357,33 @@ export default function ChatScreen({ route, navigation }) {
       ),
       headerRight: () => (
         <View style={hr.row}>
+          {usageProjection.supported && (
+            <TouchableOpacity
+              onPress={() => setUsageDetailsOpen(true)}
+              style={[hr.usageButton, hr[`usage_${usageProjection.tone}`]]}
+              activeOpacity={0.7}
+              accessibilityRole="button"
+              accessibilityLabel={`${usageProjection.billingProviderName} usage details. ${usageHeaderRows.map(row => `${row.label} ${row.compactValue}`).join('. ') || usageProjection.message}`}
+            >
+              <View style={hr.usageMark} importantForAccessibility="no-hide-descendants">
+                <ProviderMark
+                  providerId={usageProjection.providerMarkId}
+                  providerName={usageProjection.billingProviderName}
+                  colorScheme="dark"
+                />
+              </View>
+              <View style={hr.usageRows}>
+                {(usageHeaderRows.length > 0 ? usageHeaderRows.slice(0, 2) : [{
+                  label: usageProjection.state === 'local' ? 'Local' : 'Limit',
+                  compactValue: usageProjection.state === 'local' ? 'No cap' : '—',
+                }]).map(row => (
+                  <Text key={row.label} style={hr.usageText} numberOfLines={1}>
+                    {row.label} {row.compactValue}
+                  </Text>
+                ))}
+              </View>
+            </TouchableOpacity>
+          )}
           {hasOpenPanel && (
             <TouchableOpacity
               onPress={() => clientRef.current?.openPanel(sessionId)}
@@ -337,7 +395,7 @@ export default function ChatScreen({ route, navigation }) {
           )}
           {hasNativeWindow && (
             <TouchableOpacity
-              onPress={() => clientRef.current?.openNativeWindow(sessionId)}
+              onPress={event => clientRef.current?.openNativeWindow(sessionId, !!event?.nativeEvent)}
               style={hr.btn}
               activeOpacity={0.7}
               accessibilityRole="button"
@@ -445,7 +503,7 @@ export default function ChatScreen({ route, navigation }) {
         </View>
       ),
     });
-  }, [navigation, sessionId, liveChatTitle, agentType, agentConfig, activityLabel]);
+  }, [navigation, sessionId, liveChatTitle, agentType, agentConfig, activityLabel, usageProjection, usageHeaderRows]);
 
   // ── Message handler ─────────────────────────────────────────────────────────
 
@@ -768,6 +826,26 @@ export default function ChatScreen({ route, navigation }) {
         break;
       }
 
+      case 'provider_usage_threshold': {
+        const affected = Array.isArray(msg.affected_session_ids) ? msg.affected_session_ids.map(String) : [];
+        if (affected.includes(sessionId)) {
+          mergeSessionMetadata({
+            percent_used: Number.isFinite(Number(msg.percent_used)) ? Number(msg.percent_used) : null,
+            rate_limit_active: msg.hard_limited === true,
+            rate_limited_until: msg.reset_hint || 'unknown',
+            usage_limit_provider: msg.provider_id || null,
+            usage_limit_window: msg.window_label || msg.window_id || null,
+          });
+        }
+        break;
+      }
+
+      case 'provider_usage_snapshot': {
+        const incoming = msg.snapshot && typeof msg.snapshot === 'object' ? msg.snapshot : msg;
+        setProviderUsage(previous => retainNewerProviderUsage(previous, incoming));
+        break;
+      }
+
       case 'permission_prompt_expired': {
         if ((msg.session_id || msg.session) !== sessionId) break;
         setPermPrompt(prev => {
@@ -808,6 +886,9 @@ export default function ChatScreen({ route, navigation }) {
         setErrorPrompt(openError ? { ...openError, received_at: Date.now() } : null);
         if (msg.agent_configs && msg.agent_configs[sessionId]) {
           setAgentConfig(msg.agent_configs[sessionId]);
+        }
+        if (msg.provider_usage && typeof msg.provider_usage === 'object') {
+          setProviderUsage(previous => retainNewerProviderUsage(previous, msg.provider_usage));
         }
         (msg.semantic_notifications || []).forEach(event => {
           processSemanticNotification(event, sessionId).catch(() => {});
@@ -1416,11 +1497,11 @@ export default function ChatScreen({ route, navigation }) {
       : null);
   }
 
-  function handleErrorPromptAction(promptId, actionId) {
+  function handleErrorPromptAction(promptId, actionId, operatorEvent) {
     setErrorPrompt(prev => prev
       ? { ...prev, submitting_action_id: actionId, error: null }
       : null);
-    clientRef.current?.respondToErrorPrompt(sessionId, promptId, actionId);
+    clientRef.current?.respondToErrorPrompt(sessionId, promptId, actionId, !!operatorEvent?.nativeEvent);
   }
 
   function handleSteerQueued(item) {
@@ -1797,6 +1878,107 @@ export default function ChatScreen({ route, navigation }) {
         controlResults={controlResults}
         onExport={shareSessionExport}
       />
+      <Modal
+        visible={usageDetailsOpen}
+        animationType="slide"
+        presentationStyle="pageSheet"
+        onRequestClose={() => setUsageDetailsOpen(false)}
+      >
+        <View style={s.sessionUsageModal} testID="session-usage-details" accessibilityViewIsModal>
+          <View style={s.sessionUsageHeader}>
+            <View style={s.sessionUsageProviderHeading}>
+              <ProviderMark
+                providerId={usageProjection.providerMarkId}
+                providerName={usageProjection.billingProviderName}
+                colorScheme="dark"
+              />
+              <View style={s.sessionUsageHeadingCopy}>
+                <Text style={s.sessionUsageTitle}>Session usage</Text>
+                <Text style={s.sessionUsageSubtitle}>{usageProjection.billingProviderName}</Text>
+              </View>
+            </View>
+            <TouchableOpacity
+              onPress={() => setUsageDetailsOpen(false)}
+              accessibilityRole="button"
+              accessibilityLabel="Close session usage details"
+            >
+              <Text style={s.sessionUsageClose}>Close</Text>
+            </TouchableOpacity>
+          </View>
+          <ScrollView contentContainerStyle={s.sessionUsageBody}>
+            <View style={[s.sessionUsageStatus, s[`sessionUsage_${usageProjection.tone}`]]}>
+              <Text style={s.sessionUsageStatusText}>
+                {usageProjection.message || `${usageProjection.applicableWindows.length} applicable usage window${usageProjection.applicableWindows.length === 1 ? '' : 's'}`}
+              </Text>
+            </View>
+            <View style={s.sessionUsageMetadata}>
+              {[
+                ['Billing provider', usageProjection.billingProviderName],
+                ['Model vendor', usageProjection.modelVendor],
+                ['Current model', usageProjection.modelLabel || usageProjection.modelId || 'Not reported'],
+                ['Account', usageProjection.accountLabel || usageProjection.accountFingerprint || 'Unavailable'],
+                ['Quota domain', usageProjection.quotaDomain || 'Unavailable'],
+                ['Plan', usageProjection.plan || 'Not reported'],
+                ['Mapping', usageProjection.mappingConfidence],
+                ['Runtime', usageProjection.runtimeKind || 'Provider managed'],
+              ].map(([label, value]) => (
+                <View key={label} style={s.sessionUsageMetadataRow}>
+                  <Text style={s.sessionUsageMetadataLabel}>{label}</Text>
+                  <Text style={s.sessionUsageMetadataValue} selectable>{value}</Text>
+                </View>
+              ))}
+            </View>
+            <Text style={s.sessionUsageSectionTitle}>Applicable limits</Text>
+            {usageProjection.applicableWindows.length === 0 ? (
+              <Text style={s.sessionUsageEmpty}>{usageProjection.message || 'No applicable usage windows reported.'}</Text>
+            ) : usageProjection.applicableWindows.map(window => {
+              const row = sessionUsageWindowLabel(window);
+              return (
+                <View key={`${window.id || row.label}:${window.modelScope?.id || ''}`} style={s.sessionUsageWindow}>
+                  <View style={s.sessionUsageWindowTop}>
+                    <Text style={s.sessionUsageWindowLabel}>{row.label}</Text>
+                    <Text style={[s.sessionUsageWindowValue, s[`sessionUsageText_${row.tone}`]]}>{row.compactValue}</Text>
+                  </View>
+                  {!!window.modelScope && (
+                    <Text style={s.sessionUsageWindowMeta}>Model: {window.modelScope.label || window.modelScope.id}</Text>
+                  )}
+                  {!!(window.resetsAt || row.reset) && (
+                    <Text style={s.sessionUsageWindowMeta}>Resets {formatProviderUsageReset(window.resetsAt || row.reset, providerUsageNowMs)}</Text>
+                  )}
+                </View>
+              );
+            })}
+            {!!formatProviderCredits(usageProjection.credits) && (
+              <View style={s.sessionUsageFinancialRow}>
+                <Text style={s.sessionUsageMetadataLabel}>Credits</Text>
+                <Text style={s.sessionUsageMetadataValue}>{formatProviderCredits(usageProjection.credits)}</Text>
+              </View>
+            )}
+            {providerFinancialRows(usageProjection.financials).map(row => (
+              <View key={row.id} style={s.sessionUsageFinancialRow}>
+                <Text style={s.sessionUsageMetadataLabel}>{row.label}</Text>
+                <Text style={s.sessionUsageMetadataValue}>{row.value}</Text>
+              </View>
+            ))}
+            <View style={s.sessionUsageSource}>
+              <Text style={s.sessionUsageWindowMeta}>Source: {usageProjection.source || 'Unavailable'}</Text>
+              <Text style={s.sessionUsageWindowMeta}>Generation: {usageProjection.generation || 'Not started'}</Text>
+              <Text style={s.sessionUsageWindowMeta}>{formatProviderUsageAge(usageProjection.capturedAt, providerUsageNowMs)}</Text>
+            </View>
+            <TouchableOpacity
+              style={s.sessionUsageOpenDashboard}
+              onPress={() => {
+                setUsageDetailsOpen(false);
+                navigation.navigate('SessionList', { openUsageNonce: Date.now() });
+              }}
+              accessibilityRole="button"
+              accessibilityLabel="Open Usage and limits"
+            >
+              <Text style={s.sessionUsageOpenDashboardText}>Open Usage &amp; limits</Text>
+            </TouchableOpacity>
+          </ScrollView>
+        </View>
+      </Modal>
       <ScheduledSendSheet
         visible={scheduleOpen}
         sessionId={sessionId}
@@ -1949,6 +2131,27 @@ const hr = StyleSheet.create({
   btn:      { marginRight: 4, paddingVertical: 6, paddingHorizontal: 2 },
   btnText:  { color: '#f85149', fontSize: 11, fontWeight: '600' },
   gearText: { color: '#768390', fontSize: 16 },
+  usageButton: {
+    width: 70,
+    minHeight: 38,
+    marginRight: 3,
+    paddingRight: 4,
+    borderWidth: 1,
+    borderColor: '#30363d',
+    borderRadius: 8,
+    flexDirection: 'row',
+    alignItems: 'center',
+    overflow: 'hidden',
+    backgroundColor: '#161b22',
+  },
+  usageMark: { width: 25, height: 34, transform: [{ scale: 0.65 }], marginLeft: -4, marginRight: -2 },
+  usageRows: { flex: 1, minWidth: 0 },
+  usageText: { color: '#c9d1d9', fontSize: 8, lineHeight: 11, fontWeight: '700' },
+  usage_warning: { borderColor: '#d29922' },
+  usage_critical: { borderColor: '#f85149' },
+  usage_stale: { borderColor: '#f0883e' },
+  usage_local: { borderColor: '#3fb950' },
+  usage_unavailable: { borderColor: '#484f58' },
 });
 
 const s = StyleSheet.create({
@@ -1956,6 +2159,50 @@ const s = StyleSheet.create({
     flex:            1,
     backgroundColor: '#0b0f14',
   },
+  sessionUsageModal: { flex: 1, backgroundColor: '#0b0f14' },
+  sessionUsageHeader: {
+    minHeight: 68,
+    paddingHorizontal: 18,
+    paddingVertical: 12,
+    borderBottomWidth: 1,
+    borderBottomColor: '#30363d',
+    flexDirection: 'row',
+    alignItems: 'center',
+    justifyContent: 'space-between',
+  },
+  sessionUsageProviderHeading: { flex: 1, flexDirection: 'row', alignItems: 'center' },
+  sessionUsageHeadingCopy: { flex: 1, marginLeft: 10 },
+  sessionUsageTitle: { color: '#f0f6fc', fontSize: 20, fontWeight: '700' },
+  sessionUsageSubtitle: { color: '#8b949e', fontSize: 12, marginTop: 2 },
+  sessionUsageClose: { color: '#58a6ff', fontSize: 15, fontWeight: '600', padding: 8 },
+  sessionUsageBody: { padding: 18, paddingBottom: 40 },
+  sessionUsageStatus: { borderWidth: 1, borderColor: '#30363d', borderRadius: 8, padding: 12, marginBottom: 14 },
+  sessionUsage_ok: { borderColor: '#3fb950' },
+  sessionUsage_warning: { borderColor: '#d29922' },
+  sessionUsage_critical: { borderColor: '#f85149' },
+  sessionUsage_stale: { borderColor: '#f0883e' },
+  sessionUsage_local: { borderColor: '#3fb950' },
+  sessionUsage_unavailable: { borderColor: '#484f58' },
+  sessionUsageStatusText: { color: '#c9d1d9', fontSize: 13, fontWeight: '600' },
+  sessionUsageMetadata: { borderWidth: 1, borderColor: '#30363d', borderRadius: 8, overflow: 'hidden', marginBottom: 18 },
+  sessionUsageMetadataRow: { minHeight: 42, paddingHorizontal: 12, paddingVertical: 8, borderBottomWidth: StyleSheet.hairlineWidth, borderBottomColor: '#30363d' },
+  sessionUsageMetadataLabel: { color: '#8b949e', fontSize: 11, textTransform: 'uppercase', letterSpacing: 0.4 },
+  sessionUsageMetadataValue: { color: '#f0f6fc', fontSize: 13, marginTop: 3 },
+  sessionUsageSectionTitle: { color: '#f0f6fc', fontSize: 15, fontWeight: '700', marginBottom: 8 },
+  sessionUsageEmpty: { color: '#8b949e', fontSize: 13, paddingVertical: 12 },
+  sessionUsageWindow: { borderWidth: 1, borderColor: '#30363d', backgroundColor: '#0d1117', borderRadius: 8, padding: 12, marginBottom: 8 },
+  sessionUsageWindowTop: { flexDirection: 'row', alignItems: 'center', justifyContent: 'space-between' },
+  sessionUsageWindowLabel: { color: '#f0f6fc', fontSize: 14, fontWeight: '600', flex: 1 },
+  sessionUsageWindowValue: { color: '#c9d1d9', fontSize: 13, fontWeight: '700', marginLeft: 12 },
+  sessionUsageText_warning: { color: '#d29922' },
+  sessionUsageText_critical: { color: '#f85149' },
+  sessionUsageText_ok: { color: '#3fb950' },
+  sessionUsageText_stale: { color: '#f0883e' },
+  sessionUsageWindowMeta: { color: '#8b949e', fontSize: 11, marginTop: 5 },
+  sessionUsageFinancialRow: { paddingVertical: 10, borderBottomWidth: StyleSheet.hairlineWidth, borderBottomColor: '#30363d' },
+  sessionUsageSource: { marginTop: 14, marginBottom: 18 },
+  sessionUsageOpenDashboard: { minHeight: 46, borderRadius: 8, alignItems: 'center', justifyContent: 'center', backgroundColor: '#1f6feb' },
+  sessionUsageOpenDashboardText: { color: '#ffffff', fontSize: 14, fontWeight: '700' },
   disconnectBanner: {
     backgroundColor: '#2d1b00',
     borderBottomWidth: 1,

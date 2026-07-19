@@ -1,0 +1,77 @@
+{
+  "schema_version": 1,
+  "policy_id": "zero-visible-window-v1",
+  "default_automation_disposition": "deny-visible-window",
+  "operator_action": {
+    "classification": "operator-action-only",
+    "action": "open_native_window",
+    "proof_ttl_ms": 30000,
+    "allowed_channels": ["web", "android"],
+    "requires_authenticated_identity": true,
+    "requires_trusted_user_gesture": true,
+    "deny_in_automation": true,
+    "single_use": true
+  },
+  "automation_environment_keys": [
+    "CI",
+    "RAC_AUTOMATION_MODE",
+    "RAC_E2E",
+    "RAC_SYNTHETIC_CLIENT",
+    "RAC_VALIDATOR"
+  ],
+  "windowless_process_defaults": {
+    "node_windowsHide": true,
+    "python_creationflags": "CREATE_NO_WINDOW",
+    "powershell_window_style": "Hidden",
+    "browser_headless": true,
+    "electron_headless_only": true,
+    "android_emulator_headless": true
+  },
+  "classified_visible_sites": [
+    {
+      "file": "agent-proxy/claude-cli.js",
+      "classification": "operator-action-only",
+      "required_guard": "assertOperatorForegroundLaunch"
+    },
+    {
+      "file": "agent-proxy/codex-cli.js",
+      "classification": "operator-action-only",
+      "required_guard": "assertOperatorForegroundLaunch"
+    },
+    {
+      "file": "agent-proxy/cursor-cli.js",
+      "classification": "operator-action-only",
+      "required_guard": "assertOperatorForegroundLaunch"
+    },
+    {
+      "file": "launch-codex-desktop-cdp.bat",
+      "classification": "operator-action-only",
+      "required_guard": "rac-window-policy: operator-action-only"
+    },
+    {
+      "file": "launch-codex-desktop-cdp.vbs",
+      "classification": "operator-action-only",
+      "required_guard": "rac-window-policy: operator-action-only"
+    },
+    {
+      "file": "launch-antigravity-ide-cdp-9228.bat",
+      "classification": "operator-action-only",
+      "required_guard": "rac-window-policy: operator-action-only"
+    },
+    {
+      "file": "launch-antigravity-v2-cdp.bat",
+      "classification": "operator-action-only",
+      "required_guard": "rac-window-policy: operator-action-only"
+    },
+    {
+      "file": "tools/codex-session-installer.js",
+      "classification": "operator-action-only",
+      "required_guard": "rac-window-policy: operator-action-only"
+    },
+    {
+      "file": "tools/codex-desktop-invisible-restart.ps1",
+      "classification": "windowless-at-creation",
+      "required_guard": "RacCbtGuard"
+    }
+  ]
+}

@@ -12,13 +12,14 @@ const webHooks = fs.readFileSync(path.join(root, 'frontend', 'hooks.jsx'), 'utf8
 const proxy = fs.readFileSync(path.join(root, 'agent-proxy', 'proxy-engine.js'), 'utf8');
 
 for (const source of [relay, webHooks]) {
-  assert.match(source, /openNativeWindow\(sessionId\)/);
-  assert.match(source, /type: 'open_native_window', session_id: sessionId, request_id: requestId/);
+  assert.match(source, /openNativeWindow\(sessionId, operator(?:Gesture|Event)/);
+  assert.match(source, /type: 'open_native_window'[\s\S]*?session_id: sessionId[\s\S]*?request_id: requestId/);
+  assert.match(source, /operator_user_gesture:/);
 }
 
 assert.match(chat, /const hasNativeWindow = caps\?\.native_window/);
 assert.match(chat, /hasNativeWindow && \(/);
-assert.match(chat, /clientRef\.current\?\.openNativeWindow\(sessionId\)/);
+assert.match(chat, /clientRef\.current\?\.openNativeWindow\(sessionId, !!event\?\.nativeEvent\)/);
 assert.match(chat, /accessibilityLabel="Open native command window"/);
 assert.match(chat, /cmd === 'open_native_window'/);
 assert.match(proxy, /native_window:\s+isCodexCli \|\| isCursorCli/);
@@ -30,6 +31,7 @@ console.log(JSON.stringify({
   capability: 'native_window',
   supported_android_fallback_agent_types: ['codex_cli', 'cursor_cli'],
   failure_feedback: true,
+  operator_gesture_required: true,
   live_action_invoked: false,
   live_action_skip_reason: 'focus-protection rule: action intentionally opens a visible desktop window',
 }, null, 2));

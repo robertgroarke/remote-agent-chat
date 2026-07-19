@@ -1,6 +1,6 @@
 'use strict';
 
-const DEFAULT_USAGE_THRESHOLDS = Object.freeze({ warning_percent: 80, critical_percent: 90 });
+const DEFAULT_USAGE_THRESHOLDS = Object.freeze({ warning_percent: 75, critical_percent: 90 });
 
 function finiteNumber(value) {
   const numeric = Number(value);

@@ -25,6 +25,19 @@ const version = computeAssetVersion(styles, bundle, providerAssets);
 const crlfVersion = computeAssetVersion(withCrLf(styles), withCrLf(bundle), providerAssets);
 const providerVersion = computeAssetVersion(styles, bundle, Buffer.from('provider-assets-v1'));
 
+const appSource = fs.readFileSync(path.join(ROOT, 'frontend', 'app.jsx'), 'utf8');
+const mirroredImports = [...appSource.matchAll(/from\s+['"]\.\/([^'"]+)['"]/g)]
+  .map(match => match[1])
+  .sort();
+const canonicalModuleSource = filePath => fs.readFileSync(filePath, 'utf8').replace(/\r\n/g, '\n');
+for (const relativePath of mirroredImports) {
+  const sourcePath = path.join(ROOT, 'frontend', relativePath);
+  const servedPath = path.join(ROOT, 'relay-server', 'public', relativePath);
+  assert(fs.existsSync(servedPath), `served source mirror is missing ${relativePath}`);
+  assert.strictEqual(canonicalModuleSource(servedPath), canonicalModuleSource(sourcePath),
+    `served source mirror drifted for ${relativePath}`);
+}
+
 assert.strictEqual(crlfVersion, version, 'asset identity must be invariant across LF and CRLF checkouts');
 assert.notStrictEqual(providerVersion, version, 'provider asset changes must advance the asset identity');
 assert.strictEqual(readVersion(path.join(ROOT, 'frontend', 'sw.js')), version,
@@ -46,6 +59,7 @@ const result = {
   asset_version: version,
   crlf_asset_version: crlfVersion,
   source_and_served_identity_match: true,
+  mirrored_import_count: mirroredImports.length,
 };
 const outputIndex = process.argv.indexOf('--output');
 if (outputIndex >= 0 && process.argv[outputIndex + 1]) {

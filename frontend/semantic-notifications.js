@@ -1,9 +1,15 @@
 export const SEMANTIC_NOTIFICATION_TYPES = Object.freeze([
   'goal_completed',
   'goal_attention',
+  'provider_usage_threshold',
 ]);
 
 const TYPE_SET = new Set(SEMANTIC_NOTIFICATION_TYPES);
+const CATEGORY_BY_TYPE = Object.freeze({
+  goal_completed: 'goal_completed',
+  goal_attention: 'goal_attention',
+  provider_usage_threshold: 'provider_usage_warning',
+});
 const LEDGER_KEY = 'remote-agent-chat:semantic-notifications:v1';
 const CLAIM_PREFIX = 'remote-agent-chat:semantic-notification-claim:v1:';
 const MAX_LEDGER_ENTRIES = 256;
@@ -15,8 +21,8 @@ export function normalizeSemanticNotification(value) {
   const dedupeKey = String(value.dedupe_key || '').trim();
   const sessionId = String(value.session_id || value.session || '').trim();
   if (!TYPE_SET.has(eventType) || !dedupeKey || !sessionId) return null;
-  const category = String(value.category || eventType).trim();
-  if (category !== eventType) return null;
+  const category = String(value.category || CATEGORY_BY_TYPE[eventType]).trim();
+  if (category !== CATEGORY_BY_TYPE[eventType]) return null;
   return {
     ...value,
     type: 'semantic_notification',
@@ -26,7 +32,8 @@ export function normalizeSemanticNotification(value) {
     session_id: sessionId,
     session: sessionId,
     title: String(value.title || '').trim() || (eventType === 'goal_completed'
-      ? 'Goal completed' : 'Goal needs attention'),
+      ? 'Goal completed' : eventType === 'provider_usage_threshold'
+        ? 'Provider usage warning' : 'Goal needs attention'),
     body: String(value.body || '').trim(),
     created_at: value.created_at || new Date().toISOString(),
   };

@@ -65,7 +65,7 @@ function stampAssetIdentity() {
 }
 
 function syncPublicAssets() {
-  const assets = ['index.html', 'styles.css', 'app.jsx', 'hooks.jsx', 'file-utils.js', 'fleet-activity.js', 'fleet-summary.js', 'host-resources.js', 'markdown.js', 'message-delta.js', 'message-time.js', 'navigation-epoch.js', 'provider-marks.jsx', 'provider-usage.js', 'semantic-notifications.js', 'session-pins.js', 'session-registry.js', 'session-title.js', 'state-sequence.js', 'title-disclosure.jsx', 'transcript-cache.js', 'workspace-groups.js', 'broadcast-send-policy.js', 'sw.js'];
+  const assets = ['index.html', 'styles.css', 'app.jsx', 'hooks.jsx', 'file-utils.js', 'fleet-activity.js', 'fleet-summary.js', 'host-resources.js', 'markdown.js', 'message-delta.js', 'message-time.js', 'navigation-epoch.js', 'provider-marks.jsx', 'provider-usage.js', 'recent-chats.js', 'semantic-notifications.js', 'session-pins.js', 'session-registry.js', 'session-title.js', 'session-usage.js', 'state-sequence.js', 'title-disclosure.jsx', 'transcript-cache.js', 'workspace-groups.js', 'broadcast-send-policy.js', 'sw.js'];
   for (const asset of assets) {
     copyFile(path.join(__dirname, asset), path.join(publicDir, asset));
   }
@@ -99,6 +99,8 @@ const buildOptions = {
   jsxFragment: 'React.Fragment',
   target: ['es2020'],
   minify: !isWatch,
+  // Keep optimized output reviewable by line-oriented release and secret scanners.
+  lineLimit: 120,
   sourcemap: isWatch ? 'inline' : false,
   logLevel: 'info',
   // Treat CDN globals as externals that esbuild won't try to resolve

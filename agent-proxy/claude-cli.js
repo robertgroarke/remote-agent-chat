@@ -5,6 +5,7 @@ const os = require('os');
 const path = require('path');
 const { spawn, spawnSync } = require('child_process');
 const { normalizeNativeLaunchMode, backgroundNativeLaunchResult } = require('./native-launch-mode');
+const { assertExistingOperatorTerminalAction, assertOperatorForegroundLaunch } = require('./windows-automation-launch-policy');
 const { setBoundedMap } = require('./bounded-map');
 let chokidar = null;
 try { chokidar = require('chokidar'); } catch {}
@@ -1095,7 +1096,8 @@ function startClaudePrintSession({ workspacePath, cliSessionId, resume = true, c
   return child;
 }
 
-function startInteractiveClaude({ workspacePath, cliSessionId, resume = true, model, effort, permissionMode, extraArgs = [] } = {}) {
+function startInteractiveClaude({ workspacePath, cliSessionId, resume = true, model, effort, permissionMode, extraArgs = [], operatorActionProof, requestId, operatorProofAlreadyConsumed = false } = {}) {
+  if (!operatorProofAlreadyConsumed) assertExistingOperatorTerminalAction();
   const useOllamaLaunch = isOllamaLaunchModel(model);
   const args = buildClaudeArgs({ cliSessionId, resume, model, effort, permissionMode, extraArgs, includeModel: !useOllamaLaunch });
   const { command, spawnArgs } = buildSpawnCommand(args, { model });
@@ -1107,10 +1109,11 @@ function startInteractiveClaude({ workspacePath, cliSessionId, resume = true, mo
   });
 }
 
-function startNativeClaudeWindow({ workspacePath, cliSessionId, resume = true, model, effort, permissionMode, title, launchMode = 'foreground' } = {}) {
+function startNativeClaudeWindow({ workspacePath, cliSessionId, resume = true, model, effort, permissionMode, title, launchMode = 'foreground', operatorActionProof, requestId } = {}) {
   if (normalizeNativeLaunchMode(launchMode) === 'background') {
     return backgroundNativeLaunchResult('claude_cli');
   }
+  assertOperatorForegroundLaunch({ operatorActionProof, requestId });
   const cwd = workspacePath || process.cwd();
   const useOllamaLaunch = isOllamaLaunchModel(model);
   // Remote Agent Chat does not expose Claude's Chrome browser integration as
@@ -1137,6 +1140,9 @@ function startNativeClaudeWindow({ workspacePath, cliSessionId, resume = true, m
       effort,
       permissionMode,
       extraArgs: nativeExtraArgs,
+      operatorActionProof,
+      requestId,
+      operatorProofAlreadyConsumed: true,
     });
   }
 

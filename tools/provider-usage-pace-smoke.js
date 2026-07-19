@@ -99,7 +99,7 @@ function exactPercentageAndThresholdFixtures() {
   assert.strictEqual(usageThreshold(87, false, over.thresholds), 85);
   assert.strictEqual(usageThreshold(125, true, over.thresholds), 100);
   assert.deepStrictEqual(thresholdsForWindow({}, 'openai-codex', 'primary'), {
-    warning_percent: 80, critical_percent: 90,
+    warning_percent: 75, critical_percent: 90,
   });
 }
 

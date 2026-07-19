@@ -39,8 +39,8 @@ const ALLOWED_KEYS = new Set([
   'project', 'model', 'speed', 'fallback', 'day',
   'provider_id', 'provider_name', 'quota_domain', 'dashboard_url',
   'account_fingerprint', 'account_label', 'plan', 'account_metadata',
-  'source', 'source_history', 'status', 'captured_at', 'stale_after',
-  'windows', 'credits', 'financials', 'local_runtime', 'reset_credits', 'error', 'request_count', 'latency_ms',
+  'source', 'source_history', 'status', 'captured_at', 'stale_after', 'next_refresh_at',
+  'windows', 'credits', 'financials', 'local_runtime', 'cloud_usage', 'reset_credits', 'error', 'request_count', 'latency_ms',
   'session_count', 'mapped_harness_types', 'last_good_captured_at',
   'id', 'label', 'scope', 'used_percent', 'remaining_percent', 'duration_minutes',
   'starts_at', 'resets_at', 'reset_description', 'window_kind', 'model_scope',
@@ -67,6 +67,10 @@ const ALLOWED_KEYS = new Set([
   'total_duration_ns', 'load_duration_ns', 'prompt_eval_duration_ns', 'eval_duration_ns',
   'tokens_per_second', 'observed_request_count', 'request_receipts', 'receipt_id', 'surface',
   'telemetry_status', 'telemetry_reason',
+  'subscription_state', 'auto_reload_enabled', 'source_receipt',
+  'ready_state', 'visibility_state', 'active_element_tag', 'page_path', 'page_state_unchanged',
+  'dom_mutation_records', 'navigation_actions', 'click_actions', 'focus_actions',
+  'existing_target_id_preserved', 'target_inventory_stable', 'targets_created',
 ]);
 
 const DETAIL_ALLOWED_KEYS = new Set([
@@ -130,7 +134,7 @@ function validOptionalArray(value, maxLength) {
 
 function validateSnapshot(snapshot) {
   if (!snapshot || typeof snapshot !== 'object' || Array.isArray(snapshot)) return false;
-  if (![1, 2, 3].includes(snapshot.schema_version)) return false;
+  if (![1, 2, 3, 4].includes(snapshot.schema_version)) return false;
   if (!ALLOWED_PROVIDER_IDS.has(snapshot.provider_id)) return false;
   if (!ALLOWED_STATUSES.has(snapshot.status)) return false;
   if (typeof snapshot.account_fingerprint !== 'string'
@@ -142,7 +146,7 @@ function validateSnapshot(snapshot) {
   if (snapshot.dashboard_url != null) {
     let parsed;
     try { parsed = new URL(snapshot.dashboard_url); } catch { return false; }
-    if (parsed.protocol !== 'https:' || !new Set(['chatgpt.com', 'claude.ai', 'cursor.com']).has(parsed.hostname)) return false;
+    if (parsed.protocol !== 'https:' || !new Set(['chatgpt.com', 'claude.ai', 'cursor.com', 'ollama.com']).has(parsed.hostname)) return false;
   }
   return true;
 }
@@ -185,7 +189,7 @@ function quotaEnvelope(payload) {
 
 function quotaBoundaryViolation(payload) {
   if (!payload || typeof payload !== 'object' || Array.isArray(payload)) return '$:payload';
-  if (![1, 2, 3].includes(payload.schema_version)) return '$.schema_version';
+  if (![1, 2, 3, 4].includes(payload.schema_version)) return '$.schema_version';
   if (!Array.isArray(payload.snapshots) || payload.snapshots.length > 32) return '$.snapshots';
   const invalidSnapshot = payload.snapshots.findIndex(snapshot => !validateSnapshot(snapshot));
   if (invalidSnapshot >= 0) return `$.snapshots[${invalidSnapshot}]:snapshot`;

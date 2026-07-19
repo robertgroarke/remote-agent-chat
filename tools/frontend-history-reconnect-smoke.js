@@ -121,15 +121,18 @@ assert.deepEqual(
   sessionMetadataActivityMaps([
     { session_id: 'active-cli', activity: {
       kind: 'generating', label: 'Working', thinkingContent: 'running',
+      observed_at: '2026-07-19T06:00:00.000Z',
       goal: { state: 'active', fingerprint: 'goal-fixture', generation: 1 },
       goal_run: { schema_version: 1, run_id: 'run-fixture', goal_fingerprint: 'goal-fixture', goal_generation: 1, lifecycle: 'running_turn', lease_active: true },
     } },
     { session_id: 'idle-cli', activity: { kind: 'idle', label: '', thinkingContent: '' } },
-  ]),
+  ], {
+    'active-cli': { transport: { latency_ms: 73 }, observed_at: '2026-07-19T05:59:59.000Z' },
+  }),
   {
     activities: {
-        'active-cli': { kind: 'generating', label: 'Working', updatedAt: null, startedAt: null, interruptHint: '', goal: { state: 'active', fingerprint: 'goal-fixture', generation: 1 }, goal_run: { schema_version: 1, run_id: 'run-fixture', goal_fingerprint: 'goal-fixture', goal_generation: 1, lifecycle: 'running_turn', lease_active: true }, thinking: null, current: null, step: null, usage: null, task_list: null, context_card: null, thinkingContent: 'running', transport: null },
-        'idle-cli': { kind: 'idle', label: '', updatedAt: null, startedAt: null, interruptHint: '', goal: null, goal_run: null, thinking: null, current: null, step: null, usage: null, task_list: null, context_card: null, thinkingContent: '', transport: null },
+        'active-cli': { kind: 'generating', label: 'Working', updatedAt: null, observed_at: '2026-07-19T06:00:00.000Z', startedAt: null, interruptHint: '', goal: { state: 'active', fingerprint: 'goal-fixture', generation: 1 }, goal_run: { schema_version: 1, run_id: 'run-fixture', goal_fingerprint: 'goal-fixture', goal_generation: 1, lifecycle: 'running_turn', lease_active: true }, thinking: null, current: null, step: null, usage: null, task_list: null, context_card: null, thinkingContent: 'running', transport: { latency_ms: 73 } },
+        'idle-cli': { kind: 'idle', label: '', updatedAt: null, observed_at: null, startedAt: null, interruptHint: '', goal: null, goal_run: null, thinking: null, current: null, step: null, usage: null, task_list: null, context_card: null, thinkingContent: '', transport: null },
     },
     thinkingContent: { 'active-cli': 'running', 'idle-cli': '' },
     thinking: { 'active-cli': 'Working', 'idle-cli': false },

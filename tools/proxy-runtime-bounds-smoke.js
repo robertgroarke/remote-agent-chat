@@ -16,7 +16,8 @@ process.env.SESSION_STORE_PATH = path.join(tempRoot, 'session-store.json');
       relayUrl: 'ws://127.0.0.1:1/proxy-ws',
       uploadDir: path.join(tempRoot, 'uploads'),
     });
-    engine.on('log', () => {});
+    const logs = [];
+    engine.on('log', (level, message) => logs.push({ level, message }));
     engine.relayReady = true;
     engine.relayWs = { readyState: 1, bufferedAmount: 64 * 1024 * 1024, send() {}, close() {} };
 
@@ -55,6 +56,18 @@ process.env.SESSION_STORE_PATH = path.join(tempRoot, 'session-store.json');
     }
     assert.equal(engine._codexConfigReceipts.size, 512);
 
+    engine._skippedPollTicks = 4;
+    let pollBudget = null;
+    for (let index = 0; index < 1800; index += 1) {
+      pollBudget = engine._recordPollTickBudget(index < 1710 ? 100 : 1900);
+    }
+    assert.equal(engine._pollBudgetTelemetry.durationsMs.length, 1800);
+    assert.equal(pollBudget.p95_ms, 100);
+    assert.equal(pollBudget.max_ms, 1900);
+    assert.equal(pollBudget.skipped_total, 4);
+    assert(logs.some(entry => String(entry?.message || '').includes('[poll] budget completed=1800')),
+      'poll budget telemetry must emit a machine-readable 30-minute receipt');
+
     engine.stop();
     assert.equal(engine._pendingRelayBulk.size, 0);
     assert.equal(engine._pendingPreReadyHistory.size, 0);
@@ -70,6 +83,10 @@ process.env.SESSION_STORE_PATH = path.join(tempRoot, 'session-store.json');
       pre_ready_history_entries: 64,
       metadata_map_entries: 512,
       codex_config_receipt_entries: 512,
+      poll_budget_window_samples: pollBudget.window_samples,
+      poll_budget_p95_ms: pollBudget.p95_ms,
+      poll_budget_max_ms: pollBudget.max_ms,
+      poll_budget_skipped_total: pollBudget.skipped_total,
       stop_cleanup: true,
     }, null, 2));
   } finally {

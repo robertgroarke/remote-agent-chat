@@ -835,6 +835,28 @@ jobs, so valid quota may publish while a slower cost scan remains `scanning`.
 }
 ```
 
+When the authoritative Codex window is exhausted and the snapshot reports earned reset
+credits, Web and Android render an operator-attention question. A reset is never automatic.
+The affirmative control sends one explicit approval:
+
+```json
+{
+  "type": "provider_usage_reset_credit_consume",
+  "protocol_version": 1,
+  "request_id": "provider-reset-42",
+  "approved": true
+}
+```
+
+The relay serializes reset attempts and replaces the browser request ID with a UUID used as
+the native Codex idempotency key. The proxy re-reads `account/rateLimits/read`; it invokes
+`account/rateLimitResetCredit/consume` only when the account is still exhausted and at least
+one credit remains. Otherwise it returns `nothingToReset` or `noCredit` without consuming.
+The requester receives `provider_usage_reset_credit_receipt` with `accepted`, then terminal
+`completed` or `error`; completed outcomes are `reset`, `nothingToReset`, `noCredit`, or
+`alreadyRedeemed`. The proxy immediately refreshes the redacted usage snapshot after the
+native receipt. Credit identifiers and authentication material never cross the relay.
+
 Large local cost detail never expands the snapshot envelope. The snapshot contains exact
 aggregates plus at most 256 inline `daily_breakdown` rows and explicit `detail` pagination
 metadata. Web and Android request bounded, range/project/provider-filtered pages as needed:
@@ -1066,12 +1088,12 @@ Proxies emit `rate_limit_active` for both visible usage warnings and hard exhaus
 native reset text, `reset_at` is its absolute timestamp normalized in the proxy's local
 timezone, and `hard_limited` distinguishes a warning from a harness that cannot continue.
 Relays deduplicate push delivery per session and usage cycle: the highest newly
-crossed threshold at 80%, 90%, or hard exhaustion is delivered once. `rate_limit_cleared`
+crossed threshold at 75%, 90%, or hard exhaustion is delivered once. `rate_limit_cleared`
 ends the cycle and re-arms those thresholds; a cleared push is emitted only when the prior
 cycle reached hard exhaustion.
 
 When a fresh provider-account snapshot covers a session, its individual native window is
-authoritative for warnings and auto-resume. The relay deduplicates the 80%, 90%, and 100%
+authoritative for warnings and auto-resume. The relay deduplicates the 75%, 90%, and 100%
 thresholds by provider/account/window/reset cycle, associates every mapped session, and emits
 one `provider_usage_threshold` event. Per-session `rate_limit_active` frames remain useful as
 context diagnostics but do not create duplicate Codex-vs-Codex-CLI or
@@ -1699,6 +1721,12 @@ The currently accepted event/category values are:
 - `goal_attention`: the same goal fingerprint transitioned to `paused`, `blocked`,
   `usageLimited`, `budgetLimited`, `cancelled`, or `failed`; title/body identify that state and
   never use completion copy.
+- `provider_usage_threshold` / `provider_usage_warning`: a fresh provider-account window crossed
+  75%, 90%, or exhaustion. Its identity is deduplicated by a hashed account/window/reset cycle and
+  threshold, while the payload carries only the privacy-safe provider/account label, reset hint,
+  percentage, and affected session IDs. Web delivery follows the synchronized category preference.
+  Android WebSocket and FCM delivery stay fail-closed until a dedicated Android channel and setting
+  ship; the usage state itself still updates in Android session surfaces.
 
 `turn_ready` is fail-closed and currently unsupported for every harness. An active-to-idle edge,
 fresh timestamp, settled text, process exit, or missing goal record is not an authoritative turn

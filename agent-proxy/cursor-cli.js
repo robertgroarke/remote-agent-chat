@@ -5,6 +5,7 @@ const os = require('os');
 const path = require('path');
 const { spawn, spawnSync } = require('child_process');
 const { normalizeNativeLaunchMode, backgroundNativeLaunchResult } = require('./native-launch-mode');
+const { assertOperatorForegroundLaunch } = require('./windows-automation-launch-policy');
 const { setBoundedMap } = require('./bounded-map');
 
 let chokidar = null;
@@ -1106,10 +1107,11 @@ function buildNativeCursorWindowPowerShell({ cwd, launcherPath } = {}) {
   ].join(' ');
 }
 
-function startNativeCursorWindow({ workspacePath, cliSessionId, resume = false, model, permissionMode, sandbox, title, launchMode = 'foreground' } = {}) {
+function startNativeCursorWindow({ workspacePath, cliSessionId, resume = false, model, permissionMode, sandbox, title, launchMode = 'foreground', operatorActionProof, requestId } = {}) {
   if (normalizeNativeLaunchMode(launchMode) === 'background') {
     return backgroundNativeLaunchResult('cursor_cli');
   }
+  assertOperatorForegroundLaunch({ operatorActionProof, requestId });
   const cwd = workspacePath || process.cwd();
   const resolved = resolveCursorCommand();
   const baseBin = resolved ? [resolved.command, ...resolved.argsPrefix] : ['agent'];

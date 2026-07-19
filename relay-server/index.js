@@ -10,6 +10,7 @@ const path       = require('path');
 const fs         = require('fs');
 const crypto     = require('crypto');
 const { isDeepStrictEqual } = require('util');
+const { Worker } = require('worker_threads');
 const jwt        = require('jsonwebtoken');
 const Database   = require('better-sqlite3');
 const admin      = require('firebase-admin');
@@ -35,6 +36,8 @@ const {
   projectFleetWorkContext,
 } = require('./fleet-work-context');
 const { normalizeQuestionAnswers } = require('./question-answers');
+const { loadSharedRuntimeContract } = require('./shared-runtime-contract');
+const { createRelayOperatorActionProof } = loadSharedRuntimeContract('windows-operator-action-proof.js');
 const {
   questionPromptDeadlineGraceMs,
   QuestionPromptRegistry,
@@ -63,7 +66,7 @@ const {
   sanitizeHostResourceSnapshot,
   sanitizeHostResourceSystemPoint,
 } = require('./host-resource-boundary');
-const { ProviderUsageAuthority } = require('./provider-usage-authority');
+const { ProviderUsageAuthority, matchingSessionIds } = require('./provider-usage-authority');
 const { ScheduledSendStore } = require('./scheduled-sends');
 const { pruneDirectory } = require('./storage-retention');
 const { GoalNotificationCoordinator } = require('./goal-notifications');
@@ -309,6 +312,7 @@ db.exec(`
     turn_ready         INTEGER NOT NULL DEFAULT 0,
     goal_completed     INTEGER NOT NULL DEFAULT 0,
     goal_attention     INTEGER NOT NULL DEFAULT 1,
+    provider_usage_warning INTEGER NOT NULL DEFAULT 1,
     agent_error        INTEGER NOT NULL DEFAULT 1,
     session_offline    INTEGER NOT NULL DEFAULT 1,
     rate_limit_cleared INTEGER NOT NULL DEFAULT 1,
@@ -357,6 +361,9 @@ const notificationPreferenceColumns = new Set(
 for (const column of ['turn_ready', 'goal_completed']) {
   if (notificationPreferenceColumns.has(column)) continue;
   db.exec(`ALTER TABLE notification_preferences ADD COLUMN ${column} INTEGER NOT NULL DEFAULT 0`);
+}
+if (!notificationPreferenceColumns.has('provider_usage_warning')) {
+  db.exec('ALTER TABLE notification_preferences ADD COLUMN provider_usage_warning INTEGER NOT NULL DEFAULT 1');
 }
 for (const [column, legacyColumn] of [
   ['goal_attention', 'agent_error'],
@@ -484,6 +491,7 @@ const DEFAULT_NOTIFICATION_PREFERENCES = Object.freeze({
   turn_ready: false,
   goal_completed: false,
   goal_attention: true,
+  provider_usage_warning: true,
   agent_error: true,
   session_offline: true,
   rate_limit_cleared: true,
@@ -494,7 +502,7 @@ const DEFAULT_NOTIFICATION_PREFERENCES = Object.freeze({
 function notificationPreferencesForEmail(email) {
   if (!email) return { ...DEFAULT_NOTIFICATION_PREFERENCES };
   const row = db.prepare(`
-    SELECT permission_required, agent_ready, turn_ready, goal_completed, goal_attention,
+    SELECT permission_required, agent_ready, turn_ready, goal_completed, goal_attention, provider_usage_warning,
            agent_error, session_offline, rate_limit_cleared,
            completion_sound, completion_haptic
     FROM notification_preferences
@@ -506,6 +514,7 @@ function notificationPreferencesForEmail(email) {
     turn_ready: TURN_READY_NOTIFICATIONS_ENABLED && (row ? !!row.turn_ready : false),
     goal_completed: row ? !!row.goal_completed : false,
     goal_attention: row ? !!row.goal_attention : true,
+    provider_usage_warning: row ? !!row.provider_usage_warning : true,
     agent_error: row ? !!row.agent_error : true,
     session_offline: row ? !!row.session_offline : true,
     rate_limit_cleared: row ? !!row.rate_limit_cleared : true,
@@ -532,6 +541,8 @@ function saveNotificationPreferences(email, requested) {
       ? requested.goal_completed : current.goal_completed,
     goal_attention: typeof requested?.goal_attention === 'boolean'
       ? requested.goal_attention : current.goal_attention,
+    provider_usage_warning: typeof requested?.provider_usage_warning === 'boolean'
+      ? requested.provider_usage_warning : current.provider_usage_warning,
     agent_error: typeof requested?.agent_error === 'boolean'
       ? requested.agent_error : current.agent_error,
     session_offline: typeof requested?.session_offline === 'boolean'
@@ -545,15 +556,16 @@ function saveNotificationPreferences(email, requested) {
   };
   db.prepare(`
     INSERT INTO notification_preferences
-      (email, permission_required, agent_ready, turn_ready, goal_completed, goal_attention,
+      (email, permission_required, agent_ready, turn_ready, goal_completed, goal_attention, provider_usage_warning,
        agent_error, session_offline, rate_limit_cleared, completion_sound, completion_haptic, updated_at)
-    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, datetime('now'))
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, datetime('now'))
     ON CONFLICT(email) DO UPDATE SET
       permission_required = excluded.permission_required,
       agent_ready = excluded.agent_ready,
       turn_ready = excluded.turn_ready,
       goal_completed = excluded.goal_completed,
       goal_attention = excluded.goal_attention,
+      provider_usage_warning = excluded.provider_usage_warning,
       agent_error = excluded.agent_error,
       session_offline = excluded.session_offline,
       rate_limit_cleared = excluded.rate_limit_cleared,
@@ -567,6 +579,7 @@ function saveNotificationPreferences(email, requested) {
     preferences.turn_ready ? 1 : 0,
     preferences.goal_completed ? 1 : 0,
     preferences.goal_attention ? 1 : 0,
+    preferences.provider_usage_warning ? 1 : 0,
     preferences.agent_error ? 1 : 0,
     preferences.session_offline ? 1 : 0,
     preferences.rate_limit_cleared ? 1 : 0,
@@ -888,6 +901,7 @@ const PUSH_TYPE_CONFIG = Object.freeze({
   permission_required: { category: 'permission_required', channelId: 'permission-required' },
   goal_completed:       { category: 'goal_completed',     channelId: 'goal-completed' },
   goal_attention:       { category: 'goal_attention',     channelId: 'goal-attention' },
+  provider_usage_threshold: { category: 'provider_usage_warning', channelId: 'usage-warning', androidEnabled: false },
   agent_error:          { category: 'agent_error',        channelId: 'agent-error' },
   rate_limit_active:    { category: 'agent_error',        channelId: 'agent-error' },
   session_offline:      { category: 'session_offline',    channelId: 'session-offline' },
@@ -965,6 +979,10 @@ async function sendPushNotification(title, body, data = {}) {
   if (firebaseApp) {
     const rows = db.prepare('SELECT token, email FROM fcm_tokens').all();
     for (const { token, email } of rows) {
+      if (pushConfig?.androidEnabled === false) {
+        recordSemanticStage('suppressed', email, 'fcm', { reasonCode: 'android_channel_unavailable' });
+        continue;
+      }
       if (!isAllowed(email, 'fcm')) continue;
       try {
         await admin.messaging().send({
@@ -2439,6 +2457,7 @@ app.put('/api/preferences/notifications', requireAnyAuth, preferenceMutationRate
     requested.turn_ready !== undefined && typeof requested.turn_ready !== 'boolean' ||
     requested.goal_completed !== undefined && typeof requested.goal_completed !== 'boolean' ||
     requested.goal_attention !== undefined && typeof requested.goal_attention !== 'boolean' ||
+    requested.provider_usage_warning !== undefined && typeof requested.provider_usage_warning !== 'boolean' ||
     requested.agent_error !== undefined && typeof requested.agent_error !== 'boolean' ||
     requested.session_offline !== undefined && typeof requested.session_offline !== 'boolean' ||
     requested.rate_limit_cleared !== undefined && typeof requested.rate_limit_cleared !== 'boolean' ||
@@ -3406,10 +3425,70 @@ function scheduleUsageResume(sessionId, resetHint, goal = sessionGoal(sessionId)
   return job;
 }
 
+function applyProviderUsageSessionLinks(snapshotPayload, allowedSessionIds = null) {
+  const allowed = allowedSessionIds instanceof Set ? allowedSessionIds : null;
+  const snapshots = Array.isArray(snapshotPayload?.snapshots) ? snapshotPayload.snapshots : [];
+  if (snapshots.length === 0 && (Number(snapshotPayload?.generation) === 0 || snapshotPayload?.in_flight === true)) return;
+  const candidatesBySession = new Map();
+  for (const snapshot of snapshots) {
+    for (const sessionId of matchingSessionIds(snapshot, sessionMeta, allowed)) {
+      if (!candidatesBySession.has(sessionId)) candidatesBySession.set(sessionId, []);
+      candidatesBySession.get(sessionId).push({
+        providerId: String(snapshot.provider_id || ''),
+        accountFingerprint: String(snapshot.account_fingerprint || ''),
+        quotaDomain: String(snapshot.quota_domain || ''),
+        capturedAt: String(snapshot.captured_at || snapshotPayload.generated_at || ''),
+      });
+    }
+  }
+  const sessionIds = allowed ? [...allowed] : [...candidatesBySession.keys()];
+  for (const sessionId of sessionIds) {
+    const previous = sessionMeta.get(sessionId);
+    if (!previous || typeof previous !== 'object') continue;
+    const candidates = candidatesBySession.get(sessionId) || [];
+    const next = { ...previous };
+    for (const key of [
+      'usage_billing_provider_id', 'usage_account_fingerprint', 'usage_quota_domain',
+      'usage_mapping_generation', 'usage_mapping_captured_at', 'usage_mapping_ambiguous',
+    ]) delete next[key];
+    if (candidates.length === 1) {
+      const candidate = candidates[0];
+      next.usage_billing_provider_id = candidate.providerId;
+      next.usage_account_fingerprint = candidate.accountFingerprint;
+      next.usage_quota_domain = candidate.quotaDomain;
+      next.usage_mapping_generation = Number(snapshotPayload?.generation) || 0;
+      next.usage_mapping_captured_at = candidate.capturedAt;
+      next.usage_mapping_ambiguous = false;
+    } else if (candidates.length > 1) {
+      const providerIds = [...new Set(candidates.map(candidate => candidate.providerId).filter(Boolean))];
+      if (providerIds.length === 1) next.usage_billing_provider_id = providerIds[0];
+      next.usage_mapping_generation = Number(snapshotPayload?.generation) || 0;
+      next.usage_mapping_captured_at = String(snapshotPayload?.generated_at || '');
+      next.usage_mapping_ambiguous = true;
+    }
+    if (isDeepStrictEqual(previous, next)) continue;
+    sessionMeta.set(sessionId, next);
+    queueSessionPatchBroadcast(sessionId, previous, next);
+  }
+}
+
 function applyProviderUsageAuthority(snapshot, proxyWs) {
   const allowedSessionIds = proxySessionClaims.get(proxyWs)?.sessions || null;
+  applyProviderUsageSessionLinks(snapshot, allowedSessionIds);
   const alerts = providerUsageAuthority.observe(snapshot, sessionMeta, allowedSessionIds);
   for (const alert of alerts) {
+    for (const sessionId of alert.affectedSessionIds) {
+      if (!sessionMeta.has(sessionId)) continue;
+      sessionMeta.set(sessionId, {
+        ...sessionMeta.get(sessionId),
+        percent_used: alert.percentUsed,
+        rate_limit_active: alert.hardLimited,
+        rate_limited_until: alert.resetHint || 'unknown',
+        usage_limit_provider: alert.providerId || null,
+        usage_limit_window: alert.windowLabel || alert.windowId || null,
+        last_seen_at: new Date().toISOString(),
+      });
+    }
     if (alert.hardLimited && alert.resetHint) {
       for (const sessionId of alert.affectedSessionIds) {
         scheduleUsageResume(sessionId, alert.resetHint);
@@ -3429,28 +3508,46 @@ function applyProviderUsageAuthority(snapshot, proxyWs) {
       affected_session_ids: alert.affectedSessionIds,
       server_ts: new Date().toISOString(),
     });
-    if (shouldSendPush()) {
-      const notification = buildUsageThresholdNotification(
-        `${alert.providerName} ${alert.windowLabel}`,
-        alert.threshold,
-        alert.percentUsed,
-        alert.resetHint,
-      );
-      sendPushNotification(
-        notification.title,
-        notification.body.slice(0, 180),
-        {
-          type: 'provider_usage_threshold',
-          activity_type: alert.hardLimited ? 'rate_limit' : 'usage_warning',
-          provider_id: alert.providerId,
-          window_id: alert.windowId || '',
-          threshold: String(alert.threshold),
-          percent_used: String(alert.percentUsed),
-          hard_limited: String(alert.hardLimited),
-          reset_hint: alert.resetHint || '',
-          session_ids: alert.affectedSessionIds.join(','),
-        },
-      ).catch(() => {});
+    const notification = buildUsageThresholdNotification(
+      `${alert.providerName} ${alert.windowLabel}`,
+      alert.threshold,
+      alert.percentUsed,
+      alert.resetHint,
+    );
+    const primarySessionId = alert.affectedSessionIds[0] || '';
+    if (primarySessionId) {
+      const createdAt = new Date().toISOString();
+      const cycleDigest = crypto.createHash('sha256')
+        .update(String(alert.cycleKey || ''), 'utf8').digest('hex').slice(0, 32);
+      const semanticEvent = goalNotifications.recordExternalEvent({
+        type: 'semantic_notification',
+        event_type: 'provider_usage_threshold',
+        category: 'provider_usage_warning',
+        dedupe_key: `provider-usage-threshold:${cycleDigest}:${alert.threshold}`,
+        session_id: primarySessionId,
+        session_name: notificationSessionName(primarySessionId),
+        title: notification.title,
+        body: notification.body.slice(0, 180),
+        activity_type: alert.hardLimited ? 'rate_limit' : 'usage_warning',
+        created_at: createdAt,
+        harness: 'provider_usage',
+        goal_affiliation: 'provider_usage',
+        provider_id: alert.providerId,
+        account_label: alert.accountLabel,
+        window_id: alert.windowId || '',
+        window_label: alert.windowLabel,
+        threshold: alert.threshold,
+        percent_used: alert.percentUsed,
+        hard_limited: alert.hardLimited,
+        reset_hint: alert.resetHint || '',
+        affected_session_ids: alert.affectedSessionIds,
+      }, {
+        harness: 'provider_usage',
+        goalAffiliation: 'provider_usage',
+        occurredAt: createdAt,
+        metadata: { source: 'provider_usage_snapshot' },
+      });
+      if (semanticEvent) dispatchSemanticNotification(semanticEvent);
     }
     log('info', 'provider-usage', 'Provider usage threshold crossed', {
       provider: alert.providerId,
@@ -3804,6 +3901,17 @@ function dispatchSemanticNotification(event) {
     goal_affiliation: event.goal_affiliation,
     native_event_id: event.native_event_id,
     turn_id: event.turn_id,
+    ...(event.provider_id ? {
+      provider_id: event.provider_id,
+      account_label: event.account_label || '',
+      window_id: event.window_id || '',
+      window_label: event.window_label || '',
+      threshold: event.threshold,
+      percent_used: event.percent_used,
+      hard_limited: event.hard_limited,
+      reset_hint: event.reset_hint || '',
+      session_ids: Array.isArray(event.affected_session_ids) ? event.affected_session_ids.join(',') : '',
+    } : {}),
   }).catch(() => {});
 }
 
@@ -3899,6 +4007,7 @@ const pendingHostResourceHistoryRequests = new Map();
 const hostResourceSubscriptions = new Map();
 const pendingProviderUsageCostDetailRequests = new Map();
 let activeProviderUsageRefresh = null;
+let activeProviderUsageResetCredit = null;
 const PROVIDER_USAGE_REQUEST_TIMEOUT_MS = 15_000;
 const HOST_RESOURCE_REQUEST_TIMEOUT_MS = 12_000;
 const HOST_RESOURCE_REQUEST_MIN_INTERVAL_MS = 2_000;
@@ -4068,45 +4177,62 @@ const stmtFindLatestVisibleMessageRow = db.prepare(`
 `);
 const stmtGetMessageTimestampById = db.prepare('SELECT ts FROM messages WHERE id = ?');
 
-// Legacy stores already contain the durable transcript rows. Seed the compact
-// content-free projection once, in one bounded scan, without fetching any
-// transcript through the client inventory path.
-const legacyLatestVisibleRows = db.prepare(`
-  WITH ranked AS (
-    SELECT m.session, m.id AS message_row_id, m.role, m.ts, m.source,
-           ROW_NUMBER() OVER (PARTITION BY m.session ORDER BY m.ts DESC, m.id DESC) AS rank
-    FROM messages m
-    WHERE lower(replace(m.role, '-', '_')) IN
-      ('user', 'assistant', 'tool', 'tool_result', 'permission', 'permission_prompt',
-       'question', 'question_prompt', 'error', 'system')
-      AND m.ts > 0
-  )
-  SELECT ranked.*
-  FROM ranked
-  LEFT JOIN session_latest_visible_message latest ON latest.session_id = ranked.session
-  WHERE ranked.rank = 1 AND latest.session_id IS NULL
-`).all();
-if (legacyLatestVisibleRows.length > 0) {
-  db.transaction(rows => rows.forEach(row => {
-    const kind = canonicalVisibleMessageKind(row.role);
-    if (!kind) return;
-    const messageId = relayVisibleMessageId(row.message_row_id);
-    stmtReplaceLatestVisibleMessage.run(
-      row.session,
-      row.message_row_id,
-      messageId,
-      row.ts,
-      kind,
-      canonicalLatestMessageSource(row.source),
-    );
-  }))(legacyLatestVisibleRows);
-  log('info', 'db', 'Backfilled latest visible message metadata', {
-    sessions: legacyLatestVisibleRows.length,
-  });
-}
 const latestVisibleMessages = new Map(
   stmtListLatestVisibleMessages.all().map(row => [row.session_id, row]),
 ); // sessionId -> compact content-free persisted message identity
+let latestVisibleBackfillWorker = null;
+let latestVisibleBackfillRetryTimer = null;
+
+function missingLatestVisibleSessionIds() {
+  return db.prepare(`
+    SELECT meta.session_id
+    FROM session_meta meta
+    LEFT JOIN session_latest_visible_message latest ON latest.session_id = meta.session_id
+    WHERE latest.session_id IS NULL
+    ORDER BY meta.session_id
+    LIMIT 4096
+  `).pluck().all();
+}
+
+function scheduleLegacyLatestVisibleBackfill(delayMs = 0) {
+  if (latestVisibleBackfillWorker || latestVisibleBackfillRetryTimer) return;
+  latestVisibleBackfillRetryTimer = setTimeout(() => {
+    latestVisibleBackfillRetryTimer = null;
+    const sessionIds = missingLatestVisibleSessionIds();
+    if (sessionIds.length === 0) return;
+    const worker = new Worker(path.join(__dirname, 'latest-visible-backfill-worker.js'), {
+      workerData: { dbPath: HISTORY_DB_PATH, sessionIds },
+    });
+    latestVisibleBackfillWorker = worker;
+    worker.on('message', message => {
+      if (message?.type === 'row') {
+        const latest = normalizedLatestVisibleMessageRow(message.row);
+        if (!latest?.session_id) return;
+        latestVisibleMessages.set(latest.session_id, latest);
+        const summary = buildSessionSummary({ type: 'latest_visible_backfill' }, latest.session_id);
+        for (const ws of browserClients) {
+          if (ws.readyState === WebSocket.OPEN && canBroadcastDeltaToBrowser(ws)) {
+            queueBrowserSessionSummary(ws, latest.session_id, summary);
+          }
+        }
+      } else if (message?.type === 'complete') {
+        log('info', 'db', 'Backfilled latest visible message metadata', {
+          candidates: message.candidates,
+          sessions: message.backfilled,
+        });
+      }
+    });
+    worker.on('error', error => {
+      log('error', 'db', 'Latest visible message backfill worker failed', { err: error.message });
+    });
+    worker.on('exit', code => {
+      if (latestVisibleBackfillWorker === worker) latestVisibleBackfillWorker = null;
+      if (code !== 0) scheduleLegacyLatestVisibleBackfill(5000);
+    });
+    worker.unref();
+  }, Math.max(0, delayMs));
+  latestVisibleBackfillRetryTimer.unref?.();
+}
 
 function compactSummaryGoalRun(goalRun) {
   if (!goalRun || typeof goalRun !== 'object' || goalRun.schema_version !== 1) return null;
@@ -4136,6 +4262,7 @@ function compactSummaryActivity(activity, fallbackLabel = '') {
     label: String(activity.label || fallbackLabel || '').slice(0, 120),
     ...(activity.started_at ? { started_at: activity.started_at } : {}),
     ...(activity.updated_at ? { updated_at: activity.updated_at } : {}),
+    ...(activity.observed_at ? { observed_at: activity.observed_at } : {}),
     ...(activity.interrupt_hint ? { interrupt_hint: activity.interrupt_hint } : {}),
     ...(goal ? { goal } : {}),
     ...(goalRun ? { goal_run: goalRun } : {}),
@@ -4702,6 +4829,7 @@ function statusBroadcastSignature(msg) {
       kind: activity.kind || '',
       label: activity.label || '',
       started_at: activity.started_at || null,
+      observed_at: activity.observed_at || null,
       interrupt_hint: activity.interrupt_hint || '',
       thinkingContent: activity.thinkingContent || '',
       task_list: activity.task_list || null,
@@ -5197,6 +5325,7 @@ const KNOWN_PROXY_TYPES = new Set([
   'native_queue',
   'provider_usage_snapshot',
   'provider_usage_refresh_receipt',
+  'provider_usage_reset_credit_receipt',
   'provider_usage_cost_detail', 'provider_usage_cost_detail_error',
   'host_resource_snapshot', 'host_resource_live', 'host_resource_detail',
   'host_resource_subscription_ack', 'host_resource_subscription_error',
@@ -5220,6 +5349,7 @@ const KNOWN_CLIENT_TYPES = new Set([
   'steer', 'discard_queued', 'edit_queued',
   'automations_list', 'automations_create', 'automations_update', 'automations_delete', 'automations_run',
   'provider_usage_refresh',
+  'provider_usage_reset_credit_consume',
   'provider_usage_cost_detail_request',
   'host_resource_refresh', 'host_resource_subscribe', 'host_resource_unsubscribe',
   'host_resource_history_request',
@@ -5247,6 +5377,37 @@ function authenticatedWebSocketPrincipal(ws, req) {
 
 function authenticatedWebSocketEmail(ws, req) {
   return String(ws._appUser?.email || req.user?.email || ALLOWED_EMAIL || 'lan-user').toLowerCase();
+}
+
+function relayOperatorActionProof(ws, req, msg, action) {
+  if (msg?.operator_user_gesture !== true
+      || msg?.synthetic === true
+      || msg?.automation === true
+      || msg?.validator === true) return null;
+  const authenticatedEmail = String(ws._appUser?.email || req.user?.email || '').trim().toLowerCase();
+  if (!authenticatedEmail) return null;
+  if (ALLOWED_EMAIL && authenticatedEmail !== String(ALLOWED_EMAIL).trim().toLowerCase()) return null;
+  return createRelayOperatorActionProof({
+    action,
+    requestId: msg.request_id,
+    channel: ws._appUser ? 'android' : 'web',
+  });
+}
+
+function rejectOperatorActionOnly(ws, msg, command) {
+  ws.send(JSON.stringify({
+    type: 'agent_control_result',
+    protocol_version: PROTOCOL_VERSION,
+    request_id: msg.request_id,
+    session_id: msg.session_id || msg.session,
+    command,
+    result: 'failed',
+    error: {
+      code: 'operator_action_only',
+      message: 'Visible native windows require an explicit click or press by the authenticated operator.',
+    },
+    server_ts: new Date().toISOString(),
+  }));
 }
 
 // ── WebSocket routing ─────────────────────────────────────────────────────────
@@ -5486,6 +5647,27 @@ function handleProxyConnection(ws, req) {
           ...(status === 'error' ? { code: String(msg.code || 'refresh_failed').replace(/[^a-z0-9_.-]/gi, '_').slice(0, 60) } : {}),
         }));
       }
+
+    } else if (t === 'provider_usage_reset_credit_receipt') {
+      const active = activeProviderUsageResetCredit;
+      if (!active || msg.request_id !== active.upstreamRequestId || active.proxyWs !== ws) return;
+      clearTimeout(active.timer);
+      activeProviderUsageResetCredit = null;
+      if (active.clientWs.readyState !== WebSocket.OPEN) return;
+      const status = msg.status === 'completed' ? 'completed' : 'error';
+      active.clientWs.send(JSON.stringify({
+        type: 'provider_usage_reset_credit_receipt',
+        protocol_version: PROTOCOL_VERSION,
+        request_id: active.clientRequestId,
+        status,
+        ...(status === 'completed' ? {
+          outcome: ['reset', 'nothingToReset', 'noCredit', 'alreadyRedeemed'].includes(msg.outcome)
+            ? msg.outcome : 'unknown',
+          reset_credits_available: Math.max(0, Number(msg.reset_credits_available) || 0),
+        } : {
+          code: String(msg.code || 'reset_credit_failed').replace(/[^a-z0-9_.-]/gi, '_').slice(0, 60),
+        }),
+      }));
 
     } else if (t === 'provider_usage_cost_detail' || t === 'provider_usage_cost_detail_error') {
       const pending = pendingProviderUsageCostDetailRequests.get(msg.request_id);
@@ -6702,18 +6884,42 @@ function handleProxyConnection(ws, req) {
       if (id && hardLimited && !providerAuthoritative) {
         scheduleUsageResume(id, msg.reset_at || msg.retry_after_hint);
       }
-      if (id && threshold != null && shouldSendPush()) {
+      if (id && threshold != null) {
         const name = notificationSessionName(id);
         const notification = buildUsageThresholdNotification(name, threshold, percentUsed, msg.retry_after_hint);
-        sendPushNotification(
-          notification.title,
-          notification.body.slice(0, 180),
-          {
-            type: 'rate_limit_active', activity_type: 'rate_limit', session_id: id, session_name: name,
-            threshold, percent_used: percentUsed ?? '', hard_limited: hardLimited,
-            reset_hint: msg.retry_after_hint || '',
-          },
-        ).catch(() => {});
+        const createdAt = new Date().toISOString();
+        const fallbackCycle = crypto.createHash('sha256').update([
+          id, msg.reset_at || msg.retry_after_hint || 'open-cycle', threshold,
+        ].join('\u0000'), 'utf8').digest('hex').slice(0, 32);
+        const semanticEvent = goalNotifications.recordExternalEvent({
+          type: 'semantic_notification',
+          event_type: 'provider_usage_threshold',
+          category: 'provider_usage_warning',
+          dedupe_key: `provider-usage-threshold:fallback-${fallbackCycle}:${threshold}`,
+          session_id: id,
+          session_name: name,
+          title: notification.title,
+          body: notification.body.slice(0, 180),
+          activity_type: hardLimited ? 'rate_limit' : 'usage_warning',
+          created_at: createdAt,
+          harness: sessionMeta.get(id)?.agent_type || 'unknown',
+          goal_affiliation: 'provider_usage',
+          provider_id: 'session-local',
+          account_label: 'Session-local source',
+          window_id: 'primary',
+          window_label: 'Primary usage',
+          threshold,
+          percent_used: percentUsed,
+          hard_limited: hardLimited,
+          reset_hint: msg.reset_at || msg.retry_after_hint || '',
+          affected_session_ids: [id],
+        }, {
+          harness: sessionMeta.get(id)?.agent_type || 'unknown',
+          goalAffiliation: 'provider_usage',
+          occurredAt: createdAt,
+          metadata: { source: 'session_rate_limit_fallback' },
+        });
+        if (semanticEvent) dispatchSemanticNotification(semanticEvent);
       }
       log('info', 'rate-limit', hardLimited ? 'Rate limit active' : 'Usage warning', {
         session: id, percent_used: percentUsed, threshold, provider_authoritative: providerAuthoritative,
@@ -6873,6 +7079,17 @@ function handleProxyConnection(ws, req) {
           code: 'proxy_disconnected',
         }));
       }
+    }
+    if (activeProviderUsageResetCredit?.proxyWs === ws) {
+      const active = activeProviderUsageResetCredit;
+      activeProviderUsageResetCredit = null;
+      clearTimeout(active.timer);
+      if (active.clientWs.readyState === WebSocket.OPEN) active.clientWs.send(JSON.stringify({
+        type: 'provider_usage_reset_credit_receipt',
+        request_id: active.clientRequestId,
+        status: 'error',
+        code: 'proxy_disconnected',
+      }));
     }
     for (const [requestId, pending] of pendingProviderUsageCostDetailRequests) {
       if (pending.proxyWs !== ws) continue;
@@ -7037,6 +7254,61 @@ function handleClientConnection(ws, req) {
         request_id: upstreamRequestId,
       }));
       log('info', 'provider-usage', 'Refresh request forwarded', { proxies: 1 });
+
+    } else if (t === 'provider_usage_reset_credit_consume') {
+      const clientRequestId = boundedString(msg.request_id, { min: 1, max: 80 }) ? msg.request_id : null;
+      const proxyWs = [...proxyConnections].find(candidate => (
+        candidate._authenticated && candidate.readyState === WebSocket.OPEN
+      ));
+      if (!clientRequestId || msg.approved !== true || !proxyWs) {
+        ws.send(JSON.stringify({
+          type: 'provider_usage_reset_credit_receipt',
+          protocol_version: PROTOCOL_VERSION,
+          request_id: clientRequestId,
+          status: 'error',
+          code: !clientRequestId ? 'invalid_request_id'
+            : (msg.approved !== true ? 'operator_approval_required' : 'proxy_unavailable'),
+        }));
+        return;
+      }
+      if (activeProviderUsageResetCredit) {
+        ws.send(JSON.stringify({
+          type: 'provider_usage_reset_credit_receipt',
+          protocol_version: PROTOCOL_VERSION,
+          request_id: clientRequestId,
+          status: 'error',
+          code: 'reset_in_progress',
+        }));
+        return;
+      }
+      const upstreamRequestId = crypto.randomUUID();
+      const timer = setTimeout(() => {
+        const active = activeProviderUsageResetCredit;
+        if (!active || active.upstreamRequestId !== upstreamRequestId) return;
+        activeProviderUsageResetCredit = null;
+        if (active.clientWs.readyState === WebSocket.OPEN) active.clientWs.send(JSON.stringify({
+          type: 'provider_usage_reset_credit_receipt',
+          protocol_version: PROTOCOL_VERSION,
+          request_id: active.clientRequestId,
+          status: 'error',
+          code: 'collector_timeout',
+        }));
+      }, PROVIDER_USAGE_REQUEST_TIMEOUT_MS * 2);
+      timer.unref?.();
+      activeProviderUsageResetCredit = { upstreamRequestId, proxyWs, clientWs: ws, clientRequestId, timer };
+      ws.send(JSON.stringify({
+        type: 'provider_usage_reset_credit_receipt',
+        protocol_version: PROTOCOL_VERSION,
+        request_id: clientRequestId,
+        status: 'accepted',
+      }));
+      proxyWs.send(JSON.stringify({
+        type: 'provider_usage_reset_credit_consume',
+        protocol_version: PROTOCOL_VERSION,
+        request_id: upstreamRequestId,
+        approved: true,
+      }));
+      log('info', 'provider-usage', 'Operator-approved reset credit request forwarded', { proxies: 1 });
 
     } else if (t === 'provider_usage_cost_detail_request') {
       const clientRequestId = boundedString(msg.request_id, { min: 1, max: 80 }) ? msg.request_id : null;
@@ -8091,6 +8363,13 @@ function handleClientConnection(ws, req) {
         }));
         return;
       }
+      const operatorActionProof = msg.action_id === 'open_native_window'
+        ? relayOperatorActionProof(ws, req, msg, 'open_native_window')
+        : null;
+      if (msg.action_id === 'open_native_window' && !operatorActionProof) {
+        rejectOperatorActionOnly(ws, msg, 'error_prompt_action');
+        return;
+      }
       const proxyWs = proxySockets.get(sessionId);
       if (!proxyWs || proxyWs.readyState !== WebSocket.OPEN) {
         ws.send(JSON.stringify({
@@ -8124,7 +8403,11 @@ function handleClientConnection(ws, req) {
         promptId,
         actionId: msg.action_id || null,
       });
-      proxyWs.send(JSON.stringify({ ...msg, type: 'error_prompt_action' }));
+      proxyWs.send(JSON.stringify({
+        ...msg,
+        type: 'error_prompt_action',
+        ...(operatorActionProof ? { operator_action_proof: operatorActionProof } : {}),
+      }));
       log('info', 'prompt', 'Error prompt action forwarded', { session: sessionId, prompt_id: promptId, action: msg.action_id });
 
     // ── Agent interrupt (A2-07) ────────────────────────────────────────────
@@ -8360,6 +8643,13 @@ function handleClientConnection(ws, req) {
     } else if (t === 'new_thread' || t === 'open_panel' || t === 'open_native_window' || t === 'chat_list' || t === 'switch_chat' || t === 'new_chat' || t === 'thread_list' || t === 'switch_thread' || t === 'switch_workspace' || t === 'terminal_output' || t === 'file_changes' || t === 'file_change_response' || t === 'send_attachment' || t === 'terminal_input' || t === 'branch_list' || t === 'switch_branch' || t === 'create_branch' || t === 'skill_list' || t === 'automation_view_action' || t === 'list_directory' || t === 'read_file') {
       const sessionId = msg.session_id || msg.session;
       const requestId = msg.request_id;
+      const operatorActionProof = t === 'open_native_window'
+        ? relayOperatorActionProof(ws, req, msg, 'open_native_window')
+        : null;
+      if (t === 'open_native_window' && !operatorActionProof) {
+        rejectOperatorActionOnly(ws, msg, 'open_native_window');
+        return;
+      }
       const navigationEpoch = NAVIGATION_CONTROL_TYPES.has(t)
         ? navigationEpochs.issue(sessionId)
         : 0;
@@ -8411,6 +8701,7 @@ function handleClientConnection(ws, req) {
         type:             t,
         protocol_version: PROTOCOL_VERSION,
         request_id:       requestId,
+        ...(operatorActionProof ? { operator_action_proof: operatorActionProof } : {}),
         session_id:       sessionId,
         ...(msg.chat_id ? { chat_id: msg.chat_id } : {}),
         ...(msg.thread_id ? { thread_id: msg.thread_id } : {}),
@@ -8663,6 +8954,7 @@ setInterval(() => {
 
 server.listen(PORT, () => {
   scheduleTranscriptSearchBackfill();
+  scheduleLegacyLatestVisibleBackfill();
   log('info', 'relay', 'Listening', {
     port:          PORT,
     public_url:    PUBLIC_URL,

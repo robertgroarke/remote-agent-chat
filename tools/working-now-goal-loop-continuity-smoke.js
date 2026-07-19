@@ -445,6 +445,51 @@ function runStorm(webFleet, androidFleet) {
   return { simulated_seconds: 60, samples: 61, membership_edges: membershipEdges, substates: Array.from(labels).sort() };
 }
 
+function runEvidenceCappedTimer(webFleet, androidFleet) {
+  const goalRecord = {
+    state: 'active',
+    status: 'active',
+    updated_at: new Date(BASE_MS).toISOString(),
+    time_used_seconds: 10,
+  };
+  const activeRun = {
+    schema_version: 1,
+    lease_active: true,
+    lease_observed_at: new Date(BASE_MS + 60_000).toISOString(),
+  };
+  const releasedRun = { ...activeRun, lease_active: false };
+  const sampledAt = BASE_MS + 60 * 60 * 1000;
+  const activeSeconds = webFleet.fleetGoalElapsedSeconds(goalRecord, activeRun, sampledAt);
+  const releasedSeconds = webFleet.fleetGoalElapsedSeconds(goalRecord, releasedRun, sampledAt);
+  assert.strictEqual(activeSeconds, 3_610);
+  assert.strictEqual(releasedSeconds, 70);
+  assert.strictEqual(androidFleet.fleetGoalElapsedSeconds(goalRecord, activeRun, sampledAt), activeSeconds);
+  assert.strictEqual(androidFleet.fleetGoalElapsedSeconds(goalRecord, releasedRun, sampledAt), releasedSeconds);
+  return {
+    sampled_after_seconds: 3_600,
+    active_elapsed_seconds: activeSeconds,
+    released_elapsed_seconds: releasedSeconds,
+    timer_stopped_at_last_evidence: true,
+  };
+}
+
+function runFreshnessFallback(webFleet, androidFleet) {
+  const activity = { observed_at: new Date(BASE_MS).toISOString() };
+  const justNow = webFleet.fleetFreshnessLabel(activity, BASE_MS + 500);
+  const observed = webFleet.fleetFreshnessLabel(activity, BASE_MS + 5_000);
+  const transport = webFleet.fleetFreshnessLabel({
+    ...activity,
+    transport: { latency_ms: 73 },
+  }, BASE_MS + 5_000);
+  assert.strictEqual(justNow, 'Observed just now');
+  assert.strictEqual(observed, 'Observed 5s ago');
+  assert.strictEqual(transport, '73 ms');
+  assert.strictEqual(androidFleet.fleetFreshnessLabel(activity, BASE_MS + 500), justNow);
+  assert.strictEqual(androidFleet.fleetFreshnessLabel(activity, BASE_MS + 5_000), observed);
+  assert.strictEqual(androidFleet.fleetFreshnessLabel({ ...activity, transport: { latency_ms: 73 } }, BASE_MS + 5_000), transport);
+  return { transport_latency_label: transport, observed_evidence_label: observed, awaiting_placeholder: false };
+}
+
 function main() {
   assert.strictEqual(typeof reduceGoalRunLifecycle, 'function', 'goal-run lifecycle reducer is missing');
   const webFleetPath = path.join(ROOT, 'frontend', 'fleet-activity.js');
@@ -461,6 +506,8 @@ function main() {
   const exits = runExitMatrix(webFleet, androidFleet);
   const stale = runStaleMatrix(webFleet, androidFleet);
   const storm = runStorm(webFleet, androidFleet);
+  const timer = runEvidenceCappedTimer(webFleet, androidFleet);
+  const freshness = runFreshnessFallback(webFleet, androidFleet);
   const nonGoal = { kind: 'idle', updated_at: new Date(BASE_MS).toISOString() };
   assert.strictEqual(webFleet.classifyFleetActivity(nonGoal, false, {
     connected: true, health: 'healthy', nowMs: BASE_MS, requireFreshness: true,
@@ -473,6 +520,8 @@ function main() {
     exits: { cases: exits.cases, samples: exits.samples, max_latency_ms: exits.max_latency_ms },
     stale: { stale_archives: stale.stale_archives, false_working_entries: stale.false_working_entries, lifecycle_regressions: stale.lifecycle_regressions },
     storm,
+    timer,
+    freshness,
     web_android_classifier_bytes_equal: true,
     ordinary_non_goal_terminal_preserved: true,
   };

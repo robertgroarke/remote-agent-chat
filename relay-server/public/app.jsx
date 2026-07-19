@@ -54,24 +54,32 @@ import {
   selectEstimatedCost,
 } from './provider-usage.js';
 import { ProviderMark } from './provider-marks.jsx';
+import { sessionUsageProjection, sessionUsageWindowLabel } from './session-usage.js';
 import {
   DEFAULT_ACTIVITY_FRESHNESS_MS,
   classifyFleetActivity,
   fleetActivityObservedAtMs,
   fleetFreshnessLabel,
+  fleetGoalElapsedSeconds,
   fleetGoalSubstateLabel,
   fleetStateIsWorking,
   fleetStateLabel,
 } from './fleet-activity.js';
 import {
+  HOST_RESOURCE_CHART_RANGES,
   downsampleHostResourceSeries,
   formatHostResourceAge,
   formatHostResourceBytes,
   formatHostResourcePercent,
   formatHostResourceRate,
   formatHostResourceTimestamp,
+  formatHostResourceTimestampFull,
   hostResourceIntervalStats,
   hostResourceMetricValue,
+  hostResourceNiceScale,
+  hostResourceTimeFraction,
+  hostResourceTimeTicks,
+  hostResourceTimeline,
   normalizeHostResources,
   projectHostResourceStrip,
   selectHostResourceRange,
@@ -1223,54 +1231,6 @@ function agentTypeLabel(agentType) {
   return AGENT_CONFIG[agentType]?.name || agentType;
 }
 
-function usageSnapshotForSession(session, activityOverride = null) {
-  if (!session || typeof session !== 'object') {
-    return { hasSignal: false, percentUsed: null, remainingPercent: null, state: 'unknown', resetAt: null, quotaModels: [] };
-  }
-  const usage = activityOverride?.usage || session.activity?.usage || null;
-  const quotaModels = Array.isArray(session.antigravity_quota_models)
-    ? session.antigravity_quota_models
-      .map(entry => ({
-        model: safeString(entry?.model),
-        percent_used: Number.isFinite(Number(entry?.percent_used))
-          ? Math.max(0, Math.min(100, Number(entry.percent_used)))
-          : null,
-        refreshes_in: safeString(entry?.refreshes_in || entry?.resets_at),
-      }))
-      .filter(entry => entry.model && entry.percent_used != null)
-    : [];
-  const directPercent = [usage?.percent_used, session.percent_used]
-    .map(value => Number(value))
-    .find(Number.isFinite);
-  const quotaPercent = quotaModels.length > 0
-    ? Math.max(...quotaModels.map(entry => entry.percent_used))
-    : null;
-  const percentUsed = Number.isFinite(directPercent)
-    ? Math.max(0, Math.min(100, directPercent))
-    : quotaPercent;
-  const exhausted = !!session.rate_limit_active
-    || usage?.state === 'exhausted'
-    || usage?.rate_limited === true;
-  const state = exhausted ? 'exhausted'
-    : percentUsed != null && percentUsed >= 90 ? 'critical'
-      : percentUsed != null && percentUsed >= 80 ? 'warning'
-        : percentUsed != null ? 'ok'
-          : 'unknown';
-  const resetAt = safeString(
-    usage?.resets_at
-      || session.rate_limited_until
-      || quotaModels.find(entry => entry.refreshes_in)?.refreshes_in,
-  );
-  return {
-    hasSignal: exhausted || percentUsed != null || !!resetAt,
-    percentUsed,
-    remainingPercent: percentUsed == null ? null : Math.max(0, 100 - Math.round(percentUsed)),
-    state,
-    resetAt: resetAt && resetAt !== 'unknown' ? resetAt : null,
-    quotaModels,
-  };
-}
-
 function formatUsageResetLabel(value) {
   const raw = safeString(value).trim();
   if (!raw) return '';
@@ -1278,6 +1238,138 @@ function formatUsageResetLabel(value) {
   const date = new Date(raw);
   if (Number.isNaN(date.getTime())) return raw;
   return date.toLocaleString([], { weekday: 'short', hour: 'numeric', minute: '2-digit' });
+}
+
+function SessionUsageMiniMonitor({ session, config, providerUsage, onOpenUsage }) {
+  const [open, setOpen] = React.useState(false);
+  const [nowMs, setNowMs] = React.useState(Date.now());
+  const triggerRef = React.useRef(null);
+  const popoverRef = React.useRef(null);
+  const normalizedUsage = React.useMemo(() => normalizeProviderUsage(providerUsage), [providerUsage]);
+  const projection = React.useMemo(
+    () => sessionUsageProjection(session, config, normalizedUsage, nowMs),
+    [session, config, normalizedUsage, nowMs],
+  );
+  const headerRows = projection.headerWindows.map(sessionUsageWindowLabel);
+
+  React.useEffect(() => {
+    if (!open) return undefined;
+    setNowMs(Date.now());
+    const timer = setInterval(() => setNowMs(Date.now()), 30_000);
+    return () => clearInterval(timer);
+  }, [open]);
+
+  React.useEffect(() => {
+    if (!open) return undefined;
+    const close = (restoreFocus = false) => {
+      setOpen(false);
+      if (restoreFocus) requestAnimationFrame(() => triggerRef.current?.focus({ preventScroll: true }));
+    };
+    const onPointerDown = event => {
+      if (triggerRef.current?.contains(event.target) || popoverRef.current?.contains(event.target)) return;
+      close(false);
+    };
+    const onKeyDown = event => {
+      if (event.key !== 'Escape') return;
+      event.preventDefault();
+      close(true);
+    };
+    document.addEventListener('pointerdown', onPointerDown);
+    document.addEventListener('keydown', onKeyDown);
+    requestAnimationFrame(() => popoverRef.current?.querySelector('button')?.focus({ preventScroll: true }));
+    return () => {
+      document.removeEventListener('pointerdown', onPointerDown);
+      document.removeEventListener('keydown', onKeyDown);
+    };
+  }, [open]);
+
+  if (!projection.supported) return null;
+  const compactValue = projection.state === 'local'
+    ? 'Local'
+    : projection.state === 'exhausted'
+      ? 'Limit'
+      : headerRows[0]?.compactValue || 'Usage ?';
+  const creditSummary = formatProviderCredits(projection.credits);
+  const financialRows = providerFinancialRows(projection.financials);
+  const openInternalUsage = () => {
+    setOpen(false);
+    onOpenUsage();
+  };
+  return (
+    <div className={`session-usage-mini tone-${projection.tone} state-${projection.state}`} data-testid="session-usage-mini">
+      <button
+        ref={triggerRef}
+        type="button"
+        className="session-usage-mini-trigger"
+        aria-expanded={open}
+        aria-controls="session-usage-popover"
+        title={`${projection.billingProviderName}: ${compactValue}`}
+        onClick={() => setOpen(value => !value)}
+      >
+        <ProviderMark providerId={projection.providerMarkId} providerName={projection.billingProviderName} />
+        <span className="session-usage-mini-rows">
+          {projection.state === 'local' ? (
+            <span className="session-usage-mini-row"><strong>Local</strong><em>no plan limit</em></span>
+          ) : headerRows.length > 0 ? headerRows.map((row, index) => (
+            <span className={`session-usage-mini-row ${row.tone}`} key={`${row.label}:${index}`}>
+              <strong>{row.label}</strong><em>{row.compactValue}</em>
+              <i aria-hidden="true"><b style={{ width: `${Math.max(0, Math.min(100, Number(row.usedPercent) || 0))}%` }} /></i>
+            </span>
+          )) : (
+            <span className="session-usage-mini-row unavailable"><strong>Usage</strong><em>{projection.state === 'ambiguous' ? 'ambiguous' : 'unavailable'}</em></span>
+          )}
+        </span>
+        <span className="session-usage-mini-compact">{compactValue}</span>
+      </button>
+      {open && (
+        <div ref={popoverRef} id="session-usage-popover" className="session-usage-popover" role="dialog" aria-modal="false" aria-label="Session usage details">
+          <div className="session-usage-popover-heading">
+            <ProviderMark providerId={projection.providerMarkId} providerName={projection.billingProviderName} />
+            <span><strong>{projection.billingProviderName}</strong><small>{projection.plan || projection.message || 'Usage details'}</small></span>
+            <button type="button" onClick={() => { setOpen(false); triggerRef.current?.focus({ preventScroll: true }); }} aria-label="Close usage details">×</button>
+          </div>
+          <dl className="session-usage-popover-meta">
+            <div><dt>Billing provider</dt><dd>{projection.billingProviderName}</dd></div>
+            <div><dt>Model vendor</dt><dd>{projection.modelVendor}</dd></div>
+            <div><dt>Current model</dt><dd>{projection.modelLabel || projection.modelId || 'Not reported'}</dd></div>
+            <div><dt>Account</dt><dd>{projection.accountLabel || (projection.state === 'ambiguous' ? 'Ambiguous' : 'Unavailable')}</dd></div>
+            <div><dt>Quota domain</dt><dd>{projection.quotaDomain || 'Unavailable'}</dd></div>
+            <div><dt>Mapping</dt><dd>{projection.mappingConfidence.replace(/_/g, ' ')}</dd></div>
+          </dl>
+          {projection.state === 'local' ? (
+            <div className="session-usage-popover-state local"><strong>Local · no plan limit</strong><span>{projection.localRuntime?.loadedModelsCount ?? 0} loaded model(s)</span></div>
+          ) : projection.applicableWindows.length > 0 ? (
+            <div className="session-usage-popover-windows">
+              {projection.applicableWindows.map((window, index) => {
+                const row = sessionUsageWindowLabel(window);
+                return (
+                  <div className={`session-usage-popover-window ${row.tone}`} key={`${window.id}:${index}`}>
+                    <span><strong>{row.label}</strong><em>{row.usedPercent == null ? 'Usage unavailable' : `${formatProviderPercent(row.usedPercent)} used · ${row.compactValue}`}</em></span>
+                    <i aria-hidden="true"><b style={{ width: `${Math.max(0, Math.min(100, Number(row.usedPercent) || 0))}%` }} /></i>
+                    <small>{row.reset ? `Resets ${formatProviderUsageReset(row.reset, nowMs)}` : 'Reset not reported'}{window.modelScope?.label ? ` · ${window.modelScope.label}` : ''}</small>
+                  </div>
+                );
+              })}
+            </div>
+          ) : (
+            <div className={`session-usage-popover-state ${projection.state}`}><strong>{projection.message}</strong><span>No percentage or $0 value is inferred.</span></div>
+          )}
+          {(creditSummary || financialRows.length > 0) && (
+            <div className="session-usage-popover-financial">
+              <strong>Credits / overage</strong>
+              {creditSummary && <span>{creditSummary}</span>}
+              {financialRows.map(row => <span key={row.id}>{row.label}: {row.value}</span>)}
+            </div>
+          )}
+          <div className="session-usage-popover-source">
+            <span>{projection.source || 'Source unavailable'} · {formatProviderUsageAge(projection.capturedAt, nowMs)}</span>
+            <span>Generation {projection.generation} · {projection.freshness}</span>
+          </div>
+          <button type="button" className="session-usage-open-dashboard" onClick={openInternalUsage}>Open Usage &amp; limits</button>
+        </div>
+      )}
+    </div>
+  );
 }
 
 function sessionHostLabel(session) {
@@ -2165,8 +2257,9 @@ function SessionCard({ session, health, unread, isThinking, isActive, agentConfi
         ><span aria-hidden="true">📌</span></button>}
         <span className="session-card-attention-slot">
           {hasBlockingPrompt && <span className="session-card-perm-badge" title={blockingPromptLabel || 'Action required'}>⚠</span>}
-          {!hasBlockingPrompt && isThinking && <span className="session-card-native-status" title={activityLabel || 'Thinking…'}><NativeActivitySpinner agentType={session?.agent_type} compact animate={false} /></span>}
-          {!isThinking && !hasBlockingPrompt && unread > 0 && (
+          {!hasBlockingPrompt && isHardLimited && <span className="session-card-perm-badge" title="Usage limited">⏳</span>}
+          {!hasBlockingPrompt && !isHardLimited && isThinking && <span className="session-card-native-status" title={activityLabel || 'Thinking…'}><NativeActivitySpinner agentType={session?.agent_type} compact animate={false} /></span>}
+          {!isThinking && !hasBlockingPrompt && !isHardLimited && unread > 0 && (
             <span className="session-card-badge">{unread > 99 ? '99+' : unread}</span>
           )}
         </span>
@@ -2185,10 +2278,10 @@ function SessionCard({ session, health, unread, isThinking, isActive, agentConfi
         <div className={`session-card-sub${hasBlockingPrompt ? ' perm-active' : ''}${recentMessageInstant ? ' has-recent-message' : ''}`}>
           <span className="session-card-sub-context">
             {hasBlockingPrompt ? `${agentContext} · ${blockingPromptLabel || 'Action required'}`
-              : isHardLimited ? `${agentContext} · ⏳ Rate limited${rateLimitedUntil && rateLimitedUntil !== 'unknown' ? ` · ${rateLimitedUntil}` : ''}`
+              : isHardLimited ? `${agentContext} · ⏳ Usage limited${rateLimitedUntil && rateLimitedUntil !== 'unknown' ? ` · resets ${formatUsageResetLabel(rateLimitedUntil)}` : ' · reset unknown'}`
               : quotaSummary ? `${agentContext} · ${quotaSummary}`
               : isAntigravitySession && pctUsed != null ? `${agentContext} · 📊 ${pctUsed}% used${rateLimitedUntil && rateLimitedUntil !== 'unknown' ? ` · ${rateLimitedUntil}` : ''}`
-              : pctUsed >= 80 ? `${agentContext} · 📊 ${pctUsed}% used`
+              : pctUsed >= 75 ? `${agentContext} · 📊 ${pctUsed}% used${rateLimitedUntil && rateLimitedUntil !== 'unknown' ? ` · resets ${formatUsageResetLabel(rateLimitedUntil)}` : ''}`
               : activityLabel ? `${agentContext} · ${activityLabel}`
               : hostLabel ? `${agentContext} · ${hostLabel}`
               : agentContext}
@@ -2338,14 +2431,9 @@ function formatClockDuration(totalSeconds, { includeSeconds = false } = {}) {
   return `${hours}h ${String(remMinutes).padStart(2, '0')}m${includeSeconds ? ` ${String(seconds).padStart(2, '0')}s` : ''}`;
 }
 
-function formatGoalElapsed(goal, nowMs) {
+function formatGoalElapsed(goal, nowMs, goalRun = null) {
   if (!goal) return '';
-  const base = Number(goal.time_used_seconds ?? goal.timeUsedSeconds ?? 0) || 0;
-  const goalUpdated = goal.updated_at ? new Date(goal.updated_at).getTime() : 0;
-  const liveDelta = (goal.state || goal.status) === 'active' && Number.isFinite(goalUpdated) && goalUpdated > 0
-    ? Math.max(0, Math.floor((nowMs - goalUpdated) / 1000))
-    : 0;
-  return formatClockDuration(base + liveDelta, { includeSeconds: true });
+  return formatClockDuration(fleetGoalElapsedSeconds(goal, goalRun, nowMs), { includeSeconds: true });
 }
 
 function ActivityRow({ activity, thinkingText, agentType, pinned = false }) {
@@ -2354,6 +2442,7 @@ function ActivityRow({ activity, thinkingText, agentType, pinned = false }) {
   const goal = activity?.goal || null;
   const isActive = meta.tone === 'thinking' || meta.tone === 'info';
   const goalActive = (goal?.state || goal?.status) === 'active';
+  const goalTimerActive = goalActive && (!activity?.goal_run || activity.goal_run.lease_active === true);
   const hasCanonicalChannels = !!(activity?.thinking || activity?.current);
   const legacyText = String(thinkingText || activity?.thinkingContent || '').trim();
   const isClaude = agentType === 'claude' || agentType === 'claude_cli';
@@ -2374,7 +2463,7 @@ function ActivityRow({ activity, thinkingText, agentType, pinned = false }) {
   const thinkingTimerSource = thinking ? (thinking.since || activity?.startedAt || activity?.updatedAt) : null;
   const currentTimerSource = current ? (current.since || activity?.startedAt || activity?.updatedAt) : null;
   const hasTimestamp = value => Boolean(value) && Number.isFinite(new Date(value).getTime());
-  const hasLiveTimerSource = (goalActive && hasTimestamp(goal?.updated_at))
+  const hasLiveTimerSource = (goalTimerActive && hasTimestamp(goal?.updated_at))
     || hasTimestamp(thinkingTimerSource)
     || hasTimestamp(currentTimerSource);
   React.useEffect(() => {
@@ -2383,7 +2472,7 @@ function ActivityRow({ activity, thinkingText, agentType, pinned = false }) {
     return () => clearInterval(id);
   }, [hasLiveTimerSource, goal?.updated_at, thinkingTimerSource, currentTimerSource]);
   const hint = activity?.interruptHint || activity?.interrupt_hint || '';
-  const goalElapsed = goal ? formatGoalElapsed(goal, nowMs) : '';
+  const goalElapsed = goal ? formatGoalElapsed(goal, nowMs, activity?.goal_run) : '';
   const goalText = String(goal?.text || goal?.objective || '').trim();
   const thinkingElapsed = thinking ? formatActivityElapsed(thinkingTimerSource, nowMs) : '';
   const currentElapsed = current ? formatActivityElapsed(currentTimerSource, nowMs) : '';
@@ -2441,7 +2530,7 @@ function ActivityRow({ activity, thinkingText, agentType, pinned = false }) {
       )}
       {usage && (
         <div className="live-usage-banner" data-live-channel="usage" role="status">
-          <div className="live-usage-title">{usage.title || "You're out of Codex and Work usage"}</div>
+          <div className="live-usage-title">{usage.title || 'Usage limit reached'}</div>
           <div className="live-usage-detail">{usage.detail || (usage.resets_at ? `Your rate limit resets at ${usage.resets_at}.` : 'Usage is currently exhausted.')}</div>
         </div>
       )}
@@ -2974,7 +3063,7 @@ function ErrorPromptOverlay({ prompt, sessionId, onRespond }) {
                 key={actionId || errorPromptActionLabel(action)}
                 className={`permission-action error-prompt-action${isPending ? ' pending' : ''}`}
                 disabled={!!submittingActionId}
-                onClick={() => onRespond(sessionId, prompt.prompt_id, actionId)}
+                onClick={event => onRespond(sessionId, prompt.prompt_id, actionId, event)}
               >
                 <span>{errorPromptActionLabel(action)}</span>
                 {isPending && <span className="permission-action-state">Sending...</span>}
@@ -3010,7 +3099,7 @@ function ErrorPromptInline({ prompt, sessionId, onRespond }) {
               key={actionId || errorPromptActionLabel(action)}
               className={`permission-action error-prompt-action${isPending ? ' pending' : ''}`}
               disabled={!!submittingActionId}
-              onClick={() => onRespond(sessionId, prompt.prompt_id, actionId)}
+              onClick={event => onRespond(sessionId, prompt.prompt_id, actionId, event)}
             >
               <span>{errorPromptActionLabel(action)}</span>
               {isPending && <span className="permission-action-state">Sending...</span>}
@@ -3448,6 +3537,7 @@ const NOTIFICATION_PREFERENCE_DEFAULTS = Object.freeze({
   turn_ready: false,
   goal_completed: false,
   goal_attention: true,
+  provider_usage_warning: true,
   agent_error: true,
   session_offline: true,
   rate_limit_cleared: true,
@@ -3700,6 +3790,15 @@ function NotificationSettingsPanel({ onClose, onPreferencesChange }) {
             checked={preferences.goal_attention}
             disabled={loading || !!saving}
             onChange={() => togglePreference('goal_attention')}
+          />
+        </label>
+        <label className="notification-setting-row">
+          <span><strong>Provider usage warning</strong><small>At 75%, 90%, and exhaustion for each provider account window</small></span>
+          <input
+            type="checkbox"
+            checked={preferences.provider_usage_warning}
+            disabled={loading || !!saving}
+            onChange={() => togglePreference('provider_usage_warning')}
           />
         </label>
         <div className="settings-note">Active /goal loop checkpoints stay quiet between turns.</div>
@@ -5674,7 +5773,7 @@ function UsageCostPanel({ cost, detailState, onRequestDetail }) {
   );
 }
 
-function UsageDashboard({ usage, refreshReceipt, costDetail, onBack, onRefresh, onRequestCostDetail }) {
+function UsageDashboard({ usage, refreshReceipt, resetReceipt, costDetail, onBack, onRefresh, onConsumeResetCredit, onRequestCostDetail }) {
   const normalized = React.useMemo(() => normalizeProviderUsage(usage), [usage]);
   const [nowMs, setNowMs] = React.useState(Date.now());
   React.useEffect(() => {
@@ -5686,6 +5785,12 @@ function UsageDashboard({ usage, refreshReceipt, costDetail, onBack, onRefresh, 
     fresh: 'Fresh', refreshing: 'Refreshing', stale: 'Stale', auth_required: 'Sign in required',
     rate_limited: 'Refresh limited', unavailable: 'Unavailable',
   })[status] || 'Unavailable';
+  const resetAttention = normalized.entries.find(entry => (
+    entry.providerId === 'openai-codex'
+    && Number(entry.resetCredits?.available_count) > 0
+    && entry.windows.some(window => window.usedPercent >= 100)
+  ));
+  const resetPending = ['requested', 'accepted'].includes(resetReceipt?.status);
 
   return (
     <div className="usage-dashboard" data-testid="usage-dashboard">
@@ -5693,7 +5798,7 @@ function UsageDashboard({ usage, refreshReceipt, costDetail, onBack, onRefresh, 
         <button className="automations-back" onClick={onBack} title="Back to sessions">←</button>
         <div className="automations-header-text">
           <h2>Usage & limits</h2>
-          <p>Provider-account quotas shared by connected harnesses. Warnings start at 80% used.</p>
+          <p>Provider-account quotas shared by connected harnesses. Warnings start at 75% used.</p>
         </div>
         <button
           type="button"
@@ -5725,6 +5830,18 @@ function UsageDashboard({ usage, refreshReceipt, costDetail, onBack, onRefresh, 
       {refreshReceipt && <div className={`usage-refresh-receipt ${refreshReceipt.status}`} role="status">
         Refresh {refreshReceipt.status}{refreshReceipt.generation != null ? ` · generation ${refreshReceipt.generation}` : ''}
       </div>}
+      {resetAttention && <div className="usage-reset-attention" role="alert" data-testid="codex-reset-credit-attention">
+        <span>
+          <strong>{resetAttention.resetCredits.available_count} limit reset{resetAttention.resetCredits.available_count === 1 ? '' : 's'} available — apply one?</strong>
+          <small>Remote Agent Chat will use Codex's native reset action only after this approval.</small>
+        </span>
+        <button type="button" onClick={onConsumeResetCredit} disabled={resetPending}>
+          {resetPending ? 'Applying…' : 'Apply one reset'}
+        </button>
+      </div>}
+      {resetReceipt && !['requested'].includes(resetReceipt.status) && <div className={`usage-refresh-receipt ${resetReceipt.status}`} role="status" data-testid="codex-reset-credit-receipt">
+        Reset {resetReceipt.status}{resetReceipt.outcome ? `: ${resetReceipt.outcome}` : ''}{resetReceipt.error ? ` (${resetReceipt.error})` : ''}
+      </div>}
       <UsageCostPanel cost={normalized.estimatedCost} detailState={costDetail} onRequestDetail={onRequestCostDetail} />
       <div className="usage-dashboard-grid">
         {normalized.entries.map(entry => {
@@ -5754,6 +5871,7 @@ function UsageDashboard({ usage, refreshReceipt, costDetail, onBack, onRefresh, 
                   <span>{entry.sessionCount} mapped session{entry.sessionCount === 1 ? '' : 's'}</span>
                   <span>{entry.harnessTypes.length > 0 ? entry.harnessTypes.join(', ') : 'No mapped surfaces'}</span>
                   <span>{formatProviderUsageAge(entry.capturedAt, nowMs)}</span>
+                  {entry.nextRefreshAt && <span>Next refresh {formatProviderUsageReset(entry.nextRefreshAt, nowMs)}</span>}
                 </div>
                 {entry.windows.length > 0 ? (
                   <div className="usage-dashboard-windows">
@@ -5812,9 +5930,21 @@ function UsageDashboard({ usage, refreshReceipt, costDetail, onBack, onRefresh, 
                       );
                     })}
                   </div>
-                ) : !entry.localRuntime ? (
+                ) : !entry.localRuntime && !entry.cloudUsage ? (
                   <div className="usage-dashboard-unavailable">{entry.error?.message || 'This provider did not report quota windows.'}</div>
                 ) : null}
+                {entry.cloudUsage && entry.providerId === 'ollama-local' && (
+                  entry.cloudUsage.subscriptionState === 'active' ? (
+                    <div className="usage-dashboard-credit-row" data-testid="ollama-cloud-usage">
+                      <span><strong>Ollama Cloud</strong>{entry.windows.length} quota window{entry.windows.length === 1 ? '' : 's'}<small>{formatProviderUsageAge(entry.cloudUsage.capturedAt, nowMs)}</small></span>
+                      <span><strong>Auto-reload</strong>{entry.cloudUsage.autoReloadEnabled == null ? 'Not reported' : entry.cloudUsage.autoReloadEnabled ? 'On' : 'Off'}<small>Extra usage balance is separate from plan quota</small></span>
+                    </div>
+                  ) : entry.cloudUsage.subscriptionState === 'none' ? (
+                    <div className="usage-dashboard-unavailable" data-testid="ollama-cloud-no-subscription"><strong>No cloud subscription</strong> - local models remain unlimited</div>
+                  ) : (
+                    <div className="usage-dashboard-unavailable" data-testid="ollama-cloud-unavailable"><strong>Cloud usage unavailable</strong> - {entry.cloudUsage.error?.message || 'Open the signed-in Ollama Usage page to expose account quota.'}</div>
+                  )
+                )}
                 {entry.localRuntime && (
                   <div className="usage-dashboard-credit-row" data-testid="ollama-local-runtime">
                     <span><strong>Local runtime</strong>{entry.localRuntime.loadedModelsCount} loaded / {entry.localRuntime.installedModelsCount} installed<small>{entry.localRuntime.endpointScope.replace(/_/g, ' ')}</small></span>
@@ -5903,24 +6033,38 @@ function hostResourceChartPath(samples, valueField, xFor, yFor) {
 function HostResourceChart({
   title, description, frames, series, percentScale = false,
   viewport, onViewportChange, crosshairSequence, onCrosshairChange,
+  range = 'live', nowMs = Date.now(), paused = false, subscriptionStatus = 'live',
 }) {
   const chartRef = React.useRef(null);
   const pointersRef = React.useRef(new Map());
   const gestureRef = React.useRef(null);
+  const previousAutoMaximumRef = React.useRef(0);
   const [hiddenSeries, setHiddenSeries] = React.useState({});
   const [scale, setScale] = React.useState({ mode: 'auto', fixedMax: null });
   const plotWidth = HOST_RESOURCE_CHART_WIDTH - HOST_RESOURCE_CHART_MARGIN.left - HOST_RESOURCE_CHART_MARGIN.right;
   const plotHeight = HOST_RESOURCE_CHART_HEIGHT - HOST_RESOURCE_CHART_MARGIN.top - HOST_RESOURCE_CHART_MARGIN.bottom;
-  const orderedFrames = Array.isArray(frames) ? frames : [];
+  const timeline = hostResourceTimeline(frames, {
+    nowMs, paused, connected: subscriptionStatus !== 'reconnecting', subscriptionStatus,
+  });
+  const orderedFrames = timeline.frames;
   const boundedViewport = clampHostViewport(viewport);
-  const startIndex = Math.max(0, Math.floor((orderedFrames.length - 1) * boundedViewport.start));
-  const endIndex = Math.min(orderedFrames.length, Math.ceil((orderedFrames.length - 1) * boundedViewport.end) + 1);
-  const visibleFrames = orderedFrames.slice(startIndex, Math.max(startIndex + 1, endIndex));
+  const rangeDuration = HOST_RESOURCE_CHART_RANGES[range] ?? HOST_RESOURCE_CHART_RANGES.live;
+  const baseEndMs = paused ? (timeline.endMs || nowMs) : nowMs;
+  const baseStartMs = rangeDuration === Infinity
+    ? (timeline.startMs || baseEndMs - HOST_RESOURCE_CHART_RANGES.live)
+    : baseEndMs - rangeDuration;
+  const baseSpanMs = Math.max(1, baseEndMs - baseStartMs);
+  const visibleStartMs = baseStartMs + baseSpanMs * boundedViewport.start;
+  const visibleEndMs = baseStartMs + baseSpanMs * boundedViewport.end;
+  const visibleFrames = orderedFrames.filter(frame => (
+    Number(frame.chart_time_ms) >= visibleStartMs && Number(frame.chart_time_ms) <= visibleEndMs
+  ));
   const chartSeries = series.map(entry => {
-    const sourceFrames = entry.frames || visibleFrames;
-    const visibleSequences = new Set(visibleFrames.map(frame => frame.sample_sequence));
+    const sourceFrames = entry.frames
+      ? hostResourceTimeline(entry.frames, { nowMs, paused: true }).frames
+      : visibleFrames;
     const boundedSource = entry.frames
-      ? sourceFrames.filter(frame => visibleSequences.has(frame.sample_sequence))
+      ? sourceFrames.filter(frame => Number(frame.chart_time_ms) >= visibleStartMs && Number(frame.chart_time_ms) <= visibleEndMs)
       : sourceFrames;
     return {
       ...entry,
@@ -5929,20 +6073,25 @@ function HostResourceChart({
     };
   });
   const activeSeries = chartSeries.filter(entry => !hiddenSeries[entry.key]);
-  const autoMaximum = Math.max(1, ...activeSeries.flatMap(entry => entry.samples.map(sample => sample.max || 0))) * 1.08;
-  const yMaximum = percentScale ? 100 : (scale.mode === 'fixed' && scale.fixedMax ? scale.fixedMax : autoMaximum);
-  const sequenceMinimum = visibleFrames[0]?.sample_sequence || 0;
-  const sequenceMaximum = visibleFrames.at(-1)?.sample_sequence || Math.max(1, sequenceMinimum);
+  const rawPeak = Math.max(0, ...activeSeries.flatMap(entry => entry.samples.map(sample => sample.max || 0)));
+  const automaticScale = hostResourceNiceScale(rawPeak, previousAutoMaximumRef.current, { percent: percentScale });
+  if (!percentScale && scale.mode === 'auto') previousAutoMaximumRef.current = automaticScale.maximum;
+  const scaleContract = scale.mode === 'fixed' && scale.fixedMax
+    ? hostResourceNiceScale(scale.fixedMax, scale.fixedMax, { percent: percentScale })
+    : automaticScale;
+  const yMaximum = scaleContract.maximum;
   const xFor = sample => HOST_RESOURCE_CHART_MARGIN.left
-    + ((sample.endSequence - sequenceMinimum) / Math.max(1, sequenceMaximum - sequenceMinimum)) * plotWidth;
+    + hostResourceTimeFraction(sample, visibleStartMs, visibleEndMs) * plotWidth;
   const yFor = value => HOST_RESOURCE_CHART_MARGIN.top + plotHeight
     - (Math.max(0, Math.min(yMaximum, value)) / Math.max(1, yMaximum)) * plotHeight;
   const crosshairFrame = visibleFrames.find(frame => frame.sample_sequence === crosshairSequence) || visibleFrames.at(-1) || null;
   const crosshairX = crosshairFrame
-    ? HOST_RESOURCE_CHART_MARGIN.left
-      + ((crosshairFrame.sample_sequence - sequenceMinimum) / Math.max(1, sequenceMaximum - sequenceMinimum)) * plotWidth
+    ? HOST_RESOURCE_CHART_MARGIN.left + hostResourceTimeFraction(crosshairFrame, visibleStartMs, visibleEndMs) * plotWidth
     : null;
   const formatValue = series[0]?.format || (value => String(value));
+  const xTicks = hostResourceTimeTicks(visibleStartMs, visibleEndMs,
+    typeof window !== 'undefined' && window.innerWidth <= 600 ? 4 : 5);
+  const statusLabel = timeline.status[0]?.toUpperCase() + timeline.status.slice(1);
 
   function clientFraction(event) {
     const bounds = chartRef.current?.getBoundingClientRect();
@@ -5952,8 +6101,11 @@ function HostResourceChart({
 
   function sequenceAtFraction(fraction) {
     if (!visibleFrames.length) return 0;
-    const index = Math.max(0, Math.min(visibleFrames.length - 1, Math.round(fraction * (visibleFrames.length - 1))));
-    return visibleFrames[index].sample_sequence;
+    const targetTime = visibleStartMs + (visibleEndMs - visibleStartMs) * fraction;
+    return visibleFrames.reduce((closest, frame) => (
+      Math.abs(Number(frame.chart_time_ms) - targetTime) < Math.abs(Number(closest.chart_time_ms) - targetTime)
+        ? frame : closest
+    ), visibleFrames[0]).sample_sequence;
   }
 
   function zoomAt(factor, fraction = 0.5) {
@@ -6052,49 +6204,67 @@ function HostResourceChart({
         <span><strong>{title}</strong><small>{description}</small></span>
         {!percentScale && (
           <button type="button" onClick={() => setScale(previous => (
-            previous.mode === 'auto' ? { mode: 'fixed', fixedMax: autoMaximum } : { mode: 'auto', fixedMax: null }
+            previous.mode === 'auto' ? { mode: 'fixed', fixedMax: automaticScale.maximum } : { mode: 'auto', fixedMax: null }
           ))}>{scale.mode === 'auto' ? 'Auto scale' : `Fixed ${formatValue(scale.fixedMax)}`}</button>
         )}
       </div>
+      <div className={`host-resource-chart-quality ${timeline.status}`} role="status">
+        <strong>{statusLabel}</strong>
+        <span>{timeline.receivedCount} received / {timeline.validCount} valid / {timeline.expectedCount} expected / {timeline.droppedCount} dropped</span>
+        <span>{Math.round(timeline.cadenceMs)} ms cadence</span>
+        <span>{timeline.gapCount} gap{timeline.gapCount === 1 ? '' : 's'}</span>
+        <span>{timeline.duplicateCount} duplicate / {timeline.outOfOrderCount} out of order</span>
+      </div>
       <div className="host-resource-chart-legend" aria-label={`${title} series`}>
-        {chartSeries.map(entry => (
+        {chartSeries.map((entry, index) => (
           <button
             type="button" key={entry.key} aria-pressed={!hiddenSeries[entry.key]}
             onClick={() => setHiddenSeries(previous => ({ ...previous, [entry.key]: !previous[entry.key] }))}
-          ><i style={{ background: entry.color }} />{entry.label}</button>
+          ><i className={`marker marker-${index % 3}`} style={{ '--series-color': entry.color }} />{entry.label}</button>
         ))}
       </div>
       <div
-        className="host-resource-chart-canvas" ref={chartRef} role="application" tabIndex="0"
+        className="host-resource-chart-canvas" ref={chartRef} role="group" tabIndex="0"
         aria-label={`${title}. Drag to pan, wheel or pinch to zoom, arrow keys move the synchronized crosshair, shift plus arrows pan, plus and minus zoom.`}
         onPointerDown={onPointerDown} onPointerMove={onPointerMove} onPointerUp={onPointerUp} onPointerCancel={onPointerUp}
         onKeyDown={onKeyDown}
       >
         <svg viewBox={`0 0 ${HOST_RESOURCE_CHART_WIDTH} ${HOST_RESOURCE_CHART_HEIGHT}`} aria-hidden="true">
-          {[0, 0.25, 0.5, 0.75, 1].map(fraction => {
-            const y = HOST_RESOURCE_CHART_MARGIN.top + plotHeight * fraction;
-            return <line key={fraction} className="host-resource-chart-grid" x1={HOST_RESOURCE_CHART_MARGIN.left} x2={HOST_RESOURCE_CHART_WIDTH - HOST_RESOURCE_CHART_MARGIN.right} y1={y} y2={y} />;
+          {timeline.gaps.filter(gap => gap.endMs >= visibleStartMs && gap.startMs <= visibleEndMs).map((gap, index) => {
+            const left = HOST_RESOURCE_CHART_MARGIN.left + Math.max(0, (gap.startMs - visibleStartMs) / Math.max(1, visibleEndMs - visibleStartMs)) * plotWidth;
+            const right = HOST_RESOURCE_CHART_MARGIN.left + Math.min(1, (gap.endMs - visibleStartMs) / Math.max(1, visibleEndMs - visibleStartMs)) * plotWidth;
+            return <rect key={`${gap.reason}-${index}`} className="host-resource-chart-gap" x={left} y={HOST_RESOURCE_CHART_MARGIN.top} width={Math.max(2, right - left)} height={plotHeight} />;
           })}
-          <text x="4" y={HOST_RESOURCE_CHART_MARGIN.top + 4}>{formatValue(yMaximum)}</text>
-          <text x="4" y={HOST_RESOURCE_CHART_MARGIN.top + plotHeight + 4}>{formatValue(0)}</text>
+          {[...scaleContract.ticks].reverse().map(value => {
+            const y = yFor(value);
+            return <React.Fragment key={value}><line className="host-resource-chart-grid" x1={HOST_RESOURCE_CHART_MARGIN.left} x2={HOST_RESOURCE_CHART_WIDTH - HOST_RESOURCE_CHART_MARGIN.right} y1={y} y2={y} /><text className="host-resource-chart-y-label" textAnchor="end" x={HOST_RESOURCE_CHART_MARGIN.left - 7} y={y + 4}>{formatValue(value)}</text></React.Fragment>;
+          })}
+          {xTicks.map((tick, index) => {
+            const x = HOST_RESOURCE_CHART_MARGIN.left + tick.fraction * plotWidth;
+            return <text key={tick.timeMs} className="host-resource-chart-x-label" aria-label={tick.accessibleLabel} textAnchor={index === 0 ? 'start' : index === xTicks.length - 1 ? 'end' : 'middle'} x={x} y={HOST_RESOURCE_CHART_HEIGHT - 7}>{tick.label}</text>;
+          })}
           {activeSeries.flatMap(entry => entry.samples.map(sample => (
             sample.gap || sample.min == null || sample.max == null ? null : (
               <line key={`${entry.key}-${sample.endSequence}`} className="host-resource-chart-range" stroke={entry.color}
                 x1={xFor(sample)} x2={xFor(sample)} y1={yFor(sample.min)} y2={yFor(sample.max)} />
             )
           )))}
-          {activeSeries.map(entry => (
-            <path key={entry.key} className="host-resource-chart-line" stroke={entry.color}
-              strokeDasharray={entry.dashed ? '6 4' : undefined}
+          {activeSeries.map((entry, index) => (
+            <path key={entry.key} className={`host-resource-chart-line series-${index % 3}`} stroke={entry.color}
+              strokeDasharray={entry.dashed || index % 3 === 1 ? '7 4' : index % 3 === 2 ? '2 4' : undefined}
               d={hostResourceChartPath(entry.samples, 'average', xFor, yFor)} />
           ))}
+          {activeSeries.flatMap((entry, seriesIndex) => entry.visibleFrames.length < 10
+            ? entry.visibleFrames.map(frame => {
+              const value = hostResourceMetricValue(frame, entry.metric);
+              return value == null ? null : <circle key={`${entry.key}-point-${frame.sample_sequence}`} className={`host-resource-chart-point marker-${seriesIndex % 3}`} cx={xFor(frame)} cy={yFor(value)} r="3" stroke={entry.color} />;
+            }) : [])}
           {crosshairX != null && <line className="host-resource-chart-crosshair" x1={crosshairX} x2={crosshairX} y1={HOST_RESOURCE_CHART_MARGIN.top} y2={HOST_RESOURCE_CHART_MARGIN.top + plotHeight} />}
-          <text x={HOST_RESOURCE_CHART_MARGIN.left} y={HOST_RESOURCE_CHART_HEIGHT - 7}>{formatHostResourceTimestamp(visibleFrames[0]?.captured_at)}</text>
-          <text textAnchor="end" x={HOST_RESOURCE_CHART_WIDTH - HOST_RESOURCE_CHART_MARGIN.right} y={HOST_RESOURCE_CHART_HEIGHT - 7}>{formatHostResourceTimestamp(visibleFrames.at(-1)?.captured_at)}</text>
         </svg>
         {crosshairFrame && (
-          <div className="host-resource-chart-tooltip" role="status">
-            <strong>{formatHostResourceTimestamp(crosshairFrame.captured_at)} / seq {crosshairFrame.sample_sequence}</strong>
+          <div className={`host-resource-chart-tooltip ${crosshairX > HOST_RESOURCE_CHART_WIDTH / 2 ? 'flip' : ''}`} role="status">
+            <strong>{formatHostResourceTimestampFull(crosshairFrame.chart_time_ms)} / seq {crosshairFrame.sample_sequence}</strong>
+            <span>{Math.max(0, Math.round((nowMs - Number(crosshairFrame.chart_time_ms)) / 1000))}s old / {crosshairFrame.sample_interval_ms || timeline.cadenceMs} ms / {statusLabel} / source {crosshairFrame.status || 'unknown'}</span>
             {chartSeries.map(entry => (
               <span key={entry.key}><i style={{ background: entry.color }} />{entry.label}: {entry.format(hostResourceMetricValue(
                 entry.visibleFrames.find(frame => frame.sample_sequence === crosshairFrame.sample_sequence), entry.metric,
@@ -6108,14 +6278,20 @@ function HostResourceChart({
           const stats = hostResourceIntervalStats(entry.visibleFrames, entry.metric);
           const peakFrame = entry.visibleFrames.find(frame => frame.sample_sequence === stats.peakSequence);
           return (
-            <span key={entry.key}><strong>{entry.label}</strong> current {entry.format(stats.current)} / min {entry.format(stats.min)} / avg {entry.format(stats.average)} / max {entry.format(stats.max)} / p95 {entry.format(stats.p95)}<small>Peak {formatHostResourceTimestamp(peakFrame?.captured_at)}</small></span>
+            <span key={entry.key}>
+              <strong>{entry.label}</strong>
+              <span>Latest-good {entry.format(stats.current)}</span><span>Min {entry.format(stats.min)}</span>
+              <span>Avg {entry.format(stats.average)} ({stats.averageMethod})</span><span>Max {entry.format(stats.max)}</span>
+              <span>{stats.p95Ready ? `p95 ${entry.format(stats.p95)}` : `p95 collecting (${stats.count}/20)`}</span>
+              <small>{stats.count} raw / {Math.round(stats.elapsedMs / 1000)}s / {stats.cadenceMs || timeline.cadenceMs} ms cadence / {Math.max(stats.gapCount, timeline.gapCount)} gaps / {statusLabel} / peak {formatHostResourceTimestamp(peakFrame?.captured_at)}</small>
+            </span>
           );
         })}
       </div>
       <details className="host-resource-chart-data">
         <summary>Accessible data table</summary>
         <div><table><caption>Latest {Math.min(120, visibleFrames.length)} of {visibleFrames.length} visible samples</caption><thead><tr><th>Time / sequence</th>{chartSeries.map(entry => <th key={entry.key}>{entry.label}</th>)}</tr></thead><tbody>
-          {visibleFrames.slice(-120).map(frame => <tr key={frame.sample_sequence}><th>{formatHostResourceTimestamp(frame.captured_at)} / {frame.sample_sequence}</th>{chartSeries.map(entry => <td key={entry.key}>{entry.format(hostResourceMetricValue(entry.visibleFrames.find(candidate => candidate.sample_sequence === frame.sample_sequence), entry.metric))}</td>)}</tr>)}
+          {visibleFrames.slice(-120).map(frame => <tr key={`${frame.sample_sequence}:${frame.chart_time_ms}`}><th>{formatHostResourceTimestampFull(frame.chart_time_ms)} / {frame.sample_sequence}{frame.gap_before ? ` / gap: ${frame.gap_reason}` : ''}</th>{chartSeries.map(entry => <td key={entry.key}>{entry.format(hostResourceMetricValue(entry.visibleFrames.find(candidate => candidate.sample_sequence === frame.sample_sequence), entry.metric))}</td>)}</tr>)}
         </tbody></table></div>
       </details>
     </section>
@@ -6276,6 +6452,7 @@ function HostResourceDashboard({
   const [nowMs, setNowMs] = React.useState(Date.now());
   const [range, setRange] = React.useState('live');
   const [pausedSequence, setPausedSequence] = React.useState(null);
+  const [pausedAtMs, setPausedAtMs] = React.useState(null);
   const [viewport, setViewport] = React.useState({ start: 0, end: 1 });
   const [crosshairSequence, setCrosshairSequence] = React.useState(0);
   const [aggregateOnly, setAggregateOnly] = React.useState(false);
@@ -6295,7 +6472,32 @@ function HostResourceDashboard({
   const liveHistory = React.useMemo(() => (
     pausedSequence == null ? history : history.filter(frame => frame.sample_sequence <= pausedSequence)
   ), [history, pausedSequence]);
-  const rangeFrames = React.useMemo(() => selectHostResourceRange(liveHistory, range), [liveHistory, range]);
+  const rangeNowMs = pausedSequence == null ? nowMs : pausedAtMs || nowMs;
+  const rangeFrames = React.useMemo(() => selectHostResourceRange(liveHistory, range, {
+    nowMs: rangeNowMs,
+    paused: pausedSequence != null,
+    subscriptionStatus: subscription?.status,
+    connected: subscription?.status !== 'reconnecting',
+    error: Boolean(error),
+  }), [liveHistory, range, rangeNowMs, pausedSequence, subscription?.status, error]);
+  const timeline = React.useMemo(() => hostResourceTimeline(liveHistory, {
+    nowMs: rangeNowMs,
+    paused: pausedSequence != null,
+    subscriptionStatus: subscription?.status,
+    connected: subscription?.status !== 'reconnecting',
+    error: Boolean(error),
+  }), [liveHistory, rangeNowMs, pausedSequence, subscription?.status, error]);
+  const staleRefreshKeyRef = React.useRef('');
+  React.useEffect(() => {
+    if (!['delayed', 'stale'].includes(timeline.status) || pausedSequence != null) {
+      staleRefreshKeyRef.current = '';
+      return;
+    }
+    const key = `${timeline.status}:${timeline.points.at(-1)?.sampleSequence || 0}`;
+    if (staleRefreshKeyRef.current === key) return;
+    staleRefreshKeyRef.current = key;
+    onRefresh(false);
+  }, [timeline.status, timeline.points, pausedSequence, onRefresh]);
   React.useEffect(() => {
     if (!crosshairSequence && rangeFrames.length) setCrosshairSequence(rangeFrames.at(-1).sample_sequence);
   }, [crosshairSequence, rangeFrames]);
@@ -6306,6 +6508,9 @@ function HostResourceDashboard({
     normalized.processes, processSearch, processFilter, processSort, expandedProcesses,
   ), [normalized.processes, processSearch, processFilter, processSort, expandedProcesses]);
   const selectedProcess = normalized.processes.find(process => process.stableKey === selectedProcessKey) || null;
+  const detailFailureAge = normalized.lastGoodCapturedAt
+    ? formatHostResourceAge(normalized.lastGoodCapturedAt, nowMs).replace(/^Updated\s+/i, '')
+    : 'not yet available';
   const selectedProcessFrames = React.useMemo(() => (selectedProcessKey ? details.flatMap(detail => {
     const process = (detail.processes || []).find(entry => entry.stable_key === selectedProcessKey);
     if (!process) return [];
@@ -6318,6 +6523,7 @@ function HostResourceDashboard({
   }) : []), [details, selectedProcessKey]);
   const percent = value => value == null ? '—' : formatHostResourcePercent(value);
   const rate = value => value == null ? '—' : formatHostResourceRate(value);
+  const timelineStatusLabel = ({ live: 'Live', delayed: 'Delayed', reconnecting: 'Reconnecting', paused: 'Paused', stale: 'Stale', waiting: 'Waiting', unavailable: 'Unavailable' })[timeline.status] || 'Unavailable';
   const cpuSeries = [
     { key: 'cpu-total', metric: 'cpu_total_percent', label: 'Total', color: '#58a6ff', format: percent },
     { key: 'cpu-user', metric: 'cpu_user_percent', label: 'User', color: '#3fb950', format: percent },
@@ -6343,10 +6549,11 @@ function HostResourceDashboard({
         <button type="button" className="usage-dashboard-refresh" onClick={() => onRefresh(true)} aria-label="Capture host resource detail now">Capture detail</button>
       </div>
       <div className="host-resource-meta">
-        <span className={`host-resource-status ${normalized.status}`}>{subscription?.status === 'reconnecting' ? 'Reconnecting' : normalized.available ? 'Live' : 'Unavailable'}</span>
+        <span className={`host-resource-status ${timeline.status}`}>{timelineStatusLabel}</span>
         <span>{aggregateOnly ? 'Aggregate-only' : normalized.machineLabel || 'Windows host'}</span>
         <span>{formatHostResourceAge(normalized.capturedAt, nowMs)}</span>
-        <span>1s system / 5s detail / seq {normalized.sampleSequence || '—'}</span>
+        <span>{timeline.receivedCount} received / {timeline.validCount} valid / {timeline.expectedCount} expected / {timeline.droppedCount} dropped / {timeline.gapCount} gaps / {timeline.duplicateCount} dup / {timeline.outOfOrderCount} out-of-order</span>
+        <span>{Math.round(timeline.cadenceMs)} ms cadence / seq {normalized.sampleSequence || '—'}</span>
       </div>
       <div className="host-resource-controls" aria-label="Host resource timeline controls">
         <div className="host-resource-range" role="group" aria-label="Time range">
@@ -6355,12 +6562,23 @@ function HostResourceDashboard({
               onClick={() => { setRange(value); setViewport({ start: 0, end: 1 }); }}>{label}</button>
           ))}
         </div>
-        <button type="button" onClick={() => setPausedSequence(previous => previous == null ? history.at(-1)?.sample_sequence || 0 : null)}>{pausedSequence == null ? 'Pause' : 'Resume'}</button>
+        <button type="button" onClick={() => {
+          if (pausedSequence == null) {
+            setPausedAtMs(Date.now());
+            setPausedSequence(history.at(-1)?.sample_sequence || 0);
+          } else {
+            setPausedSequence(null);
+            setPausedAtMs(null);
+          }
+        }}>{pausedSequence == null ? 'Pause' : 'Resume'}</button>
         <button type="button" disabled={viewport.start === 0 && viewport.end === 1} onClick={() => setViewport({ start: 0, end: 1 })}>Reset zoom</button>
         <label><input type="checkbox" checked={aggregateOnly} onChange={event => { setAggregateOnly(event.target.checked); setSelectedProcessKey(''); }} /> Aggregate-only privacy</label>
-        <span>{rangeFrames.length} samples{pausedSequence == null ? '' : ` / paused at ${pausedSequence}`}</span>
+        <span>{rangeFrames.length} raw samples / {Math.round(timeline.elapsedMs / 1000)}s actual{pausedSequence == null ? '' : ` / paused at ${pausedSequence}`}</span>
       </div>
-      {(error || normalized.error) && <div className="host-resource-error" role="status">{error?.message || normalized.error?.message}</div>}
+      {(error || normalized.error) && <div className="host-resource-error" role="status">
+        {error?.message || normalized.error?.message}
+        {normalized.error && ` Last full detail: ${detailFailureAge}.`}
+      </div>}
       {system ? (
         <>
           <div className="host-resource-summary" aria-label="Host resource summary">
@@ -6370,16 +6588,16 @@ function HostResourceDashboard({
             <div><strong>{formatHostResourceRate(networkRate)}</strong><span>network I/O</span><small>Receive {formatHostResourceRate(system.network.receiveBps)} / send {formatHostResourceRate(system.network.sendBps)}</small></div>
           </div>
           <div className="host-resource-charts">
-            <HostResourceChart title="CPU" description="Host utilization (%)" frames={rangeFrames} series={cpuSeries} percentScale viewport={viewport} onViewportChange={setViewport} crosshairSequence={crosshairSequence} onCrosshairChange={setCrosshairSequence} />
+            <HostResourceChart title="CPU" description="Total outline; User and Kernel component overlays (%)" frames={rangeFrames} series={cpuSeries} percentScale viewport={viewport} onViewportChange={setViewport} crosshairSequence={crosshairSequence} onCrosshairChange={setCrosshairSequence} range={range} nowMs={rangeNowMs} paused={pausedSequence != null} subscriptionStatus={subscription?.status} />
             <HostResourceChart title="Memory" description="Physical used and committed (%)" frames={rangeFrames} series={[
               { key: 'memory-used', metric: 'memory_used_percent', label: 'Physical used', color: '#bc8cff', format: percent },
               { key: 'memory-commit', metric: 'memory_commit_percent', label: 'Committed', color: '#f778ba', format: percent },
-            ]} percentScale viewport={viewport} onViewportChange={setViewport} crosshairSequence={crosshairSequence} onCrosshairChange={setCrosshairSequence} />
-            <HostResourceChart title="Disk" description="Aggregate throughput (IEC bytes/s)" frames={rangeFrames} series={diskSeries} viewport={viewport} onViewportChange={setViewport} crosshairSequence={crosshairSequence} onCrosshairChange={setCrosshairSequence} />
+            ]} percentScale viewport={viewport} onViewportChange={setViewport} crosshairSequence={crosshairSequence} onCrosshairChange={setCrosshairSequence} range={range} nowMs={rangeNowMs} paused={pausedSequence != null} subscriptionStatus={subscription?.status} />
+            <HostResourceChart title="Disk" description="Aggregate throughput (IEC bytes/s); isolate unequal series in the legend" frames={rangeFrames} series={diskSeries} viewport={viewport} onViewportChange={setViewport} crosshairSequence={crosshairSequence} onCrosshairChange={setCrosshairSequence} range={range} nowMs={rangeNowMs} paused={pausedSequence != null} subscriptionStatus={subscription?.status} />
             <HostResourceChart title="Network" description="Physical-default receive and send (IEC bytes/s)" frames={rangeFrames} series={[
               { key: 'network-receive', metric: 'network_receive_bps', label: 'Receive', color: '#3fb950', format: rate },
               { key: 'network-send', metric: 'network_send_bps', label: 'Send', color: '#d29922', format: rate },
-            ]} viewport={viewport} onViewportChange={setViewport} crosshairSequence={crosshairSequence} onCrosshairChange={setCrosshairSequence} />
+            ]} viewport={viewport} onViewportChange={setViewport} crosshairSequence={crosshairSequence} onCrosshairChange={setCrosshairSequence} range={range} nowMs={rangeNowMs} paused={pausedSequence != null} subscriptionStatus={subscription?.status} />
           </div>
           {!aggregateOnly && (
             <section className="host-resource-process-section" aria-labelledby="host-resource-process-heading">
@@ -6453,7 +6671,7 @@ function fleetSessionSnippet(session, sessionMessages) {
 }
 
 function fleetElapsed(activity, nowMs) {
-  if (activity?.goal) return formatGoalElapsed(activity.goal, nowMs);
+  if (activity?.goal) return formatGoalElapsed(activity.goal, nowMs, activity.goal_run);
   const startedAt = Date.parse(activity?.startedAt || activity?.started_at || activity?.since || '');
   return Number.isFinite(startedAt)
     ? formatClockDuration(Math.max(0, (nowMs - startedAt) / 1000), { includeSeconds: true })
@@ -6488,7 +6706,8 @@ function FleetView({ sessions, activities, thinking, permissionPrompts, errorPro
     // failures, and other actionable signals so a newly active session cannot
     // be masked by an older completion notification.
     const attentionSignal = sessionAttention[id] || null;
-    const attention = !!prompt || attentionSignal?.kind === 'goal_attention';
+    const attention = !!prompt || session?.rate_limit_active === true
+      || ['goal_attention', 'provider_usage_threshold'].includes(attentionSignal?.kind);
     const config = agentConfigs[id] || {};
     const agentType = session?.agent_type;
     const goalCapable = goalLifecycleSupported(agentType, config.capabilities);
@@ -6517,18 +6736,27 @@ function FleetView({ sessions, activities, thinking, permissionPrompts, errorPro
     });
     const goal = workContext.kind === 'goal' ? capabilitySafeActivity?.goal || null : null;
     const activityKind = safeString(capabilitySafeActivity?.kind).replace(/_/g, ' ');
+    const usagePercent = Number(session?.percent_used);
+    const usageReset = session?.rate_limited_until && session.rate_limited_until !== 'unknown'
+      ? formatUsageResetLabel(session.rate_limited_until) : '';
+    const usageStatus = session?.rate_limit_active === true
+      ? `Usage limited${usageReset ? ` · resets ${usageReset}` : ' · reset unknown'}`
+      : Number.isFinite(usagePercent) && usagePercent >= 75
+        ? `Usage ${Math.round(usagePercent)}% used${usageReset ? ` · resets ${usageReset}` : ''}`
+        : '';
     return {
       id, session, agent, activity: capabilitySafeActivity, attention: needsAttention, working, state, goal, config,
+      stateLabel: session?.rate_limit_active === true ? 'Usage limited' : fleetStateLabel(state),
       title: sidebarChatTitle(session, id, config, messages[id] || []),
       status: prompt ? (safeString(prompt.title).trim() || 'Action required')
-        : (goalSubstate || safeString(activity?.label).trim()
+        : (usageStatus || goalSubstate || safeString(activity?.label).trim()
           || (state === 'idle' ? (goal ? 'Goal paused' : 'Idle') : (activityKind || (goal ? 'Goal active' : 'Working')))),
       workContext,
       progress: fleetWorkContextProgress(workContext),
       snippet: fleetSessionSnippet(session, messages[id] || []),
       health: health[id] || 'unknown',
       canReceiveBroadcast: sessionSupportsBroadcast(session, agentConfigs[id], health[id] || 'unknown', connected),
-      freshness: fleetFreshnessLabel(activity),
+      freshness: fleetFreshnessLabel(activity, nowMs),
       activityLatencyMs: Number.isFinite(Number(activity?.transport?.latency_ms)) ? Math.round(Number(activity.transport.latency_ms)) : null,
     };
   }).filter(Boolean).sort((left, right) => (
@@ -6661,7 +6889,7 @@ function FleetView({ sessions, activities, thinking, permissionPrompts, errorPro
               </span>
               <span className="fleet-card-status">
                 {entry.working && <NativeActivitySpinner agentType={entry.session?.agent_type} compact animate={false} />}
-                <span className={`fleet-state-badge ${entry.state}`}>{fleetStateLabel(entry.state)}</span>
+                <span className={`fleet-state-badge ${entry.state}`}>{entry.stateLabel}</span>
                 <strong>{entry.status}</strong>
                 {entry.working && <time>{fleetElapsed(entry.activity, nowMs)}</time>}
               </span>
@@ -6686,7 +6914,7 @@ function FleetView({ sessions, activities, thinking, permissionPrompts, errorPro
               {(entry.workContext.kind === 'goal' || entry.progress != null) && <span
                 className={`fleet-work-meter kind-${entry.workContext.kind}${entry.progress == null && entry.working ? ' indeterminate' : ''}${entry.working ? '' : ' inactive'}`}
                 aria-label={entry.progress == null
-                  ? `${entry.workContext.label} ${fleetStateLabel(entry.state).toLowerCase()}`
+                  ? `${entry.workContext.label} ${entry.stateLabel.toLowerCase()}`
                   : Number.isInteger(entry.workContext.completed) && Number.isInteger(entry.workContext.total)
                     ? `${entry.workContext.label} ${entry.workContext.completed} of ${entry.workContext.total} complete`
                     : `${entry.workContext.label} ${Math.round(entry.progress)}% complete`}
@@ -6877,7 +7105,7 @@ class AppErrorBoundary extends React.Component {
 }
 
 function App() {
-  const { sessions, messages, provisionalStreams, historyMeta, historyLoading, connected, connectionHealth, unread, setUnread, thinking, thinkingContent, activities, health, deliveryStates, launchStates, justLaunched, setJustLaunched, permissionPrompts, respondToPrompt, errorPrompts, respondToErrorPrompt, interruptSession, agentConfigs, configControlStates, requestAgentConfig, setAgentModel, setAgentEffort, setAgentPermissionMode, setAutoApprovePermissions, setAntigravityMode, setCodexConfig, newThread, openPanel, openNativeWindow, requestChatList, switchChat, newChat, chatLists, requestThreadList, switchThread, threadLists, switchWorkspace, requestTerminalOutput, sendTerminalInput, terminalOutputs, requestFileChanges, respondToFileChange, fileChanges, sendAttachment, send, sendToSession, steerMessage, discardQueuedMessage, editQueuedMessage, queuedMessages, scheduledSends, scheduleSend, cancelScheduledSend, launchSession, resumeSession, closeSession, activeSessionRef, restoreCachedTranscript, setSessionSubscriptions, workspaces, branchLists, requestBranchList, switchBranch, createBranch, skillLists, requestSkillList, automationViews, showCodexAutomation, controlResults, directoryListings, requestDirectoryListing, fileContents, requestFileContent, requestHistory, requestHistoryChunk, duplicateProxyAlarms, nightlyValidationFailures, latestAppUpdateValidation, providerUsage, providerUsageRefreshReceipt, requestProviderUsageRefresh, providerUsageCostDetail, requestProviderUsageCostDetail, hostResources, hostResourceError, hostResourceHistory, hostResourceDetails, hostResourceSubscription, subscribeHostResources, unsubscribeHostResources, requestHostResourceRefresh, semanticNotifications } = useRelay();
+  const { sessions, messages, provisionalStreams, historyMeta, historyLoading, connected, connectionHealth, unread, setUnread, thinking, thinkingContent, activities, health, deliveryStates, launchStates, justLaunched, setJustLaunched, permissionPrompts, respondToPrompt, errorPrompts, respondToErrorPrompt, interruptSession, agentConfigs, configControlStates, requestAgentConfig, setAgentModel, setAgentEffort, setAgentPermissionMode, setAutoApprovePermissions, setAntigravityMode, setCodexConfig, newThread, openPanel, openNativeWindow, requestChatList, switchChat, newChat, chatLists, requestThreadList, switchThread, threadLists, switchWorkspace, requestTerminalOutput, sendTerminalInput, terminalOutputs, requestFileChanges, respondToFileChange, fileChanges, sendAttachment, send, sendToSession, steerMessage, discardQueuedMessage, editQueuedMessage, queuedMessages, scheduledSends, scheduleSend, cancelScheduledSend, launchSession, resumeSession, closeSession, activeSessionRef, restoreCachedTranscript, setSessionSubscriptions, workspaces, branchLists, requestBranchList, switchBranch, createBranch, skillLists, requestSkillList, automationViews, showCodexAutomation, controlResults, directoryListings, requestDirectoryListing, fileContents, requestFileContent, requestHistory, requestHistoryChunk, duplicateProxyAlarms, nightlyValidationFailures, latestAppUpdateValidation, providerUsage, providerUsageRefreshReceipt, requestProviderUsageRefresh, providerUsageResetReceipt, consumeProviderUsageResetCredit, providerUsageCostDetail, requestProviderUsageCostDetail, hostResources, hostResourceError, hostResourceHistory, hostResourceDetails, hostResourceSubscription, subscribeHostResources, unsubscribeHostResources, requestHostResourceRefresh, semanticNotifications } = useRelay();
   const [activeSession, setActiveSession] = useState(null);
   const subscribeActiveTranscript = React.useCallback(
     listener => subscribeCachedTranscript(activeSession, listener),
@@ -7540,10 +7768,6 @@ function App() {
     () => orderedSessions.find(s => sessionIdOf(s) === activeSession),
     [orderedSessions, activeSession],
   );
-  const activeUsageSnapshot = React.useMemo(
-    () => usageSnapshotForSession(activeSessionMeta, activeSession ? activities[activeSession] : null),
-    [activeSessionMeta, activeSession, activities],
-  );
   const activeMessagesForScroll = activeSession ? activeTranscriptMessages : EMPTY_MESSAGES;
   const activeProvisionalStream = activeSession ? (provisionalStreams[activeSession] || null) : null;
   const activeNativeCliPlaceholder = shouldRefreshNativeCliPlaceholder(activeSessionMeta, activeMessagesForScroll);
@@ -8056,7 +8280,7 @@ function App() {
         recordSemanticNotificationStage(event, 'claimed');
         const kind = event.event_type;
         if (attentionFeedbackPreferences.completion_sound) {
-          playAttentionSound(kind === 'goal_attention' ? 'prompt' : 'completion');
+          playAttentionSound(kind === 'goal_attention' || kind === 'provider_usage_threshold' ? 'prompt' : 'completion');
         }
         if (sessionId !== activeSession) {
           setSessionAttention(existing => ({
@@ -9870,9 +10094,11 @@ async function uploadBinaryDraft(sessionId, base64, mimeType, filename) {
           <UsageDashboard
             usage={providerUsage}
             refreshReceipt={providerUsageRefreshReceipt}
+            resetReceipt={providerUsageResetReceipt}
             costDetail={providerUsageCostDetail}
             onBack={() => setShowUsageDashboard(false)}
             onRefresh={requestProviderUsageRefresh}
+            onConsumeResetCredit={consumeProviderUsageResetCredit}
             onRequestCostDetail={requestProviderUsageCostDetail}
           />
         )}
@@ -9985,7 +10211,7 @@ async function uploadBinaryDraft(sessionId, base64, mimeType, filename) {
                     {theme === 'light' ? '🌙' : '☀️'}
                   </button>
                   <span
-                    className={`context-pill ${connected ? 'ok' : 'warn'}`}
+                    className={`context-pill topbar-relay-status ${connected ? 'ok' : 'warn'}`}
                     title={connected ? 'Relay connected' : 'Relay disconnected — reconnecting'}
                   >
                     {connected ? 'relay live' : 'reconnecting'}
@@ -10009,18 +10235,12 @@ async function uploadBinaryDraft(sessionId, base64, mimeType, filename) {
                   {activeHostLabel && (
                     <span className="context-pill" title="Native editor host">{activeHostLabel}</span>
                   )}
-                  {activeUsageSnapshot.hasSignal && (
-                    <button
-                      type="button"
-                      className={`context-pill usage-context-pill ${activeUsageSnapshot.state}`}
-                      title={activeUsageSnapshot.resetAt ? `Usage resets ${activeUsageSnapshot.resetAt}` : 'Open usage and limits'}
-                      onClick={() => { captureChatRouteScroll(); setShowUsageDashboard(true); setShowHostResourceDashboard(false); setShowFleetView(false); }}
-                    >
-                      {activeUsageSnapshot.state === 'exhausted'
-                        ? 'limit reached'
-                        : `${activeUsageSnapshot.remainingPercent}% left`}
-                    </button>
-                  )}
+                  <SessionUsageMiniMonitor
+                    session={activeSessionMeta}
+                    config={activeConfig}
+                    providerUsage={providerUsage}
+                    onOpenUsage={() => { captureChatRouteScroll(); setShowUsageDashboard(true); setShowHostResourceDashboard(false); setShowFleetView(false); }}
+                  />
                   {activeSessionMeta?.agent_type === 'codex' && activeSessionMeta?.visible_pane_visible && (
                     <span
                       className={`context-pill ${activeCodexPaneLive ? 'ok' : 'warn'}`}
@@ -10127,7 +10347,7 @@ async function uploadBinaryDraft(sessionId, base64, mimeType, filename) {
                     <button
                       className="context-pill open-panel-btn"
                       title={`Open this ${agentTypeLabel(activeSessionMeta?.agent_type) || 'CLI'} session in a native command window`}
-                      onClick={() => openNativeWindow(activeSession)}
+                      onClick={event => openNativeWindow(activeSession, event)}
                     >
                       native
                     </button>
@@ -10307,13 +10527,13 @@ async function uploadBinaryDraft(sessionId, base64, mimeType, filename) {
               onRespond={respondToErrorPrompt}
             />
           )}
-          {(activeSessionMeta?.rate_limit_active || (activeSessionMeta?.percent_used != null && activeSessionMeta.percent_used >= 80)) && (
+          {(activeSessionMeta?.rate_limit_active || (activeSessionMeta?.percent_used != null && activeSessionMeta.percent_used >= 75)) && (
             <div className={`rate-limit-overlay${activeSessionMeta?.rate_limit_active ? ' critical' : activeSessionMeta?.percent_used >= 90 ? ' critical' : activeSessionMeta?.percent_used >= 75 ? ' warning' : ''}`}>
               <span className="rate-limit-icon">{activeSessionMeta?.rate_limit_active ? '⏳' : '📊'}</span>
               <span className="rate-limit-text">
                 {activeSessionMeta?.rate_limit_active
-                  ? <>Rate limited{activeSessionMeta.rate_limited_until && activeSessionMeta.rate_limited_until !== 'unknown' ? <> — resets in <strong>{activeSessionMeta.rate_limited_until}</strong></> : null}</>
-                  : <>Used <strong>{activeSessionMeta.percent_used}%</strong> of session limit{activeSessionMeta.rate_limited_until && activeSessionMeta.rate_limited_until !== 'unknown' ? <> · resets in <strong>{activeSessionMeta.rate_limited_until}</strong></> : null}</>
+                  ? <>Rate limited{activeSessionMeta.rate_limited_until && activeSessionMeta.rate_limited_until !== 'unknown' ? <> — resets <strong>{formatUsageResetLabel(activeSessionMeta.rate_limited_until)}</strong></> : null}</>
+                  : <>Used <strong>{activeSessionMeta.percent_used}%</strong> of session limit{activeSessionMeta.rate_limited_until && activeSessionMeta.rate_limited_until !== 'unknown' ? <> · resets <strong>{formatUsageResetLabel(activeSessionMeta.rate_limited_until)}</strong></> : null}</>
                 }
               </span>
             </div>
@@ -10708,7 +10928,7 @@ async function uploadBinaryDraft(sessionId, base64, mimeType, filename) {
                 {activeConfig?.capabilities?.native_window && (
                   <button
                     className="composer-gear-btn mobile-hide"
-                    onClick={() => openNativeWindow(activeSession)}
+                    onClick={event => openNativeWindow(activeSession, event)}
                     title="Open native command window"
                   >cmd</button>
                 )}
@@ -10808,7 +11028,10 @@ async function uploadBinaryDraft(sessionId, base64, mimeType, filename) {
                         {composerModelOptionsFor(activeSessionMeta?.agent_type, activeConfig).map(m => (
                           <option key={m.id} value={m.id}>{m.label}</option>
                         ))}
-                        {!composerModelOptionsFor(activeSessionMeta?.agent_type, activeConfig).some(m => m.id === activeConfig.model_id) && activeConfig?.model_id && activeConfig.model_id !== 'unknown' && activeConfig?.config_semantics !== 'observed_and_next_send' && (
+                        {activeConfig?.model_id
+                          && !composerModelOptionsFor(activeSessionMeta?.agent_type, activeConfig).some(m => m.id === activeConfig.model_id)
+                          && activeConfig.model_id !== 'unknown'
+                          && activeConfig.config_semantics !== 'observed_and_next_send' && (
                           <option value={activeConfig.model_id}>{activeConfig.model_id}</option>
                         )}
                       </select>
@@ -11067,7 +11290,7 @@ async function uploadBinaryDraft(sessionId, base64, mimeType, filename) {
       {attentionToast && (
         <div className="attention-toast" role="status" aria-live="polite">
           <span className={`attention-toast-icon ${attentionToast.kind}`} aria-hidden="true">
-            {attentionToast.kind === 'prompt' || attentionToast.kind === 'goal_attention' ? '!' : '✓'}
+            {attentionToast.kind === 'prompt' || ['goal_attention', 'provider_usage_threshold'].includes(attentionToast.kind) ? '!' : '✓'}
           </span>
           <span className="attention-toast-copy">
             <strong>{attentionToast.title}</strong>

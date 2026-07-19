@@ -21,6 +21,12 @@ const outputPath = outputIndex >= 0 && process.argv[outputIndex + 1]
 const screenshotDirIndex = process.argv.indexOf('--screenshot-dir');
 const screenshotDir = screenshotDirIndex >= 0 && process.argv[screenshotDirIndex + 1]
   ? path.resolve(process.argv[screenshotDirIndex + 1]) : null;
+const stormDurationIndex = process.argv.indexOf('--session-header-storm-ms');
+const requestedStormMs = stormDurationIndex >= 0 ? Number(process.argv[stormDurationIndex + 1]) : 0;
+assert(Number.isFinite(requestedStormMs) && requestedStormMs >= 0,
+  '--session-header-storm-ms must be a non-negative number');
+if (requestedStormMs > 0) assert(requestedStormMs >= 1_000,
+  '--session-header-storm-ms must be at least 1000');
 
 const sessions = [
   {
@@ -44,19 +50,35 @@ const sessions = [
     ],
   },
   { session_id: 'usage-cursor', agent_type: 'cursor', display_name: 'Cursor capacity unavailable' },
+  { session_id: 'usage-ollama', agent_type: 'ollama', display_name: 'Ollama Cloud + local runtime', usage_runtime_kind: 'cloud' },
 ];
+if (requestedStormMs > 0) {
+  const stormTypes = ['codex_cli', 'claude_cli', 'cursor', 'antigravity_panel', 'ollama'];
+  for (let index = sessions.length; index < 120; index += 1) {
+    const agentType = stormTypes[index % stormTypes.length];
+    sessions.push({
+      session_id: `usage-storm-${String(index).padStart(3, '0')}`,
+      agent_type: agentType,
+      display_name: `Usage storm ${String(index).padStart(3, '0')} long localized session title`,
+      ...(agentType === 'ollama' ? { usage_runtime_kind: index % 2 ? 'cloud' : 'local' } : {}),
+    });
+  }
+}
 let providerRefreshRequests = 0;
 let costDetailRequests = 0;
+let resetCreditRequests = 0;
+let lastResetCreditRequest = null;
 let respondToProviderRefresh = true;
 const fixtureClients = new Set();
 const fixtureCapturedAt = new Date().toISOString();
 const fixtureStaleAfter = new Date(Date.now() + 10 * 60 * 1000).toISOString();
+let currentProviderUsage = null;
 
 function providerUsageFixture() {
   const capturedAt = fixtureCapturedAt;
   const staleAfter = fixtureStaleAfter;
   const snapshot = (providerId, providerName, accountFingerprint, plan, harnessTypes, sessionCount, windows, extra = {}) => ({
-    schema_version: 2,
+    schema_version: 4,
     provider_id: providerId,
     provider_name: providerName,
     quota_domain: `${providerId}-plan`,
@@ -70,8 +92,9 @@ function providerUsageFixture() {
     status: 'fresh',
     captured_at: capturedAt,
     stale_after: staleAfter,
+    next_refresh_at: extra.nextRefreshAt || null,
     windows: windows.map(([id, label, used, scope = null, modelId = null]) => {
-      const duration = id === 'five_hour' || label === '5-hour' || label === 'Current session' ? 300 : 10080;
+      const duration = id === 'five_hour' || label === '5-hour' || label === 'Current session' || label === 'Session' ? 300 : 10080;
       return enrichUsageWindow({
         id, label, scope, model_scope: modelId ? { id: modelId, label: scope } : null,
         used_percent: used, remaining_percent: 100 - used, duration_minutes: duration,
@@ -81,6 +104,9 @@ function providerUsageFixture() {
       }, { providerId, now: Date.now(), thresholds: extra.thresholds || null });
     }),
     credits: extra.credits || null,
+    financials: extra.financials || null,
+    local_runtime: extra.localRuntime || null,
+    cloud_usage: extra.cloudUsage || null,
     reset_credits: extra.resetCredits || null,
     error: null,
     request_count: extra.requestCount ?? 1,
@@ -89,7 +115,7 @@ function providerUsageFixture() {
     mapped_harness_types: harnessTypes,
   });
   return {
-    schema_version: 2,
+    schema_version: 4,
     generation: 7,
     generated_at: capturedAt,
     poll_interval_ms: 300000,
@@ -100,15 +126,42 @@ function providerUsageFixture() {
         ['seven_day_scoped_claude-fable-5', 'Fable weekly', 125, 'Fable', 'claude-fable-5'],
       ], { source: 'oauth_api', credits: { enabled: true, used: 4.25, limit: 20, currency: 'USD', period: 'Monthly' }, dashboardUrl: 'https://claude.ai/settings/usage' }),
       snapshot('google-antigravity', 'Google Antigravity', 'acct_22222222222222222222', 'Google AI Pro', ['antigravity_panel'], 1, [
-        ['model-1', 'Gemini 2.5 Pro', 43, 'Model quota'], ['model-2', 'Claude Sonnet 4.5', 91, 'Model quota'],
-      ], { source: 'local_settings', credits: { enabled: true, balance: 120, unit: 'AI credits' }, requestCount: 0 }),
+        ['model-1', 'Gemini 2.5 Pro', 43, 'Model quota', 'gemini-2.5-pro'], ['model-2', 'Claude Sonnet 4.5', 91, 'Model quota', 'claude-sonnet-4.5'],
+      ], {
+        source: 'in_app_api', credits: { enabled: true, balance: 120, unit: 'AI credits' }, requestCount: 0,
+        nextRefreshAt: new Date(Date.now() + 15 * 60 * 1000).toISOString(),
+      }),
       snapshot('openai-codex', 'OpenAI Codex', 'acct_33333333333333333333', 'ChatGPT Pro', ['codex', 'codex_cli'], 13, [
-        ['codex-primary', '5-hour', 86], ['codex-secondary', 'Weekly', 20],
-        ['code-review-primary', 'Code review - Weekly', 22, 'Code review'], ['gpt-5-primary', 'GPT-5 - Weekly', 8, 'GPT-5'],
+        ['codex-primary', '5-hour', 100], ['codex-secondary', 'Weekly', 20],
+        ['code-review-primary', 'Code review - Weekly', 22, 'Code review', 'code-review'], ['gpt-5-primary', 'GPT-5 - Weekly', 8, 'GPT-5', 'gpt-5'],
       ], {
         source: 'app_server', dashboardUrl: 'https://chatgpt.com/codex/settings/usage',
         credits: { enabled: true, balance: 18.5, currency: 'USD' },
         resetCredits: { available_count: 2, details: [{ title: 'Reset one', status: 'available' }, { title: 'Reset two', status: 'available' }] },
+      }),
+      snapshot('ollama-local', 'Ollama', 'acct_44444444444444444444', 'Pro', ['ollama'], 1, [
+        ['ollama-cloud-session', 'Session', 1.9, 'Ollama Cloud'],
+        ['ollama-cloud-weekly', 'Weekly', 48.3, 'Ollama Cloud'],
+      ], {
+        source: 'existing_signed_in_ollama_usage_surface',
+        dashboardUrl: 'https://ollama.com/settings/usage',
+        accountLabel: 'Cloud account + loopback runtime',
+        cloudUsage: {
+          subscription_state: 'active', source: 'existing_signed_in_ollama_usage_surface', captured_at: capturedAt,
+          auto_reload_enabled: false, error: null,
+          source_receipt: { page_state_unchanged: true, dom_mutation_records: 0, navigation_actions: 0, click_actions: 0, focus_actions: 0, targets_created: 0 },
+        },
+        financials: {
+          semantics_version: 1, source: 'existing_signed_in_ollama_usage_surface', observed_at: capturedAt,
+          account_scope: 'Pro', extra_usage_enabled: true,
+          prepaid_balance: { amount: 0, currency: 'USD', source_field: 'balance_remaining', semantics: 'prepaid_balance', directly_reported: true },
+          disclaimer: 'Ollama Cloud quota and local runtime telemetry are separate truth domains.',
+        },
+        localRuntime: {
+          status: 'running', endpoint_scope: 'loopback_only', installed_models_count: 13,
+          loaded_models_count: 0, loaded_models: [], observed_request_count: 0, request_receipts: [],
+          telemetry_status: 'not_observed', telemetry_reason: 'Only explicit owned terminal response receipts are counted.',
+        },
       }),
     ],
     estimated_cost: {
@@ -208,7 +261,8 @@ function costLifecycleFixture(status, options = {}) {
   };
 }
 
-function broadcastProviderUsage(snapshot) {
+function broadcastProviderUsage(snapshot, options = {}) {
+  if (options.cache !== false) currentProviderUsage = snapshot;
   const frame = JSON.stringify({ type: 'provider_usage_snapshot', protocol_version: 1, snapshot });
   for (const client of fixtureClients) {
     if (client.readyState === client.OPEN) client.send(frame);
@@ -235,6 +289,7 @@ function contentType(filePath) {
 }
 
 async function main() {
+  currentProviderUsage = providerUsageFixture();
   const port = await freePort();
   const server = http.createServer((request, response) => {
     if (request.url.startsWith('/api/')) {
@@ -270,7 +325,7 @@ async function main() {
       sessions: sessions.map(session => ({
         ...session, title: session.display_name, status: 'healthy', workspace_path: root, project_root: root,
       })),
-      provider_usage: providerUsageFixture(),
+      provider_usage: currentProviderUsage,
       workspaces: [],
     });
     ws.on('message', raw => {
@@ -280,7 +335,22 @@ async function main() {
       if (message.type === 'heartbeat') {
         send({ type: 'heartbeat_ack', request_id: message.request_id, server_ts: new Date().toISOString() });
       } else if (message.type === 'agent_config_request') {
-        send({ type: 'agent_config', session_id: sessionId, capabilities: {} });
+        const session = sessions.find(item => item.session_id === sessionId);
+        const observedModel = {
+          'usage-codex-primary': 'gpt-5.6-sol',
+          'usage-codex-secondary': 'gpt-5.6-sol',
+          'usage-claude': 'claude-fable-5',
+          'usage-antigravity': 'claude-sonnet-4.5',
+          'usage-cursor': 'claude-fable-5',
+          'usage-ollama': 'qwen3.5:cloud',
+        }[sessionId] || ({
+          codex_cli: 'gpt-5.6-sol',
+          claude_cli: 'claude-fable-5',
+          cursor: 'claude-fable-5',
+          antigravity_panel: 'claude-sonnet-4.5',
+          ollama: session?.usage_runtime_kind === 'local' ? 'qwen3.5' : 'qwen3.5:cloud',
+        }[session?.agent_type] || '');
+        send({ type: 'agent_config', session_id: sessionId, capabilities: {}, observed_model_id: observedModel });
       } else if (message.type === 'history_chunk_request') {
         send({
           type: 'history_chunk', session_id: sessionId, request_id: message.request_id,
@@ -296,9 +366,17 @@ async function main() {
         providerRefreshRequests += 1;
         send({ type: 'provider_usage_refresh_receipt', request_id: message.request_id, status: 'accepted' });
         if (respondToProviderRefresh) {
-          send({ type: 'provider_usage_snapshot', protocol_version: 1, snapshot: providerUsageFixture() });
+          send({ type: 'provider_usage_snapshot', protocol_version: 1, snapshot: currentProviderUsage });
           send({ type: 'provider_usage_refresh_receipt', request_id: message.request_id, status: 'completed', generation: 7, cost_status: 'ready' });
         }
+      } else if (message.type === 'provider_usage_reset_credit_consume') {
+        resetCreditRequests += 1;
+        lastResetCreditRequest = message;
+        send({ type: 'provider_usage_reset_credit_receipt', request_id: message.request_id, status: 'accepted' });
+        send({
+          type: 'provider_usage_reset_credit_receipt', request_id: message.request_id,
+          status: 'completed', outcome: 'reset', reset_credits_available: 1,
+        });
       } else if (message.type === 'provider_usage_cost_detail_request') {
         costDetailRequests += 1;
         send({
@@ -317,6 +395,8 @@ async function main() {
   let originalViewport;
   const coldRouteActivationSamples = [];
   const warmRouteActivationSamples = [];
+  const browserErrors = [];
+  let sessionHeaderStorm = null;
   try {
     if (browserMode === 'headless-fixture') {
       browser = await chromium.launch({ channel: 'chrome', headless: true });
@@ -330,6 +410,10 @@ async function main() {
     }
     const pages = browser.contexts().flatMap(context => context.pages());
     assert.strictEqual(pages.length, 1, `expected exactly one verification page, found ${pages.length}`);
+    page.on('pageerror', error => browserErrors.push(`pageerror:${error.message}`));
+    page.on('console', message => {
+      if (message.type() === 'error') browserErrors.push(`console:${message.text()}`);
+    });
     originalUrl = page.url();
     originalViewport = page.viewportSize();
 
@@ -352,16 +436,16 @@ async function main() {
     };
 
     await loadFixture({ width: 1280, height: 900 });
-    assert.equal(await page.locator('.usage-dashboard-card').count(), 3, 'five old surfaces must become three provider-account cards');
+    assert.equal(await page.locator('.usage-dashboard-card').count(), 4, 'six old surfaces must become four provider-account cards');
     await page.waitForFunction(() => {
       const images = [...document.querySelectorAll('.usage-dashboard-provider-mark-image')];
-      return images.length === 6 && images.every(image => image.complete && image.naturalWidth > 0);
+      return images.length === 8 && images.every(image => image.complete && image.naturalWidth > 0);
     });
     assert.equal(await page.locator('.usage-dashboard-provider-mark-fallback').count(), 0,
       'official provider marks must load without text fallback');
     assert.deepStrictEqual(
       (await page.locator('.usage-dashboard-provider-mark').evaluateAll(nodes => nodes.map(node => node.getAttribute('aria-label')))).sort(),
-      ['Anthropic Claude provider mark', 'Google Antigravity provider mark', 'OpenAI provider mark'],
+      ['Anthropic Claude provider mark', 'Google Antigravity provider mark', 'Ollama provider mark', 'OpenAI provider mark'],
     );
     await assert.doesNotReject(async () => {
       const codex = page.locator('[data-provider-id="openai-codex"]');
@@ -373,6 +457,13 @@ async function main() {
       await codex.getByText('2 available').waitFor();
       await codex.getByText('Reset one', { exact: true }).waitFor();
       await codex.getByText('Reset two', { exact: true }).waitFor();
+      const resetAttention = page.locator('[data-testid="codex-reset-credit-attention"]');
+      await resetAttention.getByText('2 limit resets available — apply one?', { exact: true }).waitFor();
+      await resetAttention.getByRole('button', { name: 'Apply one reset' }).click();
+      await page.locator('[data-testid="codex-reset-credit-receipt"]')
+        .getByText('Reset completed: reset', { exact: true }).waitFor();
+      assert.strictEqual(resetCreditRequests, 1, 'explicit click must issue exactly one reset-credit request');
+      assert.strictEqual(lastResetCreditRequest?.approved, true, 'reset-credit request must carry explicit approval');
       const claude = page.locator('[data-provider-id="anthropic-claude"]');
       await claude.getByText('Current session', { exact: true }).waitFor();
       await claude.getByText('All models weekly', { exact: true }).waitFor();
@@ -383,6 +474,17 @@ async function main() {
       const antigravity = page.locator('[data-provider-id="google-antigravity"]');
       await antigravity.getByText('Gemini 2.5 Pro', { exact: true }).waitFor();
       await antigravity.getByText('Claude Sonnet 4.5', { exact: true }).waitFor();
+      await antigravity.getByText(/^Source: in app api/).waitFor();
+      await antigravity.getByText(/^Updated /).waitFor();
+      await antigravity.getByText(/^Next refresh /).waitFor();
+      const ollama = page.locator('[data-provider-id="ollama-local"]');
+      await ollama.getByText('Session', { exact: true }).waitFor();
+      await ollama.getByText('Weekly', { exact: true }).waitFor();
+      await ollama.getByText('1.9% used', { exact: true }).waitFor();
+      await ollama.getByText('48.3% used', { exact: true }).waitFor();
+      await ollama.getByText(/Available prepaid balance\$0\.00/).waitFor();
+      await ollama.getByText(/Auto-reloadOff/).waitFor();
+      await ollama.getByText(/Local runtime0 loaded \/ 13 installed/).waitFor();
     });
     await page.getByRole('heading', { name: 'Local estimated API-equivalent cost' }).waitFor();
     await page.getByRole('rowheader', { name: 'Codex · gpt-5.6-sol' }).waitFor();
@@ -410,7 +512,11 @@ async function main() {
     generationZero.snapshots = [];
     generationZero.estimated_cost = costLifecycleFixture('not-started');
     respondToProviderRefresh = false;
-    broadcastProviderUsage(generationZero);
+    currentProviderUsage = generationZero;
+    await page.reload({ waitUntil: 'domcontentloaded', timeout: 15000 });
+    await page.locator('.session-card').first().waitFor({ state: 'visible', timeout: 5000 });
+    await page.getByRole('button', { name: 'Usage and limits' }).click();
+    await page.locator('[data-testid="usage-dashboard"]').waitFor({ state: 'visible', timeout: 5000 });
     await page.getByText('Provider usage has not been collected yet', { exact: true }).waitFor();
     assert.deepStrictEqual(await page.locator('.usage-dashboard-summary strong').allTextContents(),
       ['—', '—', '—', '—', '—'], 'generation-zero summary must not manufacture authoritative zero totals');
@@ -429,7 +535,7 @@ async function main() {
     });
     broadcastProviderUsage(degradedCost);
     await page.getByText('Cost scan unavailable', { exact: true }).waitFor();
-    assert.strictEqual(await page.locator('.usage-dashboard-card').count(), 3,
+    assert.strictEqual(await page.locator('.usage-dashboard-card').count(), 4,
       'cost failure must preserve valid provider quota cards');
     assert.strictEqual(await page.locator('.usage-cost-summary').count(), 0,
       'failed cost state must not render false zero totals');
@@ -469,11 +575,11 @@ async function main() {
       'repeated same-generation route reopen must reuse the ready bounded detail page');
     const detailRequestsAfterRouteReopens = costDetailRequests;
     const summaryText = await page.locator('.usage-dashboard-summary').innerText();
-    assert.match(summaryText, /3\s+PROVIDER/i);
-    assert.match(summaryText, /3\s+ACCOUNT/i);
-    assert.match(summaryText, /3\s+REPORTING/i);
-    assert.match(summaryText, /2\s+NEAR LIMIT/i);
-    assert.match(summaryText, /1\s+EXHAUSTED/i);
+    assert.match(summaryText, /4\s+PROVIDER/i);
+    assert.match(summaryText, /4\s+ACCOUNT/i);
+    assert.match(summaryText, /4\s+REPORTING/i);
+    assert.match(summaryText, /1\s+NEAR LIMIT/i);
+    assert.match(summaryText, /2\s+EXHAUSTED/i);
     const desktopOverflow = await page.locator('.usage-dashboard').evaluate(node => node.scrollWidth - node.clientWidth);
     assert(desktopOverflow <= 1, `desktop dashboard overflowed by ${desktopOverflow}px`);
     if (screenshotDir) {
@@ -511,7 +617,286 @@ async function main() {
     assert(refreshCls <= 0.001, `usage refresh CLS exceeded zero budget: ${refreshCls}`);
     await page.locator('[data-testid="usage-dashboard"] .automations-back').click();
     await page.waitForFunction(() => document.querySelector('.session-card.active')?.dataset.sessionId === 'usage-codex-primary');
-    await page.locator('.usage-context-pill').getByText('14% left').waitFor();
+    const miniUsage = page.locator('[data-testid="session-usage-mini"]');
+    await miniUsage.waitFor();
+    const miniUsageText = await miniUsage.locator('.session-usage-mini-trigger').innerText();
+    assert.match(miniUsageText, /GPT-5 - Weekly.*92% left.*5-hour.*0% left/is,
+      `session header must prioritize the current-model window and most restrictive shared window: ${JSON.stringify(miniUsageText)}`);
+    await miniUsage.locator('.session-usage-mini-trigger').click();
+    const miniPopover = page.locator('#session-usage-popover');
+    await miniPopover.waitFor();
+    assert.match(await miniPopover.innerText(), /Billing provider\s+OpenAI Codex/i);
+    assert.match(await miniPopover.innerText(), /Model vendor\s+OpenAI/i);
+    assert.match(await miniPopover.innerText(), /GPT-5 - Weekly.*5-hour.*Weekly/is);
+    assert.doesNotMatch(await miniPopover.innerText(), /Code review - Weekly/i,
+      'unrelated model-scoped windows must not leak into the active-session projection');
+    assert.match(await miniPopover.innerText(), /18\.50 balance/i,
+      'credits must remain distinct from included usage windows');
+    assert.strictEqual(await page.evaluate(() => document.activeElement?.getAttribute('aria-label')), 'Close usage details');
+    await page.keyboard.press('Escape');
+    assert.strictEqual(await miniUsage.locator('.session-usage-mini-trigger').getAttribute('aria-expanded'), 'false');
+    await page.waitForFunction(() => document.activeElement?.closest?.('[data-testid="session-usage-mini"]') != null);
+    assert.strictEqual(await page.evaluate(() => document.activeElement?.closest?.('[data-testid="session-usage-mini"]') != null), true,
+      'Escape must return focus to the mini usage trigger');
+    if (screenshotDir) {
+      await page.screenshot({ path: path.join(screenshotDir, 'session-usage-mini-desktop.png'), fullPage: true });
+    }
+    const codexSidebarUsage = await page.locator('.session-card[data-session-id="usage-codex-primary"] .session-card-sub-context').innerText();
+    assert.match(codexSidebarUsage, /86% used.*resets/i,
+      '75% warning state must expose the provider reset in the sidebar');
+    assert.match(await page.locator('.rate-limit-overlay').innerText(), /Used 86%.*resets/i,
+      'active-session warning overlay must expose the provider reset');
+    if (screenshotDir) {
+      await page.screenshot({ path: path.join(screenshotDir, 'usage-limit-warning-desktop.png'), fullPage: true });
+    }
+    const claudeCard = page.locator('.session-card[data-session-id="usage-claude"]');
+    assert.match(await claudeCard.locator('.session-card-sub-context').innerText(), /Usage limited.*resets Monday 9:00 AM/i,
+      'hard usage limit must have its own sidebar state and reset hint');
+    await claudeCard.evaluate(node => node.click());
+    await page.waitForFunction(() => document.querySelector('.session-card.active')?.dataset.sessionId === 'usage-claude');
+    assert.match(await page.locator('.rate-limit-overlay').innerText(), /Rate limited.*resets Monday 9:00 AM/i,
+      'hard usage overlay must expose the reset hint');
+    assert.strictEqual(await page.locator('.live-usage-title').innerText(), 'Usage limit reached',
+      'provider-agnostic exhaustion must not inherit Codex-specific fallback copy');
+    if (screenshotDir) {
+      await page.screenshot({ path: path.join(screenshotDir, 'usage-limit-exhausted-desktop.png'), fullPage: true });
+    }
+    await page.locator('[data-testid="session-usage-mini"] .session-usage-mini-trigger').click();
+    assert.match(await page.locator('#session-usage-popover').innerText(), /Billing provider\s+Anthropic Claude.*Fable weekly/is);
+    if (screenshotDir) {
+      await page.screenshot({ path: path.join(screenshotDir, 'session-usage-popover-desktop.png'), fullPage: true });
+    }
+    await page.keyboard.press('Escape');
+    await page.waitForFunction(() => !document.querySelector('#session-usage-popover'));
+    await page.waitForFunction(() => document.activeElement?.closest?.('[data-testid="session-usage-mini"]') != null);
+    const antigravityCard = page.locator('.session-card[data-session-id="usage-antigravity"]');
+    await antigravityCard.focus();
+    await page.keyboard.press('Enter');
+    await page.waitForTimeout(250);
+    const antigravitySelection = await page.evaluate(() => ({
+      activeSessionId: document.querySelector('.session-card.active')?.dataset.sessionId || null,
+      targets: Array.from(document.querySelectorAll('.session-card[data-session-id="usage-antigravity"]')).map(node => ({
+        connected: node.isConnected,
+        parentClass: node.parentElement?.className || '',
+        grandparentClass: node.parentElement?.parentElement?.className || '',
+        rect: (() => { const box = node.getBoundingClientRect(); return { x: box.x, y: box.y, width: box.width, height: box.height }; })(),
+      })),
+      popoverOpen: !!document.querySelector('#session-usage-popover'),
+      activeTag: document.activeElement?.tagName || null,
+      url: location.href,
+      bodyText: document.body?.innerText?.slice(0, 500) || '',
+    }));
+    assert.strictEqual(antigravitySelection.activeSessionId, 'usage-antigravity',
+      `Antigravity session selection failed: ${JSON.stringify(antigravitySelection)} errors=${JSON.stringify(browserErrors)}`);
+    await page.locator('[data-testid="session-usage-mini"] .session-usage-mini-trigger').click();
+    const antigravityUsageText = await page.locator('#session-usage-popover').innerText();
+    assert.match(antigravityUsageText, /Billing provider\s+Google Antigravity/i,
+      'Antigravity billing authority must remain Google when the selected model is Claude');
+    assert.match(antigravityUsageText, /Model vendor\s+Anthropic/i);
+    await page.keyboard.press('Escape');
+
+    if (requestedStormMs > 0) {
+      const stormSessionIds = sessions.map(session => session.session_id);
+      const refreshesBeforeStorm = providerRefreshRequests;
+      const initialStormSnapshot = providerUsageFixture();
+      initialStormSnapshot.generation = 100;
+      initialStormSnapshot.generated_at = new Date().toISOString();
+      broadcastProviderUsage(initialStormSnapshot);
+      await page.waitForTimeout(50);
+      await page.evaluate(() => {
+        const cards = [...document.querySelectorAll('.session-card[data-session-id]')];
+        window.__sessionUsageStorm = {
+          cards: new Map(cards.map(node => [node.dataset.sessionId, node])),
+          mini: document.querySelector('[data-testid="session-usage-mini"]'),
+          title: document.querySelector('.topbar-title-group'),
+          topbarCls: 0,
+          topbarShiftSources: [],
+        };
+        window.__sessionUsageStorm.observer = new PerformanceObserver(list => {
+          for (const entry of list.getEntries()) {
+            const topbarShifted = (entry.sources || []).some(source => source.node?.closest?.('.topbar'));
+            if (!entry.hadRecentInput && topbarShifted) {
+              window.__sessionUsageStorm.topbarCls += entry.value;
+              if (window.__sessionUsageStorm.topbarShiftSources.length < 24) {
+                window.__sessionUsageStorm.topbarShiftSources.push({
+                  value: entry.value,
+                  nodes: (entry.sources || []).filter(source => source.node?.closest?.('.topbar')).map(source => ({
+                    tag: source.node.tagName,
+                    className: String(source.node.className || ''),
+                    text: String(source.node.textContent || '').replace(/\s+/g, ' ').trim().slice(0, 100),
+                  })),
+                });
+              }
+            }
+          }
+        });
+        window.__sessionUsageStorm.observer.observe({ type: 'layout-shift', buffered: false });
+        window.__sessionUsageStorm.mini?.querySelector('button')?.focus({ preventScroll: true });
+      });
+      const startedAt = Date.now();
+      const renderSamples = [];
+      let switches = 0;
+      let providerUpdates = 1;
+      let reconnects = 0;
+      let identityFailures = 0;
+      let focusFailures = 0;
+      let activeSelectionFailures = 0;
+      let titleMovementPx = 0;
+      let miniMovementPx = 0;
+      let healthMovementPx = 0;
+      let nextReconnectAt = requestedStormMs / 3;
+      let nextProviderAt = 1_000;
+      let lastGeneration = 100;
+      const initialTitlePosition = await page.locator('.topbar-title-group').evaluate(node => {
+        const box = node.getBoundingClientRect();
+        return { left: box.left, top: box.top };
+      });
+      const initialMetaPositions = await page.evaluate(() => {
+        const position = selector => {
+          const box = document.querySelector(selector)?.getBoundingClientRect();
+          return box ? { left: box.left, top: box.top, width: box.width, height: box.height } : null;
+        };
+        return {
+          mini: position('[data-testid="session-usage-mini"]'),
+          health: position('.topbar-proxy-health'),
+          meta: position('.topbar-meta'),
+        };
+      });
+      while (Date.now() - startedAt < requestedStormMs) {
+        const elapsed = Date.now() - startedAt;
+        if (elapsed >= nextProviderAt) {
+          lastGeneration += 1;
+          const update = providerUsageFixture();
+          update.generation = lastGeneration;
+          update.generated_at = new Date().toISOString();
+          broadcastProviderUsage(update);
+          providerUpdates += 1;
+          nextProviderAt += 1_000;
+        }
+        if (elapsed >= nextReconnectAt && reconnects < 2) {
+          for (const client of [...fixtureClients]) client.close(1012, 'formal usage storm reconnect');
+          reconnects += 1;
+          nextReconnectAt += requestedStormMs / 3;
+        }
+        const sessionId = stormSessionIds[switches % stormSessionIds.length];
+        const sample = await page.evaluate(async id => {
+          const state = window.__sessionUsageStorm;
+          const node = document.querySelector(`.session-card[data-session-id="${CSS.escape(id)}"]`);
+          const started = performance.now();
+          node?.click();
+          await new Promise(resolve => setTimeout(resolve, 0));
+          const renderDuration = performance.now() - started;
+          const titleBox = document.querySelector('.topbar-title-group')?.getBoundingClientRect();
+          const currentMini = document.querySelector('[data-testid="session-usage-mini"]');
+          const identityStable = state.cards.get(id) === node && state.mini === currentMini;
+          const focused = document.activeElement === currentMini?.querySelector('button');
+          return {
+            renderDuration,
+            activeSessionId: document.querySelector('.session-card.active')?.dataset.sessionId || null,
+            identityStable,
+            focused,
+            titleLeft: titleBox?.left ?? null,
+            titleTop: titleBox?.top ?? null,
+            miniBox: (() => { const box = currentMini?.getBoundingClientRect(); return box ? { left: box.left, top: box.top, width: box.width, height: box.height } : null; })(),
+            healthBox: (() => { const box = document.querySelector('.topbar-proxy-health')?.getBoundingClientRect(); return box ? { left: box.left, top: box.top, width: box.width, height: box.height } : null; })(),
+          };
+        }, sessionId);
+        renderSamples.push(sample.renderDuration);
+        if (!sample.identityStable) identityFailures += 1;
+        if (!sample.focused) focusFailures += 1;
+        if (sample.activeSessionId !== sessionId) activeSelectionFailures += 1;
+        if (sample.titleLeft != null) {
+          titleMovementPx = Math.max(
+            titleMovementPx,
+            Math.abs(sample.titleLeft - initialTitlePosition.left),
+            Math.abs(sample.titleTop - initialTitlePosition.top),
+          );
+        }
+        if (sample.miniBox && initialMetaPositions.mini) {
+          miniMovementPx = Math.max(miniMovementPx,
+            Math.abs(sample.miniBox.left - initialMetaPositions.mini.left),
+            Math.abs(sample.miniBox.top - initialMetaPositions.mini.top),
+            Math.abs(sample.miniBox.width - initialMetaPositions.mini.width),
+            Math.abs(sample.miniBox.height - initialMetaPositions.mini.height));
+        }
+        if (sample.healthBox && initialMetaPositions.health) {
+          healthMovementPx = Math.max(healthMovementPx,
+            Math.abs(sample.healthBox.left - initialMetaPositions.health.left),
+            Math.abs(sample.healthBox.top - initialMetaPositions.health.top),
+            Math.abs(sample.healthBox.width - initialMetaPositions.health.width),
+            Math.abs(sample.healthBox.height - initialMetaPositions.health.height));
+        }
+        switches += 1;
+        const nextTickAt = startedAt + switches * 100;
+        const delay = nextTickAt - Date.now();
+        if (delay > 0) await new Promise(resolve => setTimeout(resolve, delay));
+      }
+      const durationMs = Date.now() - startedAt;
+      const finalGoodSnapshot = currentProviderUsage;
+      broadcastProviderUsage({
+        ...finalGoodSnapshot,
+        generation: Math.max(0, lastGeneration - 1),
+        generated_at: new Date(Date.now() + 1_000).toISOString(),
+      }, { cache: false });
+      await page.waitForTimeout(100);
+      await page.evaluate(() => document.querySelector('.session-card[data-session-id="usage-codex-primary"]')?.click());
+      await page.waitForFunction(() => document.querySelector('.session-card.active')?.dataset.sessionId === 'usage-codex-primary');
+      const finalMini = page.locator('[data-testid="session-usage-mini"]');
+      await finalMini.locator('.session-usage-mini-trigger').click();
+      const finalPopover = page.locator('#session-usage-popover');
+      await finalPopover.waitFor({ state: 'visible' });
+      const finalGenerationText = await finalPopover.locator('.session-usage-popover-source').innerText();
+      assert.match(finalGenerationText, new RegExp(`Generation\\s+${lastGeneration}\\b`),
+        `stale provider generation regressed the mini monitor: ${finalGenerationText}`);
+      await page.keyboard.press('Escape');
+      const stormDom = await page.evaluate(() => {
+        const state = window.__sessionUsageStorm;
+        state.observer?.disconnect();
+        return {
+          topbarCls: state.topbarCls,
+          topbarShiftSources: state.topbarShiftSources,
+          cardIdentityStable: [...state.cards].every(([id, node]) => (
+            document.querySelector(`.session-card[data-session-id="${CSS.escape(id)}"]`) === node
+          )),
+          miniIdentityStable: state.mini === document.querySelector('[data-testid="session-usage-mini"]'),
+        };
+      });
+      const sortedRenderSamples = [...renderSamples].sort((left, right) => left - right);
+      const renderP95 = sortedRenderSamples[Math.max(0, Math.ceil(sortedRenderSamples.length * 0.95) - 1)] || 0;
+      assert(durationMs >= requestedStormMs, `formal usage storm ended early at ${durationMs}ms`);
+      assert.strictEqual(providerRefreshRequests, refreshesBeforeStorm,
+        'session header storm must issue zero per-session collector refresh requests');
+      assert.strictEqual(reconnects, 2, `formal usage storm completed ${reconnects} reconnects`);
+      assert.strictEqual(identityFailures, 0, `formal usage storm observed ${identityFailures} sampled remounts`);
+      assert.strictEqual(focusFailures, 0, `formal usage storm observed ${focusFailures} focus losses`);
+      assert.strictEqual(activeSelectionFailures, 0, `formal usage storm observed ${activeSelectionFailures} selection failures`);
+      assert.strictEqual(stormDom.cardIdentityStable, true, 'formal usage storm remounted a session card');
+      assert.strictEqual(stormDom.miniIdentityStable, true, 'formal usage storm remounted the mini usage monitor');
+      assert(stormDom.topbarCls <= 0.001,
+        `formal usage storm topbar CLS ${stormDom.topbarCls} exceeded zero budget: miniMovement=${miniMovementPx} healthMovement=${healthMovementPx} initial=${JSON.stringify(initialMetaPositions)} sources=${JSON.stringify(stormDom.topbarShiftSources)}`);
+      assert(titleMovementPx <= 0.5, `formal usage storm moved the chat title by ${titleMovementPx}px`);
+      assert(renderP95 <= 16, `formal usage storm projection/render p95 ${renderP95}ms exceeded 16ms`);
+      sessionHeaderStorm = {
+        requested_duration_ms: requestedStormMs,
+        duration_ms: durationMs,
+        sessions: stormSessionIds.length,
+        switches,
+        provider_updates: providerUpdates,
+        reconnects,
+        collector_refresh_requests: providerRefreshRequests - refreshesBeforeStorm,
+        duplicate_refresh_requests: 0,
+        stale_generation_regressions: 0,
+        remounts: 0,
+        focus_losses: 0,
+        selection_failures: 0,
+        topbar_cls: stormDom.topbarCls,
+        chat_title_movement_px: titleMovementPx,
+        mini_geometry_movement_px: miniMovementPx,
+        health_geometry_movement_px: healthMovementPx,
+        projection_render_p95_ms: Number(renderP95.toFixed(3)),
+        final_generation: lastGeneration,
+      };
+    }
 
     await loadFixture({ width: 390, height: 844 });
     const mobile = await page.locator('.usage-dashboard').evaluate(node => ({
@@ -529,6 +914,38 @@ async function main() {
     if (screenshotDir) {
       await page.screenshot({ path: path.join(screenshotDir, 'usage-dashboard-mobile-390.png'), fullPage: true });
     }
+    await page.locator('[data-testid="usage-dashboard"] .automations-back').click();
+    const mobileMini = page.locator('[data-testid="session-usage-mini"]');
+    await mobileMini.waitFor({ state: 'visible' });
+    const mobileMiniGeometry = await mobileMini.evaluate(node => {
+      const box = node.getBoundingClientRect();
+      return {
+        left: box.left, right: box.right, width: box.width,
+        viewportOverflow: document.documentElement.scrollWidth - document.documentElement.clientWidth,
+      };
+    });
+    assert(mobileMiniGeometry.viewportOverflow <= 1,
+      `390px session header overflowed by ${mobileMiniGeometry.viewportOverflow}px`);
+    assert(mobileMiniGeometry.left >= -1 && mobileMiniGeometry.right <= 391,
+      `390px mini usage monitor escaped viewport: ${JSON.stringify(mobileMiniGeometry)}`);
+    assert(mobileMiniGeometry.width <= 104,
+      `390px mini usage monitor did not use compact geometry: ${JSON.stringify(mobileMiniGeometry)}`);
+    if (screenshotDir) {
+      await page.screenshot({ path: path.join(screenshotDir, 'session-usage-mini-mobile-390.png'), fullPage: true });
+    }
+    await mobileMini.locator('.session-usage-mini-trigger').click();
+    const mobilePopover = page.locator('#session-usage-popover');
+    await mobilePopover.waitFor({ state: 'visible' });
+    const mobilePopoverGeometry = await mobilePopover.evaluate(node => {
+      const box = node.getBoundingClientRect();
+      return { left: box.left, right: box.right, top: box.top, bottom: box.bottom, width: box.width };
+    });
+    assert(mobilePopoverGeometry.left >= -1 && mobilePopoverGeometry.right <= 391,
+      `390px usage popover escaped viewport: ${JSON.stringify(mobilePopoverGeometry)}`);
+    if (screenshotDir) {
+      await page.screenshot({ path: path.join(screenshotDir, 'session-usage-popover-mobile-390.png'), fullPage: true });
+    }
+    await page.keyboard.press('Escape');
 
     await page.evaluate(() => localStorage.setItem('remote-agent-chat-theme', 'light'));
     await loadFixture({ width: 1280, height: 900 });
@@ -560,20 +977,31 @@ async function main() {
       new_windows_opened: 0,
       focus_actions: 0,
       external_sends_or_controls: 0,
-      provider_cards: 3,
-      provider_accounts: 3,
-      reporting_accounts: 3,
-      warning_accounts: 2,
-      exhausted_accounts: 1,
+      provider_cards: 4,
+      provider_accounts: 4,
+      reporting_accounts: 4,
+      warning_accounts: 1,
+      exhausted_accounts: 2,
       desktop_overflow_px: desktopOverflow,
       mobile,
       light_desktop_overflow_px: lightDesktopOverflow,
       light_mobile_overflow_px: lightMobileOverflow,
       light_and_dark_checked: true,
-      official_provider_marks_loaded: 3,
+      official_provider_marks_loaded: 4,
       provider_mark_fallbacks: 0,
       no_session_jump_and_header_chip_preserved: true,
-      schema_version: 2,
+      sidebar_warning_reset_visible: true,
+      sidebar_usage_limited_state_visible: true,
+      active_usage_reset_visible: true,
+      session_header_projection: true,
+      session_header_focus_return: true,
+      session_header_mobile_390: mobileMiniGeometry,
+      session_header_mobile_popover_390: mobilePopoverGeometry,
+      antigravity_billing_model_separation: true,
+      session_header_formal_storm: sessionHeaderStorm,
+      schema_version: 4,
+      ollama_cloud_and_local: true,
+      ollama_zero_balance_exact: true,
       predictive_pace_windows: await page.locator('.usage-pace').count(),
       safe_budget_groups: await page.locator('.usage-pace-budgets').count(),
       scoped_claude_lane: 'Fable weekly',
@@ -587,6 +1015,11 @@ async function main() {
       route_activation_p95_ms: activationP95,
       refresh_cls: refreshCls,
       provider_refresh_requests: providerRefreshRequests,
+      reset_credit_prompt: '2 limit resets available — apply one?',
+      reset_credit_requests: resetCreditRequests,
+      reset_credit_approved: lastResetCreditRequest?.approved === true,
+      reset_credit_outcome: 'reset',
+      real_reset_credit_consumed: false,
       visual_controls_triggered_provider_calls: 0,
       provider_lifecycle_without_false_zero: true,
       cost_lifecycle_without_false_zero: true,

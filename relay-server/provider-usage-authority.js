@@ -76,7 +76,7 @@ class ProviderUsageAuthority {
           identity,
           cycleKey,
           threshold,
-          warningThreshold: Number(window?.thresholds?.warning_percent) || 80,
+          warningThreshold: Number(window?.thresholds?.warning_percent) || 75,
           criticalThreshold: Number(window?.thresholds?.critical_percent) || 90,
           hardLimited,
           percentUsed,

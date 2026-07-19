@@ -24,6 +24,7 @@ for (const marker of [
   'Paginated local cost detail',
   'Open dashboard',
   'formatProviderUsageReset(window.resetsAt',
+  'Next refresh {formatProviderUsageReset(entry.nextRefreshAt',
   'Local estimated API-equivalent cost',
   "normalizedProviderUsage.collectionState === 'not-started'",
   'normalizedProviderUsage.summaryAuthoritative',
@@ -34,6 +35,9 @@ for (const marker of [
   'window.pace.category',
   'window.thresholds.warningPercent',
   'accessibilityLabel="Ollama owned request metrics"',
+  'accessibilityLabel="Ollama Cloud usage"',
+  'accessibilityLabel="Ollama Cloud usage unavailable"',
+  'accessibilityLabel="Ollama Cloud no subscription"',
   'formatOllamaTokenRate(entry.localRuntime.latestRequest.tokensPerSecond)',
   'formatOllamaDuration(entry.localRuntime.latestRequest.promptEvalDurationNs)',
   'usagePaceBudgets',
@@ -55,6 +59,7 @@ const result = {
   provider_account_aggregation: true,
   live_provider_snapshot_updates: true,
   all_windows_and_reset_capacity: true,
+  source_age_and_next_refresh: true,
   warning_and_exhausted_states: true,
   collapsible_expanded_cards: true,
   arbitrary_session_jump_removed: true,
@@ -71,6 +76,7 @@ const result = {
   official_provider_marks: true,
   provider_mark_text_fallback: true,
   ollama_owned_request_metrics: true,
+  ollama_cloud_usage_states: true,
 };
 const outputIndex = process.argv.indexOf('--output');
 if (outputIndex >= 0 && process.argv[outputIndex + 1]) {

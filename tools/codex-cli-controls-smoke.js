@@ -136,6 +136,8 @@ assert.match(codexSource, /buildNativeCodexWindowPowerShell\(\{ cwd, launcherPat
 assert.match(codexSource, /'-ArgumentList', `\$\{quotePowerShellString\('\/k'\)\}, \$\{quotePowerShellString\(launcherPath\)\}`/);
 assert.match(codexSource, /startNativeCodexWindow\(\{[\s\S]*?elevated = false/);
 assert.match(codexSource, /default-terminal[\s\S]*?windowsHide: false/);
+assert.match(codexSource, /assertOperatorForegroundLaunch\(\{ operatorActionProof, requestId \}\)/,
+  'visible Codex launch must consume a request-bound operator proof before spawning');
 assert.match(codexSource, /const resolved = resolveCodexCommand\(\);[\s\S]*?resolved\.command, \.\.\.resolved\.argsPrefix, \.\.\.args/);
 assert.match(codexSource, /'-PassThru', '\|', 'Select-Object', '-ExpandProperty', 'Id'/);
 assert.match(codexSource, /const result = spawnSync\('powershell\.exe'/);

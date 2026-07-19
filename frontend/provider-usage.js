@@ -105,6 +105,24 @@ function normalizeLocalRuntime(value) {
   };
 }
 
+function normalizeCloudUsage(value) {
+  if (!value || typeof value !== 'object') return null;
+  const subscriptionState = ['active', 'none', 'unavailable'].includes(value.subscription_state)
+    ? value.subscription_state : 'unavailable';
+  return {
+    subscriptionState,
+    source: String(value.source || ''),
+    capturedAt: String(value.captured_at || ''),
+    autoReloadEnabled: typeof value.auto_reload_enabled === 'boolean' ? value.auto_reload_enabled : null,
+    error: value.error && typeof value.error === 'object' ? {
+      code: String(value.error.code || ''),
+      message: String(value.error.message || ''),
+    } : null,
+    sourceReceipt: value.source_receipt && typeof value.source_receipt === 'object'
+      ? { ...value.source_receipt } : null,
+  };
+}
+
 function normalizePace(value) {
   if (!value || typeof value !== 'object') return null;
   const category = ['slow', 'steady', 'racing', 'burning'].includes(value.category) ? value.category : '';
@@ -128,7 +146,7 @@ function normalizedWindow(window, index) {
   const usedPercent = finitePercent(window?.used_percent);
   const status = String(window?.status || (usedPercent == null ? 'unavailable' : 'available'));
   if (usedPercent == null && status !== 'unavailable') return null;
-  const warningThreshold = finitePercent(window?.thresholds?.warning_percent) ?? 80;
+  const warningThreshold = finitePercent(window?.thresholds?.warning_percent) ?? 75;
   const criticalThreshold = Math.max(warningThreshold, finitePercent(window?.thresholds?.critical_percent) ?? 90);
   const normalized = {
     id: String(window?.id || `window-${index + 1}`),
@@ -190,11 +208,13 @@ function normalizeEntry(snapshot, index) {
     status: String(snapshot?.status || 'unavailable'),
     capturedAt: snapshot?.captured_at ? String(snapshot.captured_at) : '',
     staleAfter: snapshot?.stale_after ? String(snapshot.stale_after) : '',
+    nextRefreshAt: snapshot?.next_refresh_at ? String(snapshot.next_refresh_at) : '',
     lastGoodCapturedAt: snapshot?.last_good_captured_at ? String(snapshot.last_good_captured_at) : '',
     windows,
     credits: snapshot?.credits && typeof snapshot.credits === 'object' ? snapshot.credits : null,
     financials: normalizeFinancials(snapshot?.financials),
     localRuntime: normalizeLocalRuntime(snapshot?.local_runtime),
+    cloudUsage: normalizeCloudUsage(snapshot?.cloud_usage),
     resetCredits: snapshot?.reset_credits && typeof snapshot.reset_credits === 'object' ? snapshot.reset_credits : null,
     error: snapshot?.error && typeof snapshot.error === 'object' ? snapshot.error : null,
     requestCount: Math.max(0, Number(snapshot?.request_count) || 0),
@@ -226,7 +246,7 @@ export function normalizeProviderUsage(payload) {
   ));
   const providerIds = new Set(entries.map(entry => entry.providerId));
   const reporting = entries.filter(entry => (
-    entry.windows.length > 0 || entry.credits || entry.resetCredits || entry.financials || entry.localRuntime
+    entry.windows.length > 0 || entry.credits || entry.resetCredits || entry.financials || entry.localRuntime || entry.cloudUsage
   )).length;
   const nearLimit = entries.filter(entry => (
     ['warning', 'critical'].includes(entry.tone) && entry.maximumUsedPercent < 100
@@ -267,6 +287,22 @@ export function normalizeProviderUsage(payload) {
       exhausted,
     },
   };
+}
+
+export function retainNewerProviderUsage(previous, incoming) {
+  if (!incoming || typeof incoming !== 'object') return previous;
+  if (!previous || typeof previous !== 'object') return incoming;
+  const previousGeneration = Math.max(0, Number(previous.generation) || 0);
+  const incomingGeneration = Math.max(0, Number(incoming.generation) || 0);
+  if (incomingGeneration < previousGeneration) return previous;
+  const previousSnapshots = Array.isArray(previous.snapshots) ? previous.snapshots : [];
+  const incomingSnapshots = Array.isArray(incoming.snapshots) ? incoming.snapshots : [];
+  if (incomingGeneration === previousGeneration && previousSnapshots.length > 0 && incomingSnapshots.length === 0) {
+    return incoming.in_flight === true && previous.in_flight !== true
+      ? { ...previous, in_flight: true }
+      : previous;
+  }
+  return incoming;
 }
 
 function costRows(value) {

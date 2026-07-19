@@ -41,7 +41,7 @@ export default function ErrorPrompt({ prompt, blocking, onAction }) {
               style={[s.action, action?.style === 'danger' && s.actionDanger, pending && s.actionPending]}
               activeOpacity={0.75}
               disabled={!!submittingActionId}
-              onPress={() => onAction(prompt.prompt_id, actionId)}
+              onPress={event => onAction(prompt.prompt_id, actionId, event)}
               accessibilityRole="button"
               accessibilityState={{ disabled: !!submittingActionId, busy: pending }}
             >

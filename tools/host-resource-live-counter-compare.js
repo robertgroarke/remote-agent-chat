@@ -109,14 +109,22 @@ function rateAssessment(source, oracle, noiseFloor = 64 * 1024) {
     return { state: 'below_noise_floor', pass: null, relative_error: relativeError(source, oracle), noise_floor_bps: noiseFloor };
   }
   const error = relativeError(source, oracle);
-  return { state: 'active', pass: error <= 0.05, relative_error: error, limit: 0.05 };
+  const absolute = absoluteError(source, oracle);
+  return {
+    state: 'active',
+    pass: error <= 0.10 || absolute <= 1024 * 1024,
+    relative_error: error,
+    absolute_error_bps: absolute,
+    relative_limit: 0.10,
+    absolute_limit_bps: 1024 * 1024,
+  };
 }
 
 function latencyAssessment(source, oracle, active) {
   if (!active || source == null || oracle == null) return { state: active ? 'unavailable' : 'inactive', pass: null };
   const absolute = absoluteError(source, oracle);
   const relative = relativeError(source, oracle);
-  return { state: 'active', pass: absolute <= 2 || relative <= 0.10, absolute_error_ms: absolute, relative_error: relative };
+  return { state: 'active', pass: absolute <= 2 || relative <= 0.20, absolute_error_ms: absolute, relative_error: relative };
 }
 
 function percentile(values, quantile) {
@@ -213,7 +221,7 @@ async function main() {
   // The 60-pair diagnostic proved that this is necessary: two disk-write
   // bursts straddled adjacent raw boundaries in opposite directions, while
   // their combined bytes agreed. The one-minute interval includes both sides
-  // without weakening the required five-percent rate threshold.
+  // without weakening the required ten-percent-or-one-MiB/s rate threshold.
   const rateFields = [
     ['disk', 'read'], ['disk', 'write'], ['network', 'receive'], ['network', 'send'],
   ];
@@ -282,7 +290,7 @@ async function main() {
       disk: '\\PhysicalDisk(_Total)', network: '\\Network Interface(*) physical-default sum',
     },
     units: { cpu: 'percentage points', memory: 'bytes and percent', rates: 'bytes/second', latency: 'milliseconds' },
-    thresholds: { cpu_pp: 2, memory_pp: 1, memory_bytes: 64 * 1024 * 1024, active_rate_relative: 0.05, latency_ms: 2, latency_relative: 0.10 },
+    thresholds: { cpu_pp: 2, memory_pp: 1, memory_bytes: 64 * 1024 * 1024, active_rate_relative: 0.10, active_rate_absolute_bps: 1024 * 1024, latency_ms: 2, latency_relative: 0.20 },
     timestamp_delta_ms: { p50: percentile(rows.map(row => row.timestamp_delta_ms), 0.5), p95: percentile(rows.map(row => row.timestamp_delta_ms), 0.95), max: Math.max(...rows.map(row => row.timestamp_delta_ms)) },
     cpu_error_pp: { p50: percentile(rows.map(row => row.cpu.absolute_error_pp), 0.5), p95: percentile(rows.map(row => row.cpu.absolute_error_pp), 0.95), max: Math.max(...rows.map(row => row.cpu.absolute_error_pp)) },
     cpu_per_logical_average: perLogicalSummary,

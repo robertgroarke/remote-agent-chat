@@ -110,6 +110,21 @@ function safeText(value, maxLength = 80) {
     .slice(0, maxLength);
 }
 
+function publicCollectorFailure(error) {
+  const code = safeText(error?.code, 48) || 'collector_failure';
+  const messages = {
+    detail_timeout: 'The Windows detail collector timed out; aggregate CPU/RAM fallback is active.',
+    startup_timeout: 'The Windows detail collector did not become ready; aggregate CPU/RAM fallback is active.',
+    invalid_json_threshold: 'The Windows detail collector lost output framing; aggregate CPU/RAM fallback is active.',
+    line_limit: 'The Windows detail collector exceeded its output limit; aggregate CPU/RAM fallback is active.',
+    unexpected_exit: 'The Windows detail collector exited; aggregate CPU/RAM fallback is active.',
+  };
+  return {
+    code: messages[code] ? code : 'collector_failure',
+    message: messages[code] || 'The Windows detail collector failed; aggregate CPU/RAM fallback is active.',
+  };
+}
+
 function safeCounterString(value) {
   if (typeof value === 'bigint') return value >= 0n ? value.toString() : '0';
   const text = String(value == null ? '' : value).trim();
@@ -605,6 +620,8 @@ class HostResourceMonitor {
     this.lastCollectedAt = 0;
     this.lastCapturedAt = 0;
     this.lastDetailAt = 0;
+    this.lastGoodDetailAt = 0;
+    this.lastDetailFailure = null;
     this.lastDetailRaw = null;
     this.lastFastRaw = null;
     this.sampleSequence = 0;
@@ -681,6 +698,8 @@ class HostResourceMonitor {
     this.lastFastRaw = null;
     this.lastCollectedAt = 0;
     this.lastDetailAt = 0;
+    this.lastGoodDetailAt = 0;
+    this.lastDetailFailure = null;
     this.history.clear();
     void this.warmCollector?.stop();
   }
@@ -760,17 +779,30 @@ class HostResourceMonitor {
             ? this.lastFastRaw : this._captureFast();
           const needsDetail = options.forceDetail === true || !this.lastDetailRaw
             || now - this.lastDetailAt >= this.detailIntervalMs;
+          let detailFailure = this.lastDetailFailure;
           if (needsDetail) {
-            this.lastDetailRaw = await this.collectRaw();
             // Keep the detail lane anchored to collection start. Anchoring at
             // completion adds the collector's own duration to every nominal
             // five-second interval and steadily slows a live subscription.
             this.lastDetailAt = now;
-            detailCollected = true;
+            try {
+              this.lastDetailRaw = await this.collectRaw();
+              this.lastGoodDetailAt = now;
+              this.lastDetailFailure = null;
+              detailFailure = null;
+              detailCollected = true;
+            } catch (error) {
+              this.lastDetailFailure = error;
+              detailFailure = error;
+              this.log('warn', `[resources] Hidden Windows collector failed: ${error?.message || 'unknown error'}`);
+            }
           }
-          return { ...(this.lastDetailRaw || {}), ...(fastRaw || {}) };
+          return {
+            raw: detailFailure ? { ...(fastRaw || {}) } : { ...(this.lastDetailRaw || {}), ...(fastRaw || {}) },
+            detailFailure,
+          };
         })
-        .then(raw => {
+        .then(({ raw, detailFailure }) => {
           const capturedAtMs = startedAt;
           const sampleIntervalMs = previousCapturedAt > 0 ? Math.max(0, capturedAtMs - previousCapturedAt) : 0;
           if (sampleIntervalMs > 1_500) {
@@ -789,7 +821,17 @@ class HostResourceMonitor {
             sampleIntervalMs,
             droppedGapCount: this.droppedGapCount,
             collectionDurationMs: safeNumber(raw?.collection_duration_ms, this.now() - startedAt),
+            aggregateOnly: !!detailFailure,
           });
+          if (detailFailure) {
+            snapshot.error = publicCollectorFailure(detailFailure);
+            snapshot.last_good_captured_at = this.lastGoodDetailAt > 0
+              ? new Date(this.lastGoodDetailAt).toISOString() : null;
+            snapshot.capabilities.unavailable = [
+              ...(snapshot.capabilities.unavailable || []),
+              { metric: 'detail', reason: snapshot.error.message },
+            ];
+          }
           this.sampleSequence = sampleSequence;
           this.lastSnapshot = snapshot;
           this.lastCollectedAt = this.now();
@@ -850,6 +892,8 @@ class HostResourceMonitor {
     this.lastSnapshot = null;
     this.lastDetailRaw = null;
     this.lastFastRaw = null;
+    this.lastGoodDetailAt = 0;
+    this.lastDetailFailure = null;
     this.history.clear();
     return stopPromise || Promise.resolve();
   }
@@ -870,5 +914,6 @@ module.exports = {
   collectWindowsHostResources,
   normalizeHostResourceSnapshot,
   processAttribution,
+  publicCollectorFailure,
   unavailableSnapshot,
 };

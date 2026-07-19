@@ -64,6 +64,17 @@ class SerializedLocks {
   assert.strictEqual(helper.semanticNotificationAllowed(base, { goal_completed: true }), true);
   assert.strictEqual(helper.semanticNotificationAllowed(base, { goal_completed: false }), false);
   assert.strictEqual(helper.semanticNotificationAllowed(base, {}), false);
+  const usageWarning = {
+    ...base,
+    event_type: 'provider_usage_threshold',
+    category: 'provider_usage_warning',
+    dedupe_key: 'provider-usage-threshold:cycle:75',
+    title: 'OpenAI Codex 5-hour has 25% usage left',
+  };
+  assert.strictEqual(helper.normalizeSemanticNotification(usageWarning)?.category, 'provider_usage_warning');
+  assert.strictEqual(helper.semanticNotificationAllowed(usageWarning, { provider_usage_warning: true }), true);
+  assert.strictEqual(helper.semanticNotificationAllowed(usageWarning, { provider_usage_warning: false }), false);
+  assert.strictEqual(helper.normalizeSemanticNotification({ ...usageWarning, category: 'agent_error' }), null);
   assert.strictEqual(helper.mergeSemanticNotifications([base], [base, { ...base, title: 'Goal completed' }]).length, 1);
 
   const storage = new MemoryStorage();
@@ -102,6 +113,8 @@ class SerializedLocks {
   assert(hooks.includes('msg.semantic_notifications'));
   assert(worker.includes('data.dedupe_key'));
   assert(worker.includes('renotify: !semanticType'));
+  assert(worker.includes("'provider_usage_threshold'"));
+  assert(worker.includes("provider_usage_threshold: 'provider_usage_warning'"));
   assert(worker.includes("['agent_idle', 'turn_ready']"));
   assert(worker.includes('/session completed/i'));
 

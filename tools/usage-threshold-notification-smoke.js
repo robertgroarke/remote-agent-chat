@@ -16,20 +16,20 @@ const outputIndex = args.indexOf('--output');
 const outputPath = outputIndex >= 0 && args[outputIndex + 1] ? path.resolve(args[outputIndex + 1]) : null;
 const tracker = new UsageThresholdTracker();
 
-assert.equal(usageThreshold(79, false), null);
-assert.equal(usageThreshold(80, false), 80);
+assert.equal(usageThreshold(74, false), null);
+assert.equal(usageThreshold(75, false), 75);
 assert.equal(usageThreshold(90, false), 90);
 assert.equal(usageThreshold(null, true), 100);
 
-assert.equal(tracker.observe('session-a', { percentUsed: 79, hardLimited: false }), null);
-assert.equal(tracker.observe('session-a', { percentUsed: 80, hardLimited: false }), 80);
+assert.equal(tracker.observe('session-a', { percentUsed: 74, hardLimited: false }), null);
+assert.equal(tracker.observe('session-a', { percentUsed: 75, hardLimited: false }), 75);
 assert.equal(tracker.observe('session-a', { percentUsed: 84, hardLimited: false }), null);
 assert.equal(tracker.observe('session-a', { percentUsed: 91, hardLimited: false }), 90);
 assert.equal(tracker.observe('session-a', { percentUsed: 92, hardLimited: false }), null);
 assert.equal(tracker.observe('session-a', { percentUsed: 100, hardLimited: true }), 100);
 assert.equal(tracker.observe('session-a', { percentUsed: 100, hardLimited: true }), null);
 assert.equal(tracker.clear('session-a').hardLimited, true);
-assert.equal(tracker.observe('session-a', { percentUsed: 82, hardLimited: false }), 80);
+assert.equal(tracker.observe('session-a', { percentUsed: 82, hardLimited: false }), 75);
 
 assert.equal(tracker.observe('session-b', { percentUsed: 95, hardLimited: false }), 90);
 assert.equal(tracker.observe('session-b', { percentUsed: 85, hardLimited: false }), null);
@@ -52,7 +52,7 @@ assert.match(proxySource, /rateLimitActive\(sessionId, untilText, pctUsed, true\
 
 const serialized = `${JSON.stringify({
   ok: true,
-  thresholds: [80, 90, 100],
+  thresholds: [75, 90, 100],
   duplicate_pushes: 0,
   warning_marked_hard_limited: false,
   warning_only_clear_pushes: 0,

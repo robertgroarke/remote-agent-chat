@@ -42,7 +42,7 @@ async function main() {
   assert.equal(before.status, 200, 'bearer GET must succeed');
   const categories = [
     'permission_required', 'turn_ready', 'goal_completed', 'goal_attention',
-    'agent_error', 'session_offline', 'rate_limit_cleared',
+    'provider_usage_warning', 'agent_error', 'session_offline', 'rate_limit_cleared',
     'completion_sound', 'completion_haptic',
   ];
   for (const category of categories) {

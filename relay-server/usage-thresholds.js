@@ -1,6 +1,6 @@
 'use strict';
 
-const WARNING_THRESHOLD = 80;
+const WARNING_THRESHOLD = 75;
 const CRITICAL_THRESHOLD = 90;
 const EXHAUSTED_THRESHOLD = 100;
 function normalizePercentUsed(value) {

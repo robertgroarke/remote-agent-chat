@@ -5,7 +5,7 @@ export const HOST_RESOURCE_COMPACT_HISTORY_LIMIT = 60;
 export const HOST_RESOURCE_STRIP_STALE_MIN_MS = 2_500;
 export const HOST_RESOURCE_PRESSURE_DURATION_MS = 15_000;
 export const HOST_RESOURCE_CHART_RANGES = Object.freeze({
-  live: 30_000,
+  live: 60_000,
   '1m': 60_000,
   '5m': 5 * 60_000,
   '15m': 15 * 60_000,
@@ -136,6 +136,7 @@ export function normalizeHostResources(snapshot) {
       available: false, status: 'waiting', schemaVersion: 0, source: '', capturedAt: '', capturedAtMs: 0,
       sampleSequence: 0, sampleIntervalMs: 0, droppedGapCount: 0, machineLabel: '', system: null,
       processes: [], attributedProcesses: [], sampling: null, privacy: null, capabilities: null, error: null,
+      lastGoodCapturedAt: '', lastGoodCapturedAtMs: 0,
     };
   }
   const rawSystem = snapshot.system && typeof snapshot.system === 'object' ? snapshot.system : null;
@@ -190,6 +191,7 @@ export function normalizeHostResources(snapshot) {
     .sort((left, right) => Number(right.attributed) - Number(left.attributed)
       || right.cpuHostPercent - left.cpuHostPercent || right.memoryBytes - left.memoryBytes || left.pid - right.pid);
   const capturedAt = snapshot.captured_at ? String(snapshot.captured_at) : '';
+  const lastGoodCapturedAt = snapshot.last_good_captured_at ? String(snapshot.last_good_captured_at) : '';
   return {
     available: snapshot.status === 'fresh' && !!system,
     status: String(snapshot.status || 'unavailable'), schemaVersion: Math.max(0, Math.round(finiteNumber(snapshot.schema_version))),
@@ -203,7 +205,26 @@ export function normalizeHostResources(snapshot) {
     privacy: snapshot.privacy && typeof snapshot.privacy === 'object' ? snapshot.privacy : null,
     capabilities: snapshot.capabilities && typeof snapshot.capabilities === 'object' ? snapshot.capabilities : null,
     error: snapshot.error && typeof snapshot.error === 'object' ? snapshot.error : null,
+    lastGoodCapturedAt,
+    lastGoodCapturedAtMs: capturedAtMs(lastGoodCapturedAt),
   };
+}
+
+function median(values, fallback = 0) {
+  const ordered = values.filter(Number.isFinite).sort((left, right) => left - right);
+  if (!ordered.length) return fallback;
+  const middle = Math.floor(ordered.length / 2);
+  return ordered.length % 2
+    ? ordered[middle]
+    : (ordered[middle - 1] + ordered[middle]) / 2;
+}
+
+function niceStep(value) {
+  const positive = Math.max(Number.EPSILON, Number(value) || 0);
+  const exponent = 10 ** Math.floor(Math.log10(positive));
+  const fraction = positive / exponent;
+  const factor = fraction <= 1 ? 1 : fraction <= 2 ? 2 : fraction <= 2.5 ? 2.5 : fraction <= 5 ? 5 : 10;
+  return factor * exponent;
 }
 
 export function normalizeHostResourcePoint(frame) {
@@ -236,6 +257,163 @@ export function normalizeHostResourcePoint(frame) {
       receiveBps: nullableNumber(network.receive_bps), sendBps: nullableNumber(network.send_bps),
       receivePps: nullableNumber(network.receive_pps), sendPps: nullableNumber(network.send_pps),
     },
+  };
+}
+
+export function hostResourceTimeline(frames, options = {}) {
+  const incoming = Array.isArray(frames) ? frames : [];
+  const bySequence = new Map();
+  let duplicateSequenceCount = 0;
+  let outOfOrderSequenceCount = 0;
+  let maximumSeenSequence = 0;
+  for (const frame of incoming) {
+    const sequence = Number(frame?.sample_sequence);
+    if (!Number.isSafeInteger(sequence) || sequence < 1) continue;
+    if (sequence < maximumSeenSequence) outOfOrderSequenceCount += 1;
+    maximumSeenSequence = Math.max(maximumSeenSequence, sequence);
+    if (bySequence.has(sequence)) duplicateSequenceCount += 1;
+    else bySequence.set(sequence, frame);
+  }
+  const ordered = [...bySequence.values()].sort((left, right) => left.sample_sequence - right.sample_sequence);
+  const rawPoints = ordered.map(frame => ({ frame, point: normalizeHostResourcePoint(frame) })).filter(row => row.point);
+  const anchor = rawPoints.find(row => row.point.capturedAtMs > 0 && row.point.monotonicMs > 0) || null;
+  const candidateRows = rawPoints.map(row => {
+    const monotonicTime = anchor && row.point.monotonicMs > 0
+      ? anchor.point.capturedAtMs + row.point.monotonicMs - anchor.point.monotonicMs
+      : 0;
+    return {
+      ...row,
+      chartTimeMs: monotonicTime > 0 ? monotonicTime : row.point.capturedAtMs,
+    };
+  });
+  const positiveIntervals = [];
+  for (let index = 1; index < candidateRows.length; index += 1) {
+    const delta = candidateRows[index].chartTimeMs - candidateRows[index - 1].chartTimeMs;
+    if (delta > 0 && delta <= 10_000) positiveIntervals.push(delta);
+  }
+  const advertisedCadences = candidateRows.map(row => row.point.sampleIntervalMs).filter(value => value > 0);
+  const cadenceMs = Math.max(1, Math.round(median(positiveIntervals, median(advertisedCadences, 1_000)) || 1_000));
+  const gapThresholdMs = Math.max(2_500, cadenceMs * 2.5);
+  const rows = [];
+  const gaps = [];
+  let invalidTimestampCount = 0;
+  let duplicateTimestampCount = 0;
+  let outOfOrderTimestampCount = 0;
+  let clockDiscontinuityCount = 0;
+  let monotonicResetCount = 0;
+  let chartTimeOffsetMs = 0;
+  for (const rawCandidate of candidateRows) {
+    const candidate = { ...rawCandidate, chartTimeMs: rawCandidate.chartTimeMs + chartTimeOffsetMs };
+    if (!(candidate.chartTimeMs > 0)) {
+      invalidTimestampCount += 1;
+      continue;
+    }
+    const previous = rows.at(-1);
+    let monotonicReset = false;
+    if (previous && candidate.point.monotonicMs > 0 && previous.point.monotonicMs > 0
+      && candidate.point.monotonicMs < previous.point.monotonicMs) {
+      const wallDelta = candidate.point.capturedAtMs - previous.point.capturedAtMs;
+      const rebasedDelta = wallDelta > 0 && wallDelta <= 10_000 ? wallDelta : cadenceMs;
+      const rebasedTime = previous.chartTimeMs + Math.max(1, rebasedDelta);
+      chartTimeOffsetMs += rebasedTime - candidate.chartTimeMs;
+      candidate.chartTimeMs = rebasedTime;
+      monotonicReset = true;
+      monotonicResetCount += 1;
+    }
+    if (previous && candidate.chartTimeMs <= previous.chartTimeMs) {
+      if (candidate.chartTimeMs === previous.chartTimeMs) duplicateTimestampCount += 1;
+      else outOfOrderTimestampCount += 1;
+      continue;
+    }
+    let gapBefore = candidate.point.status !== 'fresh';
+    let gapReason = gapBefore ? 'unavailable' : '';
+    if (previous) {
+      const timeDelta = candidate.chartTimeMs - previous.chartTimeMs;
+      const sequenceDelta = candidate.point.sampleSequence - previous.point.sampleSequence;
+      const droppedDelta = candidate.point.droppedGapCount - previous.point.droppedGapCount;
+      if (sequenceDelta !== 1 || droppedDelta > 0 || timeDelta > gapThresholdMs) {
+        gapBefore = true;
+        gapReason = sequenceDelta !== 1 || droppedDelta > 0 ? 'dropped' : 'cadence';
+      }
+      if (monotonicReset) {
+        clockDiscontinuityCount += 1;
+        gapBefore = true;
+        gapReason = 'clock_discontinuity';
+      } else if (candidate.point.monotonicMs > 0 && previous.point.monotonicMs > 0
+        && candidate.point.capturedAtMs > 0 && previous.point.capturedAtMs > 0) {
+        const wallDelta = candidate.point.capturedAtMs - previous.point.capturedAtMs;
+        const monotonicDelta = candidate.point.monotonicMs - previous.point.monotonicMs;
+        if (Math.abs(wallDelta - monotonicDelta) > Math.max(5_000, cadenceMs * 2)) {
+          clockDiscontinuityCount += 1;
+          gapBefore = true;
+          gapReason = 'clock_discontinuity';
+        }
+      }
+      if (gapBefore) gaps.push({
+        startMs: previous.chartTimeMs,
+        endMs: candidate.chartTimeMs,
+        reason: gapReason,
+        previousSequence: previous.point.sampleSequence,
+        nextSequence: candidate.point.sampleSequence,
+      });
+    }
+    rows.push({ ...candidate, gapBefore, gapReason });
+  }
+  const nowMs = Number.isFinite(Number(options.nowMs)) ? Number(options.nowMs) : Date.now();
+  const latest = rows.at(-1) || null;
+  const latestAgeMs = latest ? Math.max(0, nowMs - latest.chartTimeMs) : Infinity;
+  const staleAfterMs = Math.max(HOST_RESOURCE_STRIP_STALE_MIN_MS, cadenceMs * 2);
+  const delayedAfterMs = Math.max(staleAfterMs * 4, 10_000);
+  let status = 'waiting';
+  if (options.paused) status = 'paused';
+  else if (options.connected === false || options.subscriptionStatus === 'reconnecting') status = 'reconnecting';
+  else if (!latest) status = options.error ? 'unavailable' : 'waiting';
+  else if (latest.point.status !== 'fresh') status = 'unavailable';
+  else if (latestAgeMs > delayedAfterMs) status = 'stale';
+  else if (latestAgeMs > staleAfterMs) status = 'delayed';
+  else status = 'live';
+  if (latest && latestAgeMs > staleAfterMs && !options.paused) gaps.push({
+    startMs: latest.chartTimeMs,
+    endMs: nowMs,
+    reason: status,
+    previousSequence: latest.point.sampleSequence,
+    nextSequence: null,
+  });
+  const elapsedMs = rows.length > 1 ? rows.at(-1).chartTimeMs - rows[0].chartTimeMs : 0;
+  const expectedEndMs = latest && !options.paused ? Math.max(latest.chartTimeMs, nowMs) : latest?.chartTimeMs || 0;
+  const expectedElapsedMs = rows.length ? Math.max(0, expectedEndMs - rows[0].chartTimeMs) : 0;
+  const expectedCount = rows.length ? Math.max(1, Math.floor(expectedElapsedMs / cadenceMs) + 1) : 0;
+  const explicitDropped = rows.length
+    ? Math.max(0, rows.at(-1).point.droppedGapCount - rows[0].point.droppedGapCount)
+    : 0;
+  const normalizedFrames = rows.map(row => ({
+    ...row.frame,
+    chart_time_ms: row.chartTimeMs,
+    gap_before: row.gapBefore,
+    gap_reason: row.gapReason,
+  }));
+  return {
+    frames: normalizedFrames,
+    points: rows.map(row => ({ ...row.point, chartTimeMs: row.chartTimeMs, gapBefore: row.gapBefore, gapReason: row.gapReason })),
+    gaps,
+    status,
+    cadenceMs,
+    staleAfterMs,
+    latestAgeMs,
+    nowMs,
+    startMs: rows[0]?.chartTimeMs || 0,
+    endMs: rows.at(-1)?.chartTimeMs || 0,
+    elapsedMs,
+    expectedCount,
+    receivedCount: incoming.length,
+    validCount: rows.filter(row => row.point.status === 'fresh').length,
+    droppedCount: Math.max(explicitDropped, Math.max(0, expectedCount - rows.length)),
+    gapCount: gaps.length,
+    duplicateCount: duplicateSequenceCount + duplicateTimestampCount,
+    outOfOrderCount: outOfOrderSequenceCount + outOfOrderTimestampCount,
+    invalidTimestampCount,
+    clockDiscontinuityCount,
+    monotonicResetCount,
   };
 }
 
@@ -327,16 +505,56 @@ export function hostResourceIntervalStats(points, metric) {
     frame,
     point: frame?.sampleSequence ? frame : normalizeHostResourcePoint(frame),
     value: hostResourceMetricValue(frame, metric),
-  })).filter(sample => sample.point && sample.value !== null);
-  if (!samples.length) return { current: null, min: null, average: null, max: null, p95: null, peakSequence: null, count: 0 };
+    timeMs: Number(frame?.chartTimeMs ?? frame?.chart_time_ms) || capturedAtMs(frame?.capturedAt ?? frame?.captured_at),
+    gapBefore: frame?.gapBefore === true || frame?.gap_before === true,
+  })).filter(sample => sample.point && sample.value !== null && sample.timeMs > 0)
+    .sort((left, right) => left.timeMs - right.timeMs || left.point.sampleSequence - right.point.sampleSequence);
+  if (!samples.length) return {
+    current: null, min: null, average: null, sampleAverage: null, timeWeightedAverage: null,
+    averageMethod: 'none', max: null, p95: null, provisionalP95: null, p95Ready: false,
+    peakSequence: null, count: 0, elapsedMs: 0, cadenceMs: 0, gapCount: 0,
+  };
   const values = samples.map(sample => sample.value);
   const ordered = [...values].sort((left, right) => left - right);
   const peak = samples.reduce((best, sample) => sample.value > best.value ? sample : best, samples[0]);
+  const sampleAverage = values.reduce((sum, value) => sum + value, 0) / values.length;
+  const intervals = samples.slice(1).map((sample, index) => sample.timeMs - samples[index].timeMs).filter(delta => delta > 0);
+  const cadenceMs = Math.max(0, Math.round(median(intervals, 0)));
+  const gapThresholdMs = Math.max(2_500, cadenceMs * 2.5);
+  let weightedTotal = 0;
+  let weightedDuration = 0;
+  let gapCount = 0;
+  for (let index = 1; index < samples.length; index += 1) {
+    const previous = samples[index - 1];
+    const current = samples[index];
+    const interval = current.timeMs - previous.timeMs;
+    if (current.gapBefore || interval > gapThresholdMs) {
+      gapCount += 1;
+      continue;
+    }
+    weightedTotal += ((previous.value + current.value) / 2) * interval;
+    weightedDuration += interval;
+  }
+  const timeWeightedAverage = weightedDuration > 0 ? weightedTotal / weightedDuration : sampleAverage;
+  const intervalMinimum = intervals.length ? Math.min(...intervals) : 0;
+  const intervalMaximum = intervals.length ? Math.max(...intervals) : 0;
+  const materiallyIrregular = intervalMinimum > 0 && intervalMaximum / intervalMinimum > 1.2;
+  const nearestRankP95 = ordered[Math.max(0, Math.ceil(ordered.length * 0.95) - 1)];
   return {
     current: values.at(-1), min: Math.min(...values),
-    average: values.reduce((sum, value) => sum + value, 0) / values.length,
-    max: Math.max(...values), p95: ordered[Math.max(0, Math.ceil(ordered.length * 0.95) - 1)],
-    peakSequence: peak.point.sampleSequence, count: values.length,
+    average: materiallyIrregular ? timeWeightedAverage : sampleAverage,
+    sampleAverage,
+    timeWeightedAverage,
+    averageMethod: materiallyIrregular ? 'time-weighted' : 'sample',
+    max: Math.max(...values),
+    p95: values.length >= 20 ? nearestRankP95 : null,
+    provisionalP95: nearestRankP95,
+    p95Ready: values.length >= 20,
+    peakSequence: peak.point.sampleSequence,
+    count: values.length,
+    elapsedMs: samples.length > 1 ? samples.at(-1).timeMs - samples[0].timeMs : 0,
+    cadenceMs,
+    gapCount,
   };
 }
 
@@ -349,7 +567,8 @@ export function hostResourceHasGap(previous, current) {
 }
 
 export function downsampleHostResourceSeries(frames, metric, targetBuckets = 240) {
-  const points = mergeOrderedHostResourceFrames([], frames).map(normalizeHostResourcePoint).filter(Boolean);
+  const timeline = hostResourceTimeline(frames, { nowMs: Number.MAX_SAFE_INTEGER, paused: true });
+  const points = timeline.points;
   if (!points.length) return [];
   const target = Math.max(1, Math.round(Number(targetBuckets) || 240));
   const width = points.length <= target ? 1 : Math.ceil(points.length / target);
@@ -359,22 +578,94 @@ export function downsampleHostResourceSeries(frames, metric, targetBuckets = 240
     const stats = hostResourceIntervalStats(rows, metric);
     output.push({
       startSequence: rows[0].sampleSequence, endSequence: rows.at(-1).sampleSequence,
-      capturedAtStartMs: rows[0].capturedAtMs, capturedAtEndMs: rows.at(-1).capturedAtMs,
+      capturedAtStartMs: rows[0].chartTimeMs, capturedAtEndMs: rows.at(-1).chartTimeMs,
+      chartTimeMs: rows.at(-1).chartTimeMs,
       current: stats.current, min: stats.min, average: stats.average, max: stats.max,
-      p95: stats.p95, peakSequence: stats.peakSequence, count: stats.count,
-      gap: rows.some((row, index) => hostResourceHasGap(index ? rows[index - 1] : points[offset - 1], row)),
+      first: hostResourceMetricValue(rows[0], metric),
+      last: hostResourceMetricValue(rows.at(-1), metric),
+      p95: stats.p95, provisionalP95: stats.provisionalP95,
+      peakSequence: stats.peakSequence, count: stats.count,
+      gap: rows.some(row => row.gapBefore),
     });
   }
   return output;
 }
 
-export function selectHostResourceRange(frames, range = 'live') {
-  const ordered = mergeOrderedHostResourceFrames([], frames);
+export function selectHostResourceRange(frames, range = 'live', options = {}) {
+  const nowMs = Number.isFinite(Number(options.nowMs)) ? Number(options.nowMs) : Date.now();
+  const timeline = hostResourceTimeline(frames, { ...options, nowMs });
+  const ordered = timeline.frames;
   const duration = HOST_RESOURCE_CHART_RANGES[range] ?? HOST_RESOURCE_CHART_RANGES.live;
   if (!ordered.length || duration === Infinity) return ordered;
-  const latest = ordered.reduce((maximum, frame) => Math.max(maximum, capturedAtMs(frame?.captured_at)), 0);
-  if (!latest) return ordered.slice(-Math.max(2, Math.ceil(duration / 1000)));
-  return ordered.filter(frame => capturedAtMs(frame?.captured_at) >= latest - duration);
+  return ordered.filter(frame => Number(frame.chart_time_ms) >= nowMs - duration && Number(frame.chart_time_ms) <= nowMs);
+}
+
+export function hostResourceNiceScale(maximumValue, previousMaximum = 0, options = {}) {
+  if (options.percent) return { maximum: 100, minimum: 0, step: 25, ticks: [0, 25, 50, 75, 100] };
+  const peak = Math.max(0, Number(maximumValue) || 0);
+  const previous = Math.max(0, Number(previousMaximum) || 0);
+  if (previous > 0 && peak <= previous * 0.95 && peak >= previous * 0.65) {
+    const step = niceStep(previous / 4);
+    const count = Math.max(2, Math.round(previous / step) + 1);
+    return {
+      maximum: previous,
+      minimum: 0,
+      step,
+      ticks: Array.from({ length: count }, (_, index) => Math.min(previous, step * index)),
+    };
+  }
+  const withHeadroom = Math.max(1, peak * 1.1);
+  let step = niceStep(withHeadroom / 4);
+  let maximum = Math.ceil(withHeadroom / step) * step;
+  let count = Math.round(maximum / step) + 1;
+  if (count < 4) {
+    step = niceStep(withHeadroom / 3);
+    maximum = Math.ceil(withHeadroom / step) * step;
+    count = Math.round(maximum / step) + 1;
+  }
+  if (count > 6) {
+    step = niceStep(withHeadroom / 5);
+    maximum = Math.ceil(withHeadroom / step) * step;
+    count = Math.round(maximum / step) + 1;
+  }
+  return {
+    maximum,
+    minimum: 0,
+    step,
+    ticks: Array.from({ length: Math.max(2, count) }, (_, index) => Math.min(maximum, step * index)),
+  };
+}
+
+export function hostResourceTimeTicks(startMs, endMs, count = 5) {
+  const start = Number(startMs);
+  const end = Number(endMs);
+  const total = Math.max(2, Math.min(6, Math.round(Number(count) || 5)));
+  if (!Number.isFinite(start) || !Number.isFinite(end) || end <= start) return [];
+  return Array.from({ length: total }, (_, index) => {
+    const timeMs = start + ((end - start) * index) / (total - 1);
+    const date = new Date(timeMs);
+    const crossedDay = new Date(start).toDateString() !== new Date(end).toDateString();
+    return {
+      timeMs,
+      fraction: index / (total - 1),
+      label: date.toLocaleString([], crossedDay
+        ? { month: 'short', day: 'numeric', hour: '2-digit', minute: '2-digit' }
+        : { hour: '2-digit', minute: '2-digit', second: '2-digit' }),
+      accessibleLabel: date.toLocaleString([], {
+        year: 'numeric', month: 'long', day: 'numeric', hour: '2-digit', minute: '2-digit',
+        second: '2-digit', timeZoneName: 'short',
+      }),
+    };
+  });
+}
+
+export function hostResourceTimeFraction(frame, startMs, endMs) {
+  const timeMs = Number(frame?.chartTimeMs ?? frame?.chart_time_ms)
+    || capturedAtMs(frame?.capturedAt ?? frame?.captured_at);
+  const start = Number(startMs);
+  const end = Number(endMs);
+  if (!(timeMs > 0) || !Number.isFinite(start) || !Number.isFinite(end) || end <= start) return 0;
+  return Math.max(0, Math.min(1, (timeMs - start) / (end - start)));
 }
 
 export function appendHostResourceHistory(history, snapshot, limit = HOST_RESOURCE_HISTORY_LIMIT) {
@@ -383,6 +674,9 @@ export function appendHostResourceHistory(history, snapshot, limit = HOST_RESOUR
   const point = {
     sample_sequence: normalized.sampleSequence || Math.max(1, (history?.at(-1)?.sample_sequence || 0) + 1),
     captured_at: normalized.capturedAt,
+    monotonic_ms: snapshot.monotonic_ms,
+    sample_interval_ms: normalized.sampleIntervalMs,
+    dropped_gap_count: normalized.droppedGapCount,
     status: normalized.status,
     system: snapshot.system,
   };
@@ -421,4 +715,13 @@ export function formatHostResourceTimestamp(value) {
   const parsed = typeof value === 'number' ? value : Date.parse(String(value || ''));
   if (!Number.isFinite(parsed)) return 'Unknown time';
   return new Date(parsed).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', second: '2-digit' });
+}
+
+export function formatHostResourceTimestampFull(value) {
+  const parsed = typeof value === 'number' ? value : Date.parse(String(value || ''));
+  if (!Number.isFinite(parsed)) return 'Unknown date and time';
+  return new Date(parsed).toLocaleString([], {
+    year: 'numeric', month: 'short', day: 'numeric', hour: '2-digit', minute: '2-digit',
+    second: '2-digit', timeZoneName: 'short',
+  });
 }

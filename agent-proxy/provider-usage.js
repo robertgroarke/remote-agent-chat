@@ -8,13 +8,15 @@ const os = require('os');
 const path = require('path');
 const { execFile, spawn } = require('child_process');
 const { enrichUsageWindow } = require('./usage-pace');
+const { STALE_AFTER_MS: ANTIGRAVITY_QUOTA_STALE_AFTER_MS } = require('./antigravity-quota-cache');
+const { readOllamaCloudUsageFromExistingChrome } = require('./ollama-cloud-usage');
 const {
   compactProviderUsageSnapshot,
   providerUsageBoundaryAssessment,
   sanitizeProviderUsageSnapshot,
 } = require('../relay-server/provider-usage-boundary');
 
-const SCHEMA_VERSION = 3;
+const SCHEMA_VERSION = 4;
 const DEFAULT_POLL_INTERVAL_MS = 5 * 60 * 1000;
 const DEFAULT_STALE_AFTER_MS = 10 * 60 * 1000;
 const MAX_RESPONSE_BYTES = 2 * 1024 * 1024;
@@ -54,8 +56,8 @@ const PROVIDERS = Object.freeze({
   ollama: {
     provider_id: 'ollama-local',
     provider_name: 'Ollama',
-    quota_domain: 'ollama-local-runtime',
-    dashboard_url: null,
+    quota_domain: 'ollama-cloud-and-local-runtime',
+    dashboard_url: 'https://ollama.com/settings/usage',
     agent_types: new Set(['ollama']),
     always_collect: true,
   },
@@ -1496,14 +1498,126 @@ async function collectCursor(fingerprintKey, options = {}) {
   };
 }
 
+function normalizeOllamaCloudUsage(value, capturedAt = Date.now()) {
+  const source = safeText(value?.source, 60) || 'existing_signed_in_ollama_usage_surface';
+  if (!value?.ok) {
+    return {
+      windows: [],
+      financials: null,
+      cloud_usage: {
+        subscription_state: 'unavailable',
+        source,
+        captured_at: null,
+        auto_reload_enabled: null,
+        error: {
+          code: safeText(value?.code, 60) || 'existing_usage_surface_unavailable',
+          message: safeText(value?.message, 180)
+            || 'Cloud usage unavailable: no readable, already-open signed-in Ollama usage page was found.',
+        },
+        source_receipt: null,
+      },
+    };
+  }
+  const capturedIso = isoTimestamp(value.captured_at) || new Date(capturedAt).toISOString();
+  const capturedMs = Date.parse(capturedIso);
+  const subscriptionState = value.subscription_state === 'none' ? 'none' : 'active';
+  const resetAt = description => {
+    const duration = relativeDurationMs(description);
+    return duration == null ? null : new Date(capturedMs + duration).toISOString();
+  };
+  const windows = subscriptionState === 'active' ? [
+    value.session ? normalizedWindow({
+      id: 'ollama-cloud-session', label: 'Session', scope: 'Ollama Cloud',
+      usedPercent: value.session.used_percent, durationMinutes: 300,
+      resetsAt: resetAt(value.session.reset_description),
+      resetDescription: value.session.reset_description, windowKind: 'rolling',
+      source, provenance: 'Signed-in Ollama usage surface',
+    }) : null,
+    value.weekly ? normalizedWindow({
+      id: 'ollama-cloud-weekly', label: 'Weekly', scope: 'Ollama Cloud',
+      usedPercent: value.weekly.used_percent, durationMinutes: 10080,
+      resetsAt: resetAt(value.weekly.reset_description),
+      resetDescription: value.weekly.reset_description, windowKind: 'rolling',
+      source, provenance: 'Signed-in Ollama usage surface',
+    }) : null,
+  ].filter(Boolean) : [];
+  const prepaidBalance = safeNumber(value.prepaid_balance);
+  const financials = prepaidBalance == null ? null : {
+    semantics_version: 1,
+    source,
+    observed_at: capturedIso,
+    account_scope: safeText(value.plan, 80) || 'Ollama Cloud',
+    extra_usage_enabled: true,
+    prepaid_balance: canonicalMoney(prepaidBalance, {
+      currency: 'USD', sourceField: 'balance_remaining', semantics: 'prepaid_balance', directlyReported: true,
+    }),
+    extra_usage_spend: null,
+    extra_usage_cap: null,
+    allowance_remaining: null,
+    reported_spend: null,
+    included_spend: null,
+    bonus_spend: null,
+    plan_limit: null,
+    reconciliation_delta: null,
+    pool_classification: null,
+    resets_at: null,
+    disclaimer: 'Ollama Cloud quota and local runtime telemetry are separate truth domains.',
+  };
+  const receipt = value.source_receipt && typeof value.source_receipt === 'object'
+    ? {
+      ready_state: safeText(value.source_receipt.ready_state, 40),
+      visibility_state: safeText(value.source_receipt.visibility_state, 40),
+      active_element_tag: safeText(value.source_receipt.active_element_tag, 40),
+      page_path: safeText(value.source_receipt.page_path, 120),
+      page_state_unchanged: value.source_receipt.page_state_unchanged === true,
+      dom_mutation_records: Math.max(0, Number(value.source_receipt.dom_mutation_records) || 0),
+      navigation_actions: Math.max(0, Number(value.source_receipt.navigation_actions) || 0),
+      click_actions: Math.max(0, Number(value.source_receipt.click_actions) || 0),
+      focus_actions: Math.max(0, Number(value.source_receipt.focus_actions) || 0),
+      existing_target_id_preserved: value.source_receipt.existing_target_id_preserved === true,
+      target_inventory_stable: value.source_receipt.target_inventory_stable === true,
+      targets_created: Math.max(0, Number(value.source_receipt.targets_created) || 0),
+    }
+    : null;
+  return {
+    windows,
+    financials,
+    cloud_usage: {
+      subscription_state: subscriptionState,
+      source,
+      captured_at: capturedIso,
+      auto_reload_enabled: typeof value.auto_reload_enabled === 'boolean' ? value.auto_reload_enabled : null,
+      error: null,
+      source_receipt: receipt,
+    },
+  };
+}
+
 async function collectOllama(fingerprintKey, options = {}) {
   const requester = options.requester || requestLoopbackJson;
   const receiptReader = options.receiptReader || readOllamaRequestReceipts;
-  const [running, installed, requestReceiptsValue] = await Promise.all([
+  const cloudReader = options.cloudReader || readOllamaCloudUsageFromExistingChrome;
+  const [runningResult, installedResult, requestReceiptsResult, cloudResult] = await Promise.allSettled([
     requester('/api/ps', options),
     requester('/api/tags', options),
     Promise.resolve(receiptReader(options)),
+    Promise.resolve(cloudReader(options.cloudOptions || {})),
   ]);
+  const running = runningResult.status === 'fulfilled' ? runningResult.value : null;
+  const installed = installedResult.status === 'fulfilled' ? installedResult.value : null;
+  const requestReceiptsValue = requestReceiptsResult.status === 'fulfilled' ? requestReceiptsResult.value : [];
+  const cloudRaw = cloudResult.status === 'fulfilled'
+    ? cloudResult.value
+    : { ok: false, code: 'existing_usage_surface_failed', message: 'The passive Ollama cloud usage source failed.' };
+  const cloud = normalizeOllamaCloudUsage(cloudRaw);
+  const localAvailable = runningResult.status === 'fulfilled' || installedResult.status === 'fulfilled';
+  if (!localAvailable && cloud.cloud_usage.subscription_state === 'unavailable') {
+    const localError = runningResult.reason || installedResult.reason;
+    throw new ProviderUsageError(
+      safeText(localError?.message, 180) || 'Ollama local runtime and cloud usage are unavailable.',
+      { code: safeText(localError?.code, 60) || 'not_running' },
+    );
+  }
   const runningModels = (Array.isArray(running?.models) ? running.models : []).slice(0, 64).map(model => ({
     name: safeText(model?.name || model?.model, 160) || 'Unnamed local model',
     size_bytes: Math.max(0, safeNumber(model?.size) || 0),
@@ -1517,21 +1631,34 @@ async function collectOllama(fingerprintKey, options = {}) {
     .filter(Boolean)
     .slice(-MAX_OLLAMA_REQUEST_RECEIPTS);
   const latestReceipt = requestReceipts.at(-1) || null;
+  const cloudAvailable = cloud.cloud_usage.subscription_state !== 'unavailable';
+  const plan = cloudAvailable
+    ? (cloud.cloud_usage.subscription_state === 'none' ? 'No cloud subscription' : safeText(cloudRaw.plan, 80) || 'Ollama Cloud')
+    : 'Local models';
   return {
-    account_fingerprint: accountFingerprint('ollama-loopback-runtime', fingerprintKey),
-    account_label: 'Loopback runtime',
-    plan: 'Local models',
-    source: 'loopback_api',
+    account_fingerprint: accountFingerprint(cloudAvailable ? `ollama-cloud:${plan}` : 'ollama-loopback-runtime', fingerprintKey),
+    account_label: cloudAvailable && localAvailable ? 'Cloud account + loopback runtime'
+      : cloudAvailable ? 'Cloud account' : 'Loopback runtime',
+    plan,
+    source: cloud.cloud_usage.subscription_state === 'active' ? cloud.cloud_usage.source : 'loopback_api',
     source_history: [
-      sourceAttempt('ollama_api_ps', 'ok'),
-      sourceAttempt('ollama_api_tags', 'ok'),
+      sourceAttempt('ollama_api_ps', runningResult.status === 'fulfilled' ? 'ok' : 'failed', {
+        code: runningResult.status === 'fulfilled' ? null : safeText(runningResult.reason?.code, 60) || 'not_running',
+      }),
+      sourceAttempt('ollama_api_tags', installedResult.status === 'fulfilled' ? 'ok' : 'failed', {
+        code: installedResult.status === 'fulfilled' ? null : safeText(installedResult.reason?.code, 60) || 'not_running',
+      }),
       ...(latestReceipt ? [sourceAttempt('ollama_owned_request_receipt', 'ok')] : []),
+      sourceAttempt('ollama_cloud_existing_surface', cloud.cloud_usage.subscription_state === 'unavailable' ? 'failed' : 'ok', {
+        code: cloud.cloud_usage.error?.code || null,
+      }),
     ],
-    windows: [],
+    windows: cloud.windows,
     credits: null,
-    financials: null,
-    local_runtime: {
-      status: 'running',
+    financials: cloud.financials,
+    cloud_usage: cloud.cloud_usage,
+    local_runtime: localAvailable ? {
+      status: runningResult.status === 'fulfilled' && installedResult.status === 'fulfilled' ? 'running' : 'partial',
       endpoint_scope: 'loopback_only',
       installed_models_count: installedCount,
       loaded_models_count: runningModels.length,
@@ -1549,9 +1676,9 @@ async function collectOllama(fingerprintKey, options = {}) {
       telemetry_reason: latestReceipt
         ? 'Only explicit owned terminal response receipts are counted; Ollama exposes no historical request totals.'
         : 'Ollama exposes no historical request totals; only explicit owned terminal response receipts are counted.',
-    },
+    } : null,
     reset_credits: null,
-    request_count: 2,
+    request_count: 3,
   };
 }
 
@@ -1560,7 +1687,7 @@ function collectAntigravity(fingerprintKey, quotaCache, machineLabel) {
   if (!snapshot || !Array.isArray(snapshot.models) || snapshot.models.length === 0) {
     throw new ProviderUsageError('Open Antigravity Settings once to expose local model quotas.', { code: 'local_quota_unavailable' });
   }
-  const capturedAt = Date.now();
+  const capturedAt = Date.parse(snapshot.fetched_at || '') || Number(quotaCache?.fetchedAt) || Date.now();
   const windows = snapshot.models.map((model, index) => {
     const resetDescription = safeText(model?.refreshes_in, 160);
     const resetDurationMs = relativeDurationMs(resetDescription);
@@ -1569,16 +1696,28 @@ function collectAntigravity(fingerprintKey, quotaCache, machineLabel) {
       label: safeText(model?.model, 100) || `Model ${index + 1}`,
       scope: 'Model quota',
       usedPercent: model?.percent_used,
-      resetsAt: resetDurationMs == null ? null : new Date(capturedAt + resetDurationMs).toISOString(),
+      resetsAt: isoTimestamp(model?.resets_at)
+        || (resetDurationMs == null ? null : new Date(capturedAt + resetDurationMs).toISOString()),
       resetDescription,
+      windowKind: safeText(model?.window_kind, 40),
     });
   }).filter(Boolean);
+  const source = safeText(quotaCache?.source || snapshot?.source, 60) || 'settings_surface';
+  const sourceHistory = (Array.isArray(quotaCache?.sourceHistory) ? quotaCache.sourceHistory : [])
+    .map(attempt => ({
+      source: safeText(attempt?.source, 60),
+      status: safeText(attempt?.status, 40),
+      captured_at: isoTimestamp(attempt?.captured_at),
+      ...(safeText(attempt?.code, 60) ? { code: safeText(attempt.code, 60) } : {}),
+    }))
+    .filter(attempt => attempt.source && attempt.status && attempt.captured_at)
+    .slice(-8);
   return {
     account_fingerprint: accountFingerprint(`antigravity:${machineLabel || os.hostname()}`, fingerprintKey),
     account_label: 'Local Google AI account',
-    plan: 'Google AI plan',
-    source: 'local_settings',
-    source_history: [sourceAttempt('local_settings', 'ok')],
+    plan: safeText(snapshot.plan || snapshot.tier, 100) || 'Google AI plan',
+    source,
+    source_history: sourceHistory.length > 0 ? sourceHistory : [sourceAttempt(source, 'ok')],
     windows,
     credits: snapshot.available_ai_credits == null ? null : {
       enabled: true,
@@ -1588,6 +1727,8 @@ function collectAntigravity(fingerprintKey, quotaCache, machineLabel) {
     reset_credits: null,
     request_count: 0,
     captured_at: isoTimestamp(snapshot.fetched_at || quotaCache?.fetchedAt),
+    next_refresh_at: isoTimestamp(quotaCache?.nextRefreshAt),
+    stale_after_ms: ANTIGRAVITY_QUOTA_STALE_AFTER_MS,
   };
 }
 
@@ -1628,9 +1769,9 @@ class ProviderUsageRegistry {
     this.collectors = {
       codex: options.collectors?.codex || (() => collectCodex(this.fingerprintKey)),
       claude: options.collectors?.claude || (() => collectClaude(this.fingerprintKey)),
-      antigravity: options.collectors?.antigravity || (async () => collectAntigravity(
+      antigravity: options.collectors?.antigravity || (async context => collectAntigravity(
         this.fingerprintKey,
-        await this.getAntigravityQuota(),
+        await this.getAntigravityQuota(context),
         this.machineLabel,
       )),
       cursor: options.collectors?.cursor || (() => collectCursor(this.fingerprintKey)),
@@ -1704,8 +1845,9 @@ class ProviderUsageRegistry {
           windows: [],
           credits: null,
           financials: null,
-          local_runtime: null,
-          reset_credits: null,
+           local_runtime: null,
+           cloud_usage: null,
+           reset_credits: null,
           error: failure.error,
           request_count: 0,
           latency_ms: failure.latency_ms || null,
@@ -1780,7 +1922,7 @@ class ProviderUsageRegistry {
         const blockedUntil = this.nextAllowedAt.get(entry.key) || 0;
         if (blockedUntil > startedAt) return;
         try {
-          const collected = await this.collectors[entry.key]();
+          const collected = await this.collectors[entry.key]({ force, reason: options.reason || 'unspecified' });
           const results = Array.isArray(collected) ? collected : [collected];
           if (results.length === 0) {
             throw new ProviderUsageError('Provider returned no account usage.', { code: 'usage_not_reported' });
@@ -1799,7 +1941,7 @@ class ProviderUsageRegistry {
               now: this.now(),
             })).filter(Boolean);
             if (windows.length === 0 && !result?.credits && !result?.reset_credits
-                && !result?.financials && !result?.local_runtime) {
+                && !result?.financials && !result?.local_runtime && !result?.cloud_usage) {
               throw new ProviderUsageError('Provider returned no usable quota values.', { code: 'usage_not_reported' });
             }
             const fingerprint = safeText(result?.account_fingerprint, 80);
@@ -1813,6 +1955,10 @@ class ProviderUsageRegistry {
             }
             const identityKey = `${entry.provider.provider_id}:${fingerprint}:${entry.provider.quota_domain}`;
             nextIdentities.add(identityKey);
+            const resultStaleAfterMs = Math.max(
+              this.pollIntervalMs,
+              Number(result.stale_after_ms) || this.staleAfterMs,
+            );
             this.lastGood.set(identityKey, {
               schema_version: SCHEMA_VERSION,
               provider_id: entry.provider.provider_id,
@@ -1827,11 +1973,13 @@ class ProviderUsageRegistry {
               source_history: Array.isArray(result.source_history) ? result.source_history.slice(-8) : [],
               status: 'fresh',
               captured_at: new Date(parsedCapturedAt).toISOString(),
-              stale_after: new Date(parsedCapturedAt + this.staleAfterMs).toISOString(),
+              stale_after: new Date(parsedCapturedAt + resultStaleAfterMs).toISOString(),
+              next_refresh_at: isoTimestamp(result.next_refresh_at),
               windows,
               credits: result.credits || null,
               financials: result.financials || null,
               local_runtime: result.local_runtime || null,
+              cloud_usage: result.cloud_usage || null,
               reset_credits: result.reset_credits || null,
               error: null,
               request_count: Math.max(0, Number(result.request_count) || 0),

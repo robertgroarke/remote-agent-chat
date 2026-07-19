@@ -24,6 +24,9 @@ for (const marker of [
   '64-bit bytes R', 'Process command lines and executable paths remain local',
   'mergeOrderedHostResourceFrames', 'downsampleHostResourceSeries', 'hostResourceIntervalStats',
   'setHostResources(null);', 'setHostResourceHistory([]);', 'setHostResourceDetails([]);',
+  "live: 'Live', delayed: 'Delayed', reconnecting: 'Reconnecting', paused: 'Paused', stale: 'Stale'",
+  'hostResourceTimelineProjection.validCount', 'hostResourceTimelineProjection.expectedCount',
+  'p95 collecting (${stats.count}/20)', 'raw samples /', 'Last full detail:',
 ]) assert(list.includes(marker), `missing Android host-resource marker: ${marker}`);
 assert(!list.includes('<HostResourceMiniChart'), 'Android must not retain the aggregate mini-chart UI');
 assert(!list.includes('setInterval(() => clientRef.current?.requestHostResourceRefresh'),
@@ -42,6 +45,8 @@ assert(webHelper.includes("export * from '../android-app/lib/host-resources.js'"
 for (const marker of [
   'export function normalizeHostResources', 'export function mergeOrderedHostResourceFrames',
   'export function downsampleHostResourceSeries', 'export function hostResourceIntervalStats',
+  'export function hostResourceTimeline', 'export function hostResourceNiceScale',
+  'export function hostResourceTimeTicks', 'export function hostResourceTimeFraction',
 ]) assert(helper.includes(marker), `missing shared Android helper marker: ${marker}`);
 assert(!list.includes("AsyncStorage.setItem('host-resource"), 'Android must not persist host-resource snapshots');
 assert(!relay.includes("AsyncStorage.setItem('host-resource"), 'Android must keep resume tokens in memory only');
@@ -64,6 +69,9 @@ const result = {
   raw_snapshot_persistence: false,
   client_snapshot_cleared_on_close: true,
   accessible_controls: true,
+  truthful_freshness_and_last_good_age: true,
+  shared_time_geometry_and_scale: true,
+  p95_minimum_sample_gate: 20,
 };
 
 const outputIndex = process.argv.indexOf('--output');

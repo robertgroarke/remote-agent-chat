@@ -6,6 +6,7 @@ const os = require('os');
 const path = require('path');
 const { spawn, spawnSync } = require('child_process');
 const { normalizeNativeLaunchMode, backgroundNativeLaunchResult } = require('./native-launch-mode');
+const { assertOperatorForegroundLaunch } = require('./windows-automation-launch-policy');
 const { setBoundedMap } = require('./bounded-map');
 const { canonicalGoalRecord } = require('./goal-lifecycle');
 
@@ -52,6 +53,7 @@ const CONFIG_OBSERVATION_CACHE = new Map();
 const GOAL_RECOVERY_CACHE = new Map();
 const SESSION_INDEX_CACHE = { sig: '', map: new Map() };
 const CODEX_PROCESS_COUNT_CACHE = { ts: 0, count: 0 };
+const CODEX_SESSION_OWNER_SNAPSHOT_CACHE = { ts: 0, state: 'unknown', owners: new Map() };
 const CODEX_SESSION_OWNER_CACHE = new Map();
 const CODEX_SESSION_OWNER_INFLIGHT = new Map();
 const JSONL_CHUNK_BYTES = 1024 * 1024;
@@ -72,6 +74,12 @@ const DEFAULT_ACTIVE_HYDRATE_MAX_BYTES = envMb(
   4
 );
 const DEFAULT_ACTIVE_HYDRATE_TAIL_BYTES = envMb('CODEX_CLI_ACTIVE_HYDRATE_TAIL_MB', 4);
+// Active files are tailed incrementally, but the retained parse state must not
+// grow for the lifetime of a multi-day goal. Rebuild from the newest bounded
+// tail once the cached window reaches twice its configured size. The overlap
+// lets the transport retain stable semantic rows while discarding old parser
+// objects.
+const ACTIVE_TAIL_REBASE_FACTOR = 2;
 const DEFAULT_CONFIG_OBSERVATION_TAIL_BYTES = envMb('CODEX_CLI_CONFIG_OBSERVATION_TAIL_MB', 64, 4);
 const DEFAULT_INTERACTIVE_HISTORY_HOURS = Math.max(1, parseInt(process.env.CODEX_CLI_INTERACTIVE_HISTORY_HOURS || '24', 10) || 24);
 const CODEX_CLI_ACTIVITY_STALE_MS = Math.max(60 * 1000, parseInt(process.env.CODEX_CLI_ACTIVITY_STALE_MS || '14400000', 10) || 14400000);
@@ -1455,6 +1463,7 @@ function parseCodexJsonlDetailed(filePath) {
       start_offset: scanStartOffset,
       end_offset: scan.offset,
       file_size: stat.size,
+      mtime_ms: stat.mtimeMs,
       bytes_read: Math.max(0, stat.size - scanStartOffset),
       events_read: scan.emitted,
     },
@@ -2177,12 +2186,19 @@ function parseCodexJsonlTail(filePath, tailBytes = DEFAULT_HYDRATE_TAIL_BYTES) {
   if (!stat) return null;
   const boundedTailBytes = Math.max(1024 * 1024, Number(tailBytes) || DEFAULT_HYDRATE_TAIL_BYTES);
   const prior = TAIL_SUMMARY_CACHE.get(filePath);
-  const canTail = !!prior
+  const appendCompatible = !!prior
     && prior.tailBytes === boundedTailBytes
     && stat.size >= prior.offset
     && stat.size >= prior.size
     && prior.anchor === fileCursorAnchor(filePath, prior.offset)
     && !(stat.size === prior.size && stat.mtimeMs !== prior.mtimeMs);
+  const retainedWindowBytes = appendCompatible
+    ? Math.max(0, stat.size - Number(prior.startOffset || 0))
+    : 0;
+  const boundedRebase = appendCompatible
+    && stat.size > prior.size
+    && retainedWindowBytes > boundedTailBytes * ACTIVE_TAIL_REBASE_FACTOR;
+  const canTail = appendCompatible && !boundedRebase;
   let state;
   let startOffset;
   let scanStartOffset;
@@ -2225,13 +2241,19 @@ function parseCodexJsonlTail(filePath, tailBytes = DEFAULT_HYDRATE_TAIL_BYTES) {
     stat,
     startOffset,
     sourceCursor: {
-      mode: canTail ? (stat.size > prior.size ? 'append' : 'unchanged') : (prior ? 'recovery' : 'baseline_tail'),
+      mode: canTail
+        ? (stat.size > prior.size ? 'append' : 'unchanged')
+        : (boundedRebase ? 'bounded_rebase' : (prior ? 'recovery' : 'baseline_tail')),
       start_offset: scanStartOffset,
       end_offset: scan.offset,
       file_size: stat.size,
+      mtime_ms: stat.mtimeMs,
       bytes_read: Math.max(0, stat.size - scanStartOffset),
       events_read: scan.emitted,
       partial: startOffset > 0,
+      window_start_offset: startOffset,
+      retained_window_bytes: Math.max(0, scan.offset - startOffset),
+      retained_window_limit_bytes: boundedTailBytes * ACTIVE_TAIL_REBASE_FACTOR,
     },
   };
 }
@@ -2430,17 +2452,112 @@ function recentActiveSessionSummaries({
 }
 
 function findSessionByCliId(cliSessionId, options = {}) {
-  if (!cliSessionId) return null;
+  const normalizedId = String(cliSessionId || '').trim().toLowerCase();
+  if (!normalizedId) return null;
   const root = sessionsDir();
   if (!fs.existsSync(root)) return null;
   const items = walkJsonlFiles(root, 0);
-  const exact = items.find(item => sessionIdFromFilePath(item.filePath) === cliSessionId);
+  const exact = items.find(item => sessionIdFromFilePath(item.filePath).toLowerCase() === normalizedId);
   if (exact) return readSessionSummary(exact.filePath, options);
+
+  // Older/renamed rollout files may not end in their native UUID, so retain a
+  // bounded metadata fallback for those files. Never fully hydrate every
+  // archive on an exact-ID miss: a stale interactive-history row otherwise
+  // turns one 30-second discovery pass into a multi-second event-loop stall.
+  const configuredFallbackLimit = parseInt(process.env.CODEX_CLI_METADATA_FALLBACK_MAX_FILES || '80', 10);
+  const fallbackLimit = Number.isFinite(configuredFallbackLimit)
+    ? Math.max(1, Math.min(1000, configuredFallbackLimit))
+    : 80;
+  let inspectedLegacyFiles = 0;
   for (const item of items) {
-    const summary = readSessionSummary(item.filePath, options);
-    if (summary?.cliSessionId === cliSessionId) return summary;
+    if (sessionIdFromFilePath(item.filePath)) continue;
+    if (inspectedLegacyFiles >= fallbackLimit) break;
+    inspectedLegacyFiles++;
+    const metadataId = metadataSessionId(readSessionMeta(item.filePath)).toLowerCase();
+    if (metadataId === normalizedId) return readSessionSummary(item.filePath, options);
   }
   return null;
+}
+
+/**
+ * Return the exact native Codex session owners visible in one process-table
+ * snapshot. A global process count is not ownership evidence: unrelated Codex
+ * processes must never make an archive look active. Only native resume/thread
+ * arguments carrying the exact UUID are accepted.
+ */
+function runningCodexCliSessionOwners({ cacheMs = 2000 } = {}) {
+  const now = Date.now();
+  if (cacheMs > 0 && CODEX_SESSION_OWNER_SNAPSHOT_CACHE.ts
+      && now - CODEX_SESSION_OWNER_SNAPSHOT_CACHE.ts < cacheMs) {
+    return {
+      state: CODEX_SESSION_OWNER_SNAPSHOT_CACHE.state,
+      checked_at_ms: CODEX_SESSION_OWNER_SNAPSHOT_CACHE.ts,
+      owners: new Map(CODEX_SESSION_OWNER_SNAPSHOT_CACHE.owners),
+    };
+  }
+  const owners = new Map();
+  let state = 'unknown';
+  try {
+    let result;
+    if (process.platform === 'win32') {
+      const script = [
+        "$ErrorActionPreference='Stop'",
+        "$uuid='(?i)[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}'",
+        "$owner='(?i)(?:\\bresume\\b|--resume|--session(?:-id)?|--thread(?:-id)?)\\s+[\"'']?('+$uuid+')'",
+        "$items=Get-CimInstance Win32_Process | Where-Object { ($_.Name -eq 'node.exe' -or $_.Name -eq 'codex.exe') -and $_.CommandLine -match '@openai\\\\codex|codex\\.js|codex\\.exe' }",
+        "foreach($item in $items){ foreach($match in [regex]::Matches([string]$item.CommandLine,$owner)){ $match.Groups[1].Value.ToLowerInvariant() + \"`t\" + $item.ProcessId } }",
+      ].join('; ');
+      result = spawnSync('powershell.exe', ['-NoProfile', '-ExecutionPolicy', 'Bypass', '-Command', script], {
+        encoding: 'utf8',
+        timeout: 5000,
+        windowsHide: true,
+      });
+    } else {
+      result = spawnSync('ps', ['-eo', 'pid=,command='], { encoding: 'utf8', timeout: 5000 });
+    }
+    if (!result.error && result.status === 0) {
+      if (process.platform === 'win32') {
+        for (const line of String(result.stdout || '').split(/\r?\n/)) {
+          const [id, pidRaw] = line.trim().split(/\s+/, 2);
+          const pid = parseInt(pidRaw, 10) || 0;
+          if (!/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/.test(id || '') || pid <= 0) continue;
+          if (!owners.has(id)) owners.set(id, new Set());
+          owners.get(id).add(pid);
+        }
+      } else {
+        const ownerPattern = /(?:\bresume\b|--resume|--session(?:-id)?|--thread(?:-id)?)\s+["']?([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})/ig;
+        for (const line of String(result.stdout || '').split(/\r?\n/)) {
+          const pid = parseInt(line.trim().match(/^\d+/)?.[0], 10) || 0;
+          if (pid <= 0 || !/@openai[\\/]+codex|codex\.js|codex(?:\.exe)?\b/i.test(line)) continue;
+          ownerPattern.lastIndex = 0;
+          let match;
+          while ((match = ownerPattern.exec(line))) {
+            const id = match[1].toLowerCase();
+            if (!owners.has(id)) owners.set(id, new Set());
+            owners.get(id).add(pid);
+          }
+        }
+      }
+      state = 'confirmed';
+    }
+  } catch {}
+  const checkedAt = Date.now();
+  CODEX_SESSION_OWNER_SNAPSHOT_CACHE.ts = checkedAt;
+  CODEX_SESSION_OWNER_SNAPSHOT_CACHE.state = state;
+  CODEX_SESSION_OWNER_SNAPSHOT_CACHE.owners = new Map(
+    Array.from(owners, ([id, pids]) => [id, new Set(pids)]),
+  );
+  for (const [id, pids] of owners) {
+    const pid = pids.values().next().value;
+    setBoundedMap(CODEX_SESSION_OWNER_CACHE, id, {
+      state: 'confirmed', checked_at_ms: checkedAt, pid,
+    }, 64);
+  }
+  return {
+    state,
+    checked_at_ms: checkedAt,
+    owners: new Map(Array.from(owners, ([id, pids]) => [id, new Set(pids)])),
+  };
 }
 
 function questionIdentity(question, canonical = false) {
@@ -3150,10 +3267,11 @@ function buildNativeCodexWindowPowerShell({ cwd, launcherPath, elevated = false 
   return ps.join(' ');
 }
 
-function startNativeCodexWindow({ workspacePath, cliSessionId, resume = true, model, effort, permissionMode, title, elevated = false, launchMode = 'foreground' } = {}) {
+function startNativeCodexWindow({ workspacePath, cliSessionId, resume = true, model, effort, permissionMode, title, elevated = false, launchMode = 'foreground', operatorActionProof, requestId } = {}) {
   if (normalizeNativeLaunchMode(launchMode) === 'background') {
     return backgroundNativeLaunchResult('codex_cli');
   }
+  assertOperatorForegroundLaunch({ operatorActionProof, requestId });
   const cwd = workspacePath || process.cwd();
   if (process.platform !== 'win32') {
     const args = buildCodexArgs({ cliSessionId, resume, model, effort, permissionMode, workspacePath: cwd });
@@ -3267,6 +3385,7 @@ module.exports = {
   recentInteractiveSessionIds,
   recentActiveSessionSummaries,
   runningCodexCliProcessCount,
+  runningCodexCliSessionOwners,
   codexCliSessionOwnerState,
   codexCliSessionOwnerStateAsync,
   readCodexModelCatalog,

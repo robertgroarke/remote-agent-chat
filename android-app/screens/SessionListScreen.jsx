@@ -5,7 +5,7 @@ import {
   Platform,
   Alert, Linking, Modal, ScrollView,
 } from 'react-native';
-import Svg, { Line, Path } from 'react-native-svg';
+import Svg, { Circle, Line, Path, Rect } from 'react-native-svg';
 import { useFocusEffect } from '@react-navigation/native';
 import AsyncStorage from '@react-native-async-storage/async-storage';
 import { RelayClient }   from '../lib/relay';
@@ -70,17 +70,24 @@ import {
   formatProviderUsageReset,
   normalizeProviderUsage,
   providerFinancialRows,
+  retainNewerProviderUsage,
   selectEstimatedCost,
 } from '../lib/provider-usage';
 import {
+  HOST_RESOURCE_CHART_RANGES,
   downsampleHostResourceSeries,
   formatHostResourceAge,
   formatHostResourceBytes,
   formatHostResourcePercent,
   formatHostResourceRate,
   formatHostResourceTimestamp,
+  formatHostResourceTimestampFull,
   hostResourceIntervalStats,
   hostResourceMetricValue,
+  hostResourceNiceScale,
+  hostResourceTimeFraction,
+  hostResourceTimeTicks,
+  hostResourceTimeline,
   mergeOrderedHostResourceFrames,
   normalizeHostResources,
   selectHostResourceRange,
@@ -90,6 +97,7 @@ import {
   classifyFleetActivity,
   fleetActivityObservedAtMs,
   fleetFreshnessLabel,
+  fleetGoalElapsedSeconds,
   fleetGoalSubstateLabel,
   fleetStateIsWorking,
   fleetStateLabel,
@@ -119,13 +127,10 @@ function fleetWorkContextProgress(context) {
 
 function fleetElapsedLabel(activity, nowMs) {
   const goal = activity?.goal;
-  const base = Number(goal?.time_used_seconds ?? goal?.timeUsedSeconds ?? 0) || 0;
-  const updated = Date.parse(goal?.updated_at || '');
   const started = Date.parse(activity?.startedAt || activity?.started_at || activity?.since || '');
-  const activeDelta = goal && String(goal.state || goal.status).toLowerCase() === 'active' && Number.isFinite(updated)
-    ? Math.max(0, (nowMs - updated) / 1000)
-    : !goal && Number.isFinite(started) ? Math.max(0, (nowMs - started) / 1000) : 0;
-  const total = Math.floor(base + activeDelta);
+  const total = goal
+    ? fleetGoalElapsedSeconds(goal, activity?.goal_run, nowMs)
+    : Math.floor(Number.isFinite(started) ? Math.max(0, (nowMs - started) / 1000) : 0);
   if (total < 60) return `${total}s`;
   const minutes = Math.floor(total / 60);
   const seconds = total % 60;
@@ -165,22 +170,39 @@ function androidHostChartPath(samples, xFor, yFor) {
   return path.trim();
 }
 
-function HostResourceChart({ title, description, frames, series, percentScale = false, viewport, onViewportChange, crosshairSequence, onCrosshairChange }) {
+function HostResourceChart({
+  title, description, frames, series, percentScale = false, viewport, onViewportChange,
+  crosshairSequence, onCrosshairChange, range = 'live', nowMs = Date.now(), paused = false,
+  subscriptionStatus = 'live',
+}) {
   const [width, setWidth] = useState(340);
   const [hiddenSeries, setHiddenSeries] = useState({});
   const [scale, setScale] = useState({ mode: 'auto', fixedMax: null });
   const [showData, setShowData] = useState(false);
   const gestureRef = useRef(null);
+  const previousAutoMaximumRef = useRef(0);
   const boundedViewport = clampHostResourceViewport(viewport);
-  const sourceFrames = Array.isArray(frames) ? frames : [];
-  const startIndex = Math.max(0, Math.floor((sourceFrames.length - 1) * boundedViewport.start));
-  const endIndex = Math.min(sourceFrames.length, Math.ceil((sourceFrames.length - 1) * boundedViewport.end) + 1);
-  const visibleFrames = sourceFrames.slice(startIndex, Math.max(startIndex + 1, endIndex));
-  const visibleSequences = new Set(visibleFrames.map(frame => frame.sample_sequence));
+  const timeline = hostResourceTimeline(frames, {
+    nowMs, paused, connected: subscriptionStatus !== 'reconnecting', subscriptionStatus,
+  });
+  const rangeDuration = HOST_RESOURCE_CHART_RANGES[range] ?? HOST_RESOURCE_CHART_RANGES.live;
+  const baseEndMs = paused ? timeline.endMs || nowMs : nowMs;
+  const baseStartMs = rangeDuration === Infinity
+    ? timeline.startMs || baseEndMs - HOST_RESOURCE_CHART_RANGES.live
+    : baseEndMs - rangeDuration;
+  const baseSpanMs = Math.max(1, baseEndMs - baseStartMs);
+  const visibleStartMs = baseStartMs + baseSpanMs * boundedViewport.start;
+  const visibleEndMs = baseStartMs + baseSpanMs * boundedViewport.end;
+  const visibleFrames = timeline.frames.filter(frame => (
+    Number(frame.chart_time_ms) >= visibleStartMs && Number(frame.chart_time_ms) <= visibleEndMs
+  ));
   const chartSeries = series.map(entry => {
-    const boundedFrames = entry.frames
-      ? entry.frames.filter(frame => visibleSequences.has(frame.sample_sequence))
+    const sourceFrames = entry.frames
+      ? hostResourceTimeline(entry.frames, { nowMs, paused: true }).frames
       : visibleFrames;
+    const boundedFrames = entry.frames
+      ? sourceFrames.filter(frame => Number(frame.chart_time_ms) >= visibleStartMs && Number(frame.chart_time_ms) <= visibleEndMs)
+      : sourceFrames;
     return {
       ...entry,
       visibleFrames: boundedFrames,
@@ -188,29 +210,38 @@ function HostResourceChart({ title, description, frames, series, percentScale = 
     };
   });
   const activeSeries = chartSeries.filter(entry => !hiddenSeries[entry.key]);
-  const autoMaximum = Math.max(1, ...activeSeries.flatMap(entry => entry.samples.map(sample => sample.max || 0))) * 1.08;
-  const maximum = percentScale ? 100 : scale.mode === 'fixed' && scale.fixedMax ? scale.fixedMax : autoMaximum;
+  const rawPeak = Math.max(0, ...activeSeries.flatMap(entry => entry.samples.map(sample => sample.max || 0)));
+  const automaticScale = hostResourceNiceScale(rawPeak, previousAutoMaximumRef.current, { percent: percentScale });
+  if (!percentScale && scale.mode === 'auto') previousAutoMaximumRef.current = automaticScale.maximum;
+  const scaleContract = scale.mode === 'fixed' && scale.fixedMax
+    ? hostResourceNiceScale(scale.fixedMax, scale.fixedMax, { percent: percentScale })
+    : automaticScale;
+  const maximum = scaleContract.maximum;
   const svgWidth = Math.max(280, width - 20);
   const svgHeight = 150;
-  const left = 6;
-  const right = svgWidth - 6;
+  const left = 42;
+  const right = svgWidth - 10;
   const top = 6;
-  const bottom = svgHeight - 6;
-  const firstSequence = visibleFrames[0]?.sample_sequence || 0;
-  const lastSequence = visibleFrames[visibleFrames.length - 1]?.sample_sequence || Math.max(1, firstSequence);
-  const xFor = sample => left + ((sample.endSequence - firstSequence) / Math.max(1, lastSequence - firstSequence)) * (right - left);
+  const bottom = svgHeight - 18;
+  const xFor = sample => left + hostResourceTimeFraction(sample, visibleStartMs, visibleEndMs) * (right - left);
   const yFor = value => bottom - (Math.max(0, Math.min(maximum, value)) / Math.max(1, maximum)) * (bottom - top);
   const crosshairFrame = visibleFrames.find(frame => frame.sample_sequence === crosshairSequence)
     || visibleFrames[visibleFrames.length - 1] || null;
   const crosshairX = crosshairFrame
-    ? left + ((crosshairFrame.sample_sequence - firstSequence) / Math.max(1, lastSequence - firstSequence)) * (right - left)
+    ? left + hostResourceTimeFraction(crosshairFrame, visibleStartMs, visibleEndMs) * (right - left)
     : null;
   const formatValue = series[0]?.format || (value => String(value));
+  const xTicks = hostResourceTimeTicks(visibleStartMs, visibleEndMs, 4);
+  const statusLabel = timeline.status[0]?.toUpperCase() + timeline.status.slice(1);
 
   function sequenceAtX(locationX) {
     if (!visibleFrames.length) return 0;
     const fraction = Math.max(0, Math.min(1, locationX / Math.max(1, width)));
-    return visibleFrames[Math.max(0, Math.min(visibleFrames.length - 1, Math.round(fraction * (visibleFrames.length - 1))))].sample_sequence;
+    const targetTime = visibleStartMs + (visibleEndMs - visibleStartMs) * fraction;
+    return visibleFrames.reduce((closest, frame) => (
+      Math.abs(Number(frame.chart_time_ms) - targetTime) < Math.abs(Number(closest.chart_time_ms) - targetTime)
+        ? frame : closest
+    ), visibleFrames[0]).sample_sequence;
   }
 
   function beginGesture(event) {
@@ -247,11 +278,14 @@ function HostResourceChart({ title, description, frames, series, percentScale = 
       <View style={s.hostResourceChartLabel}>
         <View style={{ flex: 1 }}><Text style={s.hostResourceChartTitle}>{title}</Text><Text style={s.hostResourceChartDescription}>{description}</Text></View>
         {!percentScale && (
-          <TouchableOpacity style={s.hostResourceChartAction} accessibilityRole="button" accessibilityLabel={`${title} ${scale.mode} scale`} onPress={() => setScale(previous => previous.mode === 'auto' ? { mode: 'fixed', fixedMax: autoMaximum } : { mode: 'auto', fixedMax: null })}>
+          <TouchableOpacity style={s.hostResourceChartAction} accessibilityRole="button" accessibilityLabel={`${title} ${scale.mode} scale`} onPress={() => setScale(previous => previous.mode === 'auto' ? { mode: 'fixed', fixedMax: automaticScale.maximum } : { mode: 'auto', fixedMax: null })}>
             <Text style={s.hostResourceChartActionText}>{scale.mode === 'auto' ? 'Auto' : 'Fixed'}</Text>
           </TouchableOpacity>
         )}
       </View>
+      <Text style={s.hostResourceChartQuality} accessibilityLiveRegion="polite">
+        {timeline.status.toUpperCase()} / {timeline.receivedCount} received / {timeline.validCount} valid of {timeline.expectedCount} expected / {timeline.droppedCount} dropped / {Math.round(timeline.cadenceMs)} ms / {timeline.gapCount} gaps / {timeline.duplicateCount} dup / {timeline.outOfOrderCount} out-of-order
+      </Text>
       <View style={s.hostResourceChartLegend} accessibilityRole="tablist">
         {chartSeries.map(entry => (
           <TouchableOpacity key={entry.key} style={[s.hostResourceLegendButton, hiddenSeries[entry.key] ? s.hostResourceLegendButtonOff : null]} accessibilityRole="button" accessibilityState={{ selected: !hiddenSeries[entry.key] }} accessibilityLabel={`${entry.label} series`} onPress={() => setHiddenSeries(previous => ({ ...previous, [entry.key]: !previous[entry.key] }))}>
@@ -271,18 +305,29 @@ function HostResourceChart({ title, description, frames, series, percentScale = 
         onResponderTerminate={() => { gestureRef.current = null; }}
       >
         <Svg width="100%" height={svgHeight} viewBox={`0 0 ${svgWidth} ${svgHeight}`}>
-          {[0, 0.25, 0.5, 0.75, 1].map(fraction => <Line key={fraction} x1={left} x2={right} y1={top + (bottom - top) * fraction} y2={top + (bottom - top) * fraction} stroke="#30363d" strokeWidth="1" />)}
+          {timeline.gaps.filter(gap => gap.endMs >= visibleStartMs && gap.startMs <= visibleEndMs).map((gap, index) => {
+            const gapLeft = left + Math.max(0, (gap.startMs - visibleStartMs) / Math.max(1, visibleEndMs - visibleStartMs)) * (right - left);
+            const gapRight = left + Math.min(1, (gap.endMs - visibleStartMs) / Math.max(1, visibleEndMs - visibleStartMs)) * (right - left);
+            return <Rect key={`${gap.reason}-${index}`} x={gapLeft} y={top} width={Math.max(2, gapRight - gapLeft)} height={bottom - top} fill="#f0883e" opacity="0.12" stroke="#f0883e" strokeDasharray="3 3" />;
+          })}
+          {scaleContract.ticks.map(value => <Line key={value} x1={left} x2={right} y1={yFor(value)} y2={yFor(value)} stroke="#30363d" strokeWidth="1" />)}
           {activeSeries.flatMap(entry => entry.samples.map(sample => sample.gap || sample.min == null || sample.max == null ? null : (
             <Line key={`${entry.key}-${sample.endSequence}`} x1={xFor(sample)} x2={xFor(sample)} y1={yFor(sample.min)} y2={yFor(sample.max)} stroke={entry.color} strokeWidth="2" opacity="0.3" />
           )))}
-          {activeSeries.map(entry => <Path key={entry.key} d={androidHostChartPath(entry.samples, xFor, yFor)} fill="none" stroke={entry.color} strokeWidth="2" strokeDasharray={entry.dashed ? '6 4' : undefined} />)}
+          {activeSeries.map((entry, index) => <Path key={entry.key} d={androidHostChartPath(entry.samples, xFor, yFor)} fill="none" stroke={entry.color} strokeWidth="2.4" strokeDasharray={entry.dashed || index % 3 === 1 ? '7 4' : index % 3 === 2 ? '2 4' : undefined} />)}
+          {activeSeries.flatMap(entry => entry.visibleFrames.length < 10 ? entry.visibleFrames.map(frame => {
+            const value = hostResourceMetricValue(frame, entry.metric);
+            return value == null ? null : <Circle key={`${entry.key}-${frame.sample_sequence}`} cx={xFor(frame)} cy={yFor(value)} r="3" fill="#0d1117" stroke={entry.color} strokeWidth="2" />;
+          }) : [])}
           {crosshairX != null && <Line x1={crosshairX} x2={crosshairX} y1={top} y2={bottom} stroke="#f0f6fc" strokeDasharray="3 3" />}
         </Svg>
-        <View style={s.hostResourceChartAxis}><Text style={s.hostResourceChartValue}>{formatValue(maximum)}</Text><Text style={s.hostResourceChartValue}>{formatValue(0)}</Text></View>
+        <View pointerEvents="none" style={s.hostResourceChartAxis}>{[...scaleContract.ticks].reverse().map(value => <Text key={value} style={s.hostResourceChartValue}>{formatValue(value)}</Text>)}</View>
+        <View pointerEvents="none" style={s.hostResourceChartXAxis}>{xTicks.map(tick => <Text key={tick.timeMs} style={s.hostResourceChartTime} accessibilityLabel={tick.accessibleLabel}>{tick.label}</Text>)}</View>
       </View>
       {!!crosshairFrame && (
         <View style={s.hostResourceChartTooltip} accessible accessibilityLiveRegion="polite">
-          <Text style={s.hostResourceChartTooltipTitle}>{formatHostResourceTimestamp(crosshairFrame.captured_at)} / seq {crosshairFrame.sample_sequence}</Text>
+          <Text style={s.hostResourceChartTooltipTitle}>{formatHostResourceTimestampFull(crosshairFrame.chart_time_ms)} / seq {crosshairFrame.sample_sequence}</Text>
+          <Text style={s.hostResourceChartTooltipText}>{Math.max(0, Math.round((nowMs - Number(crosshairFrame.chart_time_ms)) / 1000))}s old / {crosshairFrame.sample_interval_ms || timeline.cadenceMs} ms / {statusLabel} / source {crosshairFrame.status || 'unknown'}</Text>
           {chartSeries.map(entry => <Text key={entry.key} style={s.hostResourceChartTooltipText}>{entry.label}: {entry.format(hostResourceMetricValue(entry.visibleFrames.find(frame => frame.sample_sequence === crosshairFrame.sample_sequence), entry.metric))}</Text>)}
         </View>
       )}
@@ -290,12 +335,12 @@ function HostResourceChart({ title, description, frames, series, percentScale = 
         {activeSeries.map(entry => {
           const stats = hostResourceIntervalStats(entry.visibleFrames, entry.metric);
           const peak = entry.visibleFrames.find(frame => frame.sample_sequence === stats.peakSequence);
-          return <Text key={entry.key} style={s.hostResourceChartStatText}>{entry.label}: current {entry.format(stats.current)} / min {entry.format(stats.min)} / avg {entry.format(stats.average)} / max {entry.format(stats.max)} / p95 {entry.format(stats.p95)} / peak {formatHostResourceTimestamp(peak?.captured_at)}</Text>;
+          return <Text key={entry.key} style={s.hostResourceChartStatText}>{entry.label}: latest-good {entry.format(stats.current)} / min {entry.format(stats.min)} / avg {entry.format(stats.average)} ({stats.averageMethod}) / max {entry.format(stats.max)} / {stats.p95Ready ? `p95 ${entry.format(stats.p95)}` : `p95 collecting (${stats.count}/20)`} / {stats.count} raw / {Math.round(stats.elapsedMs / 1000)}s / {Math.max(stats.gapCount, timeline.gapCount)} gaps / {statusLabel} / peak {formatHostResourceTimestamp(peak?.captured_at)}</Text>;
         })}
       </View>
       <TouchableOpacity style={s.hostResourceDataToggle} accessibilityRole="button" accessibilityState={{ expanded: showData }} onPress={() => setShowData(previous => !previous)}><Text style={s.hostResourceDataToggleText}>{showData ? 'Hide' : 'Show'} accessible data table</Text></TouchableOpacity>
       {showData && <View style={s.hostResourceDataTable} accessible accessibilityLabel={`${title} latest data table`}>
-        {visibleFrames.slice(-12).map(frame => <View key={frame.sample_sequence} style={s.hostResourceDataRow}><Text style={s.hostResourceDataTime}>{formatHostResourceTimestamp(frame.captured_at)} / {frame.sample_sequence}</Text><Text style={s.hostResourceDataValues}>{chartSeries.map(entry => `${entry.label} ${entry.format(hostResourceMetricValue(entry.visibleFrames.find(candidate => candidate.sample_sequence === frame.sample_sequence), entry.metric))}`).join(' / ')}</Text></View>)}
+        {visibleFrames.slice(-12).map(frame => <View key={`${frame.sample_sequence}:${frame.chart_time_ms}`} style={s.hostResourceDataRow}><Text style={s.hostResourceDataTime}>{formatHostResourceTimestampFull(frame.chart_time_ms)} / {frame.sample_sequence}{frame.gap_before ? ` / gap ${frame.gap_reason}` : ''}</Text><Text style={s.hostResourceDataValues}>{chartSeries.map(entry => `${entry.label} ${entry.format(hostResourceMetricValue(entry.visibleFrames.find(candidate => candidate.sample_sequence === frame.sample_sequence), entry.metric))}`).join(' / ')}</Text></View>)}
       </View>}
     </View>
   );
@@ -414,7 +459,7 @@ function useSidebarFreshnessClock(activities, sessions) {
   return nowMs;
 }
 
-export default function SessionListScreen({ navigation }) {
+export default function SessionListScreen({ navigation, route }) {
   const reducedMotion = useReducedMotion();
   const [sessionRegistry, setSessionRegistry] = useState(() => createSessionRegistry());
   const sessions = sessionRegistry.list;
@@ -450,6 +495,7 @@ export default function SessionListScreen({ navigation }) {
   const [latestAppUpdateValidation, setLatestAppUpdateValidation] = useState(null);
   const [providerUsage, setProviderUsage] = useState(null);
   const [providerUsageRefreshReceipt, setProviderUsageRefreshReceipt] = useState(null);
+  const [providerUsageResetReceipt, setProviderUsageResetReceipt] = useState(null);
   const [providerUsageCostDetail, setProviderUsageCostDetail] = useState(null);
   const [providerUsageNowMs, setProviderUsageNowMs] = useState(Date.now());
   const [estimatedCostDays, setEstimatedCostDays] = useState(1);
@@ -465,6 +511,7 @@ export default function SessionListScreen({ navigation }) {
   const [hostResourceAggregateOnly, setHostResourceAggregateOnly] = useState(false);
   const [hostResourceRange, setHostResourceRange] = useState('live');
   const [hostResourcePausedSequence, setHostResourcePausedSequence] = useState(null);
+  const [hostResourcePausedAtMs, setHostResourcePausedAtMs] = useState(null);
   const [hostResourceViewport, setHostResourceViewport] = useState({ start: 0, end: 1 });
   const [hostResourceCrosshairSequence, setHostResourceCrosshairSequence] = useState(0);
   const [hostResourceProcessSearch, setHostResourceProcessSearch] = useState('');
@@ -476,6 +523,13 @@ export default function SessionListScreen({ navigation }) {
   const [showFleetView, setShowFleetView] = useState(false);
   const [showFleetIdle, setShowFleetIdle] = useState(false);
   const [showTranscriptSearch, setShowTranscriptSearch] = useState(false);
+  useEffect(() => {
+    if (!route?.params?.openUsageNonce) return;
+    setShowUsageDashboard(true);
+    setShowHostResourceDashboard(false);
+    setShowFleetView(false);
+    setShowTranscriptSearch(false);
+  }, [route?.params?.openUsageNonce]);
   const [transcriptSearchQuery, setTranscriptSearchQuery] = useState('');
   const [transcriptSearchProject, setTranscriptSearchProject] = useState('');
   const [transcriptSearchHarness, setTranscriptSearchHarness] = useState('');
@@ -736,7 +790,9 @@ export default function SessionListScreen({ navigation }) {
         setDuplicateProxyAlarms(Array.isArray(msg.duplicate_proxy_alarms) ? msg.duplicate_proxy_alarms : []);
         setNightlyValidationFailures(Array.isArray(msg.nightly_validation_failures) ? msg.nightly_validation_failures : []);
         setLatestAppUpdateValidation(msg.latest_app_update_validation || null);
-        if (msg.provider_usage && typeof msg.provider_usage === 'object') setProviderUsage(msg.provider_usage);
+        if (msg.provider_usage && typeof msg.provider_usage === 'object') {
+          setProviderUsage(previous => retainNewerProviderUsage(previous, msg.provider_usage));
+        }
         if (msg.sessions) {
           setSessions(msg.sessions);
         }
@@ -764,11 +820,39 @@ export default function SessionListScreen({ navigation }) {
         break;
 
       case 'provider_usage_snapshot':
-        if (msg.snapshot && typeof msg.snapshot === 'object') setProviderUsage(msg.snapshot);
+        if (msg.snapshot && typeof msg.snapshot === 'object') {
+          setProviderUsage(previous => retainNewerProviderUsage(previous, msg.snapshot));
+        }
         break;
+
+      case 'provider_usage_threshold': {
+        const affected = new Set(Array.isArray(msg.affected_session_ids) ? msg.affected_session_ids.map(String) : []);
+        if (affected.size > 0) setSessions(previous => previous.map(item => {
+          const sid = sessionKey(item);
+          if (!affected.has(sid)) return item;
+          return {
+            ...(typeof item === 'object' ? item : {}),
+            session_id: sid,
+            percent_used: Number.isFinite(Number(msg.percent_used)) ? Number(msg.percent_used) : null,
+            rate_limit_active: msg.hard_limited === true,
+            rate_limited_until: msg.reset_hint || 'unknown',
+            usage_limit_provider: msg.provider_id || null,
+            usage_limit_window: msg.window_label || msg.window_id || null,
+          };
+        }));
+        break;
+      }
 
       case 'provider_usage_refresh_receipt':
         setProviderUsageRefreshReceipt(previous => (
+          !previous || !msg.request_id || previous.requestId === msg.request_id
+            ? { requestId: msg.request_id || previous?.requestId || '', status: msg.status || 'error', ...msg }
+            : previous
+        ));
+        break;
+
+      case 'provider_usage_reset_credit_receipt':
+        setProviderUsageResetReceipt(previous => (
           !previous || !msg.request_id || previous.requestId === msg.request_id
             ? { requestId: msg.request_id || previous?.requestId || '', status: msg.status || 'error', ...msg }
             : previous
@@ -1443,9 +1527,40 @@ export default function SessionListScreen({ navigation }) {
       ? hostResourceHistory
       : hostResourceHistory.filter(frame => frame.sample_sequence <= hostResourcePausedSequence)
   ), [hostResourceHistory, hostResourcePausedSequence]);
+  const hostResourceRangeNowMs = hostResourcePausedSequence == null
+    ? hostResourceNowMs
+    : hostResourcePausedAtMs || hostResourceNowMs;
   const rangedHostResourceHistory = useMemo(() => (
-    selectHostResourceRange(visibleHostResourceHistory, hostResourceRange)
-  ), [visibleHostResourceHistory, hostResourceRange]);
+    selectHostResourceRange(visibleHostResourceHistory, hostResourceRange, {
+      nowMs: hostResourceRangeNowMs,
+      paused: hostResourcePausedSequence != null,
+      subscriptionStatus: hostResourceSubscription.status,
+      connected: hostResourceSubscription.status !== 'reconnecting',
+      error: Boolean(hostResourceError),
+    })
+  ), [visibleHostResourceHistory, hostResourceRange, hostResourceRangeNowMs,
+    hostResourcePausedSequence, hostResourceSubscription.status, hostResourceError]);
+  const hostResourceTimelineProjection = useMemo(() => hostResourceTimeline(visibleHostResourceHistory, {
+    nowMs: hostResourceRangeNowMs,
+    paused: hostResourcePausedSequence != null,
+    subscriptionStatus: hostResourceSubscription.status,
+    connected: hostResourceSubscription.status !== 'reconnecting',
+    error: Boolean(hostResourceError),
+  }), [visibleHostResourceHistory, hostResourceRangeNowMs, hostResourcePausedSequence,
+    hostResourceSubscription.status, hostResourceError]);
+  const hostResourceStaleRefreshKeyRef = useRef('');
+  useEffect(() => {
+    if (!showHostResourceDashboard || hostResourcePausedSequence != null
+      || !['delayed', 'stale'].includes(hostResourceTimelineProjection.status)) {
+      hostResourceStaleRefreshKeyRef.current = '';
+      return;
+    }
+    const key = `${hostResourceTimelineProjection.status}:${hostResourceTimelineProjection.points[hostResourceTimelineProjection.points.length - 1]?.sampleSequence || 0}`;
+    if (hostResourceStaleRefreshKeyRef.current === key) return;
+    hostResourceStaleRefreshKeyRef.current = key;
+    clientRef.current?.requestHostResourceRefresh(false);
+  }, [showHostResourceDashboard, hostResourcePausedSequence, hostResourceTimelineProjection.status,
+    hostResourceTimelineProjection.points]);
   const hostResourceProcessRows = useMemo(() => androidHostResourceProcessRows(
     normalizedHostResources.processes,
     hostResourceProcessSearch,
@@ -1494,7 +1609,8 @@ export default function SessionListScreen({ navigation }) {
     const type = agentType(session);
     const goalCapable = goalLifecycleSupported(type, session?.capabilities);
     const capabilitySafeActivity = goalCapable ? activity : { ...activity, goal: null };
-    const attention = !!permPrompts[id] || String(capabilitySafeActivity?.kind || '').toLowerCase() === 'waiting_for_user';
+    const attention = !!permPrompts[id] || session?.rate_limit_active === true
+      || String(capabilitySafeActivity?.kind || '').toLowerCase() === 'waiting_for_user';
     const state = classifyFleetActivity(capabilitySafeActivity, attention, {
       connected,
       health: healthMap[id],
@@ -1515,6 +1631,14 @@ export default function SessionListScreen({ navigation }) {
       latestUserRequest: session?.last_user_request || null,
     });
     const goal = workContext.kind === 'goal' ? capabilitySafeActivity?.goal || null : null;
+    const usagePercent = Number(session?.percent_used);
+    const usageReset = session?.rate_limited_until && session.rate_limited_until !== 'unknown'
+      ? String(session.rate_limited_until) : '';
+    const usageStatus = session?.rate_limit_active === true
+      ? `Usage limited${usageReset ? ` · resets ${usageReset}` : ' · reset unknown'}`
+      : Number.isFinite(usagePercent) && usagePercent >= 75
+        ? `Usage ${Math.round(usagePercent)}% used${usageReset ? ` · resets ${usageReset}` : ''}`
+        : '';
     return {
       id,
       session,
@@ -1522,16 +1646,17 @@ export default function SessionListScreen({ navigation }) {
       attention: needsAttention,
       working,
       state,
+      stateLabel: session?.rate_limit_active === true ? 'Usage limited' : fleetStateLabel(state),
       goal,
       badge,
       title: sessionName(session),
-      status: attention ? 'Action required' : (goalSubstate || capabilitySafeActivity?.label || (state === 'idle' ? (goal ? 'Goal paused' : 'Idle') : String(capabilitySafeActivity?.kind || 'Working').replace(/_/g, ' '))),
+      status: usageStatus || (attention ? 'Action required' : (goalSubstate || capabilitySafeActivity?.label || (state === 'idle' ? (goal ? 'Goal paused' : 'Idle') : String(capabilitySafeActivity?.kind || 'Working').replace(/_/g, ' ')))),
       workContext,
       progress: fleetWorkContextProgress(workContext),
       snippet: fleetSnippet(session),
       healthColor: healthDotColor(id),
       canReceiveBroadcast: sessionSupportsBroadcast(session, healthMap[id] || 'unknown', connected),
-      freshness: fleetFreshnessLabel(activity),
+      freshness: fleetFreshnessLabel(activity, fleetNowMs),
       activityLatencyMs: Number.isFinite(Number(activity?.transport?.latency_ms)) ? Math.round(Number(activity.transport.latency_ms)) : null,
     };
   }).filter(Boolean).sort((left, right) => (
@@ -1796,6 +1921,11 @@ export default function SessionListScreen({ navigation }) {
             <Text style={s.usageSessions}>Refresh {providerUsageRefreshReceipt.status}
               {providerUsageRefreshReceipt.generation != null ? ` - generation ${providerUsageRefreshReceipt.generation}` : ''}</Text>
           </View>}
+          {!!providerUsageResetReceipt && providerUsageResetReceipt.status !== 'requested' && <View style={s.usageCostState} accessibilityRole="summary">
+            <Text style={s.usageSessions}>Reset {providerUsageResetReceipt.status}
+              {providerUsageResetReceipt.outcome ? ` - ${providerUsageResetReceipt.outcome}` : ''}
+              {providerUsageResetReceipt.code ? ` (${providerUsageResetReceipt.code})` : ''}</Text>
+          </View>}
           {normalizedProviderUsage.collectionState !== 'ready' && <View style={s.usageCostState} accessibilityRole="summary">
             <Text style={s.usageWindowTitle}>{({
               'not-started': 'Provider usage has not been collected yet',
@@ -1994,6 +2124,7 @@ export default function SessionListScreen({ navigation }) {
                     <Text style={s.usageSessions}>{entry.sessionCount} mapped session{entry.sessionCount === 1 ? '' : 's'}</Text>
                     <Text style={s.usageSessions}>{entry.harnessTypes.length ? entry.harnessTypes.join(', ') : 'No mapped surfaces'}</Text>
                     <Text style={s.usageSessions}>{formatProviderUsageAge(entry.capturedAt, providerUsageNowMs)}</Text>
+                    {!!entry.nextRefreshAt && <Text style={s.usageSessions}>Next refresh {formatProviderUsageReset(entry.nextRefreshAt, providerUsageNowMs)}</Text>}
                   </View>
                   {entry.windows.length > 0 ? (
                     <View style={s.usageWindows}>
@@ -2048,9 +2179,25 @@ export default function SessionListScreen({ navigation }) {
                         );
                       })}
                     </View>
-                  ) : !entry.localRuntime ? (
+                  ) : !entry.localRuntime && !entry.cloudUsage ? (
                     <Text style={s.usageUnavailable}>{entry.error?.message || 'This provider did not report quota windows.'}</Text>
                   ) : null}
+                  {!!entry.cloudUsage && entry.providerId === 'ollama-local' && (
+                    entry.cloudUsage.subscriptionState === 'active' ? <View style={s.usageCredits} accessibilityLabel="Ollama Cloud usage">
+                      <View style={s.usageCreditCell}>
+                        <Text style={s.usageCreditLabel}>Ollama Cloud</Text>
+                        <Text style={s.usageCreditValue}>{entry.windows.length} quota window{entry.windows.length === 1 ? '' : 's'}</Text>
+                        <Text style={s.usageSessions}>{formatProviderUsageAge(entry.cloudUsage.capturedAt, providerUsageNowMs)}</Text>
+                      </View>
+                      <View style={s.usageCreditCell}>
+                        <Text style={s.usageCreditLabel}>Auto-reload</Text>
+                        <Text style={s.usageCreditValue}>{entry.cloudUsage.autoReloadEnabled == null ? 'Not reported' : entry.cloudUsage.autoReloadEnabled ? 'On' : 'Off'}</Text>
+                        <Text style={s.usageSessions}>Extra usage balance is separate from plan quota</Text>
+                      </View>
+                    </View> : entry.cloudUsage.subscriptionState === 'none'
+                      ? <Text style={s.usageUnavailable} accessibilityLabel="Ollama Cloud no subscription">No cloud subscription - local models remain unlimited</Text>
+                      : <Text style={s.usageUnavailable} accessibilityLabel="Ollama Cloud usage unavailable">Cloud usage unavailable - {entry.cloudUsage.error?.message || 'Open the signed-in Ollama Usage page to expose account quota.'}</Text>
+                  )}
                   {!!entry.localRuntime && <View style={s.usageCredits} accessibilityLabel="Ollama local runtime">
                     <View style={s.usageCreditCell}>
                       <Text style={s.usageCreditLabel}>Local runtime</Text>
@@ -2102,6 +2249,28 @@ export default function SessionListScreen({ navigation }) {
                         <Text style={s.usageCreditLabel}>Rate-limit resets</Text>
                         <Text style={s.usageCreditValue}>{entry.resetCredits.available_count || 0} available</Text>
                       </View>}
+                    </View>
+                  )}
+                  {entry.providerId === 'openai-codex'
+                    && Number(entry.resetCredits?.available_count) > 0
+                    && entry.windows.some(window => window.usedPercent >= 100) && (
+                    <View style={s.usageResetAttention} accessibilityRole="alert" accessibilityLabel={`${entry.resetCredits.available_count} limit resets available - apply one?`}>
+                      <View style={{ flex: 1, gap: 2 }}>
+                        <Text style={s.usageWindowTitle}>{entry.resetCredits.available_count} limit reset{entry.resetCredits.available_count === 1 ? '' : 's'} available — apply one?</Text>
+                        <Text style={s.usageSessions}>Uses Codex's native reset action only after this approval.</Text>
+                      </View>
+                      <TouchableOpacity
+                        accessibilityRole="button"
+                        accessibilityLabel="Apply one Codex rate limit reset"
+                        disabled={['requested', 'accepted'].includes(providerUsageResetReceipt?.status)}
+                        onPress={() => {
+                          const requestId = clientRef.current?.consumeProviderUsageResetCredit();
+                          if (requestId) setProviderUsageResetReceipt({ requestId, status: 'requested' });
+                        }}
+                        style={s.usageResetButton}
+                      >
+                        <Text style={s.usageResetButtonText}>{['requested', 'accepted'].includes(providerUsageResetReceipt?.status) ? 'Applying...' : 'Apply one reset'}</Text>
+                      </TouchableOpacity>
                     </View>
                   )}
                   {Array.isArray(entry.resetCredits?.details) && entry.resetCredits.details.length > 0 && (
@@ -2173,25 +2342,40 @@ export default function SessionListScreen({ navigation }) {
           </View>
           <ScrollView contentContainerStyle={s.hostResourceList}>
             <View style={s.hostResourceMeta}>
-              <Text style={[s.hostResourceStatus, normalizedHostResources.available ? s.hostResourceStatusLive : s.hostResourceStatusUnavailable]}>
-                {hostResourceSubscription.status === 'reconnecting' ? 'Reconnecting' : normalizedHostResources.available ? 'Live' : 'Unavailable'}
+              <Text style={[s.hostResourceStatus,
+                hostResourceTimelineProjection.status === 'live' ? s.hostResourceStatusLive
+                  : ['delayed', 'stale'].includes(hostResourceTimelineProjection.status) ? s.hostResourceStatusWarning
+                    : hostResourceTimelineProjection.status === 'paused' ? s.hostResourceStatusPaused
+                      : hostResourceTimelineProjection.status === 'reconnecting' ? s.hostResourceStatusReconnecting
+                        : s.hostResourceStatusUnavailable]}>
+                {({ live: 'Live', delayed: 'Delayed', reconnecting: 'Reconnecting', paused: 'Paused', stale: 'Stale', waiting: 'Waiting', unavailable: 'Unavailable' })[hostResourceTimelineProjection.status] || 'Unavailable'}
               </Text>
               <Text style={s.usageSessions}>{hostResourceAggregateOnly ? 'Aggregate-only' : normalizedHostResources.machineLabel || 'Windows host'}</Text>
               <Text style={s.usageSessions}>{formatHostResourceAge(normalizedHostResources.capturedAt, hostResourceNowMs)}</Text>
-              <Text style={s.usageSessions}>1s system / 5s detail / seq {normalizedHostResources.sampleSequence || '--'}</Text>
+              <Text style={s.usageSessions}>{hostResourceTimelineProjection.receivedCount} received / {hostResourceTimelineProjection.validCount} valid / {hostResourceTimelineProjection.expectedCount} expected / {hostResourceTimelineProjection.droppedCount} dropped / {hostResourceTimelineProjection.gapCount} gaps / {hostResourceTimelineProjection.duplicateCount} dup / {hostResourceTimelineProjection.outOfOrderCount} out-of-order</Text>
+              <Text style={s.usageSessions}>{Math.round(hostResourceTimelineProjection.cadenceMs)} ms cadence / seq {normalizedHostResources.sampleSequence || '--'}</Text>
             </View>
             <ScrollView horizontal showsHorizontalScrollIndicator={false} contentContainerStyle={s.hostResourceControls} accessibilityLabel="Host resource timeline controls">
               {[['live', 'Live'], ['1m', '1m'], ['5m', '5m'], ['15m', '15m'], ['since_open', 'Since open']].map(([value, label]) => (
                 <TouchableOpacity key={value} style={[s.hostResourceControlButton, hostResourceRange === value ? s.hostResourceControlButtonActive : null]} accessibilityRole="button" accessibilityState={{ selected: hostResourceRange === value }} onPress={() => { setHostResourceRange(value); setHostResourceViewport({ start: 0, end: 1 }); }}><Text style={[s.hostResourceControlText, hostResourceRange === value ? s.hostResourceControlTextActive : null]}>{label}</Text></TouchableOpacity>
               ))}
-              <TouchableOpacity style={s.hostResourceControlButton} accessibilityRole="button" onPress={() => setHostResourcePausedSequence(previous => previous == null ? hostResourceHistory[hostResourceHistory.length - 1]?.sample_sequence || 0 : null)}><Text style={s.hostResourceControlText}>{hostResourcePausedSequence == null ? 'Pause' : 'Resume'}</Text></TouchableOpacity>
+              <TouchableOpacity style={s.hostResourceControlButton} accessibilityRole="button" onPress={() => {
+                if (hostResourcePausedSequence == null) {
+                  setHostResourcePausedAtMs(Date.now());
+                  setHostResourcePausedSequence(hostResourceHistory[hostResourceHistory.length - 1]?.sample_sequence || 0);
+                } else {
+                  setHostResourcePausedSequence(null);
+                  setHostResourcePausedAtMs(null);
+                }
+              }}><Text style={s.hostResourceControlText}>{hostResourcePausedSequence == null ? 'Pause' : 'Resume'}</Text></TouchableOpacity>
               <TouchableOpacity style={s.hostResourceControlButton} accessibilityRole="button" accessibilityState={{ disabled: hostResourceViewport.start === 0 && hostResourceViewport.end === 1 }} disabled={hostResourceViewport.start === 0 && hostResourceViewport.end === 1} onPress={() => setHostResourceViewport({ start: 0, end: 1 })}><Text style={s.hostResourceControlText}>Reset zoom</Text></TouchableOpacity>
               <TouchableOpacity style={[s.hostResourceControlButton, hostResourceAggregateOnly ? s.hostResourceControlButtonActive : null]} accessibilityRole="checkbox" accessibilityState={{ checked: hostResourceAggregateOnly }} accessibilityLabel="Aggregate-only privacy" onPress={() => { setHostResourceAggregateOnly(previous => !previous); setHostResourceSelectedProcessKey(''); }}><Text style={[s.hostResourceControlText, hostResourceAggregateOnly ? s.hostResourceControlTextActive : null]}>Aggregate-only</Text></TouchableOpacity>
             </ScrollView>
-            <Text style={s.hostResourceSampleCount}>{rangedHostResourceHistory.length} samples{hostResourcePausedSequence == null ? '' : ` / paused at ${hostResourcePausedSequence}`}</Text>
+            <Text style={s.hostResourceSampleCount}>{rangedHostResourceHistory.length} raw samples / {Math.round(hostResourceTimelineProjection.elapsedMs / 1000)}s actual{hostResourcePausedSequence == null ? '' : ` / paused at ${hostResourcePausedSequence}`}</Text>
             {!!(hostResourceError || normalizedHostResources.error) && (
               <Text style={s.hostResourceError} accessibilityRole="alert">
                 {hostResourceError?.message || normalizedHostResources.error?.message}
+                {normalizedHostResources.error ? ` Last full detail: ${normalizedHostResources.lastGoodCapturedAt ? formatHostResourceAge(normalizedHostResources.lastGoodCapturedAt, hostResourceNowMs).replace(/^Updated\s+/i, '') : 'not yet available'}.` : ''}
               </Text>
             )}
             {normalizedHostResources.system ? (
@@ -2211,17 +2395,17 @@ export default function SessionListScreen({ navigation }) {
                   ))}
                 </View>
                 <View style={s.hostResourceCharts}>
-                  <HostResourceChart title="CPU" description="Host utilization (%)" frames={rangedHostResourceHistory} percentScale viewport={hostResourceViewport} onViewportChange={setHostResourceViewport} crosshairSequence={hostResourceCrosshairSequence} onCrosshairChange={setHostResourceCrosshairSequence} series={[
+                  <HostResourceChart title="CPU" description="Total outline; User and Kernel component overlays (%)" frames={rangedHostResourceHistory} percentScale viewport={hostResourceViewport} onViewportChange={setHostResourceViewport} crosshairSequence={hostResourceCrosshairSequence} onCrosshairChange={setHostResourceCrosshairSequence} range={hostResourceRange} nowMs={hostResourceRangeNowMs} paused={hostResourcePausedSequence != null} subscriptionStatus={hostResourceSubscription.status} series={[
                     { key: 'cpu-total', metric: 'cpu_total_percent', label: 'Total', color: '#58a6ff', format: formatHostResourcePercent },
                     { key: 'cpu-user', metric: 'cpu_user_percent', label: 'User', color: '#3fb950', format: formatHostResourcePercent },
                     { key: 'cpu-kernel', metric: 'cpu_privileged_percent', label: 'Kernel', color: '#d29922', format: formatHostResourcePercent },
                     ...(selectedHostResourceFrames.length ? [{ key: 'process-cpu', metric: 'cpu_total_percent', label: `${selectedHostResourceProcess?.agentLabel || selectedHostResourceProcess?.name || 'Process'} overlay`, color: '#f778ba', format: formatHostResourcePercent, frames: selectedHostResourceFrames, dashed: true }] : []),
                   ]} />
-                  <HostResourceChart title="Memory" description="Physical used and committed (%)" frames={rangedHostResourceHistory} percentScale viewport={hostResourceViewport} onViewportChange={setHostResourceViewport} crosshairSequence={hostResourceCrosshairSequence} onCrosshairChange={setHostResourceCrosshairSequence} series={[
+                  <HostResourceChart title="Memory" description="Physical used and committed (%)" frames={rangedHostResourceHistory} percentScale viewport={hostResourceViewport} onViewportChange={setHostResourceViewport} crosshairSequence={hostResourceCrosshairSequence} onCrosshairChange={setHostResourceCrosshairSequence} range={hostResourceRange} nowMs={hostResourceRangeNowMs} paused={hostResourcePausedSequence != null} subscriptionStatus={hostResourceSubscription.status} series={[
                     { key: 'memory-used', metric: 'memory_used_percent', label: 'Physical used', color: '#bc8cff', format: formatHostResourcePercent },
                     { key: 'memory-commit', metric: 'memory_commit_percent', label: 'Committed', color: '#f778ba', format: formatHostResourcePercent },
                   ]} />
-                  <HostResourceChart title="Disk" description="Aggregate throughput (IEC bytes/s)" frames={rangedHostResourceHistory} viewport={hostResourceViewport} onViewportChange={setHostResourceViewport} crosshairSequence={hostResourceCrosshairSequence} onCrosshairChange={setHostResourceCrosshairSequence} series={[
+                  <HostResourceChart title="Disk" description="Aggregate throughput (IEC bytes/s); isolate unequal series in the legend" frames={rangedHostResourceHistory} viewport={hostResourceViewport} onViewportChange={setHostResourceViewport} crosshairSequence={hostResourceCrosshairSequence} onCrosshairChange={setHostResourceCrosshairSequence} range={hostResourceRange} nowMs={hostResourceRangeNowMs} paused={hostResourcePausedSequence != null} subscriptionStatus={hostResourceSubscription.status} series={[
                     { key: 'disk-read', metric: 'disk_read_bps', label: 'Read', color: '#58a6ff', format: value => value == null ? '--' : formatHostResourceRate(value) },
                     { key: 'disk-write', metric: 'disk_write_bps', label: 'Write', color: '#f0883e', format: value => value == null ? '--' : formatHostResourceRate(value) },
                     ...(selectedHostResourceFrames.length ? [
@@ -2229,7 +2413,7 @@ export default function SessionListScreen({ navigation }) {
                       { key: 'process-write', metric: 'disk_write_bps', label: 'Process write overlay', color: '#f778ba', format: value => value == null ? '--' : formatHostResourceRate(value), frames: selectedHostResourceFrames, dashed: true },
                     ] : []),
                   ]} />
-                  <HostResourceChart title="Network" description="Physical-default receive and send (IEC bytes/s)" frames={rangedHostResourceHistory} viewport={hostResourceViewport} onViewportChange={setHostResourceViewport} crosshairSequence={hostResourceCrosshairSequence} onCrosshairChange={setHostResourceCrosshairSequence} series={[
+                  <HostResourceChart title="Network" description="Physical-default receive and send (IEC bytes/s)" frames={rangedHostResourceHistory} viewport={hostResourceViewport} onViewportChange={setHostResourceViewport} crosshairSequence={hostResourceCrosshairSequence} onCrosshairChange={setHostResourceCrosshairSequence} range={hostResourceRange} nowMs={hostResourceRangeNowMs} paused={hostResourcePausedSequence != null} subscriptionStatus={hostResourceSubscription.status} series={[
                     { key: 'network-receive', metric: 'network_receive_bps', label: 'Receive', color: '#3fb950', format: value => value == null ? '--' : formatHostResourceRate(value) },
                     { key: 'network-send', metric: 'network_send_bps', label: 'Send', color: '#d29922', format: value => value == null ? '--' : formatHostResourceRate(value) },
                   ]} />
@@ -2405,7 +2589,7 @@ export default function SessionListScreen({ navigation }) {
                 }}
                 accessibilityRole="button"
                 accessibilityLabel={`Open ${entry.title}`}
-                accessibilityHint={`${fleetStateLabel(entry.state)}. Activity ${entry.freshness}.`}
+                accessibilityHint={`${entry.stateLabel}. Activity ${entry.freshness}.`}
               >
                 <View style={s.fleetCardTop}>
                   <View style={[s.agentBadge, { backgroundColor: entry.badge.color + '22', borderColor: entry.badge.color + '55' }]}>
@@ -2433,7 +2617,7 @@ export default function SessionListScreen({ navigation }) {
                     entry.state === 'working_goal' ? s.fleetStateWorkingGoal : null,
                     entry.state === 'working' ? s.fleetStateWorking : null,
                     entry.state === 'needs_attention' ? s.fleetStateAttention : null,
-                  ]}>{fleetStateLabel(entry.state)}</Text>
+                  ]}>{entry.stateLabel}</Text>
                   <Text style={s.fleetStatus} numberOfLines={1}>{entry.status}</Text>
                   {entry.working && <Text style={s.fleetElapsed}>{fleetElapsedLabel(entry.activity, fleetNowMs)}</Text>}
                 </View>
@@ -2454,7 +2638,7 @@ export default function SessionListScreen({ navigation }) {
                   style={s.fleetMeter}
                   accessible
                   accessibilityLabel={entry.progress == null
-                    ? `${entry.workContext.label} ${fleetStateLabel(entry.state).toLowerCase()}`
+                    ? `${entry.workContext.label} ${entry.stateLabel.toLowerCase()}`
                     : Number.isInteger(entry.workContext.completed) && Number.isInteger(entry.workContext.total)
                       ? `${entry.workContext.label} ${entry.workContext.completed} of ${entry.workContext.total} complete`
                       : `${entry.workContext.label} ${Math.round(entry.progress)}% complete`}
@@ -2693,9 +2877,17 @@ export default function SessionListScreen({ navigation }) {
           const contextualSubtitle = workspaceLabel ? `${subtitle || badge.label} / ${workspaceLabel}` : subtitle;
           const latestVisibleMessage = section.recent ? normalizeLatestVisibleMessage(item) : null;
           const recentMessageInstant = latestVisibleMessage ? parseMessageInstant(latestVisibleMessage.at) : null;
-          const rowActivityLabel = recentMessageInstant
+          const rowUsagePercent = Number(item?.percent_used);
+          const rowUsageReset = item?.rate_limited_until && item.rate_limited_until !== 'unknown'
+            ? String(item.rate_limited_until) : '';
+          const rowUsageLabel = item?.rate_limit_active === true
+            ? `Usage limited${rowUsageReset ? ` · resets ${rowUsageReset}` : ' · reset unknown'}`
+            : Number.isFinite(rowUsagePercent) && rowUsagePercent >= 75
+              ? `Usage ${Math.round(rowUsagePercent)}% used${rowUsageReset ? ` · resets ${rowUsageReset}` : ''}`
+              : '';
+          const rowActivityLabel = rowUsageLabel || (recentMessageInstant
             ? `Last message ${formatVisibleMessageTime(recentMessageInstant)}`
-            : label;
+            : label);
           const unread = testSessionIds.has(sid) ? 0 : unreadMap[sid] || 0;
           const hasPerm = !!permPrompts[sid];
           const promptRequiredLabel = permPrompts[sid]?.type === 'question_prompt'
@@ -2763,6 +2955,7 @@ export default function SessionListScreen({ navigation }) {
               <View style={s.cardSignalSlot}>
                 {hasPerm
                   ? <Text style={s.permBadge}>⚠</Text>
+                  : item?.rate_limit_active === true ? <Text style={s.permBadge}>⏳</Text>
                   : unread > 0 ? <View style={s.unreadBadge}>
                     <Text style={s.unreadBadgeText}>
                       {unread > 99 ? '99+' : unread}
@@ -3094,6 +3287,9 @@ const s = StyleSheet.create({
   usageCreditValue: { color: '#f0f6fc', fontSize: 11 },
   usageResetCredits: { flexDirection: 'row', flexWrap: 'wrap', gap: 6 },
   usageResetCredit: { backgroundColor: '#0d1117', borderWidth: 1, borderColor: '#30363d', borderRadius: 7, paddingHorizontal: 8, paddingVertical: 6 },
+  usageResetAttention: { flexDirection: 'row', alignItems: 'center', gap: 10, backgroundColor: '#f8514914', borderWidth: 1, borderColor: '#f8514988', borderRadius: 9, padding: 10 },
+  usageResetButton: { backgroundColor: '#da3633', borderWidth: 1, borderColor: '#f85149', borderRadius: 7, paddingHorizontal: 10, paddingVertical: 7 },
+  usageResetButtonText: { color: '#ffffff', fontSize: 10, fontWeight: '800' },
   usageStaleError: { color: '#d29922', backgroundColor: '#d2992216', borderRadius: 7, padding: 8, fontSize: 11 },
   usageSourceRow: { flexDirection: 'row', alignItems: 'center', justifyContent: 'space-between', gap: 10 },
   usageDashboardLink: { color: '#58a6ff', fontSize: 11, fontWeight: '600', paddingVertical: 5 },
@@ -3121,6 +3317,9 @@ const s = StyleSheet.create({
   hostResourceMeta: { flexDirection: 'row', flexWrap: 'wrap', alignItems: 'center', gap: 8, paddingTop: 12 },
   hostResourceStatus: { borderWidth: 1, borderRadius: 12, fontSize: 9, fontWeight: '800', paddingHorizontal: 8, paddingVertical: 3, textTransform: 'uppercase' },
   hostResourceStatusLive: { borderColor: '#3fb95088', color: '#3fb950' },
+  hostResourceStatusWarning: { borderColor: '#d2992288', color: '#d29922' },
+  hostResourceStatusPaused: { borderColor: '#58a6ff88', color: '#58a6ff' },
+  hostResourceStatusReconnecting: { borderColor: '#bc8cff88', color: '#bc8cff' },
   hostResourceStatusUnavailable: { borderColor: '#f8514988', color: '#f85149' },
   hostResourceError: { color: '#ff7b72', backgroundColor: '#f851491a', borderWidth: 1, borderColor: '#f8514966', borderRadius: 8, padding: 10, fontSize: 12 },
   hostResourceControls: { alignItems: 'center', gap: 6, paddingVertical: 2, paddingRight: 12 },
@@ -3137,6 +3336,7 @@ const s = StyleSheet.create({
   hostResourceChartLabel: { flexDirection: 'row', alignItems: 'center', justifyContent: 'space-between', gap: 8 },
   hostResourceChartTitle: { color: '#f0f6fc', fontSize: 13, fontWeight: '800' },
   hostResourceChartDescription: { color: '#8b949e', fontSize: 9, marginTop: 2 },
+  hostResourceChartQuality: { color: '#c9d1d9', fontSize: 10, lineHeight: 15, fontFamily: Platform.OS === 'ios' ? 'Menlo' : 'monospace' },
   hostResourceChartAction: { minHeight: 34, justifyContent: 'center', borderWidth: 1, borderColor: '#30363d', borderRadius: 17, paddingHorizontal: 10 },
   hostResourceChartActionText: { color: '#c9d1d9', fontSize: 9, fontWeight: '700' },
   hostResourceChartLegend: { flexDirection: 'row', flexWrap: 'wrap', gap: 6 },
@@ -3145,13 +3345,15 @@ const s = StyleSheet.create({
   hostResourceLegendDot: { width: 8, height: 8, borderRadius: 4 },
   hostResourceLegendText: { color: '#c9d1d9', fontSize: 9, fontWeight: '600' },
   hostResourceChartCanvas: { minHeight: 150, overflow: 'hidden', backgroundColor: '#0d1117', borderWidth: 1, borderColor: '#30363d', borderRadius: 8 },
-  hostResourceChartAxis: { position: 'absolute', top: 5, right: 7, bottom: 5, justifyContent: 'space-between', alignItems: 'flex-end' },
-  hostResourceChartValue: { color: '#8b949e', fontSize: 9, fontFamily: Platform.OS === 'ios' ? 'Menlo' : 'monospace' },
+  hostResourceChartAxis: { position: 'absolute', top: 5, left: 5, bottom: 18, justifyContent: 'space-between', alignItems: 'flex-start' },
+  hostResourceChartXAxis: { position: 'absolute', left: 42, right: 10, bottom: 2, flexDirection: 'row', justifyContent: 'space-between' },
+  hostResourceChartValue: { color: '#c9d1d9', fontSize: 10, fontFamily: Platform.OS === 'ios' ? 'Menlo' : 'monospace' },
+  hostResourceChartTime: { color: '#c9d1d9', fontSize: 8, fontFamily: Platform.OS === 'ios' ? 'Menlo' : 'monospace' },
   hostResourceChartTooltip: { backgroundColor: '#0d1117', borderWidth: 1, borderColor: '#30363d', borderRadius: 8, padding: 8, gap: 2 },
-  hostResourceChartTooltipTitle: { color: '#f0f6fc', fontSize: 9, fontWeight: '700', fontFamily: Platform.OS === 'ios' ? 'Menlo' : 'monospace' },
-  hostResourceChartTooltipText: { color: '#c9d1d9', fontSize: 9, fontFamily: Platform.OS === 'ios' ? 'Menlo' : 'monospace' },
+  hostResourceChartTooltipTitle: { color: '#f0f6fc', fontSize: 11, fontWeight: '700', fontFamily: Platform.OS === 'ios' ? 'Menlo' : 'monospace' },
+  hostResourceChartTooltipText: { color: '#c9d1d9', fontSize: 10, fontFamily: Platform.OS === 'ios' ? 'Menlo' : 'monospace' },
   hostResourceChartStats: { gap: 3 },
-  hostResourceChartStatText: { color: '#8b949e', fontSize: 8, lineHeight: 12, fontFamily: Platform.OS === 'ios' ? 'Menlo' : 'monospace' },
+  hostResourceChartStatText: { color: '#c9d1d9', fontSize: 10, lineHeight: 15, fontFamily: Platform.OS === 'ios' ? 'Menlo' : 'monospace' },
   hostResourceDataToggle: { minHeight: 34, alignSelf: 'flex-start', justifyContent: 'center', borderWidth: 1, borderColor: '#30363d', borderRadius: 17, paddingHorizontal: 10 },
   hostResourceDataToggleText: { color: '#58a6ff', fontSize: 9, fontWeight: '700' },
   hostResourceDataTable: { borderWidth: StyleSheet.hairlineWidth, borderColor: '#30363d', borderRadius: 8, overflow: 'hidden' },

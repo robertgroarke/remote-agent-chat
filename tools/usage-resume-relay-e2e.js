@@ -154,6 +154,25 @@ async function main() {
       message.type === 'usage_resume_scheduled' && message.session_id === sessionId
     )), 10_000, 'usage resume schedule');
     assert.equal(scheduled.reset_at, resetAt);
+    const warningFrame = {
+      type: 'rate_limit_active', protocol_version: 1, session_id: sessionId,
+      percent_used: 75, hard_limited: false, retry_after_hint: resetAt, reset_at: resetAt,
+    };
+    pair.proxy.ws.send(JSON.stringify(warningFrame));
+    const semanticWarning = await waitFor(() => pair.browser.messages.find(message => (
+      message.type === 'semantic_notification'
+      && message.event_type === 'provider_usage_threshold'
+      && message.threshold === 75
+    )), 10_000, 'session-local semantic usage warning');
+    assert.strictEqual(semanticWarning.category, 'provider_usage_warning');
+    assert.match(semanticWarning.dedupe_key, /^provider-usage-threshold:fallback-[a-f0-9]{32}:75$/);
+    pair.proxy.ws.send(JSON.stringify(warningFrame));
+    await new Promise(resolve => setTimeout(resolve, 150));
+    assert.strictEqual(pair.browser.messages.filter(message => (
+      message.type === 'semantic_notification'
+      && message.event_type === 'provider_usage_threshold'
+      && message.threshold === 75
+    )).length, 1, 'session-local warning must dedupe within the usage cycle');
     await stopRelay(relay, [pair.proxy, pair.browser]);
     relay = null;
     pair = null;
@@ -206,6 +225,8 @@ async function main() {
       proxy_delivery_settled: true,
       completed_job_persisted: true,
       duplicate_dispatches_after_second_restart: 0,
+      session_local_semantic_warning_threshold: 75,
+      session_local_semantic_warning_duplicates: 0,
       client_message_id: sent.client_message_id,
       visible_windows_opened: 0,
       protected_user_apps_touched: 0,

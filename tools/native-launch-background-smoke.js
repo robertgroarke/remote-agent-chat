@@ -31,7 +31,12 @@ const engineSource = fs.readFileSync(path.join(__dirname, '..', 'agent-proxy', '
 const backgroundCalls = engineSource.match(/launchMode:\s*'background'/g) || [];
 const foregroundCalls = engineSource.match(/launchMode:\s*'foreground'/g) || [];
 assert.strictEqual(backgroundCalls.length, 6, 'new_chat and launch_session must use background mode for all three CLI agents');
-assert.strictEqual(foregroundCalls.length, 3, 'only the explicit open-native action should request foreground mode');
+assert.strictEqual(foregroundCalls.length, 4,
+  'only the three CLI branches and the explicit Claude error-prompt action may request foreground mode');
+assert((engineSource.match(/operatorActionProof:\s*msg\.operator_action_proof/g) || []).length >= 4,
+  'every foreground branch must forward its relay-stamped operator proof');
+assert.match(engineSource, /trusted Claude workspace[\s\S]*?native window remains operator-action-only/,
+  'workspace trust must not implicitly reopen a native window');
 assert.match(engineSource, /nativeCliStatus:\s*'background_ready'/, 'background sessions must expose truthful ready state');
 
 console.log('native launch background smoke: PASS');

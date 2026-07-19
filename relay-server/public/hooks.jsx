@@ -31,6 +31,7 @@ import {
   HOST_RESOURCE_HISTORY_LIMIT,
   mergeOrderedHostResourceFrames,
 } from './host-resources.js';
+import { retainNewerProviderUsage } from './provider-usage.js';
 
 const { useState, useEffect, useRef, useCallback } = React;
 
@@ -211,7 +212,7 @@ export function shouldRefreshNativeCliPlaceholder(session, messages) {
   return /\*\*(?:Codex|Cursor) CLI is waiting for a native transcript\.\*\*/.test(String(only.content || ''));
 }
 
-export function sessionMetadataActivityMaps(sessionList) {
+export function sessionMetadataActivityMaps(sessionList, previousActivities = {}) {
   const activities = {};
   const thinkingContent = {};
   const thinking = {};
@@ -223,6 +224,7 @@ export function sessionMetadataActivityMaps(sessionList) {
       kind,
       label,
       updatedAt: session.activity.updated_at || null,
+      observed_at: session.activity.observed_at || previousActivities[session.session_id]?.observed_at || null,
       startedAt: session.activity.started_at || null,
       interruptHint: session.activity.interrupt_hint || '',
       goal: session.activity.goal || null,
@@ -234,7 +236,7 @@ export function sessionMetadataActivityMaps(sessionList) {
       task_list: session.activity.task_list || null,
       context_card: session.activity.context_card || null,
       thinkingContent: session.activity.thinking?.text || session.activity.thinkingContent || '',
-      transport: session.activity.transport || null,
+      transport: session.activity.transport || previousActivities[session.session_id]?.transport || null,
     };
     thinkingContent[session.session_id] = session.activity.thinking?.text || session.activity.thinkingContent || '';
     thinking[session.session_id] = ['thinking', 'generating', 'running_command', 'applying_patch', 'reading_files', 'working'].includes(kind)
@@ -289,6 +291,7 @@ export function useRelay() {
     const [latestAppUpdateValidation, setLatestAppUpdateValidation] = useState(null);
     const [providerUsage, setProviderUsage] = useState(null);
     const [providerUsageRefreshReceipt, setProviderUsageRefreshReceipt] = useState(null);
+    const [providerUsageResetReceipt, setProviderUsageResetReceipt] = useState(null);
     const [providerUsageCostDetail, setProviderUsageCostDetail] = useState(null);
     const [hostResources, setHostResources] = useState(null);
     const [hostResourceError, setHostResourceError] = useState(null);
@@ -458,6 +461,18 @@ export function useRelay() {
         protocol_version: 1,
         force: force === true,
         request_id: requestId,
+      });
+      return requestId;
+    }, [send]);
+
+    const consumeProviderUsageResetCredit = useCallback(() => {
+      const requestId = `provider-reset-${Date.now()}-${Math.random().toString(36).slice(2, 7)}`;
+      setProviderUsageResetReceipt({ requestId, status: 'requested' });
+      send({
+        type: 'provider_usage_reset_credit_consume',
+        protocol_version: 1,
+        request_id: requestId,
+        approved: true,
       });
       return requestId;
     }, [send]);
@@ -896,7 +911,10 @@ export function useRelay() {
 
     function mergeSessionMetadataActivity(sessionList) {
       const normalized = sessionMetadataActivityMaps(sessionList);
-      setActivities(prev => shallowMapMerge(prev, normalized.activities));
+      setActivities(prev => shallowMapMerge(
+        prev,
+        sessionMetadataActivityMaps(sessionList, prev).activities,
+      ));
       setThinkingContent(prev => shallowMapMerge(prev, normalized.thinkingContent));
       setThinking(prev => shallowMapMerge(prev, normalized.thinking));
     }
@@ -1296,12 +1314,17 @@ export function useRelay() {
       }
     }
 
-    function respondToErrorPrompt(sessionId, promptId, actionId) {
+    function respondToErrorPrompt(sessionId, promptId, actionId, operatorEvent) {
       const requestId = `errprompt-${Date.now()}-${Math.random().toString(36).slice(2, 7)}`;
       setErrorPrompts(prev => prev[sessionId]
         ? { ...prev, [sessionId]: { ...prev[sessionId], submitting_action_id: actionId, request_id: requestId, error: null } }
         : prev);
-      send({ type: 'error_prompt_action', session_id: sessionId, prompt_id: promptId, action_id: actionId, request_id: requestId });
+      send({
+        type: 'error_prompt_action', session_id: sessionId, prompt_id: promptId,
+        action_id: actionId, request_id: requestId,
+        ...(actionId === 'open_native_window'
+          ? { operator_user_gesture: operatorEvent?.isTrusted === true } : {}),
+      });
     }
 
     function interruptSession(sessionId) {
@@ -1388,9 +1411,12 @@ export function useRelay() {
       return requestId;
     }
 
-    function openNativeWindow(sessionId) {
+    function openNativeWindow(sessionId, operatorEvent) {
       const requestId = `native-${Date.now()}-${Math.random().toString(36).slice(2, 7)}`;
-      send({ type: 'open_native_window', session_id: sessionId, request_id: requestId });
+      send({
+        type: 'open_native_window', session_id: sessionId, request_id: requestId,
+        operator_user_gesture: operatorEvent?.isTrusted === true,
+      });
       return requestId;
     }
 
@@ -1727,7 +1753,28 @@ export function useRelay() {
         return;
       }
       if (t === 'provider_usage_snapshot') {
-        if (msg.snapshot && typeof msg.snapshot === 'object') setProviderUsage(msg.snapshot);
+        if (msg.snapshot && typeof msg.snapshot === 'object') {
+          setProviderUsage(previous => retainNewerProviderUsage(previous, msg.snapshot));
+        }
+        return;
+      }
+      if (t === 'provider_usage_threshold') {
+        const affected = new Set(Array.isArray(msg.affected_session_ids) ? msg.affected_session_ids.map(String) : []);
+        if (affected.size > 0) {
+          setSessions(previous => previous.map(session => {
+            const id = typeof session === 'string' ? session : session?.session_id;
+            if (!affected.has(id)) return session;
+            return {
+              ...(typeof session === 'object' ? session : {}),
+              session_id: id,
+              percent_used: Number.isFinite(Number(msg.percent_used)) ? Number(msg.percent_used) : null,
+              rate_limit_active: msg.hard_limited === true,
+              rate_limited_until: msg.reset_hint || 'unknown',
+              usage_limit_provider: msg.provider_id || null,
+              usage_limit_window: msg.window_label || msg.window_id || null,
+            };
+          }));
+        }
         return;
       }
       if (t === 'provider_usage_refresh_receipt') {
@@ -1735,6 +1782,20 @@ export function useRelay() {
           !previous || !msg.request_id || previous.requestId === msg.request_id
             ? { requestId: msg.request_id || previous?.requestId || '', status: msg.status || 'error', ...msg }
             : previous
+        ));
+        return;
+      }
+      if (t === 'provider_usage_reset_credit_receipt') {
+        setProviderUsageResetReceipt(previous => (
+          previous?.requestId && msg.request_id !== previous.requestId
+            ? previous
+            : {
+                requestId: msg.request_id,
+                status: msg.status || 'error',
+                outcome: msg.outcome || null,
+                availableCount: msg.reset_credits_available,
+                error: msg.code || null,
+              }
         ));
         return;
       }
@@ -1943,7 +2004,9 @@ export function useRelay() {
         setDuplicateProxyAlarms(Array.isArray(msg.duplicate_proxy_alarms) ? msg.duplicate_proxy_alarms : []);
         setNightlyValidationFailures(Array.isArray(msg.nightly_validation_failures) ? msg.nightly_validation_failures : []);
         setLatestAppUpdateValidation(msg.latest_app_update_validation || null);
-        if (msg.provider_usage && typeof msg.provider_usage === 'object') setProviderUsage(msg.provider_usage);
+        if (msg.provider_usage && typeof msg.provider_usage === 'object') {
+          setProviderUsage(previous => retainNewerProviderUsage(previous, msg.provider_usage));
+        }
         if (msg.sessions && msg.sessions.length > 0) {
           setSessionRegistry(prev => reconcileSessionRegistry(prev, msg.sessions));
           mergeSessionMetadataActivity(msg.sessions);
@@ -2305,6 +2368,7 @@ export function useRelay() {
               kind:      msg.activity?.kind || (isThinking ? 'thinking' : 'working'),
               label,
               updatedAt: msg.activity?.updated_at || null,
+              observed_at: msg.activity?.observed_at || null,
               startedAt: msg.activity?.started_at || null,
               interruptHint: msg.activity?.interrupt_hint || '',
               goal: msg.activity?.goal || null,
@@ -2948,7 +3012,7 @@ export function useRelay() {
     // where `sessions` / `messages` would be frozen at initial render values).
     handleRelayMessageRef.current = handleRelayMessage;
 
-    return { sessions, messages, provisionalStreams, historyMeta, historyLoading, connected, connectionHealth, unread, setUnread, thinking, thinkingContent, activities, health, deliveryStates, launchStates, justLaunched, setJustLaunched, permissionPrompts, respondToPrompt, errorPrompts, respondToErrorPrompt, interruptSession, agentConfigs, configControlStates, requestAgentConfig, setAgentModel, setAgentEffort, setAgentPermissionMode, setAutoApprovePermissions, setAntigravityMode, setCodexConfig, newThread, openPanel, openNativeWindow, requestChatList, switchChat, newChat, chatLists, requestThreadList, switchThread, threadLists, switchWorkspace, requestTerminalOutput, sendTerminalInput, terminalOutputs, requestFileChanges, respondToFileChange, fileChanges, sendAttachment, send, sendToSession, steerMessage, discardQueuedMessage, editQueuedMessage, queuedMessages, scheduledSends, scheduleSend, cancelScheduledSend, refreshScheduledSends, launchSession, resumeSession, closeSession, activeSessionRef, restoreCachedTranscript, setSessionSubscriptions, workspaces, branchLists, requestBranchList, switchBranch, createBranch, skillLists, requestSkillList, automationViews, showCodexAutomation, controlResults, directoryListings, requestDirectoryListing, fileContents, requestFileContent, requestHistory, requestHistoryChunk, duplicateProxyAlarms, nightlyValidationFailures, latestAppUpdateValidation, providerUsage, providerUsageRefreshReceipt, requestProviderUsageRefresh, providerUsageCostDetail, requestProviderUsageCostDetail, hostResources, hostResourceError, hostResourceHistory, hostResourceDetails, hostResourceSubscription, subscribeHostResources, unsubscribeHostResources, requestHostResourceRefresh, clearHostResources, semanticNotifications };
+    return { sessions, messages, provisionalStreams, historyMeta, historyLoading, connected, connectionHealth, unread, setUnread, thinking, thinkingContent, activities, health, deliveryStates, launchStates, justLaunched, setJustLaunched, permissionPrompts, respondToPrompt, errorPrompts, respondToErrorPrompt, interruptSession, agentConfigs, configControlStates, requestAgentConfig, setAgentModel, setAgentEffort, setAgentPermissionMode, setAutoApprovePermissions, setAntigravityMode, setCodexConfig, newThread, openPanel, openNativeWindow, requestChatList, switchChat, newChat, chatLists, requestThreadList, switchThread, threadLists, switchWorkspace, requestTerminalOutput, sendTerminalInput, terminalOutputs, requestFileChanges, respondToFileChange, fileChanges, sendAttachment, send, sendToSession, steerMessage, discardQueuedMessage, editQueuedMessage, queuedMessages, scheduledSends, scheduleSend, cancelScheduledSend, refreshScheduledSends, launchSession, resumeSession, closeSession, activeSessionRef, restoreCachedTranscript, setSessionSubscriptions, workspaces, branchLists, requestBranchList, switchBranch, createBranch, skillLists, requestSkillList, automationViews, showCodexAutomation, controlResults, directoryListings, requestDirectoryListing, fileContents, requestFileContent, requestHistory, requestHistoryChunk, duplicateProxyAlarms, nightlyValidationFailures, latestAppUpdateValidation, providerUsage, providerUsageRefreshReceipt, requestProviderUsageRefresh, providerUsageResetReceipt, consumeProviderUsageResetCredit, providerUsageCostDetail, requestProviderUsageCostDetail, hostResources, hostResourceError, hostResourceHistory, hostResourceDetails, hostResourceSubscription, subscribeHostResources, unsubscribeHostResources, requestHostResourceRefresh, clearHostResources, semanticNotifications };
   }
 
 // (removed window.useRelay — now an ES module export)

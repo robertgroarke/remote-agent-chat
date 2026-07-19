@@ -89,18 +89,68 @@ async function main() {
   assert.strictEqual(mergedDiscovery.externalActiveIds.has('live-a'), true);
   assert.strictEqual(mergedDiscovery.externalActiveIds.has('archive-a'), false);
 
+  const ownershipEngine = harness();
+  const originalOwnerSnapshot = codexCli.runningCodexCliSessionOwners;
+  const originalProcessCount = codexCli.runningCodexCliProcessCount;
+  const originalInteractiveHistory = codexCli.recentInteractiveSessionIds;
+  let snapshot = {
+    state: 'confirmed',
+    checked_at_ms: NOW,
+    owners: new Map([['live-a', new Set([101])], ['live-b', new Set([102])]]),
+  };
+  ownershipEngine._findCodexCliSummaryByCliId = cliSessionId => ({ cliSessionId, origin: 'exact-owner' });
+  try {
+    codexCli.runningCodexCliSessionOwners = () => snapshot;
+    codexCli.runningCodexCliProcessCount = () => { throw new Error('global process count must not classify ownership'); };
+    codexCli.recentInteractiveSessionIds = () => { throw new Error('interactive history must not classify ownership'); };
+    assert.deepStrictEqual(
+      ownershipEngine._codexCliExternalActiveSummaries(NOW).map(item => item.cliSessionId),
+      ['live-a', 'live-b'],
+    );
+    snapshot = {
+      state: 'confirmed',
+      checked_at_ms: NOW + 1_000,
+      owners: new Map([['live-b', new Set([102])]]),
+    };
+    assert.deepStrictEqual(
+      ownershipEngine._codexCliExternalActiveSummaries(NOW + 1_000).map(item => item.cliSessionId),
+      ['live-a', 'live-b'],
+      'one owner-free checkpoint must remain inside the bounded continuity grace',
+    );
+    snapshot = {
+      state: 'confirmed',
+      checked_at_ms: NOW + 31_000,
+      owners: new Map([['live-b', new Set([102])]]),
+    };
+    assert.deepStrictEqual(
+      ownershipEngine._codexCliExternalActiveSummaries(NOW + 31_000).map(item => item.cliSessionId),
+      ['live-b'],
+      'missing exact owner did not decay inside 120 seconds',
+    );
+  } finally {
+    codexCli.runningCodexCliSessionOwners = originalOwnerSnapshot;
+    codexCli.runningCodexCliProcessCount = originalProcessCount;
+    codexCli.recentInteractiveSessionIds = originalInteractiveHistory;
+  }
+
   const archiveModeEngine = harness();
   archiveModeEngine._codexCliArchiveDiscoveryEnabled = () => true;
   archiveModeEngine._codexCliArchiveSessionLimit = () => 3;
   archiveModeEngine._codexCliArchiveSummaryVisible = () => true;
   archiveModeEngine._codexCliExternalActiveSummaries = () => [activeDiscovery[0]];
   archiveModeEngine._broadcastSessionSnapshot = () => {};
+  const oldLiveFile = path.join(tempRoot, 'old-live.jsonl');
+  const removedLiveFile = path.join(tempRoot, 'removed-live.jsonl');
+  fs.writeFileSync(oldLiveFile, '{}\n');
+  fs.writeFileSync(removedLiveFile, '{}\n');
   archiveModeEngine.sessions.set('old-live', {
     session_id: 'old-live',
     agentType: 'codex_cli',
     cliSessionId: 'old-live',
     codexCliArchiveDiscovered: true,
     codexCliExternalActive: true,
+    codexCliFilePath: oldLiveFile,
+    activity: { kind: 'generating', label: 'Working', updated_at: new Date(NOW).toISOString() },
   });
   archiveModeEngine.sessions.set('removed-live', {
     session_id: 'removed-live',
@@ -108,6 +158,8 @@ async function main() {
     cliSessionId: 'removed-live',
     codexCliArchiveDiscovered: true,
     codexCliExternalActive: true,
+    codexCliFilePath: removedLiveFile,
+    activity: { kind: 'generating', label: 'Working', updated_at: new Date(NOW).toISOString() },
   });
   const registrations = [];
   archiveModeEngine._registerCodexCliSession = (summary, options) => {
@@ -132,7 +184,10 @@ async function main() {
     [['live-a', true], ['archive-a', false], ['old-live', false]],
   );
   assert.strictEqual(archiveModeEngine.sessions.get('old-live').codexCliExternalActive, false);
-  assert.strictEqual(archiveModeEngine.sessions.has('removed-live'), false);
+  assert.strictEqual(archiveModeEngine.sessions.has('removed-live'), true);
+  assert.strictEqual(archiveModeEngine.sessions.get('removed-live').codexCliExternalActive, false);
+  assert.strictEqual(archiveModeEngine.sessions.get('removed-live').codexCliOwnerDemoted, true);
+  assert.strictEqual(archiveModeEngine.sessions.get('removed-live').activity.kind, 'idle');
 
   const engine = harness();
   const activeGoal = goal();
@@ -151,6 +206,26 @@ async function main() {
   }, context({ offset: 100, live: false, started: 'turn-1', owner: 'ambiguous', evidence: 'archive_baseline' }));
   assert.strictEqual(session.activity.goal_run.lifecycle, 'unknown_disconnected');
   assert.strictEqual(session.activity.goal_run.lease_active, false);
+
+  const exactOwnerSession = {
+    session_id: 'exact-owner-first-discovery',
+    agentType: 'codex_cli',
+    cliSessionId: '019f6b9c-31c1-72c1-8f80-7ff60b163159',
+    codexCliExternalActive: true,
+    status: 'healthy',
+    activity: { kind: 'idle', label: '', updated_at: new Date(NOW).toISOString() },
+  };
+  engine.sessions.set(exactOwnerSession.session_id, exactOwnerSession);
+  engine._setCodexCliActivity(exactOwnerSession.session_id, exactOwnerSession, {
+    kind: 'generating', label: 'Working', goal: activeGoal, updated_at: new Date(NOW + 150).toISOString(),
+  }, engine._codexCliGoalRunContext({
+    sourceCursor: { mode: 'baseline', start_offset: 0, end_offset: 150, events_read: 10 },
+    taskStartedTurnId: 'turn-owner',
+    activity: { kind: 'generating', goal: activeGoal },
+    updatedAt: new Date(NOW + 150).toISOString(),
+  }, { ownerState: 'confirmed' }));
+  assert.strictEqual(exactOwnerSession.activity.goal_run.lease_active, true);
+  assert.strictEqual(exactOwnerSession.activity.goal_run.owner_state, 'confirmed');
 
   engine._setCodexCliActivity(SESSION_ID, session, {
     kind: 'generating', label: 'Working', goal: activeGoal, updated_at: new Date(NOW + 200).toISOString(),
@@ -220,6 +295,33 @@ async function main() {
   assert(logText.includes('generation='));
   assert(logText.includes('source_seq='));
   assert(engine.sent.some(message => message.type === 'proxy_status' && message.activity?.goal_run));
+
+  const evidenceSession = {
+    session_id: 'fresh-evidence-session',
+    agentType: 'codex_cli',
+    status: 'healthy',
+    activity: { kind: 'generating', label: 'Working', updated_at: new Date(NOW).toISOString() },
+  };
+  engine.sessions.set(evidenceSession.session_id, evidenceSession);
+  const evidenceFramesBefore = engine.sent.length;
+  engine._setCodexCliActivity(evidenceSession.session_id, evidenceSession, {
+    kind: 'generating', label: 'Working', updated_at: new Date(NOW).toISOString(),
+  }, {
+    observedAt: new Date(NOW + 5_000).toISOString(),
+    evidenceType: 'poll_append',
+    liveLeaseProof: true,
+  });
+  assert.strictEqual(evidenceSession.activity.observed_at, new Date(NOW + 5_000).toISOString());
+  assert.strictEqual(engine.sent.length, evidenceFramesBefore + 1, 'fresh append evidence did not emit a status frame');
+  engine._setCodexCliActivity(evidenceSession.session_id, evidenceSession, {
+    kind: 'generating', label: 'Working', updated_at: new Date(NOW + 6_000).toISOString(),
+  }, {
+    observedAt: new Date(NOW + 6_000).toISOString(),
+    evidenceType: 'controller_summary_without_new_evidence',
+    liveLeaseProof: false,
+  });
+  assert.strictEqual(evidenceSession.activity.observed_at, new Date(NOW + 5_000).toISOString(),
+    'non-evidentiary summary discarded or refreshed the last activity observation');
 
   const controllerEngine = harness();
   let controllerStatus = 'active';
@@ -295,6 +397,14 @@ async function main() {
     controller_terminal_released: true,
     archive_mode_live_lease_eligible: true,
     archive_mode_stale_lease_ineligible: true,
+    exact_owner_bound_discovery: true,
+    exact_owner_first_discovery_lease: true,
+    global_process_flap_ignored: true,
+    interactive_history_visibility_only: true,
+    owner_decay_ms: 31_000,
+    rotation_twin_demoted_without_delete: true,
+    fresh_append_status_emitted: true,
+    non_evidentiary_summary_preserved_observation: true,
     diagnostics_redacted: true,
   };
   const outputIndex = process.argv.indexOf('--output');

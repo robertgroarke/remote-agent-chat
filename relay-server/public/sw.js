@@ -1,7 +1,7 @@
 'use strict';
 
-const CACHE_NAME = 'agent-chat-build-ac2831d69189275e';
-const ASSET_VERSION = 'build-ac2831d69189275e';
+const CACHE_NAME = 'agent-chat-build-3c7c3fee73e5cd26';
+const ASSET_VERSION = 'build-3c7c3fee73e5cd26';
 
 const SHELL_ASSETS = [
   '/',
@@ -15,6 +15,13 @@ const SHELL_ASSETS = [
   '/logo-claude-in-ag.svg',
   '/logo-codex-in-ag.svg',
   '/logo-gemini-in-ag.svg',
+  '/provider-assets/openai-light.png',
+  '/provider-assets/openai-dark.png',
+  '/provider-assets/claude-color.svg',
+  '/provider-assets/cursor-light.svg',
+  '/provider-assets/cursor-dark.svg',
+  '/provider-assets/antigravity-color.png',
+  '/provider-assets/ollama-light.png',
 ];
 
 const VERSIONED_SHELL_ASSETS = new Set(SHELL_ASSETS.filter(asset => asset.includes('?')));
@@ -23,6 +30,7 @@ const PUSH_CATEGORY_BY_TYPE = Object.freeze({
   permission_required: 'permission_required',
   goal_completed: 'goal_completed',
   goal_attention: 'goal_attention',
+  provider_usage_threshold: 'provider_usage_warning',
   agent_error: 'agent_error',
   rate_limit_active: 'agent_error',
   proxy_watchdog_failed: 'agent_error',
@@ -35,6 +43,7 @@ const PUSH_CATEGORY_BY_TYPE = Object.freeze({
   app_update_pass: 'agent_ready',
 });
 const semanticPushClaims = new Set();
+const SEMANTIC_PUSH_TYPES = new Set(['goal_completed', 'goal_attention', 'provider_usage_threshold']);
 
 async function authoritativePushPolicy(data) {
   const type = String(data?.type || '').trim();
@@ -43,7 +52,7 @@ async function authoritativePushPolicy(data) {
   if (type === 'turn_ready' || category === 'turn_ready') {
     return { allowed: false, reason: 'unsupported_turn_ready' };
   }
-  if (['goal_completed', 'goal_attention'].includes(type) && category !== type) {
+  if (SEMANTIC_PUSH_TYPES.has(type) && category !== PUSH_CATEGORY_BY_TYPE[type]) {
     return { allowed: false, reason: 'invalid_category' };
   }
   try {
@@ -134,7 +143,7 @@ self.addEventListener('push', event => {
     || /session completed/i.test(`${payload.title || ''} ${payload.body || ''}`)) {
     return;
   }
-  const semanticType = ['goal_completed', 'goal_attention'].includes(data.type);
+  const semanticType = SEMANTIC_PUSH_TYPES.has(data.type);
   const notificationTag = semanticType && data.dedupe_key
     ? `semantic:${data.dedupe_key}`
     : `${data.type || 'agent-update'}:${data.session_id || ''}`;

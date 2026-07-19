@@ -131,6 +131,7 @@ async function main() {
   let proxy;
   let observer;
   let reconnect;
+  let linkAudit;
   let replacementProxy;
   let foreignProxy;
   try {
@@ -163,10 +164,44 @@ async function main() {
     const threshold = await waitFor(() => observer.messages.find(message => message.type === 'provider_usage_threshold'), 10000, 'provider threshold');
     assert.deepStrictEqual(threshold.affected_session_ids, ['provider-codex-cli', 'provider-codex-ui']);
     assert.strictEqual(threshold.hard_limited, true);
+    const semanticThreshold = await waitFor(() => observer.messages.find(message => (
+      message.type === 'semantic_notification'
+      && message.event_type === 'provider_usage_threshold'
+    )), 10000, 'semantic provider threshold');
+    assert.strictEqual(semanticThreshold.category, 'provider_usage_warning');
+    assert.match(semanticThreshold.dedupe_key, /^provider-usage-threshold:[a-f0-9]{32}:100$/);
+    assert.deepStrictEqual(semanticThreshold.affected_session_ids, ['provider-codex-cli', 'provider-codex-ui']);
+    const linkedSessionPatch = await waitFor(() => observer.messages.find(message => (
+      message.type === 'session_patch'
+      && message.session_id === 'provider-codex-cli'
+      && message.patch?.usage_account_fingerprint === snapshot.snapshots[0].account_fingerprint
+    )), 10000, 'provider account session link');
+    assert.strictEqual(linkedSessionPatch.patch.usage_billing_provider_id, 'openai-codex');
+    assert.strictEqual(linkedSessionPatch.patch.usage_quota_domain, 'codex-plan');
+    assert.strictEqual(linkedSessionPatch.patch.usage_mapping_ambiguous, false);
 
     proxy.ws.send(JSON.stringify({ type: 'provider_usage_snapshot', protocol_version: 1, snapshot }));
     await new Promise(resolve => setTimeout(resolve, 150));
     assert.strictEqual(observer.messages.filter(message => message.type === 'provider_usage_threshold').length, 1, 'threshold must dedupe by provider/window/reset cycle');
+    assert.strictEqual(observer.messages.filter(message => (
+      message.type === 'semantic_notification' && message.event_type === 'provider_usage_threshold'
+    )).length, 1, 'semantic threshold must dedupe by provider/account/window/reset cycle');
+
+    const preferenceResponse = await fetch(`${origin}/api/preferences/notifications`, {
+      method: 'PUT',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ preferences: { provider_usage_warning: false } }),
+    });
+    assert.strictEqual(preferenceResponse.status, 200);
+    const savedPreferences = await preferenceResponse.json();
+    assert.strictEqual(savedPreferences.preferences.provider_usage_warning, false);
+    const restoredPreferenceResponse = await fetch(`${origin}/api/preferences/notifications`, {
+      method: 'PUT',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ preferences: { provider_usage_warning: true } }),
+    });
+    assert.strictEqual(restoredPreferenceResponse.status, 200);
+    assert.strictEqual((await restoredPreferenceResponse.json()).preferences.provider_usage_warning, true);
 
     observer.ws.send(JSON.stringify({ type: 'provider_usage_refresh', protocol_version: 1, force: true, request_id: 'refresh-e2e' }));
     const refresh = await waitFor(() => proxy.messages.find(message => message.type === 'provider_usage_refresh'), 10000, 'refresh forwarding');
@@ -192,6 +227,53 @@ async function main() {
       )), 10000, `completed receipt ${requestId}`);
       assert.strictEqual(completed.generation, 2);
     }
+
+    observer.ws.send(JSON.stringify({
+      type: 'provider_usage_reset_credit_consume', protocol_version: 1,
+      request_id: 'reset-rejected-e2e', approved: false,
+    }));
+    const rejectedReset = await waitFor(() => observer.messages.find(message => (
+      message.type === 'provider_usage_reset_credit_receipt'
+      && message.request_id === 'reset-rejected-e2e' && message.status === 'error'
+    )), 10000, 'unapproved reset rejection');
+    assert.strictEqual(rejectedReset.code, 'operator_approval_required');
+
+    observer.ws.send(JSON.stringify({
+      type: 'provider_usage_reset_credit_consume', protocol_version: 1,
+      request_id: 'reset-approved-e2e', approved: true,
+    }));
+    const acceptedReset = await waitFor(() => observer.messages.find(message => (
+      message.type === 'provider_usage_reset_credit_receipt'
+      && message.request_id === 'reset-approved-e2e' && message.status === 'accepted'
+    )), 10000, 'approved reset acceptance');
+    assert.strictEqual(acceptedReset.status, 'accepted');
+    const resetRequest = await waitFor(() => proxy.messages.find(message => (
+      message.type === 'provider_usage_reset_credit_consume'
+    )), 10000, 'reset forwarding');
+    assert.strictEqual(resetRequest.approved, true);
+    assert.match(resetRequest.request_id, /^[0-9a-f-]{36}$/i);
+    assert.notStrictEqual(resetRequest.request_id, 'reset-approved-e2e');
+
+    observer.ws.send(JSON.stringify({
+      type: 'provider_usage_reset_credit_consume', protocol_version: 1,
+      request_id: 'reset-concurrent-e2e', approved: true,
+    }));
+    const concurrentReset = await waitFor(() => observer.messages.find(message => (
+      message.type === 'provider_usage_reset_credit_receipt'
+      && message.request_id === 'reset-concurrent-e2e' && message.status === 'error'
+    )), 10000, 'concurrent reset rejection');
+    assert.strictEqual(concurrentReset.code, 'reset_in_progress');
+    proxy.ws.send(JSON.stringify({
+      type: 'provider_usage_reset_credit_receipt', protocol_version: 1,
+      request_id: resetRequest.request_id, status: 'completed', outcome: 'reset',
+      reset_credits_available: 2,
+    }));
+    const completedReset = await waitFor(() => observer.messages.find(message => (
+      message.type === 'provider_usage_reset_credit_receipt'
+      && message.request_id === 'reset-approved-e2e' && message.status === 'completed'
+    )), 10000, 'completed reset receipt');
+    assert.strictEqual(completedReset.outcome, 'reset');
+    assert.strictEqual(completedReset.reset_credits_available, 2);
 
     observer.ws.send(JSON.stringify({
       type: 'provider_usage_cost_detail_request', protocol_version: 1,
@@ -299,6 +381,9 @@ async function main() {
       schema_version: 2, generation: 0, generated_at: new Date().toISOString(),
       poll_interval_ms: 300000, in_flight: false, snapshots: [], estimated_cost: null,
     };
+    const linkedPatchCountBeforeGenerationZero = observer.messages.filter(message => (
+      message.type === 'session_patch' && message.session_id === 'provider-codex-cli'
+    )).length;
     publicCount = observer.messages.filter(message => message.type === 'provider_usage_snapshot').length;
     proxy.ws.send(JSON.stringify({ type: 'provider_usage_snapshot', protocol_version: 1, snapshot: generationZero }));
     const retainedGeneration = await waitFor(() => {
@@ -308,6 +393,24 @@ async function main() {
     assert.strictEqual(retainedGeneration.snapshot.snapshots.length, 1,
       'generation-0 empty from the same active proxy must not replace last-good quota');
     assert.strictEqual(retainedGeneration.snapshot.generation, 3);
+    await new Promise(resolve => setTimeout(resolve, 50));
+    const generationZeroLinkPatches = observer.messages.filter(message => (
+      message.type === 'session_patch' && message.session_id === 'provider-codex-cli'
+    )).slice(linkedPatchCountBeforeGenerationZero);
+    assert(generationZeroLinkPatches.every(message => (
+      message.patch?.usage_account_fingerprint !== null
+      && message.patch?.usage_billing_provider_id !== null
+      && message.patch?.usage_mapping_ambiguous !== true
+    )), 'generation-0 empty refresh emitted an account-link removal or ambiguity');
+    linkAudit = await openSocket('/client-ws');
+    const linkAuditAck = await waitFor(() => linkAudit.messages.find(message => message.type === 'connection_ack'), 10000, 'account link reconnect audit');
+    const linkedSession = linkAuditAck.sessions.find(session => session.session_id === 'provider-codex-cli');
+    assert.strictEqual(linkedSession.usage_account_fingerprint, snapshot.snapshots[0].account_fingerprint,
+      'generation-0 empty refresh regressed a known account link to unavailable');
+    assert.strictEqual(linkedSession.usage_billing_provider_id, 'openai-codex');
+    assert.strictEqual(linkedSession.usage_mapping_ambiguous, false);
+    linkAudit.ws.close();
+    linkAudit = null;
 
     const malformed = { ...snapshot, token: secretCanary };
     publicCount = observer.messages.filter(message => message.type === 'provider_usage_snapshot').length;
@@ -447,6 +550,7 @@ async function main() {
       oversized_cost_preserved_quota: true,
       last_good_cost_retained: true,
       generation_zero_empty_retained_quota: true,
+      generation_zero_preserved_session_account_link: true,
       replacement_process_retained_quota_and_cost: true,
       partial_generation_zero_retained_complete_quota: true,
       different_machine_cache_isolated: true,
@@ -454,11 +558,20 @@ async function main() {
       refresh_forwarded_to_authenticated_proxy: true,
       refresh_receipts: ['accepted', 'coalesced', 'completed'],
       concurrent_refreshes_forwarded: 1,
+      reset_credit_approval_required: true,
+      reset_credit_idempotency_uuid: true,
+      reset_credit_receipts: ['accepted', 'completed'],
+      concurrent_reset_rejected: true,
       paginated_cost_detail_rows: 2,
       cost_detail_query_mismatch_rejected: true,
       proxy_disconnect_receipts: true,
       affected_sessions: threshold.affected_session_ids,
       duplicate_threshold_events: 0,
+      semantic_threshold_category: semanticThreshold.category,
+      semantic_threshold_dedupe: true,
+      provider_usage_preference_round_trip: true,
+      android_semantic_transport_enabled: false,
+      session_account_linked_by_relay: true,
       credential_canary_in_relay_storage: false,
       credential_canary_in_relay_logs: false,
       visible_windows_opened: 0,
@@ -474,6 +587,7 @@ async function main() {
     try { foreignProxy?.ws.close(); } catch {}
     try { replacementProxy?.ws.close(); } catch {}
     try { reconnect?.ws.close(); } catch {}
+    try { linkAudit?.ws.close(); } catch {}
     try { observer?.ws.close(); } catch {}
     try { proxy?.ws.close(); } catch {}
     if (relay.exitCode == null) {

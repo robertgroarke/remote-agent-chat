@@ -244,7 +244,7 @@ export class RelayClient {
     return requestId;
   }
 
-  respondToErrorPrompt(sessionId, promptId, actionId) {
+  respondToErrorPrompt(sessionId, promptId, actionId, operatorGesture = false) {
     const requestId = `errprompt-${Date.now()}-${Math.random().toString(36).slice(2, 7)}`;
     this._send({
       type: 'error_prompt_action',
@@ -252,6 +252,7 @@ export class RelayClient {
       prompt_id: promptId,
       action_id: actionId,
       request_id: requestId,
+      ...(actionId === 'open_native_window' ? { operator_user_gesture: operatorGesture === true } : {}),
     });
     return requestId;
   }
@@ -361,9 +362,12 @@ export class RelayClient {
     return requestId;
   }
 
-  openNativeWindow(sessionId) {
+  openNativeWindow(sessionId, operatorGesture = false) {
     const requestId = `native-${Date.now()}-${Math.random().toString(36).slice(2, 7)}`;
-    this._send({ type: 'open_native_window', session_id: sessionId, request_id: requestId });
+    this._send({
+      type: 'open_native_window', session_id: sessionId, request_id: requestId,
+      operator_user_gesture: operatorGesture === true,
+    });
     return requestId;
   }
 
@@ -486,6 +490,17 @@ export class RelayClient {
       protocol_version: 1,
       force: force === true,
       request_id: requestId,
+    });
+    return requestId;
+  }
+
+  consumeProviderUsageResetCredit() {
+    const requestId = `provider-reset-${Date.now()}-${Math.random().toString(36).slice(2, 7)}`;
+    this._send({
+      type: 'provider_usage_reset_credit_consume',
+      protocol_version: 1,
+      request_id: requestId,
+      approved: true,
     });
     return requestId;
   }

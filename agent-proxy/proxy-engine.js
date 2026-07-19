@@ -28,6 +28,7 @@ const { acquireCodexDesktopCdpLock } = require('./codex-desktop-cdp-lock');
 const { listCdpTargets, connectCdpTarget } = require('./cdp-loopback');
 const proto        = require('./protocol');
 const sessionStore = require('./session-store');
+const antigravityQuotaCache = require('./antigravity-quota-cache');
 const {
   isEditorWorkbenchPage,
   detectWorkbenchHost,
@@ -46,12 +47,14 @@ const {
 } = require('./codex-desktop-archive');
 const cursorCli    = require('./cursor-cli');
 const { nativeLaunchState } = require('./native-launch-mode');
+const { validateOperatorActionProof } = require('./windows-automation-launch-policy');
 const { CdpDomPushManager } = require('./cdp-dom-push');
 const { sessionNoiseMetadata } = require('./session-noise-policy');
 const { selectDurableChatTitleDetails } = require('./session-title-policy');
 const { ProviderUsageRegistry } = require('./provider-usage');
 const { LocalUsageCostScanner } = require('./usage-costs');
 const { HostResourceMonitor } = require('./host-resource-monitor');
+const { normalizeRateLimitState } = require('../tools/codex-session-native');
 const { pruneDirectory } = require('../relay-server/storage-retention');
 const { appendBoundedFileSync } = require('./bounded-file-log');
 const { canonicalGoalRecord, reduceGoalRunLifecycle } = require('./goal-lifecycle');
@@ -821,10 +824,14 @@ const CODEX_CLI_HISTORY_REPEAT_CURSOR_MS = 60_000;
 const FILE_TRANSCRIPT_ASYNC_APPEND_THRESHOLD = 20;
 const FILE_TRANSCRIPT_APPEND_BATCH_ROWS = 8;
 const FILE_TRANSCRIPT_APPEND_BATCH_MS = 8;
-const CODEX_CLI_ACTIVE_FILE_MAX_AGE_MS = Math.max(
-  60_000,
-  parseInt(process.env.CODEX_CLI_ACTIVE_FILE_MAX_AGE_MS || '1800000', 10) || 1_800_000
-);
+const FILE_TRANSCRIPT_RECOVERY_BLOCK_MS = 60_000;
+const FILE_TRANSCRIPT_RECOVERY_ROW_OVERHEAD_BYTES = 256;
+const POLL_BUDGET_SAMPLE_MAX = 1800;
+const POLL_BUDGET_REPORT_EVERY_TICKS = 30;
+const CODEX_CLI_OWNER_MISSING_GRACE_MS = Math.min(120_000, Math.max(
+  5_000,
+  parseInt(process.env.CODEX_CLI_OWNER_MISSING_GRACE_MS || '30000', 10) || 30_000,
+));
 const VSCODE_CODEX_NATIVE_DEADLINE_RECEIPT_GRACE_MS = 15000;
 
 // ─── Cursor CLI history streaming constants ─────────────────────────────────
@@ -994,6 +1001,12 @@ class ProxyEngine extends EventEmitter {
 
     // Main poll interval handle
     this._pollTimer = null;
+    this._pollBudgetTelemetry = {
+      durationsMs: [],
+      completedTicks: 0,
+      lastReportedSkippedTicks: 0,
+      latest: null,
+    };
     this._antigravityV2PollTimer = null;
     this._antigravityV2PollInProgress = false;
     this._codexDesktopPollTimer = null;
@@ -1021,16 +1034,21 @@ class ProxyEngine extends EventEmitter {
       onDirty: (sessionId, event) => this._handleDomPush(sessionId, event),
     });
 
-    // Best-effort cache for Antigravity quota usage scraped from the Settings page.
-    this._antigravityQuotaCache = { fetchedAt: 0, data: null };
+    // Last-good Antigravity quota data is persisted as a strict normalized
+    // allowlist.  Raw RPC responses and in-renderer credentials never enter
+    // the session store or relay payload.
+    this._antigravityQuotaCache = antigravityQuotaCache.hydrateCache(sessionStore)
+      || { schemaVersion: 1, fetchedAt: 0, nextRefreshAt: 0, source: null, sourceHistory: [], data: null };
+    this._antigravityQuotaRefreshInFlight = null;
+    this._antigravityQuotaLastReceipt = null;
 
     // Provider/account quota aggregation is deliberately proxy-owned: local
     // credentials never cross the relay boundary, and the registry emits only
     // its normalized, redacted public snapshot.
     this._providerUsage = new ProviderUsageRegistry({
       getSessions: () => this.sessions.values(),
-      getAntigravityQuota: async () => {
-        await this._refreshAntigravityQuotaUsage();
+      getAntigravityQuota: async context => {
+        await this._refreshAntigravityQuotaUsage(context?.force === true);
         return this._antigravityQuotaCache;
       },
       onSnapshot: snapshot => this._sendToRelay({
@@ -1042,6 +1060,9 @@ class ProxyEngine extends EventEmitter {
       machineLabel: this.MACHINE_LABEL,
       costScanner: new LocalUsageCostScanner(),
     });
+    this._providerUsageResetInFlight = null;
+    this._codexUsageResetConnectionFactory = config.codexUsageResetConnectionFactory
+      || (options => new CodexAppServerConnection(options));
     this._hostResourceMonitor = new HostResourceMonitor({
       getSessions: () => this.sessions.values(),
       onSnapshot: (snapshot, requestId) => this._sendToRelay(proto.hostResourceSnapshot(requestId, snapshot)),
@@ -3249,8 +3270,7 @@ class ProxyEngine extends EventEmitter {
     return crypto.createHash('sha1').update(basis).digest('hex').substring(0, 16);
   }
 
-  _fileTranscriptMessageIds(agentType, generation, messages) {
-    const occurrences = new Map();
+  _fileTranscriptMessageIds(agentType, generation, messages, occurrences = new Map()) {
     return (Array.isArray(messages) ? messages : []).map((message) => {
       const parserSourceId = String(message?.source_message_id || '').trim();
       if (parserSourceId) return parserSourceId;
@@ -3282,14 +3302,94 @@ class ProxyEngine extends EventEmitter {
   _fileTranscriptState(agentType, filePath, messages, sourceCursor, nonce = '') {
     const generation = this._fileTranscriptGeneration(agentType, filePath, sourceCursor, nonce);
     const clonedMessages = this._cloneTranscriptMessages(messages);
+    const messageIdOccurrences = new Map();
     return {
       agentType,
       filePath,
       generation,
       messages: clonedMessages,
-      messageIds: this._fileTranscriptMessageIds(agentType, generation, clonedMessages),
+      messageIds: this._fileTranscriptMessageIds(agentType, generation, clonedMessages, messageIdOccurrences),
+      messageIdOccurrences,
+      messageBaseIndex: 0,
+      approximateRecoveryBytes: this._fileTranscriptApproximateSizeInfo(clonedMessages).bytes,
       sourceCursor: sourceCursor ? { ...sourceCursor } : null,
     };
+  }
+
+  _fileTranscriptApproximateSizeInfo(messages, maxBytes = Infinity) {
+    const rows = Array.isArray(messages) ? messages : [];
+    let bytes = 512;
+    for (let index = 0; index < rows.length; index++) {
+      let encoded;
+      try { encoded = JSON.stringify(rows[index]); } catch {
+        encoded = JSON.stringify({
+          role: rows[index]?.role || '',
+          content: this._messageContentText(rows[index]),
+        });
+      }
+      bytes += Buffer.byteLength(encoded || 'null', 'utf8')
+        + FILE_TRANSCRIPT_RECOVERY_ROW_OVERHEAD_BYTES;
+      if (bytes > maxBytes) return { fits: false, bytes, counted: index + 1 };
+    }
+    return { fits: bytes <= maxBytes, bytes, counted: rows.length };
+  }
+
+  _fileTranscriptStableKey(message) {
+    if (!message || typeof message !== 'object') return 'empty';
+    const sourceId = String(message?.source_message_id || '').trim();
+    if (sourceId) return `source:${sourceId}`;
+    const nativeId = String(message?.native_source_id || '').trim();
+    if (nativeId) return `native:${nativeId}`;
+    return `semantic:${crypto.createHash('sha1').update(this._transcriptSignature([message])).digest('hex')}`;
+  }
+
+  _fileTranscriptWindowOverlap(previousMessages, currentMessages) {
+    const previous = (Array.isArray(previousMessages) ? previousMessages : []).map(message => this._fileTranscriptStableKey(message));
+    const current = (Array.isArray(currentMessages) ? currentMessages : []).map(message => this._fileTranscriptStableKey(message));
+    if (previous.length === 0 || current.length === 0) return 0;
+    const separator = Symbol('file-transcript-overlap');
+    const combined = [...current, separator, ...previous];
+    const prefix = new Array(combined.length).fill(0);
+    for (let index = 1; index < combined.length; index++) {
+      let matched = prefix[index - 1];
+      while (matched > 0 && combined[index] !== combined[matched]) matched = prefix[matched - 1];
+      if (combined[index] === combined[matched]) matched += 1;
+      prefix[index] = matched;
+    }
+    return Math.min(prefix[prefix.length - 1], previous.length, current.length);
+  }
+
+  _fileTranscriptObservationKey(filePath, sourceCursor, messages) {
+    const rows = Array.isArray(messages) ? messages : [];
+    const last = rows.length > 0 ? rows[rows.length - 1] : null;
+    if (!sourceCursor) return `${String(filePath || '')}\u0000fallback\u0000${rows.length}\u0000${this._fileTranscriptStableKey(last)}`;
+    return [
+      String(filePath || ''),
+      Number(sourceCursor.end_offset) || 0,
+      Number(sourceCursor.file_size) || 0,
+      Number(sourceCursor.mtime_ms) || 0,
+      Number(sourceCursor.window_start_offset) || 0,
+      rows.length,
+      last ? this._fileTranscriptStableKey(last) : '',
+    ].join('\u0000');
+  }
+
+  _fileTranscriptRecoveryPreflight(sessionId, session, messages, reason) {
+    const now = Date.now();
+    if (Number(session?._fileTranscriptRecoveryBlockedUntil || 0) > now) {
+      return { allowed: false, reason: 'cooldown', retryAfterMs: session._fileTranscriptRecoveryBlockedUntil - now };
+    }
+    const maxBytes = this._historySnapshotLimitBytes(reason);
+    // Inspect at most the automatic frame budget. This is deliberately based
+    // on the candidate rows rather than cached state: a mutation can replace a
+    // short transcript with a much larger one at the same path.
+    const sizeInfo = this._fileTranscriptApproximateSizeInfo(messages, maxBytes);
+    if (sizeInfo.fits) return { allowed: true, maxBytes, sizeInfo };
+    if (session) session._fileTranscriptRecoveryBlockedUntil = now + FILE_TRANSCRIPT_RECOVERY_BLOCK_MS;
+    if (this._shouldLogLargeHistorySkip(sessionId, reason)) {
+      this._log('warn', `[${sessionId}] Deferred oversized ${reason} before row remap (${sizeInfo.counted} rows inspected, >${Math.round(maxBytes / 1024)} KB); selected-history loading remains available`);
+    }
+    return { allowed: false, reason: 'oversized', retryAfterMs: FILE_TRANSCRIPT_RECOVERY_BLOCK_MS, maxBytes, sizeInfo };
   }
 
   _fileTranscriptMessage(state, message, index, sourceCursor) {
@@ -3301,7 +3401,7 @@ class ProxyEngine extends EventEmitter {
       source_message_id: sourceMessageId,
       source_cursor: {
         generation: state.generation,
-        message_index: index,
+        message_index: Math.max(0, Number(state.messageBaseIndex) || 0) + index,
         end_offset: Number(sourceCursor?.end_offset) || 0,
         file_size: Number(sourceCursor?.file_size) || 0,
       },
@@ -3335,8 +3435,8 @@ class ProxyEngine extends EventEmitter {
           ...drain.candidate,
           messages: acceptedMessages,
           messageIds: drain.candidate.messageIds.slice(0, index),
+          approximateRecoveryBytes: this._fileTranscriptApproximateSizeInfo(acceptedMessages).bytes,
         };
-        session.lastTranscriptSig = this._transcriptSignature(acceptedMessages);
         session.lastObservedCount = acceptedMessages.length;
         session.lastMessageCount = acceptedMessages.length;
         const pending = drain.pending;
@@ -3358,6 +3458,8 @@ class ProxyEngine extends EventEmitter {
       return;
     }
     session._fileTranscriptState = drain.candidate;
+    session._lastFileTranscriptObservationKey = drain.candidate.observationKey
+      || this._fileTranscriptObservationKey(drain.candidate.filePath, drain.candidate.sourceCursor, drain.candidate.messages);
     const pending = drain.pending;
     session._fileTranscriptAppendDrain = null;
     this._log('info', `[${sessionId}] Emitted ${drain.sent} ${drain.agentType} semantic append rows in priority-safe batches (${drain.reason}, cursor ${drain.sourceCursor?.start_offset ?? '?'}-${drain.sourceCursor?.end_offset ?? '?'})`);
@@ -3392,7 +3494,9 @@ class ProxyEngine extends EventEmitter {
 
     if (!previous || previous.agentType !== agentType || previous.filePath !== filePath) {
       const seeded = this._fileTranscriptState(agentType, filePath, currentMessages, sourceCursor);
+      seeded.observationKey = this._fileTranscriptObservationKey(filePath, sourceCursor, currentMessages);
       session._fileTranscriptState = seeded;
+      session._lastFileTranscriptObservationKey = seeded.observationKey;
       if (!allowInitialAppend || currentMessages.length === 0 || currentMessages.length > 20) {
         return { mode: 'baseline', sent: 0 };
       }
@@ -3405,20 +3509,105 @@ class ProxyEngine extends EventEmitter {
     }
 
     const priorMessages = previous.messages || [];
+    const cursorMode = String(sourceCursor?.mode || '');
+    if (cursorMode === 'bounded_rebase') {
+      const candidate = this._fileTranscriptState(agentType, filePath, currentMessages, sourceCursor);
+      const overlap = this._fileTranscriptWindowOverlap(priorMessages, candidate.messages);
+      if (overlap > 0) {
+        const previousStart = priorMessages.length - overlap;
+        candidate.messageBaseIndex = Math.max(0, Number(previous.messageBaseIndex) || 0) + previousStart;
+        const occurrences = new Map(previous.messageIdOccurrences || []);
+        const appendedIds = this._fileTranscriptMessageIds(
+          previous.agentType,
+          previous.generation,
+          candidate.messages.slice(overlap),
+          occurrences,
+        );
+        candidate.generation = previous.generation;
+        candidate.messageIds = [
+          ...(previous.messageIds || []).slice(previousStart),
+          ...appendedIds,
+        ];
+        candidate.messageIdOccurrences = occurrences;
+        candidate.observationKey = this._fileTranscriptObservationKey(filePath, sourceCursor, currentMessages);
+        const appended = candidate.messages.slice(overlap);
+        if (appended.length > FILE_TRANSCRIPT_ASYNC_APPEND_THRESHOLD) {
+          const drain = {
+            agentType,
+            candidate,
+            sourceCursor: sourceCursor ? { ...sourceCursor } : previous.sourceCursor,
+            reason,
+            nextIndex: overlap,
+            sent: 0,
+            scheduled: false,
+            pending: null,
+          };
+          session._fileTranscriptAppendDrain = drain;
+          this._scheduleFileTranscriptAppendDrain(sessionId, session, drain);
+          return { mode: 'bounded_rebase_append_scheduled', sent: 0, pending: appended.length, overlap };
+        }
+        let sent = 0;
+        appended.forEach((message, offset) => {
+          const index = overlap + offset;
+          if (this._sendProxyMessage(sessionId, this._fileTranscriptMessage(candidate, message, index, sourceCursor))) sent += 1;
+        });
+        if (sent !== appended.length) {
+          session.lastObservedCount = priorMessages.length;
+          session.lastMessageCount = priorMessages.length;
+          return { mode: 'bounded_rebase_append_deferred', sent, overlap };
+        }
+        session._fileTranscriptState = candidate;
+        session._lastFileTranscriptObservationKey = candidate.observationKey;
+        this._log('info', `[${sessionId}] Rebased bounded ${agentType} tail with ${overlap} overlapping rows and ${sent} semantic appends (${reason})`);
+        return { mode: sent > 0 ? 'bounded_rebase_append' : 'bounded_rebase_unchanged', sent, overlap };
+      }
+      this._log('warn', `[${sessionId}] Bounded ${agentType} tail rebase had no semantic overlap; preserving the prior cursor until authoritative recovery is available (${reason})`);
+      return { mode: 'bounded_rebase_deferred', sent: 0, overlap: 0 };
+    }
+
     let prefixCount = 0;
     const shared = Math.min(priorMessages.length, currentMessages.length);
-    while (
-      prefixCount < shared
-      && this._transcriptSignature([priorMessages[prefixCount]]) === this._transcriptSignature([currentMessages[prefixCount]])
-    ) prefixCount += 1;
+    const appendCursorFastPath = cursorMode === 'append'
+      && currentMessages.length >= priorMessages.length
+      && (
+        priorMessages.length === 0
+        || this._transcriptSignature([priorMessages[priorMessages.length - 1]])
+          === this._transcriptSignature([currentMessages[priorMessages.length - 1]])
+      );
+    if (appendCursorFastPath) {
+      prefixCount = priorMessages.length;
+    } else {
+      while (
+        prefixCount < shared
+        && this._transcriptSignature([priorMessages[prefixCount]]) === this._transcriptSignature([currentMessages[prefixCount]])
+      ) prefixCount += 1;
+    }
 
     if (prefixCount === priorMessages.length && currentMessages.length >= priorMessages.length) {
       const appended = currentMessages.slice(priorMessages.length);
+      if (appended.length === 0) {
+        session._fileTranscriptState = {
+          ...previous,
+          sourceCursor: sourceCursor ? { ...sourceCursor } : previous.sourceCursor,
+          observationKey: this._fileTranscriptObservationKey(filePath, sourceCursor, currentMessages),
+        };
+        session._lastFileTranscriptObservationKey = session._fileTranscriptState.observationKey;
+        return { mode: 'unchanged', sent: 0 };
+      }
+      const appendedMessages = this._cloneTranscriptMessages(appended);
+      const occurrences = new Map(previous.messageIdOccurrences || []);
       const candidate = {
         ...previous,
-        messages: this._cloneTranscriptMessages(currentMessages),
-        messageIds: this._fileTranscriptMessageIds(previous.agentType, previous.generation, currentMessages),
+        messages: [...priorMessages, ...appendedMessages],
+        messageIds: [
+          ...(previous.messageIds || []),
+          ...this._fileTranscriptMessageIds(previous.agentType, previous.generation, appendedMessages, occurrences),
+        ],
+        messageIdOccurrences: occurrences,
+        approximateRecoveryBytes: Number(previous.approximateRecoveryBytes || 512)
+          + Math.max(0, this._fileTranscriptApproximateSizeInfo(appendedMessages).bytes - 512),
         sourceCursor: sourceCursor ? { ...sourceCursor } : previous.sourceCursor,
+        observationKey: this._fileTranscriptObservationKey(filePath, sourceCursor, currentMessages),
       };
       if (appended.length > FILE_TRANSCRIPT_ASYNC_APPEND_THRESHOLD) {
         const drain = {
@@ -3441,12 +3630,12 @@ class ProxyEngine extends EventEmitter {
         if (this._sendProxyMessage(sessionId, this._fileTranscriptMessage(candidate, message, index, sourceCursor))) sent += 1;
       });
       if (sent !== appended.length) {
-        session.lastTranscriptSig = this._transcriptSignature(priorMessages);
         session.lastObservedCount = priorMessages.length;
         session.lastMessageCount = priorMessages.length;
         return { mode: 'append_deferred', sent };
       }
       session._fileTranscriptState = candidate;
+      session._lastFileTranscriptObservationKey = candidate.observationKey;
       if (sent > 0) {
         this._log('info', `[${sessionId}] Emitted ${sent} ${agentType} semantic append rows (${reason}, cursor ${sourceCursor?.start_offset ?? '?'}-${sourceCursor?.end_offset ?? '?'})`);
       }
@@ -3456,11 +3645,21 @@ class ProxyEngine extends EventEmitter {
     const now = Date.now();
     const minResyncIntervalMs = 5000;
     if (session._lastFileTranscriptResyncAt && now - session._lastFileTranscriptResyncAt < minResyncIntervalMs) {
-      session.lastTranscriptSig = this._transcriptSignature(priorMessages);
       session.lastObservedCount = priorMessages.length;
       session.lastMessageCount = priorMessages.length;
       this._log('warn', `[${sessionId}] Deferred ${agentType} mutation recovery inside ${minResyncIntervalMs} ms rate limit (${reason})`);
       return { mode: 'resync_throttled', sent: 0 };
+    }
+    const preflight = this._fileTranscriptRecoveryPreflight(
+      sessionId,
+      session,
+      currentMessages,
+      `${agentType} mutation recovery`,
+    );
+    if (!preflight.allowed) {
+      session.lastObservedCount = priorMessages.length;
+      session.lastMessageCount = priorMessages.length;
+      return { mode: `resync_${preflight.reason}`, sent: 0, retry_after_ms: preflight.retryAfterMs };
     }
     const resyncId = crypto.randomUUID();
     const recovered = this._fileTranscriptState(agentType, filePath, currentMessages, sourceCursor, resyncId);
@@ -3476,13 +3675,14 @@ class ProxyEngine extends EventEmitter {
       rateLimitMs: minResyncIntervalMs,
     });
     if (!accepted) {
-      session.lastTranscriptSig = this._transcriptSignature(priorMessages);
       session.lastObservedCount = priorMessages.length;
       session.lastMessageCount = priorMessages.length;
       return { mode: 'resync_deferred', sent: 0 };
     }
     session._lastFileTranscriptResyncAt = now;
     session._fileTranscriptState = recovered;
+    recovered.observationKey = this._fileTranscriptObservationKey(filePath, sourceCursor, currentMessages);
+    session._lastFileTranscriptObservationKey = recovered.observationKey;
     this._log('warn', `[${sessionId}] Sent bounded ${agentType} mutation recovery ${resyncId} (${prefixCount}/${priorMessages.length} prefix, ${reason})`);
     return { mode: 'resync', sent: recoveredMessages.length, resync_id: resyncId };
   }
@@ -4606,6 +4806,80 @@ class ProxyEngine extends EventEmitter {
       return;
     }
 
+    if (type === 'provider_usage_reset_credit_consume') {
+      const requestId = typeof msg.request_id === 'string' ? msg.request_id.slice(0, 120) : null;
+      if (!requestId || msg.approved !== true) {
+        this._sendToRelay({
+          type: 'provider_usage_reset_credit_receipt',
+          protocol_version: proto.PROTOCOL_VERSION,
+          request_id: requestId,
+          status: 'error',
+          code: requestId ? 'operator_approval_required' : 'invalid_request_id',
+        });
+        return;
+      }
+      if (this._providerUsageResetInFlight) {
+        this._sendToRelay({
+          type: 'provider_usage_reset_credit_receipt',
+          protocol_version: proto.PROTOCOL_VERSION,
+          request_id: requestId,
+          status: 'error',
+          code: 'reset_in_progress',
+        });
+        return;
+      }
+      const run = (async () => {
+        const connection = this._codexUsageResetConnectionFactory({
+          sessionId: 'provider-usage-reset',
+          cwd: process.cwd(),
+          clientName: 'remote-agent-chat-usage-reset',
+          clientVersion: '1.0.0',
+        });
+        try {
+          await connection.start();
+          const before = normalizeRateLimitState(await connection.readRateLimits());
+          let outcome = 'nothingToReset';
+          if (before.limited && before.resetCreditsAvailable > 0) {
+            const consumed = await connection.consumeRateLimitResetCredit(null, requestId);
+            outcome = consumed?.outcome || 'unknown';
+          } else if (before.limited) {
+            outcome = 'noCredit';
+          }
+          let after = before;
+          try {
+            after = normalizeRateLimitState(await connection.readRateLimits());
+          } catch (error) {
+            this._log('warn', `[usage] Post-reset limit read failed: ${error?.message || 'unknown error'}`);
+          }
+          this._sendToRelay({
+            type: 'provider_usage_reset_credit_receipt',
+            protocol_version: proto.PROTOCOL_VERSION,
+            request_id: requestId,
+            status: 'completed',
+            outcome,
+            reset_credits_available: after.resetCreditsAvailable,
+          });
+          await this._providerUsage.refresh({ force: true, reason: 'reset_credit', waitForCost: false })
+            .catch(error => this._log('warn', `[usage] Post-reset refresh failed: ${error?.message || 'unknown error'}`));
+        } finally {
+          await connection.stop().catch(() => {});
+        }
+      })().catch(error => {
+        this._log('warn', `[usage] Reset credit action failed: ${error?.message || 'unknown error'}`);
+        this._sendToRelay({
+          type: 'provider_usage_reset_credit_receipt',
+          protocol_version: proto.PROTOCOL_VERSION,
+          request_id: requestId,
+          status: 'error',
+          code: String(error?.code || 'reset_credit_failed').replace(/[^a-z0-9_.-]/gi, '_').slice(0, 60),
+        });
+      }).finally(() => {
+        if (this._providerUsageResetInFlight === run) this._providerUsageResetInFlight = null;
+      });
+      this._providerUsageResetInFlight = run;
+      return;
+    }
+
     if (type === 'provider_usage_cost_detail_request') {
       const requestId = typeof msg.request_id === 'string' ? msg.request_id.slice(0, 80) : null;
       this._providerUsage.costDetailPage({
@@ -5099,13 +5373,16 @@ class ProxyEngine extends EventEmitter {
               effort: sessionData.effort,
               permissionMode: sessionData.permission_mode,
               title: `${sessionData.workspace_name || 'Claude Code'} - Claude CLI`,
+              launchMode: 'foreground',
+              operatorActionProof: msg.operator_action_proof,
+              requestId: msg.request_id,
             });
             sessionData.nativeClaudeWindowChild = child;
             this._log('info', `[ctrl] reopened native Claude CLI window for ${sid} pid=${child?.pid || 'unknown'}`);
             this._sendToRelay(proto.agentControlResult(sid, msg.request_id, 'error_prompt_action', 'ok'));
           } catch (e) {
             this._sendToRelay(proto.agentControlResult(sid, msg.request_id, 'error_prompt_action', 'failed', {
-              code: 'spawn_failed', message: e.message,
+              code: e.code || 'spawn_failed', message: e.message,
             }));
           }
           return;
@@ -5124,23 +5401,13 @@ class ProxyEngine extends EventEmitter {
               return;
             }
             try {
-              const stopped = sessionData.nativeClaudeWindowChild
-                ? claudeCli.stopNativeClaudeWindow(sessionData.nativeClaudeWindowChild)
-                : { ok: true, detail: 'no tracked pre-trust process' };
-              if (!stopped.ok) {
-                throw new Error(`Could not close pre-trust Claude CLI window: ${stopped.detail}`);
-              }
-              const child = claudeCli.startNativeClaudeWindow({
-                workspacePath: sessionData.workspace_path || process.cwd(),
-                cliSessionId: sessionData.cliSessionId || crypto.randomUUID(),
-                resume: !!sessionData.claudeCliFilePath,
-                model: sessionData.model_id,
-                effort: sessionData.effort,
-                permissionMode: sessionData.permission_mode,
-                title: `${sessionData.workspace_name || 'Claude Code'} - Claude CLI`,
+              sessionData.nativeCliStatus = 'background_ready';
+              sessionData.nativeCliWindowOpened = false;
+              sessionStore.updateSession(sid, {
+                native_cli_status: sessionData.nativeCliStatus,
+                native_cli_window_opened: false,
               });
-              sessionData.nativeClaudeWindowChild = child;
-              this._log('info', `[ctrl] trusted workspace and reopened native Claude CLI window for ${sid} pid=${child?.pid || 'unknown'}`);
+              this._log('info', `[ctrl] trusted Claude workspace for ${sid}; native window remains operator-action-only`);
               this._sendToRelay(proto.agentControlResult(sid, msg.request_id, 'error_prompt_action', 'ok'));
             } catch (e) {
               this._sendToRelay(proto.agentControlResult(sid, msg.request_id, 'error_prompt_action', 'failed', {
@@ -7278,6 +7545,19 @@ class ProxyEngine extends EventEmitter {
         return;
       }
 
+      const operatorProof = validateOperatorActionProof(msg.operator_action_proof, {
+        action: 'open_native_window',
+        requestId,
+        consume: false,
+      });
+      if (!operatorProof.ok) {
+        this._sendToRelay(proto.agentControlResult(sid, requestId, 'open_native_window', 'failed', {
+          code: 'operator_action_only',
+          message: `Visible native windows are operator-action-only (${operatorProof.reason})`,
+        }));
+        return;
+      }
+
       try {
         const cliSessionId = sessionData.cliSessionId || crypto.randomUUID();
         sessionData.cliSessionId = cliSessionId;
@@ -7307,6 +7587,8 @@ class ProxyEngine extends EventEmitter {
             title: `${sessionData.workspace_name || 'Codex'} - Codex CLI`,
             elevated: false,
             launchMode: 'foreground',
+            operatorActionProof: msg.operator_action_proof,
+            requestId,
           });
         } else if (isCursorCli) {
           const existingSummary = sessionData.cursorCliFilePath
@@ -7325,6 +7607,8 @@ class ProxyEngine extends EventEmitter {
             sandbox: sessionData.sandbox,
             title: `${sessionData.workspace_name || 'Cursor'} - Cursor CLI`,
             launchMode: 'foreground',
+            operatorActionProof: msg.operator_action_proof,
+            requestId,
           });
         } else {
           child = claudeCli.startNativeClaudeWindow({
@@ -7336,6 +7620,8 @@ class ProxyEngine extends EventEmitter {
             permissionMode: sessionData.permission_mode,
             title: `${sessionData.workspace_name || 'Claude Code'} - Claude CLI`,
             launchMode: 'foreground',
+            operatorActionProof: msg.operator_action_proof,
+            requestId,
           });
           sessionData.nativeClaudeWindowChild = child;
         }
@@ -7364,7 +7650,7 @@ class ProxyEngine extends EventEmitter {
           : !!sessionData.claudeCliFilePath;
         if (!hasTranscript) this._sendHistorySnapshot(sid, pendingMsgs, `${label} cli native startup failed`);
         this._sendToRelay(proto.agentControlResult(sid, requestId, 'open_native_window', 'failed', {
-          code: 'spawn_failed', message: e.message,
+          code: e.code || 'spawn_failed', message: e.message,
         }));
       }
       return;
@@ -8186,6 +8472,16 @@ class ProxyEngine extends EventEmitter {
     }
     session._pendingRelayTranscriptResync = null;
     const sourceCursor = state.sourceCursor ? { ...state.sourceCursor } : null;
+    const preflight = this._fileTranscriptRecoveryPreflight(
+      sessionId,
+      session,
+      state.messages,
+      `${state.agentType} relay cursor recovery`,
+    );
+    if (!preflight.allowed) {
+      this._log('warn', `[${sessionId}] Relay-requested ${state.agentType} recovery deferred (${preflight.reason}, retry after ${preflight.retryAfterMs} ms)`);
+      return;
+    }
     const recoveredMessages = state.messages.map((message, index) => (
       this._fileTranscriptMessage(state, message, index, sourceCursor)
     ));
@@ -8649,6 +8945,38 @@ class ProxyEngine extends EventEmitter {
     }
     return false;
 
+  }
+
+  _recordPollTickBudget(durationMs) {
+    if (!this._pollBudgetTelemetry) {
+      this._pollBudgetTelemetry = {
+        durationsMs: [], completedTicks: 0, lastReportedSkippedTicks: 0, latest: null,
+      };
+    }
+    const telemetry = this._pollBudgetTelemetry;
+    telemetry.durationsMs.push(Math.max(0, Number(durationMs) || 0));
+    if (telemetry.durationsMs.length > POLL_BUDGET_SAMPLE_MAX) {
+      telemetry.durationsMs.splice(0, telemetry.durationsMs.length - POLL_BUDGET_SAMPLE_MAX);
+    }
+    telemetry.completedTicks += 1;
+    if (telemetry.completedTicks % POLL_BUDGET_REPORT_EVERY_TICKS !== 0) {
+      return telemetry.latest;
+    }
+    const sorted = [...telemetry.durationsMs].sort((a, b) => a - b);
+    const p95Index = Math.max(0, Math.ceil(sorted.length * 0.95) - 1);
+    const skippedTotal = Math.max(0, Number(this._skippedPollTicks) || 0);
+    const latest = {
+      completed_ticks: telemetry.completedTicks,
+      window_samples: sorted.length,
+      p95_ms: sorted[p95Index] || 0,
+      max_ms: sorted[sorted.length - 1] || 0,
+      skipped_total: skippedTotal,
+      skipped_delta: skippedTotal - telemetry.lastReportedSkippedTicks,
+    };
+    telemetry.latest = latest;
+    telemetry.lastReportedSkippedTicks = skippedTotal;
+    this._log('info', `[poll] budget completed=${latest.completed_ticks} window=${latest.window_samples} p95_ms=${latest.p95_ms} max_ms=${latest.max_ms} skipped_total=${latest.skipped_total} skipped_delta=${latest.skipped_delta}`);
+    return latest;
   }
 
   // ─── Heartbeat ───────────────────────────────────────────────────────
@@ -9436,6 +9764,9 @@ class ProxyEngine extends EventEmitter {
       active_quota_model: s.activeQuotaModel   || null,
       available_ai_credits: s.availableAiCredits ?? null,
       antigravity_quota_models: Array.isArray(s.antigravityQuotaModels) ? s.antigravityQuotaModels : null,
+      antigravity_quota_source: s.antigravityQuotaSource || null,
+      antigravity_quota_fetched_at: s.antigravityQuotaFetchedAt || null,
+      antigravity_quota_next_refresh_at: s.antigravityQuotaNextRefreshAt || null,
       is_list_view:       s._panelEmpty        || s._listView || false,
       is_new_chat_draft:  !!s._newChatPending,
       ...sessionNoiseMetadata(s),
@@ -9611,6 +9942,33 @@ class ProxyEngine extends EventEmitter {
     return true;
   }
 
+  _scheduleBackgroundMaintenanceStep(label, work, options = {}) {
+    if (!this._backgroundMaintenanceInFlight) this._backgroundMaintenanceInFlight = new Map();
+    if (this._backgroundMaintenanceInFlight.has(label)) return false;
+    const startedAt = Date.now();
+    const pending = this._runBackgroundMaintenanceStep(label, work, options)
+      .then(ran => {
+        if (ran) {
+          const durationMs = Date.now() - startedAt;
+          if (durationMs >= 2000) {
+            this._log('info', `[poll] Background ${label} completed in ${durationMs}ms`);
+          }
+        }
+        return ran;
+      })
+      .catch(error => {
+        this._log('warn', `[poll] Background ${label} failed: ${error.message}`);
+        return false;
+      })
+      .finally(() => {
+        if (this._backgroundMaintenanceInFlight.get(label) === pending) {
+          this._backgroundMaintenanceInFlight.delete(label);
+        }
+      });
+    this._backgroundMaintenanceInFlight.set(label, pending);
+    return true;
+  }
+
   async _primeEphemeralIframeRuntime(session, Runtime, forceRefresh = false) {
     const focusTag = session.agentType === 'claude' ? 'claude-focus' : 'continue-focus';
     const cachedContextId = session._iframeInnerContextId || session._continueInnerContextId || null;
@@ -9674,6 +10032,7 @@ class ProxyEngine extends EventEmitter {
   }
 
   async _withAntigravitySettingsClient(work) {
+    let lastFailure = null;
     for (const cdpPort of this.CDP_PORTS) {
       let targets;
       try {
@@ -9711,7 +10070,8 @@ class ProxyEngine extends EventEmitter {
           // page, but must never navigate, focus, click, or refresh it.
           const result = await this._withTimeout(work(client), 8000, 'antigravity quota read');
           if (result) return result;
-        } catch {
+        } catch (error) {
+          lastFailure = error;
           // Continue to the next exact Antigravity candidate/port.
         } finally {
           if (client) {
@@ -9720,7 +10080,9 @@ class ProxyEngine extends EventEmitter {
         }
       }
     }
-    throw new Error('No readable Antigravity quota page found');
+    const error = new Error('No readable Antigravity quota source found');
+    error.code = lastFailure?.code || 'quota_source_unavailable';
+    throw error;
   }
 
   _normalizeAntigravityModelName(name) {
@@ -9758,17 +10120,25 @@ class ProxyEngine extends EventEmitter {
   _applyAntigravityQuotaSnapshot(snapshot) {
     let changed = false;
     for (const session of this.sessions.values()) {
-      if (session.agentType !== 'antigravity' && session.agentType !== 'antigravity_panel') continue;
+      if (!['antigravity', 'antigravity_panel', 'antigravity-v2', 'gemini'].includes(session.agentType)) continue;
       const entry = this._findAntigravityQuotaEntry(session, snapshot);
       const nextPct = entry?.percent_used ?? null;
-      const nextReset = entry?.refreshes_in || null;
+      const nextReset = entry?.resets_at || entry?.refreshes_in || null;
       const nextCredits = snapshot?.available_ai_credits ?? null;
       const nextActiveModel = entry?.model || null;
+      const nextSource = this._antigravityQuotaCache.source || snapshot?.source || null;
+      const nextFetchedAt = snapshot?.fetched_at || null;
+      const nextRefreshAt = Number.isFinite(this._antigravityQuotaCache.nextRefreshAt)
+        ? new Date(this._antigravityQuotaCache.nextRefreshAt).toISOString()
+        : null;
       const nextQuotaModels = Array.isArray(snapshot?.models)
         ? snapshot.models.map(model => ({
             model: model?.model || null,
             refreshes_in: model?.refreshes_in || null,
+            resets_at: model?.resets_at || null,
+            window_kind: model?.window_kind || null,
             percent_used: model?.percent_used ?? null,
+            percent_remaining: model?.percent_remaining ?? null,
             color: model?.color || null,
           }))
         : null;
@@ -9792,6 +10162,18 @@ class ProxyEngine extends EventEmitter {
         session.antigravityQuotaModels = nextQuotaModels;
         changed = true;
       }
+      if ((session.antigravityQuotaSource || null) !== nextSource) {
+        session.antigravityQuotaSource = nextSource;
+        changed = true;
+      }
+      if ((session.antigravityQuotaFetchedAt || null) !== nextFetchedAt) {
+        session.antigravityQuotaFetchedAt = nextFetchedAt;
+        changed = true;
+      }
+      if ((session.antigravityQuotaNextRefreshAt || null) !== nextRefreshAt) {
+        session.antigravityQuotaNextRefreshAt = nextRefreshAt;
+        changed = true;
+      }
     }
     if (changed) this._broadcastSessionSnapshot();
     return changed;
@@ -9803,30 +10185,97 @@ class ProxyEngine extends EventEmitter {
     );
     if (!hasAntigravitySessions) return false;
 
+    if (this._antigravityQuotaRefreshInFlight) return this._antigravityQuotaRefreshInFlight;
+
     const now = Date.now();
-    if (!force && this._antigravityQuotaCache.data && (now - this._antigravityQuotaCache.fetchedAt) < 30000) {
+    if (!force && this._antigravityQuotaCache.data && now < this._antigravityQuotaCache.nextRefreshAt) {
       return this._applyAntigravityQuotaSnapshot(this._antigravityQuotaCache.data);
     }
 
-    try {
-      const snapshot = await this._withTimeout(
-        this._withAntigravitySettingsClient(async client => {
-          return this._withTimeout(
-            selectors.readAntigravityModelQuota(client.Runtime), 4000, 'read quota'
+    const refreshRun = (async () => {
+      try {
+        const priorSourceHistory = Array.isArray(this._antigravityQuotaCache.sourceHistory)
+          ? this._antigravityQuotaCache.sourceHistory
+          : [];
+        const acquisition = await this._withTimeout(
+          this._withAntigravitySettingsClient(async client => {
+            const internal = await this._withTimeout(
+              selectors.readAntigravityInternalQuota(client.Runtime, true),
+              18000,
+              'read Antigravity in-app quota API',
+            );
+            if (internal?.ok && Array.isArray(internal.models) && internal.models.length > 0) {
+              return {
+                snapshot: internal,
+                source: 'in_app_api',
+                sourceHistory: [
+                  ...priorSourceHistory,
+                  antigravityQuotaCache.sourceAttempt('official_cli', 'unavailable', 'interactive_tui_only'),
+                  antigravityQuotaCache.sourceAttempt('in_app_api', 'ok'),
+                ],
+              };
+            }
+
+            // Existing open Settings surfaces remain a read-only fallback.
+            // This does not create, navigate, focus, or click a target.
+            const settingsSnapshot = await this._withTimeout(
+              selectors.readAntigravityModelQuota(client.Runtime),
+              4000,
+              'read existing Antigravity quota surface',
+            );
+            if (settingsSnapshot?.models?.length) {
+              return {
+                snapshot: { ...settingsSnapshot, source: 'settings_surface' },
+                source: 'settings_surface',
+                sourceHistory: [
+                  ...priorSourceHistory,
+                  antigravityQuotaCache.sourceAttempt('official_cli', 'unavailable', 'interactive_tui_only'),
+                  antigravityQuotaCache.sourceAttempt('in_app_api', 'unavailable', internal?.code || 'schema_mismatch'),
+                  antigravityQuotaCache.sourceAttempt('settings_surface', 'ok'),
+                ],
+              };
+            }
+            const sourceError = new Error('Antigravity quota source schema did not match');
+            sourceError.code = internal?.code || 'quota_schema_mismatch';
+            throw sourceError;
+          }),
+          // Tier B performs two bounded local RPC reads after its optional
+          // refresh RPC. Keep the cap outside the main poll loop as well.
+          20000,
+          'antigravity quota refresh',
+        );
+        const cache = antigravityQuotaCache.createCache(acquisition?.snapshot, {
+          source: acquisition?.source,
+          sourceHistory: acquisition?.sourceHistory,
+        });
+        if (!cache) {
+          const schemaError = new Error('Antigravity quota normalization failed');
+          schemaError.code = 'quota_normalization_failed';
+          throw schemaError;
+        }
+        this._antigravityQuotaLastReceipt = acquisition.snapshot?.source_receipt || null;
+        this._antigravityQuotaCache = cache;
+        antigravityQuotaCache.persistCache(sessionStore, cache);
+        return this._applyAntigravityQuotaSnapshot(cache.data);
+      } catch (error) {
+        if (this._antigravityQuotaCache.data) {
+          this._antigravityQuotaCache = antigravityQuotaCache.cacheAfterFailure(
+            this._antigravityQuotaCache,
+            error?.code || 'refresh_failed',
+            Date.now(),
           );
-        }),
-        // Outer cap so a hung settings renderer can't wedge the main poll
-        // loop. Inner timeouts protect each step; this is the belt.
-        15000, 'antigravity quota refresh'
-      );
-      if (!snapshot || !Array.isArray(snapshot.models) || snapshot.models.length === 0) {
+          antigravityQuotaCache.persistCache(sessionStore, this._antigravityQuotaCache);
+          return this._applyAntigravityQuotaSnapshot(this._antigravityQuotaCache.data);
+        }
         return false;
       }
-      this._antigravityQuotaCache = { fetchedAt: now, data: snapshot };
-      return this._applyAntigravityQuotaSnapshot(snapshot);
-    } catch {
-      return false;
-    }
+    })();
+    this._antigravityQuotaRefreshInFlight = refreshRun;
+    return refreshRun.finally(() => {
+      if (this._antigravityQuotaRefreshInFlight === refreshRun) {
+        this._antigravityQuotaRefreshInFlight = null;
+      }
+    });
   }
 
   _claudeCliPendingTranscriptMessages(session) {
@@ -10995,14 +11444,25 @@ class ProxyEngine extends EventEmitter {
         ? summary?.taskCompletedAt || summary?.activity?.updated_at || summary?.updatedAt || null
         : summary?.taskStartedAt || summary?.activity?.updated_at || summary?.updatedAt || null,
       observedAt: new Date().toISOString(),
-      evidenceType: evidenceType || (completedCheckpoint ? 'task_complete' : (currentAppend ? 'current_generation_event' : 'summary_snapshot')),
-      liveLeaseProof: liveObserved === true && currentAppend,
-      ...(ownerState ? { ownerState } : {}),
+      evidenceType: evidenceType || (ownerState === 'confirmed'
+        ? 'confirmed_native_owner'
+        : (completedCheckpoint ? 'task_complete' : (currentAppend ? 'current_generation_event' : 'summary_snapshot'))),
+      liveLeaseProof: (liveObserved === true && currentAppend) || ownerState === 'confirmed',
+      ...(ownerState || liveObserved === true ? { ownerState: ownerState || 'confirmed' } : {}),
     };
   }
 
   _setCodexCliActivity(sessionId, session, activity, lifecycleContext = {}) {
-    const sourceActivity = activity || { kind: 'idle', label: '', updated_at: new Date().toISOString() };
+    const sourceActivityBase = activity || { kind: 'idle', label: '', updated_at: new Date().toISOString() };
+    const retainedObservedAt = sourceActivityBase.observed_at || session.activity?.observed_at || null;
+    const sourceActivity = lifecycleContext.liveLeaseProof === true
+      ? {
+          ...sourceActivityBase,
+          observed_at: lifecycleContext.observedAt || new Date().toISOString(),
+        }
+      : retainedObservedAt
+        ? { ...sourceActivityBase, observed_at: retainedObservedAt }
+        : sourceActivityBase;
     const terminalCompletedAtMs = Number(session._codexAppServerTerminalCompletedAtMs || 0);
     const sourceUpdatedAtMs = Date.parse(sourceActivity.updated_at || sourceActivity.started_at || '');
     const staleAfterOwnedTerminal = terminalCompletedAtMs > 0
@@ -11402,7 +11862,10 @@ class ProxyEngine extends EventEmitter {
       client: null,
       lastMessageCount: summary.messageCount || 0,
       lastObservedCount: summary.messageCount || 0,
-      lastTranscriptSig: this._transcriptSignature(summary.messages || []),
+      // Codex file-backed transcripts use the parser cursor/last semantic
+      // identity as their hot-path observation key. Avoid serializing a
+      // multi-megabyte active tail merely to rediscover the same cursor.
+      lastTranscriptSig: '',
       nullPollCount: 0,
       waitingForAssistant: false,
       thinking: false,
@@ -11425,6 +11888,7 @@ class ProxyEngine extends EventEmitter {
       codexCliFilePath: summary.filePath,
       codexCliArchiveDiscovered: sessionMeta.codex_cli_archive_discovered === true,
       codexCliExternalActive: sessionMeta.codex_cli_external_active === true,
+      codexCliOwnerDemoted: sessionMeta.codex_cli_owner_demoted === true,
       nativeCliStartedAt: sessionMeta.native_cli_started_at || summary.nativeCliStartedAt || null,
       nativeCliStatus: sessionMeta.native_cli_status || summary.nativeCliStatus || null,
       nativeCliWindowOpened: sessionMeta.native_cli_window_opened === true || summary.nativeCliWindowOpened === true,
@@ -11452,6 +11916,9 @@ class ProxyEngine extends EventEmitter {
       codexCliEffortConfigured: sessionMeta.codex_cli_effort_configured === true,
       _fileTranscriptState: this._fileTranscriptState(
         'codex_cli', summary.filePath, summary.messages || [], summary.sourceCursor || null
+      ),
+      _lastFileTranscriptObservationKey: this._fileTranscriptObservationKey(
+        summary.filePath, summary.sourceCursor || null, summary.messages || []
       ),
       _codexCliInterrupted: interrupted,
       _codexCliPendingReceipt: sessionMeta.codex_cli_pending_receipt || null,
@@ -11724,6 +12191,7 @@ class ProxyEngine extends EventEmitter {
       const metaChanged = this._applyCodexCliSummaryMetadata(sessionId, existing, summary);
       existing.codexCliArchiveDiscovered = archiveDiscovered === true;
       existing.codexCliExternalActive = externalActiveFlag;
+      if (externalActiveFlag) existing.codexCliOwnerDemoted = false;
       existing.cliSessionId = summary.cliSessionId;
       const migratedMeta = sessionStore.migrateVirtualSession(
         sessionId,
@@ -11732,7 +12200,11 @@ class ProxyEngine extends EventEmitter {
       );
       if (migratedMeta?.target_signature) existing.target_signature = migratedMeta.target_signature;
       const ownedTurnCompleted = this._observeCodexCliOwnedTurnCompletion(sessionId, existing, summary);
-      const lifecycleContext = this._codexCliGoalRunContext(summary, { liveObserved, evidenceType });
+      const lifecycleContext = this._codexCliGoalRunContext(summary, {
+        liveObserved,
+        evidenceType,
+        ownerState: summary._racCodexCliOwnerConfirmed === true ? 'confirmed' : '',
+      });
       this._setCodexCliActivity(sessionId, existing,
         ownedTurnCompleted && summary.activity?.kind !== 'idle'
           ? { ...summary.activity, kind: 'idle', label: '', updated_at: summary.taskCompletedAt || summary.updatedAt || new Date().toISOString() }
@@ -11743,6 +12215,7 @@ class ProxyEngine extends EventEmitter {
         codex_cli_file_path: existing.codexCliFilePath || null,
         codex_cli_archive_discovered: archiveDiscovered === true,
         codex_cli_external_active: externalActiveFlag,
+        codex_cli_owner_demoted: externalActiveFlag ? false : existing.codexCliOwnerDemoted === true,
         chat_title: existing.chat_title || null,
         workspace_path: existing.workspace_path || null,
         workspace_name: existing.workspace_name || null,
@@ -11757,12 +12230,11 @@ class ProxyEngine extends EventEmitter {
         ? summaryMessages
         : (summary.filePath ? [] : this._codexCliPendingTranscriptMessages(existing));
       if (effectiveMessages.length === 0) return existing;
-      const sig = this._transcriptSignature(effectiveMessages);
-      if (sig !== existing.lastTranscriptSig) {
+      const observationKey = this._fileTranscriptObservationKey(summary.filePath, summary.sourceCursor, effectiveMessages);
+      if (observationKey !== existing._lastFileTranscriptObservationKey) {
         const reason = shouldPrioritizeCliAssistantSnapshot(existing.lastObservedCount, effectiveMessages)
           ? 'assistant completion'
           : 'codex cli file attached';
-        existing.lastTranscriptSig = sig;
         existing.lastObservedCount = effectiveMessages.length;
         existing.lastMessageCount = effectiveMessages.length;
         this._sendFileBackedTranscriptUpdate(sessionId, existing, effectiveMessages, {
@@ -11788,6 +12260,7 @@ class ProxyEngine extends EventEmitter {
         codex_cli_file_path: summary.filePath,
         codex_cli_archive_discovered: archiveDiscovered === true,
         codex_cli_external_active: externalActive === true,
+        codex_cli_owner_demoted: false,
         chat_title: summary.title || null,
         model_id: summary.model_observation ? (summary.model_id || undefined) : undefined,
         codex_cli_observed_model_id: summary.model_observation ? (summary.model_id || undefined) : undefined,
@@ -11817,9 +12290,14 @@ class ProxyEngine extends EventEmitter {
       const metaChanged = this._applyCodexCliSummaryMetadata(sessionId, existing, summary);
       existing.codexCliArchiveDiscovered = archiveDiscovered === true;
       existing.codexCliExternalActive = externalActiveFlag;
+      if (externalActiveFlag) existing.codexCliOwnerDemoted = false;
       existing.cliSessionId = summary.cliSessionId;
       const ownedTurnCompleted = this._observeCodexCliOwnedTurnCompletion(sessionId, existing, summary);
-      const lifecycleContext = this._codexCliGoalRunContext(summary, { liveObserved, evidenceType });
+      const lifecycleContext = this._codexCliGoalRunContext(summary, {
+        liveObserved,
+        evidenceType,
+        ownerState: summary._racCodexCliOwnerConfirmed === true ? 'confirmed' : '',
+      });
       this._setCodexCliActivity(sessionId, existing,
         ownedTurnCompleted && summary.activity?.kind !== 'idle'
           ? { ...summary.activity, kind: 'idle', label: '', updated_at: summary.taskCompletedAt || summary.updatedAt || new Date().toISOString() }
@@ -11833,12 +12311,11 @@ class ProxyEngine extends EventEmitter {
         ? summaryMessages
         : (summary.filePath ? [] : this._codexCliPendingTranscriptMessages(existing));
       if (effectiveMessages.length === 0) return existing;
-      const sig = this._transcriptSignature(effectiveMessages);
-      if (sig !== existing.lastTranscriptSig) {
+      const observationKey = this._fileTranscriptObservationKey(summary.filePath, summary.sourceCursor, effectiveMessages);
+      if (observationKey !== existing._lastFileTranscriptObservationKey) {
         const reason = shouldPrioritizeCliAssistantSnapshot(existing.lastObservedCount, effectiveMessages)
           ? 'assistant completion'
           : 'codex cli file changed';
-        existing.lastTranscriptSig = sig;
         existing.lastObservedCount = effectiveMessages.length;
         existing.lastMessageCount = effectiveMessages.length;
         this._sendFileBackedTranscriptUpdate(sessionId, existing, effectiveMessages, {
@@ -11870,7 +12347,6 @@ class ProxyEngine extends EventEmitter {
         ? summary.messages
         : (summary.filePath ? [] : this._codexCliPendingTranscriptMessages(session));
       if (initialMessages.length > 0) {
-        session.lastTranscriptSig = this._transcriptSignature(initialMessages);
         session.lastObservedCount = initialMessages.length;
         session.lastMessageCount = initialMessages.length;
       }
@@ -11912,40 +12388,100 @@ class ProxyEngine extends EventEmitter {
     };
   }
 
-  _codexCliExternalActiveSummaries() {
+  _codexCliExternalActiveSummaries(nowMs = Date.now()) {
     const configuredLimit = parseInt(process.env.CODEX_CLI_ACTIVE_SESSION_LIMIT || '', 10);
-    const runningProcessCount = codexCli.runningCodexCliProcessCount();
-    const detectedLimit = runningProcessCount > 0 ? Math.min(runningProcessCount, 10) : 1;
-    const limit = Number.isFinite(configuredLimit) && configuredLimit > 0 ? configuredLimit : detectedLimit;
-    const hours = parseInt(process.env.CODEX_CLI_INTERACTIVE_HISTORY_HOURS || '24', 10);
-    const processCountSig = `${runningProcessCount}:${limit}`;
-    if (this._lastCodexCliProcessCountSig !== processCountSig) {
-      this._lastCodexCliProcessCountSig = processCountSig;
-      this._log('info', `[codex-cli] detected ${runningProcessCount} running Codex CLI process(es); active history limit=${limit}`);
-    }
-    const activeSummaryOptions = this._codexCliActiveSummaryOptions();
-    const byId = new Map();
-    if (runningProcessCount > 0) {
-      for (const summary of codexCli.recentActiveSessionSummaries({
-        limit,
-        maxAgeMs: CODEX_CLI_ACTIVE_FILE_MAX_AGE_MS,
-        summaryOptions: activeSummaryOptions,
-      })) {
-        byId.set(summary.cliSessionId, summary);
-        if (byId.size >= limit) break;
+    const ownerSnapshot = codexCli.runningCodexCliSessionOwners({ cacheMs: 2000 });
+    const ownerIds = ownerSnapshot.state === 'confirmed'
+      ? Array.from(ownerSnapshot.owners.keys())
+      : [];
+    const limitedOwnerIds = Number.isFinite(configuredLimit) && configuredLimit > 0
+      ? ownerIds.slice(0, configuredLimit)
+      : ownerIds;
+    if (!this._codexCliExternalOwnerLedger) this._codexCliExternalOwnerLedger = new Map();
+    if (this._codexCliExternalOwnerLedgerSeeded !== true) {
+      this._codexCliExternalOwnerLedgerSeeded = true;
+      for (const stored of sessionStore.getAllSessions()) {
+        if (stored.agent_type !== 'codex_cli' || stored.codex_cli_external_active !== true) continue;
+        const lastEvidenceMs = Date.parse(
+          stored.activity?.goal_run?.lease_observed_at
+          || stored.activity?.observed_at
+          || stored.last_seen_at
+          || '',
+        );
+        if (!Number.isFinite(lastEvidenceMs) || nowMs - lastEvidenceMs > CODEX_CLI_OWNER_MISSING_GRACE_MS) continue;
+        const summary = this._findCodexCliSummaryByCliId(stored.cli_session_id);
+        if (!summary) continue;
+        this._codexCliExternalOwnerLedger.set(stored.cli_session_id, {
+          summary,
+          last_confirmed_at_ms: lastEvidenceMs,
+        });
       }
     }
-    const historyIds = codexCli.recentInteractiveSessionIds({
-      limit,
-      maxAgeMs: (Number.isFinite(hours) && hours > 0 ? hours : 24) * 60 * 60 * 1000,
-    });
-    for (const cliSessionId of historyIds) {
-      if (byId.has(cliSessionId)) continue;
-      const summary = this._findCodexCliSummaryByCliId(cliSessionId);
-      if (summary) byId.set(cliSessionId, summary);
-      if (byId.size >= limit) break;
+    const processCountSig = `${ownerSnapshot.state}:${ownerIds.length}:${limitedOwnerIds.length}`;
+    if (this._lastCodexCliProcessCountSig !== processCountSig) {
+      this._lastCodexCliProcessCountSig = processCountSig;
+      this._log('info', `[codex-cli] exact owner snapshot state=${ownerSnapshot.state} owners=${ownerIds.length} selected=${limitedOwnerIds.length}`);
     }
-    return Array.from(byId.values());
+    const selected = new Set(limitedOwnerIds);
+    for (const cliSessionId of limitedOwnerIds) {
+      const summary = this._findCodexCliSummaryByCliId(cliSessionId);
+      if (!summary) continue;
+      this._codexCliExternalOwnerLedger.set(cliSessionId, {
+        summary,
+        last_confirmed_at_ms: ownerSnapshot.checked_at_ms || nowMs,
+      });
+    }
+    const summaries = [];
+    for (const [cliSessionId, record] of this._codexCliExternalOwnerLedger) {
+      const confirmed = selected.has(cliSessionId);
+      const missingForMs = nowMs - Number(record.last_confirmed_at_ms || 0);
+      if (!confirmed && missingForMs > CODEX_CLI_OWNER_MISSING_GRACE_MS) {
+        this._codexCliExternalOwnerLedger.delete(cliSessionId);
+        continue;
+      }
+      if (record.summary) {
+        record.summary._racCodexCliOwnerConfirmed = confirmed;
+        summaries.push(record.summary);
+      }
+    }
+    return summaries;
+  }
+
+  _demoteCodexCliExternalSession(sessionId, session, evidenceType = 'confirmed_owner_gone') {
+    if (!sessionId || !session || session.agentType !== 'codex_cli'
+        || session.codexCliExternalActive !== true) return false;
+    session.codexCliExternalActive = false;
+    session.codexCliOwnerDemoted = true;
+    const lastEvidenceAt = session.activity?.goal_run?.lease_observed_at
+      || session.activity?.updated_at
+      || session.activity?.updatedAt
+      || new Date().toISOString();
+    const {
+      thinking: _thinking,
+      current: _current,
+      thinkingContent: _thinkingContent,
+      ...settledActivity
+    } = session.activity || {};
+    this._setCodexCliActivity(sessionId, session, {
+      ...settledActivity,
+      kind: 'idle',
+      label: '',
+      updated_at: lastEvidenceAt,
+    }, {
+      source: 'codex_cli_native_owner',
+      goalSource: session.activity?.goal?.source || 'codex_cli_jsonl',
+      observedAt: new Date().toISOString(),
+      evidenceType,
+      ownerState: 'gone',
+      confirmedDisconnect: true,
+      liveLeaseProof: false,
+    });
+    sessionStore.updateSession(sessionId, {
+      codex_cli_external_active: false,
+      codex_cli_owner_demoted: true,
+      activity: session.activity,
+    });
+    return true;
   }
 
   _codexCliExternalActiveIds() {
@@ -11970,7 +12506,23 @@ class ProxyEngine extends EventEmitter {
         const isExternalActive = cliSessionId && externalActiveIds.has(cliSessionId);
         const isArchiveOnly = sess.codex_cli_archive_discovered === true && !isExternalActive;
         const isStaleExternal = sess.codex_cli_external_active === true && !isExternalActive;
-        if (sess.status === 'healthy' && (isArchiveOnly || isStaleExternal)) {
+        if (sess.status === 'healthy' && isStaleExternal) {
+          const inMemory = this.sessions.get(sess.session_id);
+          if (!inMemory) {
+            const lastEvidenceAt = sess.activity?.goal_run?.lease_observed_at
+              || sess.activity?.updated_at
+              || sess.last_seen_at
+              || new Date().toISOString();
+            sessionStore.updateSession(sess.session_id, {
+              codex_cli_external_active: false,
+              codex_cli_owner_demoted: true,
+              activity: { ...(sess.activity || {}), kind: 'idle', label: '', updated_at: lastEvidenceAt },
+            });
+          }
+          changed = true;
+          continue;
+        }
+        if (sess.status === 'healthy' && isArchiveOnly) {
           sessionStore.markDisconnected(sess.session_id);
           changed = true;
         }
@@ -11978,6 +12530,10 @@ class ProxyEngine extends EventEmitter {
       for (const [sessionId, session] of this.sessions.entries()) {
         if (session.agentType !== 'codex_cli') continue;
         const isExternalActive = session.cliSessionId && externalActiveIds.has(session.cliSessionId);
+        if (session.codexCliExternalActive === true && !isExternalActive) {
+          if (this._demoteCodexCliExternalSession(sessionId, session)) changed = true;
+          continue;
+        }
         if ((session.codexCliArchiveDiscovered === true && !isExternalActive)
           || (session.codexCliExternalActive === true && !isExternalActive)) {
           this.sessions.delete(sessionId);
@@ -12042,11 +12598,19 @@ class ProxyEngine extends EventEmitter {
     );
     const visibleCliIds = new Set(summaries.map(summary => summary.cliSessionId).filter(Boolean));
     let changed = false;
+    for (const [sessionId, session] of this.sessions.entries()) {
+      if (session.agentType !== 'codex_cli') continue;
+      if (session.codexCliExternalActive !== true) continue;
+      if (session.cliSessionId && externalActiveIds.has(session.cliSessionId)) continue;
+      if (this._demoteCodexCliExternalSession(sessionId, session)) changed = true;
+    }
     for (const sess of sessionStore.getAllSessions()) {
       if (sess.agent_type !== 'codex_cli') continue;
       if (sess.status !== 'healthy') continue;
       if (sess.codex_cli_archive_discovered !== true) continue;
       if (sess.cli_session_id && visibleCliIds.has(sess.cli_session_id)) continue;
+      if (sess.codex_cli_owner_demoted === true && sess.codex_cli_file_path
+          && fs.existsSync(sess.codex_cli_file_path)) continue;
       sessionStore.markDisconnected(sess.session_id);
       changed = true;
     }
@@ -12054,6 +12618,8 @@ class ProxyEngine extends EventEmitter {
       if (session.agentType !== 'codex_cli') continue;
       if (session.codexCliArchiveDiscovered !== true) continue;
       if (session.cliSessionId && visibleCliIds.has(session.cliSessionId)) continue;
+      if (session.codexCliOwnerDemoted === true && session.codexCliFilePath
+          && fs.existsSync(session.codexCliFilePath)) continue;
       this.sessions.delete(sessionId);
       changed = true;
     }
@@ -13626,10 +14192,13 @@ class ProxyEngine extends EventEmitter {
     const effectiveMessages = messages.length > 0
       ? messages
       : (session.codexCliFilePath ? [] : this._codexCliPendingTranscriptMessages(session));
-    if (effectiveMessages.length > 0 && (transcriptMaybeChanged || !session.lastTranscriptSig)) {
-      const sig = this._transcriptSignature(effectiveMessages);
-      if (sig !== session.lastTranscriptSig) {
-        session.lastTranscriptSig = sig;
+    if (effectiveMessages.length > 0 && (transcriptMaybeChanged || !session._lastFileTranscriptObservationKey)) {
+      const observationKey = this._fileTranscriptObservationKey(
+        session.codexCliFilePath,
+        summaryCursor,
+        effectiveMessages,
+      );
+      if (observationKey !== session._lastFileTranscriptObservationKey) {
         session.lastObservedCount = effectiveMessages.length;
         session.lastMessageCount = effectiveMessages.length;
         this._sendFileBackedTranscriptUpdate(sessionId, session, effectiveMessages, {
@@ -18462,6 +19031,7 @@ class ProxyEngine extends EventEmitter {
         }
         return;
       }
+      const pollTickStartedAt = Date.now();
       this._pollLoopInProgress = true;
       try {
       tick++;
@@ -18483,21 +19053,6 @@ class ProxyEngine extends EventEmitter {
         }, { deferForQuestionLatency: true });
         if (ran) this._targetDiscoveryDue = false;
       }
-      if (this._cliDiscoveryDue) {
-        const ran = await this._runBackgroundMaintenanceStep('CLI discovery', async () => {
-          try {
-            await this._withTimeout(this._discoverClaudeCliSessions(), 10000, 'tick discoverClaudeCli');
-          } catch (e) { this._log('warn', `[poll] discoverClaudeCli: ${e.message}`); }
-          try {
-            await this._withTimeout(this._discoverCodexCliSessions(), 10000, 'tick discoverCodexCli');
-          } catch (e) { this._log('warn', `[poll] discoverCodexCli: ${e.message}`); }
-          try {
-            await this._withTimeout(this._discoverCursorCliSessions(), 10000, 'tick discoverCursorCli');
-          } catch (e) { this._log('warn', `[poll] discoverCursorCli: ${e.message}`); }
-        }, { deferForQuestionLatency: true });
-        if (ran) this._cliDiscoveryDue = false;
-      }
-
       if (this._statusMaintenanceDue && this.sessions.size > 0) {
         const ran = await this._runBackgroundMaintenanceStep('quota/status maintenance', async () => {
           try {
@@ -18667,7 +19222,25 @@ class ProxyEngine extends EventEmitter {
       } catch (e) {
         this._log('error', `[poll] Tick error: ${e.message}`);
       } finally {
+        this._recordPollTickBudget(Date.now() - pollTickStartedAt);
         this._pollLoopInProgress = false;
+        // CLI archive discovery performs bounded synchronous filesystem work.
+        // Start it only after releasing the primary tick so timer callbacks do
+        // not count that independent maintenance as an overlapping poll.
+        if (this._cliDiscoveryDue) {
+          this._scheduleBackgroundMaintenanceStep('CLI discovery', async () => {
+            try {
+              await this._withTimeout(this._discoverClaudeCliSessions(), 10000, 'tick discoverClaudeCli');
+            } catch (e) { this._log('warn', `[poll] discoverClaudeCli: ${e.message}`); }
+            try {
+              await this._withTimeout(this._discoverCodexCliSessions(), 10000, 'tick discoverCodexCli');
+            } catch (e) { this._log('warn', `[poll] discoverCodexCli: ${e.message}`); }
+            try {
+              await this._withTimeout(this._discoverCursorCliSessions(), 10000, 'tick discoverCursorCli');
+            } catch (e) { this._log('warn', `[poll] discoverCursorCli: ${e.message}`); }
+            this._cliDiscoveryDue = false;
+          }, { deferForQuestionLatency: true });
+        }
       }
     }, this.POLL_INTERVAL_MS);
   }

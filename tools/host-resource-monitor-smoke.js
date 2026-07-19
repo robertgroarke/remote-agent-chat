@@ -317,6 +317,49 @@ async function main() {
     'system sample interval did not remain anchored to capture start');
   systemCadenceMonitor.stop();
 
+  let fallbackNow = 4_000_000;
+  let fallbackCollections = 0;
+  const fallbackMonitor = new HostResourceMonitor({
+    getSessions: () => sessions,
+    collectRaw: async () => {
+      fallbackCollections += 1;
+      if (fallbackCollections === 1) return rawFixture();
+      const error = new Error('private collector diagnostic must not cross the relay');
+      error.code = 'detail_timeout';
+      throw error;
+    },
+    systemSampler: {
+      capture: () => ({
+        cpu_percent: 37.5,
+        cpu_user_percent: 25,
+        cpu_privileged_percent: 12.5,
+        cpu_idle_percent: 62.5,
+        memory_available_bytes: 6 * 1024 ** 3,
+        uptime_seconds: 86400,
+      }),
+    },
+    now: () => fallbackNow,
+    monotonicNow: () => fallbackNow,
+    detailIntervalMs: 5_000,
+    totalMemoryBytes: 16 * 1024 ** 3,
+    logicalCpuCount: 8,
+    machineLabel: 'fixture-host',
+  });
+  const fallbackBaseline = await fallbackMonitor._sample();
+  fallbackNow += 5_000;
+  const fallback = await fallbackMonitor._sample();
+  assert.equal(fallback.snapshot.status, 'fresh', 'detail failure hid healthy aggregate metrics');
+  assert.equal(fallback.snapshot.system.cpu.total_percent, 37.5);
+  assert.equal(fallback.snapshot.system.memory.used_percent, 62.5);
+  assert.equal(fallback.snapshot.privacy.aggregate_only, true);
+  assert.equal(fallback.snapshot.processes.length, 0);
+  assert.equal(fallback.snapshot.error.code, 'detail_timeout');
+  assert(!fallback.snapshot.error.message.includes('private collector diagnostic'));
+  assert.equal(fallback.snapshot.last_good_captured_at, fallbackBaseline.snapshot.captured_at);
+  assert.deepStrictEqual(sanitizeHostResourceSnapshot(fallback.snapshot), fallback.snapshot,
+    'aggregate fallback did not survive the relay privacy boundary');
+  fallbackMonitor.stop();
+
   let sharedCaptureCount = 0;
   let sharedCollectionCount = 0;
   const sharedCadenceMonitor = new HostResourceMonitor({
@@ -418,6 +461,9 @@ async function main() {
     numeric_64_bit_counter_rejected: true,
     explicit_unsubscribe_stops_helper_immediately: true,
     concurrent_helper_shutdown_idempotent: true,
+    aggregate_fallback_on_detail_failure: true,
+    detail_failure_reason_public_safe: true,
+    last_good_detail_age_transmitted: true,
     warm_helper_stopped_after_inactive_lease: true,
     visible_windows_opened: 0,
     generated_at: new Date().toISOString(),

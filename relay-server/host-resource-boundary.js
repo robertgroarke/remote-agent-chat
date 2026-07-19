@@ -38,7 +38,7 @@ const ALLOWED_KEYS = new Set([
   'windows_hide',
   'privacy', 'ephemeral', 'relay_cached', 'relay_persisted', 'command_lines_transmitted',
   'executable_paths_transmitted', 'aggregate_only', 'transient_fields',
-  'error', 'code', 'message', 'id', 'label', 'kind',
+  'error', 'code', 'message', 'last_good_captured_at', 'id', 'label', 'kind',
 ]);
 
 const ARRAY_LIMITS = Object.freeze({

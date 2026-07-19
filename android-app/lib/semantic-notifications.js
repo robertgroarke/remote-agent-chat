@@ -7,9 +7,15 @@ export const SEMANTIC_NOTIFICATION_EVENT = 'rac:semantic-notification';
 export const SEMANTIC_NOTIFICATION_TYPES = Object.freeze([
   'goal_completed',
   'goal_attention',
+  'provider_usage_threshold',
 ]);
 
 const TYPE_SET = new Set(SEMANTIC_NOTIFICATION_TYPES);
+const CATEGORY_BY_TYPE = Object.freeze({
+  goal_completed: 'goal_completed',
+  goal_attention: 'goal_attention',
+  provider_usage_threshold: 'provider_usage_warning',
+});
 const LEDGER_KEY = 'semantic_notification_ledger_v1';
 const MAX_LEDGER_ENTRIES = 256;
 const RETENTION_MS = 7 * 24 * 60 * 60 * 1000;
@@ -17,6 +23,7 @@ const CATEGORY_PREFERENCES = Object.freeze({
   turn_ready: 'pref_notify_turn_ready',
   goal_completed: 'pref_notify_goal_completed',
   goal_attention: 'pref_notify_goal_attention',
+  provider_usage_warning: 'pref_notify_provider_usage_warning',
 });
 
 let claimTail = Promise.resolve();
@@ -32,6 +39,9 @@ export function setAuthoritativeSemanticNotificationPreferences(preferences) {
     turn_ready: false,
     goal_completed: preferences.goal_completed === true,
     goal_attention: preferences.goal_attention === true,
+    // Keep this lane fail-closed on Android until its dedicated FCM channel
+    // and operator-facing preference ship.
+    provider_usage_warning: false,
   });
   return true;
 }
@@ -56,8 +66,8 @@ export function normalizeSemanticNotification(value) {
   const sessionId = String(value.session_id || value.session || '').trim();
   if (!TYPE_SET.has(eventType) || !dedupeKey || !sessionId) return null;
   if (messageType && messageType !== 'semantic_notification' && messageType !== eventType) return null;
-  const category = String(value.category || eventType).trim();
-  if (category !== eventType) return null;
+  const category = String(value.category || CATEGORY_BY_TYPE[eventType]).trim();
+  if (category !== CATEGORY_BY_TYPE[eventType]) return null;
   return {
     ...value,
     type: 'semantic_notification',
@@ -67,7 +77,8 @@ export function normalizeSemanticNotification(value) {
     session_id: sessionId,
     session: sessionId,
     title: String(value.title || '').trim() || (eventType === 'goal_completed'
-      ? 'Goal completed' : 'Goal needs attention'),
+      ? 'Goal completed' : eventType === 'provider_usage_threshold'
+        ? 'Provider usage warning' : 'Goal needs attention'),
     body: String(value.body || '').trim(),
     created_at: value.created_at || new Date().toISOString(),
   };

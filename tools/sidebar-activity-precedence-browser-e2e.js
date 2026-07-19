@@ -331,6 +331,9 @@ async function main() {
     const afterCollapse = await snapshot(page);
     assertHierarchy(afterCollapse, sessions.length);
     assert.deepStrictEqual(afterCollapse.working, initial.working, 'collapsing a workspace hid or reordered working rows');
+    // The disclosure animation is 180 ms. Do not let its intentional tail
+    // contaminate the subsequent no-transition CLS observation window.
+    if (!reducedMotion) await page.waitForTimeout(120);
 
     const selectedId = 'antigravity-v2-paused';
     const selectedCard = page.locator(`.session-card[data-session-id="${selectedId}"]`);

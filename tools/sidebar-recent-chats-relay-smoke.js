@@ -38,6 +38,7 @@ async function reservePort() {
 }
 
 async function waitForHealth(port, child) {
+  const startedAt = Date.now();
   const deadline = Date.now() + 15_000;
   while (Date.now() < deadline) {
     if (child.exitCode != null) throw new Error(`relay exited ${child.exitCode}`);
@@ -50,7 +51,7 @@ async function waitForHealth(port, child) {
         req.setTimeout(500, () => req.destroy(new Error('timeout')));
         req.on('error', reject);
       });
-      if (status === 200) return;
+      if (status === 200) return Date.now() - startedAt;
     } catch {}
     await delay(50);
   }
@@ -80,11 +81,11 @@ async function startRelay(port) {
   child.stdout.on('data', chunk => logs.push(chunk.toString()));
   child.stderr.on('data', chunk => logs.push(chunk.toString()));
   try {
-    await waitForHealth(port, child);
+    const healthMs = await waitForHealth(port, child);
+    return { child, logs, healthMs };
   } catch (error) {
     throw new Error(`${error.message}\n${logs.join('').slice(-8000)}`);
   }
-  return { child, logs };
 }
 
 async function stopRelay(runtime) {
@@ -231,10 +232,31 @@ async function run() {
     proxy.ws.close();
     await stopRelay(runtime);
 
+    // Exercise the production upgrade path: a legacy store has durable messages
+    // but no compact projection. Startup must listen immediately while the
+    // worker reconstructs and publishes the missing row.
+    const legacyDb = new Database(path.join(TEMP, 'messages.db'));
+    const insertLegacy = legacyDb.prepare(`
+      INSERT INTO messages (session, role, content, ts, source)
+      VALUES (?, 'assistant', 'legacy fixture', ?, 'legacy_fixture')
+    `);
+    legacyDb.transaction(() => {
+      for (let index = 0; index < 25_000; index += 1) {
+        insertLegacy.run(TARGET, 1_700_000_000 + index);
+      }
+    })();
+    legacyDb.prepare('DELETE FROM session_latest_visible_message WHERE session_id = ?').run(TARGET);
+    legacyDb.close();
+
     runtime = await startRelay(port);
+    assert(runtime.healthMs < 5_000, `legacy startup blocked health for ${runtime.healthMs}ms`);
     proxy = await connectProxy(port, sessions);
     client = await connectClient(port);
-    const coldTarget = client.ack.sessions.find(session => session.session_id === TARGET);
+    let coldTarget = client.ack.sessions.find(session => session.session_id === TARGET);
+    if (!coldTarget?.latest_visible_message) {
+      coldTarget = await client.next(message => message.type === 'session_summary'
+        && message.session_id === TARGET && message.latest_visible_message, 10_000);
+    }
     assertCanonical(coldTarget, messageId);
     assert.strictEqual(JSON.stringify(client.ack.sessions).includes(MESSAGE_CONTENT), false);
 
@@ -258,6 +280,9 @@ async function run() {
       older_message_moves: 0,
       status_noise_moves: 0,
       cold_restart_match: true,
+      legacy_backfill_runs_after_listen: true,
+      legacy_rows_preloaded: 25_000,
+      legacy_startup_health_ms: runtime.healthMs,
       transcript_fetches: 0,
       inventory_contains_message_content: false,
       metadata_columns: columns,

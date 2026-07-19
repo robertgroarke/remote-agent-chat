@@ -47,7 +47,6 @@ extern "C" __declspec(dllexport) LRESULT CALLBACK RacCbtHookProc(
         SetWindowLongPtrW(window, GWL_EXSTYLE, style | WS_EX_NOACTIVATE);
         SetWindowPos(window, nullptr, -32000, -32000, 0, 0,
             SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE);
-        ShowWindow(window, SW_SHOWNOACTIVATE);
         return 1;
     }
     return CallNextHookEx(nullptr, code, w_param, l_param);

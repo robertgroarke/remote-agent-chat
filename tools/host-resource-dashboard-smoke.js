@@ -34,6 +34,10 @@ for (const marker of [
   'Accessible data table',
   'Process command lines and executable paths remain local',
   'host-resource-process-table',
+  "live: 'Live', delayed: 'Delayed', reconnecting: 'Reconnecting', paused: 'Paused', stale: 'Stale'",
+  'timeline.validCount', 'timeline.expectedCount', 'p95 collecting (${stats.count}/20)',
+  'formatHostResourceTimestampFull',
+  'Last full detail:',
 ]) assert(webApp.includes(marker), `missing web host-resource marker: ${marker}`);
 assert(!webApp.includes('setInterval(() => onRefresh(false), 5_000)'),
   'the Web dashboard must consume the one-second subscription instead of legacy polling');
@@ -57,20 +61,23 @@ for (const marker of [
   '.host-resource-summary', '.host-resource-charts', '.host-resource-process-scroll',
   '.host-resource-process-table', '.host-resource-privacy', '.host-resource-chart-canvas',
   '.host-resource-chart-tooltip', '@media (max-width: 600px)', '@media (prefers-reduced-motion: reduce)',
+  '.host-resource-chart-quality', '.host-resource-chart-gap', '.host-resource-chart-point',
   '.global-desktop-status-rail', '.global-host-resource-strip', '@media (max-width: 899px)',
 ]) assert(webStyles.includes(marker), `missing host-resource style: ${marker}`);
 assert(/\.host-resource-process-section\s*\{[^}]*flex:\s*0 0 auto/.test(webStyles),
   'host resource process rows must retain intrinsic height inside the scrollable dashboard');
 assert(/\.host-resource-charts\s*\{[^}]*grid-template-columns:\s*repeat\(2/.test(webStyles),
   'desktop host resource charts must use the production 2x2 grid');
-assert(/\.host-resource-chart\s*\{[^}]*min-height:\s*240px/.test(webStyles),
-  'desktop chart cards must meet the 240px minimum height');
+assert(/\.host-resource-chart\s*\{[^}]*min-height:\s*320px/.test(webStyles),
+  'desktop chart cards must meet the 320px precision-layout minimum height');
 
 assert(webHelper.includes("export * from '../android-app/lib/host-resources.js'"),
   'the Web helper must delegate to the Android-local shared implementation');
 for (const marker of [
   'export function normalizeHostResources', 'export function mergeOrderedHostResourceFrames',
   'export function downsampleHostResourceSeries', 'export function hostResourceIntervalStats',
+  'export function hostResourceTimeline', 'export function hostResourceNiceScale',
+  'export function hostResourceTimeTicks', 'export function hostResourceTimeFraction',
   'export function projectHostResourceStrip', 'HOST_RESOURCE_COMPACT_HISTORY_LIMIT = 60',
 ]) assert(androidHelper.includes(marker), `missing shared host-resource helper: ${marker}`);
 assert(!androidSessionList.includes('global-host-resource-strip'),
@@ -81,6 +88,10 @@ assert(historyStore.includes('MAX_COMPACT_SYSTEM_POINTS = 60'),
   'aggregate-only subscriptions must retain at most 60 one-second points');
 assert(monitor.includes('detailCollected && !state.aggregateOnly'),
   'aggregate-only subscriptions must not transmit detail frames');
+assert(monitor.includes('aggregateOnly: !!detailFailure'),
+  'detail collector failures must retain aggregate CPU/RAM through the privacy boundary');
+assert(monitor.includes('last_good_captured_at'),
+  'detail collector failures must expose the last-good sample time');
 assert(relay.includes('pending.proxyWs !== ws'), 'relay must accept a snapshot only from the selected proxy');
 assert(relay.includes('pendingHostResourceRequests.set(upstreamRequestId, { ws, proxyWs, clientRequestId, timer })'),
   'relay must bind the requester and selected proxy');
@@ -108,6 +119,10 @@ const result = {
   mobile_responsive_styles: true,
   one_second_subscription_history: true,
   interactive_charts: true,
+  wall_clock_expected_and_dropped_counts: true,
+  monotonic_clock_reset_recovery: true,
+  truthful_live_delayed_paused_reconnecting_stale: true,
+  p95_minimum_sample_gate: 20,
   accessible_data_tables: true,
   shared_helper_source: 'android-app/lib/host-resources.js',
   web_shared_helper_delegation: true,
@@ -126,6 +141,8 @@ const result = {
   android_permanent_strip: false,
   command_lines_transmitted: false,
   executable_paths_transmitted: false,
+  degraded_detail_reason_and_last_good_age: true,
+  aggregate_cpu_ram_fallback: true,
 };
 
 const outputIndex = process.argv.indexOf('--output');

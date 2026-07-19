@@ -355,9 +355,10 @@ async function main(argv = process.argv.slice(2)) {
     { ...webResult, client: 'parity', cold_load_ms: 0 },
     { ...androidResult, client: 'parity', cold_load_ms: 0 },
   );
-  assert(
-    fs.readFileSync(path.join(ROOT, 'frontend', 'fleet-summary.js'))
-      .equals(fs.readFileSync(path.join(ROOT, 'android-app', 'lib', 'fleet-summary.js'))),
+  const normalizedSource = filePath => fs.readFileSync(filePath, 'utf8').replace(/\r\n/g, '\n');
+  assert.strictEqual(
+    normalizedSource(path.join(ROOT, 'frontend', 'fleet-summary.js')),
+    normalizedSource(path.join(ROOT, 'android-app', 'lib', 'fleet-summary.js')),
     'Web/Android Fleet summary policy drift',
   );
   const sizes = sessions.map(session => bytes(session.fleet_summary));

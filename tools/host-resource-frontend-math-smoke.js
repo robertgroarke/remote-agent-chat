@@ -54,7 +54,8 @@ assert.equal(stats.count, 898);
 assert.equal(stats.max, 9_000_000_000);
 assert.equal(stats.peakSequence, 777);
 const diskValues = merged.map(frame => frame.disk?.read_bps).filter(Number.isFinite);
-assert.equal(stats.average, diskValues.reduce((sum, value) => sum + value, 0) / diskValues.length);
+assert.equal(stats.sampleAverage, diskValues.reduce((sum, value) => sum + value, 0) / diskValues.length);
+assert.equal(stats.averageMethod, 'time-weighted', 'the two-sample gap must switch to time-weighted average');
 assert.equal(stats.p95, [...diskValues].sort((left, right) => left - right)[Math.ceil(diskValues.length * 0.95) - 1]);
 
 const buckets = host.downsampleHostResourceSeries(merged, 'disk_read_bps', 60);
@@ -63,9 +64,96 @@ assert(buckets.some(bucket => bucket.gap), 'unavailable history must remain a vi
 const spike = buckets.find(bucket => bucket.startSequence <= 777 && bucket.endSequence >= 777);
 assert.equal(spike.max, 9_000_000_000, 'min/max/average downsampling must preserve one-sample peaks');
 
-assert.equal(host.selectHostResourceRange(merged, '15m').length, 900);
-assert(host.selectHostResourceRange(merged, 'live').length >= 30);
-assert(host.selectHostResourceRange(merged, 'live').length <= 31);
+const finalFrameMs = Date.parse(merged.at(-1).captured_at);
+assert.equal(host.selectHostResourceRange(merged, '15m', { nowMs: finalFrameMs }).length, 900);
+assert(host.selectHostResourceRange(merged, 'live', { nowMs: finalFrameMs }).length >= 60);
+assert(host.selectHostResourceRange(merged, 'live', { nowMs: finalFrameMs }).length <= 61);
+
+const fiveSamples = frames.slice(0, 5);
+const fiveStats = host.hostResourceIntervalStats(fiveSamples, 'cpu_total_percent');
+assert.equal(fiveStats.count, 5);
+assert.equal(fiveStats.p95, null, 'p95 must be withheld below 20 samples');
+assert.equal(fiveStats.p95Ready, false);
+assert(Number.isFinite(fiveStats.provisionalP95));
+
+const irregular = [
+  { ...frames[0], sample_sequence: 10_001, captured_at: new Date(startedAt).toISOString(), cpu: { total_percent: 0 } },
+  { ...frames[1], sample_sequence: 10_002, captured_at: new Date(startedAt + 1_000).toISOString(), cpu: { total_percent: 100 } },
+  { ...frames[2], sample_sequence: 10_003, captured_at: new Date(startedAt + 5_000).toISOString(), cpu: { total_percent: 100 } },
+];
+const irregularStats = host.hostResourceIntervalStats(irregular, 'cpu_total_percent');
+assert.equal(irregularStats.averageMethod, 'time-weighted');
+assert(irregularStats.average > irregularStats.sampleAverage,
+  'time weighting must reflect the longer high-value interval');
+
+const timelineInput = [
+  { ...frames[0], sample_sequence: 20_001, monotonic_ms: 1_000 },
+  { ...frames[1], sample_sequence: 20_002, monotonic_ms: 2_000 },
+  { ...frames[1], sample_sequence: 20_002, monotonic_ms: 2_000 },
+  { ...frames[3], sample_sequence: 20_004, monotonic_ms: 4_000, dropped_gap_count: 1 },
+  { ...frames[2], sample_sequence: 20_003, monotonic_ms: 3_000 },
+];
+const stalledTimeline = host.hostResourceTimeline(timelineInput, {
+  nowMs: startedAt + 25_000,
+  connected: true,
+  subscriptionStatus: 'live',
+});
+assert.equal(stalledTimeline.status, 'stale');
+assert.equal(stalledTimeline.duplicateCount, 1);
+assert(stalledTimeline.outOfOrderCount >= 1);
+assert(stalledTimeline.gapCount >= 2, 'dropped sequence and latest-to-now span must both remain visible');
+assert(stalledTimeline.latestAgeMs >= 22_000);
+assert(stalledTimeline.expectedCount >= 26, 'stale expected count must extend through wall-clock now');
+assert(stalledTimeline.droppedCount >= 22, 'the latest-to-now missing interval must count as dropped samples');
+assert(stalledTimeline.frames.every(frame => Number.isFinite(frame.chart_time_ms)));
+
+const clockJump = host.hostResourceTimeline([
+  { ...frames[0], sample_sequence: 30_001, monotonic_ms: 1_000 },
+  { ...frames[1], sample_sequence: 30_002, monotonic_ms: 2_000,
+    captured_at: new Date(startedAt + 60_000).toISOString() },
+], { nowMs: startedAt + 2_500, paused: true });
+assert.equal(clockJump.clockDiscontinuityCount, 1);
+assert(clockJump.gaps.some(gap => gap.reason === 'clock_discontinuity'));
+
+const monotonicReset = host.hostResourceTimeline([
+  { ...frames[0], sample_sequence: 31_001, monotonic_ms: 100_000 },
+  { ...frames[1], sample_sequence: 31_002, monotonic_ms: 101_000 },
+  { ...frames[2], sample_sequence: 31_003, monotonic_ms: 1_000 },
+  { ...frames[3], sample_sequence: 31_004, monotonic_ms: 2_000 },
+], { nowMs: startedAt + 3_500, paused: true });
+assert.equal(monotonicReset.monotonicResetCount, 1);
+assert.equal(monotonicReset.frames.length, 4, 'a monotonic reset must rebase the new epoch, not reject it');
+assert(monotonicReset.frames.every((frame, index, rows) => index === 0 || frame.chart_time_ms > rows[index - 1].chart_time_ms));
+assert(monotonicReset.gaps.some(gap => gap.reason === 'clock_discontinuity'));
+
+const nicePercent = host.hostResourceNiceScale(42, 0, { percent: true });
+assert.deepEqual(nicePercent.ticks, [0, 25, 50, 75, 100]);
+const niceRate = host.hostResourceNiceScale(1_923_000);
+assert(niceRate.maximum > 1_923_000 && niceRate.ticks.length >= 4 && niceRate.ticks.length <= 6);
+const retainedNiceRate = host.hostResourceNiceScale(niceRate.maximum * 0.8, niceRate.maximum);
+assert.equal(retainedNiceRate.maximum, niceRate.maximum, 'scale hysteresis must retain a stable nice maximum');
+const timeTicks = host.hostResourceTimeTicks(startedAt, startedAt + 60_000, 5);
+assert.equal(timeTicks.length, 5);
+assert(timeTicks.every(tick => tick.accessibleLabel.length > tick.label.length));
+assert.equal(host.hostResourceTimeFraction({ chart_time_ms: startedAt + 30_000 }, startedAt, startedAt + 60_000), 0.5);
+
+for (const [shape, values] of Object.entries({
+  zero: Array(60).fill(0),
+  flat: Array(60).fill(17),
+  ramp: Array.from({ length: 60 }, (_, index) => index),
+  sine: Array.from({ length: 60 }, (_, index) => 50 + 40 * Math.sin(index / 5)),
+  spikes: Array.from({ length: 60 }, (_, index) => index % 2 ? 1 : 99),
+})) {
+  const shapeFrames = values.map((value, index) => ({
+    ...frames[index], sample_sequence: 40_000 + index + 1,
+    captured_at: new Date(startedAt + index * 1_000).toISOString(),
+    cpu: { total_percent: value }, status: 'fresh', dropped_gap_count: 0,
+  }));
+  const shapeBuckets = host.downsampleHostResourceSeries(shapeFrames, 'cpu_total_percent', 12);
+  assert(shapeBuckets.length >= 2, `${shape} must render at least two buckets`);
+  assert(shapeBuckets.every(bucket => bucket.min !== null && bucket.max !== null), `${shape} produced empty buckets`);
+  if (shape === 'spikes') assert.equal(Math.max(...shapeBuckets.map(bucket => bucket.max)), 99);
+}
 
 const snapshot = {
   schema_version: 2,

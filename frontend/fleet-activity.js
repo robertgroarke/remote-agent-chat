@@ -123,6 +123,21 @@ export function fleetStateIsWorking(state) {
   return state === 'working_goal' || state === 'working';
 }
 
+export function fleetGoalElapsedSeconds(goal, goalRun = null, nowMs = Date.now()) {
+  if (!goal || typeof goal !== 'object') return 0;
+  const base = Math.max(0, Number(goal.time_used_seconds ?? goal.timeUsedSeconds ?? 0) || 0);
+  const updatedMs = timestampMs(goal.updated_at || goal.updatedAt);
+  const active = String(goal.state || goal.status || '').toLowerCase() === 'active';
+  const evidenceCutoff = goalRun && goalRun.lease_active !== true
+    ? timestampMs(goalRun.lease_observed_at || goalRun.observed_at)
+    : Number(nowMs);
+  const effectiveNow = evidenceCutoff > 0 ? Math.min(Number(nowMs) || evidenceCutoff, evidenceCutoff) : updatedMs;
+  const liveDelta = active && updatedMs > 0
+    ? Math.max(0, Math.floor((effectiveNow - updatedMs) / 1000))
+    : 0;
+  return Math.floor(base + liveDelta);
+}
+
 function finiteTimestamp(value) {
   const number = Number(value);
   return Number.isFinite(number) && number > 0 ? number : null;
@@ -143,7 +158,14 @@ export function normalizeFleetActivityTrace(trace, clientReceivedAtMs = Date.now
   };
 }
 
-export function fleetFreshnessLabel(activity) {
+export function fleetFreshnessLabel(activity, nowMs = Date.now()) {
   const latency = Number(activity?.transport?.latency_ms);
-  return Number.isFinite(latency) ? `${Math.round(latency)} ms` : 'Awaiting live update';
+  if (Number.isFinite(latency)) return `${Math.round(latency)} ms`;
+  const observedAtMs = fleetActivityObservedAtMs(activity);
+  if (!observedAtMs) return 'Awaiting live update';
+  const ageMs = Math.max(0, Number(nowMs) - observedAtMs);
+  if (ageMs < 1_000) return 'Observed just now';
+  if (ageMs < 60_000) return `Observed ${Math.floor(ageMs / 1_000)}s ago`;
+  if (ageMs < 3_600_000) return `Observed ${Math.floor(ageMs / 60_000)}m ago`;
+  return `Observed ${Math.floor(ageMs / 3_600_000)}h ago`;
 }

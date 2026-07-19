@@ -131,6 +131,16 @@ class MemoryStorage {
   assert.strictEqual(disabled.code, 'disabled');
   assert.strictEqual(emitted.length, 1);
 
+  const usageWarning = await semantic.processSemanticNotification({
+    ...event,
+    event_type: 'provider_usage_threshold',
+    category: 'provider_usage_warning',
+    dedupe_key: 'provider-usage-threshold:android-disabled:75',
+    title: 'OpenAI Codex has 25% usage left',
+  }, null);
+  assert.strictEqual(usageWarning.code, 'disabled');
+  assert.strictEqual(emitted.length, 1);
+
   const pushed = semantic.semanticNotificationFromExpo({
     request: { content: { title: event.title, body: event.body, data: {
       type: 'goal_completed',

@@ -507,6 +507,47 @@ class GoalNotificationCoordinator {
     return null;
   }
 
+  recordExternalEvent(value, telemetry = {}) {
+    if (!value || typeof value !== 'object') return null;
+    const sessionId = String(value.session_id || value.session || '').trim().slice(0, 160);
+    const eventType = String(value.event_type || '').trim().slice(0, 80);
+    const category = String(value.category || '').trim().slice(0, 80);
+    const dedupeKey = String(value.dedupe_key || '').trim().slice(0, 240);
+    const title = String(value.title || '').trim().slice(0, 160);
+    const body = String(value.body || '').trim().slice(0, 500);
+    const createdAt = normalizedIso(value.created_at) || new Date(this.now()).toISOString();
+    if (!sessionId || !eventType || !category || !dedupeKey || !title) return null;
+    const payload = {
+      ...value,
+      type: 'semantic_notification',
+      event_type: eventType,
+      category,
+      dedupe_key: dedupeKey,
+      session_id: sessionId,
+      session: sessionId,
+      title,
+      body,
+      created_at: createdAt,
+    };
+    this.recordStage(payload, 'candidate', telemetry);
+    const inserted = this.insertEvent.run(
+      dedupeKey,
+      sessionId,
+      eventType,
+      category,
+      title,
+      body,
+      JSON.stringify(payload),
+      createdAt,
+    );
+    if (inserted.changes === 1) {
+      this.recordStage(payload, 'eligible', telemetry);
+      return payload;
+    }
+    this.recordStage(payload, 'suppressed', { ...telemetry, reasonCode: 'duplicate_lifecycle_identity' });
+    return null;
+  }
+
   observeGoal(sessionId, incomingGoal, {
     sessionName = 'Agent',
     hydrateOnly = false,

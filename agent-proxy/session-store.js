@@ -710,6 +710,17 @@ function updatePreference(preference_key, updates) {
   _saveStore();
 }
 
+function replacePreference(preference_key, value) {
+  if (!preference_key) return;
+  const replacement = value && typeof value === 'object' ? value : {};
+  _store.preferences[preference_key] = {
+    preference_key,
+    ...replacement,
+    updated_at: new Date().toISOString(),
+  };
+  _saveStore();
+}
+
 function getPreference(preference_key) {
   if (!preference_key) return null;
   const pref = _store.preferences[preference_key];
@@ -780,6 +791,7 @@ module.exports = {
   markDisconnected,
   updatePreference,
   getPreference,
+  replacePreference,
   getSession,
   getAllSessions,
   pruneStale,
