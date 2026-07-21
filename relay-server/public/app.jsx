@@ -244,6 +244,32 @@ function scrollIdentityKeysForMessages(messages) {
   return list.map((msg, i) => messageIdentityKey(msg, i));
 }
 
+function promptContinuityKey(sessionId, prompt) {
+  if (!sessionId || !prompt) return '';
+  if (prompt.type !== 'question_prompt') {
+    return `${sessionId}\u0000legacy\u0000${prompt.prompt_id || prompt.request_id || prompt.id || 'prompt'}`;
+  }
+  const semanticPrompt = {
+    kind: prompt.kind || 'request_user_input',
+    title: prompt.title || '',
+    source_surface: prompt.source?.surface || '',
+    questions: (prompt.questions || []).map(question => ({
+      id: question.question_id || question.id || '',
+      header: question.header || '',
+      question: question.question || question.message || '',
+      answer_mode: question.answer_mode || '',
+      multi_select: question.multi_select === true,
+      choices: (question.choices || question.options || []).map(choice => ({
+        id: choice.choice_id || choice.id || '',
+        label: choice.label || '',
+        description: choice.description || '',
+        other: choice.requires_text === true || choice.is_other === true,
+      })),
+    })),
+  };
+  return `${sessionId}\u0000question\u0000${stableContentHash(JSON.stringify(semanticPrompt))}`;
+}
+
 function setScrollTopInstant(element, value) {
   if (!element) return;
   const previous = element.style.scrollBehavior;
@@ -409,6 +435,7 @@ function ContentBlocks({
   const isClaude = safeString(agentType).toLowerCase() === 'claude';
   const isCodex = safeString(agentType).toLowerCase() === 'codex';
   const isCodexDesktop = safeString(agentType).toLowerCase() === 'codex-desktop';
+  const isCodexFamily = ['codex', 'codex-desktop', 'codex_cli'].includes(safeString(agentType).toLowerCase());
   const isAntigravityV2 = safeString(agentType).toLowerCase() === 'antigravity-v2';
   function blockBody(block) {
     const terminalParts = [
@@ -449,6 +476,27 @@ function ContentBlocks({
         if (type === 'thinking') {
           // Cursor "Thought for Ns" chips are header-only; keep them compact like Agents.
           const bodyIsTitleOnly = !body || safeString(body).replace(/\s+/g, ' ').trim() === title;
+          if (isCodexFamily && block.activity_summary === true) {
+            const nativeSummaryBody = body && !bodyIsTitleOnly
+              ? body
+              : (title && title.toLowerCase() !== 'thinking' ? title : '');
+            if (!nativeSummaryBody) return null;
+            return (
+              <div
+                key={block.native_source_id || index}
+                className="content-block content-block-thinking-native-summary"
+                role="note"
+                aria-label="Codex activity summary"
+                data-native-source-id={block.native_source_id || undefined}
+                data-native-turn-id={block.native_turn_id || undefined}
+              >
+                <div className="content-block-thinking-native-summary-copy">
+                  {richMarkdown(nativeSummaryBody, index)}
+                </div>
+                <MessageTimestamp instant={block.producer_timestamp || block.created_at || block.timestamp || block.ts} />
+              </div>
+            );
+          }
           // Codex renders intermediate commentary as ordinary transcript prose. It does not
           // wrap settled reasoning in the shared labeled disclosure used by other harnesses.
           if (isCodex) {
@@ -1433,6 +1481,36 @@ function NativeActivitySpinner({ agentType, compact = false, animate = true }) {
 //   agent_started          → ▶ (later native activity observed for that turn)
 //   (historical without receipt provenance) → Recorded
 
+function deliveryFailureText(value) {
+  const raw = String(value || 'Send failed').trim();
+  const normalized = raw.toLowerCase();
+  if (normalized.includes('pending_revalidation')
+      || normalized.includes('fixture version mismatch')
+      || normalized.includes('validation pending')) {
+    return 'Update validation pending';
+  }
+  if (normalized.includes('agent_busy') || normalized.includes('agent is generating')) {
+    return 'Agent busy';
+  }
+  if (normalized.includes('codex_desktop_thread_not_open')
+      || normalized.includes('codex_desktop_thread_changed')
+      || normalized.includes('open this thread')) {
+    return 'Open this thread in Codex Desktop';
+  }
+  if (normalized.includes('native_user_turn_not_observed')
+      || normalized.includes('native user turn')
+      || normalized.includes('could not confirm native delivery')) {
+    return 'Could not confirm native delivery';
+  }
+  if (normalized.includes('input_verify_failed')
+      || normalized.includes('composer input could not be verified')
+      || normalized.includes('verified send-ready state')) {
+    return 'Composer input could not be verified';
+  }
+  if (normalized === 'send_failed') return 'Send failed';
+  return raw.length > 80 ? `${raw.slice(0, 77)}…` : raw;
+}
+
 function DeliveryStatus({ msg, deliveryStates, onSteer, onRetry }) {
   if (msg._optimistic) {
     const status = deliveryStates[msg._cid] || 'queued';
@@ -1449,20 +1527,29 @@ function DeliveryStatus({ msg, deliveryStates, onSteer, onRetry }) {
     if (status === 'launch_accepted') return <span className="delivery launch-accepted" title="Native launch accepted; user-turn receipt pending" aria-label="Native launch accepted; user-turn receipt pending">↗</span>;
     if (status === 'delivered') return <span className="delivery delivered" title="Native user turn observed" aria-label="Native user turn delivered">✓✓</span>;
     if (status === 'agent_started') return <span className="delivery agent-started" title="Agent started working" aria-label="Agent started working">▶</span>;
-    if (status === 'failed') return (
-      <span className="delivery failed" title={msg._sendError || "Failed — agent may be offline"} aria-label={`Send failed: ${msg._sendError || 'agent may be offline'}`}>
-        <span aria-hidden="true">✕</span>
-        {onRetry && (
-          <button type="button" className="delivery-retry" onClick={(event) => { event.stopPropagation(); onRetry(msg); }}>
-            Retry
-          </button>
-        )}
-      </span>
-    );
+    if (status === 'failed') {
+      const failureDetail = msg._sendError || 'Agent may be offline';
+      const failureText = deliveryFailureText(failureDetail);
+      return (
+        <span className="delivery failed" title={failureDetail} aria-label={`Send failed: ${failureText}`}>
+          <span aria-hidden="true">✕</span>
+          <span className="delivery-failure-reason">{failureText}</span>
+          {onRetry && (
+            <button type="button" className="delivery-retry" onClick={(event) => { event.stopPropagation(); onRetry(msg); }}>
+              Retry
+            </button>
+          )}
+        </span>
+      );
+    }
   }
   if (msg._agentStarted || msg.status === 'agent_started') return <span className="delivery agent-started" title="Agent started working" aria-label="Agent started working">▶</span>;
   if (msg._delivered || msg.status === 'delivered') return <span className="delivery delivered" title="Native user turn observed" aria-label="Native user turn delivered">✓✓</span>;
-  if (msg.status === 'failed') return <span className="delivery failed" title={msg.failure_code || 'Send failed'} aria-label={`Send failed: ${msg.failure_code || 'unknown failure'}`}>✕</span>;
+  if (msg.status === 'failed') {
+    const failureDetail = msg.failure_code || msg._sendError || 'Send failed';
+    const failureText = deliveryFailureText(failureDetail);
+    return <span className="delivery failed" title={failureDetail} aria-label={`Send failed: ${failureText}`}><span aria-hidden="true">✕</span><span className="delivery-failure-reason">{failureText}</span></span>;
+  }
   if (msg._launchAcceptedAt || msg.launch_accepted_at) return <span className="delivery launch-accepted" title="Native launch accepted; user-turn receipt pending" aria-label="Native launch accepted; user-turn receipt pending">↗</span>;
   if (msg.status === 'accepted') return <span className="delivery accepted" title="Received by relay; native receipt pending" aria-label="Relay accepted; native receipt pending">✓</span>;
   return <span className="delivery recorded" title="Recorded — native delivery receipt unknown" aria-label="Recorded; native delivery receipt unknown">Recorded</span>;
@@ -1728,7 +1815,7 @@ function VirtualTranscriptRow({ index, messageKey, onMeasure, children }) {
   React.useLayoutEffect(() => {
     const node = rowRef.current;
     if (!node) return undefined;
-    const measure = () => onMeasure(index, messageKey, node.getBoundingClientRect().height);
+    const measure = () => onMeasure(index, messageKey, node.getBoundingClientRect().height, node);
     measure();
     if (typeof ResizeObserver === 'undefined') return undefined;
     const observer = new ResizeObserver(measure);
@@ -1738,7 +1825,7 @@ function VirtualTranscriptRow({ index, messageKey, onMeasure, children }) {
   return <div className="transcript-window-row" data-window-index={index} ref={rowRef}>{children}</div>;
 }
 
-function useTranscriptWindow({ messages, containerRef, sessionId, routeActive }) {
+function useTranscriptWindow({ messages, containerRef, sessionId, routeActive, suppressProgrammaticScrollRef }) {
   const enabled = routeActive && messages.length > TRANSCRIPT_WINDOW_THRESHOLD;
   const enabledRef = React.useRef(enabled);
   enabledRef.current = enabled;
@@ -1762,6 +1849,10 @@ function useTranscriptWindow({ messages, containerRef, sessionId, routeActive })
   const pendingAnchorDeltaRef = React.useRef(0);
   const [heightRevision, setHeightRevision] = React.useState(0);
   const [range, setRange] = React.useState({ sessionId: null, start: 0, end: 0 });
+  const mayWriteProgrammaticScroll = React.useCallback(
+    () => suppressProgrammaticScrollRef?.current?.() !== true,
+    [suppressProgrammaticScrollRef],
+  );
 
   const keys = React.useMemo(
     () => messages.map((message, index) => `${sessionId || ''}\u0001${messageIdentityKey(message, index)}`),
@@ -1894,8 +1985,13 @@ function useTranscriptWindow({ messages, containerRef, sessionId, routeActive })
       start: nextIndex,
       end: Math.min(messages.length, nextIndex + TRANSCRIPT_WINDOW_FALLBACK_ROWS),
     });
-    setScrollTopInstant(list, Math.max(0, list.scrollTop + nextOffset - previousOffset));
-  }, [captureViewportAnchor, containerRef, enabled, keys, messages.length, prefix, releasePinnedIndex, sessionId]);
+    if (mayWriteProgrammaticScroll()) {
+      setScrollTopInstant(list, Math.max(0, list.scrollTop + nextOffset - previousOffset));
+    } else {
+      pendingAnchorRestoreRef.current = null;
+      releasePinnedIndex();
+    }
+  }, [captureViewportAnchor, containerRef, enabled, keys, mayWriteProgrammaticScroll, messages.length, prefix, releasePinnedIndex, sessionId]);
 
   React.useLayoutEffect(() => {
     const pending = pendingAnchorRestoreRef.current;
@@ -1905,6 +2001,12 @@ function useTranscriptWindow({ messages, containerRef, sessionId, routeActive })
     const list = containerRef.current;
     const row = list?.querySelector(`.transcript-window-row[data-window-index="${index}"]`);
     if (!list || !row) return;
+    if (!mayWriteProgrammaticScroll()) {
+      pendingAnchorRestoreRef.current = null;
+      releasePinnedIndex();
+      captureViewportAnchor();
+      return;
+    }
     if (pending.atBottom) {
       setScrollTopInstant(list, list.scrollHeight);
       viewportAnchorRef.current = pending;
@@ -1916,17 +2018,28 @@ function useTranscriptWindow({ messages, containerRef, sessionId, routeActive })
       setScrollTopInstant(list, Math.max(0, list.scrollTop + correction));
     }
     viewportAnchorRef.current = pending;
-  }, [containerRef, enabled, keys, prefix, range, sessionId]);
+  }, [captureViewportAnchor, containerRef, enabled, keys, mayWriteProgrammaticScroll, prefix, range, releasePinnedIndex, sessionId]);
 
   React.useLayoutEffect(() => {
     const pending = pendingAnchorRestoreRef.current;
     if (!enabled || !pending?.routeRestore) return;
+    if (!mayWriteProgrammaticScroll()) {
+      pendingAnchorRestoreRef.current = null;
+      releasePinnedIndex();
+      captureViewportAnchor();
+      return;
+    }
     let active = true;
     const restoreRouteAnchor = () => {
       if (!active) return;
       const current = pendingAnchorRestoreRef.current;
       const list = containerRef.current;
       if (!current?.routeRestore || current.sessionId !== sessionId || !list) return;
+      if (!mayWriteProgrammaticScroll()) {
+        pendingAnchorRestoreRef.current = null;
+        releasePinnedIndex();
+        return;
+      }
       const index = keys.indexOf(current.key);
       const row = index >= 0
         ? list.querySelector(`.transcript-window-row[data-window-index="${index}"]`)
@@ -1959,7 +2072,7 @@ function useTranscriptWindow({ messages, containerRef, sessionId, routeActive })
       if (routeRestoreFrameRef.current) cancelAnimationFrame(routeRestoreFrameRef.current);
       routeRestoreFrameRef.current = 0;
     };
-  }, [captureViewportAnchor, containerRef, enabled, keys, releasePinnedIndex, sessionId]);
+  }, [captureViewportAnchor, containerRef, enabled, keys, mayWriteProgrammaticScroll, releasePinnedIndex, sessionId]);
 
   React.useLayoutEffect(() => {
     if (!enabled) {
@@ -2005,10 +2118,38 @@ function useTranscriptWindow({ messages, containerRef, sessionId, routeActive })
     updateRange();
   }, [enabled, prefix, updateRange]);
 
-  const onMeasure = React.useCallback((index, key, rawHeight) => {
+  const onMeasure = React.useCallback((index, key, rawHeight, node = null) => {
     if (!enabledRef.current) return;
     const nextHeight = Math.max(1, Math.ceil(rawHeight));
     const previousHeight = heightsRef.current.get(key) || estimatedTranscriptRowHeight(messages[index]);
+    const temporalObserver = typeof window !== 'undefined' ? window.__RAC_TEMPORAL_CANARY__ : null;
+    if (temporalObserver?.active) {
+      const measurements = temporalObserver.transcriptMeasurements
+        || (temporalObserver.transcriptMeasurements = []);
+      if (measurements.length < 4_000 && Math.abs(nextHeight - previousHeight) >= 1) {
+        const activeList = containerRef.current;
+        const renderedMessage = node?.querySelector?.('.message[data-message-key]') || null;
+        const renderedRect = renderedMessage?.getBoundingClientRect?.() || null;
+        const wrapperRect = node?.getBoundingClientRect?.() || null;
+        measurements.push({
+          at_epoch_ms: Date.now(),
+          index,
+          key,
+          rendered_window_index: Number(node?.dataset?.windowIndex ?? index),
+          rendered_message_key: renderedMessage?.dataset?.messageKey || null,
+          rendered_message_role: renderedMessage?.dataset?.messageRole || null,
+          rendered_message_height_px: renderedRect ? Number(renderedRect.height.toFixed(3)) : null,
+          rendered_message_top_px: renderedRect ? Number(renderedRect.top.toFixed(3)) : null,
+          wrapper_top_px: wrapperRect ? Number(wrapperRect.top.toFixed(3)) : null,
+          raw_height_px: Number(rawHeight.toFixed(3)),
+          next_height_px: nextHeight,
+          previous_height_px: previousHeight,
+          delta_px: nextHeight - previousHeight,
+          anchor_index: activeList ? transcriptPrefixIndex(prefixRef.current, activeList.scrollTop) : null,
+          scroll_top: activeList?.scrollTop ?? null,
+        });
+      }
+    }
     if (Math.abs(nextHeight - previousHeight) < 1) return;
     heightsRef.current.set(key, nextHeight);
     const list = containerRef.current;
@@ -2024,12 +2165,12 @@ function useTranscriptWindow({ messages, containerRef, sessionId, routeActive })
       const activeList = containerRef.current;
       const anchorDelta = pendingAnchorDeltaRef.current;
       pendingAnchorDeltaRef.current = 0;
-      if (activeList && Math.abs(anchorDelta) >= 1) {
+      if (activeList && Math.abs(anchorDelta) >= 1 && mayWriteProgrammaticScroll()) {
         setScrollTopInstant(activeList, Math.max(0, activeList.scrollTop + anchorDelta));
       }
       setHeightRevision(revision => revision + 1);
     });
-  }, [containerRef, messages]);
+  }, [containerRef, mayWriteProgrammaticScroll, messages]);
 
   React.useLayoutEffect(() => {
     if (enabled || !measureFrameRef.current) return;
@@ -7239,7 +7380,21 @@ class SidebarScrollCoordinator extends React.Component {
 }
 
 function App() {
-  const { sessions, messages, provisionalStreams, historyMeta, historyLoading, connected, connectionHealth, unread, setUnread, thinking, thinkingContent, activities, health, deliveryStates, launchStates, justLaunched, setJustLaunched, permissionPrompts, respondToPrompt, errorPrompts, respondToErrorPrompt, interruptSession, controlGoal, agentConfigs, configControlStates, requestAgentConfig, setAgentModel, setAgentEffort, setAgentPermissionMode, setAutoApprovePermissions, setAntigravityMode, setCodexConfig, newThread, openPanel, openNativeWindow, requestChatList, switchChat, newChat, chatLists, requestThreadList, switchThread, threadLists, switchWorkspace, requestTerminalOutput, sendTerminalInput, terminalOutputs, requestFileChanges, respondToFileChange, fileChanges, sendAttachment, send, sendToSession, steerMessage, discardQueuedMessage, editQueuedMessage, queuedMessages, scheduledSends, scheduleSend, cancelScheduledSend, launchSession, resumeSession, closeSession, activeSessionRef, restoreCachedTranscript, setSessionSubscriptions, workspaces, branchLists, requestBranchList, switchBranch, createBranch, skillLists, requestSkillList, automationViews, showCodexAutomation, controlResults, directoryListings, requestDirectoryListing, fileContents, requestFileContent, requestHistory, requestHistoryChunk, duplicateProxyAlarms, nightlyValidationFailures, latestAppUpdateValidation, revalidationProgramHealth, providerUsage, providerUsageRefreshReceipt, requestProviderUsageRefresh, setProviderUsageWatching, providerUsageResetReceipt, consumeProviderUsageResetCredit, providerUsageCostDetail, requestProviderUsageCostDetail, hostResources, hostResourceError, hostResourceHistory, hostResourceDetails, hostResourceSubscription, subscribeHostResources, unsubscribeHostResources, requestHostResourceRefresh, semanticNotifications } = useRelay();
+  React.useLayoutEffect(() => {
+    const temporalObserver = typeof window !== 'undefined' ? window.__RAC_TEMPORAL_CANARY__ : null;
+    if (!temporalObserver?.active) return;
+    const commits = temporalObserver.reactCommits || (temporalObserver.reactCommits = []);
+    if (commits.length < 20_000) {
+      commits.push({
+        sequence: commits.length + 1,
+        at_epoch_ms: Date.now(),
+        route: document.querySelector('.messages') ? 'chat' : 'other',
+      });
+    } else {
+      temporalObserver.droppedSamples = Number(temporalObserver.droppedSamples || 0) + 1;
+    }
+  });
+  const { sessions, messages, provisionalStreams, historyMeta, historyLoading, connected, connectionHealth, unread, setUnread, thinking, thinkingContent, activities, health, deliveryStates, launchStates, justLaunched, setJustLaunched, permissionPrompts, respondToPrompt, errorPrompts, respondToErrorPrompt, interruptSession, controlGoal, agentConfigs, configControlStates, requestAgentConfig, setAgentModel, setAgentEffort, setAgentPermissionMode, setAutoApprovePermissions, setAntigravityMode, setCodexConfig, newThread, openPanel, openNativeWindow, requestChatList, switchChat, newChat, chatLists, requestThreadList, switchThread, threadLists, switchWorkspace, requestTerminalOutput, sendTerminalInput, terminalOutputs, requestFileChanges, respondToFileChange, fileChanges, sendAttachment, send, sendToSession, steerMessage, discardQueuedMessage, editQueuedMessage, queuedMessages, scheduledSends, scheduleSend, cancelScheduledSend, launchSession, resumeSession, closeSession, activeSessionRef, restoreCachedTranscript, setSessionSubscriptions, workspaces, branchLists, requestBranchList, switchBranch, createBranch, skillLists, requestSkillList, automationViews, showCodexAutomation, controlResults, directoryListings, requestDirectoryListing, fileContents, requestFileContent, requestHistory, requestHistoryChunk, duplicateProxyAlarms, nightlyValidationFailures, latestAppUpdateValidation, revalidationProgramHealth, operatorDogfoodHealth, providerUsage, providerUsageRefreshReceipt, requestProviderUsageRefresh, setProviderUsageWatching, providerUsageResetReceipt, consumeProviderUsageResetCredit, providerUsageCostDetail, requestProviderUsageCostDetail, hostResources, hostResourceError, hostResourceHistory, hostResourceDetails, hostResourceSubscription, subscribeHostResources, unsubscribeHostResources, requestHostResourceRefresh, semanticNotifications, sessionAliases } = useRelay();
   const [activeSession, setActiveSession] = useState(null);
   const subscribeActiveTranscript = React.useCallback(
     listener => subscribeCachedTranscript(activeSession, listener),
@@ -8035,7 +8190,11 @@ function App() {
   const pinnedToNewestUntilRef = useRef(0);
   const requestOlderHistoryRef = useRef(null);
   const nonWindowedPrependAnchorRef = useRef(null);
-  const blockingPromptScrollKeyRef = useRef('');
+  const blockingPromptScrollStateRef = useRef({
+    activeSemanticKey: '',
+    lastClearedSemanticKey: '',
+    clearedAt: 0,
+  });
   const selectedSessionRef = useRef(activeSession);
   const scrollSnapshotRef = useRef({
     sessionId: null,
@@ -8048,6 +8207,7 @@ function App() {
   const routeScrollSnapshotRef = useRef(null);
   const routeScrollRestoreFrameRef = useRef(0);
   const textareaRef     = useRef(null);
+  const suppressProgrammaticTranscriptScrollRef = useRef(() => false);
   const fileInputRef    = useRef(null);
   const transcriptArrivalRef = useRef(activeTranscriptArrival);
   const jumpBaselineRef = useRef(activeTranscriptArrival);
@@ -8057,10 +8217,65 @@ function App() {
   const pendingAttachmentReqs = useRef({});
   const seenAttachmentResults = useRef({});
   transcriptArrivalRef.current = activeTranscriptArrival;
+  suppressProgrammaticTranscriptScrollRef.current = () => (
+    !!activePermissionPromptForScroll
+    || (typeof document !== 'undefined' && document.activeElement === textareaRef.current)
+    || Date.now() < userScrollIntentUntilRef.current
+  );
 
   useLayoutEffect(() => {
     selectedSessionRef.current = activeSession;
   }, [activeSession]);
+
+  useLayoutEffect(() => {
+    const aliases = Object.values(sessionAliases || {});
+    if (aliases.length === 0) return;
+    const migrateObject = (setter, aliasId, canonicalId, merge = (canonical, alias) => canonical ?? alias) => {
+      setter(previous => {
+        if (!previous || !Object.prototype.hasOwnProperty.call(previous, aliasId)) return previous;
+        const next = { ...previous };
+        next[canonicalId] = merge(next[canonicalId], next[aliasId]);
+        delete next[aliasId];
+        return next;
+      });
+    };
+    for (const alias of aliases) {
+      const aliasId = alias?.alias_session_id;
+      const canonicalId = alias?.canonical_session_id;
+      if (!aliasId || !canonicalId || aliasId === canonicalId) continue;
+      migrateObject(setDrafts, aliasId, canonicalId,
+        (canonical, value) => (typeof canonical === 'string' && canonical.length > 0 ? canonical : value || ''));
+      migrateObject(setDraftFiles, aliasId, canonicalId, (canonical, value) => {
+        const combined = [...(Array.isArray(canonical) ? canonical : []), ...(Array.isArray(value) ? value : [])];
+        return [...new Map(combined.map(file => [`${file?.name || ''}:${file?.size || file?.content?.length || 0}`, file])).values()];
+      });
+      migrateObject(setSessionAttention, aliasId, canonicalId, (canonical, value) => canonical || value);
+      migrateObject(setSessionPreferences, aliasId, canonicalId,
+        (canonical, value) => ({ ...(value || {}), ...(canonical || {}) }));
+      if (managedSessionId === aliasId) setManagedSessionId(canonicalId);
+      setAttentionToast(previous => previous?.sessionId === aliasId
+        ? { ...previous, sessionId: canonicalId }
+        : previous);
+      if (sendHistoryRef.current[aliasId]) {
+        sendHistoryRef.current[canonicalId] = [
+          ...(sendHistoryRef.current[canonicalId] || []),
+          ...sendHistoryRef.current[aliasId],
+        ];
+        delete sendHistoryRef.current[aliasId];
+      }
+      if (sendHistoryCursorRef.current.sessionId === aliasId) {
+        sendHistoryCursorRef.current = { ...sendHistoryCursorRef.current, sessionId: canonicalId };
+      }
+      if (activeSession !== aliasId) continue;
+      scrollSnapshotRef.current = { ...scrollSnapshotRef.current, sessionId: canonicalId };
+      if (routeScrollSnapshotRef.current?.sessionId === aliasId) {
+        routeScrollSnapshotRef.current = { ...routeScrollSnapshotRef.current, sessionId: canonicalId };
+      }
+      selectedSessionRef.current = canonicalId;
+      activeSessionRef.current = canonicalId;
+      setActiveSession(canonicalId);
+    }
+  }, [sessionAliases, activeSession, managedSessionId]);
 
   useEffect(() => {
     const onError = (event) => {
@@ -8120,8 +8335,9 @@ function App() {
   useEffect(() => {
     if (!activeSession && orderedSessions.length > 0) {
       const requestedId = new URLSearchParams(window.location.search).get('session');
-      const requested = requestedId
-        ? orderedSessions.find(session => sessionIdOf(session) === requestedId)
+      const canonicalRequestedId = sessionAliases?.[requestedId]?.canonical_session_id || requestedId;
+      const requested = canonicalRequestedId
+        ? orderedSessions.find(session => sessionIdOf(session) === canonicalRequestedId)
         : null;
       const selected = requested || orderedSessions[0];
       const id = sessionIdOf(selected);
@@ -8130,19 +8346,20 @@ function App() {
         if (requested) window.history.replaceState({}, '', window.location.pathname);
       }
     }
-  }, [orderedSessions, activeSession]);
+  }, [orderedSessions, activeSession, sessionAliases]);
 
   useEffect(() => {
     if (!('serviceWorker' in navigator)) return undefined;
     const handlePushClick = event => {
       if (event.data?.type !== 'push_notification_clicked') return;
       const requestedId = event.data.data?.session_id;
-      const requested = orderedSessions.find(session => sessionIdOf(session) === requestedId);
-      if (requestedId && requested) selectSession(requestedId, requested);
+      const canonicalRequestedId = sessionAliases?.[requestedId]?.canonical_session_id || requestedId;
+      const requested = orderedSessions.find(session => sessionIdOf(session) === canonicalRequestedId);
+      if (canonicalRequestedId && requested) selectSession(canonicalRequestedId, requested);
     };
     navigator.serviceWorker.addEventListener('message', handlePushClick);
     return () => navigator.serviceWorker.removeEventListener('message', handlePushClick);
-  }, [orderedSessions]);
+  }, [orderedSessions, sessionAliases]);
 
   // Auto-select a just-launched session once it appears in the sessions list
   useEffect(() => {
@@ -8236,7 +8453,8 @@ function App() {
       const list = messagesListRef.current;
       if (!list
         || selectedSessionRef.current !== sessionAtStart
-        || scrollPinGenerationRef.current !== pinGeneration) return false;
+        || scrollPinGenerationRef.current !== pinGeneration
+        || suppressProgrammaticTranscriptScrollRef.current()) return false;
       programmaticScrollUntilRef.current = Date.now() + 800;
       stickyToNewestRef.current = true;
       jumpBaselineRef.current = transcriptArrivalRef.current;
@@ -8305,8 +8523,12 @@ function App() {
       && prevFirstIndex > 0
       && prevLastIndex >= prevFirstIndex
     );
+    const suppressProgrammaticScroll = suppressProgrammaticTranscriptScrollRef.current();
 
-    if (sameRenderedKeys && !forcePinnedToNewest && !wasAtBottom) {
+    if (suppressProgrammaticScroll) {
+      // Open prompts, composer focus, and recent manual interaction own the
+      // viewport. Update the observation snapshot below without writing it.
+    } else if (sameRenderedKeys && !forcePinnedToNewest && !wasAtBottom) {
       // Older hydration chunks often change the backing array without changing
       // the rendered tail window. Leave scrollTop alone so the browser does not
       // visibly bounce while history backfills in the background.
@@ -9099,6 +9321,7 @@ async function uploadBinaryDraft(sessionId, base64, mimeType, filename) {
     containerRef: messagesListRef,
     sessionId: activeSession,
     routeActive: chatRouteActive,
+    suppressProgrammaticScrollRef: suppressProgrammaticTranscriptScrollRef,
   });
   const captureChatRouteScroll = React.useCallback(() => {
     const list = messagesListRef.current;
@@ -9154,6 +9377,10 @@ async function uploadBinaryDraft(sessionId, base64, mimeType, filename) {
   const activeBlockingErrorPrompt = isBlockingErrorPrompt(activeErrorPrompt) ? activeErrorPrompt : null;
   const activeInlineErrorPrompt = activeErrorPrompt && !isBlockingErrorPrompt(activeErrorPrompt) ? activeErrorPrompt : null;
   const activeBlockingPrompt = activePrompt || activeBlockingErrorPrompt;
+  const activePromptContinuityKey = React.useMemo(
+    () => promptContinuityKey(activeSession, activePrompt),
+    [activeSession, activePrompt],
+  );
   const activeBlockingPromptLabel = activePrompt
     ? (activePrompt.type === 'question_prompt' ? 'Question required' : 'Permission required')
     : activeBlockingErrorPrompt
@@ -9162,24 +9389,47 @@ async function uploadBinaryDraft(sessionId, base64, mimeType, filename) {
   useLayoutEffect(() => {
     const list = messagesListRef.current;
     if (!list) return;
-    const promptKey = activePrompt
-      ? `${activeSession || ''}\u0000${activePrompt.prompt_id || activePrompt.request_id || activePrompt.id || 'prompt'}`
-      : '';
-    const previousPromptKey = blockingPromptScrollKeyRef.current;
-    blockingPromptScrollKeyRef.current = promptKey;
-    if (promptKey) {
-      scrollPinGenerationRef.current += 1;
-      pinnedToNewestUntilRef.current = 0;
-      stickyToNewestRef.current = false;
-      programmaticScrollUntilRef.current = Date.now() + 800;
-      setScrollTopInstant(list, 0);
-      isAtBottom.current = list.scrollHeight - list.clientHeight < 80;
-      setShowJumpButton(false);
-      setNewMessagesBelow(0);
-    } else if (previousPromptKey) {
-      stickTranscriptToNewest(scrollIdentityKeysForMessages(activeMessagesForScroll), 3);
+    const now = Date.now();
+    const state = blockingPromptScrollStateRef.current;
+    if (!activePromptContinuityKey) {
+      if (state.activeSemanticKey) {
+        state.lastClearedSemanticKey = state.activeSemanticKey;
+        state.clearedAt = now;
+        state.activeSemanticKey = '';
+      }
+      // Clearing a prompt never owns a bottom snap. The operator's current
+      // viewport remains authoritative until an explicit action changes it.
+      return;
     }
-  }, [activeSession, activePrompt?.prompt_id, activeLiveScrollVersion, activeMessagesForScroll]);
+    const continuous = state.activeSemanticKey === activePromptContinuityKey
+      || (state.lastClearedSemanticKey === activePromptContinuityKey
+        && now - state.clearedAt <= 5000);
+    state.activeSemanticKey = activePromptContinuityKey;
+    if (continuous) return;
+
+    scrollPinGenerationRef.current += 1;
+    pinnedToNewestUntilRef.current = 0;
+    stickyToNewestRef.current = false;
+    const operatorOwnsViewport = document.activeElement === textareaRef.current
+      || now < userScrollIntentUntilRef.current;
+    if (operatorOwnsViewport) return;
+
+    // A genuinely new, settled prompt receives one initial reveal. Semantic
+    // continuity makes producer re-keys and short snapshot omissions no-ops.
+    programmaticScrollUntilRef.current = now + 800;
+    setScrollTopInstant(list, 0);
+    isAtBottom.current = list.scrollHeight - list.clientHeight < 80;
+    setShowJumpButton(false);
+    setNewMessagesBelow(0);
+    scrollSnapshotRef.current = {
+      ...scrollSnapshotRef.current,
+      sessionId: activeSession,
+      scrollTop: 0,
+      scrollHeight: list.scrollHeight,
+      clientHeight: list.clientHeight,
+      atBottom: false,
+    };
+  }, [activePromptContinuityKey, activeSession, renderedMessages.length]);
   const activeWriteGate = activeSession
     ? agentConfigs[activeSession]?.capabilities?.write_capability_gate || null
     : null;
@@ -9204,7 +9454,15 @@ async function uploadBinaryDraft(sessionId, base64, mimeType, filename) {
   );
   const revalidationRows = Object.entries(revalidationProgramHealth?.harnesses || {})
     .sort(([left], [right]) => left.localeCompare(right));
-  const hasSystemBanner = duplicateProxyAlarms.length > 0 || visibleNightlyValidationFailures.length > 0 || !!recentAppUpdateValidation || !!activeWriteGate;
+  const dogfoodLatest = operatorDogfoodHealth?.latest || null;
+  const dogfoodAgeMs = dogfoodLatest?.completed_at ? Date.now() - Date.parse(dogfoodLatest.completed_at) : Number.POSITIVE_INFINITY;
+  const dogfoodStatus = !operatorDogfoodHealth || !dogfoodLatest || dogfoodAgeMs > 45 * 60 * 1000
+    ? 'STALE' : String(operatorDogfoodHealth.status || dogfoodLatest.status || 'STALE').toUpperCase();
+  const dogfoodOpenFingerprints = Array.isArray(operatorDogfoodHealth?.open_fingerprints)
+    ? operatorDogfoodHealth.open_fingerprints : [];
+  const dogfoodUnhealthy = dogfoodStatus !== 'PASS' || dogfoodOpenFingerprints.length > 0;
+  const hasSystemBanner = duplicateProxyAlarms.length > 0 || visibleNightlyValidationFailures.length > 0
+    || !!recentAppUpdateValidation || !!activeWriteGate || dogfoodUnhealthy;
   const slashQuery      = currentInput.startsWith('/') ? currentInput.slice(1).trim().toLowerCase() : '';
   const filteredSlashCommands = currentInput.startsWith('/')
     ? SLASH_COMMANDS.filter(item => item.command.slice(1).includes(slashQuery))
@@ -10066,6 +10324,20 @@ async function uploadBinaryDraft(sessionId, base64, mimeType, filename) {
             <p className="revalidation-ledger-summary">
               Continuous version watch, nightly tier-1, and staggered weekly tier-2. Write controls fail closed after drift until the installed version passes its required tiers.
             </p>
+            <section className={`operator-dogfood-health validation-state-${dogfoodStatus.toLowerCase()}`} aria-label="Chat stability sentinel health">
+              <h3>Chat stability sentinel: {dogfoodStatus}</h3>
+              <p>{dogfoodLatest
+                ? `${dogfoodLatest.mode || 'unknown'} / ${dogfoodLatest.trigger_source || 'unknown trigger'} / ${dogfoodLatest.duration_ms || 0} ms / ${dogfoodLatest.refresh_count ?? 0} refreshes / ${dogfoodLatest.dropped_samples ?? 0} dropped`
+                : 'No sentinel result has been published; health remains stale.'}</p>
+              <dl>
+                <div><dt>Source</dt><dd>{dogfoodLatest?.source_commit || 'unavailable'}</dd></div>
+                <div><dt>Build</dt><dd>{dogfoodLatest?.source_bundle_sha256 || 'unavailable'}</dd></div>
+                <div><dt>Last end</dt><dd>{dogfoodLatest?.completed_at ? new Date(dogfoodLatest.completed_at).toLocaleString() : 'never'}</dd></div>
+                <div><dt>Next due</dt><dd>{dogfoodLatest?.next_due_at ? new Date(dogfoodLatest.next_due_at).toLocaleString() : 'unknown'}</dd></div>
+                <div><dt>Scheduler</dt><dd>{dogfoodLatest?.scheduler_last_result || 'unavailable'}</dd></div>
+                <div><dt>Open findings</dt><dd>{dogfoodOpenFingerprints.length}</dd></div>
+              </dl>
+            </section>
             {revalidationRows.length === 0 ? (
               <div className="revalidation-ledger-empty">Program health has not been published by the updated sentinel yet.</div>
             ) : (
@@ -10095,7 +10367,7 @@ async function uploadBinaryDraft(sessionId, base64, mimeType, filename) {
       )}
       <div className={`overlay ${sidebarOpen ? 'open' : ''}`} onClick={() => setSidebarOpen(false)} />
       {hasSystemBanner && (
-        <div className={`duplicate-proxy-banner${recentAppUpdateValidation?.status === 'pass' && duplicateProxyAlarms.length === 0 && visibleNightlyValidationFailures.length === 0 && !activeWriteGate ? ' app-update-pass' : ''}`} role={recentAppUpdateValidation?.status === 'pass' && duplicateProxyAlarms.length === 0 && visibleNightlyValidationFailures.length === 0 && !activeWriteGate ? 'status' : 'alert'} ref={systemBannerRef}>
+        <div className={`duplicate-proxy-banner${recentAppUpdateValidation?.status === 'pass' && duplicateProxyAlarms.length === 0 && visibleNightlyValidationFailures.length === 0 && !activeWriteGate && !dogfoodUnhealthy ? ' app-update-pass' : ''}`} role={recentAppUpdateValidation?.status === 'pass' && duplicateProxyAlarms.length === 0 && visibleNightlyValidationFailures.length === 0 && !activeWriteGate && !dogfoodUnhealthy ? 'status' : 'alert'} ref={systemBannerRef}>
           {duplicateProxyAlarms.length > 0 && <>
             <strong>Duplicate proxy detected.</strong>
             <span>{duplicateProxyAlarms.length} session{duplicateProxyAlarms.length === 1 ? '' : 's'} claimed by multiple proxies. Stop the extra proxy to prevent conflicting controls.</span>
@@ -10112,7 +10384,13 @@ async function uploadBinaryDraft(sessionId, base64, mimeType, filename) {
             <strong>Harness writes paused.</strong>
             <span>{activeWriteGate}. Read-only transcript access remains available.</span>
           </>}
-          {revalidationProgramHealth && <button type="button" className="validation-health-link" onClick={() => setRevalidationLedgerOpen(true)}>View program health</button>}
+          {dogfoodUnhealthy && <>
+            <strong>Chat stability sentinel {dogfoodStatus.toLowerCase()}.</strong>
+            <span>{dogfoodOpenFingerprints.length > 0
+              ? `${dogfoodOpenFingerprints.length} open P0/P1 fingerprint${dogfoodOpenFingerprints.length === 1 ? '' : 's'}.`
+              : 'The required 30-minute canary is missing, expired, skipped, or running against a different served asset.'}</span>
+          </>}
+          {(revalidationProgramHealth || operatorDogfoodHealth || dogfoodUnhealthy) && <button type="button" className="validation-health-link" onClick={() => setRevalidationLedgerOpen(true)}>View program health</button>}
         </div>
       )}
 
@@ -11393,7 +11671,7 @@ async function uploadBinaryDraft(sessionId, base64, mimeType, filename) {
                   : activeSession
                     ? (window.innerWidth < 600 ? 'Enter message…' : 'Message… (/ for commands)')
                     : 'Select a session'}
-                disabled={!activeSession || !!activeBlockingPrompt}
+                disabled={!activeSession}
                 rows={1}
               />
               <div className="textarea-btns">

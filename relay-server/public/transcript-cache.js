@@ -113,6 +113,19 @@ export function deleteCachedTranscript(sessionId) {
   return true;
 }
 
+export function migrateCachedTranscript(aliasSessionId, canonicalSessionId) {
+  const aliasId = normalizedSessionId(aliasSessionId);
+  const canonicalId = normalizedSessionId(canonicalSessionId);
+  if (!aliasId || !canonicalId || aliasId === canonicalId) return getTranscriptSnapshot(canonicalId);
+  const aliasMessages = transcriptCache.get(aliasId) || [];
+  const canonicalMessages = transcriptCache.get(canonicalId) || [];
+  if (aliasMessages.length > 0) {
+    setCachedTranscript(canonicalId, mergeTranscriptMessages(canonicalMessages, aliasMessages));
+  }
+  deleteCachedTranscript(aliasId);
+  return getTranscriptSnapshot(canonicalId);
+}
+
 function transcriptMapSnapshot() {
   return Object.fromEntries([...transcriptCache.entries()]);
 }

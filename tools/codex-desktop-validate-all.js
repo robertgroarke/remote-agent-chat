@@ -8,8 +8,10 @@ const { withCodexDesktopCdpLock } = require('../agent-proxy/codex-desktop-cdp-lo
 const root = path.join(__dirname, '..');
 const args = process.argv.slice(2);
 const readOnly = args.includes('--read-only');
-if (args.some(arg => arg !== '--read-only' && arg !== '--send-live') || (readOnly && args.includes('--send-live'))) {
-  console.error('Codex Desktop validate-all accepts --read-only or --send-live.');
+const sourceOnly = args.includes('--source-only');
+if (args.some(arg => !['--read-only', '--source-only', '--send-live'].includes(arg))
+    || (readOnly && args.includes('--send-live')) || (sourceOnly && !readOnly)) {
+  console.error('Codex Desktop validate-all accepts --read-only [--source-only] or --send-live.');
   process.exit(2);
 }
 const stepTimeoutMs = Number(process.env.CODEX_DESKTOP_VALIDATE_STEP_TIMEOUT_MS || 60000);
@@ -45,6 +47,10 @@ const steps = [
 if (!readOnly) {
   steps.splice(11, 0, ['notice, goal, queue, and action fixture', ['tools/codex-notice-smoke.js']]);
 }
+if (sourceOnly) {
+  const fidelityIndex = steps.findIndex(([label]) => label === 'native/relay fidelity tail');
+  if (fidelityIndex >= 0) steps.splice(fidelityIndex, 1);
+}
 
 function runStep(label, args) {
   console.log(`\n=== ${label} ===`);
@@ -75,6 +81,7 @@ async function main() {
 
   console.log('\nCodex Desktop validate-all: PASS');
   if (readOnly) console.log('READ-ONLY PASS (DOM action fixture and all mutating controls were intentionally not run)');
+  if (sourceOnly) console.log('SOURCE-ONLY PASS (production native/relay fidelity remains an explicit external gate)');
 }
 
 main().catch(error => {

@@ -18,6 +18,11 @@ const { freshEvidencePath } = require('./evidence-path');
 
 const ROOT = path.resolve(__dirname, '..');
 const PORT = Number(process.env.CODEX_DESKTOP_CDP_PORT || 9225);
+const auditArgs = process.argv.slice(2);
+const ACTIVE_ONLY = auditArgs.includes('--active-only');
+if (auditArgs.some(argument => argument !== '--active-only')) {
+  throw new Error('Codex Desktop structured DOM audit accepts only --active-only.');
+}
 const TARGET_THREAD = process.env.CODEX_DESKTOP_AUDIT_THREAD_ID
   || 'local:019f4b6a-f61c-7db3-ba89-284406bbeefe';
 const OUTPUT = process.env.CODEX_DESKTOP_AUDIT_OUTPUT
@@ -177,9 +182,10 @@ async function main() {
     const threads = await selectors.readCodexThreadList(client.Runtime, true);
     originalThread = String(threads.find(thread => thread?.active)?.id || '');
     assert(originalThread, 'active Codex Desktop thread was not detected');
-    const switched = originalThread === TARGET_THREAD
+    const auditThread = ACTIVE_ONLY ? originalThread : TARGET_THREAD;
+    const switched = originalThread === auditThread
       ? { ok: true, method: 'already-active' }
-      : await selectors.switchCodexThread(client.Runtime, TARGET_THREAD, true);
+      : await selectors.switchCodexThread(client.Runtime, auditThread, true);
     assert.equal(switched?.ok, true, `audit thread switch failed: ${JSON.stringify(switched)}`);
     const structure = await evaluate(client.Runtime);
     assert.equal(structure?.ok, true, structure?.error || 'structure audit failed');
@@ -189,7 +195,7 @@ async function main() {
       'structured-dom-audit',
       { maxRecentTurns: 24, maxRecentUnits: 96 },
     ) || '[]');
-    const cliSessionId = TARGET_THREAD.match(
+    const cliSessionId = auditThread.match(
       /([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})/i,
     )?.[1] || '';
     const archive = cliSessionId ? codexCli.findSessionByCliId(cliSessionId) : null;
@@ -210,7 +216,7 @@ async function main() {
       'structured-dom-audit',
       {
         agentType: 'codex-desktop',
-        _activeThreadKey: TARGET_THREAD,
+        _activeThreadKey: auditThread,
         _activeThreadTitle: '',
       },
       domMessages,
@@ -223,7 +229,8 @@ async function main() {
       generated_at: new Date().toISOString(),
       port: PORT,
       original_thread_id: originalThread,
-      audited_thread_id: TARGET_THREAD,
+      audited_thread_id: auditThread,
+      active_thread_only: ACTIVE_ONLY,
       content_safe: true,
       focus_actions: 0,
       visible_windows_opened: 0,
@@ -263,7 +270,7 @@ async function main() {
     }));
   } finally {
     try {
-      if (originalThread && originalThread !== TARGET_THREAD) {
+      if (originalThread && !ACTIVE_ONLY && originalThread !== TARGET_THREAD) {
         const restore = await selectors.switchCodexThread(client.Runtime, originalThread, true);
         restored = restore?.ok === true;
       } else {

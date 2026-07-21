@@ -44,6 +44,9 @@ export default function CollapsibleBlock({ maxHeight = 240, children }) {
         style={s.toggleBtn}
         onPress={() => setCollapsed(v => !v)}
         activeOpacity={0.7}
+        accessibilityRole="button"
+        accessibilityState={{ expanded: !collapsed }}
+        accessibilityLabel={collapsed ? 'Show full content' : 'Collapse content'}
       >
         <Text style={s.toggleText}>
           {collapsed ? '▼ Show more' : '▲ Show less'}
@@ -67,9 +70,11 @@ const s = StyleSheet.create({
     backgroundColor: 'rgba(22, 27, 34, 0.85)',
   },
   toggleBtn: {
+    minHeight:         44,
     paddingVertical:   6,
     paddingHorizontal: 4,
     alignItems:        'center',
+    justifyContent:    'center',
   },
   toggleText: {
     color:      '#58a6ff',

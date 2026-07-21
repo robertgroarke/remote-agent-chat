@@ -155,10 +155,13 @@ function settle() {
 
   const opened = prompt(sessionId);
   fakeTurn.emit('question_prompt', opened);
+  fakeTurn.emit('question_prompt', { ...opened, observed_at: new Date().toISOString() });
   assert.strictEqual(engine.activeQuestionPromptAdapters.has(sessionId), true);
   assert.strictEqual(session.activity.kind, 'waiting_for_user');
   const relayedPrompt = engine.sent.find(message => message.type === 'question_prompt');
   assert.strictEqual(relayedPrompt.prompt_id, opened.prompt_id);
+  assert.strictEqual(engine.sent.filter(message => message.type === 'question_prompt').length, 1,
+    'identical native question replay must not emit another relay open edge');
   engine._setCodexCliActivity(sessionId, session, {
     kind: 'idle', label: '', updated_at: new Date().toISOString(),
   });

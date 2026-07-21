@@ -395,8 +395,18 @@ async function main() {
       await page.waitForFunction(() => !!window.document.querySelector('[data-message-source-id="timestamp-fixture:optimistic-settled"]'));
       assert(sentMessage?.created_at, 'client send did not carry the optimistic producer instant');
 
+      // The initial wheel intentionally grants the operator a 1.2s no-auto-
+      // scroll window. Prove prepend anchoring after that contract expires,
+      // rather than asking the app to violate viewport ownership.
+      await page.waitForTimeout(1300);
       const beforePrepend = await page.locator(anchorSelector).evaluate(node => node.getBoundingClientRect().top);
-      await page.locator('.history-tail-banner button').evaluate(node => node.click());
+      // Model a real operator click: focus leaves the composer before the
+      // user-requested prepend, so the focus-protection scroll gate does not
+      // suppress the anchor-preservation write.
+      await page.locator('.history-tail-banner button').evaluate(node => {
+        node.focus({ preventScroll: true });
+        node.click();
+      });
       await page.waitForFunction(() => document.querySelectorAll('.messages .message.transcript-virtual-row').length === 41,
         null, { timeout: 5000 });
       const afterPrepend = await page.locator(anchorSelector).evaluate(node => node.getBoundingClientRect().top);

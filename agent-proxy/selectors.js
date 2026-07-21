@@ -602,7 +602,23 @@ const CODEX_DOM_SIG_EXPR = `
     var activeThreadSpinner = activeThreadRow
       ? Array.from(activeThreadRow.querySelectorAll('[class*="animate-spin"]')).find(visible)
       : null;
-    return '|a:' + (stopBtn ? '1' : '0') + ':' + shimmerCount + ':' + (activeThreadSpinner ? '1' : '0');
+    var activityHeaders = Array.from(c.querySelectorAll(
+      '[class*="group/activity-header"], [data-testid*="activity-header" i], [data-codex-activity-header]'
+    )).filter(function(el) {
+      return visible(el)
+        && !el.closest('nav, aside, [data-app-action-sidebar-thread-row], [aria-hidden="true"]');
+    }).slice(-8).map(function(el) {
+      var owner = el.closest('[data-turn-key], [data-content-search-turn-key], [data-content-search-unit-key]');
+      var ownerKey = owner && (
+        owner.getAttribute('data-turn-key')
+        || owner.getAttribute('data-content-search-turn-key')
+        || owner.getAttribute('data-content-search-unit-key')
+      ) || '';
+      var text = String(el.innerText || el.textContent || '').replace(/\\s+/g, ' ').trim().slice(0, 500);
+      return ownerKey + ':' + text.length + ':' + _tinyHash(text);
+    }).join('|');
+    return '|a:' + (stopBtn ? '1' : '0') + ':' + shimmerCount + ':' + (activeThreadSpinner ? '1' : '0')
+      + ':h:' + activityHeaders;
   }
   var activitySig = _codexActivitySig();
   // Prefer [data-content-search-unit-key] — newer Codex Desktop builds
@@ -1232,6 +1248,84 @@ async function detectThinking(Runtime, agentType) {
           };
         }
         var goalSurface = readGoalSurface();
+        function readActivitySummary() {
+          function visible(el) {
+            if (!el || !el.getBoundingClientRect || el.offsetParent === null) return false;
+            var rect = el.getBoundingClientRect();
+            if (rect.width <= 0 || rect.height <= 0) return false;
+            var style = window.getComputedStyle ? window.getComputedStyle(el) : null;
+            return !style || (style.display !== 'none' && style.visibility !== 'hidden' && style.opacity !== '0');
+          }
+          function norm(text) {
+            return String(text || '').replace(/\u00a0/g, ' ').replace(/\\s+/g, ' ').trim();
+          }
+          function tinyHash(text) {
+            var h = 2166136261;
+            text = String(text || '');
+            for (var i = 0; i < text.length; i++) {
+              h ^= text.charCodeAt(i);
+              h = Math.imul(h, 16777619);
+            }
+            return (h >>> 0).toString(36);
+          }
+          var conversation = d.querySelector('[data-thread-find-target="conversation"]');
+          if (!conversation) return null;
+          var units = Array.from(conversation.querySelectorAll('[data-content-search-unit-key]'));
+          var latestTurnId = units.length > 0
+            ? String(units[units.length - 1].getAttribute('data-content-search-unit-key') || '').split(':')[0]
+            : '';
+          var candidates = Array.from(conversation.querySelectorAll(
+            '[class*="group/activity-header"], [data-testid*="activity-header" i], [data-codex-activity-header]'
+          )).filter(function(el) {
+            if (!visible(el)) return false;
+            if (el.closest('nav, aside, [data-app-action-sidebar-thread-row], [aria-hidden="true"]')) return false;
+            var owner = el.closest('[data-turn-key], [data-content-search-turn-key], [data-content-search-unit-key]');
+            var ownerKey = owner && (
+              owner.getAttribute('data-turn-key')
+              || owner.getAttribute('data-content-search-turn-key')
+              || owner.getAttribute('data-content-search-unit-key')
+            ) || '';
+            var ownerTurnId = String(ownerKey).split(':')[0];
+            return !latestTurnId || !ownerTurnId || ownerTurnId === latestTurnId;
+          });
+          for (var ci = candidates.length - 1; ci >= 0; ci--) {
+            var candidate = candidates[ci];
+            var clone = candidate.cloneNode(true);
+            Array.from(clone.querySelectorAll('button, svg, path, [aria-hidden="true"]')).forEach(function(node) {
+              if (node && node.parentNode) node.parentNode.removeChild(node);
+            });
+            var text = norm(clone.innerText || clone.textContent || '');
+            if (!text || text.length > 2000) continue;
+            if (/^(?:Thinking|Generating|Working|Worked for .*|Working for .*|Undo|Review)$/i.test(text)) continue;
+            var owner = candidate.closest('[data-turn-key], [data-content-search-turn-key], [data-content-search-unit-key]');
+            var ownerKey = owner && (
+              owner.getAttribute('data-turn-key')
+              || owner.getAttribute('data-content-search-turn-key')
+              || owner.getAttribute('data-content-search-unit-key')
+            ) || '';
+            var turnId = String(ownerKey).split(':')[0] || null;
+            return {
+              text: text,
+              label: 'Thinking',
+              native_turn_id: turnId,
+              native_source_id: 'codex_dom_activity:' + (turnId || 'active') + ':' + tinyHash(text),
+              native_source_cursor: {
+                mode: 'live_dom',
+                unit_key: ownerKey || null,
+                summary_hash: tinyHash(text)
+              },
+              lifecycle_generation: units.length,
+              observed_at: new Date().toISOString(),
+              surface_provenance: {
+                family: 'codex',
+                surface: isDesktopApp ? 'codex_desktop' : 'codex_vscode',
+                source: isDesktopApp ? 'codex_desktop_dom' : 'codex_extension_dom'
+              }
+            };
+          }
+          return null;
+        }
+        var activitySummary = readActivitySummary();
         // Codex shows a stop button (aria-label contains "stop") while generating.
         // Also check if the send button SVG changed from arrow to square (stop icon).
         var isThinking = false;
@@ -1533,9 +1627,10 @@ async function detectThinking(Runtime, agentType) {
         return JSON.stringify({
           thinking: true,
           label: label,
-          thinkingContent: (current && current.partial) || reasoningText || '',
+          thinkingContent: activitySummary ? activitySummary.text : ((current && current.partial) || reasoningText || ''),
           reasoningText: reasoningText,
           current: current,
+          activitySummary: activitySummary,
           goal: goalSurface,
         });
       `);

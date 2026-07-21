@@ -9,6 +9,7 @@ const path = require('path');
 const { pathToFileURL } = require('url');
 const { chromium } = require(process.env.RAC_PLAYWRIGHT_CORE || '../frontend/node_modules/playwright-core');
 const { DETECTION_CLASSES, auditPage } = require('./operator-dogfood-audit');
+const { analyzeTemporalTrace } = require('./chat-stability-temporal-contract');
 const { freshEvidenceDirectory } = require('./evidence-path');
 
 const ROOT = path.resolve(__dirname, '..');
@@ -138,13 +139,44 @@ async function main(argv = process.argv.slice(2)) {
 
     const seeded = await auditPage(page, { staleStatusMs: 120000 });
     await page.screenshot({ path: screenshotPath, fullPage: true, animations: 'disabled' });
-    const detected = [...seeded.detected_classes].sort();
+    const temporal = analyzeTemporalTrace({
+      samples: [
+        { at_ms: 0, refresh_sequence: 0, session_id: 'seed-session', canonical_conversation_id: 'codex:seed-thread',
+          scroll_top: 800, anchor_key: 'seed-anchor', anchor_offset_px: 0, prompt_count: 0,
+          canonical_card_count: 1, lifecycle: 'paused', user_scroll_epoch: 0 },
+        { at_ms: 400, refresh_sequence: 1, session_id: 'seed-session', canonical_conversation_id: 'codex:seed-thread',
+          scroll_top: 0, anchor_key: 'seed-anchor', anchor_offset_px: -800, phase: 'programmatic_scroll_write',
+          writer: 'prompt_transition', prompt_id: 'false-seed', prompt_generation: 1,
+          prompt_source: 'inferred_goal_state', prompt_count: 1, canonical_card_count: 2,
+          lifecycle: 'waiting_for_user', user_scroll_epoch: 0,
+          canonical_rows: [
+            { surface: 'codex-desktop', canonical_conversation_id: 'codex:seed-thread', owner_verified: true },
+            { surface: 'codex_cli', canonical_conversation_id: 'codex:seed-thread', owner_verified: false },
+          ] },
+        { at_ms: 900, refresh_sequence: 2, session_id: 'seed-session', canonical_conversation_id: 'codex:seed-thread',
+          scroll_top: 800, anchor_key: 'seed-anchor', anchor_offset_px: 0, phase: 'programmatic_scroll_write',
+          writer: 'live_edge_anchor', prompt_count: 0, canonical_card_count: 1,
+          lifecycle: 'paused', user_scroll_epoch: 0 },
+      ],
+      truth: { native_prompts: [], session_id: 'seed-session', canonical_conversation_id: 'codex:seed-thread' },
+    });
+    const detected = [...new Set([...seeded.detected_classes, ...temporal.detected_classes])].sort();
     const expected = [...DETECTION_CLASSES].sort();
     assert.deepStrictEqual(detected, expected, `seed detection mismatch: ${JSON.stringify({ expected, detected })}`);
 
     await page.setContent(cleanHtml(), { waitUntil: 'load' });
     const restored = await auditPage(page, { staleStatusMs: 120000 });
-    assert.strictEqual(restored.ok, true, `restored fixture must be clean: ${JSON.stringify(restored.findings)}`);
+    const restoredTemporal = analyzeTemporalTrace({
+      samples: Array.from({ length: 20 }, (_, index) => ({
+        at_ms: index * 100, refresh_sequence: index, session_id: 'seed-session',
+        canonical_conversation_id: 'codex:seed-thread', scroll_top: 800,
+        anchor_key: 'seed-anchor', anchor_offset_px: 0, prompt_count: 0,
+        canonical_card_count: 1, lifecycle: 'paused', user_scroll_epoch: 0,
+      })),
+      truth: { native_prompts: [] },
+    });
+    assert.strictEqual(restored.ok && restoredTemporal.ok, true,
+      `restored fixture must be clean: ${JSON.stringify([...restored.findings, ...restoredTemporal.findings])}`);
     assert.strictEqual(restored.findings.length, 0, 'restored fixture must have zero findings');
     assert.deepStrictEqual(consoleErrors, [], 'seed audit must not produce console/page errors');
     assert.deepStrictEqual(failedRequests, [], 'seed audit must not produce failed requests');
@@ -159,7 +191,7 @@ async function main(argv = process.argv.slice(2)) {
       expected_classes: expected,
       detected_classes: detected,
       score: { detected: detected.length, expected: expected.length, percent: 100 },
-      findings: seeded.findings,
+      findings: [...seeded.findings, ...temporal.findings],
       generic_assertion_contract: 'Detection is keyed by semantic DOM/state evidence, never a component ID.',
       clean_control: {
         result: 'PASS',

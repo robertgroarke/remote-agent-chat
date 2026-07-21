@@ -341,6 +341,24 @@ assert(hasAll(webHooks, [
 assert(hasAll(webApp, ['App update validated.', 'App update drift validation failed.']),
   'Web must render immediate app-update pass/fail status');
 assert(hasAll(androidList, [
+  "case 'operator_dogfood_status'", 'msg.operator_dogfood_health',
+  "dogfoodAgeMs > 45 * 60 * 1000", 'Chat stability sentinel',
+  'dogfoodLatest?.refresh_count', 'dogfoodLatest?.dropped_samples',
+  'dogfoodLatest?.scheduler_last_result', 'dogfoodOpenFingerprints.length',
+]), 'Android must fail closed and expose measured autonomous chat-stability program health');
+assert(hasAll(webHooks, [
+  "t === 'operator_dogfood_status'", 'msg.operator_dogfood_health', 'setOperatorDogfoodHealth',
+]), 'Web must restore autonomous chat-stability health from ack and live updates');
+assert(hasAll(webApp, [
+  "dogfoodAgeMs > 45 * 60 * 1000", 'Chat stability sentinel',
+  'dogfoodLatest.refresh_count', 'dogfoodLatest.dropped_samples',
+  'dogfoodLatest?.scheduler_last_result', 'dogfoodOpenFingerprints.length',
+]), 'Web must fail closed and expose measured autonomous chat-stability program health');
+assert(hasAll(relayIndex, [
+  "const OPERATOR_DOGFOOD_HEALTH_KEY = 'operator_dogfood_health'", "type: 'operator_dogfood_status'",
+  'operator_dogfood_health: operatorDogfoodHealth()',
+]), 'Relay must persist, restore, and broadcast autonomous chat-stability health');
+assert(hasAll(androidList, [
   "case 'provider_usage_snapshot':", 'normalizeProviderUsage(providerUsage)', 'Usage & limits',
   'Provider-account quotas shared by connected harnesses', 'Refresh provider usage',
   'Local estimated API-equivalent cost', 'window.pace.category', 'window.visualPercent',
@@ -531,6 +549,13 @@ assert(hasAll(webApp, [
   "title: 'Working now'", "title: 'Recent chats'", 'const sections = [workingSection, recentSection, pinnedSection',
   'workspaceLabelBySessionId', 'maintainVisibleContentPosition',
 ]), 'Both clients must render Working now, Recent chats, Pinned chats, then workspace sessions');
+assert(hasAll(webApp, [
+  'block.activity_summary === true', 'content-block-thinking-native-summary',
+  'aria-label="Codex activity summary"', '<MessageTimestamp instant={block.producer_timestamp',
+]) && hasAll(androidBubble, [
+  'block.activity_summary === true', 'CodexActivitySummaryBlock',
+  'accessibilityLabel={`Codex activity summary.', '<CollapsibleBlock maxHeight={154}',
+]), 'Web and Android must preserve typed Codex native activity summaries with timestamps and accessibility semantics');
 
 const rows = [
   ['Directory-only session grouping and persistent collapse', 'PARITY',
@@ -545,6 +570,8 @@ const rows = [
     'Both clients restore and update session health/activity and duplicate-proxy alarms; collapsed groups retain visible alerts.'],
   ['Nightly and immediate app-update drift status', 'PARITY',
     'Both clients restore nightly failures plus the latest event-driven app-update pass/fail banner with old and new versions.'],
+  ['Autonomous chat-stability program health', 'PARITY',
+    'Relay persists and broadcasts dogfood health; Web and Android fail closed on missing, stale, skipped, dropped-sample, served-asset-mismatch, or open-fingerprint state and expose trigger, build, duration, refresh, next-due, and scheduler receipts.'],
   ['Provider-account usage, pace, and estimated-cost dashboard', 'PARITY',
     'Web and Android render byte-identical provider/account normalization with raw overage truth, scoped windows, predictive pace and budgets, per-window thresholds, credits/reset credits, correlated refresh receipts, and exact filter-preserving paginated local cost detail.'],
   ['Ephemeral host resource and process dashboard', 'PARITY',
@@ -555,6 +582,8 @@ const rows = [
     'Web and Android select up to 20 capable Fleet sessions, require exact count confirmation, fan out through durable single-send semantics, and render per-session lifecycle receipts.'],
   ['Canonical structured transcript blocks', 'PARITY',
     `Both clients render all ${canonicalTypes.length} canonical block types. Android long-press copy preserves them.`],
+  ['Codex native reasoning-summary fidelity', 'PARITY',
+    'Web and Android render activity_summary thinking blocks as subdued, timestamped, source-owned Codex rows with accessible labels; long Android rows use the 44px collapse control.'],
   ['Canonical live plan/task-list surface', 'PARITY',
     'Proxy status carries the live task list as a canonical plan block; web and Android render every task and state without flattening.'],
   ['Expanded-by-default transcript content', 'PARITY',

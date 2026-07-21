@@ -1,6 +1,11 @@
 #!/usr/bin/env node
 'use strict';
 
+const {
+  TEMPORAL_DETECTION_CLASSES,
+  analyzeTemporalTrace,
+} = require('./chat-stability-temporal-contract');
+
 const DETECTION_CLASSES = Object.freeze([
   'clipped_portal',
   'horizontal_overflow',
@@ -14,6 +19,7 @@ const DETECTION_CLASSES = Object.freeze([
   'false_completion_cue',
   'populated_source_empty',
   'lost_focus_scroll',
+  ...TEMPORAL_DETECTION_CLASSES,
 ]);
 
 const HARNESS_LABELS = Object.freeze({
@@ -309,6 +315,7 @@ async function auditPage(page, options = {}) {
 module.exports = {
   DETECTION_CLASSES,
   HARNESS_LABELS,
+  analyzeTemporalTrace,
   auditDynamicStability,
   auditPage,
   staticPageAudit,

@@ -33,7 +33,7 @@
       "capability_gate": true
     },
     "codex-desktop": {
-      "fixture": "tests/fixtures/harness-revalidation/codex-desktop/26.715.4045.0.json",
+      "fixture": "tests/fixtures/harness-revalidation/codex-desktop/26.715.8383.0.json",
       "tier1": ["node", "tools/codex-desktop-validate-all.js", "--read-only"],
       "tier2": { "mode": "owned_disposable", "command": ["node", "tools/codex-desktop-validate-all.js", "--send-live"], "weekday": 6 },
       "capability_gate": true

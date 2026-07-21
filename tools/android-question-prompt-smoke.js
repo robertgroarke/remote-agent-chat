@@ -34,6 +34,12 @@ assert.match(component, /\{ action: 'cancel' \}/);
 assert.match(screen, /case 'question_prompt'/);
 assert.match(screen, /case 'question_prompt_state'/);
 assert.match(screen, /open_question_prompts/);
+assert.match(screen, /\['open', 'submitting'\]\.includes\(prompt\.lifecycle\)/,
+  'Android reconnect restore must exclude retained terminal question prompts');
+assert.match(screen, /previous\?\.type === 'question_prompt'/,
+  'Android reconnect omission must retain an unresolved first-class question');
+assert.match(screen, /\['open', 'submitting'\]\.includes\(previous\.lifecycle\)/,
+  'Android question latch must be limited to unresolved lifecycle states');
 assert.match(screen, /\['permission_response', 'question_response'\]\.includes\(msg\.command\)/);
 assert.match(screen, /respondToPermission\(sessionId, promptId, choiceId, details, prompt\)/);
 assert.match(screen, /prev\?\.prompt_id !== msg\.prompt_id \|\| prev\?\.generation !== msg\.generation/);

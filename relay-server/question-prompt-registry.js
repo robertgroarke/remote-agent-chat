@@ -168,6 +168,27 @@ class QuestionPromptRegistry {
       .map(publicView);
   }
 
+  migrateSession(aliasSessionId, canonicalSessionId) {
+    if (!aliasSessionId || !canonicalSessionId || aliasSessionId === canonicalSessionId) return 0;
+    let migrated = 0;
+    for (const [key, entry] of [...this.entries]) {
+      if (entry.prompt.session_id !== aliasSessionId) continue;
+      const destinationKey = keyFor(canonicalSessionId, entry.prompt.prompt_id);
+      const existing = this.entries.get(destinationKey);
+      this.entries.delete(key);
+      if (existing) {
+        if (existing.prompt.generation !== entry.prompt.generation) continue;
+        const rank = lifecycle => ['open', 'submitting', 'failed', 'expired', 'cancelled', 'answered', 'auto_resolved']
+          .indexOf(lifecycle);
+        if (rank(entry.lifecycle) <= rank(existing.lifecycle)) continue;
+      }
+      entry.prompt = { ...entry.prompt, session_id: canonicalSessionId };
+      this.entries.set(destinationKey, entry);
+      migrated += 1;
+    }
+    return migrated;
+  }
+
   claim(rawResponse) {
     const sessionId = typeof rawResponse?.session_id === 'string' ? rawResponse.session_id : '';
     const promptId = typeof rawResponse?.prompt_id === 'string' ? rawResponse.prompt_id : '';

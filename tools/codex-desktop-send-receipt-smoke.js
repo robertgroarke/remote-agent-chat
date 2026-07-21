@@ -3,6 +3,7 @@
 
 const assert = require('assert');
 const selectors = require('../agent-proxy/selectors');
+const { ProxyEngine } = require('../agent-proxy/proxy-engine');
 
 function runtimeFixture(state, prompt) {
   return {
@@ -104,6 +105,28 @@ async function runRotatedClientCase() {
   assert.deepStrictEqual(result, { ok: true, method: 'cdp_input_enter_confirmed' });
 }
 
+async function runThreadTargetGateCases() {
+  const engine = Object.create(ProxyEngine.prototype);
+  const session = {
+    _activeThreadKey: 'local:019f0000-0000-7000-8000-000000000001',
+  };
+  engine._readCodexDesktopActiveThread = async () => 'local:019f0000-0000-7000-8000-000000000001';
+  assert.deepStrictEqual(
+    await engine._verifyCodexDesktopSendTarget('fixture-session', session),
+    { ok: true, active_thread_key: 'local:019f0000-0000-7000-8000-000000000001' },
+  );
+
+  engine._readCodexDesktopActiveThread = async () => 'local:019f0000-0000-7000-8000-000000000002';
+  const mismatch = await engine._verifyCodexDesktopSendTarget('fixture-session', session);
+  assert.strictEqual(mismatch.ok, false);
+  assert.strictEqual(mismatch.code, 'codex_desktop_thread_not_open');
+  assert.match(mismatch.detail, /Open this thread in Codex Desktop/);
+
+  const missing = await engine._verifyCodexDesktopSendTarget('fixture-session', {});
+  assert.strictEqual(missing.ok, false);
+  assert.strictEqual(missing.code, 'codex_desktop_thread_not_open');
+}
+
 (async () => {
   const delivered = await runCase('delivered', true);
   assert.deepStrictEqual(delivered, { ok: true, method: 'cdp_input_enter_confirmed' });
@@ -117,6 +140,7 @@ async function runRotatedClientCase() {
   assert.strictEqual(ambiguous.baseline_matches, 0);
 
   await runRotatedClientCase();
+  await runThreadTargetGateCases();
 
   const unsupported = await selectors.sendCodexDesktopTrustedInput(
     {},

@@ -1,0 +1,44 @@
+{
+  "client_version": "0.144.6",
+  "thread_id": "00000000-0000-4000-8000-000000000201",
+  "turn_id": "00000000-0000-4000-8000-000000000202",
+  "notifications": [
+    {
+      "method": "item/reasoning/summaryTextDelta",
+      "params": {
+        "threadId": "00000000-0000-4000-8000-000000000201",
+        "turnId": "00000000-0000-4000-8000-000000000202",
+        "itemId": "reasoning-fixture",
+        "summaryIndex": 0,
+        "delta": "Checking the fixture."
+      }
+    },
+    {
+      "method": "item/commandExecution/outputDelta",
+      "params": {
+        "threadId": "00000000-0000-4000-8000-000000000201",
+        "turnId": "00000000-0000-4000-8000-000000000202",
+        "itemId": "command-fixture",
+        "delta": "validation passed\n"
+      }
+    },
+    {
+      "method": "item/agentMessage/delta",
+      "params": {
+        "threadId": "00000000-0000-4000-8000-000000000201",
+        "turnId": "00000000-0000-4000-8000-000000000202",
+        "itemId": "message-fixture",
+        "delta": "Headless streamed "
+      }
+    },
+    {
+      "method": "item/agentMessage/delta",
+      "params": {
+        "threadId": "00000000-0000-4000-8000-000000000201",
+        "turnId": "00000000-0000-4000-8000-000000000202",
+        "itemId": "message-fixture",
+        "delta": "answer."
+      }
+    }
+  ]
+}

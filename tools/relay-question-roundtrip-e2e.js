@@ -529,6 +529,11 @@ function directoryContains(root, needle) {
       && message.lifecycle === 'failed'
     ));
     assert.strictEqual(failedAfterDisconnect.error_code, 'adapter_disconnected_during_submit');
+    const browserAfterFailedPrompt = await openBrowser(port);
+    sockets.push(browserAfterFailedPrompt.ws);
+    assert.ok(!(browserAfterFailedPrompt.ack.open_question_prompts || []).some(item => (
+      item.prompt_id === disconnectAfterSubmitPrompt.prompt_id
+    )), 'connection_ack must not restore a retained terminal question prompt');
 
     const proxyAfterDisconnect = await authenticateProxy(port, proxySecret, 'question-e2e-proxy');
     sockets.push(proxyAfterDisconnect.ws);

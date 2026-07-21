@@ -35,7 +35,12 @@ import {
   normalizeTranscriptTimestamps,
   parseMessageInstant,
 } from '../lib/message-time';
-import { getCachedTranscript, setCachedTranscript, stableTranscriptMessageKey } from '../lib/transcript-cache';
+import {
+  getCachedTranscript,
+  migrateCachedTranscript,
+  setCachedTranscript,
+  stableTranscriptMessageKey,
+} from '../lib/transcript-cache';
 import {
   clearPromptAttentionFeedback,
   notePromptForAttentionFeedback,
@@ -200,6 +205,11 @@ export default function ChatScreen({ route, navigation }) {
   const stateSequenceGateRef = useRef(createStateSequenceGate());
   const flatListRef     = useRef(null);
   const inputRef        = useRef(null);
+  const messagesValueRef = useRef(messages);
+  const composerDraftRef = useRef(input);
+  const routeParamsRef = useRef(route.params);
+  const routeSessionRef = useRef(routeSession);
+  const sessionMetaRef = useRef(sessionMeta);
   const sendTimer       = useRef(null);
   const deliveryStageTimers = useRef({});
   const deliveryRecords = useRef({});
@@ -225,6 +235,11 @@ export default function ChatScreen({ route, navigation }) {
   const interruptPendingRef = useRef('');
   const goalControlPendingRef = useRef('');
   const pendingGoalSlashControlRef = useRef(null);
+  messagesValueRef.current = messages;
+  composerDraftRef.current = input;
+  routeParamsRef.current = route.params;
+  routeSessionRef.current = routeSession;
+  sessionMetaRef.current = sessionMeta;
 
   function publishProvisionalStream(stream) {
     provisionalStreamRef.current = stream;
@@ -558,6 +573,41 @@ export default function ChatScreen({ route, navigation }) {
         : '';
     if (stateKey && !stateSequenceGateRef.current.accept(msg, stateKey)) return;
     switch (msg.type) {
+      case 'session_alias_reconciled': {
+        const aliasId = String(msg.alias_session_id || '').trim();
+        const canonicalId = String(msg.canonical_session_id || '').trim();
+        if (!aliasId || !canonicalId || aliasId !== sessionId || aliasId === canonicalId) break;
+        const migratedMessages = migrateCachedTranscript(aliasId, canonicalId);
+        if (migratedMessages.length === 0 && messagesSessionIdRef.current === aliasId) {
+          setCachedTranscript(canonicalId, messagesValueRef.current);
+        }
+        messagesSessionIdRef.current = canonicalId;
+        draftLoadedRef.current = false;
+        const aliasDraftKey = `${DRAFT_STORAGE_PREFIX}${aliasId}`;
+        const canonicalDraftKey = `${DRAFT_STORAGE_PREFIX}${canonicalId}`;
+        Promise.all([
+          AsyncStorage.getItem(aliasDraftKey).catch(() => null),
+          AsyncStorage.getItem(canonicalDraftKey).catch(() => null),
+        ]).then(([aliasDraft, canonicalDraft]) => {
+          const retainedDraft = composerDraftRef.current || canonicalDraft || aliasDraft || '';
+          const persist = retainedDraft
+            ? AsyncStorage.setItem(canonicalDraftKey, retainedDraft)
+            : AsyncStorage.removeItem(canonicalDraftKey);
+          return Promise.all([persist, AsyncStorage.removeItem(aliasDraftKey)]);
+        }).catch(() => {});
+        navigation.replace('Chat', {
+          ...routeParamsRef.current,
+          sessionId: canonicalId,
+          session: {
+            ...(routeSessionRef.current && typeof routeSessionRef.current === 'object' ? routeSessionRef.current : {}),
+            ...(sessionMetaRef.current && typeof sessionMetaRef.current === 'object' ? sessionMetaRef.current : {}),
+            session_id: canonicalId,
+            canonical_session_id: canonicalId,
+          },
+        });
+        break;
+      }
+
       case '_connected':
         setConnected(true);
         setReconnectInfo(null);
@@ -945,12 +995,27 @@ export default function ChatScreen({ route, navigation }) {
         ));
         if (session) mergeSessionMetadata(session);
         const openPermission = (msg.open_question_prompts || [])
+          .filter(prompt => !prompt.lifecycle || ['open', 'submitting'].includes(prompt.lifecycle))
           .find(prompt => (prompt.session_id || prompt.session) === sessionId)
           || (msg.open_prompts || []).find(prompt => (prompt.session_id || prompt.session) === sessionId);
         const openError = (msg.open_error_prompts || [])
           .find(prompt => (prompt.session_id || prompt.session) === sessionId);
         if (openPermission) rememberPromptForAttentionFeedback(openPermission);
-        setPermPrompt(openPermission ? { ...openPermission, received_at: Date.now() } : null);
+        setPermPrompt(previous => {
+          if (openPermission) {
+            const samePrompt = previous?.prompt_id === openPermission.prompt_id
+              && previous?.generation === openPermission.generation;
+            return {
+              ...(samePrompt ? previous : {}),
+              ...openPermission,
+              received_at: samePrompt ? previous.received_at : Date.now(),
+            };
+          }
+          return previous?.type === 'question_prompt'
+              && (!previous.lifecycle || ['open', 'submitting'].includes(previous.lifecycle))
+            ? previous
+            : null;
+        });
         setErrorPrompt(openError ? { ...openError, received_at: Date.now() } : null);
         if (msg.agent_configs && msg.agent_configs[sessionId]) {
           setAgentConfig(msg.agent_configs[sessionId]);

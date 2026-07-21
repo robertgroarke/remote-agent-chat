@@ -1505,6 +1505,18 @@ body {
   font-family: 'Cascadia Code', 'SF Mono', Consolas, monospace;
 }
 
+/* A background tail refresh is transient status, not transcript content. Keep
+   it out of the scroll flow so reconnect/rehydrate cannot move the operator's
+   logical anchor while the banner mounts and settles. */
+.messages > .history-refresh-banner {
+  position: absolute;
+  z-index: 4;
+  top: 8px;
+  left: 50%;
+  margin: 0;
+  transform: translateX(-50%);
+}
+
 .history-tail-banner button {
   border: 1px solid var(--border2);
   background: var(--bg3);
@@ -1863,6 +1875,15 @@ body {
   contain-intrinsic-block-size: auto 96px;
 }
 
+/* Windowing already bounds large transcripts to a small overscan range. Let
+   those mounted rows keep their measured height even while just outside the
+   viewport; content-visibility's intrinsic fallback otherwise alternates with
+   the real height at a range boundary and makes anchor correction oscillate. */
+.messages[data-transcript-windowed="true"] .message.transcript-virtual-row {
+  content-visibility: visible;
+  contain-intrinsic-block-size: none;
+}
+
 .message-role {
   display: flex;
   flex-wrap: wrap;
@@ -2038,6 +2059,12 @@ body {
 .delivery.delivered { color: var(--green); }
 .delivery.agent-started { color: var(--green); font-weight: 600; }
 .delivery.failed    { color: var(--red); font-weight: 600; display: inline-flex; align-items: center; gap: 5px; }
+.delivery-failure-reason {
+  max-width: min(34ch, 42vw);
+  overflow-wrap: anywhere;
+  line-height: 1.25;
+  letter-spacing: 0;
+}
 .delivery-retry {
   appearance: none;
   border: 1px solid color-mix(in srgb, var(--red) 45%, transparent);
@@ -5740,6 +5767,16 @@ select.new-session-workspace option { background: var(--bg2); color: var(--text)
   .permission-overlay .permission-question-cancel,
   .permission-overlay .permission-question-text-input,
   .permission-overlay .permission-other-input { min-height: 44px; }
+  .permission-overlay {
+    flex: 0 1 auto;
+    min-height: 0;
+    max-height: calc(100% - 8px);
+  }
+  .permission-card {
+    max-height: 100%;
+    overflow-y: auto;
+    overscroll-behavior: contain;
+  }
   .session-card-close {
     min-height: 44px;
     min-width: 44px;
@@ -8551,6 +8588,43 @@ select.new-session-workspace option { background: var(--bg2); color: var(--text)
   color: var(--harness-text);
   font-style: normal;
 }
+.harness-theme .content-block-thinking-native-summary {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-start;
+  min-width: 0;
+  max-width: 100%;
+  margin: 4px 0 7px;
+  padding: 0;
+  border: 0;
+  background: transparent;
+  color: var(--harness-muted);
+  font-size: var(--harness-body-size);
+  font-weight: 400;
+  font-style: normal;
+  line-height: var(--harness-body-line);
+  overflow-wrap: anywhere;
+  word-break: normal;
+}
+.harness-theme .content-block-thinking-native-summary-copy,
+.harness-theme .content-block-thinking-native-summary-copy .message-body,
+.harness-theme .content-block-thinking-native-summary-copy .message-body > :first-child {
+  min-width: 0;
+  max-width: 100%;
+  margin-top: 0;
+  color: inherit;
+  font: inherit;
+  overflow-wrap: anywhere;
+}
+.harness-theme .content-block-thinking-native-summary-copy .message-body > :last-child {
+  margin-bottom: 0;
+}
+.harness-theme .content-block-thinking-native-summary .message-timestamp {
+  margin-top: 2px;
+  color: inherit;
+  font-size: max(11px, calc(var(--harness-body-size) - 2px));
+  line-height: 1.35;
+}
 /* Claude CLI 2.1.207 renders active thinking as an unboxed orange spinner
    verb (for example, "✻ Hatching…") on the terminal background. Keep the
    retained reasoning body readable while removing the shared disclosure rail
@@ -9009,6 +9083,13 @@ select.new-session-workspace option { background: var(--bg2); color: var(--text)
 }
 .revalidation-ledger-summary,
 .revalidation-ledger-empty { margin: 0; padding: 11px 14px; color: var(--text2); font-size: 12px; line-height: 1.5; }
+.operator-dogfood-health { margin: 0 14px 12px; padding: 12px; border: 1px solid var(--border); border-radius: 8px; background: var(--bg2); }
+.operator-dogfood-health h3 { margin: 0 0 6px; font-size: 13px; color: inherit; }
+.operator-dogfood-health p { margin: 0 0 9px; color: var(--text2); font-size: 11px; line-height: 1.45; overflow-wrap: anywhere; }
+.operator-dogfood-health dl { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 7px 12px; margin: 0; }
+.operator-dogfood-health dl div { min-width: 0; }
+.operator-dogfood-health dt { color: var(--text3); font-size: 10px; text-transform: uppercase; letter-spacing: .04em; }
+.operator-dogfood-health dd { margin: 2px 0 0; color: var(--text); font-size: 11px; overflow-wrap: anywhere; }
 .revalidation-ledger-table-wrap { max-height: calc(min(84vh, 760px) - 92px); overflow: auto; }
 .revalidation-ledger-table { width: 100%; border-collapse: collapse; font-size: 11px; }
 .revalidation-ledger-table th,
@@ -9019,6 +9100,8 @@ select.new-session-workspace option { background: var(--bg2); color: var(--text)
 .validation-state-fail,
 .validation-state-missing { color: var(--error); }
 .validation-state-gated,
+.validation-state-stale,
+.validation-state-skipped,
 .validation-state-pending,
 .validation-state-scheduled { color: var(--warning); }
 .shortcut-help-header { display: flex; align-items: center; padding: 12px 14px; border-bottom: 1px solid var(--border); }
@@ -9036,6 +9119,7 @@ select.new-session-workspace option { background: var(--bg2); color: var(--text)
   .revalidation-ledger-backdrop { padding: 18px 8px; align-items: stretch; }
   .revalidation-ledger { width: 100%; max-height: calc(100vh - 36px); }
   .revalidation-ledger-table-wrap { max-height: calc(100vh - 132px); }
+  .operator-dogfood-health dl { grid-template-columns: 1fr 1fr; }
   .quick-switcher { max-height: calc(100vh - 72px); }
   .quick-switcher-footer { gap: 8px; }
   .quick-switcher-footer span:nth-child(2) { display: none; }

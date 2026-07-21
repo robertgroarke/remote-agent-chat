@@ -12,12 +12,18 @@ const source = parseArgs(['--mode', 'source', '--run-id', 'runner-smoke', '--out
 assert.strictEqual(source.mode, 'source');
 assert.strictEqual(source.readOnly, false);
 assert.strictEqual(source.maxMinutes, 10);
+assert.strictEqual(source.publish, false);
+assert.strictEqual(source.temporalDurationMs, 5_000);
 assert.deepStrictEqual(buildPlan(source).map(step => step.id), [
   'manifest_guard',
   'manifest_guard_adversarial',
   'manifest_snapshot',
   'seeded_discovery',
   'android_parity',
+  'chat_stability_seed_contract',
+  'chat_stability_prompt_lifecycle',
+  'chat_stability_health_projection',
+  'chat_stability_temporal',
 ]);
 
 assert.throws(
@@ -42,6 +48,40 @@ assert.deepStrictEqual(
   ['--source-root', path.join(ROOT, 'exact-source'), '--env-root', path.join(ROOT, 'exact-env')],
   'post-deploy asset identity did not use the explicit clean source and environment roots',
 );
+
+const canary = parseArgs([
+  '--mode', 'canary', '--read-only', '--no-publish', '--run-id', 'canary-smoke',
+  '--output-dir', path.join(ROOT, 'tmp-canary'), '--trigger-source', 'scheduled_task',
+]);
+assert.strictEqual(canary.maxMinutes, 5);
+assert.strictEqual(canary.temporalDurationMs, 120_000);
+assert.strictEqual(canary.triggerSource, 'scheduled_task');
+assert.deepStrictEqual(buildPlan(canary).map(step => step.id), [
+  'manifest_guard',
+  'manifest_guard_adversarial',
+  'manifest_snapshot',
+  'chat_stability_seed_contract',
+  'chat_stability_prompt_lifecycle',
+  'chat_stability_health_projection',
+  'chat_stability_temporal',
+  'production_asset_identity',
+]);
+
+const weekly = parseArgs([
+  '--mode', 'weekly', '--read-only', '--no-publish', '--run-id', 'weekly-smoke',
+  '--output-dir', path.join(ROOT, 'tmp-weekly'),
+]);
+assert.strictEqual(weekly.temporalDurationMs, 2 * 60 * 60 * 1000);
+assert.deepStrictEqual(buildPlan(weekly).map(step => step.id), [
+  'manifest_guard',
+  'manifest_guard_adversarial',
+  'manifest_snapshot',
+  'chat_stability_seed_contract',
+  'chat_stability_prompt_lifecycle',
+  'chat_stability_health_projection',
+  'chat_stability_temporal',
+  'production_asset_identity',
+]);
 assert.deepStrictEqual(
   buildPlan(postDeploy).find(step => step.id === 'production_passive_surface').args.slice(0, 5),
   ['--read-only-production', '--env-root', path.join(ROOT, 'exact-env'), '--source-root', path.join(ROOT, 'exact-source')],
@@ -67,6 +107,9 @@ assert.strictEqual(selected[selected.length - 1], images[images.length - 1]);
 const runnerSource = fs.readFileSync(path.join(ROOT, 'tools', 'operator-dogfood.js'), 'utf8');
 const passiveSource = fs.readFileSync(path.join(ROOT, 'tools', 'operator-dogfood-production-passive-e2e.js'), 'utf8');
 assert(runnerSource.includes('windowsHide: true'), 'child tools must remain hidden');
+assert(runnerSource.includes('chat_stability_temporal'), 'dogfood plan must execute the temporal canary');
+assert(runnerSource.includes('chat_stability_prompt_lifecycle'), 'dogfood plan must exercise answer, cancel, and interrupt headlessly');
+assert(runnerSource.includes('acquireDogfoodLocks'), 'dogfood plan must coordinate with production operations');
 assert(runnerSource.includes("options.mode !== 'source' && !options.readOnly"), 'production modes must fail closed');
 assert(runnerSource.includes('manifest_rows_visited_in_built_ui: 0'), 'source runs must not overclaim built coverage');
 assert(runnerSource.includes("production_mutations: 0"), 'runner evidence must declare the production mutation count');

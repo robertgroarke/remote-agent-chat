@@ -31,6 +31,7 @@ const SURFACES = ['web', 'android'];
 function parseArgs(argv) {
   const options = {
     updateGoldens: false,
+    replaceGoldens: false,
     outputDir: DEFAULT_OUTPUT_DIR,
     goldenDir: GOLDEN_DIR,
     resultFile: freshEvidencePath(ROOT, 'question-presenter-visual-regression.json'),
@@ -38,6 +39,10 @@ function parseArgs(argv) {
   for (let index = 0; index < argv.length; index += 1) {
     const arg = argv[index];
     if (arg === '--update-goldens') options.updateGoldens = true;
+    else if (arg === '--replace-goldens') {
+      options.updateGoldens = true;
+      options.replaceGoldens = true;
+    }
     else if (arg === '--output-dir' && argv[index + 1]) options.outputDir = path.resolve(argv[++index]);
     else if (arg === '--golden-dir' && argv[index + 1]) options.goldenDir = path.resolve(argv[++index]);
     else if (arg === '--result-file' && argv[index + 1]) options.resultFile = path.resolve(argv[++index]);
@@ -204,6 +209,12 @@ async function geometry(page, surface, viewportName) {
       viewport: { width: innerWidth, height: innerHeight },
       document_horizontal_overflow_px: Math.max(0, document.documentElement.scrollWidth - innerWidth),
       root_horizontal_overflow_px: root ? Math.max(0, root.scrollWidth - root.clientWidth) : null,
+      transcript_scroll_top: document.querySelector('.messages')?.scrollTop ?? null,
+      transcript_bounds: (() => {
+        const bounds = document.querySelector('.messages')?.getBoundingClientRect();
+        return bounds ? { x: bounds.x, y: bounds.y, width: bounds.width, height: bounds.height } : null;
+      })(),
+      active_element: document.activeElement?.className || document.activeElement?.tagName || null,
       mobile_prompt_not_clipped: !mobile || (rect?.y || 0) >= 80,
       radio_count: root?.querySelectorAll('[role="radio"]').length || 0,
       checkbox_count: root?.querySelectorAll('[role="checkbox"]').length || 0,
@@ -389,7 +400,8 @@ async function main(argv = process.argv.slice(2)) {
           assert.strictEqual(metrics.dialog_role, true);
           assert.strictEqual(metrics.document_horizontal_overflow_px, 0);
           assert.strictEqual(metrics.root_horizontal_overflow_px, 0);
-          assert.strictEqual(metrics.mobile_prompt_not_clipped, true);
+          assert.strictEqual(metrics.mobile_prompt_not_clipped, true,
+            `${surface}/${viewportName}/${theme} prompt geometry: ${JSON.stringify(metrics)}`);
           assert.strictEqual(metrics.radio_count, 3);
           assert.strictEqual(metrics.checkbox_count, 2);
           assert.strictEqual(metrics.selected_count, 3);
@@ -402,12 +414,23 @@ async function main(argv = process.argv.slice(2)) {
           const goldenPath = path.join(options.goldenDir, name);
           const diffPath = path.join(options.outputDir, 'diff', name);
           fs.mkdirSync(path.dirname(actualPath), { recursive: true });
-          await page.screenshot({ path: actualPath, fullPage: false, animations: 'disabled' });
+          const captureRoot = page.locator(surface === 'web'
+            ? '.permission-card'
+            : '[data-question-presenter="android"]');
+          if (surface === 'web') {
+            await captureRoot.evaluate(node => { node.scrollTop = 0; });
+          }
+          await captureRoot.screenshot({ path: actualPath, animations: 'disabled' });
           const png = PNG.sync.read(fs.readFileSync(actualPath));
-          assert.deepStrictEqual([png.width, png.height], [viewport.width, viewport.height]);
+          assert.deepStrictEqual(
+            [png.width, png.height],
+            [Math.ceil(metrics.root_bounds.width), Math.ceil(metrics.root_bounds.height)],
+            'component capture dimensions must match the measured question presenter',
+          );
           let comparison;
           if (options.updateGoldens) {
-            assert(!fs.existsSync(goldenPath), `Refusing to overwrite approved golden: ${goldenPath}`);
+            assert(options.replaceGoldens || !fs.existsSync(goldenPath),
+              `Refusing to overwrite approved golden without --replace-goldens: ${goldenPath}`);
             fs.mkdirSync(path.dirname(goldenPath), { recursive: true });
             fs.copyFileSync(actualPath, goldenPath);
             comparison = { status: 'created', different: 0, ratio: 0 };

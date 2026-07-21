@@ -124,6 +124,22 @@ assert.strictEqual(prompt.questions[0].choices.at(-1).requires_text, true);
 assert.ok(!JSON.stringify(prompt).includes('connection-request-47'), 'connection request ID leaked into canonical prompt');
 assert.deepStrictEqual(canonicalQuestionPrompt(prompt), prompt, 'canonical prompt normalization must be idempotent');
 
+const replayPrompt = bridge.open({ ...nativeRequest, id: 'connection-request-48' });
+assert.strictEqual(replayPrompt, prompt, 'same-connection replay must retain the canonical prompt object');
+const reconnectBridge = new CodexQuestionBridge({
+  sessionId: 'codex-cli-session',
+  surface: 'codex_cli',
+  version: codexCliVersion,
+  connectionGeneration: 'connection-generation-reconnected',
+  now: () => Date.parse('2026-07-15T12:01:00.000Z'),
+});
+const reconnectPrompt = reconnectBridge.open({ ...nativeRequest, id: 'connection-request-reconnected' });
+assert.strictEqual(reconnectPrompt.prompt_id, prompt.prompt_id,
+  'transport reconnect must not re-key the same native question');
+assert.strictEqual(reconnectPrompt.generation, prompt.generation,
+  'transport reconnect must not change the same native question generation');
+assert.strictEqual(reconnectPrompt.observed_at, '2026-07-15T12:01:00.000Z');
+
 const staging = prompt.questions[0].choices.find(choice => choice.label === 'Staging');
 const canonical = canonicalQuestionResponse(prompt, {
   prompt_id: prompt.prompt_id,
@@ -138,7 +154,7 @@ const receipt = publicQuestionResponse(canonical);
 assert.ok(!JSON.stringify(receipt).includes('secret-value-that-must-not-leak'));
 const nativeResponse = bridge.buildResponse(canonical);
 assert.deepStrictEqual(nativeResponse, {
-  id: 'connection-request-47',
+  id: 'connection-request-48',
   result: {
     answers: {
       deploy: { answers: ['Staging'] },
@@ -160,6 +176,10 @@ const stalePrompt = staleBridge.open({
   id: 99,
   params: { ...nativeRequest.params, autoResolutionMs: null, questions: [nativeRequest.params.questions[0]] },
 });
+assert.notStrictEqual(stalePrompt.prompt_id, prompt.prompt_id,
+  'a semantically different native question must receive a distinct prompt identity');
+assert.notStrictEqual(stalePrompt.generation, prompt.generation,
+  'a semantically different native question must receive a distinct generation');
 const staleChoice = stalePrompt.questions[0].choices[0];
 expectCode(() => staleBridge.buildResponse({
   prompt_id: stalePrompt.prompt_id,

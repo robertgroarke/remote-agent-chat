@@ -28,6 +28,9 @@ for (const [label, marker] of [
   ['focused prompt shortcut scope', "closest?.('.permission-card')"],
   ['neutral document shortcut scope', 'neutralPromptShortcutTarget'],
   ['blocked composer send guard', 'if (activeBlockingPrompt) return;'],
+  ['stable prompt semantic continuity key', 'promptContinuityKey(activeSession, activePrompt)'],
+  ['stable prompt scroll guard', 'if (continuous) return;'],
+  ['short prompt omission continuity', 'state.lastClearedSemanticKey === activePromptContinuityKey'],
   ['number accessibility metadata', 'aria-keyshortcuts='],
   ['prompt dialog semantics', "aria-label={claudeActionPrompt ? 'Claude Code permission prompt' : 'Permission or question prompt'}"],
   ['discoverable unresolved keyboard help', 'return to composer'],
@@ -49,4 +52,5 @@ console.log(JSON.stringify({
   claude_escape_submits_negative_choice: true,
   unresolved_escape_preserves_prompt: true,
   accessible_hints: true,
+  stable_prompt_does_not_repeat_scroll_write: true,
 }, null, 2));

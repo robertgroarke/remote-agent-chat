@@ -1,0 +1,28 @@
+{
+  "schema_version": 1,
+  "harness": "codex-desktop",
+  "installed_version": "26.715.8383.0",
+  "captured_contract": "Desktop transcript, composer, question, goal, native stop, active-thread and persisted user-turn receipt selectors",
+  "source": "installed read-only active-thread loopback CDP probe",
+  "reader_contract": {
+    "conversation_selector": "[data-thread-find-target=\"conversation\"]",
+    "unit_selector": "[data-content-search-unit-key]",
+    "role_source": "terminal data-content-search-unit-key segment",
+    "turn_identity_source": "UUIDv7 data-content-search-unit-key prefix",
+    "observed_units": 24,
+    "observed_roles": {
+      "user": 6,
+      "assistant": 18
+    },
+    "observed_turn_keys": 6,
+    "observed_dom_messages": 34,
+    "observed_content_blocks": {
+      "markdown": 18,
+      "file_changes": 4,
+      "thinking": 6
+    },
+    "user_turn_confirmation": "new exact normalized user-message count or exact active-thread archive append",
+    "active_thread_required": true
+  },
+  "content_safe_evidence_sha256": "65109bfc327344f541bb9a996a98cbea86afe1f4b5fb4901c31e6cf30d848f20"
+}

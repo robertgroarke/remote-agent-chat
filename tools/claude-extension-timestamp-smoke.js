@@ -2,6 +2,8 @@
 'use strict';
 
 const assert = require('assert');
+const fs = require('fs');
+const path = require('path');
 const {
   ProxyEngine,
   CLAUDE_EXTENSION_OBSERVED_SOURCE,
@@ -10,6 +12,16 @@ const {
 const SESSION_ID = 'claude-extension-timestamp-fixture';
 const FIRST_OBSERVED_MS = Date.parse('2026-07-20T20:00:00.000Z');
 const engine = Object.create(ProxyEngine.prototype);
+const proxySource = fs.readFileSync(path.resolve(__dirname, '../agent-proxy/proxy-engine.js'), 'utf8');
+
+assert(proxySource.includes("if (session.agentType === 'claude' && Array.isArray(session._accumulatedMessages))"),
+  'Claude polling must assign observations on the accumulated read path');
+assert(proxySource.includes('force: cursorObservation?.newlyObserved > 0 || claudeObservation?.newlyObserved > 0'),
+  'new Claude observations must force durable session-store persistence');
+assert(proxySource.includes("if (agentType === 'claude' && initialMsgs.length > 0)"),
+  'Claude initial discovery must assign observations before its first history snapshot');
+assert(proxySource.includes('sessionStore.flushPendingSaves();'),
+  'Claude observed instants must survive a proxy restart');
 
 const initial = engine._prepareClaudeMessageObservations(SESSION_ID, [
   { role: 'user', content: 'Inspect the current tree.' },
@@ -75,5 +87,8 @@ console.log(JSON.stringify({
   stable_stream_growth: true,
   stable_proxy_restart: true,
   non_decreasing: true,
+  poll_path_wired: true,
+  initial_discovery_wired: true,
+  durable_store_flush_wired: true,
   native_dom_timestamp_identity_available: false,
 }, null, 2));

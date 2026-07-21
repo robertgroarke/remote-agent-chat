@@ -1,6 +1,6 @@
 {
   "schema_version": 1,
-  "updated_at": "2026-07-15",
+  "updated_at": "2026-07-21",
   "scope": "Complete built Remote Agent Chat Web and Android operator surface inventory",
   "required_matrix": {
     "web_viewports": ["1440x900", "390x844"],
@@ -13,7 +13,9 @@
       "empty", "loading", "ready", "working", "thinking", "streaming", "tool", "command", "diff",
       "question", "permission", "blocked", "error", "rate_limited", "offline", "reconnecting",
       "interrupted", "ordinary_turn_terminal", "goal_active", "goal_paused", "goal_completed",
-      "stale", "long_history", "high_session_count", "unicode_rtl", "unavailable"
+      "stale", "long_history", "high_session_count", "unicode_rtl", "unavailable",
+      "temporal_stability", "paused_without_prompt", "genuine_prompt_once",
+      "canonical_owner_collision", "program_health_stale", "program_health_skipped"
     ]
   },
   "surfaces": [
@@ -28,7 +30,7 @@
       "parity_partner": "android.session_list",
       "evidence_status": "PENDING",
       "states": ["empty", "loading", "ready", "working", "attention", "offline", "pinned", "archived_filter", "test_filter", "high_session_count", "unicode_rtl"],
-      "source_files": ["frontend/app.jsx"],
+      "source_files": ["frontend/app.jsx", "frontend/hooks.jsx"],
       "discovery": { "web_toggles": ["showTestSessions"] }
     },
     {
@@ -41,7 +43,7 @@
       "mutation_mode": "mixed_guarded",
       "parity_partner": "android.chat",
       "evidence_status": "PENDING",
-      "states": ["empty", "loading", "ready", "streaming", "tool", "command", "diff", "partial_history", "live_draft", "queued", "offline_queue", "interrupted", "goal_active", "goal_paused", "goal_completed", "long_history"],
+      "states": ["empty", "loading", "ready", "streaming", "tool", "command", "diff", "partial_history", "live_draft", "queued", "offline_queue", "interrupted", "goal_active", "goal_paused", "goal_completed", "long_history", "temporal_stability", "paused_without_prompt", "genuine_prompt_once", "canonical_owner_collision"],
       "source_files": ["frontend/app.jsx", "frontend/hooks.jsx"],
       "discovery": { "web_toggles": ["showJumpButton"] }
     },
@@ -421,8 +423,8 @@
       "mutation_mode": "source_fixture",
       "parity_partner": "android.session_list",
       "evidence_status": "PENDING",
-      "states": ["duplicate_proxy", "validation_failure", "update_pass", "update_fail", "reconnecting", "offline", "rate_limited", "recovered"],
-      "source_files": ["frontend/app.jsx"],
+      "states": ["duplicate_proxy", "validation_failure", "update_pass", "update_fail", "reconnecting", "offline", "rate_limited", "recovered", "chat_stability_fail", "chat_stability_stale", "chat_stability_skipped"],
+      "source_files": ["frontend/app.jsx", "frontend/hooks.jsx"],
       "discovery": {}
     },
     {
@@ -460,13 +462,13 @@
       "kind": "route",
       "owner_component": "SessionListScreen",
       "entry_action": "Open the authenticated app root",
-      "fixture": "Same fleet/title/status/pin/mute/offline/high-count fixtures as Web sidebar",
+      "fixture": "Same fleet/title/status/pin/mute/offline/high-count fixtures as Web sidebar plus fail-closed autonomous program-health states",
       "mutation_mode": "mixed_guarded",
       "parity_partner": "web.sidebar",
       "evidence_status": "PENDING",
-      "states": ["loading", "empty", "ready", "working", "attention", "offline", "history", "test_filter", "high_session_count", "unicode_rtl"],
+      "states": ["loading", "empty", "ready", "working", "attention", "offline", "history", "test_filter", "high_session_count", "unicode_rtl", "chat_stability_fail", "chat_stability_stale", "chat_stability_skipped"],
       "source_files": ["android-app/App.jsx", "android-app/screens/SessionListScreen.jsx"],
-      "discovery": { "android_routes": ["SessionList"], "android_toggles": ["showTestSessions"] }
+      "discovery": { "android_routes": ["SessionList"], "android_toggles": ["showTestSessions", "showValidationHealth"] }
     },
     {
       "id": "android.chat",
@@ -478,7 +480,7 @@
       "mutation_mode": "mixed_guarded",
       "parity_partner": "web.chat",
       "evidence_status": "PENDING",
-      "states": ["loading", "empty", "ready", "streaming", "tool", "command", "diff", "queued", "offline_queue", "prompt", "goal", "long_history", "jump_button"],
+      "states": ["loading", "empty", "ready", "streaming", "tool", "command", "diff", "queued", "offline_queue", "prompt", "goal", "long_history", "jump_button", "temporal_stability", "paused_without_prompt", "genuine_prompt_once", "canonical_owner_collision"],
       "source_files": ["android-app/App.jsx", "android-app/screens/ChatScreen.jsx"],
       "discovery": { "android_routes": ["Chat"], "android_toggles": ["showJumpBtn"] }
     },
@@ -534,8 +536,8 @@
       "mutation_mode": "disposable_only",
       "parity_partner": "web.semantic_toasts",
       "evidence_status": "SOURCE_ONLY",
-      "states": ["goal_attention", "goal_completed", "disabled", "muted", "duplicate", "focused_suppressed", "background", "turn_finished_gated"],
-      "source_files": ["android-app/App.jsx", "android-app/lib/semantic-notifications.js"],
+      "states": ["goal_attention", "goal_completed", "disabled", "muted", "duplicate", "focused_suppressed", "background", "turn_finished_gated", "chat_stability_fail", "chat_stability_stale", "chat_stability_skipped"],
+      "source_files": ["android-app/App.jsx", "android-app/lib/semantic-notifications.js", "android-app/screens/SessionListScreen.jsx"],
       "discovery": { "android_components": ["NotificationBanner"] }
     },
     {

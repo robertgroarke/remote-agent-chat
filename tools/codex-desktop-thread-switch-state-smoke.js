@@ -54,6 +54,7 @@ async function main() {
       cdpPorts: [],
       relayUrl: 'ws://127.0.0.1:1/proxy-ws',
     });
+    engine._validationGateForAgentType = () => ({ gated: false });
     const sessionId = 'codex-desktop-switch-state-smoke';
     const session = {
       agentType: 'codex-desktop',
@@ -81,9 +82,11 @@ async function main() {
       request_id: 'switch-state-fixture',
       thread_id: targetThread,
     });
-    await waitFor(() => relayed.find(message =>
+    const controlResult = await waitFor(() => relayed.find(message =>
       message.type === 'agent_control_result'
       && message.request_id === 'switch-state-fixture'));
+    assert.strictEqual(controlResult.result, 'ok',
+      `thread switch failed before state reconciliation: ${JSON.stringify(controlResult)}`);
 
     assert.strictEqual(session._activeThreadKey, targetThread);
     assert.strictEqual(session.codexDesktopActiveThreadKey, targetThread);

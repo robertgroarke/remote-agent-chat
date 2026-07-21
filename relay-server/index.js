@@ -70,6 +70,7 @@ const { ProviderUsageAuthority, matchingSessionIds } = require('./provider-usage
 const { ScheduledSendStore } = require('./scheduled-sends');
 const { pruneDirectory } = require('./storage-retention');
 const { GoalNotificationCoordinator } = require('./goal-notifications');
+const { SessionAliasReconciler } = require('./session-alias-reconciler');
 const { ExactlyOnceControlRegistry } = require('./exactly-once-control');
 const {
   NavigationEpochRegistry,
@@ -403,7 +404,7 @@ function getOrCreateVapidKeys() {
 
 const vapidKeys = getOrCreateVapidKeys();
 webpush.setVapidDetails(
-  'mailto:notifications@your-server',
+  process.env.VAPID_CONTACT || 'mailto:notifications@your-server',
   vapidKeys.publicKey,
   vapidKeys.privateKey,
 );
@@ -412,6 +413,7 @@ const NIGHTLY_VALIDATION_HARNESSES = new Set([
   'antigravity-v2', 'claude-cli', 'claude', 'codex-cli', 'codex-desktop', 'codex', 'continue',
   'cursor-cli', 'cursor', 'native-golden-approval', 'performance-budgets', 'production-block-inventory',
   'production-overnight-runner', 'scheduled-send', 'visual-regression',
+  'operator-dogfood',
 ]);
 const APP_UPDATE_VALIDATION_HARNESSES = new Set([
   ...NIGHTLY_VALIDATION_HARNESSES,
@@ -425,6 +427,22 @@ const HARNESS_REVALIDATION_HARNESSES = new Set([
 
 const LATEST_APP_UPDATE_VALIDATION_KEY = 'latest_app_update_validation';
 const HARNESS_REVALIDATION_HEALTH_KEY = 'harness_revalidation_health';
+const OPERATOR_DOGFOOD_HEALTH_KEY = 'operator_dogfood_health';
+
+function operatorDogfoodHealth() {
+  const row = db.prepare('SELECT value FROM relay_settings WHERE key = ?').get(OPERATOR_DOGFOOD_HEALTH_KEY);
+  if (!row?.value) return null;
+  try { return JSON.parse(row.value); } catch { return null; }
+}
+
+function saveOperatorDogfoodHealth(value) {
+  if (!value || typeof value !== 'object') return null;
+  const serialized = JSON.stringify(value);
+  if (serialized.length > 128 * 1024) throw new Error('Operator dogfood health exceeds 128 KiB');
+  db.prepare('INSERT OR REPLACE INTO relay_settings (key, value) VALUES (?, ?)')
+    .run(OPERATOR_DOGFOOD_HEALTH_KEY, serialized);
+  return value;
+}
 
 function harnessRevalidationHealth() {
   const row = db.prepare('SELECT value FROM relay_settings WHERE key = ?').get(HARNESS_REVALIDATION_HEALTH_KEY);
@@ -488,7 +506,7 @@ function saveNightlyValidationStatus(requested) {
       ? HARNESS_REVALIDATION_HARNESSES
     : NIGHTLY_VALIDATION_HARNESSES;
   if (!allowedHarnesses.has(harness)) throw new Error('Unknown validation harness');
-  if (!['pass', 'fail', 'timed_out', 'gated'].includes(status)) throw new Error('Invalid validation status');
+  if (!['pass', 'fail', 'timed_out', 'gated', 'stale', 'skipped'].includes(status)) throw new Error('Invalid validation status');
   if (!completedAt || Number.isNaN(Date.parse(completedAt))) throw new Error('Invalid validation completion time');
   const metadata = {
     kind: String(requested?.kind || 'nightly_validation').slice(0, 80),
@@ -747,6 +765,7 @@ db.exec(`
 `);
 const scheduledSends = new ScheduledSendStore(db);
 const goalNotifications = new GoalNotificationCoordinator(db);
+const sessionAliases = new SessionAliasReconciler(db);
 
 // ── Session metadata table — persists workspace info for resume ───────────────
 const RELAY_VISIBLE_MESSAGE_KINDS = new Set([
@@ -2590,6 +2609,7 @@ app.get('/api/maintenance/validation', requireAnyAuth, (req, res) => {
       validations: nightlyValidationStatuses(),
       latest_app_update_validation: latestAppUpdateValidation(),
       revalidation_program_health: harnessRevalidationHealth(),
+      operator_dogfood_health: operatorDogfoodHealth(),
     });
   } catch (e) {
     log('error', 'validation', 'Nightly validation status read failed', { err: e.message });
@@ -2601,7 +2621,10 @@ app.put('/api/maintenance/validation', requireAnyAuth, (req, res) => {
   try {
     const requested = req.body?.validation || req.body || {};
     const validation = saveNightlyValidationStatus(requested);
-    const revalidationHealth = saveHarnessRevalidationHealth(requested.program_health);
+    const revalidationHealth = ['harness_revalidation_tier2', 'harness_revalidation_program'].includes(requested.kind)
+      ? saveHarnessRevalidationHealth(requested.program_health) : null;
+    const dogfoodHealth = requested.kind === 'operator_dogfood'
+      ? saveOperatorDogfoodHealth(requested.program_health) : null;
     const validations = nightlyValidationStatuses();
     const failures = validations.filter(item => item.status !== 'pass');
     broadcastToBrowsers({
@@ -2609,12 +2632,20 @@ app.put('/api/maintenance/validation', requireAnyAuth, (req, res) => {
       validations,
       failures,
       ...(revalidationHealth ? { revalidation_program_health: revalidationHealth } : {}),
+      ...(dogfoodHealth ? { operator_dogfood_health: dogfoodHealth } : {}),
       server_ts: new Date().toISOString(),
     });
     if (revalidationHealth) {
       broadcastToBrowsers({
         type: 'harness_revalidation_status',
         program_health: revalidationHealth,
+        server_ts: new Date().toISOString(),
+      });
+    }
+    if (dogfoodHealth) {
+      broadcastToBrowsers({
+        type: 'operator_dogfood_status',
+        program_health: dogfoodHealth,
         server_ts: new Date().toISOString(),
       });
     }
@@ -3238,6 +3269,124 @@ const sendLifecycle = new SendLifecycleTracker();
 const MAX_SESSION_SUBSCRIPTIONS = 128;
 const SESSION_SUMMARY_SNIPPET_CHARS = 192;
 const SESSION_SUMMARY_BROADCAST_COALESCE_MS = 100;
+
+function canonicalizeSessionMessage(message) {
+  if (!message || typeof message !== 'object' || message.type === 'session_alias_reconciled') return message;
+  let changed = false;
+  const next = { ...message };
+  for (const key of ['session', 'session_id']) {
+    if (typeof next[key] !== 'string') continue;
+    const canonical = sessionAliases.resolve(next[key]);
+    if (canonical === next[key]) continue;
+    next[key] = canonical;
+    changed = true;
+  }
+  if (next.message && typeof next.message === 'object' && typeof next.message.session_id === 'string') {
+    const canonical = sessionAliases.resolve(next.message.session_id);
+    if (canonical !== next.message.session_id) {
+      next.message = { ...next.message, session_id: canonical };
+      changed = true;
+    }
+  }
+  return changed ? next : message;
+}
+
+function moveRuntimeSessionEntry(map, aliasId, canonicalId, merge = (canonical, alias) => canonical ?? alias) {
+  if (!map?.has?.(aliasId)) return false;
+  const alias = map.get(aliasId);
+  const canonical = map.get(canonicalId);
+  map.set(canonicalId, merge(canonical, alias));
+  map.delete(aliasId);
+  return true;
+}
+
+function migrateKeyedPromptMap(map, aliasId, canonicalId) {
+  let changed = 0;
+  for (const [key, value] of [...map]) {
+    if (!String(key).startsWith(`${aliasId}:`) && !String(key).startsWith(`${aliasId}\0`)) continue;
+    const suffix = String(key).slice(aliasId.length);
+    const nextKey = `${canonicalId}${suffix}`;
+    const prompt = value?.prompt && typeof value.prompt === 'object'
+      ? { ...value.prompt, session_id: canonicalId, session: canonicalId }
+      : value?.prompt;
+    if (!map.has(nextKey)) map.set(nextKey, prompt ? { ...value, prompt } : value);
+    map.delete(key);
+    changed += 1;
+  }
+  return changed;
+}
+
+function migrateRuntimeSessionAlias(aliasId, canonicalId, event) {
+  const counts = { maps: 0, prompts: 0, subscriptions: 0, claims: 0 };
+  const canonicalMeta = sessionMeta.get(canonicalId) || {};
+  const aliasMeta = sessionMeta.get(aliasId) || {};
+  const nextMeta = {
+    ...aliasMeta,
+    ...canonicalMeta,
+    session_id: canonicalId,
+    canonical_session_id: canonicalId,
+    canonical_conversation_id: event.canonical_conversation_id || canonicalMeta.canonical_conversation_id || null,
+    canonical_native_id: event.canonical_native_id || canonicalMeta.canonical_native_id || null,
+    current_surface: event.current_surface || canonicalMeta.current_surface || null,
+    current_surface_label: event.current_surface_label || canonicalMeta.current_surface_label || null,
+  };
+  if (sessionMeta.has(aliasId) || sessionMeta.has(canonicalId)) {
+    sessionMeta.set(canonicalId, nextMeta);
+    sessionMeta.delete(aliasId);
+    counts.maps += 1;
+  }
+  counts.maps += moveRuntimeSessionEntry(proxySockets, aliasId, canonicalId) ? 1 : 0;
+  counts.maps += moveRuntimeSessionEntry(sessionProxyId, aliasId, canonicalId) ? 1 : 0;
+  counts.maps += moveRuntimeSessionEntry(sessionHealth, aliasId, canonicalId, (canonical, alias) => canonical || alias) ? 1 : 0;
+  counts.maps += moveRuntimeSessionEntry(sessionLastSeen, aliasId, canonicalId,
+    (canonical, alias) => Math.max(Number(canonical) || 0, Number(alias) || 0)) ? 1 : 0;
+  counts.maps += moveRuntimeSessionEntry(sessionActivity, aliasId, canonicalId) ? 1 : 0;
+  counts.maps += moveRuntimeSessionEntry(sessionSeq, aliasId, canonicalId,
+    (canonical, alias) => Math.max(Number(canonical) || 0, Number(alias) || 0)) ? 1 : 0;
+  counts.maps += moveRuntimeSessionEntry(sessionControlGeneration, aliasId, canonicalId,
+    (canonical, alias) => Math.max(Number(canonical) || 0, Number(alias) || 0)) ? 1 : 0;
+  counts.maps += moveRuntimeSessionEntry(sessionTurnGeneration, aliasId, canonicalId,
+    (canonical, alias) => Math.max(Number(canonical) || 0, Number(alias) || 0)) ? 1 : 0;
+  counts.maps += moveRuntimeSessionEntry(agentConfigs, aliasId, canonicalId,
+    (canonical, alias) => ({ ...(alias || {}), ...(canonical || {}), session_id: canonicalId, session: canonicalId })) ? 1 : 0;
+  counts.maps += moveRuntimeSessionEntry(cachedChatLists, aliasId, canonicalId,
+    (canonical, alias) => ({ ...(alias || {}), ...(canonical || {}), session_id: canonicalId, session: canonicalId })) ? 1 : 0;
+  counts.maps += moveRuntimeSessionEntry(recentResumeSessions, aliasId, canonicalId) ? 1 : 0;
+  counts.maps += moveRuntimeSessionEntry(latestVisibleMessages, aliasId, canonicalId,
+    (canonical, alias) => {
+      const selected = Number(alias?.message_at || 0) > Number(canonical?.message_at || 0) ? alias : canonical || alias;
+      return selected ? { ...selected, session_id: canonicalId } : selected;
+    }) ? 1 : 0;
+  counts.prompts += migrateKeyedPromptMap(pendingPrompts, aliasId, canonicalId);
+  counts.prompts += migrateKeyedPromptMap(questionPromptTimers, aliasId, canonicalId);
+  counts.prompts += migrateKeyedPromptMap(pendingErrorPrompts, aliasId, canonicalId);
+  counts.prompts += questionPromptRegistry.migrateSession(aliasId, canonicalId);
+  for (const claim of proxySessionClaims.values()) {
+    if (!claim.sessions.delete(aliasId)) continue;
+    claim.sessions.add(canonicalId);
+    counts.claims += 1;
+  }
+  for (const client of browserClients) {
+    if (client._sessionSubscriptions instanceof Set && client._sessionSubscriptions.delete(aliasId)) {
+      client._sessionSubscriptions.add(canonicalId);
+      counts.subscriptions += 1;
+    }
+    if (client._transcriptGaps instanceof Map && client._transcriptGaps.has(aliasId)) {
+      if (!client._transcriptGaps.has(canonicalId)) client._transcriptGaps.set(canonicalId, client._transcriptGaps.get(aliasId));
+      client._transcriptGaps.delete(aliasId);
+    }
+  }
+  for (const summaries of pendingBrowserSessionSummaries.values()) {
+    if (!summaries.has(aliasId)) continue;
+    const alias = summaries.get(aliasId);
+    summaries.set(canonicalId, mergeSessionSummary(summaries.get(canonicalId), {
+      ...alias, session_id: canonicalId, session: canonicalId,
+    }));
+    summaries.delete(aliasId);
+  }
+  recomputeLatestVisibleMessage(canonicalId);
+  return counts;
+}
 
 function normalizedLatestVisibleMessageRow(row) {
   if (!row) return null;
@@ -5866,6 +6015,7 @@ const KNOWN_PROXY_TYPES = new Set([
   'status', 'proxy_status',
   'message', 'proxy_message', 'message_delta',
   'session_launch_ack', 'session_launch_failed', 'session_closed', 'session_meta_backfill',
+  'session_alias_reconciled',
   'permission_prompt', 'permission_prompt_expired', 'question_prompt', 'question_prompt_state',
   'session_error_prompt', 'session_error_prompt_cleared', 'agent_config', 'agent_control_result',
   'history', 'history_snapshot', 'history_chunk',
@@ -6067,6 +6217,7 @@ function handleProxyConnection(ws, req) {
     try { msg = JSON.parse(data.toString()); } catch { return; }
     const proxyMessageReceivedAtMs = Date.now();
     const t = msg.type;
+    if (t !== 'session_alias_reconciled') msg = canonicalizeSessionMessage(msg);
 
     // SEC-02: Before authentication, only accept hello messages
     if (!ws._authenticated) {
@@ -6151,6 +6302,45 @@ function handleProxyConnection(ws, req) {
       }));
 
     // ── Session registration (old: session_list, new: proxy_session_snapshot)
+    } else if (t === 'session_alias_reconciled') {
+      const result = sessionAliases.reconcile(msg);
+      if (!result.accepted) {
+        log('warn', 'session-alias', 'Rejected canonical session alias reconciliation', {
+          alias_session_id: result.alias_session_id || msg.alias_session_id || null,
+          canonical_session_id: result.canonical_session_id || msg.canonical_session_id || null,
+          reason: result.reason,
+        });
+        return;
+      }
+      const aliasId = result.alias.alias_session_id;
+      const canonicalId = result.alias.canonical_session_id;
+      const runtimeCounts = migrateRuntimeSessionAlias(aliasId, canonicalId, msg);
+      const currentSurfaceLabel = typeof msg.current_surface_label === 'string'
+        ? msg.current_surface_label.trim().slice(0, 80)
+        : null;
+      broadcastToBrowsers({
+        type: 'session_alias_reconciled',
+        protocol_version: PROTOCOL_VERSION,
+        alias_session_id: aliasId,
+        canonical_session_id: canonicalId,
+        canonical_conversation_id: result.alias.canonical_conversation_id,
+        canonical_native_id: result.alias.canonical_native_id,
+        current_surface: result.alias.current_surface,
+        current_surface_label: currentSurfaceLabel,
+        suppression_reason: result.alias.suppression_reason,
+        generation: result.alias.generation_clock,
+        server_ts: new Date().toISOString(),
+      });
+      log('info', 'session-alias', 'Canonical session alias reconciled', {
+        alias_session_id: aliasId,
+        canonical_session_id: canonicalId,
+        canonical_conversation_id: result.alias.canonical_conversation_id,
+        reason: result.reason,
+        database: result.counts,
+        runtime: runtimeCounts,
+      });
+      queueSessionListBroadcast();
+
     } else if (t === 'provider_usage_snapshot') {
       const assessment = providerUsageBoundaryAssessment(msg.snapshot);
       const snapshot = sanitizeProviderUsageSnapshot(msg.snapshot);
@@ -6405,7 +6595,24 @@ function handleProxyConnection(ws, req) {
     } else if (t === 'session_list' || t === 'proxy_session_snapshot') {
       // A6-05: track which proxy_id is sending this snapshot
       const snapshotProxyId = msg.proxy_id || thisProxyId || null;
-      const sessions = msg.sessions || [];
+      const rawSessions = Array.isArray(msg.sessions) ? msg.sessions : [];
+      const directIds = new Set(rawSessions.map(session => (
+        typeof session === 'string' ? session : session?.session_id
+      )).filter(id => id && sessionAliases.resolve(id) === id));
+      const sessionsByCanonicalId = new Map();
+      for (const session of rawSessions) {
+        const rawId = typeof session === 'string' ? session : session?.session_id;
+        if (!rawId) continue;
+        const canonicalId = sessionAliases.resolve(rawId);
+        if (rawId !== canonicalId && directIds.has(canonicalId)) continue;
+        const normalized = typeof session === 'string'
+          ? canonicalId
+          : { ...session, session_id: canonicalId };
+        if (!sessionsByCanonicalId.has(canonicalId) || rawId === canonicalId) {
+          sessionsByCanonicalId.set(canonicalId, normalized);
+        }
+      }
+      const sessions = [...sessionsByCanonicalId.values()];
       const duplicateSessions = [];
       const sessionIdsBefore = new Set(proxySockets.keys());
       const sessionStateBefore = new Map(sessionIdsBefore.size > 0
@@ -7732,13 +7939,24 @@ function handleClientConnection(ws, req) {
     timeout_at:  p.timeout_at,
   }));
   const openPromptList = Array.from(pendingPrompts.values()).map(e => e.prompt);
-  const openQuestionPromptList = questionPromptRegistry.views();
+  const openQuestionPromptList = questionPromptRegistry.views()
+    .filter(prompt => ['open', 'submitting'].includes(prompt.lifecycle));
   const openErrorPromptList = Array.from(pendingErrorPrompts.values()).map(e => e.prompt);
   const agentConfigMap = getCompactAgentConfigsForAck();
   const nightlyValidationFailures = nightlyValidationStatuses().filter(item => item.status !== 'pass');
   const latestAppUpdate = latestAppUpdateValidation();
   const revalidationHealth = harnessRevalidationHealth();
+  const dogfoodHealth = operatorDogfoodHealth();
   const recentSemanticNotifications = semanticNotificationsForClient(ws);
+  const sessionAliasList = [...sessionAliases.aliases.values()].map(alias => ({
+    alias_session_id: alias.alias_session_id,
+    canonical_session_id: alias.canonical_session_id,
+    canonical_conversation_id: alias.canonical_conversation_id,
+    canonical_native_id: alias.canonical_native_id,
+    current_surface: alias.current_surface,
+    suppression_reason: alias.suppression_reason,
+    generation: alias.generation_clock,
+  }));
   ws.send(JSON.stringify({
     type:                 'connection_ack',
     protocol_version:     PROTOCOL_VERSION,
@@ -7759,6 +7977,8 @@ function handleClientConnection(ws, req) {
     ...(nightlyValidationFailures.length > 0 ? { nightly_validation_failures: nightlyValidationFailures } : {}),
     ...(latestAppUpdate ? { latest_app_update_validation: latestAppUpdate } : {}),
     ...(revalidationHealth ? { revalidation_program_health: revalidationHealth } : {}),
+    ...(dogfoodHealth ? { operator_dogfood_health: dogfoodHealth } : {}),
+    ...(sessionAliasList.length > 0 ? { session_aliases: sessionAliasList } : {}),
     ...(cachedProviderUsage ? { provider_usage: cachedProviderUsage } : {}),
     ...(cachedWorkspaces.length > 0 ? { workspaces: cachedWorkspaces } : {}),
     ...(recentSemanticNotifications.length > 0
@@ -7773,6 +7993,7 @@ function handleClientConnection(ws, req) {
     let msg;
     try { msg = JSON.parse(data.toString()); } catch { return; }
     const t = msg.type;
+    msg = canonicalizeSessionMessage(msg);
 
     // Drop messages with unknown or missing type (A8-01)
     if (typeof t !== 'string' || !KNOWN_CLIENT_TYPES.has(t)) {

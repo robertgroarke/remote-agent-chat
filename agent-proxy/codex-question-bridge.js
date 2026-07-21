@@ -128,9 +128,30 @@ function nativeRequest(message) {
   return { id: message.id, params };
 }
 
-function generationToken(connectionGeneration, params) {
+function normalizedQuestionIdentity(params) {
+  return JSON.stringify({
+    thread_id: params.threadId,
+    turn_id: params.turnId,
+    item_id: params.itemId,
+    questions: params.questions.map(question => ({
+      id: question.id,
+      header: question.header,
+      question: question.question,
+      options: Array.isArray(question.options)
+        ? question.options.map(option => ({
+            label: option.label,
+            description: option.description,
+          }))
+        : null,
+      is_other: question.isOther === true,
+      is_secret: question.isSecret === true,
+    })),
+  });
+}
+
+function identityToken(domain, params) {
   return crypto.createHash('sha256')
-    .update(`${connectionGeneration}\0${params.threadId}\0${params.turnId}\0${params.itemId}`)
+    .update(`rac-codex-question-v1\0${domain}\0${normalizedQuestionIdentity(params)}`)
     .digest('hex');
 }
 
@@ -152,13 +173,29 @@ class CodexQuestionBridge {
   open(message) {
     if (!this.connected) fail('adapter_disconnected', 'Codex question adapter is disconnected');
     const native = nativeRequest(message);
-    const promptId = crypto.randomUUID();
+    const promptId = `codex-question-${identityToken('prompt', native.params).slice(0, 32)}`;
+    const generation = identityToken('generation', native.params);
+    const existing = this.entries.get(promptId);
+    if (existing) {
+      if (existing.prompt.generation !== generation) {
+        fail('prompt_id_collision', 'question prompt identity was reused for a different generation');
+      }
+      // App-server may replay the same still-open request after a transport
+      // reconnect. Refresh only the native response destination; preserve the
+      // canonical prompt object, observed time, and deadline so downstream
+      // clients see continuous membership rather than a replacement.
+      existing.nativeRequestId = native.id;
+      existing.threadId = native.params.threadId;
+      existing.turnId = native.params.turnId;
+      existing.itemId = native.params.itemId;
+      return existing.prompt;
+    }
     const observedMs = this.now();
     const autoResolutionMs = native.params.autoResolutionMs ?? null;
     const prompt = canonicalQuestionPrompt({
       prompt_id: promptId,
       session_id: this.sessionId,
-      generation: generationToken(this.connectionGeneration, native.params),
+      generation,
       kind: 'request_user_input',
       source: { surface: this.surface, version: this.version },
       title: native.params.questions.length === 1 ? native.params.questions[0].header : 'Codex questions',

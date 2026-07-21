@@ -35,7 +35,73 @@ export class RelayClient {
     this._hostResourceSubscribeRequestId = '';
     this._hostResourceSequence = 0;
     this._controlConnectionId = '';
+    this._sessionAliases = new Map();
     this.stopped        = false;
+  }
+
+  _applySessionAlias(event) {
+    const aliasId = typeof event?.alias_session_id === 'string' ? event.alias_session_id.trim() : '';
+    const canonicalId = typeof event?.canonical_session_id === 'string' ? event.canonical_session_id.trim() : '';
+    if (!aliasId || !canonicalId || aliasId === canonicalId) return false;
+    this._sessionAliases.set(aliasId, { ...event, alias_session_id: aliasId, canonical_session_id: canonicalId });
+    this._sessionSubscriptions = [...new Set(this._sessionSubscriptions.map(id => (
+      id === aliasId ? canonicalId : id
+    )))];
+    return true;
+  }
+
+  _canonicalSessionId(sessionId) {
+    let current = typeof sessionId === 'string' ? sessionId : '';
+    const seen = new Set();
+    while (current && !seen.has(current)) {
+      seen.add(current);
+      const next = this._sessionAliases.get(current)?.canonical_session_id;
+      if (!next) break;
+      current = next;
+    }
+    return current || sessionId;
+  }
+
+  _canonicalizeSessionMessage(message) {
+    if (!message || typeof message !== 'object' || message.type === 'session_alias_reconciled') return message;
+    const next = { ...message };
+    for (const key of ['session', 'session_id']) {
+      if (typeof next[key] === 'string') next[key] = this._canonicalSessionId(next[key]);
+    }
+    if (Array.isArray(next.sessions)) {
+      const direct = new Set(next.sessions.map(item => (
+        typeof item === 'string' ? item : item?.session_id || item?.id
+      )).filter(id => id && this._canonicalSessionId(id) === id));
+      const byId = new Map();
+      for (const item of next.sessions) {
+        const rawId = typeof item === 'string' ? item : item?.session_id || item?.id;
+        if (!rawId) continue;
+        const canonicalId = this._canonicalSessionId(rawId);
+        if (canonicalId !== rawId && direct.has(canonicalId)) continue;
+        const normalized = typeof item === 'string' ? canonicalId : { ...item, session_id: canonicalId };
+        if (!byId.has(canonicalId) || rawId === canonicalId) byId.set(canonicalId, normalized);
+      }
+      next.sessions = [...byId.values()];
+    }
+    for (const key of ['session_health', 'agent_configs']) {
+      if (!next[key] || typeof next[key] !== 'object' || Array.isArray(next[key])) continue;
+      const mapped = {};
+      for (const [sessionId, value] of Object.entries(next[key])) {
+        const canonicalId = this._canonicalSessionId(sessionId);
+        if (!Object.prototype.hasOwnProperty.call(mapped, canonicalId) || sessionId === canonicalId) {
+          mapped[canonicalId] = value;
+        }
+      }
+      next[key] = mapped;
+    }
+    for (const key of ['open_prompts', 'open_question_prompts', 'open_error_prompts', 'semantic_notifications']) {
+      if (!Array.isArray(next[key])) continue;
+      next[key] = next[key].map(item => this._canonicalizeSessionMessage(item));
+    }
+    if (Array.isArray(next.affected_session_ids)) {
+      next.affected_session_ids = [...new Set(next.affected_session_ids.map(id => this._canonicalSessionId(String(id))))];
+    }
+    return next;
   }
 
   // ── Connect ────────────────────────────────────────────────────────────────
@@ -75,7 +141,17 @@ export class RelayClient {
 
     this.ws.onmessage = (e) => {
       try {
-        const msg = JSON.parse(e.data);
+        let msg = JSON.parse(e.data);
+        if (msg.type === 'session_alias_reconciled') {
+          this._applySessionAlias(msg);
+        } else if (msg.type === 'connection_ack' && Array.isArray(msg.session_aliases)) {
+          for (const alias of msg.session_aliases) {
+            if (this._applySessionAlias(alias)) this.onMessage({ type: 'session_alias_reconciled', ...alias });
+          }
+          msg = this._canonicalizeSessionMessage(msg);
+        } else {
+          msg = this._canonicalizeSessionMessage(msg);
+        }
         if (msg.type === 'connection_ack') {
           this._controlConnectionId = String(msg.connection_id || '');
           this._heartbeatIntervalMs = Math.max(1_000, Number(msg.heartbeat_interval_ms) || DEFAULT_HEARTBEAT_MS);
@@ -641,7 +717,7 @@ export class RelayClient {
 
   _send(msg) {
     if (this.ws?.readyState === WebSocket.OPEN) {
-      this.ws.send(JSON.stringify(msg));
+      this.ws.send(JSON.stringify(this._canonicalizeSessionMessage(msg)));
     }
   }
 

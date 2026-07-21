@@ -5,7 +5,12 @@ const crypto = require('crypto');
 const fs = require('fs');
 const path = require('path');
 const selectors = require('../agent-proxy/selectors');
+const codexCli = require('../agent-proxy/codex-cli');
 const sessionStore = require('../agent-proxy/session-store');
+const {
+  codexDesktopCliSessionId,
+  codexDesktopArchiveMessages,
+} = require('../agent-proxy/codex-desktop-archive');
 const { withCodexDesktopCdpLock } = require('../agent-proxy/codex-desktop-cdp-lock');
 const { listCdpTargets, connectCdpTarget } = require('../agent-proxy/cdp-loopback');
 
@@ -338,6 +343,71 @@ function messageText(msg) {
     return msg.content_blocks.map(contentBlockText).filter(Boolean).join('\n\n') || String(msg.content || '');
   }
   return String(msg?.content || '');
+}
+
+function reasoningSummaryDescriptors(messages) {
+  const descriptors = [];
+  for (const message of (Array.isArray(messages) ? messages : [])) {
+    for (const block of (Array.isArray(message?.content_blocks) ? message.content_blocks : [])) {
+      if (block?.type !== 'thinking' || block.activity_summary !== true) continue;
+      const content = normalizeContent(block.content || block.text || block.markdown || '');
+      if (!content) continue;
+      const turnId = String(block.native_turn_id || message.native_turn_id || '').trim();
+      const sourceId = String(block.native_source_id || message.native_source_id || '').trim();
+      const contentHash = crypto.createHash('sha256').update(content).digest('hex');
+      const owner = turnId || sourceId || `ordinal:${descriptors.length}`;
+      descriptors.push({
+        key: `${owner}\u0000${contentHash}`,
+        turn_fingerprint: crypto.createHash('sha256').update(owner).digest('hex').slice(0, 16),
+        content_sha256: contentHash,
+        source_present: !!sourceId,
+        turn_present: !!turnId,
+      });
+    }
+  }
+  return descriptors;
+}
+
+function compareReasoningSummaryDescriptors(nativeDescriptors, webDescriptors) {
+  const remaining = new Map();
+  for (const descriptor of webDescriptors) {
+    if (!remaining.has(descriptor.key)) remaining.set(descriptor.key, []);
+    remaining.get(descriptor.key).push(descriptor);
+  }
+  const missing = [];
+  for (const descriptor of nativeDescriptors) {
+    const matches = remaining.get(descriptor.key);
+    if (matches?.length) matches.shift();
+    else missing.push(descriptor);
+  }
+  const extra = Array.from(remaining.values()).flat();
+  let prefix = 0;
+  while (
+    prefix < nativeDescriptors.length
+    && prefix < webDescriptors.length
+    && nativeDescriptors[prefix].key === webDescriptors[prefix].key
+  ) prefix += 1;
+  return { missing, extra, prefix, exact: missing.length === 0 && extra.length === 0 && prefix === nativeDescriptors.length };
+}
+
+async function collectAuthoritativeCodexReasoning(surface, target) {
+  let conversationId = '';
+  if (surface === 'codex-desktop') {
+    conversationId = await withTarget(PORTS.codexDesktop, target, async Runtime => {
+      const threads = await selectors.readCodexThreadList(Runtime, true);
+      return codexDesktopCliSessionId((Array.isArray(threads) ? threads.find(thread => thread?.active)?.id : '') || '');
+    });
+  } else if (surface === 'codex') {
+    conversationId = await withTarget(PORTS.antigravity, target, Runtime => selectors.readCodexVsCodeConversationId(Runtime));
+    conversationId = codexDesktopCliSessionId(conversationId);
+  }
+  if (!conversationId) return null;
+  const lightweight = codexCli.findSessionByCliId(conversationId, { includeMessages: false });
+  if (!lightweight?.filePath) return null;
+  return {
+    conversation_id: conversationId,
+    messages: codexDesktopArchiveMessages(codexCli.parseCodexJsonl(lightweight.filePath)),
+  };
 }
 
 function normalizeMessages(messages, tail) {
@@ -713,6 +783,78 @@ async function runSurfaceComparison(surface, target, mappedSession, context, rep
       investigation_hint: 'Check relay auth/DB availability or session mapping for ' + surface,
     });
     return;
+  }
+
+  if (surface === 'codex-desktop' || surface === 'codex') {
+    try {
+      const authoritative = await collectAuthoritativeCodexReasoning(surface, target);
+      if (!authoritative) {
+        reporter.add({
+          surface,
+          test_id: `${surface}.reasoning-summary.fidelity`,
+          status: STATUS_SKIP,
+          detail: 'Exact native conversation JSONL is unavailable for reasoning-summary comparison',
+          investigation_hint: 'Verify the active native conversation UUID and local Codex JSONL archive mapping',
+        });
+      } else {
+        const nativeReasoning = reasoningSummaryDescriptors(authoritative.messages);
+        const webReasoning = reasoningSummaryDescriptors(webuiResult.messages);
+        const reasoningComparison = compareReasoningSummaryDescriptors(nativeReasoning, webReasoning);
+        const exactFixtureHash = crypto.createHash('sha256')
+          .update(normalizeContent('Designing process management helpers'))
+          .digest('hex');
+        const nativeExactFixtureCount = nativeReasoning.filter(item => item.content_sha256 === exactFixtureHash).length;
+        const webExactFixtureCount = webReasoning.filter(item => item.content_sha256 === exactFixtureHash).length;
+        const hasNativeReasoning = nativeReasoning.length > 0;
+        reporter.add({
+          surface,
+          test_id: `${surface}.reasoning-summary.fidelity`,
+          status: !hasNativeReasoning
+            ? STATUS_SKIP
+            : reasoningComparison.exact ? STATUS_PASS : STATUS_FAIL,
+          detail: !hasNativeReasoning
+            ? 'Authoritative native thread has no plaintext reasoning-summary rows'
+            : reasoningComparison.exact
+              ? `Matched ${nativeReasoning.length} ordered typed reasoning summaries from exact native JSONL`
+              : `Reasoning-summary mismatch: native=${nativeReasoning.length} webui=${webReasoning.length} missing=${reasoningComparison.missing.length} extra=${reasoningComparison.extra.length} prefix=${reasoningComparison.prefix}`,
+          native_evidence: {
+            typed_summary_count: nativeReasoning.length,
+            exact_fixture_count: nativeExactFixtureCount,
+            all_source_ids_present: nativeReasoning.every(item => item.source_present),
+            all_turn_ids_present: nativeReasoning.every(item => item.turn_present),
+            missing_fingerprints: reasoningComparison.missing.slice(0, 3).map(item => ({
+              turn_fingerprint: item.turn_fingerprint,
+              content_sha256: item.content_sha256,
+            })),
+          },
+          webui_evidence: {
+            source: webuiResult.source,
+            typed_summary_count: webReasoning.length,
+            exact_fixture_count: webExactFixtureCount,
+            extra_fingerprints: reasoningComparison.extra.slice(0, 3).map(item => ({
+              turn_fingerprint: item.turn_fingerprint,
+              content_sha256: item.content_sha256,
+            })),
+          },
+          expected: 'Every native plaintext reasoning summary should appear exactly once, in source-turn order, as a typed WebUI block',
+          actual: {
+            prefix_match_count: reasoningComparison.prefix,
+            missing_count: reasoningComparison.missing.length,
+            extra_count: reasoningComparison.extra.length,
+            exact: reasoningComparison.exact,
+          },
+          investigation_hint: 'Check exact JSONL archive enrichment, paired-record deduplication, then relay persistence and client hydration',
+        });
+      }
+    } catch (error) {
+      reporter.add({
+        surface,
+        test_id: `${surface}.reasoning-summary.fidelity`,
+        status: STATUS_FAIL,
+        detail: `Reasoning-summary fidelity probe failed structurally: ${error.message}`,
+        investigation_hint: 'Repair the exact native JSONL comparison without falling back to prose normalization',
+      });
+    }
   }
 
   let normalizedNative = normalizeMessages(nativeMessages, context.options.tail);
@@ -1117,6 +1259,8 @@ module.exports = {
   main,
   matchSessionByTarget,
   normalizeMessages,
+  reasoningSummaryDescriptors,
+  compareReasoningSummaryDescriptors,
   parseArgs,
   readWebuiHistory,
   runFidelitySuite,

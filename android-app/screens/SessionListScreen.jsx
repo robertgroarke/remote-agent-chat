@@ -459,6 +459,29 @@ function useSidebarFreshnessClock(activities, sessions) {
   return nowMs;
 }
 
+function migrateSessionKeyedObject(previous, aliasId, canonicalId, mergeValues = null) {
+  if (!previous || typeof previous !== 'object' || Array.isArray(previous)
+    || !Object.prototype.hasOwnProperty.call(previous, aliasId)) return previous;
+  const next = { ...previous };
+  const aliasValue = next[aliasId];
+  delete next[aliasId];
+  if (!Object.prototype.hasOwnProperty.call(next, canonicalId)) next[canonicalId] = aliasValue;
+  else if (typeof mergeValues === 'function') next[canonicalId] = mergeValues(next[canonicalId], aliasValue);
+  return next;
+}
+
+function migrateSessionList(previous, aliasId, canonicalId) {
+  const rows = Array.isArray(previous) ? previous : [];
+  const canonicalPresent = rows.some(item => sessionKey(item) === canonicalId);
+  return rows.flatMap(item => {
+    const id = sessionKey(item);
+    if (id !== aliasId) return [item];
+    if (canonicalPresent) return [];
+    if (typeof item === 'string') return [canonicalId];
+    return [{ ...item, session_id: canonicalId, canonical_session_id: canonicalId }];
+  });
+}
+
 export default function SessionListScreen({ navigation, route }) {
   const reducedMotion = useReducedMotion();
   const [sessionRegistry, setSessionRegistry] = useState(() => createSessionRegistry());
@@ -494,6 +517,7 @@ export default function SessionListScreen({ navigation, route }) {
   const [nightlyValidationFailures, setNightlyValidationFailures] = useState([]);
   const [latestAppUpdateValidation, setLatestAppUpdateValidation] = useState(null);
   const [revalidationProgramHealth, setRevalidationProgramHealth] = useState(null);
+  const [operatorDogfoodHealth, setOperatorDogfoodHealth] = useState(null);
   const [showValidationHealth, setShowValidationHealth] = useState(false);
   const [fleetControlPending, setFleetControlPending] = useState({});
   const [providerUsage, setProviderUsage] = useState(null);
@@ -743,6 +767,43 @@ export default function SessionListScreen({ navigation, route }) {
       });
     }
     switch (msg.type) {
+      case 'session_alias_reconciled': {
+        const aliasId = String(msg.alias_session_id || '').trim();
+        const canonicalId = String(msg.canonical_session_id || '').trim();
+        if (!aliasId || !canonicalId || aliasId === canonicalId) break;
+        setSessions(previous => migrateSessionList(previous, aliasId, canonicalId));
+        setActivities(previous => migrateSessionKeyedObject(previous, aliasId, canonicalId));
+        setHealthMap(previous => migrateSessionKeyedObject(previous, aliasId, canonicalId));
+        setUnreadMap(previous => migrateSessionKeyedObject(
+          previous, aliasId, canonicalId, (canonical, alias) => Number(canonical || 0) + Number(alias || 0),
+        ));
+        setPermPrompts(previous => migrateSessionKeyedObject(previous, aliasId, canonicalId));
+        setClosingSessions(previous => migrateSessionKeyedObject(previous, aliasId, canonicalId));
+        setSessionPreferences(previous => migrateSessionKeyedObject(previous, aliasId, canonicalId));
+        setFleetControlPending(previous => migrateSessionKeyedObject(previous, aliasId, canonicalId));
+        fleetControlPendingRef.current = migrateSessionKeyedObject(
+          fleetControlPendingRef.current, aliasId, canonicalId,
+        );
+        setBroadcastSelectedIds(previous => [...new Set(previous.map(id => id === aliasId ? canonicalId : id))]);
+        setBroadcastReceipts(previous => migrateSessionKeyedObject(previous, aliasId, canonicalId));
+        setSidebarTranscriptTitles(previous => migrateSessionKeyedObject(previous, aliasId, canonicalId));
+        setTranscriptSearchResults(previous => previous.map(result => {
+          const resultSessionId = result?.session_id || result?.session;
+          return resultSessionId === aliasId
+            ? { ...result, session_id: canonicalId, session: canonicalId }
+            : result;
+        }));
+        setManagingSession(previous => {
+          if (!previous) return previous;
+          if (typeof previous === 'string') return previous === aliasId ? canonicalId : previous;
+          return sessionKey(previous) === aliasId
+            ? { ...previous, session_id: canonicalId, canonical_session_id: canonicalId }
+            : previous;
+        });
+        if (activeSessionRef.current === aliasId) activeSessionRef.current = canonicalId;
+        break;
+      }
+
       case '_connected':
         setConnected(true);
         setLoading(false);
@@ -797,6 +858,7 @@ export default function SessionListScreen({ navigation, route }) {
         setNightlyValidationFailures(Array.isArray(msg.nightly_validation_failures) ? msg.nightly_validation_failures : []);
         setLatestAppUpdateValidation(msg.latest_app_update_validation || null);
         setRevalidationProgramHealth(msg.revalidation_program_health || null);
+        setOperatorDogfoodHealth(msg.operator_dogfood_health || null);
         if (msg.provider_usage && typeof msg.provider_usage === 'object') {
           setProviderUsage(previous => retainNewerProviderUsage(previous, msg.provider_usage));
         }
@@ -1192,6 +1254,7 @@ export default function SessionListScreen({ navigation, route }) {
       case 'nightly_validation_status':
         setNightlyValidationFailures(Array.isArray(msg.failures) ? msg.failures : []);
         if (msg.revalidation_program_health) setRevalidationProgramHealth(msg.revalidation_program_health);
+        if (msg.operator_dogfood_health) setOperatorDogfoodHealth(msg.operator_dogfood_health);
         break;
 
       case 'app_update_validation_status':
@@ -1200,6 +1263,10 @@ export default function SessionListScreen({ navigation, route }) {
 
       case 'harness_revalidation_status':
         setRevalidationProgramHealth(msg.program_health || null);
+        break;
+
+      case 'operator_dogfood_status':
+        setOperatorDogfoodHealth(msg.program_health || null);
         break;
 
       case 'session_launching': {
@@ -1838,6 +1905,13 @@ export default function SessionListScreen({ navigation, route }) {
   const visibleNightlyValidationFailures = recentAppUpdateValidation
     ? nightlyValidationFailures.filter(item => item.run_id !== recentAppUpdateValidation.run_id)
     : nightlyValidationFailures;
+  const dogfoodLatest = operatorDogfoodHealth?.latest || null;
+  const dogfoodAgeMs = dogfoodLatest?.completed_at ? Date.now() - Date.parse(dogfoodLatest.completed_at) : Number.POSITIVE_INFINITY;
+  const dogfoodStatus = !operatorDogfoodHealth || !dogfoodLatest || dogfoodAgeMs > 45 * 60 * 1000
+    ? 'STALE' : String(operatorDogfoodHealth.status || dogfoodLatest.status || 'STALE').toUpperCase();
+  const dogfoodOpenFingerprints = Array.isArray(operatorDogfoodHealth?.open_fingerprints)
+    ? operatorDogfoodHealth.open_fingerprints : [];
+  const dogfoodUnhealthy = dogfoodStatus !== 'PASS' || dogfoodOpenFingerprints.length > 0;
 
   return (
     <View style={s.container}>
@@ -1947,6 +2021,16 @@ export default function SessionListScreen({ navigation, route }) {
           </TouchableOpacity>
         </View>
       )}
+      {dogfoodUnhealthy && (
+        <TouchableOpacity style={s.duplicateProxyBanner} accessibilityRole="alert" onPress={() => setShowValidationHealth(true)}>
+          <Text style={s.duplicateProxyTitle}>Chat stability sentinel {dogfoodStatus.toLowerCase()}</Text>
+          <Text style={s.duplicateProxyText}>
+            {dogfoodOpenFingerprints.length > 0
+              ? `${dogfoodOpenFingerprints.length} open P0/P1 fingerprint${dogfoodOpenFingerprints.length === 1 ? '' : 's'}. Tap for program health.`
+              : 'The 30-minute canary is missing, expired, skipped, or on a different served asset. Tap for program health.'}
+          </Text>
+        </TouchableOpacity>
+      )}
 
       <Modal
         visible={showValidationHealth}
@@ -1965,6 +2049,19 @@ export default function SessionListScreen({ navigation, route }) {
             </TouchableOpacity>
           </View>
           <ScrollView contentContainerStyle={s.validationList}>
+            <View style={s.validationCard} accessibilityLabel="Chat stability sentinel health">
+              <View style={s.validationCardHeader}>
+                <Text style={s.validationHarness}>Chat stability sentinel</Text>
+                <Text style={[s.validationStatus, dogfoodStatus === 'PASS' ? s.validationPass : s.validationFail]}>{dogfoodStatus}</Text>
+              </View>
+              <Text style={s.validationMeta}>{dogfoodLatest
+                ? `${dogfoodLatest.mode || 'unknown'} / ${dogfoodLatest.trigger_source || 'unknown trigger'} / ${dogfoodLatest.duration_ms || 0} ms`
+                : 'No result has been published.'}</Text>
+              <Text style={s.validationMeta}>{dogfoodLatest?.refresh_count ?? 0} refreshes / {dogfoodLatest?.dropped_samples ?? 0} dropped / {dogfoodOpenFingerprints.length} open findings</Text>
+              <Text style={s.validationMeta}>Source {dogfoodLatest?.source_commit || 'unavailable'} / build {dogfoodLatest?.source_bundle_sha256 || 'unavailable'}</Text>
+              <Text style={s.validationMeta}>Last end {dogfoodLatest?.completed_at ? new Date(dogfoodLatest.completed_at).toLocaleString() : 'never'}</Text>
+              <Text style={s.validationMeta}>Next due {dogfoodLatest?.next_due_at ? new Date(dogfoodLatest.next_due_at).toLocaleString() : 'unknown'} / scheduler {dogfoodLatest?.scheduler_last_result || 'unavailable'}</Text>
+            </View>
             {Object.entries(revalidationProgramHealth?.harnesses || {}).sort(([left], [right]) => left.localeCompare(right)).map(([harness, record]) => {
               const coverage = (revalidationProgramHealth?.coverage_matrix || []).find(row => row.harness === harness) || {};
               const tier2Mode = coverage.tier2?.mode === 'gated' ? 'gated' : record.last_tier2_status || 'scheduled';

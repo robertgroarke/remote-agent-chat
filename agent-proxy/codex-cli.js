@@ -315,6 +315,19 @@ function reasoningText(payload) {
   return responseMessageText(payload) || payload?.text || '';
 }
 
+function reasoningSummaryBlock(text) {
+  const content = String(text || '').trim();
+  if (!content) return null;
+  return {
+    type: 'thinking',
+    title: 'Thinking',
+    label: 'Thinking',
+    content,
+    collapsed: false,
+    activity_summary: true,
+  };
+}
+
 function isCodexContextNoise(text) {
   const trimmed = String(text || '').trim();
   return /^<(?:recommended_plugins|environment_context|codex_internal_context|goal_context|turn_aborted)(?:\s|>)/i.test(trimmed)
@@ -353,7 +366,32 @@ function stampNativeMessage(messages, next) {
     next.source_message_id = `codex_cli:${crypto.createHash('sha256').update(basis).digest('hex').substring(0, 32)}`;
   }
   const producerTime = new Date(context.entry?.timestamp || '').getTime();
-  if (Number.isFinite(producerTime)) next.created_at = new Date(producerTime).toISOString();
+  const producerTimestamp = Number.isFinite(producerTime) ? new Date(producerTime).toISOString() : null;
+  if (producerTimestamp) next.created_at = producerTimestamp;
+  const nativeTurnId = String(context.state?.currentTurnId || '').trim() || null;
+  const lifecycleGeneration = Math.max(0, Number(context.state?.currentTurnGeneration) || 0);
+  const sourceCursor = {
+    start_offset: Math.max(0, Number(context.offsets?.start_offset) || 0),
+    end_offset: Math.max(0, Number(context.offsets?.end_offset) || 0),
+  };
+  next.native_turn_id = nativeTurnId;
+  next.lifecycle_generation = lifecycleGeneration;
+  next.native_source_cursor = sourceCursor;
+  next.surface_provenance = {
+    family: 'codex',
+    surface: 'codex_cli',
+    source: 'codex_cli_jsonl',
+  };
+  for (const block of (Array.isArray(next.content_blocks) ? next.content_blocks : [])) {
+    if (block?.type !== 'thinking' || block.activity_summary !== true) continue;
+    block.native_source_id = next.native_source_id;
+    block.native_source_kind = next.native_source_kind;
+    block.native_turn_id = nativeTurnId;
+    block.lifecycle_generation = lifecycleGeneration;
+    block.native_source_cursor = sourceCursor;
+    block.producer_timestamp = producerTimestamp;
+    block.surface_provenance = { ...next.surface_provenance };
+  }
   Object.defineProperty(next, '_native_start_offset', {
     configurable: true,
     enumerable: false,
@@ -366,32 +404,96 @@ function stampNativeMessage(messages, next) {
   });
 }
 
+function semanticMessageBody(message) {
+  const provenanceKeys = new Set([
+    'native_source_id',
+    'native_source_kind',
+    'native_turn_id',
+    'lifecycle_generation',
+    'native_source_cursor',
+    'native_sources',
+    'producer_timestamp',
+    'surface_provenance',
+  ]);
+  const blocks = (Array.isArray(message?.content_blocks) ? message.content_blocks : []).map(block => {
+    if (!block || typeof block !== 'object') return block;
+    return Object.fromEntries(Object.entries(block).filter(([key]) => !provenanceKeys.has(key)));
+  });
+  return compactJson({ role: message?.role || '', content: message?.content || '', blocks });
+}
+
+function reasoningPairCompatible(left, right) {
+  if (!left || !right || semanticMessageBody(left) !== semanticMessageBody(right)) return false;
+  const leftTurn = String(left.native_turn_id || '').trim();
+  const rightTurn = String(right.native_turn_id || '').trim();
+  if (leftTurn && rightTurn) return leftTurn === rightTurn;
+  const leftAt = Date.parse(left.created_at || '') || Number(left.ts || 0) * 1000;
+  const rightAt = Date.parse(right.created_at || '') || Number(right.ts || 0) * 1000;
+  return Number.isFinite(leftAt) && Number.isFinite(rightAt) && Math.abs(leftAt - rightAt) <= 1000;
+}
+
+function mergeNativePair(target, incoming) {
+  const sources = [
+    ...(Array.isArray(target.native_sources) ? target.native_sources : [{
+      id: target.native_source_id,
+      kind: target.native_source_kind,
+      cursor: target.native_source_cursor,
+      producer_timestamp: target.created_at || null,
+    }]),
+    ...(Array.isArray(incoming.native_sources) ? incoming.native_sources : [{
+      id: incoming.native_source_id,
+      kind: incoming.native_source_kind,
+      cursor: incoming.native_source_cursor,
+      producer_timestamp: incoming.created_at || null,
+    }]),
+  ].filter(source => source.id && source.kind);
+  target.native_sources = [...new Map(sources.map(source => [`${source.kind}:${source.id}`, source])).values()];
+  const responseSource = incoming.native_source_kind?.startsWith('response_item.') ? incoming
+    : target.native_source_kind?.startsWith('response_item.') ? target
+    : incoming;
+  for (const key of ['native_source_id', 'source_message_id', 'native_source_kind', 'native_source_cursor']) {
+    if (responseSource[key]) target[key] = responseSource[key];
+  }
+  if (incoming.created_at && (!target.created_at || Date.parse(incoming.created_at) < Date.parse(target.created_at))) {
+    target.created_at = incoming.created_at;
+  }
+  if (incoming.ts != null && (target.ts == null || incoming.ts < target.ts)) target.ts = incoming.ts;
+  target.native_source_paired = true;
+  const block = target.content_blocks?.find(item => item?.type === 'thinking' && item.activity_summary === true);
+  if (block) {
+    block.native_source_id = target.native_source_id;
+    block.native_source_kind = target.native_source_kind;
+    block.native_source_cursor = target.native_source_cursor;
+    block.native_sources = target.native_sources;
+    block.producer_timestamp = target.created_at || block.producer_timestamp || null;
+  }
+}
+
 function pushDedup(messages, next) {
   if ((!next?.content || !next.content.trim()) && !Array.isArray(next?.content_blocks)) return;
   if (next.role === 'user' && isCodexContextNoise(next.content)) return;
   stampNativeMessage(messages, next);
   const last = messages[messages.length - 1];
-  const lastBlocks = last?.content_blocks ? compactJson(last.content_blocks) : '';
-  const nextBlocks = next?.content_blocks ? compactJson(next.content_blocks) : '';
-  const sameBody = last && last.role === next.role && last.content === next.content && lastBlocks === nextBlocks;
-  const lastFamily = codexNativePairFamily(last?.native_source_kind, last?.role);
+  const sameBody = last && semanticMessageBody(last) === semanticMessageBody(next);
   const nextFamily = codexNativePairFamily(next?.native_source_kind, next?.role);
-  const explicitNativePair = sameBody
-    && !last?.native_source_paired
-    && !!lastFamily
-    && lastFamily === nextFamily
-    && last.native_source_kind !== next.native_source_kind;
-  if (explicitNativePair) {
-    if (next.native_source_kind.startsWith('response_item.')) {
-      last.native_source_id = next.native_source_id;
-      last.source_message_id = next.source_message_id;
-      last.native_source_kind = next.native_source_kind;
-      if (next.created_at) last.created_at = next.created_at;
-      if (next.ts != null) last.ts = next.ts;
+  if (nextFamily) {
+    // Native Codex can interleave lifecycle/status records between the event
+    // and response_item representations of one logical source record. Search
+    // a small same-turn window instead of assuming the pair is adjacent.
+    for (let index = messages.length - 1; index >= Math.max(0, messages.length - 12); index -= 1) {
+      const candidate = messages[index];
+      const candidateFamily = codexNativePairFamily(candidate?.native_source_kind, candidate?.role);
+      if (
+        !candidate?.native_source_paired
+        && candidateFamily === nextFamily
+        && candidate.native_source_kind !== next.native_source_kind
+        && reasoningPairCompatible(candidate, next)
+      ) {
+        mergeNativePair(candidate, next);
+        delete next._preserve_identical;
+        return;
+      }
     }
-    last.native_source_paired = true;
-    delete next._preserve_identical;
-    return;
   }
   if (sameBody && next._preserve_identical !== true) return;
   delete next._preserve_identical;
@@ -1156,6 +1258,8 @@ function createParseState(filePath) {
     taskStartedTurnId: null,
     taskCompletedAt: 0,
     taskCompletedTurnId: null,
+    currentTurnId: null,
+    currentTurnGeneration: 0,
     lastEventAt: 0,
     lastUserAt: 0,
     lastAssistantAt: 0,
@@ -1214,6 +1318,11 @@ function applyEntryToState(state, entry) {
     return;
   }
   if (entry.type === 'turn_context' && payload) {
+    const nextTurnId = String(payload.turn_id || payload.id || '').trim();
+    if (nextTurnId && nextTurnId !== state.currentTurnId) {
+      state.currentTurnId = nextTurnId;
+      state.currentTurnGeneration += 1;
+    }
     if (payload.sandbox_mode || payload.sandbox_policy?.mode || payload.sandbox_policy?.type) {
       state.permission_mode = payload.sandbox_mode || payload.sandbox_policy.mode || payload.sandbox_policy.type;
     }
@@ -1256,10 +1365,11 @@ function applyEntryToState(state, entry) {
       const text = reasoningText(payload);
       if (text) {
         state.lastReasoningText = text;
+        const block = reasoningSummaryBlock(text);
         pushDedup(state.messages, {
           role: 'assistant',
           content: 'Reasoning',
-          content_blocks: [{ type: 'thinking', title: 'Reasoning', content: text, collapsed: false }],
+          content_blocks: [block],
           native_source_kind: 'response_item.reasoning',
           _preserve_identical: true,
           ts,
@@ -1372,10 +1482,11 @@ function applyEntryToState(state, entry) {
       if (text) {
         state.lastReasoningAt = tsMs || state.lastReasoningAt;
         state.lastReasoningText = text;
+        const block = reasoningSummaryBlock(text);
         pushDedup(state.messages, {
           role: 'assistant',
           content: 'Reasoning',
-          content_blocks: [{ type: 'thinking', title: 'Reasoning', content: text, collapsed: false }],
+          content_blocks: [block],
           native_source_kind: 'event_msg.agent_reasoning',
           _preserve_identical: true,
           ts,
@@ -1821,6 +1932,41 @@ function readSessionMeta(filePath) {
   return meta;
 }
 
+function credentialSafeProvenanceText(value, max = 80) {
+  const text = typeof value === 'string' ? value.trim() : '';
+  if (!text || !/^[\w .:/+-]+$/u.test(text)) return null;
+  return text.slice(0, max);
+}
+
+function buildSessionProvenance(meta, nativeSessionId, stat, sourceCursor = null) {
+  const candidateId = String(metadataSessionId(meta) || nativeSessionId || '').trim().toLowerCase();
+  const sessionUuid = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(candidateId)
+    ? candidateId
+    : null;
+  const fileSize = Math.max(0, Number(sourceCursor?.file_size ?? stat?.size) || 0);
+  const endOffset = Math.max(0, Math.min(
+    fileSize,
+    Number(sourceCursor?.end_offset ?? sourceCursor?.offset ?? fileSize) || 0,
+  ));
+  return {
+    originator: credentialSafeProvenanceText(meta?.originator),
+    source: credentialSafeProvenanceText(meta?.source),
+    thread_source: credentialSafeProvenanceText(meta?.thread_source),
+    session_uuid: sessionUuid,
+    first_native_cursor: {
+      session_uuid: sessionUuid,
+      byte_offset: 0,
+      event_sequence: 0,
+    },
+    last_native_cursor: {
+      session_uuid: sessionUuid,
+      byte_offset: endOffset,
+      file_size: fileSize,
+      observed_at: stat?.mtime ? stat.mtime.toISOString() : null,
+    },
+  };
+}
+
 function cloneConfigObservationState(filePath, source = null) {
   const state = createParseState(filePath);
   if (!source) return state;
@@ -2032,14 +2178,16 @@ function readSessionCandidate(filePath, stat) {
   const workspace = resolveCodexWorkspace(meta.cwd || null, firstUserText);
   const workspacePath = workspace.workspacePath || null;
   const fileCliSessionId = sessionIdFromFilePath(filePath);
+  const cliSessionId = fileCliSessionId || metadataSessionId(meta) || fallbackSessionIdFromPath(filePath);
   return {
-    cliSessionId: fileCliSessionId || metadataSessionId(meta) || fallbackSessionIdFromPath(filePath),
+    cliSessionId,
     filePath,
     workspacePath,
     workspaceName: workspace.workspaceName,
     title: firstUserText.replace(/\s+/g, ' ').trim().substring(0, 80) || 'Codex CLI session',
     updatedAt: stat.mtime.toISOString(),
     hasUser: !!firstUserText,
+    provenance: buildSessionProvenance(meta, cliSessionId, stat),
   };
 }
 
@@ -2071,6 +2219,7 @@ function readLightweightSessionSummary(filePath, stat) {
     config_source_cursor: configObservation.source_cursor,
     permission_mode: meta.sandbox_mode || 'workspace-write',
     approval_policy: meta.approval_policy || null,
+    provenance: buildSessionProvenance(meta, cliSessionId, stat, configObservation.source_cursor),
     updatedAt: latestIso(index?.updated_at, stat.mtime),
     sizeBytes: stat.size,
   };
@@ -2472,6 +2621,7 @@ function readSessionSummary(filePath, { includeMessages = true, maxHydrateBytes 
     effort_observation: state.effort_observation,
     permission_mode: state.permission_mode || 'workspace-write',
     approval_policy: state.approval_policy || null,
+    provenance: buildSessionProvenance(meta, state.cliSessionId, stat, detailed.sourceCursor),
     token_usage: state.tokenUsage || null,
     rate_limits: state.rateLimits || null,
     percent_used: state.percentUsed,
@@ -3461,6 +3611,10 @@ module.exports = {
   refreshCodexModelCatalog,
   codexCliEffortsForModel,
   readLatestNativeConfigObservation,
+  readSessionMeta,
+  readSessionCandidate,
+  readLightweightSessionSummary,
+  buildSessionProvenance,
   normalizeCodexModelAlias,
   contentFingerprint,
   captureCodexReceiptBaseline,

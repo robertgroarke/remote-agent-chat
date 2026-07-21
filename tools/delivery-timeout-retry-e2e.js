@@ -118,6 +118,19 @@ async function main() {
       }
       if (message.type !== 'send' || message.session !== fixtureSessionId) return;
       sends.push({ cid: message.client_message_id, content: message.content, at: Date.now() });
+      if (sends.length === 3) {
+        setTimeout(() => send({
+          type: 'proxy_send_result',
+          session_id: fixtureSessionId,
+          client_message_id: message.client_message_id,
+          result: 'failed',
+          error: {
+            code: 'pending_revalidation',
+            message: 'fixture version mismatch: expected current, found prior',
+          },
+        }), 25);
+        return;
+      }
       if (sends.length !== 2) return;
       setTimeout(() => send({ type: 'message_accepted', client_message_id: message.client_message_id, ts: Date.now() }), 25);
       setTimeout(() => send({ type: 'message_delivered', client_message_id: message.client_message_id }), 50);
@@ -166,6 +179,15 @@ async function main() {
     assert.strictEqual(await page.locator('.message.user').count(), 1, 'retry must reuse the original user bubble');
     assert.strictEqual(await page.locator('.delivery.failed').count(), 0, 'successful retry must clear failed state');
 
+    await composer.fill('structured failure reason proof');
+    await page.locator('.send-btn').click();
+    const structuredFailure = page.locator('.delivery.failed').last();
+    await structuredFailure.waitFor({ state: 'visible', timeout: 3000 });
+    assert.match(await structuredFailure.innerText(), /Update validation pending/i);
+    assert.match(await structuredFailure.getAttribute('title') || '', /fixture version mismatch/);
+    assert.strictEqual(sends.length, 3, 'fixture should observe one explicit structured-failure send');
+    assert.strictEqual(await page.locator('.message.user').count(), 2, 'structured failure retains one explanatory user bubble');
+
     await page.locator('.composer-gear-btn').first().click();
     const modelSelect = page.locator('.composer-setting-label').filter({ hasText: 'Model' }).locator('select').first();
     await modelSelect.waitFor({ state: 'visible', timeout: 3000 });
@@ -186,7 +208,8 @@ async function main() {
       pages: 1,
       timeout_stage: 'queued',
       correlation_id_reused: true,
-      user_bubbles: 1,
+      user_bubbles: 2,
+      structured_failure_reason_visible: true,
       final_state: 'agent_started',
       optimistic_control: 'new-model',
       rejected_control_rolled_back: 'old-model',

@@ -16,6 +16,7 @@ import {
 } from './session-registry.js';
 import {
   getCachedTranscript,
+  migrateCachedTranscript,
   transcriptStoreView,
   updateTranscriptStore,
 } from './transcript-cache.js';
@@ -36,6 +37,14 @@ import { retainNewerProviderUsage } from './provider-usage.js';
 const { useState, useEffect, useRef, useCallback } = React;
 
 const DEFAULT_HISTORY_TAIL_LIMIT = 120;
+
+function migrateSessionKeyedObject(previous, aliasId, canonicalId, merge = (canonical, alias) => canonical ?? alias) {
+  if (!previous || !Object.prototype.hasOwnProperty.call(previous, aliasId)) return previous;
+  const next = { ...previous };
+  next[canonicalId] = merge(next[canonicalId], next[aliasId]);
+  delete next[aliasId];
+  return next;
+}
 const CODEX_CLI_HISTORY_CHUNK_BYTES = 1024 * 1024;
 const HISTORY_CHUNK_TIMEOUT_MS = 15000;
 const MAX_HISTORY_CHUNK_RETRIES = 3;
@@ -297,6 +306,7 @@ export function useRelay() {
     const [nightlyValidationFailures, setNightlyValidationFailures] = useState([]);
     const [latestAppUpdateValidation, setLatestAppUpdateValidation] = useState(null);
     const [revalidationProgramHealth, setRevalidationProgramHealth] = useState(null);
+    const [operatorDogfoodHealth, setOperatorDogfoodHealth] = useState(null);
     const [providerUsage, setProviderUsage] = useState(null);
     const [providerUsageRefreshReceipt, setProviderUsageRefreshReceipt] = useState(null);
     const [providerUsageResetReceipt, setProviderUsageResetReceipt] = useState(null);
@@ -311,6 +321,7 @@ export function useRelay() {
     });
     const [provisionalStreams, setProvisionalStreams] = useState({}); // sessionId -> ephemeral assistant stream
     const [semanticNotifications, setSemanticNotifications] = useState([]);
+    const [sessionAliases, setSessionAliases] = useState({});
 
     const thinkingTimers   = useRef({});
     const deliveryTimers   = useRef({});
@@ -364,6 +375,90 @@ export function useRelay() {
     const hostResourceHistoryRequestRef = useRef({ system: '', detail: '' });
     const hostResourceHistoryCursorRef = useRef({ system: 0, detail: 0 });
     const hostResourceLastLiveSequenceRef = useRef({ system: 0, detail: 0 });
+
+    function reconcileSessionAlias(event) {
+      const aliasId = typeof event?.alias_session_id === 'string' ? event.alias_session_id.trim() : '';
+      const canonicalId = typeof event?.canonical_session_id === 'string' ? event.canonical_session_id.trim() : '';
+      if (!aliasId || !canonicalId || aliasId === canonicalId) return false;
+      setSessionAliases(previous => ({
+        ...previous,
+        [aliasId]: {
+          ...event,
+          alias_session_id: aliasId,
+          canonical_session_id: canonicalId,
+        },
+      }));
+      migrateCachedTranscript(aliasId, canonicalId);
+      setSessions(previous => {
+        const canonical = previous.find(session => (typeof session === 'string' ? session : session?.session_id) === canonicalId);
+        const alias = previous.find(session => (typeof session === 'string' ? session : session?.session_id) === aliasId);
+        const retained = previous.filter(session => {
+          const id = typeof session === 'string' ? session : session?.session_id;
+          return id !== aliasId && id !== canonicalId;
+        });
+        const base = canonical && typeof canonical === 'object'
+          ? canonical
+          : (alias && typeof alias === 'object' ? { ...alias, session_id: canonicalId } : { session_id: canonicalId });
+        retained.push({
+          ...base,
+          session_id: canonicalId,
+          canonical_session_id: canonicalId,
+          canonical_conversation_id: event.canonical_conversation_id || base.canonical_conversation_id || null,
+          canonical_native_id: event.canonical_native_id || base.canonical_native_id || null,
+          current_surface: event.current_surface || base.current_surface || null,
+          current_surface_label: event.current_surface_label || base.current_surface_label || null,
+        });
+        return retained;
+      });
+      const preferCanonical = (canonical, alias) => canonical ?? alias;
+      const mergeArrays = (canonical, alias) => [...(Array.isArray(canonical) ? canonical : []), ...(Array.isArray(alias) ? alias : [])];
+      setHistoryMeta(previous => migrateSessionKeyedObject(previous, aliasId, canonicalId, preferCanonical));
+      setHistoryLoading(previous => migrateSessionKeyedObject(previous, aliasId, canonicalId, preferCanonical));
+      setUnread(previous => migrateSessionKeyedObject(previous, aliasId, canonicalId,
+        (canonical, alias) => Number(canonical || 0) + Number(alias || 0)));
+      setThinking(previous => migrateSessionKeyedObject(previous, aliasId, canonicalId, preferCanonical));
+      setThinkingContent(previous => migrateSessionKeyedObject(previous, aliasId, canonicalId, preferCanonical));
+      setActivities(previous => migrateSessionKeyedObject(previous, aliasId, canonicalId, preferCanonical));
+      setHealth(previous => migrateSessionKeyedObject(previous, aliasId, canonicalId, preferCanonical));
+      setQueuedMessages(previous => migrateSessionKeyedObject(previous, aliasId, canonicalId, mergeArrays));
+      setPermissionPrompts(previous => migrateSessionKeyedObject(previous, aliasId, canonicalId, preferCanonical));
+      setErrorPrompts(previous => migrateSessionKeyedObject(previous, aliasId, canonicalId, preferCanonical));
+      setAgentConfigs(previous => migrateSessionKeyedObject(previous, aliasId, canonicalId,
+        (canonical, alias) => ({ ...(alias || {}), ...(canonical || {}), session_id: canonicalId, session: canonicalId })));
+      setChatLists(previous => migrateSessionKeyedObject(previous, aliasId, canonicalId, preferCanonical));
+      setThreadLists(previous => migrateSessionKeyedObject(previous, aliasId, canonicalId, preferCanonical));
+      setTerminalOutputs(previous => migrateSessionKeyedObject(previous, aliasId, canonicalId, mergeArrays));
+      setFileChanges(previous => migrateSessionKeyedObject(previous, aliasId, canonicalId, mergeArrays));
+      setBranchLists(previous => migrateSessionKeyedObject(previous, aliasId, canonicalId, preferCanonical));
+      setSkillLists(previous => migrateSessionKeyedObject(previous, aliasId, canonicalId, preferCanonical));
+      setAutomationViews(previous => migrateSessionKeyedObject(previous, aliasId, canonicalId, preferCanonical));
+      setDirectoryListings(previous => migrateSessionKeyedObject(previous, aliasId, canonicalId, preferCanonical));
+      setProvisionalStreams(previous => migrateSessionKeyedObject(previous, aliasId, canonicalId, preferCanonical));
+      setScheduledSends(previous => previous.map(job => (
+        job?.session_id === aliasId ? { ...job, session_id: canonicalId } : job
+      )));
+      permissionPromptsRef.current = migrateSessionKeyedObject(
+        permissionPromptsRef.current, aliasId, canonicalId, preferCanonical,
+      );
+      agentConfigsRef.current = migrateSessionKeyedObject(
+        agentConfigsRef.current, aliasId, canonicalId, preferCanonical,
+      );
+      provisionalStreamsRef.current = migrateSessionKeyedObject(
+        provisionalStreamsRef.current, aliasId, canonicalId, preferCanonical,
+      );
+      if (activeSessionRef.current === aliasId) activeSessionRef.current = canonicalId;
+      sessionSubscriptionsRef.current = [...new Set(sessionSubscriptionsRef.current.map(id => (
+        id === aliasId ? canonicalId : id
+      )))];
+      for (const [clientMessageId, sessionId] of Object.entries(deliverySessionsRef.current)) {
+        if (sessionId === aliasId) deliverySessionsRef.current[clientMessageId] = canonicalId;
+      }
+      for (const ref of [latestHistoryRequest, latestHistoryChunkRequest, historyChunkState, activeCursorThreadIdentity,
+        pendingCursorThreadHistoryReset]) {
+        ref.current = migrateSessionKeyedObject(ref.current, aliasId, canonicalId, preferCanonical);
+      }
+      return true;
+    }
 
     function restoreCachedTranscript(sessionId) {
       const cached = getCachedTranscript(sessionId);
@@ -1289,19 +1384,28 @@ export function useRelay() {
     function reconcileHistoryTailReplacement(existing, incoming, chunkState, responseSource) {
       const current = Array.isArray(existing) ? existing : [];
       const nextIncoming = Array.isArray(incoming) ? incoming : [];
+      const currentByKey = new Map(current.map(message => [messageDedupeKey(message), message]));
+      const stableIncoming = nextIncoming.map(message => {
+        const previous = currentByKey.get(messageDedupeKey(message));
+        return previous && sessionRegistryValueEqual(previous, message) ? previous : message;
+      });
+      const stableIncomingList = stableIncoming.length === current.length
+        && stableIncoming.every((message, index) => message === current[index])
+        ? current
+        : stableIncoming;
       const baselineKeys = new Set(Array.isArray(chunkState?.baselineMessageKeys)
         ? chunkState.baselineMessageKeys
         : []);
       const nativeSource = chunkState?.source === 'native'
         || responseSource === 'codex_cli_jsonl'
         || responseSource === 'cursor_cli_jsonl';
-      if (nativeSource && baselineKeys.size > nextIncoming.length) return current;
+      if (nativeSource && baselineKeys.size > stableIncomingList.length) return current;
       const arrivedAfterRequest = current.filter(message => {
         const key = messageDedupeKey(message);
         return key && !baselineKeys.has(key);
       });
-      if (arrivedAfterRequest.length === 0) return nextIncoming;
-      return mergeHistoryChunk(nextIncoming, arrivedAfterRequest, 'tail');
+      if (arrivedAfterRequest.length === 0) return stableIncomingList;
+      return mergeHistoryChunk(stableIncomingList, arrivedAfterRequest, 'tail');
     }
 
     function shouldPreserveTranscriptInListView(session) {
@@ -1808,6 +1912,11 @@ export function useRelay() {
       if (t === 'connection_ack') {
         stateSequenceGate.current.reset(msg.state_epoch);
         controlConnectionIdRef.current = String(msg.connection_id || '');
+        if (Array.isArray(msg.session_aliases)) msg.session_aliases.forEach(reconcileSessionAlias);
+      }
+      if (t === 'session_alias_reconciled') {
+        reconcileSessionAlias(msg);
+        return;
       }
       const stateSessionId = msg.session || msg.session_id || '';
       const stateKey = (t === 'session_list' || t === 'session_snapshot' || t === 'proxy_session_snapshot')
@@ -2074,6 +2183,7 @@ export function useRelay() {
         setNightlyValidationFailures(Array.isArray(msg.nightly_validation_failures) ? msg.nightly_validation_failures : []);
         setLatestAppUpdateValidation(msg.latest_app_update_validation || null);
         setRevalidationProgramHealth(msg.revalidation_program_health || null);
+        setOperatorDogfoodHealth(msg.operator_dogfood_health || null);
         if (msg.provider_usage && typeof msg.provider_usage === 'object') {
           setProviderUsage(previous => retainNewerProviderUsage(previous, msg.provider_usage));
         }
@@ -2106,14 +2216,32 @@ export function useRelay() {
         if (msg.agent_configs && typeof msg.agent_configs === 'object') {
           setAgentConfigs(prev => ({ ...prev, ...msg.agent_configs }));
         }
-        // Restore open permission prompts on reconnect
+        // Restore handshake prompts without treating a temporarily incomplete
+        // snapshot as a terminal edge for a first-class native question. Only
+        // an explicit question_prompt_state may clear an unresolved question.
         {
           const restored = {};
-          [...(msg.open_prompts || []), ...(msg.open_question_prompts || [])].forEach(p => {
+          (msg.open_prompts || []).forEach(p => {
             const sid = p.session_id || p.session;
             if (sid) restored[sid] = { ...p, received_at: Date.now() };
           });
-          setPermissionPrompts(restored);
+          (msg.open_question_prompts || [])
+            .filter(p => !p.lifecycle || ['open', 'submitting'].includes(p.lifecycle))
+            .forEach(p => {
+              const sid = p.session_id || p.session;
+              if (sid) restored[sid] = { ...p, received_at: Date.now() };
+            });
+          setPermissionPrompts(previous => {
+            const next = { ...restored };
+            Object.entries(previous).forEach(([sid, prompt]) => {
+              if (next[sid]) return;
+              if (prompt?.type === 'question_prompt'
+                  && (!prompt.lifecycle || ['open', 'submitting'].includes(prompt.lifecycle))) {
+                next[sid] = prompt;
+              }
+            });
+            return next;
+          });
         }
         {
           const restored = {};
@@ -2157,24 +2285,31 @@ export function useRelay() {
       if (t === 'session_summary') {
         const id = msg.session || msg.session_id;
         if (!id) return;
-        setSessions(prev => prev.map(session => {
-          const sessionId = typeof session === 'string' ? session : session?.session_id;
-          if (sessionId !== id) return session;
-          return {
-            ...(typeof session === 'object' ? session : {}),
-            session_id: id,
-            ...(msg.status ? { status: msg.status } : {}),
-            ...(msg.activity ? { activity: msg.activity } : {}),
-            ...(msg.goal ? { goal: msg.goal } : {}),
-            ...(msg.fleet_summary ? { fleet_summary: msg.fleet_summary } : {}),
-            ...(msg.fleet_work_context ? { fleet_work_context: msg.fleet_work_context } : {}),
-            ...(msg.last_user_request ? { last_user_request: msg.last_user_request } : {}),
-            ...(msg.last_snippet != null ? { last_snippet: msg.last_snippet } : {}),
-            ...latestVisibleMessageSessionPatch(msg),
-            ...sessionChatTitleMetadataPatch(msg),
-          };
-        }));
-        if (msg.status) setHealth(prev => ({ ...prev, [id]: msg.status }));
+        setSessions(prev => {
+          let changed = false;
+          const next = prev.map(session => {
+            const sessionId = typeof session === 'string' ? session : session?.session_id;
+            if (sessionId !== id) return session;
+            const projected = {
+              ...(typeof session === 'object' ? session : {}),
+              session_id: id,
+              ...(msg.status ? { status: msg.status } : {}),
+              ...(msg.activity ? { activity: msg.activity } : {}),
+              ...(msg.goal ? { goal: msg.goal } : {}),
+              ...(msg.fleet_summary ? { fleet_summary: msg.fleet_summary } : {}),
+              ...(msg.fleet_work_context ? { fleet_work_context: msg.fleet_work_context } : {}),
+              ...(msg.last_user_request ? { last_user_request: msg.last_user_request } : {}),
+              ...(msg.last_snippet != null ? { last_snippet: msg.last_snippet } : {}),
+              ...latestVisibleMessageSessionPatch(msg),
+              ...sessionChatTitleMetadataPatch(msg),
+            };
+            if (typeof session === 'object' && sessionRegistryValueEqual(session, projected)) return session;
+            changed = true;
+            return projected;
+          });
+          return changed ? next : prev;
+        });
+        if (msg.status) setHealth(prev => shallowMapMerge(prev, { [id]: msg.status }));
         if (msg.activity) {
           const kind = String(msg.activity.kind || 'idle').toLowerCase();
           handleRelayMessage({
@@ -2501,10 +2636,7 @@ export function useRelay() {
         } else if (activityKind === 'idle') {
           clearTimeout(thinkingTimers.current[id]);
           setThinking(prev => prev[id] === false ? prev : ({ ...prev, [id]: false }));
-          setActivities(prev => {
-            const nextActivity = activity;
-            return Object.is(prev[id], nextActivity) ? prev : ({ ...prev, [id]: nextActivity });
-          });
+          setActivities(prev => shallowMapMerge(prev, { [id]: activity }));
           setThinkingContent(prev => prev[id] === '' ? prev : ({ ...prev, [id]: '' }));
         } else if (msg.activity?.goal || msg.activity?.task_list || msg.activity?.step || msg.activity?.usage) {
           clearTimeout(thinkingTimers.current[id]);
@@ -2636,6 +2768,7 @@ export function useRelay() {
       if (t === 'nightly_validation_status') {
         setNightlyValidationFailures(Array.isArray(msg.failures) ? msg.failures : []);
         if (msg.revalidation_program_health) setRevalidationProgramHealth(msg.revalidation_program_health);
+        if (msg.operator_dogfood_health) setOperatorDogfoodHealth(msg.operator_dogfood_health);
         return;
       }
 
@@ -2646,6 +2779,11 @@ export function useRelay() {
 
       if (t === 'harness_revalidation_status') {
         setRevalidationProgramHealth(msg.program_health || null);
+        return;
+      }
+
+      if (t === 'operator_dogfood_status') {
+        setOperatorDogfoodHealth(msg.program_health || null);
         return;
       }
 
@@ -3124,7 +3262,7 @@ export function useRelay() {
     // where `sessions` / `messages` would be frozen at initial render values).
     handleRelayMessageRef.current = handleRelayMessage;
 
-    return { sessions, messages, provisionalStreams, historyMeta, historyLoading, connected, connectionHealth, unread, setUnread, thinking, thinkingContent, activities, health, deliveryStates, launchStates, justLaunched, setJustLaunched, permissionPrompts, respondToPrompt, errorPrompts, respondToErrorPrompt, interruptSession, controlGoal, agentConfigs, configControlStates, requestAgentConfig, setAgentModel, setAgentEffort, setAgentPermissionMode, setAutoApprovePermissions, setAntigravityMode, setCodexConfig, newThread, openPanel, openNativeWindow, requestChatList, switchChat, newChat, chatLists, requestThreadList, switchThread, threadLists, switchWorkspace, requestTerminalOutput, sendTerminalInput, terminalOutputs, requestFileChanges, respondToFileChange, fileChanges, sendAttachment, send, sendToSession, steerMessage, discardQueuedMessage, editQueuedMessage, queuedMessages, scheduledSends, scheduleSend, cancelScheduledSend, refreshScheduledSends, launchSession, resumeSession, closeSession, activeSessionRef, restoreCachedTranscript, setSessionSubscriptions, workspaces, branchLists, requestBranchList, switchBranch, createBranch, skillLists, requestSkillList, automationViews, showCodexAutomation, controlResults, directoryListings, requestDirectoryListing, fileContents, requestFileContent, requestHistory, requestHistoryChunk, duplicateProxyAlarms, nightlyValidationFailures, latestAppUpdateValidation, revalidationProgramHealth, providerUsage, providerUsageRefreshReceipt, requestProviderUsageRefresh, setProviderUsageWatching, providerUsageResetReceipt, consumeProviderUsageResetCredit, providerUsageCostDetail, requestProviderUsageCostDetail, hostResources, hostResourceError, hostResourceHistory, hostResourceDetails, hostResourceSubscription, subscribeHostResources, unsubscribeHostResources, requestHostResourceRefresh, clearHostResources, semanticNotifications };
+    return { sessions, messages, provisionalStreams, historyMeta, historyLoading, connected, connectionHealth, unread, setUnread, thinking, thinkingContent, activities, health, deliveryStates, launchStates, justLaunched, setJustLaunched, permissionPrompts, respondToPrompt, errorPrompts, respondToErrorPrompt, interruptSession, controlGoal, agentConfigs, configControlStates, requestAgentConfig, setAgentModel, setAgentEffort, setAgentPermissionMode, setAutoApprovePermissions, setAntigravityMode, setCodexConfig, newThread, openPanel, openNativeWindow, requestChatList, switchChat, newChat, chatLists, requestThreadList, switchThread, threadLists, switchWorkspace, requestTerminalOutput, sendTerminalInput, terminalOutputs, requestFileChanges, respondToFileChange, fileChanges, sendAttachment, send, sendToSession, steerMessage, discardQueuedMessage, editQueuedMessage, queuedMessages, scheduledSends, scheduleSend, cancelScheduledSend, refreshScheduledSends, launchSession, resumeSession, closeSession, activeSessionRef, restoreCachedTranscript, setSessionSubscriptions, workspaces, branchLists, requestBranchList, switchBranch, createBranch, skillLists, requestSkillList, automationViews, showCodexAutomation, controlResults, directoryListings, requestDirectoryListing, fileContents, requestFileContent, requestHistory, requestHistoryChunk, duplicateProxyAlarms, nightlyValidationFailures, latestAppUpdateValidation, revalidationProgramHealth, operatorDogfoodHealth, providerUsage, providerUsageRefreshReceipt, requestProviderUsageRefresh, setProviderUsageWatching, providerUsageResetReceipt, consumeProviderUsageResetCredit, providerUsageCostDetail, requestProviderUsageCostDetail, hostResources, hostResourceError, hostResourceHistory, hostResourceDetails, hostResourceSubscription, subscribeHostResources, unsubscribeHostResources, requestHostResourceRefresh, clearHostResources, semanticNotifications, sessionAliases };
   }
 
 // (removed window.useRelay — now an ES module export)

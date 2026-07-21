@@ -48,6 +48,10 @@ const VIEWPORTS = {
   desktop: { width: 1280, height: 900 },
   mobile: { width: 390, height: 844 },
 };
+const REASONING_SUMMARY_VIEWPORTS = {
+  desktop_1440: { width: 1440, height: 900 },
+  desktop_1920: { width: 1920, height: 1080 },
+};
 const THEMES = ['dark', 'light'];
 
 function parseArgs(argv) {
@@ -215,11 +219,15 @@ function fixtureHtml(css) {
     };
     const composerSkin = composerSkinMap[agent] || 'default';
     const composerCase = '<section class="fixture-block" data-composer-case="composer_chrome"><div class="fixture-label">' + label + ' &middot; native composer chrome</div><div class="input-area composer-skin-' + composerSkin + '" data-composer-skin="' + composerSkin + '"><span class="attach-btn" aria-hidden="true">+</span><div class="input-col"><div class="textarea-row"><textarea rows="1" placeholder="Message..."></textarea><div class="textarea-btns"><button class="composer-gear-btn">&#9881;</button><button class="send-btn">&#8593;</button></div></div><div class="composer-settings is-open">' + (composerControlMap[agent] || '') + '<span class="composer-workspace">&#8962; Remote Agent Chat</span></div></div></div></section>';
-    const thinkingBlock = agent === 'codex'
+    const legacyThinkingBlock = agent === 'codex'
       ? '<div class="content-blocks"><div class="content-block content-block-thinking-native"><div class="message-body"><p>Inspecting the current harness state before acting.</p></div></div></div>'
       : agent === 'codex-desktop'
         ? '<div class="content-blocks"><div class="content-block content-block-thinking-codex-desktop"><span>Worked for 19m 5s</span><span class="content-block-thinking-codex-desktop-chevron" aria-hidden="true">⌄</span></div></div>'
         : '<div class="content-blocks"><details class="content-block content-block-thinking" open><summary>Thinking</summary><div class="message-body"><p>Inspecting the current harness state before acting.</p></div></details></div>';
+    const nativeActivitySummaryBlock = '<div class="content-blocks"><div class="content-block content-block-thinking-native-summary" role="note" aria-label="Codex activity summary" data-native-source-id="response_item.reasoning:id:fixture" data-native-turn-id="turn-fixture"><div class="content-block-thinking-native-summary-copy"><div class="message-body"><p><strong>Designing process management helpers</strong> while retaining a deliberately long native summary that wraps cleanly on the 390 px fixture without becoming ordinary assistant prose.</p></div></div><time class="message-timestamp" datetime="2026-07-21T11:47:22.971Z" title="Tuesday, July 21, 2026 at 4:47:22 AM Pacific Daylight Time">Jul 21, 4:47 AM</time></div></div>';
+    const thinkingBlock = ['codex', 'codex-desktop', 'codex_cli'].includes(agent)
+      ? nativeActivitySummaryBlock
+      : legacyThinkingBlock;
     const terminalBlock = agent === 'claude'
       ? '<div class="content-blocks"><div class="content-block content-block-terminal-claude"><div class="content-block-terminal-claude-header"><span class="content-block-terminal-claude-dot completed"></span><strong>Bash</strong><span>Run tests</span></div><div class="content-block-terminal-claude-body"><div class="content-block-terminal-claude-row"><span>IN</span><pre>npm test</pre></div><div class="content-block-terminal-claude-row"><span>OUT</span><pre>42 passed, 0 failed</pre></div></div></div></div>'
       : agent === 'codex-desktop'
@@ -328,6 +336,7 @@ async function captureAll(options) {
       composer_agents: COMPOSER_AGENTS,
       composer_cases: COMPOSER_CASES,
       viewports: VIEWPORTS,
+      reasoning_summary_viewports: REASONING_SUMMARY_VIEWPORTS,
       cases: [],
     };
     for (const agent of agents) {
@@ -484,6 +493,47 @@ async function captureAll(options) {
           result.cases.push({ agent, theme, block, composer_case: composerCase, viewport: viewportName, actual: path.relative(ROOT, actualPath), golden: path.relative(ROOT, goldenPath), diff: fs.existsSync(diffPath) ? path.relative(ROOT, diffPath) : null, ...comparison });
         }
       }
+      if (['codex', 'codex-desktop', 'codex_cli'].includes(agent)) {
+        for (const [viewportName, viewport] of Object.entries(REASONING_SUMMARY_VIEWPORTS)) {
+          await page.setViewportSize(viewport);
+          await page.goto(`${fileUrl(fixturePath)}?agent=${encodeURIComponent(agent)}&theme=${encodeURIComponent(theme)}`, { waitUntil: 'load' });
+          await page.waitForFunction(() => document.documentElement.dataset.visualReady === 'true');
+          await page.evaluate(() => document.fonts && document.fonts.ready);
+          const block = 'thinking';
+          const name = `${slug(agent)}-${block}-${viewportName}${theme === 'dark' ? '' : `-${theme}`}.png`;
+          const actualPath = path.join(options.outputDir, 'actual', name);
+          const goldenPath = path.join(options.goldenDir, name);
+          const diffPath = path.join(options.outputDir, 'diff', name);
+          fs.mkdirSync(path.dirname(actualPath), { recursive: true });
+          const locator = page.locator('[data-visual-block="thinking"]');
+          if (await locator.count() !== 1) throw new Error(`${agent}/${theme}/${viewportName}/thinking is not uniquely rendered`);
+          await capturePaintedLocator(page, locator, { path: actualPath, animations: 'disabled' });
+          let comparison;
+          if (options.updateGoldens) {
+            fs.mkdirSync(path.dirname(goldenPath), { recursive: true });
+            fs.copyFileSync(actualPath, goldenPath);
+            comparison = { status: 'updated', pixels: null, different: 0, ratio: 0 };
+          } else if (!fs.existsSync(goldenPath)) {
+            comparison = { status: 'missing-golden', pixels: null, different: null, ratio: 1 };
+            result.ok = false;
+          } else {
+            const metrics = comparePng(actualPath, goldenPath, diffPath, options.threshold);
+            comparison = { status: metrics.ratio <= options.maxDiffRatio ? 'pass' : 'fail', ...metrics };
+            if (comparison.status === 'fail') result.ok = false;
+          }
+          result.cases.push({
+            agent,
+            theme,
+            block,
+            reasoning_summary_width: true,
+            viewport: viewportName,
+            actual: path.relative(ROOT, actualPath),
+            golden: path.relative(ROOT, goldenPath),
+            diff: fs.existsSync(diffPath) ? path.relative(ROOT, diffPath) : null,
+            ...comparison,
+          });
+        }
+      }
       }
     }
     return result;
@@ -526,4 +576,4 @@ if (require.main === module) main().catch(error => {
   process.exit(1);
 });
 
-module.exports = { AGENTS, BLOCKS, LIVE_STATUS_AGENTS, LIVE_STATUS_CASES, SIDEBAR_CASES, LAYOUT_AGENTS, LAYOUT_CASES, COMPOSER_AGENTS, COMPOSER_CASES, VIEWPORTS, THEMES, parseArgs, fixtureHtml, comparePng, captureAll };
+module.exports = { AGENTS, BLOCKS, LIVE_STATUS_AGENTS, LIVE_STATUS_CASES, SIDEBAR_CASES, LAYOUT_AGENTS, LAYOUT_CASES, COMPOSER_AGENTS, COMPOSER_CASES, VIEWPORTS, REASONING_SUMMARY_VIEWPORTS, THEMES, parseArgs, fixtureHtml, comparePng, captureAll };

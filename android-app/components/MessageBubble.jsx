@@ -10,6 +10,7 @@ import {
   formatAbsoluteMessageTime,
   formatVisibleMessageTime,
   messageInstant,
+  parseMessageInstant,
 } from '../lib/message-time';
 const {
   normalizeMessageBlocks,
@@ -254,6 +255,9 @@ function renderBlock(block, i, isUser, theme) {
       );
 
     case 'thinking':
+      if (block.activity_summary === true && theme.nativeCodexActivitySummary) {
+        return <CodexActivitySummaryBlock key={block.native_source_id || i} block={block} theme={theme} />;
+      }
       if (theme.nativePlainThinking) {
         const content = block.content || block.thinking || block.text || '';
         return content ? <Markdown key={i} style={theme.markdown}>{content}</Markdown> : null;
@@ -282,6 +286,44 @@ function renderBlock(block, i, isUser, theme) {
     default:
       return null;
   }
+}
+
+function CodexActivitySummaryBlock({ block, theme }) {
+  const content = String(block.content || block.thinking || block.text || '').trim();
+  if (!content) return null;
+  const instant = parseMessageInstant(
+    block.producer_timestamp || block.created_at || block.timestamp || block.ts,
+  );
+  const visibleTimestamp = instant ? formatVisibleMessageTime(instant) : 'Time unknown';
+  const absoluteTimestamp = instant ? formatAbsoluteMessageTime(instant) : 'time unknown';
+  const activityMarkdown = {
+    ...theme.markdown,
+    body: {
+      ...(theme.markdown?.body || {}),
+      ...(theme.thinking || {}),
+      fontStyle: 'normal',
+    },
+    paragraph: {
+      ...(theme.markdown?.paragraph || {}),
+      marginTop: 0,
+      marginBottom: 0,
+    },
+  };
+  return (
+    <View
+      style={s.codexActivitySummary}
+      accessible
+      accessibilityRole="text"
+      accessibilityLabel={`Codex activity summary. ${content}. Sent ${absoluteTimestamp}`}
+    >
+      <CollapsibleBlock maxHeight={154}>
+        <Markdown style={activityMarkdown}>{content}</Markdown>
+      </CollapsibleBlock>
+      <Text style={[s.codexActivitySummaryTime, theme.isLight && s.codexActivitySummaryTimeLight]}>
+        {visibleTimestamp}
+      </Text>
+    </View>
+  );
 }
 
 function ClaudeTerminalBlock({ block, light }) {
@@ -678,17 +720,37 @@ function measuredTranscriptTheme({
   };
 }
 
+function deliveryFailureText(value) {
+  const raw = String(value || 'Send failed').trim();
+  const normalized = raw.toLowerCase();
+  if (normalized.includes('pending_revalidation')
+      || normalized.includes('fixture version mismatch')
+      || normalized.includes('validation pending')) return 'Update validation pending';
+  if (normalized.includes('agent_busy') || normalized.includes('agent is generating')) return 'Agent busy';
+  if (normalized.includes('codex_desktop_thread_not_open')
+      || normalized.includes('codex_desktop_thread_changed')
+      || normalized.includes('open this thread')) return 'Open this thread in Codex Desktop';
+  if (normalized.includes('native_user_turn_not_observed')
+      || normalized.includes('native user turn')
+      || normalized.includes('could not confirm native delivery')) return 'Could not confirm native delivery';
+  if (normalized.includes('input_verify_failed')
+      || normalized.includes('composer input could not be verified')
+      || normalized.includes('verified send-ready state')) return 'Composer input could not be verified';
+  if (normalized === 'send_failed') return 'Send failed';
+  return raw.length > 80 ? `${raw.slice(0, 77)}…` : raw;
+}
+
 function deliveryLabel(message, deliveryState) {
   if (deliveryState === 'offline_queued') return 'Queued offline';
   if (deliveryState === 'queued') return 'Sending…';
   if (deliveryState === 'busy_queued' || message._queued) return 'Queued';
   if (deliveryState === 'steered') return 'Steered';
-  if (deliveryState === 'failed') return 'Failed';
+  if (deliveryState === 'failed') return `✕ ${deliveryFailureText(message._sendError || message.failure_code)}`;
   if (deliveryState === 'launch_accepted') return '↗ Native launch accepted · receipt pending';
   if (deliveryState === 'delivered') return '✓✓ Delivered';
   if (deliveryState === 'agent_started' || message._agentStarted) return '▶ Agent started';
   if (message._delivered) return '✓✓ Delivered';
-  if (message.status === 'failed') return '✕ Failed';
+  if (message.status === 'failed') return `✕ ${deliveryFailureText(message.failure_code || message._sendError)}`;
   if (message._launchAcceptedAt || message.launch_accepted_at) return '↗ Native launch accepted · receipt pending';
   if (message.status === 'accepted') return '✓ Relay accepted';
   return 'Recorded · receipt unknown';
@@ -788,6 +850,7 @@ function themeForAgent(agentType, isLight = false) {
     nativeCursorFileChangeSummary: normalizedAgent === 'cursor',
     nativeInlineNotice: normalizedAgent === 'cursor',
     nativeDesktopNotice: normalizedAgent === 'codex-desktop' && isLight,
+    nativeCodexActivitySummary: ['codex', 'codex-desktop', 'codex_cli'].includes(normalizedAgent),
     nativePlainThinking: normalizedAgent === 'codex',
     nativeDesktopThinking: normalizedAgent === 'codex-desktop',
     nativeClaudeTerminal: normalizedAgent === 'claude',
@@ -908,6 +971,22 @@ const s = StyleSheet.create({
     fontSize:   12,
     fontStyle:  'italic',
     lineHeight: 18,
+  },
+  codexActivitySummary: {
+    alignSelf:    'stretch',
+    minWidth:     0,
+    marginTop:    3,
+    marginBottom: 6,
+  },
+  codexActivitySummaryTime: {
+    color:      '#8b949e',
+    fontSize:   11,
+    lineHeight: 16,
+    marginTop:  2,
+    fontVariant: ['tabular-nums'],
+  },
+  codexActivitySummaryTimeLight: {
+    color: '#57606a',
   },
   codexDesktopThinking: {
     alignSelf:    'stretch',

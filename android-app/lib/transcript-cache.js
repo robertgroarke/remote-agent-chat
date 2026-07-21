@@ -166,6 +166,22 @@ export function mergeCachedTranscript(sessionId, messages, options = {}) {
   return next;
 }
 
+export function migrateCachedTranscript(aliasSessionId, canonicalSessionId) {
+  const aliasId = normalizedSessionId(aliasSessionId);
+  const canonicalId = normalizedSessionId(canonicalSessionId);
+  if (!aliasId || !canonicalId || aliasId === canonicalId) {
+    return getCachedTranscript(canonicalId) || [];
+  }
+  const aliasMessages = transcriptCache.get(aliasId) || [];
+  const canonicalMessages = transcriptCache.get(canonicalId) || [];
+  const merged = mergeTranscriptMessages(canonicalMessages, aliasMessages);
+  if (aliasMessages.length > 0 || canonicalMessages.length > 0) {
+    setCachedTranscript(canonicalId, merged);
+  }
+  if (transcriptCache.delete(aliasId)) notifyTranscript(aliasId);
+  return merged;
+}
+
 export function appendCachedTranscript(sessionId, message, options = {}) {
   return mergeCachedTranscript(sessionId, message ? [message] : [], options);
 }

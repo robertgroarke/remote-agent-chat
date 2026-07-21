@@ -9,6 +9,9 @@ const frontendHook = read('frontend/hooks.jsx');
 const frontendApp = read('frontend/app.jsx');
 const frontendStyles = read('frontend/styles.css');
 const androidChat = read('android-app/screens/ChatScreen.jsx');
+const androidBubble = read('android-app/components/MessageBubble.jsx');
+const proxyEngine = read('agent-proxy/proxy-engine.js');
+const protocol = require('../agent-proxy/protocol');
 // esbuild's lineLimit may split long string literals with a JavaScript line
 // continuation. Normalize only that serialization detail before asserting the
 // runtime-visible copy.
@@ -34,6 +37,17 @@ assert(frontendHook.includes("armDeliveryTimeout(cid, 'delivered'"), 'web rearms
 assert(frontendHook.includes("setTrackedDeliveryState(cid, 'agent_started')"), 'web clears at correlated agent activity');
 assert(frontendHook.includes("deliveryStatesRef.current[clientMessageId] === 'agent_started'"), 'web ignores a stale failure after agent activity');
 assert(frontendApp.includes('className="delivery-retry"'), 'web failed state renders a Retry action');
+assert(frontendApp.includes('className="delivery-failure-reason"'), 'web failed state renders a visible failure reason');
+for (const copy of [
+  'Update validation pending',
+  'Agent busy',
+  'Open this thread in Codex Desktop',
+  'Could not confirm native delivery',
+  'Composer input could not be verified',
+]) {
+  assert(frontendApp.includes(copy), `web maps the actionable delivery failure: ${copy}`);
+  assert(androidBubble.includes(copy), `Android maps the actionable delivery failure: ${copy}`);
+}
 assert(frontendApp.includes('sendToSessionRef.current(activeSession, message.content, message._cid)'), 'web Retry submits the same bubble and correlation ID');
 assert(frontendStyles.includes('.delivery-retry:focus-visible'), 'web Retry action has keyboard focus styling');
 
@@ -43,6 +57,15 @@ assert(androidChat.includes("armDeliveryStageTimeout(cid, 'delivered'"), 'Androi
 assert(androidChat.includes("deliveryStatesRef.current[clientMsgId] === 'agent_started'"), 'Android ignores a stale failure after agent activity');
 assert(androidChat.includes('doSend(text, clientMsgId);'), 'Android Retry resubmits the original correlation ID');
 assert(androidChat.includes("failedMsg.reason || 'Send failed'"), 'Android surfaces the stage-specific retry reason');
+assert(androidBubble.includes("deliveryFailureText(message._sendError || message.failure_code)"), 'Android failed bubble renders its reason');
+
+assert(proxyEngine.includes("code: 'codex_desktop_thread_not_open'"), 'Codex Desktop send fails closed when its thread is not open');
+assert(proxyEngine.includes("proto.proxySendResult(sessionId, msg.client_message_id, 'failed', { error })"), 'revalidation failure preserves its structured error');
+assert(proxyEngine.includes("QUEUE_ON_SEND_CODES.has(result.code)"), 'agent-busy delivery remains a distinct steerable queue state');
+const revalidationFailure = protocol.proxySendResult('fixture-session', 'fixture-cid', 'failed', {
+  error: { code: 'pending_revalidation', message: 'fixture version mismatch' },
+});
+assert(revalidationFailure.error?.code === 'pending_revalidation', 'protocol preserves the revalidation failure code');
 
 for (const marker of [
   'Timed out waiting for relay acceptance.',

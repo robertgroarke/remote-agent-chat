@@ -12,6 +12,7 @@ const {
 } = require('../agent-proxy/codex-desktop-archive');
 
 const THREAD_ID = '019f51a6-8834-7c21-95fc-78fa8b3daba9';
+const THINKING_THREAD_ID = '019f51a6-8834-7c21-95fc-78fa8b3dabb0';
 const shellCall = {
   role: 'assistant',
   content: '[Tool: exec]',
@@ -110,13 +111,41 @@ const originalFind = codexCli.findSessionByCliId;
 const originalTitleFind = codexCli.findLatestSessionForTitle;
 const originalAnchorFind = codexCli.findRecentSessionByUserAnchor;
 try {
-  codexCli.findSessionByCliId = id => id === THREAD_ID ? {
-    cliSessionId: THREAD_ID,
-    filePath: 'fixture.jsonl',
-    updatedAt: '2026-07-13T00:00:00.000Z',
-    messages: [shellCall, shellResult, editCall, fileChange],
-    messagesPartial: true,
-  } : null;
+  const thinkingUser = { role: 'user', content: 'Keep exact native summary fidelity' };
+  const thinkingTerminal = {
+    role: 'assistant',
+    content: '[Command]',
+    content_blocks: [{ type: 'terminal', title: 'Command', command: 'Write-Output ok', stdout: 'ok' }],
+  };
+  const activitySummary = {
+    type: 'thinking',
+    title: 'Thinking',
+    label: 'Thinking',
+    content: 'Designing process management helpers',
+    activity_summary: true,
+    native_turn_id: 'turn-summary',
+    native_source_id: 'response_item.reasoning:id:summary',
+    producer_timestamp: '2026-07-21T11:47:22.971Z',
+  };
+  codexCli.findSessionByCliId = id => {
+    if (id === THREAD_ID) return {
+      cliSessionId: THREAD_ID,
+      filePath: 'fixture.jsonl',
+      updatedAt: '2026-07-13T00:00:00.000Z',
+      messages: [shellCall, shellResult, editCall, fileChange],
+      messagesPartial: true,
+    };
+    if (id === THINKING_THREAD_ID) return {
+      cliSessionId: THINKING_THREAD_ID,
+      filePath: 'thinking-fixture.jsonl',
+      updatedAt: '2026-07-21T11:47:23.000Z',
+      messages: [thinkingUser, {
+        ...thinkingTerminal,
+        content_blocks: [...thinkingTerminal.content_blocks, activitySummary],
+      }],
+    };
+    return null;
+  };
   codexCli.findLatestSessionForTitle = () => {
     throw new Error('exact UUID recovery must not fall back to a title match');
   };
@@ -133,6 +162,25 @@ try {
   }, dom);
   assert.equal(recovered.length, 3);
   assert.equal(recovered[0].content_blocks[0].type, 'terminal');
+
+  const equalLengthDomWithTool = [thinkingUser, thinkingTerminal];
+  const reasoningRecovered = engine._maybeUseCodexDesktopArchive('thinking-fixture-session', {
+    agentType: 'codex-desktop',
+    _activeThreadKey: `local:${THINKING_THREAD_ID}`,
+    _activeThreadTitle: 'mutable title with an otherwise rich DOM',
+  }, equalLengthDomWithTool);
+  assert.equal(reasoningRecovered.length, equalLengthDomWithTool.length,
+    'reasoning richness recovery should not depend on archive message count');
+  assert(reasoningRecovered[1].content_blocks.some(block => block.activity_summary === true),
+    'exact archive must win when only the reasoning-summary block is missing from a tool-rich DOM');
+
+  const vsCodeRecovered = engine._maybeUseCodexDesktopArchive('thinking-vscode-fixture-session', {
+    agentType: 'codex',
+    _codexVsCodeConversationId: THINKING_THREAD_ID,
+    _activeChatTitle: 'Codex side pane fixture',
+  }, equalLengthDomWithTool);
+  assert(vsCodeRecovered[1].content_blocks.some(block => block.activity_summary === true),
+    'Codex VS Code must enrich an exact conversation from the same authoritative JSONL contract');
 
   const provisionalPrompt = 'This is an owned disposable Remote Agent Chat production check with a unique marker.';
   let provisionalLookup = null;
