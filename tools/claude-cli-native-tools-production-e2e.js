@@ -197,9 +197,9 @@ async function main(argv = process.argv.slice(2)) {
     const genericTaskCards = blocks.filter(block =>
       /^(?:TaskCreate|TaskGet|TaskUpdate|TaskList)$/.test(block.tool_name || '')
       && (block.type === 'tool_call' || block.type === 'tool_result'));
-    assert.equal(messages.length, 6, 'production history must preserve the six-message retained conversation');
+    assert.equal(messages.length, 5, 'production history must preserve the five-message retained conversation');
     assert.deepStrictEqual(blocks.map(block => block.type),
-      ['thinking', 'plan', 'tool_call', 'tool_result', 'markdown']);
+      ['thinking', 'plan', 'tool_result', 'markdown']);
     assert.equal(plans.length, 1);
     assert.equal(plans[0].title, '2 tasks (2 done, 0 open)');
     assert.equal(plans[0].status, 'completed');
@@ -207,9 +207,7 @@ async function main(argv = process.argv.slice(2)) {
       { step: 'Read fixture', status: 'completed' },
       { step: 'Report token', status: 'completed' },
     ]);
-    assert.equal(toolCalls.length, 1);
-    assert.equal(toolCalls[0].tool_name, 'Read');
-    assert.equal(toolCalls[0].status, 'completed');
+    assert.equal(toolCalls.length, 0);
     assert.equal(toolResults.length, 1);
     assert.equal(toolResults[0].tool_name, 'Read');
     assert.equal(toolResults[0].status, 'completed');
@@ -258,7 +256,7 @@ async function main(argv = process.argv.slice(2)) {
           status: plans[0].status,
           tasks: plans[0].tasks,
         },
-        tool_call: { tool_name: toolCalls[0].tool_name, title: toolCalls[0].title, status: toolCalls[0].status },
+        tool_call: null,
         tool_result: { tool_name: toolResults[0].tool_name, title: toolResults[0].title, status: toolResults[0].status },
         generic_task_cards: genericTaskCards.length,
         final_marker_present: true,

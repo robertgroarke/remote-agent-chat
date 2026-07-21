@@ -43,6 +43,11 @@ import {
 } from './broadcast-send-policy.js';
 import { FullTitleDisclosure } from './title-disclosure.jsx';
 import {
+  GOAL_CONTROL_SLASH_COMMANDS,
+  classifyGoalCommandIntent,
+  satisfiedGoalCommandLabel,
+} from './goal-command.js';
+import {
   formatOllamaDuration,
   formatOllamaTokenRate,
   formatProviderCredits,
@@ -107,6 +112,7 @@ const CODEX_CLI_INITIAL_HISTORY_LIMIT = 160;
 const CODEX_CLI_INITIAL_HISTORY_CHUNK_BYTES = 256 * 1024;
 const EMPTY_MESSAGES = Object.freeze([]);
 const SLASH_COMMANDS = [
+  ...GOAL_CONTROL_SLASH_COMMANDS,
   { command: '/plan', detail: 'Outline the implementation approach and major steps.' },
   { command: '/review', detail: 'Review the current changes for bugs, regressions, and missing tests.' },
   { command: '/fix', detail: 'Implement or repair the current issue.' },
@@ -4035,6 +4041,30 @@ function AgentSettingsPanel({ session, config, configControlStates, onRequestRef
   const autoApproveEnabled = typeof config?.auto_approve_permissions === 'boolean'
     ? config.auto_approve_permissions
     : !!session?.auto_approve_permissions;
+  const codexLiveOwner = agentType === 'codex_cli' ? session?.codex_live_owner : null;
+  const codexLiveOwnerLabel = !codexLiveOwner
+    ? 'Ownership status unavailable'
+    : codexLiveOwner.state === 'confirmed'
+      ? ({
+          interactive_tui: 'Interactive terminal active',
+          proxy_app_server: 'Headless RAC app-server turn active',
+          rotator_exec: 'Headless rotator worker active',
+        }[codexLiveOwner.owner_kind] || 'Live owner active')
+      : codexLiveOwner.state === 'multiple'
+        ? 'Needs attention: multiple owners'
+        : codexLiveOwner.state === 'stale'
+          ? 'Needs attention: stale owner proof'
+          : codexLiveOwner.state === 'unavailable'
+            ? 'Ownership startup is not ready'
+            : 'No live owner';
+  const codexLiveOwnerDetail = codexLiveOwner
+    ? [
+        codexLiveOwner.thread_id ? `thread ${codexLiveOwner.thread_id}` : null,
+        codexLiveOwner.turn_id ? `turn ${codexLiveOwner.turn_id}` : null,
+        codexLiveOwner.root_pid ? `PID ${codexLiveOwner.root_pid}` : null,
+        codexLiveOwner.reason || null,
+      ].filter(Boolean).join(' · ')
+    : '';
   const effortLevel    = config?.effort || null;
   const nextSendEffort = config?.next_send_effort || '';
   const fileScope    = config?.file_access_scope || 'unknown';
@@ -4107,6 +4137,25 @@ function AgentSettingsPanel({ session, config, configControlStates, onRequestRef
         <button className="settings-panel-close" onClick={onClose} title="Close">✕</button>
       </div>
       <div className="settings-panel-body">
+
+        {agentType === 'codex_cli' && (
+          <div className="settings-row" data-testid="codex-live-owner-status">
+            <span className="settings-label">Live owner</span>
+            <span
+              className={`settings-value${['multiple', 'stale', 'unavailable'].includes(codexLiveOwner?.state) ? ' error' : ''}`}
+              title={codexLiveOwnerDetail}
+            >{codexLiveOwnerLabel}</span>
+          </div>
+        )}
+        {agentType === 'codex_cli' && (
+          <div className="settings-row" data-testid="codex-headless-send-mode">
+            <span className="settings-label">Remote sends</span>
+            <span className="settings-value" title={config?.send_execution_detail}>
+              {config?.send_execution_label || 'Headless / out-of-process'}
+            </span>
+            <span className="settings-value small">Interactive TUI may stay idle</span>
+          </div>
+        )}
 
         {/* Rate limit warning banner — shown above model when limited */}
         {rateLimitedUntil && (
@@ -4324,7 +4373,9 @@ function AgentSettingsPanel({ session, config, configControlStates, onRequestRef
               {(config.available_efforts || []).map(m => <option key={m.id} value={m.id}>{m.label}</option>)}
             </select>
             <span className={`settings-value small${config?.next_send_effort_status === 'failed' ? ' error' : ''}`}>
-              {config?.next_send_effort_status || 'unset'}
+              {config?.next_send_effort_status && config.next_send_effort_status !== 'unset'
+                ? config.next_send_effort_status
+                : 'No override selected'}
             </span>
           </div>
         )}
@@ -6754,7 +6805,14 @@ function FleetView({ sessions, activities, thinking, permissionPrompts, errorPro
     });
     const goal = workContext.kind === 'goal' ? capabilitySafeActivity?.goal || null : null;
     const goalState = String(goal?.state || goal?.status || '').toLowerCase();
-    const goalAction = goalState === 'active' ? 'pause' : goalState === 'paused' ? 'resume' : null;
+    const goalBlocked = goalState === 'blocked';
+    const blockedResumeSupported = goalBlocked && config.capabilities?.goal_blocked_resume === true;
+    const goalAction = goalState === 'active'
+      ? 'pause'
+      : (goalState === 'paused' || blockedResumeSupported ? 'resume' : null);
+    const goalBlockedReason = goalBlocked
+      ? safeString(goal?.block_reason || goal?.reason || capabilitySafeActivity?.label || 'Goal blocked').trim()
+      : '';
     const turnActive = ['thinking', 'generating', 'running_command', 'applying_patch', 'reading_files', 'working']
       .includes(String(capabilitySafeActivity?.kind || '').toLowerCase());
     const activityKind = safeString(capabilitySafeActivity?.kind).replace(/_/g, ' ');
@@ -6783,6 +6841,8 @@ function FleetView({ sessions, activities, thinking, permissionPrompts, errorPro
       goalAction,
       canControlGoal: !!(goalAction && goal?.fingerprint && config.capabilities?.goal_pause_resume === true
         && Number(session?.control_generation) > 0),
+      goalBlocked,
+      goalBlockedReason,
       canInterrupt: !!(turnActive && config.capabilities?.interrupt === true
         && Number(session?.control_generation) > 0 && Number(session?.turn_generation) > 0),
     };
@@ -6921,17 +6981,24 @@ function FleetView({ sessions, activities, thinking, permissionPrompts, errorPro
                 {entry.working && <time>{fleetElapsed(entry.activity, nowMs)}</time>}
               </span>
               <span className="fleet-freshness" title="Proxy-to-Fleet delivery time">Activity {entry.freshness}</span>
-              {(entry.canControlGoal || entry.canInterrupt) && <span className="fleet-control-actions" role="group" aria-label={`Controls for ${entry.title}`} onClick={event => event.stopPropagation()}>
+              {(entry.canControlGoal || entry.goalBlocked || entry.canInterrupt) && <span className="fleet-control-actions" role="group" aria-label={`Controls for ${entry.title}`} onClick={event => event.stopPropagation()}>
                 {entry.canControlGoal && <button
                   type="button"
                   onClick={() => onGoalControl(entry.id, entry.goalAction, entry.goal, entry.session)}
                   disabled={!connected || !!goalControlPending?.[entry.id]}
-                  aria-label={`${entry.goalAction === 'pause' ? 'Pause' : 'Resume'} goal for ${entry.title}`}
+                  aria-label={`${entry.goalAction === 'pause' ? 'Pause' : entry.goalBlocked ? 'Resume blocked' : 'Resume'} goal for ${entry.title}`}
+                  title={entry.goalBlocked ? entry.goalBlockedReason : undefined}
                 >
                   {goalControlPending?.[entry.id]
                     ? (entry.goalAction === 'pause' ? 'Pausing...' : 'Resuming...')
-                    : (entry.goalAction === 'pause' ? 'Pause goal' : 'Resume goal')}
+                    : (entry.goalAction === 'pause' ? 'Pause goal' : entry.goalBlocked ? 'Resume blocked goal' : 'Resume goal')}
                 </button>}
+                {entry.goalBlocked && !entry.canControlGoal && <button
+                  type="button"
+                  disabled
+                  aria-label={`Goal blocked for ${entry.title}; resolve in the native session`}
+                  title={entry.goalBlockedReason || 'No verified native unblock action is available'}
+                >Goal blocked · native action required</button>}
                 {entry.canInterrupt && <button
                   type="button"
                   className="danger"
@@ -7150,6 +7217,27 @@ class AppErrorBoundary extends React.Component {
   }
 }
 
+class SidebarScrollCoordinator extends React.Component {
+  componentDidMount() {
+    this.props.finishStructureChange(null);
+  }
+
+  getSnapshotBeforeUpdate(previousProps) {
+    if (previousProps.structureKey === this.props.structureKey) return null;
+    return this.props.prepareStructureChange(previousProps.placements, this.props.placements);
+  }
+
+  componentDidUpdate(previousProps, _previousState, snapshot) {
+    if (previousProps.structureKey !== this.props.structureKey) {
+      this.props.finishStructureChange(snapshot);
+    }
+  }
+
+  render() {
+    return this.props.children;
+  }
+}
+
 function App() {
   const { sessions, messages, provisionalStreams, historyMeta, historyLoading, connected, connectionHealth, unread, setUnread, thinking, thinkingContent, activities, health, deliveryStates, launchStates, justLaunched, setJustLaunched, permissionPrompts, respondToPrompt, errorPrompts, respondToErrorPrompt, interruptSession, controlGoal, agentConfigs, configControlStates, requestAgentConfig, setAgentModel, setAgentEffort, setAgentPermissionMode, setAutoApprovePermissions, setAntigravityMode, setCodexConfig, newThread, openPanel, openNativeWindow, requestChatList, switchChat, newChat, chatLists, requestThreadList, switchThread, threadLists, switchWorkspace, requestTerminalOutput, sendTerminalInput, terminalOutputs, requestFileChanges, respondToFileChange, fileChanges, sendAttachment, send, sendToSession, steerMessage, discardQueuedMessage, editQueuedMessage, queuedMessages, scheduledSends, scheduleSend, cancelScheduledSend, launchSession, resumeSession, closeSession, activeSessionRef, restoreCachedTranscript, setSessionSubscriptions, workspaces, branchLists, requestBranchList, switchBranch, createBranch, skillLists, requestSkillList, automationViews, showCodexAutomation, controlResults, directoryListings, requestDirectoryListing, fileContents, requestFileContent, requestHistory, requestHistoryChunk, duplicateProxyAlarms, nightlyValidationFailures, latestAppUpdateValidation, revalidationProgramHealth, providerUsage, providerUsageRefreshReceipt, requestProviderUsageRefresh, setProviderUsageWatching, providerUsageResetReceipt, consumeProviderUsageResetCredit, providerUsageCostDetail, requestProviderUsageCostDetail, hostResources, hostResourceError, hostResourceHistory, hostResourceDetails, hostResourceSubscription, subscribeHostResources, unsubscribeHostResources, requestHostResourceRefresh, semanticNotifications } = useRelay();
   const [activeSession, setActiveSession] = useState(null);
@@ -7197,6 +7285,8 @@ function App() {
   const [revalidationLedgerOpen, setRevalidationLedgerOpen] = useState(false);
   const [stopPending, setStopPending]       = useState({});
   const [goalControlPending, setGoalControlPending] = useState({});
+  const [goalCommandNotices, setGoalCommandNotices] = useState({});
+  const pendingGoalSlashControlsRef = useRef(new Map());
   const [interruptConfirmSession, setInterruptConfirmSession] = useState(null);
   const interruptConfirmRef = useRef({ sessionId: null, expiresAt: 0 });
   const interruptConfirmTimerRef = useRef(null);
@@ -7395,6 +7485,10 @@ function App() {
   const sidebarListRef = useRef(null);
   const pendingSidebarSortAnchorRef = useRef(null);
   const sidebarInteractionTimerRef = useRef(null);
+  const sidebarInteractionEpochRef = useRef(0);
+  const sidebarExpectedProgrammaticScrollRef = useRef(null);
+  const sidebarExpectedProgrammaticScrollFrameRef = useRef(null);
+  const sidebarStructuralTransactionFrameRef = useRef(null);
   const [sidebarStructureLocked, setSidebarStructureLocked] = useState(false);
   const beginSidebarInteraction = React.useCallback(() => {
     if (sidebarInteractionTimerRef.current) clearTimeout(sidebarInteractionTimerRef.current);
@@ -7416,11 +7510,16 @@ function App() {
       window.removeEventListener('pointerup', releasePointer, true);
       window.removeEventListener('pointercancel', releasePointer, true);
       if (sidebarInteractionTimerRef.current) clearTimeout(sidebarInteractionTimerRef.current);
+      if (sidebarExpectedProgrammaticScrollFrameRef.current) {
+        cancelAnimationFrame(sidebarExpectedProgrammaticScrollFrameRef.current);
+      }
+      if (sidebarStructuralTransactionFrameRef.current) {
+        cancelAnimationFrame(sidebarStructuralTransactionFrameRef.current);
+      }
     };
   }, [endSidebarInteraction]);
   const {
     sessions: workingSessions,
-    revision: workingOrderRevision,
   } = useStableWorkingSessions(workingSessionCandidates, sidebarStructureLocked);
   const workingSessionIds = React.useMemo(
     () => new Set(workingSessions.map(sessionIdOf)),
@@ -7462,7 +7561,6 @@ function App() {
     groups: stableSessionGroups,
     orderChanged: sidebarOrderChanged,
     sortNow: sortSidebarNow,
-    revision: sidebarOrderRevision,
   } = useStableSidebarGroups(rawSessionGroups, sidebarRankOptions, sidebarStructureLocked);
   const sessionGroups = React.useMemo(
     () => stableSessionGroups.filter(group => group.sessions.length > 0),
@@ -7541,50 +7639,76 @@ function App() {
     () => new Set(sidebarPortalSessions.map(sessionIdOf)),
     [sidebarPortalSessions],
   );
-  const sidebarPlacementKey = React.useMemo(() => [
-    `working:${workingSessions.map(sessionIdOf).sort().join(',')}`,
-    `recent:${recentSessions.map(sessionIdOf).sort().join(',')}`,
-    `pinned:${pinnedSessions.map(sessionIdOf).sort().join(',')}`,
-    ...sessionGroups
-      .map(group => `${group.key}:${group.sessions.map(sessionIdOf).sort().join(',')}`)
-      .sort(),
-  ].join('|'), [workingSessions, recentSessions, pinnedSessions, sessionGroups]);
+  const sidebarPlacementBySessionId = React.useMemo(() => {
+    const placements = new Map();
+    const claim = (sessions, placement) => {
+      for (const session of sessions) {
+        const id = sessionIdOf(session);
+        if (id && !placements.has(id)) placements.set(id, placement);
+      }
+    };
+    claim(workingSessions, 'working');
+    claim(recentSessions, 'recent');
+    claim(pinnedSessions, 'pinned');
+    for (const group of sessionGroups) claim(group.sessions, `workspace:${group.key}`);
+    return placements;
+  }, [workingSessions, recentSessions, pinnedSessions, sessionGroups]);
+  const sidebarStructureKey = React.useMemo(() => [
+    `working:${workingSessions.map(sessionIdOf).join(',')}`,
+    `recent:${recentSessions.map(sessionIdOf).join(',')}`,
+    `pinned:${pinnedSessions.map(sessionIdOf).join(',')}`,
+    ...sessionGroups.map(group => `${group.key}:${group.sessions.map(sessionIdOf).join(',')}`),
+    `collapsed:${Object.keys(collapsedSessionGroups).filter(key => collapsedSessionGroups[key]).sort().join(',')}`,
+    `filter:${normalizedSidebarSearchQuery}`,
+  ].join('|'), [
+    workingSessions,
+    recentSessions,
+    pinnedSessions,
+    sessionGroups,
+    collapsedSessionGroups,
+    normalizedSidebarSearchQuery,
+  ]);
   const sidebarCardHostsRef = useRef(new Map());
   const sidebarCardPoolRef = useRef(null);
-  const sidebarPendingFocusRef = useRef(null);
-  useLayoutEffect(() => {
+  const prepareSidebarStructureChange = React.useCallback((previousPlacements, nextPlacements) => {
     const list = sidebarListRef.current;
-    if (!list) return;
-    const focusedElement = sidebarPendingFocusRef.current || document.activeElement;
-    const focusedHost = focusedElement instanceof Element
-      ? focusedElement.closest('[data-sidebar-card-host]')
+    if (!list) return null;
+    if (sidebarStructuralTransactionFrameRef.current) {
+      cancelAnimationFrame(sidebarStructuralTransactionFrameRef.current);
+      sidebarStructuralTransactionFrameRef.current = null;
+    }
+    list.classList.add('sidebar-structural-transaction');
+    const activeElement = document.activeElement;
+    const activeHost = activeElement instanceof Element
+      ? activeElement.closest('[data-sidebar-card-host]')
       : null;
-    const retainedIds = new Set();
-    for (const slot of list.querySelectorAll('[data-sidebar-card-slot]')) {
-      const id = slot.getAttribute('data-sidebar-card-slot') || '';
+    const listRect = list.getBoundingClientRect();
+    const cards = Array.from(list.querySelectorAll('[data-session-id]'));
+    const focusedCard = activeElement instanceof Element
+      ? activeElement.closest('[data-session-id]')
+      : null;
+    const visibleCards = cards.filter(node => {
+      const rect = node.getBoundingClientRect();
+      return rect.bottom > listRect.top && rect.top < listRect.bottom;
+    });
+    const focusedCardIsVisible = focusedCard && visibleCards.includes(focusedCard);
+    const anchorCards = [
+      ...(focusedCardIsVisible ? [focusedCard] : []),
+      ...visibleCards.filter(card => card !== focusedCard),
+    ];
+    const anchorCandidates = anchorCards.map(card => ({
+      sessionId: card.dataset.sessionId,
+      top: card.getBoundingClientRect().top,
+    }));
+    const capturedScrollTop = list.scrollTop;
+    const changedHosts = [];
+    for (const [id, previousPlacement] of previousPlacements) {
+      const nextPlacement = nextPlacements.get(id);
+      if (!nextPlacement || nextPlacement === previousPlacement) continue;
       const host = sidebarCardHostsRef.current.get(id);
-      if (!id || !host) continue;
-      retainedIds.add(id);
-      if (host.parentElement !== slot) {
-        const restoreExactFocus = focusedHost === host && focusedElement?.isConnected;
-        slot.appendChild(host);
-        if (restoreExactFocus && document.activeElement !== focusedElement && focusedElement.isConnected) {
-          focusedElement.focus({ preventScroll: true });
-        }
-      }
+      if (host) changedHosts.push(host);
     }
-    sidebarPendingFocusRef.current = null;
-    for (const [id, host] of sidebarCardHostsRef.current) {
-      if (retainedIds.has(id) || sidebarPortalSessionIds.has(id)) continue;
-      host.remove();
-      sidebarCardHostsRef.current.delete(id);
-    }
-    return () => {
-      const activeElement = document.activeElement;
-      const activeHost = activeElement instanceof Element
-        ? activeElement.closest('[data-sidebar-card-host]')
-        : null;
-      sidebarPendingFocusRef.current = activeHost ? activeElement : null;
+    if (changedHosts.length > 0) {
       let pool = sidebarCardPoolRef.current;
       if (!pool) {
         pool = document.createElement('div');
@@ -7601,19 +7725,119 @@ function App() {
         document.body.appendChild(pool);
         sidebarCardPoolRef.current = pool;
       }
-      for (const host of sidebarCardHostsRef.current.values()) pool.appendChild(host);
-      if (sidebarPendingFocusRef.current?.isConnected
-          && document.activeElement !== sidebarPendingFocusRef.current) {
-        sidebarPendingFocusRef.current.focus({ preventScroll: true });
+      for (const host of changedHosts) {
+        const slot = host.closest('[data-sidebar-card-slot]');
+        if (slot) {
+          const card = host.querySelector('[data-session-id]');
+          const cardStyle = card ? getComputedStyle(card) : null;
+          const height = card ? card.getBoundingClientRect().height
+            + (Number.parseFloat(cardStyle?.marginTop) || 0)
+            + (Number.parseFloat(cardStyle?.marginBottom) || 0) : 0;
+          slot.style.display = 'block';
+          slot.style.height = `${height}px`;
+          slot.setAttribute('data-sidebar-card-placeholder', '');
+        }
+        pool.appendChild(host);
       }
+    }
+    if (activeHost && activeElement?.isConnected && document.activeElement !== activeElement) {
+      activeElement.focus({ preventScroll: true });
+    }
+    return {
+      candidates: anchorCandidates,
+      scrollTop: capturedScrollTop,
+      interactionEpoch: sidebarInteractionEpochRef.current,
+      focusedElement: activeHost ? activeElement : null,
+      focusedHost: activeHost,
+      movedHostCount: changedHosts.length,
     };
-  }, [sidebarPlacementKey]);
+  }, []);
+  const finishSidebarStructureChange = React.useCallback((snapshot) => {
+    const list = sidebarListRef.current;
+    if (!list) return;
+    const focusedElement = snapshot?.focusedElement || document.activeElement;
+    const focusedHost = snapshot?.focusedHost || (focusedElement instanceof Element
+      ? focusedElement.closest('[data-sidebar-card-host]')
+      : null);
+    const retainedIds = new Set();
+    for (const slot of list.querySelectorAll('[data-sidebar-card-slot]')) {
+      const id = slot.getAttribute('data-sidebar-card-slot') || '';
+      const host = sidebarCardHostsRef.current.get(id);
+      if (!id || !host) continue;
+      retainedIds.add(id);
+      if (host.parentElement !== slot) {
+        const restoreExactFocus = focusedHost === host && focusedElement?.isConnected;
+        slot.appendChild(host);
+        if (restoreExactFocus && document.activeElement !== focusedElement && focusedElement.isConnected) {
+          focusedElement.focus({ preventScroll: true });
+        }
+      }
+    }
+    const explicitSortAnchor = pendingSidebarSortAnchorRef.current;
+    const pendingAnchor = explicitSortAnchor
+      ? { candidates: [explicitSortAnchor], scrollTop: list.scrollTop, interactionEpoch: sidebarInteractionEpochRef.current }
+      : snapshot;
+    if (pendingAnchor && pendingAnchor.interactionEpoch === sidebarInteractionEpochRef.current) {
+      const candidates = Array.isArray(pendingAnchor.candidates) ? pendingAnchor.candidates : [];
+      const survivingAnchor = candidates.map(candidate => ({
+        ...candidate,
+        card: Array.from(list.querySelectorAll('[data-session-id]'))
+          .find(node => node.dataset.sessionId === candidate.sessionId),
+      })).find(candidate => candidate.card);
+      let targetScrollTop = null;
+      let anchorSessionId = null;
+      if (survivingAnchor) {
+        const delta = survivingAnchor.card.getBoundingClientRect().top - survivingAnchor.top;
+        if (Math.abs(delta) > 0.5) targetScrollTop = list.scrollTop + delta;
+        anchorSessionId = survivingAnchor.sessionId;
+      } else if (Number.isFinite(pendingAnchor.scrollTop)) {
+        targetScrollTop = pendingAnchor.scrollTop;
+      }
+      if (targetScrollTop != null) {
+        const clampedTarget = Math.max(0, Math.min(
+          targetScrollTop,
+          Math.max(0, list.scrollHeight - list.clientHeight),
+        ));
+        if (Math.abs(list.scrollTop - clampedTarget) > 0.5) {
+          const from = list.scrollTop;
+          sidebarExpectedProgrammaticScrollRef.current = { target: clampedTarget };
+          list.scrollTop = clampedTarget;
+          list.dispatchEvent(new CustomEvent('rac-sidebar-scroll-correction', {
+            detail: { from, to: list.scrollTop, anchorSessionId, explicitSort: !!explicitSortAnchor },
+          }));
+          if (sidebarExpectedProgrammaticScrollFrameRef.current) {
+            cancelAnimationFrame(sidebarExpectedProgrammaticScrollFrameRef.current);
+          }
+          sidebarExpectedProgrammaticScrollFrameRef.current = requestAnimationFrame(() => {
+            sidebarExpectedProgrammaticScrollRef.current = null;
+            sidebarExpectedProgrammaticScrollFrameRef.current = null;
+          });
+        }
+      }
+    }
+    pendingSidebarSortAnchorRef.current = null;
+    for (const [id, host] of sidebarCardHostsRef.current) {
+      if (retainedIds.has(id) || sidebarPortalSessionIds.has(id)) continue;
+      host.remove();
+      sidebarCardHostsRef.current.delete(id);
+    }
+    if (snapshot?.focusedElement?.isConnected
+        && document.activeElement !== snapshot.focusedElement) {
+      snapshot.focusedElement.focus({ preventScroll: true });
+    }
+    sidebarStructuralTransactionFrameRef.current = requestAnimationFrame(() => {
+      sidebarStructuralTransactionFrameRef.current = requestAnimationFrame(() => {
+        list.classList.remove('sidebar-structural-transaction');
+        sidebarStructuralTransactionFrameRef.current = null;
+      });
+    });
+  }, [sidebarPortalSessionIds]);
   useEffect(() => () => {
     for (const host of sidebarCardHostsRef.current.values()) host.remove();
     sidebarCardHostsRef.current.clear();
     sidebarCardPoolRef.current?.remove();
     sidebarCardPoolRef.current = null;
-    sidebarPendingFocusRef.current = null;
+    pendingSidebarSortAnchorRef.current = null;
   }, []);
   const summarizeSidebarSessions = React.useCallback(sessionList => sessionList.reduce((result, session) => {
     const id = sessionIdOf(session);
@@ -7749,69 +7973,6 @@ function App() {
     window.addEventListener('keydown', onGlobalShortcut);
     return () => window.removeEventListener('keydown', onGlobalShortcut);
   }, [activeSession, quickSwitcherIndex, quickSwitcherItems, quickSwitcherOpen, quickSwitcherResults, shortcutHelpOpen]);
-  const sidebarAnchorRef = useRef(null);
-  useLayoutEffect(() => {
-    const list = sidebarListRef.current;
-    if (!list) {
-      sidebarAnchorRef.current = null;
-      return;
-    }
-
-    const explicitSortAnchor = pendingSidebarSortAnchorRef.current;
-    let restoredExplicitSort = false;
-    if (explicitSortAnchor?.sessionId) {
-      const card = Array.from(list.querySelectorAll('[data-session-id]'))
-        .find(node => node.dataset.sessionId === explicitSortAnchor.sessionId);
-      if (card) {
-        const delta = card.getBoundingClientRect().top - explicitSortAnchor.top;
-        if (Math.abs(delta) > 0.5) list.scrollTop += delta;
-        restoredExplicitSort = true;
-      }
-      pendingSidebarSortAnchorRef.current = null;
-    }
-
-    const restorePreviousAnchor = () => {
-      const previous = sidebarAnchorRef.current;
-      if (!previous?.sessionId) return;
-      const card = Array.from(list.querySelectorAll('[data-session-id]'))
-        .find(node => node.dataset.sessionId === previous.sessionId);
-      if (!card) return;
-      const delta = card.getBoundingClientRect().top - previous.top;
-      if (Math.abs(delta) > 0.5) list.scrollTop += delta;
-      if (previous.menuOpen) {
-        const menu = card.querySelector('details.session-card-menu');
-        if (menu) menu.open = true;
-      }
-      if (previous.focusTitle && !list.contains(document.activeElement)) {
-        const focusTarget = Array.from(card.querySelectorAll('button, [tabindex]'))
-          .find(node => node.getAttribute('title') === previous.focusTitle);
-        focusTarget?.focus({ preventScroll: true });
-      }
-    };
-    const captureAnchor = () => {
-      const listRect = list.getBoundingClientRect();
-      const cards = Array.from(list.querySelectorAll('[data-session-id]'));
-      const focusedCard = document.activeElement?.closest?.('[data-session-id]');
-      const visibleCard = cards.find(node => {
-        const rect = node.getBoundingClientRect();
-        return rect.bottom > listRect.top && rect.top < listRect.bottom;
-      });
-      const card = focusedCard || visibleCard || cards[0];
-      if (!card) return null;
-      return {
-        sessionId: card.dataset.sessionId,
-        top: card.getBoundingClientRect().top,
-        focusTitle: focusedCard ? document.activeElement?.getAttribute?.('title') || null : null,
-        menuOpen: !!card.querySelector('details.session-card-menu[open]'),
-      };
-    };
-
-    if (!restoredExplicitSort) restorePreviousAnchor();
-    sidebarAnchorRef.current = captureAnchor();
-    return () => {
-      sidebarAnchorRef.current = captureAnchor();
-    };
-  }, [activeSession, workingOrderRevision, sidebarOrderRevision]);
   const activeSessionMeta = React.useMemo(
     () => orderedSessions.find(s => sessionIdOf(s) === activeSession),
     [orderedSessions, activeSession],
@@ -8165,8 +8326,8 @@ function App() {
               .find(row => row.dataset.messageKey === anchor.messageKey)
           : null;
         if (anchorRow) {
-          const currentOffset = anchorRow.getBoundingClientRect().top - list.getBoundingClientRect().top;
-          const correction = currentOffset - anchor.viewportOffset;
+          const currentViewportTop = anchorRow.getBoundingClientRect().top;
+          const correction = currentViewportTop - anchor.viewportTop;
           if (Math.abs(correction) >= 0.5) {
             setScrollTopInstant(list, Math.max(0, list.scrollTop + correction));
           }
@@ -8225,6 +8386,34 @@ function App() {
       setGoalControlPending(previous => Object.fromEntries(
         Object.entries(previous).filter(([sessionId]) => !completedIds.has(sessionId)),
       ));
+      for (const [sessionId, requestId] of completedGoals) {
+        const pending = pendingGoalSlashControlsRef.current.get(requestId);
+        if (!pending) continue;
+        const result = controlResults[requestId];
+        pendingGoalSlashControlsRef.current.delete(requestId);
+        if (result?.result === 'ok') {
+          setDraftForSession(sessionId, current => (
+            String(current || '').trim().toLowerCase() === pending.command ? '' : current
+          ));
+          setGoalCommandNotices(previous => ({
+            ...previous,
+            [sessionId]: {
+              status: 'success',
+              requestId,
+              text: pending.action === 'pause' ? 'Goal paused' : 'Goal resumed',
+            },
+          }));
+          showToast(pending.action === 'pause' ? 'Goal paused' : 'Goal resumed');
+        } else {
+          const detail = result?.error?.message || 'Native goal control did not apply.';
+          setGoalCommandNotices(previous => ({
+            ...previous,
+            [sessionId]: {
+              status: 'failed', requestId, text: `${detail} Command retained; press Send to retry.`,
+            },
+          }));
+        }
+      }
     }
     const failure = [...completedStops, ...completedGoals]
       .map(([, requestId]) => controlResults[requestId])
@@ -8381,7 +8570,10 @@ function App() {
 
   function setDraftForSession(sessionId, value) {
     if (!sessionId) return;
-    setDrafts(prev => ({ ...prev, [sessionId]: value }));
+    setDrafts(prev => ({
+      ...prev,
+      [sessionId]: typeof value === 'function' ? value(prev[sessionId] || '') : value,
+    }));
   }
 
   function setDraftFileForSession(sessionId, file) {
@@ -8625,6 +8817,12 @@ async function uploadBinaryDraft(sessionId, base64, mimeType, filename) {
     if (!text && attachedFiles.length === 0) return;
     if (!activeSession) return;
 
+    const goalIntent = classifyGoalCommandIntent(currentInput, { attachmentCount: attachedFiles.length });
+    if (goalIntent.kind !== 'chat') {
+      handleGoalCommandIntent(goalIntent);
+      return;
+    }
+
     let content = '';
     if (attachedFiles.length > 0) {
       const fileParts = attachedFiles.map(f => {
@@ -8705,13 +8903,85 @@ async function uploadBinaryDraft(sessionId, base64, mimeType, filename) {
     return requestId;
   }
 
-  function requestGoalControl(sessionId, action, goal, sessionMeta) {
+  function requestGoalControl(sessionId, action, goal, sessionMeta, options = {}) {
     if (!sessionId || !goal || goalControlPending[sessionId]) return null;
     const requestId = controlGoal(sessionId, action, goal, {
       sessionGeneration: sessionMeta?.control_generation,
+      requestId: options.requestId,
     });
     setGoalControlPending(prev => ({ ...prev, [sessionId]: requestId }));
     return requestId;
+  }
+
+  function handleGoalCommandIntent(intent) {
+    if (!activeSession) return;
+    const fail = text => {
+      setGoalCommandNotices(previous => ({
+        ...previous,
+        [activeSession]: { status: 'failed', requestId: null, text },
+      }));
+      showToast(text);
+      setShowSlashMenu(false);
+    };
+    if (intent.kind === 'unsupported_goal_control') {
+      fail('Unsupported goal command. Use /goal resume or /goal pause.');
+      return;
+    }
+    if (!connected) {
+      fail('Goal control is offline. Command retained; reconnect and press Send to retry.');
+      return;
+    }
+    if (goalControlPending[activeSession]) {
+      fail('A goal control is already applying. Command retained.');
+      return;
+    }
+    const agentType = activeSessionMeta?.agent_type;
+    if (!['codex', 'codex-desktop', 'codex_cli'].includes(agentType)
+        || activeConfig?.capabilities?.goal_pause_resume !== true
+        || !activeGoal?.fingerprint
+        || Number(activeSessionMeta?.control_generation) <= 0) {
+      fail('This session has no verified native goal control. Command retained.');
+      return;
+    }
+    const satisfied = satisfiedGoalCommandLabel(intent.action, activeGoalState);
+    if (satisfied) {
+      setDraftForSession(activeSession, '');
+      setGoalCommandNotices(previous => ({
+        ...previous,
+        [activeSession]: { status: 'success', requestId: null, text: satisfied },
+      }));
+      showToast(satisfied);
+      setShowSlashMenu(false);
+      return;
+    }
+    if (intent.action === 'resume' && activeGoalState === 'blocked'
+        && activeConfig?.capabilities?.goal_blocked_resume !== true) {
+      fail('Blocked-goal resume is not verified for this session. Command retained.');
+      return;
+    }
+    const expectedState = intent.action === 'pause'
+      ? activeGoalState === 'active'
+      : ['paused', 'blocked'].includes(activeGoalState);
+    if (!expectedState) {
+      fail(`Goal state is ${activeGoalState || 'unknown'}; refresh before retrying this command.`);
+      return;
+    }
+    const requestId = `goal-slash-${intent.action}-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+    pendingGoalSlashControlsRef.current.set(requestId, {
+      action: intent.action,
+      command: intent.command,
+    });
+    setGoalCommandNotices(previous => ({
+      ...previous,
+      [activeSession]: { status: 'applying', requestId, text: 'Validating goal, then applying native control…' },
+    }));
+    const sentRequestId = requestGoalControl(activeSession, intent.action, activeGoal, activeSessionMeta, { requestId });
+    if (!sentRequestId) {
+      pendingGoalSlashControlsRef.current.delete(requestId);
+      fail('Goal control could not be queued. Command retained; press Send to retry.');
+      return;
+    }
+    setShowSlashMenu(false);
   }
 
   useEffect(() => () => {
@@ -9207,7 +9477,15 @@ async function uploadBinaryDraft(sessionId, base64, mimeType, filename) {
     : null;
   const activeGoal = activeActivity?.goal || null;
   const activeGoalState = String(activeGoal?.state || activeGoal?.status || '').toLowerCase();
-  const activeGoalAction = activeGoalState === 'active' ? 'pause' : activeGoalState === 'paused' ? 'resume' : null;
+  const activeGoalBlocked = activeGoalState === 'blocked';
+  const activeBlockedResumeSupported = activeGoalBlocked
+    && activeConfig?.capabilities?.goal_blocked_resume === true;
+  const activeGoalAction = activeGoalState === 'active'
+    ? 'pause'
+    : (activeGoalState === 'paused' || activeBlockedResumeSupported ? 'resume' : null);
+  const activeGoalBlockedReason = activeGoalBlocked
+    ? safeString(activeGoal?.block_reason || activeGoal?.reason || activeActivity?.label || 'Goal blocked').trim()
+    : '';
   const activeGoalControlAvailable = !!(
     activeGoalAction
     && activeGoal?.fingerprint
@@ -9293,7 +9571,7 @@ async function uploadBinaryDraft(sessionId, base64, mimeType, filename) {
       }) || rows.find(row => row.getBoundingClientRect().bottom > listTop) || rows[0] || null;
       nonWindowedPrependAnchorRef.current = anchorRow ? {
         messageKey: anchorRow.dataset.messageKey,
-        viewportOffset: anchorRow.getBoundingClientRect().top - listTop,
+        viewportTop: anchorRow.getBoundingClientRect().top,
       } : null;
     }
     const chunkSource = (activeSessionMeta?.agent_type === 'codex_cli' || activeSessionMeta?.agent_type === 'cursor_cli') ? 'native' : 'relay_sqlite';
@@ -9954,13 +10232,43 @@ async function uploadBinaryDraft(sessionId, base64, mimeType, filename) {
             showTestSessions={showTestSessions}
           />
         )}
-        <div
-          className="session-list"
-          ref={sidebarListRef}
-          onPointerDown={beginSidebarInteraction}
+        <SidebarScrollCoordinator
+          structureKey={sidebarStructureKey}
+          placements={sidebarPlacementBySessionId}
+          prepareStructureChange={prepareSidebarStructureChange}
+          finishStructureChange={finishSidebarStructureChange}
+        >
+          <div
+            className="session-list"
+            ref={sidebarListRef}
+          onPointerDown={() => {
+            sidebarInteractionEpochRef.current += 1;
+            beginSidebarInteraction();
+          }}
           onPointerUp={() => endSidebarInteraction(80)}
           onPointerCancel={() => endSidebarInteraction(80)}
-          onScroll={() => {
+          onWheel={() => {
+            sidebarInteractionEpochRef.current += 1;
+            beginSidebarInteraction();
+            endSidebarInteraction(180);
+          }}
+          onTouchStart={() => {
+            sidebarInteractionEpochRef.current += 1;
+            beginSidebarInteraction();
+          }}
+          onKeyDown={event => {
+            if (!['ArrowUp', 'ArrowDown', 'PageUp', 'PageDown', 'Home', 'End', ' '].includes(event.key)) return;
+            sidebarInteractionEpochRef.current += 1;
+            beginSidebarInteraction();
+            endSidebarInteraction(180);
+          }}
+          onScroll={event => {
+            const expected = sidebarExpectedProgrammaticScrollRef.current;
+            if (expected && Math.abs(event.currentTarget.scrollTop - expected.target) <= 0.5) {
+              sidebarExpectedProgrammaticScrollRef.current = null;
+              return;
+            }
+            sidebarInteractionEpochRef.current += 1;
             beginSidebarInteraction();
             endSidebarInteraction(180);
           }}
@@ -10115,7 +10423,8 @@ async function uploadBinaryDraft(sessionId, base64, mimeType, filename) {
               workspaceOwnedSessionIds.has(id) ? '' : (workspaceLabelBySessionId[id] || 'Unscoped'),
             );
           })}
-        </div>
+          </div>
+        </SidebarScrollCoordinator>
         <div className="sidebar-footer">
           <span className={`status-dot ${relayHealthState}`} />
           <span className="sidebar-footer-health">
@@ -10414,17 +10723,25 @@ async function uploadBinaryDraft(sessionId, base64, mimeType, filename) {
                     providerUsage={providerUsage}
                     onOpenUsage={() => { captureChatRouteScroll(); setShowUsageDashboard(true); setShowHostResourceDashboard(false); setShowFleetView(false); }}
                   />
-                  {activeGoalControlAvailable && (
+                  {(activeGoalControlAvailable || activeGoalBlocked) && (
                     <button
                       type="button"
                       className="context-pill session-control-pill goal-control"
-                      onClick={() => requestGoalControl(activeSession, activeGoalAction, activeGoal, activeSessionMeta)}
-                      disabled={!connected || !!goalControlPending[activeSession]}
-                      aria-label={`${activeGoalAction === 'pause' ? 'Pause' : 'Resume'} goal`}
+                      onClick={() => activeGoalControlAvailable
+                        && requestGoalControl(activeSession, activeGoalAction, activeGoal, activeSessionMeta)}
+                      disabled={!activeGoalControlAvailable || !connected || !!goalControlPending[activeSession]}
+                      aria-label={activeGoalControlAvailable
+                        ? `${activeGoalAction === 'pause' ? 'Pause' : activeGoalBlocked ? 'Resume blocked' : 'Resume'} goal`
+                        : 'Goal blocked; resolve in the native session'}
+                      title={activeGoalBlocked ? (activeGoalBlockedReason || 'No verified native unblock action is available') : undefined}
                     >
                       {goalControlPending[activeSession]
                         ? (activeGoalAction === 'pause' ? 'Pausing goal...' : 'Resuming goal...')
-                        : (activeGoalAction === 'pause' ? 'Pause goal' : 'Resume goal')}
+                        : (activeGoalAction === 'pause'
+                          ? 'Pause goal'
+                          : activeGoalBlocked
+                            ? (activeGoalControlAvailable ? 'Resume blocked goal' : 'Goal blocked · native action required')
+                            : 'Resume goal')}
                     </button>
                   )}
                   {activeInterruptAvailable && (
@@ -10743,6 +11060,17 @@ async function uploadBinaryDraft(sessionId, base64, mimeType, filename) {
               </button>
             </div>
           )}
+          {activeSession && activeHistoryLoading && currentMessages.length > 0 && !showPartialHistoryBanner && (
+            <div className="history-tail-banner history-refresh-banner" role="status">
+              <span>Refreshing latest messages...</span>
+            </div>
+          )}
+          {activeSession && activeHistoryMeta?.error && (
+            <div className="history-tail-banner history-error-inline" role="alert">
+              <span>{activeHistoryMeta.error}</span>
+              <button type="button" onClick={retryActiveHistory} disabled={!!activeHistoryLoading}>Retry transcript</button>
+            </div>
+          )}
           {!activeSession ? (
             <div className="empty-state"><div className="icon">🤖</div><div>Select an agent session</div></div>
           ) : currentMessages.length === 0 && !activeProvisionalStream && hasThreadCap && activeSessionMeta?.is_list_view && (threadLists[activeSession]?.length > 0) && !pendingDraftThreads[activeSession] && !hasNativeDraftThread ? (
@@ -10809,12 +11137,6 @@ async function uploadBinaryDraft(sessionId, base64, mimeType, filename) {
                   </button>
                 ))}
               </div>
-            </div>
-          ) : currentMessages.length === 0 && !activeProvisionalStream && activeHistoryMeta?.error ? (
-            <div className="empty-state history-error-state">
-              <div className="icon">⚠</div>
-              <div>{activeHistoryMeta.error}</div>
-              <button type="button" className="thread-picker-new" onClick={retryActiveHistory}>Retry transcript</button>
             </div>
           ) : currentMessages.length === 0 && !activeProvisionalStream && activeHistoryLoading ? (
             <div className="empty-state history-loading-state">
@@ -11036,6 +11358,16 @@ async function uploadBinaryDraft(sessionId, base64, mimeType, filename) {
               </div>
             )}
             {/* Queued messages bar — shown above input when agent is busy */}
+            {activeSession && goalCommandNotices[activeSession] && (
+              <div
+                className={`goal-command-notice ${goalCommandNotices[activeSession].status}`}
+                role={goalCommandNotices[activeSession].status === 'failed' ? 'alert' : 'status'}
+                data-request-id={goalCommandNotices[activeSession].requestId || undefined}
+              >
+                <strong>Goal control</strong>
+                <span>{goalCommandNotices[activeSession].text}</span>
+              </div>
+            )}
             {activeSession && (queuedMessages[activeSession] || []).length > 0 && (
               <div className="queued-bar">
                 {(queuedMessages[activeSession] || []).map(qm => (
@@ -11315,7 +11647,11 @@ async function uploadBinaryDraft(sessionId, base64, mimeType, filename) {
                         ))}
                       </select>
                       {activeSessionMeta?.agent_type === 'codex_cli' && activeConfig?.config_semantics === 'observed_and_next_send' && (
-                        <span className="composer-hint">{activeConfig.next_send_effort_status || 'unset'}</span>
+                        <span className="composer-hint">
+                          {activeConfig.next_send_effort_status && activeConfig.next_send_effort_status !== 'unset'
+                            ? activeConfig.next_send_effort_status
+                            : 'No override selected'}
+                        </span>
                       )}
                     </label>
                   </>

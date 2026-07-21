@@ -9,11 +9,15 @@ const { EventEmitter } = require('events');
 
 const tempRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'rac-proxy-codex-app-server-'));
 process.env.SESSION_STORE_PATH = path.join(tempRoot, 'session-store.json');
+const nativeThreadId = '019f7444-1111-7111-8111-111111111111';
+fs.writeFileSync(path.join(tempRoot, 'rollout.jsonl'), '{"type":"session_meta"}\n', 'utf8');
 const {
   ProxyEngine,
   shouldFastPollCodexCliSession,
 } = require('../agent-proxy/proxy-engine');
 const { canonicalQuestionPrompt } = require('../shared/question-prompt-contract');
+const { createReadyOwnerRegistry } = require('./codex-owner-test-fixture');
+const { resolveLineageOwner } = require('../shared/codex-live-owner-registry');
 
 class FakeTurn extends EventEmitter {
   constructor({ fail = false } = {}) {
@@ -22,6 +26,7 @@ class FakeTurn extends EventEmitter {
     this.startCalls = [];
     this.answerCalls = [];
     this.stopCalls = 0;
+    this.connection = { connectionGeneration: 'fixture-connection', child: { pid: process.pid } };
   }
 
   async start(params) {
@@ -31,15 +36,15 @@ class FakeTurn extends EventEmitter {
       error.code = 'owned_app_server_failed';
       throw error;
     }
-    this.threadId = 'native-thread';
+    this.threadId = nativeThreadId;
     this.turnId = 'native-turn';
     return {
-      thread_id: 'native-thread',
+      thread_id: nativeThreadId,
       turn_id: 'native-turn',
       thread_path: path.join(tempRoot, 'rollout.jsonl'),
       native_receipt: {
         transport: 'codex_app_server',
-        thread_id: 'native-thread',
+        thread_id: nativeThreadId,
         turn_id: 'native-turn',
         observed_at: new Date().toISOString(),
       },
@@ -69,6 +74,7 @@ function createHarness(fakeTurn) {
   engine.logs = [];
   engine.broadcasts = 0;
   engine._codexCliAppServerTurnFactory = () => fakeTurn;
+  engine._codexOwnerRegistryPath = createReadyOwnerRegistry(tempRoot);
   engine._findCodexCliSummaryByCliId = () => null;
   engine._sendToRelay = message => { engine.sent.push(message); return true; };
   engine._publishCodexCliConfig = () => {};
@@ -125,10 +131,10 @@ function settle() {
   assert.strictEqual(result.ok, true);
   assert.strictEqual(result.lifecycle_managed, true);
   assert.strictEqual(result.native_receipt.transport, 'codex_app_server');
-  assert.strictEqual(session.cliSessionId, 'native-thread');
+  assert.strictEqual(session.cliSessionId, nativeThreadId);
   assert.strictEqual(session._codexAppServerTurn, fakeTurn);
   assert.deepStrictEqual(session._codexAppServerLastTurnIdentity, {
-    thread_id: 'native-thread',
+    thread_id: nativeThreadId,
     turn_id: 'native-turn',
     process_epoch: result.process_epoch,
   });
@@ -141,6 +147,11 @@ function settle() {
     clientMessageId: 'client-message',
     collaborationMode: null,
   });
+  const liveOwner = resolveLineageOwner(nativeThreadId, { registryPath: engine._codexOwnerRegistryPath });
+  assert.strictEqual(liveOwner.state, 'confirmed');
+  assert.strictEqual(liveOwner.owner.owner_kind, 'proxy_app_server');
+  assert.strictEqual(liveOwner.owner.rac_session_id, sessionId);
+  assert.strictEqual(liveOwner.owner.turn_id, 'native-turn');
 
   const opened = prompt(sessionId);
   fakeTurn.emit('question_prompt', opened);
@@ -173,7 +184,7 @@ function settle() {
   assert.strictEqual(session.activity.kind, 'generating');
 
   assert.strictEqual(engine._observeCodexCliOwnedTurnCompletion(sessionId, session, {
-    cliSessionId: 'native-thread',
+    cliSessionId: nativeThreadId,
     taskCompletedTurnId: 'different-turn',
     taskCompletedAt: new Date().toISOString(),
   }), false, 'a different JSONL turn must not release the owned app-server turn');
@@ -183,7 +194,7 @@ function settle() {
     message.type === 'proxy_status' && message.activity?.kind === 'idle').length;
   const liveTerminalStatuses = idleStatusCount();
   assert.strictEqual(engine._observeCodexCliOwnedTurnCompletion(sessionId, session, {
-    cliSessionId: 'native-thread',
+    cliSessionId: nativeThreadId,
     taskCompletedTurnId: 'native-turn',
     taskCompletedAt: new Date().toISOString(),
   }), true, 'the exact terminal JSONL turn must release via live turn-object identity');
@@ -204,11 +215,14 @@ function settle() {
   }), false, 'pre-terminal reasoning must not overwrite authoritative idle');
   assert.strictEqual(session.activity.kind, 'idle');
   assert.strictEqual(fakeTurn.stopCalls, 1);
+  assert.strictEqual(resolveLineageOwner(nativeThreadId, {
+    registryPath: engine._codexOwnerRegistryPath,
+  }).state, 'none');
 
   session.activity = { kind: 'generating', label: 'stale', updated_at: new Date().toISOString() };
   session._codexCliPendingReceipt = null;
   assert.strictEqual(engine._observeCodexCliOwnedTurnCompletion(sessionId, session, {
-    cliSessionId: 'native-thread',
+    cliSessionId: nativeThreadId,
     taskCompletedTurnId: 'native-turn',
     taskCompletedAt: new Date().toISOString(),
   }), true, 'the retained exact turn identity must reconcile terminal activity after live ownership detaches');
@@ -216,7 +230,7 @@ function settle() {
 
   const reconciledStatuses = idleStatusCount();
   assert.strictEqual(engine._observeCodexCliOwnedTurnCompletion(sessionId, session, {
-    cliSessionId: 'native-thread',
+    cliSessionId: nativeThreadId,
     taskCompletedTurnId: 'native-turn',
     taskCompletedAt: new Date().toISOString(),
   }), true, 'an already reconciled exact terminal remains acknowledged');
@@ -226,7 +240,7 @@ function settle() {
   session._codexAppServerTerminalReconciledTurnId = null;
   const detachedNoopStatuses = idleStatusCount();
   assert.strictEqual(engine._observeCodexCliOwnedTurnCompletion(sessionId, session, {
-    cliSessionId: 'native-thread',
+    cliSessionId: nativeThreadId,
     taskCompletedTurnId: 'native-turn',
     taskCompletedAt: new Date().toISOString(),
   }), true, 'a detached exact terminal must reconcile even when activity is already idle');
@@ -250,6 +264,7 @@ function settle() {
     app_server_default_transport: true,
     owned_turn_fast_poll_lane: true,
     native_turn_receipt: true,
+    canonical_owner_published_and_cleared: true,
     question_relayed_once: true,
     response_forwarded_once: fakeTurn.answerCalls.length,
     native_ack_required: true,

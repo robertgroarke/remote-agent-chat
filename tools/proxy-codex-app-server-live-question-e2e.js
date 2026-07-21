@@ -13,6 +13,7 @@ const { ProxyEngine } = require('../agent-proxy/proxy-engine');
 const { CodexCliAppServerTurn } = require('../agent-proxy/codex-cli-app-server');
 const { CodexAppServerConnection } = require('../agent-proxy/codex-app-server');
 const sessionStore = require('../agent-proxy/session-store');
+const { createReadyOwnerRegistry } = require('./codex-owner-test-fixture');
 
 const repoRoot = path.resolve(__dirname, '..');
 
@@ -37,7 +38,7 @@ function createHarness() {
   engine.sent = [];
   engine.logs = [];
   engine._codexCliAppServerTurnFactory = options => new CodexCliAppServerTurn(options);
-  engine._findCodexCliSummaryByCliId = () => null;
+  engine._codexOwnerRegistryPath = createReadyOwnerRegistry(tempRoot);
   engine._sendToRelay = message => { engine.sent.push(message); return true; };
   engine._publishCodexCliConfig = () => {};
   engine._broadcastSessionSnapshot = () => {};
@@ -93,7 +94,7 @@ async function archiveThread(threadId) {
       sessionId,
       { clientMessageId: `client-${crypto.randomUUID()}` },
     );
-    assert.strictEqual(sendResult.ok, true);
+    assert.strictEqual(sendResult.ok, true, `live send failed: ${JSON.stringify(sendResult)}; logs=${JSON.stringify(engine.logs)}`);
     assert.strictEqual(sendResult.native_receipt.transport, 'codex_app_server');
     nativeThreadId = sendResult.native_receipt.thread_id;
     const prompt = await waitFor(

@@ -75,7 +75,7 @@ function SettingRow({ label, options, value, onChange, disabled = false }) {
 // ── Main sheet ──────────────────────────────────────────────────────────────
 
 export default function AgentSettingsSheet({
-  visible, onClose, agentType, config, relay, sessionId, controlResults, onExport,
+  visible, onClose, agentType, config, relay, sessionId, session, controlResults, onExport,
 }) {
   const [controlStates, setControlStates] = useState({});
   const [bypassConfirmation, setBypassConfirmation] = useState(false);
@@ -243,6 +243,30 @@ export default function AgentSettingsSheet({
   const autoApproveEnabled = typeof config.auto_approve_permissions === 'boolean'
     ? config.auto_approve_permissions
     : false;
+  const codexLiveOwner = agentType === 'codex_cli' ? session?.codex_live_owner : null;
+  const codexLiveOwnerLabel = !codexLiveOwner
+    ? 'Ownership status unavailable'
+    : codexLiveOwner.state === 'confirmed'
+      ? ({
+          interactive_tui: 'Interactive terminal active',
+          proxy_app_server: 'Headless RAC app-server turn active',
+          rotator_exec: 'Headless rotator worker active',
+        }[codexLiveOwner.owner_kind] || 'Live owner active')
+      : codexLiveOwner.state === 'multiple'
+        ? 'Needs attention: multiple owners'
+        : codexLiveOwner.state === 'stale'
+          ? 'Needs attention: stale owner proof'
+          : codexLiveOwner.state === 'unavailable'
+            ? 'Ownership startup is not ready'
+            : 'No live owner';
+  const codexLiveOwnerDetail = codexLiveOwner
+    ? [
+        codexLiveOwner.thread_id ? `Thread ${codexLiveOwner.thread_id}` : null,
+        codexLiveOwner.turn_id ? `Turn ${codexLiveOwner.turn_id}` : null,
+        codexLiveOwner.root_pid ? `PID ${codexLiveOwner.root_pid}` : null,
+        codexLiveOwner.reason || null,
+      ].filter(Boolean).join(' · ')
+    : '';
 
   if (!hasConfig) return null;
 
@@ -256,6 +280,22 @@ export default function AgentSettingsSheet({
         <Text style={s.sheetTitle}>Agent Settings</Text>
 
         <ScrollView style={s.sheetBody} bounces={false}>
+          {agentType === 'codex_cli' && (
+            <View style={s.infoRow} testID="codex-live-owner-status" accessibilityLabel={`${codexLiveOwnerLabel}. ${codexLiveOwnerDetail}`}>
+              <Text style={s.infoLabel}>Live owner</Text>
+              <Text style={[s.infoValue, ['multiple', 'stale', 'unavailable'].includes(codexLiveOwner?.state) && s.controlStatusTextFailed]} selectable>
+                {codexLiveOwnerLabel}
+              </Text>
+              {!!codexLiveOwnerDetail && <Text style={[s.infoLabel, s.infoLabelSpaced]} selectable>{codexLiveOwnerDetail}</Text>}
+            </View>
+          )}
+          {agentType === 'codex_cli' && (
+            <View style={s.infoRow} testID="codex-headless-send-mode" accessibilityLabel={`${config.send_execution_label || 'Headless / out-of-process'}. ${config.send_execution_detail || 'A separate interactive Codex TUI may remain idle.'}`}>
+              <Text style={s.infoLabel}>Remote sends</Text>
+              <Text style={s.infoValue}>{config.send_execution_label || 'Headless / out-of-process'}</Text>
+              <Text style={[s.infoLabel, s.infoLabelSpaced]}>{config.send_execution_detail || 'A separate interactive Codex TUI may remain idle.'}</Text>
+            </View>
+          )}
           {splitObservedConfig && (
             <View style={s.infoRow}>
               <Text style={s.infoLabel}>Observed model</Text>
@@ -319,7 +359,7 @@ export default function AgentSettingsSheet({
           {showEffort && (
             <SettingRow
               label={splitObservedConfig
-                ? `Next send effort · ${config.next_send_effort_status || 'unset'}`
+                ? `Next send effort · ${config.next_send_effort_status && config.next_send_effort_status !== 'unset' ? config.next_send_effort_status : 'no override selected'}`
                 : (isVsCodeCodex ? 'Next turn effort' : 'Effort')}
               options={config.available_efforts}
               value={valueFor('effort', splitObservedConfig ? (config.next_send_effort || '') : (config.effort || 'medium').toLowerCase())}

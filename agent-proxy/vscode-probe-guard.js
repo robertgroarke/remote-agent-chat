@@ -37,9 +37,14 @@ function assertUpdatesDisabled(callSite = 'vscode probe') {
 }
 
 function isThrowawayWorkbench(target) {
+  const escapedWorkspace = WORKSPACE_NAME.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+  const exactWorkspaceTitle = new RegExp(
+    `(?:^| - )${escapedWorkspace}(?: \\(workspace\\))? - visual studio code(?: |$)`,
+    'i',
+  );
   return target?.type === 'page'
     && /workbench\.html/i.test(String(target.url || ''))
-    && String(target.title || '').toLowerCase().includes(WORKSPACE_NAME);
+    && exactWorkspaceTitle.test(String(target.title || ''));
 }
 
 function iframeExtension(target) {
@@ -57,7 +62,7 @@ function assertTargetSet(targets, agentType, callSite = 'vscode probe') {
   if (pages.length !== 1) throw new Error(`${callSite}: expected one disposable workbench, found ${pages.length}`);
   if (frames.length < 1) throw new Error(`${callSite}: expected a disposable ${agentType} iframe, found ${frames.length}`);
   const launcher = agentType === 'claude'
-    ? frames.find(frame => /[?&]purpose=webviewView(?:&|$)/i.test(String(frame.url || '')))
+    ? frames.find(frame => /[?&]purpose=webviewView(?:&|$)/i.test(String(frame.url || ''))) || (frames.length === 1 ? frames[0] : null)
     : frames[0];
   if (!launcher) throw new Error(`${callSite}: disposable ${agentType} extension iframe not found`);
   if (agentType !== 'claude' && frames.length !== 1) {

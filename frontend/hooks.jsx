@@ -38,7 +38,14 @@ const { useState, useEffect, useRef, useCallback } = React;
 const DEFAULT_HISTORY_TAIL_LIMIT = 120;
 const CODEX_CLI_HISTORY_CHUNK_BYTES = 1024 * 1024;
 const HISTORY_CHUNK_TIMEOUT_MS = 15000;
-const MAX_HISTORY_CHUNK_RETRIES = 1;
+const MAX_HISTORY_CHUNK_RETRIES = 3;
+const RECOVERABLE_HISTORY_CHUNK_CODES = new Set([
+  'history_chunk_throttled',
+  'history_chunk_duplicate_cursor',
+  'history_waiter_capacity',
+  'history_request_capacity',
+  'throttled',
+]);
 export const CONFIG_CONTROL_TIMEOUT_MS = 15000;
 export const DELIVERY_STAGE_TIMEOUT_MS = Object.freeze({
   queued: 10000,
@@ -1123,11 +1130,23 @@ export function useRelay() {
           mode,
           replace,
           baselineMessageKeys,
+          beforeOffset,
+          beforeId,
+          aroundId,
+          userInitiated: options.userInitiated === true || options.user_initiated === true,
+          retryAttempt: Number(options.retryAttempt || 0),
           lastRequestSig: requestCursorSig,
           lastRequestAt: nowMs,
         };
       } else {
-        historyChunkState.current[id] = { ...(historyChunkState.current[id] || {}), source, chunkBytes, limit: options.limit || historyChunkState.current[id]?.limit || null, inFlight: true, mode, lastRequestSig: requestCursorSig, lastRequestAt: nowMs };
+        historyChunkState.current[id] = {
+          ...(historyChunkState.current[id] || {}), source, chunkBytes,
+          limit: options.limit || historyChunkState.current[id]?.limit || null,
+          inFlight: true, mode, beforeOffset, beforeId, aroundId,
+          userInitiated: options.userInitiated === true || options.user_initiated === true,
+          retryAttempt: Number(options.retryAttempt || 0),
+          lastRequestSig: requestCursorSig, lastRequestAt: nowMs,
+        };
       }
       latestHistoryChunkRequest.current[id] = requestId;
       setHistoryMeta(prev => {
@@ -1164,8 +1183,20 @@ export function useRelay() {
         if (!latestState.inFlight) return;
         historyChunkState.current[id] = { ...latestState, inFlight: false };
 
+        if (activeSessionRef.current !== id) {
+          setHistoryLoading(prev => {
+            if (prev[id]?.requestId !== requestId) return prev;
+            const next = { ...prev };
+            delete next[id];
+            return next;
+          });
+          return;
+        }
+
         const retryAttempt = Number(options.retryAttempt || 0);
-        if (retryAttempt < MAX_HISTORY_CHUNK_RETRIES && wsRef.current?.readyState === WebSocket.OPEN) {
+        if (retryAttempt < MAX_HISTORY_CHUNK_RETRIES
+            && activeSessionRef.current === id
+            && wsRef.current?.readyState === WebSocket.OPEN) {
           requestHistoryChunk(id, {
             ...options,
             mode,
@@ -1352,7 +1383,8 @@ export function useRelay() {
     }
 
     function controlGoal(sessionId, action, goal, options = {}) {
-      const requestId = `goal-${action}-${Date.now()}-${Math.random().toString(36).slice(2, 7)}`;
+      const requestId = String(options.requestId || '').trim()
+        || `goal-${action}-${Date.now()}-${Math.random().toString(36).slice(2, 7)}`;
       send({
         type: 'agent_goal_control',
         session_id: sessionId,
@@ -2271,6 +2303,41 @@ export function useRelay() {
           return;
         }
         if (msg.error && (!Array.isArray(msg.messages) || msg.messages.length === 0)) {
+          const errorCode = String(msg.error?.code || '');
+          const retryAttempt = Number(currentChunkState.retryAttempt || 0);
+          if (RECOVERABLE_HISTORY_CHUNK_CODES.has(errorCode) && retryAttempt < MAX_HISTORY_CHUNK_RETRIES) {
+            const hintedDelay = Number(msg.error?.retry_after_ms ?? msg.retry_after_ms);
+            const retryAfterMs = Number.isFinite(hintedDelay) && hintedDelay > 0 ? hintedDelay : 1500;
+            const jitterMs = Math.max(25, Math.min(250, Math.floor(retryAfterMs * 0.05)));
+            clearTimeout(historyChunkTimers.current[id]);
+            historyChunkState.current[id] = {
+              ...currentChunkState,
+              inFlight: false,
+              recovering: true,
+            };
+            setHistoryMeta(prev => {
+              const nextMeta = { ...(prev[id] || {}), refreshing: true };
+              delete nextMeta.error;
+              return { ...prev, [id]: nextMeta };
+            });
+            historyChunkTimers.current[id] = setTimeout(() => {
+              delete historyChunkTimers.current[id];
+              if (activeSessionRef.current !== id || wsRef.current?.readyState !== WebSocket.OPEN) return;
+              requestHistoryChunk(id, {
+                mode: currentChunkState.mode,
+                source: currentChunkState.source,
+                replace: currentChunkState.replace,
+                beforeOffset: currentChunkState.beforeOffset,
+                beforeId: currentChunkState.beforeId,
+                aroundId: currentChunkState.aroundId,
+                userInitiated: currentChunkState.userInitiated,
+                limit: currentChunkState.limit,
+                chunkBytes: currentChunkState.chunkBytes,
+                retryAttempt: retryAttempt + 1,
+              });
+            }, Math.ceil(retryAfterMs) + jitterMs);
+            return;
+          }
           setHistoryLoading(prev => {
             if (!prev[id]) return prev;
             const next = { ...prev };
@@ -2326,6 +2393,7 @@ export function useRelay() {
             source: msg.source || 'native',
             cursor,
             bytes_total: cursor.total_bytes || 0,
+            refreshing: false,
           };
           delete nextMeta.error;
           if (sessionRegistryValueEqual(prev[id] || null, nextMeta)) return prev;

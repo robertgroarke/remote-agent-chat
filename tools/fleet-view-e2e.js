@@ -156,6 +156,7 @@ async function captureFleetVisualMatrix(browser, origin, screenshotDir, refreshL
           control_groups: document.querySelectorAll('.fleet-control-actions').length,
           pause_controls: document.querySelectorAll('[aria-label^="Pause goal for"]').length,
           resume_controls: document.querySelectorAll('[aria-label^="Resume goal for"]').length,
+          blocked_resume_controls: document.querySelectorAll('[aria-label^="Resume blocked goal for"]').length,
           interrupt_controls: document.querySelectorAll('[aria-label^="Interrupt turn for"]').length,
           gated_antigravity_controls: document.querySelectorAll('.fleet-card[data-session-id="fleet-antigravity-work"] .fleet-control-actions').length,
           layout_shift: Number((window.__fleetLayoutShift || 0).toFixed(6)),
@@ -177,9 +178,10 @@ async function captureFleetVisualMatrix(browser, origin, screenshotDir, refreshL
       assert.strictEqual(metrics.indeterminate_goal, 1, `${visualCase.name} lost an indeterminate native goal`);
       assert.strictEqual(metrics.checkpoint_status, 'Waiting for next goal turn', `${visualCase.name} lost the goal checkpoint substate`);
       assert.strictEqual(metrics.verifying_status, 'Reconnecting', `${visualCase.name} lost the goal verification substate`);
-      assert.strictEqual(metrics.control_groups, 5, `${visualCase.name} lost a Fleet control group`);
+      assert.strictEqual(metrics.control_groups, 6, `${visualCase.name} lost a Fleet control group`);
       assert.strictEqual(metrics.pause_controls, 2, `${visualCase.name} lost a Pause goal control`);
       assert.strictEqual(metrics.resume_controls, 1, `${visualCase.name} lost the Resume goal control`);
+      assert.strictEqual(metrics.blocked_resume_controls, 1, `${visualCase.name} lost the blocked-goal resume control`);
       assert.strictEqual(metrics.interrupt_controls, 2, `${visualCase.name} lost an Interrupt turn control`);
       assert.strictEqual(metrics.gated_antigravity_controls, 0, `${visualCase.name} exposed a gated Antigravity stop`);
       assert.strictEqual(metrics.layout_shift, 0, `${visualCase.name} shifted after the Fleet view settled`);
@@ -302,7 +304,7 @@ async function main() {
       { session_id: 'fleet-goal-two', agent_type: 'codex-desktop', chat_title: 'Release lane', display_name: 'Release lane', workspace_name: 'Remote Agent Chat', last_snippet: 'Preparing exact release evidence.', capabilities: { goal_lifecycle: true, goal_pause_resume: true, interrupt: true, interrupt_method: 'native_stop' } },
       { session_id: 'fleet-cursor-work', agent_type: 'cursor', chat_title: 'Cursor lane', display_name: 'Cursor lane', workspace_name: 'Remote Agent Chat', last_snippet: 'Reviewing the active diff.', capabilities: { interrupt: true, interrupt_method: 'native_stop' } },
       { session_id: 'fleet-antigravity-work', agent_type: 'antigravity_panel', chat_title: 'Antigravity lane', display_name: 'Antigravity lane', workspace_name: 'Remote Agent Chat', last_snippet: 'Drafting the current response.', capabilities: { interrupt: false, interrupt_gate: 'no_verified_session_scoped_stop' } },
-      { session_id: 'fleet-attention-two', agent_type: 'continue', chat_title: 'Blocked lane', display_name: 'Blocked lane', workspace_name: 'Remote Agent Chat', last_snippet: 'Waiting for an operator choice.' },
+      { session_id: 'fleet-attention-two', agent_type: 'codex_cli', chat_title: 'Blocked lane', display_name: 'Blocked lane', workspace_name: 'Remote Agent Chat', last_snippet: 'Waiting for an operator choice.', capabilities: { goal_lifecycle: true, goal_pause_resume: true, goal_blocked_resume: true, interrupt: true, interrupt_method: 'turn_interrupt_or_owned_process_tree' } },
       {
         session_id: 'fleet-idle-claude',
         agent_type: 'claude',
@@ -404,7 +406,7 @@ async function main() {
       ['fleet-goal-two', { kind: 'idle', label: '', started_at: new Date(now - 45_000).toISOString(), goal: { status: 'active', state: 'active', objective: 'Ship the verified release', token_budget: 12000, fingerprint: 'fleet-release-goal', generation: 1, transition_seq: 2, progress_percent: 40, updated_at: new Date(now).toISOString() }, goal_run: { schema_version: 1, run_id: 'fleet-release-run', goal_fingerprint: 'fleet-release-goal', goal_generation: 1, lifecycle: 'verifying', lease_active: true, owner_state: 'verifying', transition_seq: 2, transition_id: 'fleet-release-verifying', lease_started_at: new Date(now - 45_000).toISOString() } }],
       ['fleet-cursor-work', { kind: 'working', label: 'Reviewing diff', current: { kind: 'tool', label: 'Reviewing active diff', since: new Date(now).toISOString() } }],
       ['fleet-antigravity-work', { kind: 'generating', label: 'Drafting response', current: { kind: 'response', label: 'Drafting the current response', since: new Date(now).toISOString() } }],
-      ['fleet-attention-two', { kind: 'blocked', label: 'Operator choice required' }],
+      ['fleet-attention-two', { kind: 'blocked', label: 'Dependency unavailable', goal: { status: 'blocked', state: 'blocked', objective: 'Resume after dependency recovery', block_reason: 'Dependency unavailable', token_budget: 6000, fingerprint: 'fleet-blocked-goal', generation: 1, transition_seq: 3, updated_at: new Date(now).toISOString() } }],
       ['fleet-idle-claude', { kind: 'idle', label: 'Idle' }],
       ['fleet-idle-cursor', { kind: 'idle', label: 'Idle' }],
       ['fleet-idle-gemini', { kind: 'idle', label: 'Idle' }],
@@ -445,7 +447,7 @@ async function main() {
         ['fleet-goal-two', { kind: 'idle', label: '', started_at: new Date(refreshedAt - 45_000).toISOString(), goal: { status: 'active', state: 'active', objective: 'Ship the verified release', token_budget: 12000, fingerprint: 'fleet-release-goal', generation: 1, transition_seq: 2, progress_percent: 40, updated_at: new Date(refreshedAt).toISOString() }, goal_run: { schema_version: 1, run_id: 'fleet-release-run', goal_fingerprint: 'fleet-release-goal', goal_generation: 1, lifecycle: 'verifying', lease_active: true, owner_state: 'verifying', transition_seq: 2, transition_id: 'fleet-release-verifying', lease_started_at: new Date(refreshedAt - 45_000).toISOString() } }],
         ['fleet-cursor-work', { kind: 'working', label: 'Reviewing diff', current: { kind: 'tool', label: 'Reviewing active diff', since: new Date(refreshedAt).toISOString() } }],
         ['fleet-antigravity-work', { kind: 'generating', label: 'Drafting response', current: { kind: 'response', label: 'Drafting the current response', since: new Date(refreshedAt).toISOString() } }],
-        ['fleet-attention-two', { kind: 'blocked', label: 'Operator choice required' }],
+        ['fleet-attention-two', { kind: 'blocked', label: 'Dependency unavailable', goal: { status: 'blocked', state: 'blocked', objective: 'Resume after dependency recovery', block_reason: 'Dependency unavailable', token_budget: 6000, fingerprint: 'fleet-blocked-goal', generation: 1, transition_seq: 3, updated_at: new Date(refreshedAt).toISOString() } }],
       ].forEach(([session, activity]) => proxy.send(JSON.stringify({
         type: 'status', session, thinking: ['thinking', 'generating', 'working'].includes(activity.kind),
         activity_trace: { proxy_emitted_at_ms: Date.now() }, activity,
@@ -489,7 +491,8 @@ async function main() {
     for (const marker of [
       'Build lane', 'Waiting for next goal turn', 'Ship fleet dashboard', 'Applying the verified dashboard patch.',
       'Validation lane', 'Running the mobile parity audit', 'Review lane', 'Needs attention', 'Waiting for approval on the generated diff.',
-      'Paused lane', 'Goal paused', 'Read-only lane', 'Unavailable', 'Working on goal', 'Reconnecting', 'Activity',
+      'Paused lane', 'Goal paused', 'Blocked lane', 'Dependency unavailable', 'Resume blocked goal',
+      'Read-only lane', 'Unavailable', 'Working on goal', 'Reconnecting', 'Activity',
     ]) assert(body.includes(marker), `fleet body missing ${marker}`);
     assert(!body.includes('Validate every client'), 'non-Codex stray goal text leaked into Fleet');
     assert(!body.includes('No active goal reported'), 'Fleet retained the false empty-goal copy');
@@ -588,6 +591,32 @@ async function main() {
     assert.equal(await page.locator('.session-card.active[data-session-id="fleet-goal"]').count(), 1);
     assert.equal(await page.getByRole('button', { name: 'Interrupt turn' }).count(), 1, 'session header lost Interrupt turn');
     await reopenFleet();
+    await page.locator('.fleet-card[data-session-id="fleet-paused"]').click();
+    await page.locator('[data-testid="fleet-view"]').waitFor({ state: 'detached' });
+    const chatSendCountBeforeGoalSlash = broadcastProxyMessages.length;
+    const controlCountBeforeGoalSlash = controlProxyMessages.length;
+    const composer = page.locator('textarea');
+    await composer.fill('/goal resume');
+    await page.locator('button.send-btn').click();
+    assert.equal(await composer.inputValue(), '/goal resume', 'goal command cleared before native acknowledgement');
+    const applyingGoalNotice = page.locator('.goal-command-notice.applying');
+    await applyingGoalNotice.waitFor();
+    assert.match(await applyingGoalNotice.getAttribute('data-request-id'), /^goal-slash-resume-/,
+      'browser goal-control request lost its stable slash-command identity');
+    await page.locator('.goal-command-notice.success').waitFor({ timeout: 2000 });
+    assert.equal(await composer.inputValue(), '', 'successful goal command did not clear after native acknowledgement');
+    assert.equal(broadcastProxyMessages.length, chatSendCountBeforeGoalSlash, 'goal command leaked into ordinary chat');
+    assert.equal(controlProxyMessages.length, controlCountBeforeGoalSlash + 1, 'goal command did not emit exactly one control');
+    assert.equal(controlProxyMessages.at(-1).session_id, 'fleet-paused');
+    assert.equal(controlProxyMessages.at(-1).action, 'resume');
+    assert.match(controlProxyMessages.at(-1).request_id, /^control-/,
+      'relay did not translate the browser identity into its canonical exactly-once native operation');
+    await reopenFleet();
+    await page.locator('.fleet-card[data-session-id="fleet-attention-two"]').click();
+    await page.locator('[data-testid="fleet-view"]').waitFor({ state: 'detached' });
+    assert.equal(await page.getByRole('button', { name: 'Resume blocked goal' }).count(), 1,
+      'blocked Codex CLI session header lost its authoritative resume control');
+    await reopenFleet();
     await page.locator('.fleet-card[data-session-id="fleet-readonly"]').tap();
     await page.locator('[data-testid="fleet-view"]').waitFor({ state: 'detached' });
     assert.equal(await page.locator('.session-card.active[data-session-id="fleet-readonly"]').count(), 1);
@@ -597,6 +626,7 @@ async function main() {
     await reopenFleet();
     assert.equal(await page.getByRole('button', { name: 'Pause goal for Build lane' }).count(), 1);
     assert.equal(await page.getByRole('button', { name: 'Resume goal for Paused lane' }).count(), 1);
+    assert.equal(await page.getByRole('button', { name: 'Resume blocked goal for Blocked lane' }).count(), 1);
     assert.equal(await page.getByRole('button', { name: 'Interrupt turn for Cursor lane' }).count(), 1);
     assert.equal(await page.locator('.fleet-card[data-session-id="fleet-antigravity-work"] .fleet-control-actions').count(), 0);
     const pauseControl = page.getByRole('button', { name: 'Pause goal for Build lane' });
@@ -604,15 +634,25 @@ async function main() {
     assert.equal(await pauseControl.isDisabled(), true, 'goal control did not enter pending state');
     assert.equal(await pauseControl.innerText(), 'Pausing...');
     await page.waitForFunction(() => document.querySelector('[aria-label="Pause goal for Build lane"]')?.disabled === false);
+    const blockedResumeControl = page.getByRole('button', { name: 'Resume blocked goal for Blocked lane' });
+    await blockedResumeControl.click();
+    assert.equal(await blockedResumeControl.isDisabled(), true, 'blocked-goal control did not enter pending state');
+    assert.equal(await blockedResumeControl.innerText(), 'Resuming...');
+    await page.waitForFunction(() => document.querySelector('[aria-label="Resume blocked goal for Blocked lane"]')?.disabled === false);
     const interruptControl = page.getByRole('button', { name: 'Interrupt turn for Cursor lane' });
     await interruptControl.click();
     assert.equal(await interruptControl.isDisabled(), true, 'interrupt control did not enter pending state');
     assert.equal(await interruptControl.innerText(), 'Interrupting...');
     await page.waitForFunction(() => document.querySelector('[aria-label="Interrupt turn for Cursor lane"]')?.disabled === false);
-    assert.deepStrictEqual(controlProxyMessages.map(message => message.type), ['agent_goal_control', 'agent_interrupt']);
+    assert.deepStrictEqual(controlProxyMessages.map(message => message.type),
+      ['agent_goal_control', 'agent_goal_control', 'agent_goal_control', 'agent_interrupt']);
+    assert.deepStrictEqual(controlProxyMessages.slice(0, 3).map(message => message.action), ['resume', 'pause', 'resume']);
     assert(controlProxyMessages.every(message => Number(message.session_generation) > 0));
-    assert(Number(controlProxyMessages[0].goal_generation) > 0 && controlProxyMessages[0].goal_fingerprint);
-    assert(Number(controlProxyMessages[1].turn_generation) > 0);
+    const goalControlMessages = controlProxyMessages.filter(message => message.type === 'agent_goal_control');
+    const interruptMessages = controlProxyMessages.filter(message => message.type === 'agent_interrupt');
+    assert(goalControlMessages.every(message => Number(message.goal_generation) > 0 && message.goal_fingerprint));
+    assert.equal(interruptMessages.length, 1);
+    assert(Number(interruptMessages[0].turn_generation) > 0);
 
     const androidSource = fs.readFileSync(path.join(__dirname, '..', 'android-app', 'screens', 'SessionListScreen.jsx'), 'utf8');
     for (const marker of [
@@ -621,13 +661,13 @@ async function main() {
       'Open session', "{'\\u203A'}", 'workContext', "navigation.navigate('Chat'",
       'broadcastSelectedIds', 'Broadcast prompt', 'SEND TO ${broadcastSelectedIds.length} SESSIONS',
       'Broadcast delivery receipts', 'sessionSupportsBroadcast',
-      'fleetControlPending', 'Pause goal', 'Resume goal', 'Interrupt turn',
+      'fleetControlPending', 'Pause goal', 'Resume goal', 'Resume blocked goal', 'native action required', 'Interrupt turn',
       'clientRef.current?.controlGoal', 'clientRef.current?.interrupt',
     ]) assert(androidSource.includes(marker), `Android fleet parity missing ${marker}`);
     const androidChatSource = fs.readFileSync(path.join(__dirname, '..', 'android-app', 'screens', 'ChatScreen.jsx'), 'utf8');
     for (const marker of [
       'sessionControlBar', 'TURN CONTROLS', 'Goal ${goalState', 'Turn in progress',
-      'Pause goal', 'Resume goal', 'Interrupt turn', 'sessionControlButtonDisabled',
+      'Pause goal', 'Resume goal', 'Resume blocked goal', 'native action required', 'Interrupt turn', 'sessionControlButtonDisabled',
       'goalControlPendingRef.current', 'interruptPendingRef.current',
     ]) assert(androidChatSource.includes(marker), `Android chat control parity missing ${marker}`);
 
@@ -639,6 +679,7 @@ async function main() {
       active_cards: 8,
       default_cards: 9,
       total_sessions: 16,
+      slash_goal_controls: 1,
       idle_cards_default: 1,
       idle_cards_revealed: 8,
       working_on_goal_cards: 2,
@@ -658,8 +699,8 @@ async function main() {
       open_action_encoding_safe: true,
       visual_matrix: visualMatrix,
       android_source_parity: true,
-      web_control_groups: 5,
-      web_header_control_states: ['pause', 'interrupt', 'goal-less-hidden'],
+      web_control_groups: 6,
+      web_header_control_states: ['pause', 'blocked-resume', 'interrupt', 'goal-less-hidden'],
       web_control_receipts: controlProxyMessages.length,
       broadcast_selected_sessions: 2,
       broadcast_exact_confirmation: true,

@@ -385,6 +385,7 @@ assert.deepEqual(
   'a live append during initial history load must survive replacement reconciliation',
 );
 
+relay.activeSessionRef.current = 'stale-tail-session';
 relay.requestHistoryChunk('stale-tail-session', { source: 'relay_sqlite' });
 const staleTailRequests = () => secondSocket.sent.filter(message => message.session_id === 'stale-tail-session');
 const firstStaleTailRequest = staleTailRequests()[0];
@@ -410,10 +411,15 @@ assert.equal(
 );
 assert.equal(states[historyLoadingStateIndex]['stale-tail-session'], undefined, 'compatible tail should clear retry loading state');
 
+relay.activeSessionRef.current = 'timeout-session';
 relay.requestHistoryChunk('timeout-session', { source: 'native' });
 assert.equal(secondSocket.sent.filter(message => message.session_id === 'timeout-session').length, 1);
 runTimer(15000);
 assert.equal(secondSocket.sent.filter(message => message.session_id === 'timeout-session').length, 2, 'first timeout should retry once');
+runTimer(15000);
+assert.equal(secondSocket.sent.filter(message => message.session_id === 'timeout-session').length, 3, 'second timeout should stay within the bounded retry budget');
+runTimer(15000);
+assert.equal(secondSocket.sent.filter(message => message.session_id === 'timeout-session').length, 4, 'third timeout should issue the final bounded retry');
 runTimer(15000);
 assert.equal(states[historyLoadingStateIndex]['timeout-session'], undefined, 'final timeout should clear loading state');
 assert.match(states[1]['timeout-session'].error, /timed out/i, 'final timeout should expose an actionable error');

@@ -8,6 +8,9 @@ const { ProxyEngine } = require('../agent-proxy/proxy-engine');
 const { hopDurations } = require('./stream-latency-report');
 
 const root = path.resolve(__dirname, '..');
+// Exercise the explicit status-frame rollback transport; the default-on
+// message_delta producer has its own sequencing/trace smoke.
+process.env.RAC_CODEX_CLI_MESSAGE_DELTA = 'false';
 const engine = Object.create(ProxyEngine.prototype);
 const sent = [];
 engine._sendToRelay = message => {
@@ -33,6 +36,7 @@ const status = sent[0];
 assert.strictEqual(status.type, 'proxy_status');
 assert.strictEqual(status.activity.current.kind, 'answer');
 assert.strictEqual(status.activity.current.partial, 'Streaming answer text');
+assert.strictEqual(status.activity.execution_mode, 'headless_out_of_process');
 assert.strictEqual(status.activity.thinking, undefined, 'answer chunks must not be copied into reasoning');
 assert(status.stream_trace.trace_id);
 assert.strictEqual(status.stream_trace.agent_type, 'codex_cli');
@@ -54,7 +58,8 @@ const relay = fs.readFileSync(path.join(root, 'relay-server', 'index.js'), 'utf8
 const hooks = fs.readFileSync(path.join(root, 'frontend', 'hooks.jsx'), 'utf8');
 const protocol = fs.readFileSync(path.join(root, 'protocol.md'), 'utf8');
 assert(/relay_received_at_ms:\s*proxyMessageReceivedAtMs/.test(relay));
-assert(/relay_forwarded_at_ms\s*=\s*Date\.now\(\)/.test(relay));
+assert(/const relayForwardedAtMs\s*=\s*Date\.now\(\)/.test(relay)
+  && /relay_forwarded_at_ms:\s*relayForwardedAtMs/.test(relay));
 assert(/browser_received_at_ms:\s*Date\.now\(\)/.test(hooks));
 assert(/__RAC_STREAM_TRACES__/.test(hooks) && /browser_paint_at_ms:\s*Date\.now\(\)/.test(hooks));
 assert(/native_event_at_ms[\s\S]+browser_paint_at_ms/.test(protocol));

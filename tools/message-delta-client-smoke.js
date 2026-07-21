@@ -10,7 +10,9 @@ const webModulePath = path.join(root, 'frontend', 'message-delta.js');
 const androidModulePath = path.join(root, 'android-app', 'lib', 'message-delta.js');
 const webSource = fs.readFileSync(webModulePath, 'utf8');
 const androidSource = fs.readFileSync(androidModulePath, 'utf8');
-assert.strictEqual(androidSource, webSource, 'web and Android delta reducers must remain byte-identical');
+const normalizeEol = source => source.replace(/\r\n/g, '\n');
+assert.strictEqual(normalizeEol(androidSource), normalizeEol(webSource),
+  'web and Android delta reducers must remain source-identical after checkout EOL normalization');
 
 function loadReducer(source) {
   const executable = `${source.replace(/export\s+function\s+/g, 'function ')}\nreturn { createProvisionalStream, reduceMessageDeltaStream, shouldClearEmptyProvisionalOnTerminal };`;

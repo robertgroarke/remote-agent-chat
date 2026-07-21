@@ -25,7 +25,7 @@ function waitFor(predicate, label, timeoutMs = 2000) {
 
 function goal(status = 'paused') {
   return {
-    label: status === 'paused' ? 'Goal paused' : 'Pursuing goal',
+    label: status === 'blocked' ? 'Goal blocked' : status === 'paused' ? 'Goal paused' : 'Pursuing goal',
     text: 'Preserve this exact objective',
     objective: 'Preserve this exact objective',
     objective_hash: 'objective-hash',
@@ -43,12 +43,12 @@ function goal(status = 'paused') {
 }
 
 class FakeGoalConnection {
-  constructor(decisionLog) {
+  constructor(decisionLog, initialStatus = 'paused') {
     this.decisionLog = decisionLog;
     this.current = {
       objective: 'Preserve this exact objective',
       tokenBudget: 5000,
-      status: 'paused',
+      status: initialStatus,
     };
     this.stops = 0;
   }
@@ -94,10 +94,11 @@ function harness(decisionLog) {
   return engine;
 }
 
-async function runBranch(decision) {
+async function runBranch(decision, initialStatus = 'paused') {
   const decisionLog = [];
   const engine = harness(decisionLog);
-  const sessionId = `goal-${decision}`;
+  engine._codexCliGoalDecisionConnectionFactory = () => new FakeGoalConnection(decisionLog, initialStatus);
+  const sessionId = `goal-${initialStatus}-${decision}`;
   const session = {
     session_id: sessionId,
     agentType: 'codex_cli',
@@ -106,20 +107,26 @@ async function runBranch(decision) {
     status: 'healthy',
     codexCliExternalActive: true,
     waitingForAssistant: false,
-    activity: { kind: 'idle', label: '', goal: goal(), updated_at: new Date().toISOString() },
+    activity: {
+      kind: initialStatus === 'blocked' ? 'blocked' : 'idle',
+      label: initialStatus === 'blocked' ? 'Goal blocked' : '',
+      goal: goal(initialStatus),
+      updated_at: new Date().toISOString(),
+    },
   };
   engine.sessions.set(sessionId, session);
   assert.strictEqual(engine._syncCodexCliGoalDecisionPrompt(sessionId, session, session.activity), true);
   const prompt = engine.sent.find(message => message.type === 'question_prompt');
   assert.ok(prompt, 'goal decision prompt was not relayed');
   assert.strictEqual(prompt.kind, 'goal_resume_decision');
+  assert.strictEqual(prompt.title, initialStatus === 'blocked' ? 'Goal blocked' : 'Goal paused');
   assert.strictEqual(prompt.questions[0].message, 'Resume paused goal?');
   assert.deepStrictEqual(prompt.questions[0].choices.map(choice => choice.label), [
     'Resume goal', 'Leave paused',
   ]);
   assert.deepStrictEqual(prompt.questions[0].choices.map(choice => choice.description), [
     'Mark it active and continue when idle',
-    'Keep it paused; use /goal resume later',
+    'Keep it paused; use the Resume goal control later',
   ]);
   assert.strictEqual(session.activity.kind, 'waiting_for_user');
   const choice = prompt.questions[0].choices.find(candidate => candidate.choice_id === decision);
@@ -143,12 +150,13 @@ async function runBranch(decision) {
   assert.strictEqual(receipt.native_receipt.native_operations, 1);
   assert.strictEqual(receipt.native_receipt.transcript_messages_appended, 0);
   assert.strictEqual(receipt.native_receipt.after_status, decision === 'resume' ? 'active' : 'paused');
+  assert.strictEqual(receipt.native_receipt.before_status, initialStatus);
   assert.deepStrictEqual(decisionLog, [{ threadId: 'native-thread', decision, native_operations: 1 }]);
   assert.strictEqual(engine.sent.filter(message => message.type === 'message').length, 0);
   assert.strictEqual(engine.sent.filter(message => message.type === 'turn_completed').length, 0);
   if (decision === 'leave_paused') {
     const promptsBefore = engine.sent.filter(message => message.type === 'question_prompt').length;
-    session.activity = { kind: 'idle', label: '', goal: goal(), updated_at: new Date().toISOString() };
+    session.activity = { ...session.activity, kind: 'idle', label: '', updated_at: new Date().toISOString() };
     assert.strictEqual(engine._syncCodexCliGoalDecisionPrompt(sessionId, session, session.activity), false);
     assert.strictEqual(engine.sent.filter(message => message.type === 'question_prompt').length, promptsBefore);
   }
@@ -247,10 +255,14 @@ function assertInactiveEdgeExpiresPrompt() {
     await assertStaleGoalFailsBeforeNative();
     const resume = await runBranch('resume');
     const leavePaused = await runBranch('leave_paused');
+    const resumeBlocked = await runBranch('resume', 'blocked');
+    const leaveBlockedPaused = await runBranch('leave_paused', 'blocked');
     console.log(JSON.stringify({
       result: 'PASS',
       prompt_kind: 'goal_resume_decision',
-      branches: [resume.native_receipt.decision, leavePaused.native_receipt.decision],
+      branches: [resume.native_receipt.decision, leavePaused.native_receipt.decision,
+        `blocked_${resumeBlocked.native_receipt.decision}`,
+        `blocked_${leaveBlockedPaused.native_receipt.decision}`],
       native_operations_per_branch: 1,
       transcript_messages_appended: 0,
       false_completion_events: 0,
@@ -258,6 +270,7 @@ function assertInactiveEdgeExpiresPrompt() {
       inactive_process_expires_prompt: true,
       stale_goal_rejected_before_native_operation: true,
       unchanged_goal_suppressed_after_leave_paused: true,
+      blocked_goal_prompt_actionable: true,
     }, null, 2));
   } finally {
     fs.rmSync(tempRoot, { recursive: true, force: true });

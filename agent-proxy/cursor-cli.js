@@ -377,6 +377,7 @@ function createParseState(filePath) {
     messages: [],
     firstUserText: '',
     pendingToolCalls: new Map(),
+    pendingInteractionQueries: new Map(),
     thinkingBuffer: '',
     pendingAssistantText: '',
     pendingAssistantHasNoTs: false,
@@ -419,6 +420,62 @@ function flushPendingAssistant(state, tsMs) {
   });
 }
 
+function pushNativeBlock(state, block, tsMs) {
+  flushPendingThinking(state, tsMs);
+  flushPendingAssistant(state, tsMs);
+  const title = String(block?.title || block?.label || 'Cursor Agent CLI');
+  const body = String(block?.content || '');
+  const ts = tsMs ? Math.floor(tsMs / 1000) : undefined;
+  pushDedup(state.messages, {
+    role: 'assistant',
+    content: body ? `[${title}]\n\n${body}` : `[${title}]`,
+    content_blocks: [block],
+    ts,
+  });
+}
+
+function interactionQueryIdentity(event) {
+  const envelope = event?.query || event?.response || {};
+  const id = envelope.id == null ? '' : String(envelope.id);
+  return `${String(event?.query_type || 'unknown')}:${id}`;
+}
+
+function interactionPromptBlock(requestEvent, responseEvent) {
+  const queryType = String(responseEvent?.query_type || requestEvent?.query_type || '');
+  const queryPayload = requestEvent?.query?.[queryType] || {};
+  const args = queryPayload.args || {};
+  const responsePayload = responseEvent?.response?.[queryType.replace(/Query$/, 'Response')] || {};
+  const approved = Object.prototype.hasOwnProperty.call(responsePayload, 'approved');
+  const denied = Object.prototype.hasOwnProperty.call(responsePayload, 'denied');
+  if (queryType === 'webSearchRequestQuery') {
+    return {
+      type: 'prompt',
+      title: 'Web search approval',
+      content: args.searchTerm ? `Search: ${String(args.searchTerm)}` : 'Cursor requested approval to search the web.',
+      status: approved ? 'approved' : denied ? 'denied' : 'answered',
+      collapsed: false,
+      prompt_id: args.toolCallId || undefined,
+    };
+  }
+  if (queryType === 'webFetchRequestQuery') {
+    return {
+      type: 'prompt',
+      title: 'Web fetch approval',
+      content: args.url ? `URL: ${String(args.url)}` : 'Cursor requested approval to fetch a web page.',
+      status: approved ? 'approved' : denied ? 'denied' : 'answered',
+      collapsed: false,
+      prompt_id: args.toolCallId || undefined,
+    };
+  }
+  return {
+    type: 'prompt',
+    title: 'Cursor approval',
+    content: 'Cursor requested approval for an interaction.',
+    status: approved ? 'approved' : denied ? 'denied' : 'answered',
+    collapsed: false,
+  };
+}
+
 function applyEventToState(state, event) {
   if (!event || typeof event !== 'object') return;
 
@@ -440,6 +497,55 @@ function applyEventToState(state, event) {
     if (event.permissionMode) state.permission_mode = event.permissionMode;
     if (event.cwd) state.workspacePath = event.cwd;
     if (!state.taskStartedAt) state.taskStartedAt = tsMs || Date.now();
+    return;
+  }
+
+  if (event.type === 'system' && event.subtype === 'task_notification') {
+    const failed = String(event.status || '').toLowerCase() === 'error';
+    pushNativeBlock(state, {
+      type: failed ? 'error' : 'notice',
+      title: String(event.title || (failed ? 'Task failed' : 'Task completed')),
+      content: String(event.detail || ''),
+      status: failed ? 'error' : String(event.status || 'completed'),
+      ...(event.task_id ? { task_id: String(event.task_id) } : {}),
+    }, tsMs);
+    return;
+  }
+
+  if (event.type === 'interaction_query') {
+    const key = interactionQueryIdentity(event);
+    if (event.subtype === 'request') {
+      state.pendingInteractionQueries.set(key, event);
+    } else if (event.subtype === 'response') {
+      const request = state.pendingInteractionQueries.get(key) || null;
+      state.pendingInteractionQueries.delete(key);
+      pushNativeBlock(state, interactionPromptBlock(request, event), tsMs);
+    }
+    return;
+  }
+
+  if (event.type === 'connection') {
+    const reconnecting = event.subtype === 'reconnecting';
+    const attempt = Number(event.attempt);
+    pushNativeBlock(state, {
+      type: 'notice',
+      title: reconnecting ? 'Reconnecting' : 'Reconnected',
+      content: reconnecting
+        ? `Cursor Agent CLI is reconnecting${Number.isFinite(attempt) ? ` (attempt ${attempt})` : ''}.`
+        : 'Cursor Agent CLI connection restored.',
+      status: reconnecting ? 'pending' : 'completed',
+    }, tsMs);
+    return;
+  }
+
+  if (event.type === 'retry') {
+    const attempt = Number(event.attempt);
+    pushNativeBlock(state, {
+      type: 'notice',
+      title: 'Retrying',
+      content: `Cursor Agent CLI is retrying the interrupted turn${Number.isFinite(attempt) ? ` (attempt ${attempt})` : ''}.`,
+      status: String(event.subtype || 'retry'),
+    }, tsMs);
     return;
   }
 
@@ -511,6 +617,7 @@ function applyEventToState(state, event) {
     flushPendingAssistant(state, tsMs);
     state.taskCompletedAt = tsMs || Date.now();
     state.pendingToolCalls.clear();
+    state.pendingInteractionQueries.clear();
     if (event.subtype === 'error') {
       const content = String(event.result || 'Cursor Agent CLI reported an error.');
       const ts = tsMs ? Math.floor(tsMs / 1000) : undefined;

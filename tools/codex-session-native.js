@@ -2,7 +2,10 @@
 
 const { CodexAppServerConnection } = require('../agent-proxy/codex-app-server');
 
-const PRESERVED_GOAL_STATUSES = new Set(['blocked', 'budgetLimited', 'complete']);
+// Operator-controlled terminal states must survive an attach-only launcher.
+// In particular, opening a desktop shortcut for a paused task is an observation
+// action, not authorization to reactivate the native Goal.
+const PRESERVED_GOAL_STATUSES = new Set(['paused', 'blocked', 'budgetLimited', 'complete']);
 
 function goalFromResponse(response) {
   return response?.goal || null;

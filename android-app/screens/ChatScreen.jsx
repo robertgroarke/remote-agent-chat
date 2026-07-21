@@ -58,9 +58,22 @@ import {
   retainStrongerSessionChatTitleProjection,
   sessionChatTitleMetadataPatch,
 } from '../lib/session-title';
+import {
+  GOAL_CONTROL_SLASH_COMMANDS,
+  classifyGoalCommandIntent,
+  satisfiedGoalCommandLabel,
+} from '../lib/goal-command';
 
 const DRAFT_STORAGE_PREFIX = 'remote-agent-chat:draft:v1:';
 const HISTORY_PAGE_SIZE = 200;
+const MAX_HISTORY_CHUNK_RETRIES = 3;
+const RECOVERABLE_HISTORY_CHUNK_CODES = new Set([
+  'history_chunk_throttled',
+  'history_chunk_duplicate_cursor',
+  'history_waiter_capacity',
+  'history_request_capacity',
+  'throttled',
+]);
 const DELIVERY_STAGE_TIMEOUT_MS = Object.freeze({
   queued: 10000,
   accepted: 30000,
@@ -69,6 +82,7 @@ const DELIVERY_STAGE_TIMEOUT_MS = Object.freeze({
   steered: 30000,
 });
 const SLASH_COMMANDS = [
+  ...GOAL_CONTROL_SLASH_COMMANDS,
   { command: '/plan', detail: 'Outline the implementation approach and major steps.' },
   { command: '/review', detail: 'Review the current changes for bugs, regressions, and missing tests.' },
   { command: '/fix', detail: 'Implement or repair the current issue.' },
@@ -158,8 +172,10 @@ export default function ChatScreen({ route, navigation }) {
   const [historyCursor, setHistoryCursor] = useState(null);
   const [hasOlderHistory, setHasOlderHistory] = useState(false);
   const [historyLoadingOlder, setHistoryLoadingOlder] = useState(false);
+  const [historyRefreshing, setHistoryRefreshing] = useState(false);
   const [historyError, setHistoryError] = useState(null);
   const [controlResults, setControlResults] = useState({});
+  const [goalCommandNotice, setGoalCommandNotice] = useState(null);
   const [interruptPending, setInterruptPending] = useState('');
   const [goalControlPending, setGoalControlPending] = useState('');
   const [provisionalStream, setProvisionalStream] = useState(null);
@@ -200,12 +216,15 @@ export default function ChatScreen({ route, navigation }) {
   const historyUserScrolledRef = useRef(false);
   const historyLoadingRef = useRef(false);
   const historyRequestTimerRef = useRef(null);
+  const historyRetryTimerRef = useRef(null);
+  const historyRequestStateRef = useRef(null);
   const searchMessageIdRef = useRef(Number.isSafeInteger(Number(searchMessageId)) ? Number(searchMessageId) : null);
   const provisionalStreamRef = useRef(null);
   const provisionalFrameRef = useRef(null);
   const provisionalPendingRef = useRef(null);
   const interruptPendingRef = useRef('');
   const goalControlPendingRef = useRef('');
+  const pendingGoalSlashControlRef = useRef(null);
 
   function publishProvisionalStream(stream) {
     provisionalStreamRef.current = stream;
@@ -239,8 +258,10 @@ export default function ChatScreen({ route, navigation }) {
   useEffect(() => {
     interruptPendingRef.current = '';
     goalControlPendingRef.current = '';
+    pendingGoalSlashControlRef.current = null;
     setInterruptPending('');
     setGoalControlPending('');
+    setGoalCommandNotice(null);
     setSessionMeta(routeSession && typeof routeSession === 'object'
       ? { ...routeSession, session_id: sessionId }
       : { session_id: sessionId, agent_type: agentType });
@@ -323,7 +344,14 @@ export default function ChatScreen({ route, navigation }) {
   const turnActive = activity?.generating === true || ['thinking', 'generating', 'running_command', 'applying_patch', 'reading_files', 'working'].includes(activityKind);
   const goal = activity?.goal || null;
   const goalState = String(goal?.state || goal?.status || '').toLowerCase();
-  const goalAction = goalState === 'active' ? 'pause' : goalState === 'paused' ? 'resume' : null;
+  const goalBlocked = goalState === 'blocked';
+  const blockedResumeSupported = goalBlocked && agentConfig?.capabilities?.goal_blocked_resume === true;
+  const goalAction = goalState === 'active'
+    ? 'pause'
+    : (goalState === 'paused' || blockedResumeSupported ? 'resume' : null);
+  const goalBlockedReason = goalBlocked
+    ? String(goal?.block_reason || goal?.reason || activity?.label || 'Goal blocked').trim()
+    : '';
   const canControlGoal = !!(goalAction && goal?.fingerprint && agentConfig?.capabilities?.goal_pause_resume === true
     && Number(sessionMeta?.control_generation) > 0);
   const canInterrupt = !!(turnActive && agentConfig?.capabilities?.interrupt === true
@@ -565,7 +593,10 @@ export default function ChatScreen({ route, navigation }) {
         clearProvisionalStream();
         historyLoadingRef.current = false;
         clearTimeout(historyRequestTimerRef.current);
+        clearTimeout(historyRetryTimerRef.current);
+        historyRequestStateRef.current = null;
         setHistoryLoadingOlder(false);
+        setHistoryRefreshing(false);
         // Mark pending send as failed
         if (pendingMsgId.current) {
           const failedPending = pendingMsgId.current;
@@ -623,13 +654,14 @@ export default function ChatScreen({ route, navigation }) {
         if (sid !== sessionId) break;
         historyLoadingRef.current = false;
         clearTimeout(historyRequestTimerRef.current);
-        clientRef.current?.requestHistoryChunk(sessionId, {
+        clearTimeout(historyRetryTimerRef.current);
+        historyRequestStateRef.current = null;
+        requestHistoryChunkWithState({
           mode: 'tail',
           limit: HISTORY_PAGE_SIZE,
           replace: true,
+          source: nativeHistorySource(),
         });
-        historyLoadingRef.current = true;
-        armHistoryTimeout();
         break;
       }
 
@@ -690,14 +722,35 @@ export default function ChatScreen({ route, navigation }) {
 
       case 'history_chunk': {
         const sid = msg.session_id || msg.session;
-        if (sid !== sessionId || (msg.source && msg.source !== 'relay_sqlite')) break;
-        historyLoadingRef.current = false;
-        clearTimeout(historyRequestTimerRef.current);
-        setHistoryLoadingOlder(false);
+        if (sid !== sessionId) break;
         if (msg.error && (!msg.messages || msg.messages.length === 0)) {
+          const errorCode = String(msg.error?.code || '');
+          const requestState = historyRequestStateRef.current || {};
+          const retryAttempt = Number(requestState.retryAttempt || 0);
+          clearTimeout(historyRequestTimerRef.current);
+          if (RECOVERABLE_HISTORY_CHUNK_CODES.has(errorCode) && retryAttempt < MAX_HISTORY_CHUNK_RETRIES) {
+            const hintedDelay = Number(msg.error?.retry_after_ms ?? msg.retry_after_ms);
+            const retryAfterMs = Number.isFinite(hintedDelay) && hintedDelay > 0 ? hintedDelay : 1500;
+            const jitterMs = Math.max(25, Math.min(250, Math.floor(retryAfterMs * 0.05)));
+            setHistoryError(null);
+            clearTimeout(historyRetryTimerRef.current);
+            historyRetryTimerRef.current = setTimeout(() => {
+              historyRetryTimerRef.current = null;
+              requestHistoryChunkWithState(requestState.options || {}, retryAttempt + 1);
+            }, Math.ceil(retryAfterMs) + jitterMs);
+            break;
+          }
+          historyLoadingRef.current = false;
+          setHistoryLoadingOlder(false);
+          setHistoryRefreshing(false);
           setHistoryError(msg.error?.message || msg.error || 'Transcript history could not be loaded.');
           break;
         }
+        historyLoadingRef.current = false;
+        clearTimeout(historyRequestTimerRef.current);
+        clearTimeout(historyRetryTimerRef.current);
+        setHistoryLoadingOlder(false);
+        setHistoryRefreshing(false);
         const authoritativeReplace = msg.mode === 'around' || (msg.mode === 'tail' && msg.replace === true);
         const rawIncoming = normalizeTranscriptTimestamps(Array.isArray(msg.messages) ? msg.messages : []);
         const incoming = authoritativeReplace ? rawIncoming : rawIncoming.filter(message => {
@@ -707,8 +760,11 @@ export default function ChatScreen({ route, navigation }) {
           return true;
         });
         if (authoritativeReplace) {
-          seenSequences.current = new Set(incoming.map(message => message?.sequence).filter(sequence => sequence != null));
-          setMessages(incoming);
+          setMessages(previous => {
+            const merged = mergeSorted([...incoming, ...previous]);
+            seenSequences.current = new Set(merged.map(message => message?.sequence).filter(sequence => sequence != null));
+            return merged;
+          });
           const targetId = searchMessageIdRef.current;
           const targetIndex = targetId == null
             ? -1
@@ -944,8 +1000,25 @@ export default function ChatScreen({ route, navigation }) {
             : null);
         }
         if (msg.command === 'agent_goal_control' && msg.request_id === goalControlPendingRef.current) {
+          const pendingSlash = pendingGoalSlashControlRef.current;
           goalControlPendingRef.current = '';
           setGoalControlPending('');
+          if (pendingSlash?.requestId === msg.request_id) {
+            pendingGoalSlashControlRef.current = null;
+            if (msg.result === 'ok') {
+              setInput(previous => previous.trim().toLowerCase() === pendingSlash.command ? '' : previous);
+              setGoalCommandNotice({
+                status: 'success', requestId: msg.request_id,
+                text: pendingSlash.action === 'pause' ? 'Goal paused' : 'Goal resumed',
+              });
+            } else {
+              const detail = msg.error?.message || 'Native goal control did not apply.';
+              setGoalCommandNotice({
+                status: 'failed', requestId: msg.request_id,
+                text: `${detail} Command retained; tap Send to retry.`,
+              });
+            }
+          }
           if (msg.result === 'failed') {
             Alert.alert('Goal control failed', msg.error?.message || 'The native goal state was not acknowledged.');
           }
@@ -1257,12 +1330,15 @@ export default function ChatScreen({ route, navigation }) {
     setHistoryCursor(null);
     setHasOlderHistory(false);
     setHistoryLoadingOlder(false);
+    setHistoryRefreshing(false);
     setHistoryError(null);
     historyLoadingRef.current = false;
     historyUserScrolledRef.current = false;
     searchMessageIdRef.current = Number.isSafeInteger(Number(searchMessageId)) ? Number(searchMessageId) : null;
     setHighlightedSearchMessageId(searchMessageIdRef.current);
     clearTimeout(historyRequestTimerRef.current);
+    clearTimeout(historyRetryTimerRef.current);
+    historyRequestStateRef.current = null;
   }, [sessionId, searchMessageId]);
 
   useEffect(() => {
@@ -1285,6 +1361,7 @@ export default function ChatScreen({ route, navigation }) {
       deliveryRecords.current = {};
       clearTimeout(configRetryRef.current);
       clearTimeout(historyRequestTimerRef.current);
+      clearTimeout(historyRetryTimerRef.current);
       if (provisionalFrameRef.current != null) cancelAnimationFrame(provisionalFrameRef.current);
       provisionalFrameRef.current = null;
       provisionalPendingRef.current = null;
@@ -1442,6 +1519,11 @@ export default function ChatScreen({ route, navigation }) {
       Alert.alert('Harness writes paused', `${writeCapabilityGate}. Read-only transcript access remains available.`);
       return;
     }
+    const goalIntent = classifyGoalCommandIntent(input, { attachmentCount: attachment ? 1 : 0 });
+    if (goalIntent.kind !== 'chat') {
+      handleGoalCommandIntent(goalIntent);
+      return;
+    }
     setInput('');
     Keyboard.dismiss();
 
@@ -1509,6 +1591,71 @@ export default function ChatScreen({ route, navigation }) {
     }
 
     doSend(content);
+  }
+
+  function handleGoalCommandIntent(intent) {
+    const fail = text => {
+      setGoalCommandNotice({ status: 'failed', requestId: null, text });
+      Alert.alert('Goal control', text);
+      setSlashMenuDismissed(true);
+    };
+    if (intent.kind === 'unsupported_goal_control') {
+      fail('Unsupported goal command. Use /goal resume or /goal pause.');
+      return;
+    }
+    if (!connected) {
+      fail('Goal control is offline. Command retained; reconnect and tap Send to retry.');
+      return;
+    }
+    if (goalControlPending) {
+      fail('A goal control is already applying. Command retained.');
+      return;
+    }
+    if (!['codex', 'codex-desktop', 'codex_cli'].includes(agentType)
+        || agentConfig?.capabilities?.goal_pause_resume !== true
+        || !goal?.fingerprint
+        || Number(sessionMeta?.control_generation) <= 0) {
+      fail('This session has no verified native goal control. Command retained.');
+      return;
+    }
+    const satisfied = satisfiedGoalCommandLabel(intent.action, goalState);
+    if (satisfied) {
+      setInput('');
+      setGoalCommandNotice({ status: 'success', requestId: null, text: satisfied });
+      setSlashMenuDismissed(true);
+      return;
+    }
+    if (intent.action === 'resume' && goalState === 'blocked'
+        && agentConfig?.capabilities?.goal_blocked_resume !== true) {
+      fail('Blocked-goal resume is not verified for this session. Command retained.');
+      return;
+    }
+    const expectedState = intent.action === 'pause'
+      ? goalState === 'active'
+      : ['paused', 'blocked'].includes(goalState);
+    if (!expectedState) {
+      fail(`Goal state is ${goalState || 'unknown'}; refresh before retrying this command.`);
+      return;
+    }
+    const requestId = `goal-slash-${intent.action}-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+    const sentRequestId = clientRef.current?.controlGoal(sessionId, intent.action, goal, {
+      sessionGeneration: sessionMeta?.control_generation,
+      requestId,
+    });
+    if (!sentRequestId) {
+      fail('Goal control could not be queued. Command retained; tap Send to retry.');
+      return;
+    }
+    pendingGoalSlashControlRef.current = {
+      requestId: sentRequestId, action: intent.action, command: intent.command,
+    };
+    goalControlPendingRef.current = sentRequestId;
+    setGoalControlPending(sentRequestId);
+    setGoalCommandNotice({
+      status: 'applying', requestId: sentRequestId,
+      text: 'Validating goal, then applying native control…',
+    });
+    setSlashMenuDismissed(true);
   }
 
   function handleRetry() {
@@ -1616,15 +1763,13 @@ export default function ChatScreen({ route, navigation }) {
 
   function loadOlderHistory() {
     if (!hasOlderHistory || historyLoadingRef.current || historyCursor == null || !connected) return;
-    historyLoadingRef.current = true;
-    setHistoryLoadingOlder(true);
-    setHistoryError(null);
-    clientRef.current?.requestHistoryChunk(sessionId, {
+    requestHistoryChunkWithState({
       mode: 'older',
       beforeId: historyCursor,
       limit: HISTORY_PAGE_SIZE,
+      source: nativeHistorySource(),
+      userInitiated: true,
     });
-    armHistoryTimeout();
   }
 
   function retryHistoryTail() {
@@ -1633,21 +1778,43 @@ export default function ChatScreen({ route, navigation }) {
   }
 
   function requestHistoryTail() {
-    historyLoadingRef.current = true;
-    setHistoryError(null);
     const aroundId = searchMessageIdRef.current;
-    clientRef.current?.requestHistoryChunk(sessionId, aroundId
-      ? { mode: 'around', aroundId, limit: HISTORY_PAGE_SIZE }
-      : { mode: 'tail', limit: HISTORY_PAGE_SIZE });
+    requestHistoryChunkWithState(aroundId
+      ? { mode: 'around', aroundId, limit: HISTORY_PAGE_SIZE, source: 'relay_sqlite' }
+      : { mode: 'tail', limit: HISTORY_PAGE_SIZE, source: nativeHistorySource() });
+  }
+
+  function nativeHistorySource() {
+    return agentType === 'codex_cli' || agentType === 'cursor_cli' ? 'native' : 'relay_sqlite';
+  }
+
+  function requestHistoryChunkWithState(options, retryAttempt = 0) {
+    if (!clientRef.current || messagesSessionIdRef.current !== sessionId) return null;
+    const requestOptions = { ...(options || {}) };
+    historyLoadingRef.current = true;
+    setHistoryLoadingOlder(requestOptions.mode === 'older');
+    setHistoryRefreshing(requestOptions.mode !== 'older');
+    setHistoryError(null);
+    const requestId = clientRef.current.requestHistoryChunk(sessionId, requestOptions);
+    historyRequestStateRef.current = { requestId, options: requestOptions, retryAttempt };
     armHistoryTimeout();
+    return requestId;
   }
 
   function armHistoryTimeout() {
     clearTimeout(historyRequestTimerRef.current);
     historyRequestTimerRef.current = setTimeout(() => {
+      const requestState = historyRequestStateRef.current || {};
+      const retryAttempt = Number(requestState.retryAttempt || 0);
+      if (retryAttempt < MAX_HISTORY_CHUNK_RETRIES && messagesSessionIdRef.current === sessionId) {
+        historyLoadingRef.current = false;
+        requestHistoryChunkWithState(requestState.options || {}, retryAttempt + 1);
+        return;
+      }
       historyLoadingRef.current = false;
       setHistoryLoadingOlder(false);
-      setHistoryError('Transcript history timed out. Tap to retry.');
+      setHistoryRefreshing(false);
+      setHistoryError('Transcript history timed out after bounded automatic retries. Tap to retry.');
     }, 15000);
   }
 
@@ -1693,20 +1860,22 @@ export default function ChatScreen({ route, navigation }) {
           </Text>
         </View>
       )}
-      {(canControlGoal || canInterrupt) && (
+      {(canControlGoal || goalBlocked || canInterrupt) && (
         <View style={s.sessionControlBar} accessibilityLabel="Session controls">
           <View style={s.sessionControlCopy}>
             <Text style={s.sessionControlEyebrow}>TURN CONTROLS</Text>
             <Text style={s.sessionControlState} numberOfLines={1}>
-              {canControlGoal
-                ? `Goal ${goalState === 'paused' ? 'paused' : 'active'}`
+              {goalBlocked
+                ? goalBlockedReason
+                : canControlGoal
+                  ? `Goal ${goalState === 'paused' ? 'paused' : 'active'}`
                 : 'Turn in progress'}
             </Text>
           </View>
           <View style={s.sessionControlActions}>
-            {canControlGoal && <TouchableOpacity
+            {(canControlGoal || goalBlocked) && <TouchableOpacity
               onPress={() => {
-                if (goalControlPending) return;
+                if (!canControlGoal || goalControlPending) return;
                 const requestId = clientRef.current?.controlGoal(sessionId, goalAction, goal, {
                   sessionGeneration: sessionMeta?.control_generation,
                 });
@@ -1715,14 +1884,23 @@ export default function ChatScreen({ route, navigation }) {
                   setGoalControlPending(requestId);
                 }
               }}
-              style={[s.sessionControlButton, goalControlPending ? s.sessionControlButtonDisabled : null]}
+              style={[s.sessionControlButton, (!canControlGoal || goalControlPending) ? s.sessionControlButtonDisabled : null]}
               activeOpacity={0.7}
-              disabled={!!goalControlPending}
+              disabled={!canControlGoal || !!goalControlPending}
               accessibilityRole="button"
-              accessibilityLabel={`${goalAction === 'pause' ? 'Pause' : 'Resume'} goal`}
+              accessibilityLabel={canControlGoal
+                ? `${goalAction === 'pause' ? 'Pause' : goalBlocked ? 'Resume blocked' : 'Resume'} goal`
+                : 'Goal blocked; resolve in the native session'}
+              accessibilityHint={goalBlockedReason || undefined}
             >
               <Text style={s.sessionControlButtonText}>
-                {goalControlPending ? 'Working...' : goalAction === 'pause' ? 'Pause goal' : 'Resume goal'}
+                {goalControlPending
+                  ? 'Working...'
+                  : goalAction === 'pause'
+                    ? 'Pause goal'
+                    : goalBlocked
+                      ? (canControlGoal ? 'Resume blocked goal' : 'Goal blocked · native action required')
+                      : 'Resume goal'}
               </Text>
             </TouchableOpacity>}
             {canInterrupt && <TouchableOpacity
@@ -1772,8 +1950,9 @@ export default function ChatScreen({ route, navigation }) {
         )}
         contentContainerStyle={s.messageList}
         maintainVisibleContentPosition={{ minIndexForVisible: 0 }}
-        ListHeaderComponent={hasOlderHistory || historyLoadingOlder || historyError ? (
+        ListHeaderComponent={hasOlderHistory || historyLoadingOlder || historyRefreshing || historyError ? (
           <View style={s.historyHeader}>
+            {historyRefreshing && <Text style={s.historyRefreshing} accessibilityLiveRegion="polite">Refreshing latest messages...</Text>}
             {!!historyError && <Text style={s.historyError} accessibilityRole="alert">{historyError}</Text>}
             {!!historyError && !hasOlderHistory && (
               <TouchableOpacity style={s.historyButton} onPress={retryHistoryTail} accessibilityRole="button">
@@ -1867,6 +2046,17 @@ export default function ChatScreen({ route, navigation }) {
         <TouchableOpacity style={s.failedRow} onPress={handleRetry} activeOpacity={0.7}>
           <Text style={s.failedText}>{failedMsg.reason || 'Send failed'} — tap to retry</Text>
         </TouchableOpacity>
+      )}
+
+      {goalCommandNotice && (
+        <View
+          style={[s.goalCommandNotice, s[`goalCommandNotice_${goalCommandNotice.status}`]]}
+          accessibilityRole={goalCommandNotice.status === 'failed' ? 'alert' : 'text'}
+          accessibilityLabel={`Goal control: ${goalCommandNotice.text}`}
+        >
+          <Text style={s.goalCommandNoticeTitle}>Goal control</Text>
+          <Text style={s.goalCommandNoticeText}>{goalCommandNotice.text}</Text>
+        </View>
       )}
 
       <QueuedMessageBar
@@ -1965,6 +2155,7 @@ export default function ChatScreen({ route, navigation }) {
         config={agentConfig}
         relay={clientRef.current}
         sessionId={sessionId}
+        session={sessionMeta}
         controlResults={controlResults}
         onExport={shareSessionExport}
       />
@@ -2411,6 +2602,7 @@ const s = StyleSheet.create({
     paddingHorizontal: 14,
   },
   historyButtonText: { color: '#58a6ff', fontSize: 12, fontWeight: '700' },
+  historyRefreshing: { color: '#8b949e', fontSize: 12, marginBottom: 8, textAlign: 'center' },
   historyError: { color: '#ff7b72', fontSize: 12, marginBottom: 8, textAlign: 'center' },
   emptyList: {
     flex:           1,
@@ -2447,6 +2639,21 @@ const s = StyleSheet.create({
     fontSize: 12,
     fontWeight: '600',
   },
+  goalCommandNotice: {
+    marginHorizontal: 10,
+    marginVertical: 4,
+    paddingHorizontal: 10,
+    paddingVertical: 8,
+    borderWidth: 1,
+    borderColor: '#30363d',
+    borderRadius: 8,
+    backgroundColor: '#1c2128',
+  },
+  goalCommandNotice_applying: { borderColor: '#58a6ff' },
+  goalCommandNotice_success: { borderColor: '#3fb950' },
+  goalCommandNotice_failed: { borderColor: '#f85149' },
+  goalCommandNoticeTitle: { color: '#f0f6fc', fontSize: 12, fontWeight: '700' },
+  goalCommandNoticeText: { color: '#8b949e', fontSize: 11, lineHeight: 16, marginTop: 2 },
   attachPreview: {
     flexDirection:    'row',
     alignItems:       'center',

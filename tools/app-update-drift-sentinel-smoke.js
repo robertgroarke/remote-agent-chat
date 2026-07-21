@@ -232,11 +232,15 @@ async function main() {
   options.revalidate = null;
 
   const sentinelSource = fs.readFileSync(path.join(root, 'tools', 'app-update-drift-sentinel.js'), 'utf8');
+  const installer = fs.readFileSync(path.join(root, 'install-app-update-drift-task.ps1'), 'utf8');
+  const launcher = fs.readFileSync(path.join(root, 'app-update-drift-hidden.vbs'), 'utf8');
   assert(sentinelSource.includes('fs.watch(watchRoot') && sentinelSource.includes('setInterval(requestScan, options.pollMs)'),
     'sentinel must combine event-driven file watches with a bounded fallback poll');
   assert(sentinelSource.includes('appVersionEventWatchRoots()')
     && sentinelSource.includes('{ recursive: false }'),
   'sentinel event watches must stay non-recursive on stable parent directories');
+  assert(installer.includes('New-ScheduledTaskTrigger -AtLogOn') && installer.includes('MultipleInstances IgnoreNew'));
+  assert(launcher.includes('shell.Run(command, 0, True)'), 'launcher must remain hidden and single-process');
 
   console.log(JSON.stringify({
     ok: true,
@@ -251,7 +255,7 @@ async function main() {
     failure_triage_appended: true,
     persistent_state: true,
     event_watch_plus_poll: true,
-    external_scheduler_compatible: true,
+    hidden_launcher: true,
     fail_closed_without_validator: true,
     targeted_revalidation: true,
   }, null, 2));

@@ -42,6 +42,7 @@ const androidRecentChats = read('android-app/lib/recent-chats.js');
 const androidHostResources = read('android-app/lib/host-resources.js');
 const androidProviderUsage = read('android-app/lib/provider-usage.js');
 const androidSessionUsage = read('android-app/lib/session-usage.js');
+const androidGoalCommand = read('android-app/lib/goal-command.js');
 const webApp = read('frontend/app.jsx');
 const webStyles = read('frontend/styles.css');
 const webHooks = read('frontend/hooks.jsx');
@@ -55,6 +56,7 @@ const webRecentChats = read('frontend/recent-chats.js');
 const webSessionTitle = read('frontend/session-title.js');
 const webSessionPins = read('frontend/session-pins.js');
 const webSessionRegistry = read('frontend/session-registry.js');
+const webGoalCommand = read('frontend/goal-command.js');
 const proxyNoisePolicy = read('agent-proxy/session-noise-policy.js');
 const proxyProtocol = read('agent-proxy/protocol.js');
 const proxyEngine = read('agent-proxy/proxy-engine.js');
@@ -77,6 +79,16 @@ assert.match(androidRelay, /client_message_id:\s*clientMsgId/,
   'Android sends must use the relay client_message_id contract');
 assert.strictEqual(count(androidChat, /case 'agent_control_result'/g), 1,
   'Android must have one reachable agent_control_result handler');
+assert.strictEqual(normalizeEol(androidGoalCommand), normalizeEol(webGoalCommand),
+  'Web and Android goal slash-command policy must remain byte-identical');
+assert(hasAll(androidChat, [
+  'classifyGoalCommandIntent', 'pendingGoalSlashControlRef', 'Command retained',
+  'Validating goal, then applying native control',
+]), 'Android must route exact goal slash controls without optimistic chat delivery');
+assert(hasAll(webApp, [
+  'classifyGoalCommandIntent', 'pendingGoalSlashControlsRef', 'Command retained',
+  'Validating goal, then applying native control',
+]), 'Web must route exact goal slash controls without optimistic chat delivery');
 assert(hasAll(androidChat, [
   "case 'message_accepted'", "case 'message_delivered'", "case 'message_failed'",
   "case 'proxy_send_result'", "case 'message_queued'", "case 'queue_delivered'",
@@ -258,7 +270,7 @@ assert(hasAll(androidChat, ["case 'directory_listing'", "case 'file_content'", '
   'Android must capability-gate and maintain workspace file-browser state');
 assert(hasAll(androidFileBrowser, ['VIEWABLE_EXTENSIONS', 'onNavigate(parentPath(currentPath))', 'selectable', 'truncated']),
   'Android must render safe directory navigation and bounded text previews');
-assert(hasAll(androidRelay, ['requestHistoryChunk', "type: 'history_chunk_request'", "source: 'relay_sqlite'", 'before_id']),
+assert(hasAll(androidRelay, ['requestHistoryChunk', "type: 'history_chunk_request'", "source: options.source || 'relay_sqlite'", 'before_id']),
   'Android must request bounded relay history chunks');
 assert(hasAll(androidChat, [
   "case 'history_chunk'", 'HISTORY_PAGE_SIZE = 200', 'Load earlier messages',
@@ -606,7 +618,7 @@ const rows = [
   ['Open native harness window', 'PARITY',
     'Web and Android capability-gate the same operator-action-only open_native_window request for supported CLI sessions.'],
   ['Draft persistence and slash-command menu', 'PARITY',
-    'Web and Android persist per-session composer drafts and expose the same plan/review/fix/summarize command starters.'],
+    'Web and Android persist per-session composer drafts, share the exact goal-command parser, and route /goal resume or /goal pause through receipt-backed native control while retaining failures.'],
   ['Bounded history pagination/backfill', 'PARITY',
     'Both clients request bounded relay tails and prepend older before_id chunks with deduplication, scroll preservation, and retryable failure state.'],
   ['Notification category settings persisted in relay', 'PARITY',

@@ -13,6 +13,7 @@ if (args.some(arg => arg !== '--read-only')) {
 const stages = [
   ['selectors syntax', ['--check', 'agent-proxy/selectors.js']],
   ['proxy syntax', ['--check', 'agent-proxy/proxy-engine.js']],
+  ['extension persistent poll and send ownership', ['tools/claude-extension-desync-smoke.js']],
   ['relay syntax', ['--check', 'relay-server/index.js']],
   ['VS Code target guard', ['tools/vscode-probe-guard-smoke.js']],
   ['relay question answer contract', ['tools/relay-question-answers-smoke.js']],

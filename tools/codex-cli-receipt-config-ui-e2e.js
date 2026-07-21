@@ -234,7 +234,7 @@ function installHistoryResponder(proxy) {
   });
 }
 
-async function captureSurface(page, viewport, theme) {
+async function captureSurface(page, viewport, theme, proxy) {
   await page.waitForSelector(`.session-card[data-session-id="${sessionId}"]`);
   if (viewport === 'mobile') {
     await page.locator('.hamburger').click();
@@ -243,6 +243,38 @@ async function captureSurface(page, viewport, theme) {
   await page.locator(`.session-card[data-session-id="${sessionId}"] .session-card-sub`).click();
   if (viewport === 'mobile') await page.waitForFunction(() => !document.querySelector('.overlay')?.classList.contains('open'));
   await page.waitForFunction(() => document.querySelectorAll('.message.user .delivery').length >= 6);
+  const streamMessageId = `app-server-stream-${viewport}-${theme}-${Date.now()}`;
+  proxy.ws.send(JSON.stringify({
+    type: 'proxy_status', session_id: sessionId, status: 'healthy',
+    activity: {
+      kind: 'generating', label: 'Codex CLI running headlessly',
+      execution_mode: 'headless_out_of_process', execution_transport: 'codex_app_server',
+      execution_detail: 'This turn runs in an owned background process; a separate interactive Codex TUI may remain idle.',
+      current: { kind: 'answer', label: 'Answering in a headless session', streaming_transport: 'message_delta' },
+      updated_at: new Date().toISOString(),
+    },
+  }));
+  for (const frame of [
+    { seq: 0, op: 'block_open' },
+    { seq: 1, op: 'append', append: 'Headless ' },
+    { seq: 2, op: 'append', append: 'streaming fixture' },
+    { seq: 3, op: 'block_close' },
+  ]) {
+    proxy.ws.send(JSON.stringify({
+      type: 'message_delta', protocol_version: 1, session_id: sessionId,
+      message_id: streamMessageId, role: 'assistant', block_index: 0, block_type: 'text',
+      ...frame,
+    }));
+  }
+  await page.waitForFunction(() => [...document.querySelectorAll('.message.assistant.provisional-stream')]
+    .some(node => (node.textContent || '').includes('Headless streaming fixture')));
+  const liveSurface = await page.evaluate(() => ({
+    provisional: [...document.querySelectorAll('.message.assistant.provisional-stream')]
+      .filter(node => (node.textContent || '').includes('Headless streaming fixture')).length,
+    headlessActivity: /headless/i.test(document.body.innerText || ''),
+  }));
+  assert.strictEqual(liveSurface.provisional, 1, `${viewport}/${theme} must render one provisional app-server answer`);
+  assert(liveSurface.headlessActivity, `${viewport}/${theme} must name the headless execution mode during streaming`);
 
   const transcript = await page.evaluate(() => [...document.querySelectorAll('.message.user')].map(message => ({
     content: message.querySelector('.user-text')?.textContent?.trim() || '',
@@ -298,12 +330,14 @@ async function captureSurface(page, viewport, theme) {
       text,
       hasObserved: normalizedText.includes('observed model') && text.includes(observedModelValue) && normalizedText.includes('observed effort') && normalizedText.includes('xhigh'),
       hasNext: normalizedText.includes('next send model') && text.includes(nextModelValue) && normalizedText.includes('next send effort') && normalizedText.includes('high'),
+      hasHeadlessMode: normalizedText.includes('headless / out-of-process') && normalizedText.includes('interactive tui may stay idle'),
       overflowing,
       panelWithinViewport: panelRect.left >= 0 && panelRect.right <= innerWidth && panelRect.top >= 0 && panelRect.bottom <= innerHeight,
     };
   }, { observedModelValue: observedModel, nextModelValue: nextModel });
   assert(details.hasObserved, `${viewport}/${theme} session details lost observed truth: ${JSON.stringify(details)}`);
   assert(details.hasNext, `${viewport}/${theme} session details lost next-send truth: ${JSON.stringify(details)}`);
+  assert(details.hasHeadlessMode, `${viewport}/${theme} session details hid the headless/TUI execution contract: ${JSON.stringify(details)}`);
   assert(details.panelWithinViewport, `${viewport}/${theme} session details escaped viewport`);
   assert.deepStrictEqual(details.overflowing, [], `${viewport}/${theme} session detail values clipped`);
 
@@ -349,6 +383,8 @@ async function captureSurface(page, viewport, theme) {
     fleet_observed_next_unambiguous: viewport === 'desktop',
     overflow_count: 0,
     accessible_statuses: 6,
+    app_server_provisional_rows: 1,
+    headless_execution_visible: true,
     refresh_stable: true,
   };
 }
@@ -397,6 +433,9 @@ async function main() {
       next_send_model_status: 'pending',
       next_send_effort: nextEffort,
       next_send_effort_status: 'pending',
+      send_execution_mode: 'headless_out_of_process',
+      send_execution_label: 'Headless / out-of-process',
+      send_execution_detail: 'Remote sends run in an owned background Codex worker. A separate interactive Codex TUI may remain idle.',
       available_models: [
         { id: nextModel, label: `${nextModel} · currently advertised alias` },
         { id: 'Sol', label: 'Sol' },
@@ -433,7 +472,7 @@ async function main() {
         await context.addInitScript(value => localStorage.setItem('remote-agent-chat-theme', value), theme);
         const page = await context.newPage();
         await page.goto(`http://127.0.0.1:${port}/`, { waitUntil: 'networkidle' });
-        cases.push(await captureSurface(page, viewport, theme));
+        cases.push(await captureSurface(page, viewport, theme, proxy));
         await context.close();
         // Each case owns a fresh browser context. Keep its first native-tail
         // request outside the relay's per-session 1.5 s anti-churn window.

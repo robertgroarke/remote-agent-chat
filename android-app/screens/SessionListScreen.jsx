@@ -1664,7 +1664,14 @@ export default function SessionListScreen({ navigation, route }) {
     });
     const goal = workContext.kind === 'goal' ? capabilitySafeActivity?.goal || null : null;
     const goalState = String(goal?.state || goal?.status || '').toLowerCase();
-    const goalAction = goalState === 'active' ? 'pause' : goalState === 'paused' ? 'resume' : null;
+    const goalBlocked = goalState === 'blocked';
+    const blockedResumeSupported = goalBlocked && session?.capabilities?.goal_blocked_resume === true;
+    const goalAction = goalState === 'active'
+      ? 'pause'
+      : (goalState === 'paused' || blockedResumeSupported ? 'resume' : null);
+    const goalBlockedReason = goalBlocked
+      ? String(goal?.block_reason || goal?.reason || capabilitySafeActivity?.label || 'Goal blocked').trim()
+      : '';
     const activityKind = String(capabilitySafeActivity?.kind || '').toLowerCase();
     const turnActive = capabilitySafeActivity?.generating === true
       || ['thinking', 'generating', 'running_command', 'applying_patch', 'reading_files', 'working'].includes(activityKind);
@@ -1691,6 +1698,8 @@ export default function SessionListScreen({ navigation, route }) {
       stateLabel: session?.rate_limit_active === true ? 'Usage limited' : fleetStateLabel(state),
       goal,
       goalAction,
+      goalBlocked,
+      goalBlockedReason,
       canControlGoal,
       canInterrupt,
       badge,
@@ -2733,13 +2742,13 @@ export default function SessionListScreen({ navigation, route }) {
                   <Text style={s.fleetStatus} numberOfLines={1}>{entry.status}</Text>
                   {entry.working && <Text style={s.fleetElapsed}>{fleetElapsedLabel(entry.activity, fleetNowMs)}</Text>}
                 </View>
-                {(entry.canControlGoal || entry.canInterrupt) && <View style={s.fleetControlRow}>
-                  {entry.canControlGoal && <TouchableOpacity
-                    style={[s.fleetControlButton, fleetControlPending[entry.id] ? s.fleetControlButtonDisabled : null]}
-                    disabled={!!fleetControlPending[entry.id]}
+                {(entry.canControlGoal || entry.goalBlocked || entry.canInterrupt) && <View style={s.fleetControlRow}>
+                  {(entry.canControlGoal || entry.goalBlocked) && <TouchableOpacity
+                    style={[s.fleetControlButton, (!entry.canControlGoal || fleetControlPending[entry.id]) ? s.fleetControlButtonDisabled : null]}
+                    disabled={!entry.canControlGoal || !!fleetControlPending[entry.id]}
                     onPress={event => {
                       event.stopPropagation && event.stopPropagation();
-                      if (fleetControlPending[entry.id]) return;
+                      if (!entry.canControlGoal || fleetControlPending[entry.id]) return;
                       const requestId = clientRef.current?.controlGoal(entry.id, entry.goalAction, entry.goal, {
                         sessionGeneration: entry.session?.control_generation,
                       });
@@ -2753,9 +2762,18 @@ export default function SessionListScreen({ navigation, route }) {
                       }
                     }}
                     accessibilityRole="button"
-                    accessibilityLabel={`${entry.goalAction === 'pause' ? 'Pause' : 'Resume'} goal for ${entry.title}`}
+                    accessibilityLabel={entry.canControlGoal
+                      ? `${entry.goalAction === 'pause' ? 'Pause' : entry.goalBlocked ? 'Resume blocked' : 'Resume'} goal for ${entry.title}`
+                      : `Goal blocked for ${entry.title}; resolve in the native session`}
+                    accessibilityHint={entry.goalBlockedReason || undefined}
                   >
-                    <Text style={s.fleetControlButtonText}>{fleetControlPending[entry.id]?.command === 'agent_goal_control' ? 'Working...' : entry.goalAction === 'pause' ? 'Pause goal' : 'Resume goal'}</Text>
+                    <Text style={s.fleetControlButtonText}>{fleetControlPending[entry.id]?.command === 'agent_goal_control'
+                      ? 'Working...'
+                      : entry.goalAction === 'pause'
+                        ? 'Pause goal'
+                        : entry.goalBlocked
+                          ? (entry.canControlGoal ? 'Resume blocked goal' : 'Goal blocked · native action required')
+                          : 'Resume goal'}</Text>
                   </TouchableOpacity>}
                   {entry.canInterrupt && <TouchableOpacity
                     style={[s.fleetControlButton, s.fleetInterruptButton, fleetControlPending[entry.id] ? s.fleetControlButtonDisabled : null]}

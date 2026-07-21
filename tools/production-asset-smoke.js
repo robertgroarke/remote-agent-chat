@@ -24,6 +24,13 @@ function normalizedText(value) {
   return String(value || '').replace(/\r\n/g, '\n');
 }
 
+function logicalBundleText(value) {
+  // esbuild's reviewable lineLimit may split long string literals with an
+  // escaped physical newline. Remove only that JavaScript continuation so
+  // semantic marker checks inspect the runtime string rather than formatting.
+  return normalizedText(value).replace(/\\\n/g, '');
+}
+
 async function readAsset(baseUrl, assetPath, headers) {
   const startedAt = Date.now();
   const separator = assetPath.includes('?') ? '&' : '?';
@@ -116,6 +123,9 @@ async function main() {
   const apk = await readBinaryAsset(baseUrl, '/agent-chat.apk', headers);
   const localApk = fs.readFileSync(path.join(sourceRoot, 'relay-server', 'public', 'agent-chat.apk'));
   const localApkSha256 = crypto.createHash('sha256').update(localApk).digest('hex').toUpperCase();
+  const localBundle = fs.readFileSync(path.join(sourceRoot, 'frontend', 'dist', 'bundle.js'), 'utf8');
+  const bundleSha256 = crypto.createHash('sha256').update(normalizedText(bundle.body)).digest('hex').toUpperCase();
+  const localBundleSha256 = crypto.createHash('sha256').update(normalizedText(localBundle)).digest('hex').toUpperCase();
 
   assert(index.body.includes(`styles.css?v=${assetVersion}`), 'production HTML has a stale stylesheet key');
   assert(index.body.includes(`bundle.js?v=${assetVersion}`), 'production HTML has a stale bundle key');
@@ -129,8 +139,11 @@ async function main() {
     normalizedText(localWorker),
     'production service worker differs semantically from the exact source root',
   );
+  assert.strictEqual(bundleSha256, localBundleSha256,
+    'production bundle differs from the exact built source root');
   assert.equal(apk.bytes, localApk.length, 'production APK byte length differs from the built release');
   assert.equal(apk.sha256, localApkSha256, 'production APK hash differs from the built release');
+  const logicalBundle = logicalBundleText(bundle.body);
   for (const marker of [
     'content-block-plan', 'content-block-queued-message', 'content-block-notice', 'content-block-tool-result',
     'content-block-thinking-native', 'content-block-thinking-codex-desktop', 'content-block-terminal-codex-desktop',
@@ -164,7 +177,7 @@ async function main() {
     'Schedule message', '/api/scheduled-sends', 'When session is next idle', 'At a specific time',
     'data-composer-skin',
   ]) {
-    assert(bundle.body.includes(marker), 'production bundle is missing ' + marker);
+    assert(logicalBundle.includes(marker), 'production bundle is missing ' + marker);
   }
 
   const parsed = new URL(baseUrl);
@@ -179,7 +192,7 @@ async function main() {
     assets: {
       index: { elapsed_ms: index.elapsed_ms, bytes: index.bytes },
       styles: { elapsed_ms: styles.elapsed_ms, bytes: styles.bytes },
-      bundle: { elapsed_ms: bundle.elapsed_ms, bytes: bundle.bytes },
+      bundle: { elapsed_ms: bundle.elapsed_ms, bytes: bundle.bytes, sha256: bundleSha256 },
       service_worker: { elapsed_ms: worker.elapsed_ms, bytes: worker.bytes },
       android_apk: { elapsed_ms: apk.elapsed_ms, bytes: apk.bytes, sha256: apk.sha256 },
     },

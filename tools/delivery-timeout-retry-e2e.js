@@ -12,6 +12,7 @@ const { WebSocketServer } = require('../relay-server/node_modules/ws');
 const root = path.resolve(__dirname, '..');
 const publicRoot = path.join(root, 'frontend');
 const cdpUrl = process.env.RAC_VERIFICATION_BROWSER_CDP || 'http://127.0.0.1:9240';
+const isolatedHeadless = process.argv.includes('--isolated-headless');
 const fixtureSessionId = 'delivery-timeout-retry-fixture';
 const outputArgIndex = process.argv.indexOf('--output');
 const outputPath = outputArgIndex >= 0 && process.argv[outputArgIndex + 1]
@@ -129,11 +130,24 @@ async function main() {
   let page;
   let originalUrl;
   try {
-    browser = await chromium.connectOverCDP(cdpUrl);
-    const pages = browser.contexts().flatMap(context => context.pages());
-    assert.strictEqual(pages.length, 1, `expected exactly one persistent verification page, found ${pages.length}`);
-    [page] = pages;
-    originalUrl = page.url();
+    if (isolatedHeadless) {
+      browser = await chromium.launch({
+        channel: 'chrome',
+        headless: true,
+        args: ['--disable-gpu', '--no-first-run', '--no-default-browser-check'],
+      });
+      page = await browser.newPage({ viewport: { width: 1280, height: 900 } });
+      await page.addInitScript(() => {
+        localStorage.setItem('remote-agent-chat:show-test-sessions:v1', '1');
+      });
+      originalUrl = 'about:blank';
+    } else {
+      browser = await chromium.connectOverCDP(cdpUrl);
+      const pages = browser.contexts().flatMap(context => context.pages());
+      assert.strictEqual(pages.length, 1, `expected exactly one persistent verification page, found ${pages.length}`);
+      [page] = pages;
+      originalUrl = page.url();
+    }
     await page.goto(`http://127.0.0.1:${port}/`, { waitUntil: 'domcontentloaded', timeout: 15000 });
     await page.getByText('Delivery timeout retry fixture', { exact: true }).first().click({ timeout: 5000 });
     const composer = page.locator('.textarea-row textarea');
@@ -167,7 +181,8 @@ async function main() {
       && !document.querySelector('.composer-control-state.pending'), null, { timeout: 3000 });
     const result = {
       ok: true,
-      cdp: cdpUrl,
+      browser_mode: isolatedHeadless ? 'isolated-headless' : 'persistent-cdp',
+      cdp: isolatedHeadless ? null : cdpUrl,
       pages: 1,
       timeout_stage: 'queued',
       correlation_id_reused: true,
@@ -185,7 +200,9 @@ async function main() {
     }
     console.log(JSON.stringify(result, null, 2));
   } finally {
-    if (page && originalUrl) await page.goto(originalUrl, { waitUntil: 'domcontentloaded', timeout: 15000 }).catch(() => {});
+    if (!isolatedHeadless && page && originalUrl) {
+      await page.goto(originalUrl, { waitUntil: 'domcontentloaded', timeout: 15000 }).catch(() => {});
+    }
     if (browser) await browser.close().catch(() => {});
     for (const ws of wss.clients) ws.terminate();
     await new Promise(resolve => wss.close(() => resolve()));

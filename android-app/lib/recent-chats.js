@@ -112,6 +112,7 @@ function asIdSet(value) {
 function projectRecentChatOwnership(sessions, options = {}) {
   const workingSessionIds = asIdSet(options.workingSessionIds);
   const pinnedSessionIds = asIdSet(options.pinnedSessionIds);
+  const pinnedOrder = new Map([...pinnedSessionIds].map((id, index) => [id, index]));
   const excludedSessionIds = asIdSet(options.excludedSessionIds);
   const limit = Number.isSafeInteger(options.limit) && options.limit >= 0
     ? options.limit
@@ -130,7 +131,9 @@ function projectRecentChatOwnership(sessions, options = {}) {
   const recent = rankRecentChatSessions(nonWorking).slice(0, limit);
   const recentIds = new Set(recent.map(sessionIdOf));
   const afterRecent = nonWorking.filter(session => !recentIds.has(sessionIdOf(session)));
-  const pinned = afterRecent.filter(session => pinnedSessionIds.has(sessionIdOf(session)));
+  const pinned = afterRecent
+    .filter(session => pinnedSessionIds.has(sessionIdOf(session)))
+    .sort((left, right) => pinnedOrder.get(sessionIdOf(left)) - pinnedOrder.get(sessionIdOf(right)));
   const pinnedIds = new Set(pinned.map(sessionIdOf));
   const remaining = afterRecent.filter(session => !pinnedIds.has(sessionIdOf(session)));
   const ownership = Object.fromEntries([

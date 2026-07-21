@@ -307,7 +307,7 @@ try {
   fs.writeFileSync(transcriptPath, `${lines.join('\n')}\n`, 'utf8');
 
   const messages = claudeCli.parseClaudeJsonl(transcriptPath);
-  assert.strictEqual(messages.length, 11, 'terminal output stays combined while current Task operations reduce to one plan');
+  assert.strictEqual(messages.length, 10, 'terminal and generic tool output stay consolidated while current Task operations reduce to one plan');
   assert(messages.every(message => message.role === 'user' || message.role === 'assistant'));
 
   const thinking = messages[1].content_blocks?.[0];
@@ -323,23 +323,17 @@ try {
   assert.strictEqual(terminal.status, 'completed');
   assert.strictEqual(terminal.collapsed, false);
 
-  const toolCall = messages[3].content_blocks?.[0];
-  assert.strictEqual(toolCall.type, 'tool_call');
-  assert.strictEqual(toolCall.title, 'Read');
-  assert.match(toolCall.content, /README\.md/);
-  assert.doesNotMatch(toolCall.content, /fixture file content/, 'tool call must not flatten its result');
-  assert.strictEqual(toolCall.call_id, 'tool-call-2');
-
-  const toolResult = messages[4].content_blocks?.[0];
+  const toolResult = messages[3].content_blocks?.[0];
   assert.strictEqual(toolResult.type, 'tool_result');
   assert.strictEqual(toolResult.title, 'Tool result: Read');
   assert.match(toolResult.content, /fixture file content/);
+  assert.doesNotMatch(toolResult.content, /README\.md/, 'completed generic tool card must show output, not echo input');
   assert.strictEqual(toolResult.call_id, 'tool-call-2');
   assert.strictEqual(toolResult.tool_name, 'Read');
   assert.strictEqual(toolResult.status, 'completed');
   assert.strictEqual(toolResult.collapsed, false);
 
-  const plan = messages[5].content_blocks?.[0];
+  const plan = messages[4].content_blocks?.[0];
   assert.strictEqual(plan.type, 'plan');
   assert.strictEqual(plan.title, 'Tasks');
   assert.deepStrictEqual(plan.tasks.map(task => task.status), ['completed', 'in_progress']);
@@ -347,11 +341,11 @@ try {
   assert.strictEqual(plan.call_id, 'tool-call-3');
   assert.strictEqual(plan.collapsed, false);
 
-  const planResult = messages[6].content_blocks?.[0];
+  const planResult = messages[5].content_blocks?.[0];
   assert.strictEqual(planResult.type, 'tool_result');
   assert.strictEqual(planResult.call_id, 'tool-call-3');
 
-  const prompt = messages[7].content_blocks?.[0];
+  const prompt = messages[6].content_blocks?.[0];
   assert.strictEqual(prompt.type, 'prompt');
   assert.strictEqual(prompt.title, 'Approach');
   assert.match(prompt.content, /Which verified approach should continue\?/);
@@ -360,11 +354,11 @@ try {
   assert.strictEqual(prompt.call_id, 'tool-call-4');
   assert.strictEqual(prompt.collapsed, false);
 
-  const promptResult = messages[8].content_blocks?.[0];
+  const promptResult = messages[7].content_blocks?.[0];
   assert.strictEqual(promptResult.type, 'tool_result');
   assert.strictEqual(promptResult.call_id, 'tool-call-4');
 
-  const currentTaskPlan = messages[9].content_blocks?.[0];
+  const currentTaskPlan = messages[8].content_blocks?.[0];
   assert.strictEqual(currentTaskPlan.type, 'plan');
   assert.strictEqual(currentTaskPlan.title, '2 tasks (2 done, 0 open)');
   assert.strictEqual(currentTaskPlan.tool_name, 'TaskUpdate');
@@ -380,7 +374,7 @@ try {
     'native Task operations must not fan out into generic tool cards',
   );
 
-  const markdown = messages[10].content_blocks?.[0];
+  const markdown = messages[9].content_blocks?.[0];
   assert.deepStrictEqual(markdown, { type: 'markdown', content: 'Fixture complete.' });
 
   const summary = claudeCli.readSessionSummary(transcriptPath);

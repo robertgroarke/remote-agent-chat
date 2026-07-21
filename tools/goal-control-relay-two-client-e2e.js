@@ -94,7 +94,7 @@ function sessionFromAck(client, sessionId) {
 function goalRequest(client, session, requestId) {
   return {
     type: 'agent_goal_control', protocol_version: 1,
-    request_id: requestId, session_id: goalSessionId, action: 'pause',
+    request_id: requestId, session_id: goalSessionId, action: 'resume',
     connection_id: client.ack.connection_id,
     session_generation: session.control_generation,
     goal_generation: 7,
@@ -128,12 +128,12 @@ async function main() {
       type: 'proxy_session_snapshot', protocol_version: 1, proxy_id: 'goal-control-proxy',
       sessions: [
         {
-          session_id: goalSessionId, agent_type: 'codex', host_type: 'vscode', status: 'healthy',
-          capabilities: { goal_pause_resume: true, interrupt: true },
+          session_id: goalSessionId, agent_type: 'codex_cli', host_type: 'cli', status: 'healthy',
+          capabilities: { goal_pause_resume: true, goal_blocked_resume: true, interrupt: true },
           activity: {
-            kind: 'working', label: 'Working',
+            kind: 'blocked', label: 'Dependency unavailable',
             goal: {
-              state: 'active', status: 'active', objective: 'Exact control', token_budget: 700,
+              state: 'blocked', status: 'blocked', objective: 'Exact control', token_budget: 700,
               generation: 7, transition_seq: 3, fingerprint: 'goal-seven',
             },
           },
@@ -252,6 +252,7 @@ async function main() {
       ok: true,
       two_clients: 2,
       goal_native_operations: 1,
+      goal_transition: 'blocked_to_active',
       interrupt_native_operations: 1,
       receipts: 4,
       replayed_double_click: true,

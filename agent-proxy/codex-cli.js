@@ -135,6 +135,7 @@ function readCodexModelCatalog(cachePath = path.join(homeDir(), '.codex', 'model
       source: 'bundled_fallback',
       fetched_at: null,
       client_version: null,
+      cache_valid: parsed != null,
     };
   }
   const models = advertised.map(model => ({
@@ -158,12 +159,80 @@ function readCodexModelCatalog(cachePath = path.join(homeDir(), '.codex', 'model
     source: 'codex_models_cache',
     fetched_at: parsed?.fetched_at || null,
     client_version: parsed?.client_version || null,
+    cache_valid: true,
   };
 }
 
-const CODEX_CLI_CATALOG = readCodexModelCatalog();
+const CODEX_MODEL_CATALOG_CACHE_PATH = path.join(homeDir(), '.codex', 'models_cache.json');
+const CODEX_MODEL_CATALOG_REFRESH_INTERVAL_MS = Math.max(
+  1000,
+  parseInt(process.env.CODEX_CLI_MODEL_CATALOG_REFRESH_MS || '15000', 10) || 15000,
+);
+
+function codexModelCatalogFileSignature(cachePath) {
+  const stat = safeStat(cachePath);
+  if (!stat) return 'missing';
+  return [stat.dev, stat.ino, stat.size, Math.trunc(stat.mtimeMs), Math.trunc(stat.ctimeMs)].join(':');
+}
+
+function replaceMutableArray(target, next) {
+  target.splice(0, target.length, ...next.map(item => ({ ...item })));
+}
+
+const CODEX_CLI_CATALOG = readCodexModelCatalog(CODEX_MODEL_CATALOG_CACHE_PATH);
 const CODEX_CLI_MODELS = CODEX_CLI_CATALOG.models;
 const CODEX_CLI_EFFORTS = CODEX_CLI_CATALOG.efforts;
+const CODEX_MODEL_CATALOG_REFRESH_STATE = {
+  cachePath: CODEX_MODEL_CATALOG_CACHE_PATH,
+  signature: codexModelCatalogFileSignature(CODEX_MODEL_CATALOG_CACHE_PATH),
+  checkedAtMs: Date.now(),
+};
+
+function refreshCodexModelCatalog({
+  cachePath = CODEX_MODEL_CATALOG_CACHE_PATH,
+  force = false,
+  nowMs = Date.now(),
+  minIntervalMs = CODEX_MODEL_CATALOG_REFRESH_INTERVAL_MS,
+} = {}) {
+  const resolvedPath = path.resolve(cachePath);
+  const samePath = resolvedPath === CODEX_MODEL_CATALOG_REFRESH_STATE.cachePath;
+  const elapsedMs = Math.max(0, Number(nowMs) - CODEX_MODEL_CATALOG_REFRESH_STATE.checkedAtMs);
+  if (!force && samePath && elapsedMs < Math.max(1000, Number(minIntervalMs) || CODEX_MODEL_CATALOG_REFRESH_INTERVAL_MS)) {
+    return { checked: false, changed: false, reason: 'debounced', source: CODEX_CLI_CATALOG.source };
+  }
+
+  const signature = codexModelCatalogFileSignature(resolvedPath);
+  CODEX_MODEL_CATALOG_REFRESH_STATE.checkedAtMs = Number(nowMs) || Date.now();
+  if (!force && samePath && signature === CODEX_MODEL_CATALOG_REFRESH_STATE.signature) {
+    return { checked: true, changed: false, reason: 'unchanged', source: CODEX_CLI_CATALOG.source };
+  }
+
+  const next = readCodexModelCatalog(resolvedPath);
+  // Codex replaces this cache during updates. Retain the last known-good
+  // advertised catalog if a bounded refresh lands on a partial write.
+  if (next.cache_valid !== true && CODEX_CLI_CATALOG.source === 'codex_models_cache') {
+    return { checked: true, changed: false, reason: 'invalid_cache_retained', source: CODEX_CLI_CATALOG.source };
+  }
+
+  replaceMutableArray(CODEX_CLI_MODELS, next.models);
+  replaceMutableArray(CODEX_CLI_EFFORTS, next.efforts);
+  Object.assign(CODEX_CLI_CATALOG, next, {
+    models: CODEX_CLI_MODELS,
+    efforts: CODEX_CLI_EFFORTS,
+    refreshed_at: new Date(Number(nowMs) || Date.now()).toISOString(),
+  });
+  CODEX_MODEL_CATALOG_REFRESH_STATE.cachePath = resolvedPath;
+  CODEX_MODEL_CATALOG_REFRESH_STATE.signature = signature;
+  return { checked: true, changed: true, reason: 'cache_changed', source: CODEX_CLI_CATALOG.source };
+}
+
+function codexCliEffortsForModel(modelId, models = CODEX_CLI_MODELS, efforts = CODEX_CLI_EFFORTS) {
+  const normalized = normalizeCodexModelAlias(modelId, models);
+  const advertised = models.find(model => model.id === normalized)?.supported_efforts;
+  if (!Array.isArray(advertised) || advertised.length === 0) return efforts;
+  const byId = new Map(efforts.map(effort => [effort.id, effort]));
+  return advertised.map(id => byId.get(id) || { id, label: effortLabel(id) });
+}
 
 function fileCursorAnchor(filePath, offset) {
   const end = Math.max(0, Number(offset) || 0);
@@ -3389,6 +3458,8 @@ module.exports = {
   codexCliSessionOwnerState,
   codexCliSessionOwnerStateAsync,
   readCodexModelCatalog,
+  refreshCodexModelCatalog,
+  codexCliEffortsForModel,
   readLatestNativeConfigObservation,
   normalizeCodexModelAlias,
   contentFingerprint,

@@ -7693,54 +7693,145 @@ async function readMessages(Runtime, agentType, sessionId, options = {}) {
 
 // ─── Claude send strategies ───────────────────────────────────────────────────
 
-async function sendClaudePrimary(Runtime, text) {
-  const set = await evalInFrame(Runtime, `
-    const input = d.querySelector('${CLAUDE_PRIMARY.input}');
-    if (!input) return 'no-input';
-    input.focus();
-    d.execCommand('selectAll', false, null);
-    const ok = d.execCommand('insertText', false, ${JSON.stringify(text)});
-    if (!ok) { input.textContent = ${JSON.stringify(text)}; input.dispatchEvent(new Event('input', { bubbles: true })); }
-    return 'ok';
+async function readClaudeUserTurnCount(Runtime, text) {
+  const raw = await evalInFrame(Runtime, `
+    function norm(value) { return String(value || '').replace(/\\s+/g, ' ').trim(); }
+    var wanted = norm(${JSON.stringify(text)});
+    var seen = new Set();
+    var rows = Array.from(d.querySelectorAll('.message_07S1Yg.${CLAUDE_PRIMARY.userClass}, .message_07S1Yg[data-role="user"], [data-role="user"]'));
+    var count = 0;
+    rows.forEach(function(row) {
+      if (seen.has(row)) return;
+      seen.add(row);
+      var textEl = row.querySelector('${CLAUDE_PRIMARY.userText}, ${CLAUDE_PRIMARY.userTextAlt}, ${CLAUDE_FALLBACK.userText}');
+      if (norm(textEl ? textEl.textContent : row.textContent) === wanted) count += 1;
+    });
+    return count;
   `);
-  if (set !== 'ok') return { ok: false, code: 'input_not_found', detail: set };
-
-  await new Promise(r => setTimeout(r, 200));
-
-  const click = await evalInFrame(Runtime, `
-    const btn = d.querySelector('${CLAUDE_PRIMARY.sendBtn}');
-    if (!btn) return 'no-btn';
-    if (btn.disabled) return 'disabled';
-    btn.click();
-    return 'sent';
-  `);
-  if (click === 'sent') return { ok: true };
-  return { ok: false, code: 'send_button_failed', detail: click };
+  return Number(raw) || 0;
 }
 
-async function sendClaudeFallback(Runtime, text) {
-  const set = await evalInFrame(Runtime, `
-    const input = d.querySelector('[contenteditable]');
-    if (!input) return 'no-input';
-    input.focus();
-    d.execCommand('selectAll', false, null);
-    const ok = d.execCommand('insertText', false, ${JSON.stringify(text)});
-    if (!ok) { input.textContent = ${JSON.stringify(text)}; input.dispatchEvent(new Event('input', { bubbles: true })); }
-    return 'ok';
+async function sendClaudeWithSelectors(Runtime, text, sessionId, {
+  inputSelector,
+  sendSelector,
+  inputMissingCode,
+  sendFailedCode,
+}) {
+  const startedAt = Date.now();
+  const guardRaw = await evalInFrame(Runtime, `
+    function norm(value) { return String(value || '').replace(/\\s+/g, ' ').trim(); }
+    var input = d.querySelector(${JSON.stringify(inputSelector)});
+    if (!input) return JSON.stringify({ state: 'no-input' });
+    var active = d.activeElement;
+    var hasComposerFocus = d.hasFocus() && (active === input || (active && input.contains(active)));
+    var existing = norm(input.innerText || input.textContent || input.value);
+    if (hasComposerFocus) return JSON.stringify({ state: 'human-composer-active', characters: existing.length });
+    if (existing) return JSON.stringify({ state: 'composer-not-empty', characters: existing.length });
+    var wanted = norm(${JSON.stringify(text)});
+    var seen = new Set();
+    var rows = Array.from(d.querySelectorAll('.message_07S1Yg.${CLAUDE_PRIMARY.userClass}, .message_07S1Yg[data-role="user"], [data-role="user"]'));
+    var baseline = 0;
+    rows.forEach(function(row) {
+      if (seen.has(row)) return;
+      seen.add(row);
+      var textEl = row.querySelector('${CLAUDE_PRIMARY.userText}, ${CLAUDE_PRIMARY.userTextAlt}, ${CLAUDE_FALLBACK.userText}');
+      if (norm(textEl ? textEl.textContent : row.textContent) === wanted) baseline += 1;
+    });
+    var nextText = ${JSON.stringify(text)};
+    if ('value' in input) input.value = nextText;
+    else input.textContent = nextText;
+    try {
+      input.dispatchEvent(new InputEvent('input', {
+        bubbles: true,
+        composed: true,
+        inputType: 'insertText',
+        data: nextText,
+      }));
+    } catch (_) {
+      input.dispatchEvent(new Event('input', { bubbles: true, composed: true }));
+    }
+    return JSON.stringify({ state: 'ready', baseline: baseline });
   `);
-  if (set !== 'ok') return { ok: false, code: 'fallback_no_input', detail: set };
+  let guard;
+  try {
+    guard = JSON.parse(guardRaw || '{}');
+  } catch {
+    guard = { state: String(guardRaw || 'unknown') };
+  }
+  if (guard.state === 'no-input') {
+    return { ok: false, code: inputMissingCode, detail: 'no-input' };
+  }
+  if (guard.state === 'human-composer-active') {
+    return {
+      ok: false,
+      code: 'human_composer_active',
+      detail: `Claude Code composer is focused${guard.characters ? ` with ${guard.characters} draft characters` : ''}`,
+    };
+  }
+  if (guard.state === 'composer-not-empty') {
+    return {
+      ok: false,
+      code: 'composer_not_empty',
+      detail: `Claude Code composer contains ${guard.characters || 'a'} draft character(s)`,
+    };
+  }
+  if (guard.state !== 'ready') {
+    return { ok: false, code: inputMissingCode, detail: guard.state || 'composer-guard-failed' };
+  }
 
-  await new Promise(r => setTimeout(r, 200));
-
+  await new Promise(resolve => setTimeout(resolve, 80));
   const click = await evalInFrame(Runtime, `
-    const btn = d.querySelector('${CLAUDE_FALLBACK.sendBtn}');
+    var btn = d.querySelector(${JSON.stringify(sendSelector)});
     if (!btn) return 'no-btn';
-    if (btn.disabled) return 'disabled';
+    if (btn.disabled || btn.getAttribute('aria-disabled') === 'true') return 'disabled';
     btn.click();
     return 'sent';
   `);
-  if (click === 'sent') return { ok: true };
-  return { ok: false, code: 'fallback_send_failed', detail: click };
+  if (click !== 'sent') return { ok: false, code: sendFailedCode, detail: click };
+
+  const deadline = startedAt + 1900;
+  do {
+    const observedCount = await readClaudeUserTurnCount(Runtime, text);
+    if (observedCount > (Number(guard.baseline) || 0)) {
+      const observedAt = new Date().toISOString();
+      return {
+        ok: true,
+        delivery_lifecycle: 'native_user_turn_observed',
+        native_receipt: {
+          transport: 'claude_extension_dom',
+          session_id: sessionId || null,
+          observed_at: observedAt,
+          latency_ms: Date.now() - startedAt,
+          occurrence: observedCount,
+        },
+      };
+    }
+    await new Promise(resolve => setTimeout(resolve, 75));
+  } while (Date.now() < deadline);
+
+  return {
+    ok: false,
+    code: 'native_user_turn_not_observed',
+    detail: 'Claude Code did not expose the submitted user turn within 1900ms; refusing a duplicate fallback send',
+  };
+}
+
+async function sendClaudePrimary(Runtime, text, sessionId) {
+  return sendClaudeWithSelectors(Runtime, text, sessionId, {
+    inputSelector: CLAUDE_PRIMARY.input,
+    sendSelector: CLAUDE_PRIMARY.sendBtn,
+    inputMissingCode: 'input_not_found',
+    sendFailedCode: 'send_button_failed',
+  });
+}
+
+async function sendClaudeFallback(Runtime, text, sessionId) {
+  return sendClaudeWithSelectors(Runtime, text, sessionId, {
+    inputSelector: '[contenteditable]',
+    sendSelector: CLAUDE_FALLBACK.sendBtn,
+    inputMissingCode: 'fallback_no_input',
+    sendFailedCode: 'fallback_send_failed',
+  });
 }
 
 // ─── Codex send strategies ────────────────────────────────────────────────────
@@ -13703,10 +13794,13 @@ async function sendMessage(Runtime, agentType, text, sessionId, cdpClient = null
       result = await sendContinueFallback(Runtime, text);
     }
   } else {
-    result = await sendClaudePrimary(Runtime, text);
-    if (!result.ok) {
+    result = await sendClaudePrimary(Runtime, text, sessionId);
+    // A fallback is safe only when the primary composer was not found. Once
+    // text was injected or a human-owned composer was detected, another
+    // strategy could clobber a draft or submit the same turn twice.
+    if (!result.ok && result.code === 'input_not_found') {
       console.warn(`[${sessionId}] [sel] Claude primary send failed (${result.code}:${result.detail}), trying fallback`);
-      result = await sendClaudeFallback(Runtime, text);
+      result = await sendClaudeFallback(Runtime, text, sessionId);
     }
   }
 
@@ -16581,6 +16675,9 @@ module.exports = {
   readCodexVsCodeConversationId,
   respondToSessionErrorPrompt,
   sendMessage,
+  sendClaudePrimary,
+  sendClaudeFallback,
+  readClaudeUserTurnCount,
   sendCodexDesktopTrustedInput,
   steerCodexInput,
   getSelectorFailures,

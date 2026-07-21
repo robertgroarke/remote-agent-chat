@@ -199,7 +199,10 @@ try {
   assert.match(appSource, /GROUP_ALIAS_STORAGE_KEY/);
   assert.match(appSource, /localStorage\.setItem\(GROUP_ALIAS_STORAGE_KEY/);
   assert.match(appSource, /session-group-working/);
-  assert.match(appSource, /sidebarAnchorRef/);
+  assert.match(appSource, /class SidebarScrollCoordinator extends React\.Component/);
+  assert.match(appSource, /getSnapshotBeforeUpdate\(previousProps\)/);
+  assert.match(appSource, /prepareStructureChange=\{prepareSidebarStructureChange\}/);
+  assert.match(appSource, /finishStructureChange=\{finishSidebarStructureChange\}/);
   assert.match(appSource, /data-session-id/);
   assert.doesNotMatch(appSource, /sidebarOrderEpoch|sidebar-rank-/);
   assert.match(appSource, /Order changed/);

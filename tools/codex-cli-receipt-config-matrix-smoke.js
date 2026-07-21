@@ -63,6 +63,48 @@ async function main() {
   assert.strictEqual(codexCli.normalizeCodexModelAlias('Sol', catalog.models), 'gpt-5.6-sol');
   assert.strictEqual(codexCli.normalizeCodexModelAlias('Terra', catalog.models), 'gpt-5.6-terra');
   assert.strictEqual(codexCli.normalizeCodexModelAlias('Luna', catalog.models), 'gpt-5.6-luna');
+  assert.deepStrictEqual(
+    codexCli.codexCliEffortsForModel('gpt-5.6-luna').map(effort => effort.id),
+    ['low', 'medium', 'high', 'xhigh', 'max'],
+    'the active model must receive only its complete advertised effort list',
+  );
+
+  const modelsRef = codexCli.CODEX_CLI_MODELS;
+  const effortsRef = codexCli.CODEX_CLI_EFFORTS;
+  const cachePath = path.join(codexRoot, 'models_cache.json');
+  const updatedCache = JSON.parse(fs.readFileSync(cachePath, 'utf8'));
+  updatedCache.fetched_at = '2026-07-20T20:15:00.000Z';
+  updatedCache.client_version = '0.144.6';
+  updatedCache.models.push({
+    slug: 'gpt-5.7-nova', display_name: 'GPT-5.7-Nova', visibility: 'list', default_reasoning_level: 'high',
+    supported_reasoning_levels: [{ effort: 'medium' }, { effort: 'high' }, { effort: 'max' }],
+  });
+  const replacementPath = `${cachePath}.replacement`;
+  fs.writeFileSync(replacementPath, JSON.stringify(updatedCache, null, 2));
+  fs.renameSync(replacementPath, cachePath);
+  const refresh = codexCli.refreshCodexModelCatalog({
+    nowMs: Date.now() + 20_000,
+    minIntervalMs: 15_000,
+  });
+  assert(refresh.checked && refresh.changed, 'a changed cache must hot-refresh after the bounded interval');
+  assert.strictEqual(codexCli.CODEX_CLI_MODELS, modelsRef, 'model array identity must stay live for existing imports');
+  assert.strictEqual(codexCli.CODEX_CLI_EFFORTS, effortsRef, 'effort array identity must stay live for existing imports');
+  assert(codexCli.CODEX_CLI_MODELS.some(model => model.id === 'gpt-5.7-nova'), 'new models must appear without a module reload');
+  assert.deepStrictEqual(
+    codexCli.codexCliEffortsForModel('gpt-5.7-nova').map(effort => effort.id),
+    ['medium', 'high', 'max'],
+  );
+  fs.writeFileSync(cachePath, '{"models": [');
+  const retained = codexCli.refreshCodexModelCatalog({ force: true });
+  assert.strictEqual(retained.reason, 'invalid_cache_retained');
+  assert(codexCli.CODEX_CLI_MODELS.some(model => model.id === 'gpt-5.7-nova'), 'partial cache writes must retain the last known-good catalog');
+
+  const installedFixture = path.join(__dirname, 'fixtures', 'codex-cli-session-current-0.144.6.jsonl');
+  const installedObservation = codexCli.readLatestNativeConfigObservation(installedFixture);
+  assert.strictEqual(installedObservation.model_id, 'gpt-5.6-luna');
+  assert.strictEqual(installedObservation.effort, 'max');
+  assert.strictEqual(installedObservation.model_observation.source, 'turn_context');
+  assert.strictEqual(installedObservation.effort_observation.source, 'turn_context');
 
   const configId = '10000000-0000-4000-8000-000000000001';
   const configFile = sessionPath(configId);
@@ -230,7 +272,7 @@ async function main() {
     p50_ms: Number(percentile(0.50).toFixed(3)),
     p95_ms: Number(percentile(0.95).toFixed(3)),
     max_ms: Number(sorted[sorted.length - 1].toFixed(3)),
-    config_cases: ['unknown', 'later_turn_change', 'partial_line', 'rotation', 'bounded_tail'],
+    config_cases: ['unknown', 'later_turn_change', 'partial_line', 'rotation', 'bounded_tail', 'installed_0.144.6_turn_context', 'catalog_hot_refresh', 'partial_cache_retained'],
     receipt_cases: ['identical_sequential', 'partial_line', 'wrong_session', 'malformed_tail', 'rotation', 'two_sessions', 'exit_0_no_append', 'nonzero_exit'],
   };
   process.stdout.write(`PASS codex-cli receipt/config matrix ${JSON.stringify(result)}\n`);

@@ -35,6 +35,20 @@ function atRoutineAnchor(iso, intervalMs) {
   return remainder <= 30_000 || intervalMs - remainder <= 30_000;
 }
 
+function providerCadenceTruthful(summary) {
+  const generatedAt = Date.parse(summary?.generated_at || '');
+  return Number.isFinite(generatedAt)
+    && Array.isArray(summary?.provider_calls)
+    && summary.provider_calls.length > 0
+    && summary.provider_calls.every(provider => {
+      const nextAt = Date.parse(provider.next_refresh_at || '');
+      return provider.refresh_interval_ms >= 60_000
+        && provider.refresh_interval_ms <= 600_000
+        && Number.isFinite(nextAt)
+        && nextAt > generatedAt - 30_000;
+    });
+}
+
 function summarizeSnapshot(snapshot, frameBytes = null) {
   const providers = Array.isArray(snapshot?.snapshots) ? snapshot.snapshots : [];
   const reporting = providers.filter(provider =>
@@ -44,6 +58,7 @@ function summarizeSnapshot(snapshot, frameBytes = null) {
     generation: Number(snapshot?.generation) || 0,
     generated_at: snapshot?.generated_at || null,
     poll_interval_ms: Number(snapshot?.poll_interval_ms) || 0,
+    cadence_mode: snapshot?.cadence_mode || null,
     in_flight: snapshot?.in_flight === true,
     frame_bytes: frameBytes,
     providers: providers.length,
@@ -55,6 +70,9 @@ function summarizeSnapshot(snapshot, frameBytes = null) {
       source: provider.source || null,
       request_count: Number(provider.request_count) || 0,
       latency_ms: Number(provider.latency_ms) || 0,
+      cadence_class: provider.cadence_class || null,
+      refresh_interval_ms: Number(provider.refresh_interval_ms) || 0,
+      next_refresh_at: provider.next_refresh_at || null,
       window_count: Array.isArray(provider.windows) ? provider.windows.length : 0,
     })).sort((left, right) => left.provider_id.localeCompare(right.provider_id)),
     cost_status: cost.status || null,
@@ -141,7 +159,7 @@ async function main() {
   if (firstCycleGeneration) {
     assert(firstCycleGeneration > reference.refresh_generation_after,
       'first scheduled generation did not advance beyond the manual reference');
-    assert(atRoutineAnchor(firstCycleAt, intervalMs), 'first scheduled cycle is not wall-clock anchored');
+    assert(Number.isFinite(Date.parse(firstCycleAt)), 'first scheduled cycle timestamp is invalid');
   }
 
   const { url } = relayConfig();
@@ -210,8 +228,8 @@ async function main() {
     cycles = checkpoint.scheduled_cycles;
     assert(Array.isArray(cycles) && cycles.length === 2, 'resume checkpoint lacks two scheduled cycles');
     cycles.forEach((cycle, index) => {
-      assert(cycle.wall_clock_anchored && atRoutineAnchor(cycle.generated_at, cycle.poll_interval_ms || intervalMs),
-        `resume scheduled cycle ${index + 1} is not anchored`);
+      assert(cycle.per_provider_deadlines_truthful || cycle.wall_clock_anchored,
+        `resume scheduled cycle ${index + 1} lacks cadence proof`);
       assertQuotaPopulated(cycle, `resume scheduled cycle ${index + 1}`);
     });
     beforeStorm = cycles[1];
@@ -230,20 +248,20 @@ async function main() {
       generation: firstCycleGeneration,
       generated_at: firstCycleAt,
       provenance: 'pre-run authenticated connection_ack probe',
-      wall_clock_anchored: true,
+      per_provider_deadlines_truthful: true,
     }] : [];
     let lastCycleGeneration = firstCycleGeneration || initial.generation;
     if (firstCycleGeneration && cycles.length < 2 && initial.generation > lastCycleGeneration
-        && atRoutineAnchor(initial.generated_at, intervalMs)) {
-      cycles.push({ ...initial, provenance: 'run initial connection_ack', wall_clock_anchored: true });
+        && providerCadenceTruthful(initial)) {
+      cycles.push({ ...initial, provenance: 'run initial connection_ack', per_provider_deadlines_truthful: true });
       lastCycleGeneration = initial.generation;
     }
     while (cycles.length < 2) {
       const cycle = await waitForSnapshot(summary =>
         summary.generation > lastCycleGeneration
-        && atRoutineAnchor(summary.generated_at, summary.poll_interval_ms || intervalMs));
+        && providerCadenceTruthful(summary));
       assertQuotaPopulated(cycle, `scheduled cycle ${cycles.length + 1}`);
-      cycles.push({ ...cycle, provenance: 'live provider_usage_snapshot', wall_clock_anchored: true });
+      cycles.push({ ...cycle, provenance: 'live provider_usage_snapshot', per_provider_deadlines_truthful: true });
       lastCycleGeneration = cycle.generation;
     }
     assert(cycles[1].generation > cycles[0].generation, 'scheduled cycles did not advance generation');

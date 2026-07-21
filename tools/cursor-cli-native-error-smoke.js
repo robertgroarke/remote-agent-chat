@@ -4,7 +4,7 @@
 const assert = require('assert');
 const fs = require('fs');
 const path = require('path');
-const { parseArgs } = require('./cursor-cli-native-error-e2e');
+const { parseArgs } = require('./cursor-cli-native-error-policy');
 
 const ROOT = path.resolve(__dirname, '..');
 const read = relativePath => fs.readFileSync(path.join(ROOT, relativePath), 'utf8');

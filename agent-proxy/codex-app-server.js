@@ -235,10 +235,10 @@ class CodexAppServerConnection extends EventEmitter {
     }
     const before = (await this.getGoal(threadId))?.goal;
     if (!before) fail('goal_not_found', 'The Codex thread has no goal');
-    const beforeStatus = action === 'pause' ? 'active' : 'paused';
+    const beforeStatuses = action === 'pause' ? ['active'] : ['paused', 'blocked'];
     const afterStatus = action === 'pause' ? 'paused' : 'active';
-    if (before.status !== beforeStatus) {
-      fail('native_goal_changed', `The Codex goal is no longer ${beforeStatus}`);
+    if (!beforeStatuses.includes(before.status)) {
+      fail('native_goal_changed', `The Codex goal is no longer ${beforeStatuses.join(' or ')}`);
     }
     if (expected.objective != null && String(before.objective || '') !== String(expected.objective)) {
       fail('native_goal_changed', 'The Codex goal objective changed');

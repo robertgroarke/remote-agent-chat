@@ -1822,12 +1822,20 @@ not change status deduplication, activity state, or transcript reconciliation.
 ### `message_delta`
 
 `message_delta` carries ephemeral in-flight assistant content without waiting for a
-settled transcript row or SQLite write. Producers enable it per harness behind a rollout
-flag; settled semantic `proxy_message` appends remain authoritative, with an identified,
-rate-limited history snapshot used only for mutation/rotation recovery. Codex CLI
-uses `RAC_CODEX_CLI_MESSAGE_DELTA=true`; Claude CLI uses
-`RAC_CLAUDE_CLI_MESSAGE_DELTA=true`; Cursor CLI uses
-`RAC_CURSOR_CLI_MESSAGE_DELTA=true`. All flags default off.
+settled transcript row or SQLite write. Settled semantic `proxy_message` appends remain
+authoritative, with an identified, rate-limited history snapshot used only for
+mutation/rotation recovery. Codex CLI enables deltas by default on both its app-server
+and exec-resume transports; `RAC_CODEX_CLI_MESSAGE_DELTA=false` is the explicit rollback.
+The app-server producer forwards `item/agentMessage/delta` immediately and carries
+reasoning/command output through `proxy_status.activity.current`, so it does not wait for
+`turn/completed`. Claude CLI and Cursor CLI remain opt-in with
+`RAC_CLAUDE_CLI_MESSAGE_DELTA=true` and `RAC_CURSOR_CLI_MESSAGE_DELTA=true`.
+
+Store-backed Codex CLI sends also declare `execution_mode:
+"headless_out_of_process"` on live activity and advertise the same contract in agent
+config. This is a presentation guarantee: Remote Agent Chat owns a background app-server
+or exec-resume worker, while a separately open interactive Codex TUI may remain idle. It
+does not authorize TUI injection, attachment, or scraping.
 
 ```json
 {

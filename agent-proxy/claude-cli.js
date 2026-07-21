@@ -22,6 +22,7 @@ function envMb(name, fallback, min = 1) {
 
 const JSONL_MAX_LINE_BYTES = envMb('CLAUDE_CLI_MAX_JSONL_LINE_MB', 8);
 const DEFAULT_HYDRATE_MAX_BYTES = envMb('CLAUDE_CLI_HYDRATE_MAX_MB', 75);
+const CLAUDE_TOOL_RESULT_MAX_CHARS = 70_000;
 const DEFAULT_HYDRATE_TAIL_BYTES = envMb('CLAUDE_CLI_HYDRATE_TAIL_MB', 4);
 
 const CLAUDE_CLI_MODELS = [
@@ -234,6 +235,13 @@ function toolResultBody(part, entry) {
   return sections.join('\n\n');
 }
 
+function boundedClaudeToolResultBody(part, entry) {
+  const body = toolResultBody(part, entry);
+  if (body.length <= CLAUDE_TOOL_RESULT_MAX_CHARS) return body;
+  const omitted = body.length - CLAUDE_TOOL_RESULT_MAX_CHARS;
+  return `${body.slice(0, CLAUDE_TOOL_RESULT_MAX_CHARS)}\n\n...[truncated ${omitted} characters from Claude tool result]`;
+}
+
 function buildClaudeToolBlock(part, entry, resultRecord) {
   const name = String(part?.name || 'Tool');
   const input = part?.input && typeof part.input === 'object' ? part.input : {};
@@ -304,6 +312,18 @@ function buildClaudeToolBlock(part, entry, resultRecord) {
       stdout,
       stderr,
       interrupted: structured.interrupted === true,
+      status,
+      call_id: callId,
+      tool_name: name,
+      collapsed: false,
+    };
+  }
+
+  if (resultRecord) {
+    return {
+      type: 'tool_result',
+      title: `${failed ? 'Tool error' : 'Tool result'}: ${name}`,
+      content: boundedClaudeToolResultBody(resultPart, resultEntry),
       status,
       call_id: callId,
       tool_name: name,
@@ -712,7 +732,8 @@ function applyClaudeEntryToState(state, entry) {
         applyClaudeTaskResult(state, toolUse, part, entry);
         continue;
       }
-      if (!/^(bash|shell|powershell)$/i.test(toolName)) {
+      const preserveStandaloneResult = !toolUse || toolName === 'TodoWrite' || toolName === 'AskUserQuestion';
+      if (!/^(bash|shell|powershell)$/i.test(toolName) && preserveStandaloneResult) {
         const content = toolResultBody(part, entry);
         resultRecord.messageIndex = state.messages.length;
         state.messages.push({

@@ -25,9 +25,9 @@ closed until the repair is understood and captured.
 - Continuous: the hidden App Update Drift Sentinel watches stable install parents and polls the full
   inventory every 60 seconds.
 - Nightly: the existing validation task runs every tier-1 entry point in read-only mode.
-- Weekly: an external hidden scheduler may invoke `tools/harness-revalidation-weekly.js` once
-  daily. The runner executes only rows whose staggered weekly due timestamp has elapsed, so missed
-  invocations recover without a burst.
+- Weekly: `Remote Agent Chat Harness Revalidation Weekly` invokes
+  `tools/harness-revalidation-weekly.js` daily at 03:15. The runner executes only rows whose
+  staggered weekly due timestamp has elapsed, so missed logons recover without a burst.
 - Update-triggered: after fixture coverage and tier-1 pass for a changed version, tier-2 runs
   immediately when `RAC_TIER2_OWNED_TARGETS_JSON` contains an owned disposable target. Without one,
   the row records a truthful gate and changed-version write controls remain closed.
@@ -50,8 +50,8 @@ protected or ordinary user session must never appear in this mapping. Commands l
 
 ## Repair loop
 
-Each drift failure writes the failing stage, fixture diff, and this playbook to the validation
-ledger exposed by the health view:
+Each drift failure writes the failing stage, fixture diff, and this playbook to the ledger and the
+maturity backlog:
 
 1. Probe an owned disposable surface without focusing a protected session.
 2. Record the expected versus observed selector, store, or event contract.

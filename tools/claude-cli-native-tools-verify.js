@@ -114,7 +114,7 @@ function main(argv = process.argv.slice(2)) {
     { id: '1', step: 'Read fixture', status: 'completed' },
     { id: '2', step: 'Report token', status: 'completed' },
   ]);
-  assert.equal(blocks.filter(block => block.type === 'tool_call' && block.tool_name === 'Read').length, 1);
+  assert.equal(blocks.filter(block => block.type === 'tool_call' && block.tool_name === 'Read').length, 0);
   assert.equal(blocks.filter(block => block.type === 'tool_result' && block.tool_name === 'Read').length, 1);
   assert.equal(blocks.filter(block => /^(?:TaskCreate|TaskGet|TaskUpdate|TaskList)$/.test(block.tool_name || '')
     && (block.type === 'tool_call' || block.type === 'tool_result')).length, 0,

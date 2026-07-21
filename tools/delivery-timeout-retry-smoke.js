@@ -9,7 +9,10 @@ const frontendHook = read('frontend/hooks.jsx');
 const frontendApp = read('frontend/app.jsx');
 const frontendStyles = read('frontend/styles.css');
 const androidChat = read('android-app/screens/ChatScreen.jsx');
-const builtBundle = read('frontend/dist/bundle.js');
+// esbuild's lineLimit may split long string literals with a JavaScript line
+// continuation. Normalize only that serialization detail before asserting the
+// runtime-visible copy.
+const builtBundle = read('frontend/dist/bundle.js').replace(/\\\r?\n/g, '');
 
 const checks = [];
 function assert(condition, label) {

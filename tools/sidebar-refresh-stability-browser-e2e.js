@@ -16,6 +16,7 @@ const SESSION_COUNT = 69;
 const MARKER_SESSION_ID = 'sidebar-session-004';
 const SELECTED_SESSION_ID = 'sidebar-session-034';
 const PINNED_SESSION_IDS = ['sidebar-session-010', 'sidebar-session-002', 'sidebar-session-018'];
+const RECENT_SCROLL_STATIC_PIN_IDS = [...PINNED_SESSION_IDS, 'sidebar-session-015'];
 const READABILITY_TITLES = [
   'goal Restore harness controls',
   'Investigate missing UI goal',
@@ -231,12 +232,185 @@ async function captureRecentOwnership(page) {
       )).map(card => card.dataset.sessionId),
       sidebarCls: (window.__RAC_RECENT_STABILITY__?.shifts || []).reduce((sum, entry) => sum + entry.value, 0),
       mutationMoves: window.__RAC_RECENT_STABILITY__?.moves || 0,
+      programmaticCorrections: window.__RAC_RECENT_STABILITY__?.corrections?.length || 0,
+      frameMinScroll: window.__RAC_RECENT_STABILITY__?.frameMinScroll ?? (list?.scrollTop || 0),
+      frameMaxScroll: window.__RAC_RECENT_STABILITY__?.frameMaxScroll ?? (list?.scrollTop || 0),
+      sampledFrames: window.__RAC_RECENT_STABILITY__?.sampledFrames || 0,
       scrollSamples: (window.__RAC_RECENT_STABILITY__?.scrollSamples || []).slice(-20),
       mutationSamples: (window.__RAC_RECENT_STABILITY__?.mutationSamples || []).slice(-20),
       visibleSectionOrder: [...document.querySelectorAll('.session-list > .session-group')]
         .filter(group => getComputedStyle(group).display !== 'none')
         .map(group => group.getAttribute('aria-label') || group.querySelector('.session-group-name')?.textContent?.trim() || ''),
     };
+  });
+}
+
+async function startSidebarScrollTrace(page, anchorSessionId) {
+  await page.evaluate(anchorId => {
+    const list = document.querySelector('.session-list');
+    assertTrace(list, 'sidebar list is unavailable');
+    const patch = window.__RAC_SIDEBAR_SCROLL_TRACE_PATCH__ || {};
+    const state = {
+      active: true,
+      anchorId,
+      events: [],
+      programmaticWrites: 0,
+      hostMovesToPool: 0,
+      hostMovesToSlots: 0,
+      nativeScrollEvents: 0,
+      frameCount: 0,
+    };
+    const snapshot = (phase, detail = null) => {
+      if (!state.active || state.events.length >= 2_000) return;
+      const anchor = document.querySelector(`.session-card[data-session-id="${CSS.escape(anchorId)}"]`);
+      const scrollTop = list.scrollTop;
+      const maxScroll = Math.max(0, list.scrollHeight - list.clientHeight);
+      state.events.push({
+        index: state.events.length,
+        at: Number(performance.now().toFixed(3)),
+        phase,
+        scroll_top: Number(scrollTop.toFixed(3)),
+        scroll_height: list.scrollHeight,
+        client_height: list.clientHeight,
+        max_scroll: maxScroll,
+        at_max_scroll: maxScroll > 0 && Math.abs(scrollTop - maxScroll) <= 0.5,
+        anchor_top: anchor ? Number(anchor.getBoundingClientRect().top.toFixed(3)) : null,
+        focused_session: document.activeElement?.closest?.('[data-session-id]')?.dataset?.sessionId || null,
+        detail,
+      });
+    };
+    function assertTrace(value, message) {
+      if (!value) throw new Error(message);
+      return value;
+    }
+    if (!patch.installed) {
+      patch.installed = true;
+      patch.originalAppendChild = Node.prototype.appendChild;
+      patch.appendChild = function appendChild(node) {
+        const activeState = patch.state;
+        const isHost = activeState?.active
+          && node instanceof Element
+          && node.matches('[data-sidebar-card-host]');
+        if (!isHost) return patch.originalAppendChild.call(this, node);
+        const destination = this instanceof Element && this.matches('[data-sidebar-card-pool]')
+          ? 'pool'
+          : (this instanceof Element && this.matches('[data-sidebar-card-slot]') ? 'slot' : 'other');
+        patch.snapshot('append_host_before', {
+          destination,
+          session_id: node.getAttribute('data-sidebar-card-host'),
+        });
+        const result = patch.originalAppendChild.call(this, node);
+        if (destination === 'pool') activeState.hostMovesToPool += 1;
+        if (destination === 'slot') activeState.hostMovesToSlots += 1;
+        patch.snapshot('append_host_after', {
+          destination,
+          session_id: node.getAttribute('data-sidebar-card-host'),
+        });
+        return result;
+      };
+      Node.prototype.appendChild = patch.appendChild;
+
+      let descriptorOwner = Element.prototype;
+      let descriptor = null;
+      while (descriptorOwner && !descriptor) {
+        descriptor = Object.getOwnPropertyDescriptor(descriptorOwner, 'scrollTop');
+        if (!descriptor) descriptorOwner = Object.getPrototypeOf(descriptorOwner);
+      }
+      if (descriptor?.get && descriptor?.set && descriptor.configurable) {
+        patch.scrollTopOwner = descriptorOwner;
+        patch.scrollTopDescriptor = descriptor;
+        Object.defineProperty(descriptorOwner, 'scrollTop', {
+          ...descriptor,
+          get() { return descriptor.get.call(this); },
+          set(value) {
+            const activeState = patch.state;
+            const activeList = document.querySelector('.session-list');
+            if (activeState?.active && this === activeList) {
+              activeState.programmaticWrites += 1;
+              patch.snapshot('scroll_write_before', { requested: Number(value) });
+              descriptor.set.call(this, value);
+              patch.snapshot('scroll_write_after', { requested: Number(value) });
+              return;
+            }
+            descriptor.set.call(this, value);
+          },
+        });
+      }
+    }
+    patch.state = state;
+    patch.snapshot = snapshot;
+    state.onScroll = () => {
+      state.nativeScrollEvents += 1;
+      snapshot('native_scroll');
+    };
+    list.addEventListener('scroll', state.onScroll, { passive: true });
+    state.observer = new MutationObserver(() => snapshot('mutation_microtask'));
+    state.observer.observe(list, { childList: true, subtree: true, attributes: true });
+    const frame = () => {
+      if (!state.active) return;
+      state.frameCount += 1;
+      snapshot('animation_frame');
+      state.frameRequest = requestAnimationFrame(frame);
+    };
+    state.frameRequest = requestAnimationFrame(frame);
+    window.__RAC_SIDEBAR_SCROLL_TRACE_PATCH__ = patch;
+    snapshot('before_mutation');
+    queueMicrotask(() => snapshot('before_mutation_microtask'));
+  }, anchorSessionId);
+}
+
+async function stopSidebarScrollTrace(page) {
+  return page.evaluate(async () => {
+    await Promise.resolve();
+    const patch = window.__RAC_SIDEBAR_SCROLL_TRACE_PATCH__;
+    const state = patch?.state;
+    if (!state) return null;
+    await new Promise(resolve => requestAnimationFrame(() => requestAnimationFrame(resolve)));
+    patch.snapshot('after_two_animation_frames');
+    state.active = false;
+    cancelAnimationFrame(state.frameRequest);
+    document.querySelector('.session-list')?.removeEventListener('scroll', state.onScroll);
+    state.observer?.disconnect();
+    Node.prototype.appendChild = patch.originalAppendChild;
+    if (patch.scrollTopOwner && patch.scrollTopDescriptor) {
+      Object.defineProperty(patch.scrollTopOwner, 'scrollTop', patch.scrollTopDescriptor);
+    }
+    const baseline = state.events[0];
+    const changedEvents = state.events.filter((event, index, events) => {
+      if (index === 0 || index === events.length - 1) return true;
+      const previous = events[index - 1];
+      return event.phase !== 'animation_frame'
+        || event.scroll_top !== previous.scroll_top
+        || event.scroll_height !== previous.scroll_height
+        || event.anchor_top !== previous.anchor_top;
+    });
+    const scrollValues = state.events.map(event => event.scroll_top);
+    const anchorDrifts = state.events
+      .filter(event => event.anchor_top != null && baseline?.anchor_top != null)
+      .map(event => Math.abs(event.anchor_top - baseline.anchor_top));
+    const frameEvents = state.events.filter(event => (
+      event.phase === 'animation_frame' || event.phase === 'after_two_animation_frames'
+    ));
+    const frameAnchorDrifts = frameEvents
+      .filter(event => event.anchor_top != null && baseline?.anchor_top != null)
+      .map(event => Math.abs(event.anchor_top - baseline.anchor_top));
+    const result = {
+      baseline,
+      programmatic_writes: state.programmaticWrites,
+      host_moves_to_pool: state.hostMovesToPool,
+      host_moves_to_slots: state.hostMovesToSlots,
+      native_scroll_events: state.nativeScrollEvents,
+      sampled_frames: state.frameCount,
+      min_scroll_top: Math.min(...scrollValues),
+      max_scroll_top: Math.max(...scrollValues),
+      max_anchor_drift_px: Number(Math.max(0, ...anchorDrifts).toFixed(3)),
+      max_frame_anchor_drift_px: Number(Math.max(0, ...frameAnchorDrifts).toFixed(3)),
+      touched_max_scroll: state.events.some(event => event.at_max_scroll && !baseline?.at_max_scroll),
+      frame_touched_max_scroll: frameEvents.some(event => event.at_max_scroll && !baseline?.at_max_scroll),
+      events: changedEvents.slice(0, 500),
+    };
+    delete window.__RAC_SIDEBAR_SCROLL_TRACE_PATCH__;
+    return result;
   });
 }
 
@@ -507,9 +681,15 @@ function writeHalfBlendOverlay(beforePath, afterPath, outputPath) {
 async function runRecentChatsMode({
   page, context, proxy, sessions, port, seedMessages, transcriptRequests,
   viewportText, colorScheme, zoomPercent, framesDir, pinsMode,
+  scrollDepthPercent, focusStructuralAnchor,
 }) {
   const expectedSeedRecent = [19, 18, 17, 16, 15]
     .map(index => `sidebar-session-${String(index).padStart(3, '0')}`);
+  const waitForStableWorking = () => page.waitForFunction(expectedIds => {
+    const rendered = [...document.querySelectorAll('.working-session-group .session-card[data-session-id]')]
+      .map(card => card.dataset.sessionId);
+    return expectedIds.every(id => rendered.includes(id));
+  }, ['sidebar-session-000', 'sidebar-session-001'], { timeout: 2_000 });
   await page.waitForFunction(expected => {
     const ids = [...document.querySelectorAll('.recent-session-group .session-card[data-session-id]')]
       .map(card => card.dataset.sessionId);
@@ -617,6 +797,8 @@ async function runRecentChatsMode({
       moves: 0,
       scrollSamples: [],
       mutationSamples: [],
+      corrections: [],
+      sampledFrames: 0,
     };
     const shiftObserver = new PerformanceObserver(list => {
       for (const entry of list.getEntries()) {
@@ -652,10 +834,131 @@ async function runRecentChatsMode({
       focusedSession: document.activeElement?.closest?.('[data-session-id]')?.dataset?.sessionId || null,
     });
     list.addEventListener('scroll', recordScroll, { passive: true });
+    list.addEventListener('rac-sidebar-scroll-correction', event => {
+      state.corrections.push({ at: performance.now(), ...event.detail });
+    });
+    state.frameBaselineScroll = list.scrollTop;
+    state.frameMinScroll = list.scrollTop;
+    state.frameMaxScroll = list.scrollTop;
+    const sampleFrame = () => {
+      state.sampledFrames += 1;
+      state.frameMinScroll = Math.min(state.frameMinScroll, list.scrollTop);
+      state.frameMaxScroll = Math.max(state.frameMaxScroll, list.scrollTop);
+      state.frameRequest = requestAnimationFrame(sampleFrame);
+    };
+    state.frameRequest = requestAnimationFrame(sampleFrame);
     state.shiftObserver = shiftObserver;
     state.moveObserver = moveObserver;
     window.__RAC_RECENT_STABILITY__ = state;
   });
+
+  let staticPartitionScroll = null;
+  if (pinsMode) {
+    const enteringRecentId = 'sidebar-session-010';
+    const leavingRecentId = 'sidebar-session-015';
+    const anchorSessionId = await page.evaluate(({ depthPercent, focusAnchor, excludedIds }) => {
+      const list = document.querySelector('.session-list');
+      const maxScroll = Math.max(0, list.scrollHeight - list.clientHeight);
+      list.scrollTop = Math.round(maxScroll * depthPercent / 100);
+      const listRect = list.getBoundingClientRect();
+      const candidates = [...document.querySelectorAll(
+        '.session-group:not(.working-session-group):not(.recent-session-group):not(.pinned-session-group) .session-card[data-session-id]',
+      )].filter(card => {
+        const rect = card.getBoundingClientRect();
+        return !excludedIds.includes(card.dataset.sessionId)
+          && rect.bottom > listRect.top && rect.top < listRect.bottom;
+      });
+      const anchor = candidates.sort((left, right) => (
+        Math.abs(left.getBoundingClientRect().top + left.getBoundingClientRect().height / 2
+          - (listRect.top + listRect.height / 2))
+        - Math.abs(right.getBoundingClientRect().top + right.getBoundingClientRect().height / 2
+          - (listRect.top + listRect.height / 2))
+      ))[0];
+      if (!anchor) throw new Error(`no stable workspace anchor at ${depthPercent}% depth`);
+      if (focusAnchor) anchor.querySelector('.session-card-manage')?.focus({ preventScroll: true });
+      else if (document.activeElement instanceof HTMLElement) document.activeElement.blur();
+      return anchor.dataset.sessionId;
+    }, {
+      depthPercent: scrollDepthPercent,
+      focusAnchor: focusStructuralAnchor,
+      excludedIds: [enteringRecentId, leavingRecentId],
+    });
+    await page.waitForTimeout(250);
+    await startSidebarScrollTrace(page, anchorSessionId);
+    const beforePartition = await page.evaluate(anchorId => {
+      const list = document.querySelector('.session-list');
+      const anchor = document.querySelector(`.session-card[data-session-id="${anchorId}"]`);
+      return {
+        anchor_top: anchor?.getBoundingClientRect().top || null,
+        scroll_top: list?.scrollTop || 0,
+        focused_session: document.activeElement?.closest?.('[data-session-id]')?.dataset?.sessionId || null,
+        working_ids: [...document.querySelectorAll('.working-session-group .session-card[data-session-id]')]
+          .map(card => card.dataset.sessionId),
+        workspace_ids: [...document.querySelectorAll('.session-group:not(.working-session-group):not(.recent-session-group):not(.pinned-session-group) .session-card[data-session-id]')]
+          .map(card => card.dataset.sessionId).sort(),
+      };
+    }, anchorSessionId);
+    const partitionAt = new Date().toISOString();
+    sendVisibleFixtureMessage(proxy, enteringRecentId, 10, partitionAt, 'recent-static-partition');
+    await page.waitForFunction(({ entering, leaving }) => (
+      document.querySelector('.recent-session-group .session-card[data-session-id]')?.dataset.sessionId === entering
+      && !!document.querySelector(`.pinned-session-group .session-card[data-session-id="${leaving}"]`)
+    ), { entering: enteringRecentId, leaving: leavingRecentId }, { timeout: 2_000 });
+    await page.evaluate(() => new Promise(resolve => requestAnimationFrame(() => requestAnimationFrame(resolve))));
+    const frameTrace = await stopSidebarScrollTrace(page);
+    const afterPartition = await page.evaluate(anchorId => {
+      const list = document.querySelector('.session-list');
+      const anchor = document.querySelector(`.session-card[data-session-id="${anchorId}"]`);
+      return {
+        anchor_top: anchor?.getBoundingClientRect().top || null,
+        scroll_top: list?.scrollTop || 0,
+        focused_session: document.activeElement?.closest?.('[data-session-id]')?.dataset?.sessionId || null,
+        working_ids: [...document.querySelectorAll('.working-session-group .session-card[data-session-id]')]
+          .map(card => card.dataset.sessionId),
+        workspace_ids: [...document.querySelectorAll('.session-group:not(.working-session-group):not(.recent-session-group):not(.pinned-session-group) .session-card[data-session-id]')]
+          .map(card => card.dataset.sessionId).sort(),
+      };
+    }, anchorSessionId);
+    staticPartitionScroll = {
+      entering_recent: enteringRecentId,
+      leaving_recent_for_pinned: leavingRecentId,
+      starting_depth_percent: scrollDepthPercent,
+      focused_anchor: focusStructuralAnchor,
+      anchor_session_id: anchorSessionId,
+      working_membership_static: JSON.stringify(beforePartition.working_ids) === JSON.stringify(afterPartition.working_ids),
+      workspace_membership_static: JSON.stringify(beforePartition.workspace_ids) === JSON.stringify(afterPartition.workspace_ids),
+      anchor_drift_px: Number(Math.abs(afterPartition.anchor_top - beforePartition.anchor_top).toFixed(3)),
+      scroll_top_before: beforePartition.scroll_top,
+      scroll_top_after: afterPartition.scroll_top,
+      focused_session_before: beforePartition.focused_session,
+      focused_session_after: afterPartition.focused_session,
+      frame_trace: frameTrace,
+    };
+    assert.strictEqual(staticPartitionScroll.working_membership_static, true);
+    assert.strictEqual(staticPartitionScroll.workspace_membership_static, true);
+    assert(beforePartition.scroll_top > 100, 'static partition fixture did not scroll below the fold');
+    assert(staticPartitionScroll.anchor_drift_px <= 2,
+      `static Recent/Pinned partition moved the visible anchor: ${JSON.stringify(staticPartitionScroll)}`);
+    assert(staticPartitionScroll.frame_trace.max_frame_anchor_drift_px <= 1,
+      `static partition painted an anchor jump: ${JSON.stringify(staticPartitionScroll.frame_trace)}`);
+    assert.strictEqual(staticPartitionScroll.frame_trace.frame_touched_max_scroll, false);
+    assert(staticPartitionScroll.frame_trace.programmatic_writes <= 1);
+    assert(staticPartitionScroll.frame_trace.host_moves_to_pool < sessions.length,
+      'structural edge evacuated the complete sidebar card pool');
+    assert.strictEqual(afterPartition.focused_session, focusStructuralAnchor ? anchorSessionId : null);
+    await page.evaluate(() => {
+      window.__RAC_RECENT_STABILITY__.shifts = [];
+      window.__RAC_RECENT_STABILITY__.moves = 0;
+      window.__RAC_RECENT_STABILITY__.mutationSamples = [];
+      window.__RAC_RECENT_STABILITY__.scrollSamples = [];
+      window.__RAC_RECENT_STABILITY__.corrections = [];
+      const list = document.querySelector('.session-list');
+      window.__RAC_RECENT_STABILITY__.frameBaselineScroll = list.scrollTop;
+      window.__RAC_RECENT_STABILITY__.frameMinScroll = list.scrollTop;
+      window.__RAC_RECENT_STABILITY__.frameMaxScroll = list.scrollTop;
+      window.__RAC_RECENT_STABILITY__.sampledFrames = 0;
+    });
+  }
 
   const stormBefore = await captureRecentOwnership(page);
   const transcriptRequestsBeforeStorm = transcriptRequests.length;
@@ -673,7 +976,7 @@ async function runRecentChatsMode({
   let activityFrames = 0;
   let clientReconnects = 0;
   const refreshStableWorking = () => {
-    for (let workingIndex = 0; workingIndex < 3; workingIndex += 1) {
+    for (let workingIndex = 0; workingIndex < 2; workingIndex += 1) {
       sendStatus(proxy, `sidebar-session-${String(workingIndex).padStart(3, '0')}`, {
         label: `Stable work ${workingIndex + 1}`,
         updatedAt: new Date(Date.now() - workingIndex).toISOString(),
@@ -743,6 +1046,9 @@ async function runRecentChatsMode({
   assert.strictEqual(stormAfter.focusedSession, stormBefore.focusedSession);
   assert.strictEqual(stormAfter.activeSession, stormBefore.activeSession);
   assert.strictEqual(stormAfter.mutationMoves, 0);
+  assert.strictEqual(stormAfter.programmaticCorrections, 0);
+  assert.strictEqual(stormAfter.frameMinScroll, stormBefore.scrollTop);
+  assert.strictEqual(stormAfter.frameMaxScroll, stormBefore.scrollTop);
   assert.strictEqual(transcriptRequests.length - transcriptRequestsBeforeStorm, 0);
 
   await page.evaluate(() => {
@@ -753,6 +1059,7 @@ async function runRecentChatsMode({
   const messageEventBase = Date.now();
   for (let index = 0; index < 10; index += 1) {
     refreshStableWorking();
+    await waitForStableWorking();
     const target = `sidebar-session-${String(20 + index).padStart(3, '0')}`;
     if (index === 0) {
       await page.locator(`.session-card[data-session-id="${target}"]`).scrollIntoViewIfNeeded();
@@ -789,6 +1096,7 @@ async function runRecentChatsMode({
     .map(index => `sidebar-session-${String(index).padStart(3, '0')}`);
   for (const target of workingTargets) {
     refreshStableWorking();
+    await waitForStableWorking();
     const beforeStart = await captureRecentOwnership(page);
     const startSentAt = Date.now();
     sendStatus(proxy, target, {
@@ -872,12 +1180,17 @@ async function runRecentChatsMode({
       ten_hz_bursts: burstStarts.length,
       duplicate_stable_id_replays: duplicateReplays,
       activity_frames: activityFrames,
-      client_reconnects: clientReconnects,
+    client_reconnects: clientReconnects,
+    static_partition_scroll: staticPartitionScroll,
       row_moves: 0,
       group_moves: 0,
       remounts: stormAfter.remountedSessionIds.length,
       sidebar_cls: stormAfter.sidebarCls,
       scroll_drift_px: Math.abs(stormAfter.scrollTop - stormBefore.scrollTop),
+      programmatic_scroll_corrections: stormAfter.programmaticCorrections,
+      sampled_frames: stormAfter.sampledFrames,
+      minimum_sampled_scroll_top: stormAfter.frameMinScroll,
+      maximum_sampled_scroll_top: stormAfter.frameMaxScroll,
       transcript_fetch_fan_out: transcriptRequests.length - transcriptRequestsBeforeStorm,
       node_identity_stable: stormAfter.nodeIdentityStable,
       keyboard_focus_stable: stormAfter.focusedSession === stormBefore.focusedSession,
@@ -940,6 +1253,10 @@ async function main() {
   const disclosureOnly = process.argv.includes('--disclosure-only');
   const pinsMode = process.argv.includes('--pins');
   const recentMode = process.argv.includes('--recent-chats');
+  const scrollDepthIndex = process.argv.indexOf('--scroll-depth');
+  const scrollDepthPercent = scrollDepthIndex === -1 ? 75 : Number(process.argv[scrollDepthIndex + 1]);
+  assert([25, 50, 75, 95].includes(scrollDepthPercent), '--scroll-depth must be 25, 50, 75, or 95');
+  const focusStructuralAnchor = !process.argv.includes('--unfocused');
   const fixtureSessionCount = recentMode ? 79 : SESSION_COUNT;
   const framesIndex = process.argv.indexOf('--frames-dir');
   const framesDir = framesIndex === -1 ? null : path.resolve(process.argv[framesIndex + 1]);
@@ -979,11 +1296,12 @@ async function main() {
     const sessions = fixtureSessions(fixtureSessionCount);
     proxy.send(JSON.stringify({ type: 'session_list', protocol_version: 1, proxy_id: 'sidebar-stability-e2e', sessions }));
     if (pinsMode) {
-      for (const sessionId of PINNED_SESSION_IDS) {
+      const pinnedFixtureIds = recentMode ? RECENT_SCROLL_STATIC_PIN_IDS : PINNED_SESSION_IDS;
+      for (const sessionId of pinnedFixtureIds) {
         seededPinPreferences.push(await putSessionPreference(port, sessionId, { pinned: true }));
       }
     }
-    for (let index = 0; index < (recentMode ? 3 : 5); index += 1) {
+    for (let index = 0; index < (recentMode ? 2 : 5); index += 1) {
       const updatedAt = new Date((recentMode ? Date.now() : Date.parse('2026-07-13T12:30:00Z')) - index * 1_000).toISOString();
       sendStatus(proxy, `sidebar-session-${String(index).padStart(3, '0')}`, {
         label: `Initial work ${index + 1}`, updatedAt,
@@ -1051,6 +1369,7 @@ async function main() {
       proxy = await runRecentChatsMode({
         page, context, proxy, sessions, port, seedMessages, transcriptRequests,
         viewportText, colorScheme, zoomPercent, framesDir, pinsMode,
+        scrollDepthPercent, focusStructuralAnchor,
       });
       return;
     }
@@ -1578,9 +1897,9 @@ async function main() {
       await cdp.send('Input.dispatchTouchEvent', {
         type: 'touchStart', touchPoints: [{ ...touchPoint, radiusX: 4, radiusY: 4, force: 1 }],
       });
-      sendStatus(proxy, SELECTED_SESSION_ID, {
-        label: 'Touch-held refresh marker', updatedAt: '2026-07-13T15:00:30Z',
-      });
+      proxy.send(JSON.stringify({
+        type: 'session_list', protocol_version: 1, proxy_id: 'sidebar-stability-e2e', sessions: currentSessions,
+      }));
       await page.waitForTimeout(150);
       const touchSessionAfter = await page.evaluate(({ x, y }) => (
         document.elementFromPoint(x, y)?.closest?.('[data-session-id]')?.dataset?.sessionId || null
@@ -1595,9 +1914,9 @@ async function main() {
 
       const momentumBefore = await captureSidebar(page);
       await page.locator('.session-list').evaluate(node => node.scrollBy({ top: 240, behavior: 'smooth' }));
-      sendStatus(proxy, 'sidebar-session-003', {
-        label: 'Momentum refresh marker', updatedAt: '2026-07-13T15:00:31Z',
-      });
+      proxy.send(JSON.stringify({
+        type: 'session_list', protocol_version: 1, proxy_id: 'sidebar-stability-e2e', sessions: currentSessions,
+      }));
       await page.waitForTimeout(650);
       const momentumAfter = await captureSidebar(page);
       momentumRefreshStable = JSON.stringify(momentumBefore.order) === JSON.stringify(momentumAfter.order)

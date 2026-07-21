@@ -183,10 +183,12 @@ export class RelayClient {
       session_id: sessionId,
       request_id: requestId,
       mode,
-      source: 'relay_sqlite',
+      source: options.source || 'relay_sqlite',
       replace: mode === 'around' || (mode === 'tail' && options.replace === true),
       limit: Math.max(1, Math.min(500, Number(options.limit) || 200)),
     };
+    if (options.userInitiated === true) message.user_initiated = true;
+    if (Number(options.chunkBytes) > 0) message.chunk_bytes = Number(options.chunkBytes);
     if (mode === 'older' && options.beforeId != null) message.before_id = options.beforeId;
     if (mode === 'around' && options.aroundId != null) message.around_id = options.aroundId;
     this._send(message);
@@ -232,7 +234,8 @@ export class RelayClient {
   }
 
   controlGoal(sessionId, action, goal, options = {}) {
-    const requestId = `goal-${action}-${Date.now()}-${Math.random().toString(36).slice(2, 7)}`;
+    const requestId = String(options.requestId || '').trim()
+      || `goal-${action}-${Date.now()}-${Math.random().toString(36).slice(2, 7)}`;
     this._send({
       type: 'agent_goal_control',
       session_id: sessionId,

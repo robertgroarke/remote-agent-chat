@@ -56,6 +56,55 @@ function writeFixture(events) {
   const fixture = writeFixture([
     { type: 'system', subtype: 'init', cwd: 'c:\\temp\\cursor-test', model: 'Cursor Grok 4.5 Medium Fast', permissionMode: 'default' },
     { type: 'user', message: { role: 'user', content: [{ type: 'text', text: 'Run echo hello and summarize' }] } },
+    { type: 'connection', subtype: 'reconnecting', attempt: 1 },
+    { type: 'retry', subtype: 'starting', attempt: 1, is_resume: false },
+    { type: 'connection', subtype: 'reconnected' },
+    {
+      type: 'interaction_query',
+      subtype: 'request',
+      query_type: 'webSearchRequestQuery',
+      query: {
+        id: 7,
+        webSearchRequestQuery: { args: { searchTerm: 'Cursor protocol docs', toolCallId: 'web-search-7' } },
+      },
+    },
+    {
+      type: 'interaction_query',
+      subtype: 'response',
+      query_type: 'webSearchRequestQuery',
+      response: { id: 7, webSearchRequestResponse: { approved: {} } },
+    },
+    {
+      type: 'interaction_query',
+      subtype: 'request',
+      query_type: 'webFetchRequestQuery',
+      query: {
+        id: 8,
+        webFetchRequestQuery: { args: { url: 'https://example.invalid/docs', toolCallId: 'web-fetch-8' }, skipApproval: false },
+      },
+    },
+    {
+      type: 'interaction_query',
+      subtype: 'response',
+      query_type: 'webFetchRequestQuery',
+      response: { id: 8, webFetchRequestResponse: { approved: {} } },
+    },
+    {
+      type: 'system',
+      subtype: 'task_notification',
+      task_id: 'background-task-1',
+      status: 'success',
+      title: 'Background task completed',
+      detail: 'The background task returned its result.',
+    },
+    {
+      type: 'system',
+      subtype: 'task_notification',
+      task_id: 'background-task-2',
+      status: 'error',
+      title: 'Background task failed',
+      detail: 'The background task reported an error.',
+    },
     { type: 'thinking', subtype: 'delta', text: 'I will run echo.' },
     { type: 'thinking', subtype: 'completed' },
     {
@@ -132,6 +181,22 @@ function writeFixture(events) {
   assert(/fixture file content/.test(genericResult.content), 'generic result missing output');
   assert(genericResult.status === 'completed', 'generic result status mismatch');
   assert(genericCall.collapsed === false && genericResult.collapsed === false, 'generic blocks must expand by default');
+  const fixtureBlocks = fixture.summary.messages.flatMap((m) => m.content_blocks || []);
+  const approvalBlock = fixtureBlocks.find((b) => b.type === 'prompt' && b.title === 'Web search approval');
+  assert(approvalBlock, 'missing interaction-query prompt block');
+  assert(approvalBlock.status === 'approved', 'interaction-query response status mismatch');
+  assert(/Cursor protocol docs/.test(approvalBlock.content), 'interaction-query prompt lost its native search term');
+  const fetchApprovalBlock = fixtureBlocks.find((b) => b.type === 'prompt' && b.title === 'Web fetch approval');
+  assert(fetchApprovalBlock, 'missing web-fetch interaction-query prompt block');
+  assert(/example\.invalid/.test(fetchApprovalBlock.content), 'web-fetch prompt lost its native URL');
+  assert(fixtureBlocks.some((b) => b.type === 'notice' && b.title === 'Reconnecting'),
+    'missing reconnect lifecycle notice');
+  assert(fixtureBlocks.some((b) => b.type === 'notice' && b.title === 'Retrying'),
+    'missing retry lifecycle notice');
+  assert(fixtureBlocks.some((b) => b.type === 'notice' && b.title === 'Background task completed'),
+    'missing successful task notification');
+  assert(fixtureBlocks.some((b) => b.type === 'error' && b.title === 'Background task failed'),
+    'missing failed task notification');
   const collapsibleBlocks = fixture.summary.messages
     .flatMap((m) => m.content_blocks || [])
     .filter((b) => b.type === 'thinking' || b.type === 'terminal' || b.type === 'tool_call' || b.type === 'tool_result' || b.type === 'file_changes');

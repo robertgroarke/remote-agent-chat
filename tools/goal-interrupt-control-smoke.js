@@ -31,9 +31,17 @@ async function appServerRoundTrip() {
   assert.equal(paused.before.status, 'active');
   assert.equal(paused.after.status, 'paused');
   assert.equal(resumed.after.status, 'active');
+  goal = { ...goal, status: 'blocked' };
+  const resumedBlocked = await connection.controlGoal('thread-1', 'resume', {
+    objective: goal.objective,
+    tokenBudget: goal.tokenBudget,
+  });
+  assert.equal(resumedBlocked.before.status, 'blocked');
+  assert.equal(resumedBlocked.after.status, 'active');
   assert(writes.every(write => write.options.objective === goal.objective && write.options.tokenBudget === 12345));
-  assert.equal(writes.length, 2);
-  assert.equal(paused.transcript_messages_appended + resumed.transcript_messages_appended, 0);
+  assert.equal(writes.length, 3);
+  assert.equal(paused.transcript_messages_appended + resumed.transcript_messages_appended
+    + resumedBlocked.transcript_messages_appended, 0);
   return { writes: writes.length };
 }
 
@@ -145,6 +153,9 @@ function stopCapabilityMatrix() {
   for (const harness of ['codex', 'codex_cli', 'codex-desktop']) {
     assert.equal(build.call(receiver, harness, null).goal_pause_resume, true);
   }
+  assert.equal(build.call(receiver, 'codex_cli', null).goal_blocked_resume, true);
+  assert.equal(build.call(receiver, 'codex', null).goal_blocked_resume, false);
+  assert.equal(build.call(receiver, 'codex-desktop', null).goal_blocked_resume, false);
   assert.equal(build.call(receiver, 'claude', null).goal_pause_resume, false);
   return { supported: supported.length, gated: 2 };
 }

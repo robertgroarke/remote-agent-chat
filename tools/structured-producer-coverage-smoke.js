@@ -59,6 +59,10 @@ assert.strictEqual(inventory.ok, true);
 assert.deepStrictEqual(inventory.canonical_block_types, CANONICAL_BLOCK_TYPES);
 assert.strictEqual(cursorCliTaxonomy.ok, true);
 assert.deepStrictEqual(cursorCliTaxonomy.unknown_event_types, []);
+assert.deepStrictEqual(cursorCliTaxonomy.unknown_event_subtypes, []);
+assert.deepStrictEqual(cursorCliTaxonomy.unknown_interaction_query_types, []);
+assert.deepStrictEqual(cursorCliTaxonomy.unknown_task_notification_statuses, []);
+assert.deepStrictEqual(cursorCliTaxonomy.unknown_interaction_response_dispositions, []);
 assert.strictEqual(queueContract.canonical_type, 'queued_message');
 assert.strictEqual(planContract.canonical_type, 'plan');
 assert.deepStrictEqual(promptContract.canonical_types, ['prompt', 'notice', 'error']);
@@ -127,10 +131,10 @@ const coverage = {
     activation: 'production_live_inventory_verified',
   },
   cursor_cli: {
-    typed: ['markdown', 'thinking', 'tool_call', 'tool_result', 'terminal', 'error'],
+    typed: ['markdown', 'thinking', 'tool_call', 'tool_result', 'terminal', 'prompt', 'notice', 'error'],
     observed_untyped: [],
-    grounded_native_absent: ['file_changes', 'prompt', 'plan', 'queued_message', 'notice', 'status'],
-    inventory_limit: 'The retained 4,512-row native taxonomy has no file-change, permission, plan, queue, notice, or status event; new event types fail closed.',
+    grounded_native_absent: ['file_changes', 'plan', 'queued_message', 'status'],
+    inventory_limit: 'The retained 56,303-row native taxonomy maps approval queries, background-task notifications, reconnects, and retries; no file-change, plan, queue, or status event is present, and new event/subtype/query shapes fail closed.',
     activation: 'production_live_inventory_verified',
   },
   gemini: {
@@ -186,7 +190,7 @@ for (const [agentType, row] of Object.entries(coverage)) {
 
 assert.deepStrictEqual(
   cursorCliTaxonomy.grounded_absent_structured_events,
-  ['file_change', 'permission_prompt', 'plan', 'queue', 'notice', 'status'],
+  ['file_change', 'plan', 'queue', 'status'],
 );
 
 const pendingMappings = Object.entries(coverage)

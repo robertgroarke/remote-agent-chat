@@ -318,7 +318,10 @@ try {
     'Android Fleet and Sidebar must both enforce producer freshness');
   assert.ok(appSource.indexOf('{workingSessions.length > 0') < appSource.indexOf('{pinnedSessions.length > 0'));
   assert.match(appSource, /\.\.\.workingSessions, \.\.\.recentSessions, \.\.\.pinnedSessions, \.\.\.sessionGroups/);
-  assert.match(appSource, /menuOpen: !!card\.querySelector/);
+  assert.match(appSource, /class SidebarScrollCoordinator extends React\.Component/);
+  assert.match(appSource, /menuOpen=\{openSidebarMenuId === id\}/);
+  assert.match(appSource, /prepareStructureChange=\{prepareSidebarStructureChange\}/);
+  assert.match(appSource, /finishStructureChange=\{finishSidebarStructureChange\}/);
   assert.match(androidSource, /const sections = \[workingSection, recentSection, pinnedSection,/);
   assert.match(androidSource, /maintainVisibleContentPosition/);
 

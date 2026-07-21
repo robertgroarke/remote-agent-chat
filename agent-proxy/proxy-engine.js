@@ -41,6 +41,19 @@ const codexCli     = require('./codex-cli');
 const { CodexCliAppServerTurn } = require('./codex-cli-app-server');
 const { CodexAppServerConnection } = require('./codex-app-server');
 const {
+  assertProxyLineageAvailable,
+  buildProxyAppServerOwner,
+  logicalNameForThread,
+} = require('./codex-live-owner');
+const {
+  acquireLineageLease,
+  clearLiveOwner,
+  defaultRegistryPath: defaultCodexOwnerRegistryPath,
+  publishLiveOwner,
+  releaseLineageLease,
+  resolveLineageOwner,
+} = require('../shared/codex-live-owner-registry');
+const {
   codexDesktopCliSessionId,
   codexDesktopArchiveMessages,
   codexDesktopStructuredBlockCounts,
@@ -560,6 +573,7 @@ function resolveCursorWorkspacePath(agent, candidates) {
 
 const CURSOR_WORKING_CONTINUITY_LEASE_MS = 5_000;
 const CURSOR_NATIVE_OBSERVED_SOURCE = 'cursor_native_observed';
+const CLAUDE_EXTENSION_OBSERVED_SOURCE = 'claude_extension_observed';
 
 function cursorNativeActivity(agent, previous = null, options = {}) {
   const signalValues = [
@@ -859,6 +873,11 @@ const RETRIABLE_SEND_CODES = new Set([
   'fallback_no_input',
   // agent_busy is NOT retriable — messages are queued instead (steer feature)
 ]);
+const QUEUE_ON_SEND_CODES = new Set([
+  'agent_busy',
+  'human_composer_active',
+  'composer_not_empty',
+]);
 const SEND_MAX_RETRIES    = 8;
 const SEND_RETRY_DELAY_MS = 3000;
 const CODEX_DESKTOP_HARD_STUCK_COOLDOWN_MS = Math.max(
@@ -1027,6 +1046,7 @@ class ProxyEngine extends EventEmitter {
     this.activeErrorPrompts = new Map();
     this._codexCliAppServerTurnFactory = config.codexCliAppServerTurnFactory
       || (options => new CodexCliAppServerTurn(options));
+    this._codexOwnerRegistryPath = config.codexOwnerRegistryPath || defaultCodexOwnerRegistryPath();
     this._codexCliGoalDecisionConnectionFactory = config.codexCliGoalDecisionConnectionFactory
       || (options => new CodexAppServerConnection(options));
     this._codexCliGoalMonitorConnectionFactory = config.codexCliGoalMonitorConnectionFactory
@@ -1602,6 +1622,9 @@ class ProxyEngine extends EventEmitter {
       // ignore stray goal-shaped fields from every other harness.
       goal_lifecycle:         isCodex || isCodexCli,
       goal_pause_resume:      isCodex || isCodexCli,
+      // Only the store-backed CLI has an owned app-server transition that is
+      // proven to resume a native `blocked` goal without TUI interaction.
+      goal_blocked_resume:    isCodexCli,
       set_model:              ['claude', 'claude_cli', 'codex_cli', 'cursor_cli', 'antigravity', 'antigravity_panel', 'gemini', 'continue', 'continue_yolo', 'cursor'].includes(agentType) || isClineLike,
       // Cursor 3.5 Agents UI has no reliable Ask/Edit/Agent/Composer page-level toggle in CDP probes.
       set_mode:               agentType === 'antigravity' || isClineLike,
@@ -1819,6 +1842,12 @@ class ProxyEngine extends EventEmitter {
       };
     }
     if (agentType === 'codex_cli') {
+      codexCli.refreshCodexModelCatalog();
+      const effortModelId = domCfg?.next_send_model_id
+        || domCfg?.observed_model_id
+        || domCfg?.active_launch_model_id
+        || domCfg?.effective_model_id
+        || domCfg?.model_id;
       return {
         model_id:          domCfg?.model_id || 'unknown',
         observed_model_id: domCfg?.observed_model_id || domCfg?.model_id || 'unknown',
@@ -1846,12 +1875,15 @@ class ProxyEngine extends EventEmitter {
         effective_effort_provenance: domCfg?.effective_effort_provenance || 'unknown',
         file_access_scope: workspacePath || domCfg?.file_access_scope || 'unknown',
         available_models:  codexCli.CODEX_CLI_MODELS,
-        available_efforts: codexCli.CODEX_CLI_EFFORTS,
+        available_efforts: codexCli.codexCliEffortsForModel(effortModelId),
         model_catalog:     {
           source: codexCli.CODEX_CLI_CATALOG.source,
           fetched_at: codexCli.CODEX_CLI_CATALOG.fetched_at,
           client_version: codexCli.CODEX_CLI_CATALOG.client_version,
         },
+        send_execution_mode: 'headless_out_of_process',
+        send_execution_label: 'Headless / out-of-process',
+        send_execution_detail: 'Remote sends run in an owned background Codex worker. A separate interactive Codex TUI may remain idle.',
         config_semantics:  'observed_and_next_send',
         available_permission_modes: codexCli.CODEX_CLI_ACCESS_MODES,
         branch:            branch || 'unknown',
@@ -3401,6 +3433,10 @@ class ProxyEngine extends EventEmitter {
   }
 
   _preserveCursorObservationMetadata(previous, observed) {
+    return this._preserveObservedTimestampMetadata(previous, observed);
+  }
+
+  _preserveObservedTimestampMetadata(previous, observed) {
     const next = { ...(observed || {}) };
     for (const key of ['source_message_id', 'source', 'ts', 'timestamp', 'created_at']) {
       if (previous && Object.prototype.hasOwnProperty.call(previous, key)) next[key] = previous[key];
@@ -3446,6 +3482,60 @@ class ProxyEngine extends EventEmitter {
       }
       changed = true;
       return next;
+    });
+    return { messages: prepared, sequence, changed, newlyObserved };
+  }
+
+  _claudeObservationSequenceFromId(sessionId, sourceMessageId) {
+    const prefix = `${CLAUDE_EXTENSION_OBSERVED_SOURCE}:${String(sessionId || '').toLowerCase()}:`;
+    const value = String(sourceMessageId || '').toLowerCase();
+    if (!value.startsWith(prefix)) return 0;
+    const sequence = Number.parseInt(value.substring(prefix.length).split(':', 1)[0], 10);
+    return Number.isSafeInteger(sequence) && sequence > 0 ? sequence : 0;
+  }
+
+  _claudeObservedMessageId(sessionId, sequence, message) {
+    const semantic = JSON.stringify([
+      String(message?.role || '').toLowerCase(),
+      String(message?.content || '').replace(/\s+/g, ' ').trim(),
+      Array.isArray(message?.content_blocks) ? message.content_blocks : null,
+    ]);
+    const fingerprint = crypto.createHash('sha256').update(semantic).digest('hex').substring(0, 16);
+    return `${CLAUDE_EXTENSION_OBSERVED_SOURCE}:${String(sessionId || '').toLowerCase()}:${sequence}:${fingerprint}`;
+  }
+
+  _prepareClaudeMessageObservations(sessionId, messages, options = {}) {
+    const rows = Array.isArray(messages) ? messages : [];
+    const observedAtMs = Number.isFinite(Number(options.observedAtMs))
+      ? Number(options.observedAtMs)
+      : Date.now();
+    let sequence = Math.max(0, Number(options.sequence) || 0);
+    let changed = false;
+    let newlyObserved = 0;
+    let lastTimestampSeconds = 0;
+    const prepared = rows.map(message => {
+      const row = message && typeof message === 'object' ? message : {};
+      const existingSourceId = String(row.source_message_id || '').trim();
+      sequence = Math.max(sequence, this._claudeObservationSequenceFromId(sessionId, existingSourceId));
+      const existingTimestamp = this._cursorObservationTimestampSeconds(row);
+      if (existingTimestamp > 0) {
+        lastTimestampSeconds = Math.max(lastTimestampSeconds, existingTimestamp);
+        return row;
+      }
+      sequence += existingSourceId ? 0 : 1;
+      const timestampSeconds = Math.max(lastTimestampSeconds, observedAtMs / 1000);
+      lastTimestampSeconds = timestampSeconds;
+      const observedAt = new Date(timestampSeconds * 1000).toISOString();
+      changed = true;
+      newlyObserved += 1;
+      return {
+        ...row,
+        source_message_id: existingSourceId || this._claudeObservedMessageId(sessionId, sequence, row),
+        source: row.source || CLAUDE_EXTENSION_OBSERVED_SOURCE,
+        ts: timestampSeconds,
+        timestamp: observedAt,
+        created_at: observedAt,
+      };
     });
     return { messages: prepared, sequence, changed, newlyObserved };
   }
@@ -5786,6 +5876,7 @@ class ProxyEngine extends EventEmitter {
       if (sessionData.agentType === 'claude_cli' || sessionData.agentType === 'codex_cli' || sessionData.agentType === 'cursor_cli') {
         const cliAgentType = sessionData.agentType;
         if (cliAgentType === 'codex_cli') {
+          codexCli.refreshCodexModelCatalog();
           const normalizedModelId = codexCli.normalizeCodexModelAlias(modelId, codexCli.CODEX_CLI_MODELS);
           const allowedModels = new Set(codexCli.CODEX_CLI_MODELS.map(item => item.id));
           if (!normalizedModelId || !allowedModels.has(normalizedModelId)) {
@@ -6072,6 +6163,7 @@ class ProxyEngine extends EventEmitter {
         return;
       }
       if (sessionData.agentType === 'codex_cli') {
+        codexCli.refreshCodexModelCatalog();
         const targetModelId = sessionData.nextSendModelId
           || (sessionData.observedModelId !== 'unknown' ? sessionData.observedModelId : null);
         const targetModel = targetModelId
@@ -8065,6 +8157,7 @@ class ProxyEngine extends EventEmitter {
       }
 
       if (agentType === 'codex_cli') {
+        codexCli.refreshCodexModelCatalog();
         const cliSessionId = crypto.randomUUID();
         const workspace = workspacePath || process.cwd();
         const workspaceName = path.basename(workspace) || 'Codex CLI';
@@ -8716,8 +8809,9 @@ class ProxyEngine extends EventEmitter {
       if (elapsed < minInterval && previous.cursorSig === cursorSig) {
         const wait = minInterval - elapsed;
         return {
-          code: 'throttled',
+          code: 'history_chunk_throttled',
           message: `Cursor CLI history chunk requests are throttled; retry in ${Math.ceil(wait / 1000)}s`,
+          retryAfterMs: wait,
         };
       }
       if (elapsed >= CURSOR_CLI_HISTORY_REPEAT_CURSOR_MS) {
@@ -8742,6 +8836,7 @@ class ProxyEngine extends EventEmitter {
       return {
         code: 'history_older_requires_user_action',
         message: 'Older Codex CLI history chunks require a current manual WebUI request.',
+        retryAfterMs: CODEX_CLI_HISTORY_OLDER_MIN_INTERVAL_MS,
       };
     }
     const now = Date.now();
@@ -8757,12 +8852,14 @@ class ProxyEngine extends EventEmitter {
         return {
           code: 'history_chunk_throttled',
           message: 'Codex CLI history chunk request throttled to protect the browser and proxy.',
+          retryAfterMs: minInterval - elapsed,
         };
       }
       if (mode === 'older' && cursorSig && previous.cursorSig === cursorSig && elapsed < CODEX_CLI_HISTORY_REPEAT_CURSOR_MS) {
         return {
           code: 'history_chunk_duplicate_cursor',
           message: 'Duplicate older Codex CLI history cursor ignored.',
+          retryAfterMs: CODEX_CLI_HISTORY_REPEAT_CURSOR_MS - elapsed,
         };
       }
     }
@@ -8832,7 +8929,7 @@ class ProxyEngine extends EventEmitter {
   _handleHistoryChunkRequest(msg) {
     const sessionId = msg.session_id || msg.session;
     const requestId = msg.request_id || null;
-    const fail = (code, message, source = 'codex_cli_jsonl') => {
+    const fail = (code, message, source = 'codex_cli_jsonl', retryAfterMs = 0) => {
       if (!sessionId) return;
       this._sendToRelay(proto.historyChunk(sessionId, {
         requestId,
@@ -8842,7 +8939,7 @@ class ProxyEngine extends EventEmitter {
         partial: false,
         complete: true,
         source,
-        error: { code, message },
+        error: { code, message, ...(retryAfterMs > 0 ? { retry_after_ms: retryAfterMs } : {}) },
       }));
     };
     if (!sessionId) return;
@@ -8853,7 +8950,7 @@ class ProxyEngine extends EventEmitter {
       const filePath = session.cursorCliFilePath || session.cursor_cli_file_path;
       if (!filePath) return fail('archive_not_found', 'Cursor CLI archive path is unavailable', 'cursor_cli_jsonl');
       const throttle = this._cursorCliHistoryChunkThrottle(sessionId, msg);
-      if (throttle) return fail(throttle.code, throttle.message, 'cursor_cli_jsonl');
+      if (throttle) return fail(throttle.code, throttle.message, 'cursor_cli_jsonl', throttle.retryAfterMs);
       const requestedBytes = Number(msg.chunk_bytes || msg.chunkBytes || 0);
       const chunkBytes = Number.isFinite(requestedBytes) && requestedBytes > 0
         ? Math.max(256 * 1024, Math.min(16 * 1024 * 1024, Math.floor(requestedBytes)))
@@ -8891,7 +8988,7 @@ class ProxyEngine extends EventEmitter {
     const filePath = session.codexCliFilePath || session.codex_cli_file_path;
     if (!filePath) return fail('archive_not_found', 'Codex CLI archive path is unavailable');
     const throttle = this._codexCliHistoryChunkThrottle(sessionId, msg);
-    if (throttle) return fail(throttle.code, throttle.message);
+    if (throttle) return fail(throttle.code, throttle.message, 'codex_cli_jsonl', throttle.retryAfterMs);
 
     const requestedBytes = Number(msg.chunk_bytes || msg.chunkBytes || 0);
     const chunkBytes = Number.isFinite(requestedBytes) && requestedBytes > 0
@@ -10046,6 +10143,38 @@ class ProxyEngine extends EventEmitter {
     return projectFleetSummary(summary);
   }
 
+  _codexLiveOwnerProjection(session) {
+    if (session?.agentType !== 'codex_cli') return null;
+    const threadId = session.cliSessionId || null;
+    if (!threadId) {
+      return {
+        state: 'unavailable',
+        reason: 'thread_identity_unavailable',
+        retryable: true,
+        startup_state: 'waiting_for_thread_identity',
+      };
+    }
+    const resolution = resolveLineageOwner(threadId, { registryPath: this._codexOwnerRegistryPath });
+    const owner = resolution.owner || null;
+    return {
+      state: resolution.state,
+      reason: resolution.error || null,
+      retryable: ['unavailable', 'stale'].includes(resolution.state),
+      startup_state: resolution.authority?.state || (resolution.state === 'unavailable' ? 'not_ready' : 'ready'),
+      registry_updated_at: resolution.registry_updated_at || null,
+      owner_kind: owner?.owner_kind || null,
+      owner_state: owner?.state || null,
+      logical_name: owner?.logical_name || null,
+      thread_id: owner?.thread_id || threadId,
+      turn_id: owner?.turn_id || null,
+      process_epoch: owner?.process_epoch || null,
+      connection_id: owner?.connection_id || null,
+      root_pid: owner?.root_pid || null,
+      native_pid: owner?.native_pid || null,
+      proof: owner?.proof || null,
+    };
+  }
+
   _buildSessionMetas() {
     return Array.from(this.sessions.values()).map(s => {
       this._promoteSessionChatTitle(s.session_id, s);
@@ -10053,6 +10182,7 @@ class ProxyEngine extends EventEmitter {
       const activity = fleetProjection.fleet_work_context && !s.activity?.work_context
         ? { ...(s.activity || { kind: 'idle', label: '' }), work_context: fleetProjection.fleet_work_context }
         : s.activity;
+      const codexLiveOwner = this._codexLiveOwnerProjection(s);
       return ({
       session_id:       s.session_id,
       agent_type:       s.agentType,
@@ -10099,6 +10229,7 @@ class ProxyEngine extends EventEmitter {
       is_new_chat_draft:  !!s._newChatPending,
       ...sessionNoiseMetadata(s),
       ...(s.cliSessionId ? { cli_session_id: s.cliSessionId } : {}),
+      ...(codexLiveOwner ? { codex_live_owner: codexLiveOwner } : {}),
       ...(s.model_id ? { model_id: s.model_id } : {}),
       ...(s.permission_mode ? { permission_mode: s.permission_mode } : {}),
       ...(Array.isArray(s._lastChatList) ? { chat_list: s._lastChatList } : {}),
@@ -10163,6 +10294,36 @@ class ProxyEngine extends EventEmitter {
     // Continue, Continue YOLO, and Roo Code remain ephemeral because they show
     // distinct focus-stealing symptoms there.
     return agentType === 'continue' || agentType === 'continue_yolo' || agentType === 'roo_code' || agentType === 'cline';
+  }
+
+  async _persistentClaudePoll(session, sessionId, options = {}) {
+    const { includeConfig = false, includeRateLimit = false } = options;
+    const Runtime = session?.client?.Runtime;
+    if (!Runtime) throw new Error('Claude persistent Runtime is unavailable');
+    Runtime._webviewId = session._webviewId || Runtime._webviewId || null;
+
+    let raw = await selectors.readMessages(Runtime, 'claude', sessionId);
+    let thinking = await selectors.detectThinking(Runtime, 'claude');
+    const sessionTitle = await selectors.readClaudeSessionTitle(Runtime).catch(() => null);
+    const perm = await selectors.detectPermissionDialog(Runtime, 'claude');
+    const errorPrompt = await selectors.detectSessionErrorPrompt(Runtime, 'claude').catch(() => null);
+    const config = includeConfig
+      ? await selectors.readAgentConfig(Runtime, 'claude', session.workspace_path).catch(() => null)
+      : null;
+    const rateLimit = includeRateLimit
+      ? await selectors.readClaudeRateLimit(Runtime).catch(() => null)
+      : null;
+
+    if (raw === JSON.stringify([]) && (session.lastObservedCount || 0) > 0) {
+      const previousContextId = Runtime._innerContextId || null;
+      Runtime._innerContextId = null;
+      await selectors.cacheInnerContextId(Runtime).catch(() => null);
+      if (!Runtime._innerContextId) Runtime._innerContextId = previousContextId;
+      raw = await selectors.readMessages(Runtime, 'claude', sessionId);
+      thinking = await selectors.detectThinking(Runtime, 'claude');
+    }
+
+    return { raw, thinking, sessionTitle, perm, errorPrompt, config, rateLimit };
   }
 
   async _ephemeralCdpPoll(session, sessionId, options = {}) {
@@ -10823,6 +10984,16 @@ class ProxyEngine extends EventEmitter {
       return this._withEphemeralIframeClient(session, client =>
         selectors.sendMessage(client.Runtime, session.agentType, content, sessionId, client)
       , 'send_message');
+    }
+    if (session.agentType === 'claude') {
+      const nativeActivity = await selectors.detectThinking(session.client.Runtime, 'claude');
+      if (nativeActivity?.thinking) {
+        return {
+          ok: false,
+          code: 'agent_busy',
+          detail: nativeActivity.label || 'Claude Code is working',
+        };
+      }
     }
     if (session.agentType === 'cursor' && session._cursorVirtual) {
       const activated = await this._ensureCursorVirtualSessionActive(session);
@@ -11901,7 +12072,8 @@ class ProxyEngine extends EventEmitter {
 
   _codexCliGoalDecisionIdentity(sessionId, session, goal = session?.activity?.goal) {
     const threadId = String(session?.cliSessionId || '').trim();
-    if (!sessionId || !threadId || !goal || goal.state !== 'paused') return null;
+    const goalState = String(goal?.state || goal?.status || '').toLowerCase();
+    if (!sessionId || !threadId || !goal || !['paused', 'blocked'].includes(goalState)) return null;
     const objectiveHash = String(goal.objective_hash || crypto.createHash('sha256')
       .update(String(goal.objective || goal.text || ''), 'utf8')
       .digest('hex'));
@@ -11913,6 +12085,7 @@ class ProxyEngine extends EventEmitter {
       transition_id: String(goal.transition_id || ''),
       objective_hash: objectiveHash,
       objective: String(goal.objective || goal.text || ''),
+      goal_state: goalState,
     };
     return {
       ...stable,
@@ -11925,7 +12098,10 @@ class ProxyEngine extends EventEmitter {
     const existing = this.activeQuestionPromptAdapters.get(sessionId);
     const existingGoalDecision = existing?.adapter_surface === 'codex_cli_goal_decision';
     const identity = this._codexCliGoalDecisionIdentity(sessionId, session, activity?.goal);
-    if (!identity || activity?.kind !== 'idle' || session.codexCliExternalActive !== true
+    const decisionActivity = identity?.goal_state === 'blocked'
+      ? ['blocked', 'waiting_for_user'].includes(String(activity?.kind || '').toLowerCase())
+      : activity?.kind === 'idle';
+    if (!identity || !decisionActivity || session.codexCliExternalActive !== true
         || session._codexAppServerTurn || session._codexCliChild) {
       if (existingGoalDecision && !existing.claimed) {
         this._clearQuestionPromptAdapter(sessionId, 'expired', { error_code: 'native_goal_changed' });
@@ -11949,7 +12125,7 @@ class ProxyEngine extends EventEmitter {
         surface: 'codex_cli',
         version: String(codexCli.CODEX_CLI_CATALOG.client_version || 'app-server-goal-v1'),
       },
-      title: 'Goal paused',
+      title: identity.goal_state === 'blocked' ? 'Goal blocked' : 'Goal paused',
       questions: [{
         id: 'goal_resume_decision',
         header: 'Goal',
@@ -11963,7 +12139,7 @@ class ProxyEngine extends EventEmitter {
           {
             id: 'leave_paused',
             label: 'Leave paused',
-            description: 'Keep it paused; use /goal resume later',
+            description: 'Keep it paused; use the Resume goal control later',
           },
         ],
       }],
@@ -12020,11 +12196,13 @@ class ProxyEngine extends EventEmitter {
         code: 'stale_goal_generation', native_attempted: false, retryable: true,
       });
     }
-    const expectedBefore = action === 'pause' ? 'active' : 'paused';
+    const expectedBeforeStates = action === 'pause'
+      ? ['active']
+      : (session.agentType === 'codex_cli' ? ['paused', 'blocked'] : ['paused']);
     const expectedAfter = action === 'pause' ? 'paused' : 'active';
     const currentState = String(currentGoal.state || currentGoal.status || '').toLowerCase();
-    if (currentState !== expectedBefore) {
-      throw Object.assign(new Error(`The goal is no longer ${expectedBefore}`), {
+    if (!expectedBeforeStates.includes(currentState)) {
+      throw Object.assign(new Error(`The goal is no longer ${expectedBeforeStates.join(' or ')}`), {
         code: 'native_goal_changed', native_attempted: false, retryable: true,
       });
     }
@@ -12127,7 +12305,7 @@ class ProxyEngine extends EventEmitter {
     return {
       native_acknowledged: true,
       action,
-      before_status: expectedBefore,
+      before_status: currentState,
       after_status: expectedAfter,
       goal_generation: currentGeneration,
       goal_fingerprint: canonicalGoal.fingerprint,
@@ -12174,8 +12352,8 @@ class ProxyEngine extends EventEmitter {
     try {
       const started = await connection.start();
       const before = (await connection.getGoal(identity.thread_id))?.goal;
-      if (!before || before.status !== 'paused') {
-        throw Object.assign(new Error('The authoritative Codex goal is no longer paused'), {
+      if (!before || before.status !== identity.goal_state) {
+        throw Object.assign(new Error(`The authoritative Codex goal is no longer ${identity.goal_state}`), {
           code: 'native_goal_changed',
         });
       }
@@ -12194,11 +12372,14 @@ class ProxyEngine extends EventEmitter {
           code: 'goal_decision_not_acknowledged',
         });
       }
-      session._codexCliGoalDecisionDismissedIdentity = decision === 'leave_paused' ? identity.key : null;
       const goal = this._canonicalGoalForSession(sessionId, session, {
         ...result.after,
         raw_state: result.after.status,
       }, 'codex_cli_app_server');
+      const postDecisionIdentity = this._codexCliGoalDecisionIdentity(sessionId, session, goal);
+      session._codexCliGoalDecisionDismissedIdentity = decision === 'leave_paused'
+        ? (postDecisionIdentity?.key || identity.key)
+        : null;
       const activity = {
         kind: 'idle',
         label: '',
@@ -13228,7 +13409,124 @@ class ProxyEngine extends EventEmitter {
   }
 
   _codexCliMessageDeltaEnabled() {
-    return process.env.RAC_CODEX_CLI_MESSAGE_DELTA === 'true';
+    return process.env.RAC_CODEX_CLI_MESSAGE_DELTA !== 'false';
+  }
+
+  _codexCliHeadlessActivity(activity, transport = 'codex_app_server') {
+    return {
+      execution_mode: 'headless_out_of_process',
+      execution_transport: transport,
+      execution_detail: 'This turn runs in an owned background process; a separate interactive Codex TUI may remain idle.',
+      ...activity,
+    };
+  }
+
+  _resetCodexCliLiveStream(session) {
+    session._codexCliDeltaMessageId = null;
+    session._codexCliDeltaSeq = -1;
+    session._codexCliDeltaOpen = false;
+    session._codexCliLiveText = '';
+    session._codexCliReasoningText = '';
+    session._codexCliToolOutput = '';
+    session._codexCliLiveStartedAt = null;
+  }
+
+  _publishCodexCliAssistantAppend(session, sessionId, append, {
+    proxyReadAtMs = Date.now(),
+    nativeEventAtMs = proxyReadAtMs,
+    nativeTimestampSource = 'codex_stream_observed',
+    transport = 'codex_app_server',
+  } = {}) {
+    if (typeof append !== 'string' || append.length === 0) return false;
+    const nextText = `${session._codexCliLiveText || ''}${append}`;
+    session._codexCliLiveText = nextText;
+    if (!session._codexCliLiveStartedAt) session._codexCliLiveStartedAt = new Date(proxyReadAtMs).toISOString();
+    const streamTrace = {
+      trace_id: crypto.randomUUID(),
+      agent_type: 'codex_cli',
+      session_id: sessionId,
+      native_event_at_ms: nativeEventAtMs,
+      native_timestamp_source: nativeTimestampSource,
+      proxy_read_at_ms: proxyReadAtMs,
+      proxy_normalized_at_ms: Date.now(),
+    };
+    const streamViaDeltas = this._codexCliMessageDeltaEnabled();
+    this._emitCodexCliMessageDelta(session, sessionId, append, streamTrace);
+    const activity = this._codexCliHeadlessActivity({
+      kind: 'generating',
+      label: 'Codex CLI running headlessly',
+      current: {
+        kind: 'answer',
+        label: 'Answering in a headless session',
+        ...(streamViaDeltas
+          ? { streaming_transport: 'message_delta' }
+          : { partial: nextText }),
+        since: session._codexCliLiveStartedAt,
+      },
+      ...(streamViaDeltas ? {} : { thinkingContent: nextText }),
+      updated_at: new Date().toISOString(),
+    }, transport);
+    session.activity = activity;
+    const status = proto.proxyStatus(sessionId, session.status || 'healthy', activity);
+    status.stream_trace = { ...streamTrace, proxy_sent_at_ms: Date.now() };
+    this._sendToRelay(status);
+    return true;
+  }
+
+  _handleCodexCliAppServerNotification(session, sessionId, turn, message, proxyReadAtMs = Date.now()) {
+    const method = String(message?.method || '');
+    const params = message?.params || {};
+    if (turn?.threadId && params.threadId && params.threadId !== turn.threadId) return false;
+    if (turn?.turnId && params.turnId && params.turnId !== turn.turnId) return false;
+    const append = typeof params.delta === 'string' ? params.delta : '';
+    if (!append) return false;
+    if (method === 'item/agentMessage/delta') {
+      return this._publishCodexCliAssistantAppend(session, sessionId, append, {
+        proxyReadAtMs,
+        nativeEventAtMs: proxyReadAtMs,
+        nativeTimestampSource: 'codex_app_server_notification_observed',
+        transport: 'codex_app_server',
+      });
+    }
+
+    let current;
+    if (method === 'item/reasoning/textDelta' || method === 'item/reasoning/summaryTextDelta') {
+      session._codexCliReasoningText = `${session._codexCliReasoningText || ''}${append}`.slice(-64 * 1024);
+      current = {
+        kind: 'reasoning',
+        label: 'Thinking in a headless session',
+        partial: session._codexCliReasoningText,
+      };
+    } else if (method === 'item/commandExecution/outputDelta' || method === 'item/fileChange/outputDelta') {
+      session._codexCliToolOutput = `${session._codexCliToolOutput || ''}${append}`.slice(-64 * 1024);
+      current = {
+        kind: 'tool',
+        label: method === 'item/fileChange/outputDelta' ? 'Applying changes headlessly' : 'Running command headlessly',
+        partial: session._codexCliToolOutput,
+      };
+    } else {
+      return false;
+    }
+    if (!session._codexCliLiveStartedAt) session._codexCliLiveStartedAt = new Date(proxyReadAtMs).toISOString();
+    const activity = this._codexCliHeadlessActivity({
+      kind: 'generating',
+      label: 'Codex CLI running headlessly',
+      current: { ...current, since: session._codexCliLiveStartedAt },
+      ...(current.kind === 'reasoning' ? { thinkingContent: current.partial } : {}),
+      updated_at: new Date().toISOString(),
+    });
+    session.activity = activity;
+    this._sendToRelay(proto.proxyStatus(sessionId, session.status || 'healthy', activity));
+    return true;
+  }
+
+  _wireCodexCliAppServerNotifications(turn, session, sessionId) {
+    const handler = message => {
+      if (this.sessions.get(sessionId) !== session || session._codexAppServerTurn !== turn) return;
+      this._handleCodexCliAppServerNotification(session, sessionId, turn, message);
+    };
+    turn.on('notification', handler);
+    return handler;
   }
 
   _emitCodexCliMessageDelta(session, sessionId, append, streamTrace) {
@@ -13306,42 +13604,16 @@ class ProxyEngine extends EventEmitter {
     if (!text) return;
     const prior = session._codexCliLiveText || '';
     const append = text.startsWith(prior) ? text.slice(prior.length) : text;
-    const nextText = text.startsWith(prior) ? text : `${prior}${text}`;
-    session._codexCliLiveText = nextText;
-    if (!session._codexCliLiveStartedAt) session._codexCliLiveStartedAt = new Date(proxyReadAtMs).toISOString();
     const embeddedNativeAtMs = Number.isFinite(Number(evt.timestamp_ms))
       ? Number(evt.timestamp_ms)
       : Date.parse(evt.timestamp || evt.created_at || '');
     const nativeEventAtMs = Number.isFinite(embeddedNativeAtMs) ? embeddedNativeAtMs : proxyReadAtMs;
-    const streamTrace = {
-      trace_id: crypto.randomUUID(),
-      agent_type: 'codex_cli',
-      session_id: sessionId,
-      native_event_at_ms: nativeEventAtMs,
-      native_timestamp_source: Number.isFinite(embeddedNativeAtMs) ? 'codex_exec_json' : 'codex_exec_stdout_observed',
-      proxy_read_at_ms: proxyReadAtMs,
-      proxy_normalized_at_ms: Date.now(),
-    };
-    const streamViaDeltas = this._codexCliMessageDeltaEnabled();
-    this._emitCodexCliMessageDelta(session, sessionId, append, streamTrace);
-    const activity = {
-      kind: 'generating',
-      label: 'Codex CLI running',
-      current: {
-        kind: 'answer',
-        label: 'Answering',
-        ...(streamViaDeltas
-          ? { streaming_transport: 'message_delta' }
-          : { partial: nextText }),
-        since: session._codexCliLiveStartedAt,
-      },
-      ...(streamViaDeltas ? {} : { thinkingContent: nextText }),
-      updated_at: new Date().toISOString(),
-    };
-    session.activity = activity;
-    const status = proto.proxyStatus(sessionId, session.status || 'healthy', activity);
-    status.stream_trace = { ...streamTrace, proxy_sent_at_ms: Date.now() };
-    this._sendToRelay(status);
+    this._publishCodexCliAssistantAppend(session, sessionId, append, {
+      proxyReadAtMs,
+      nativeEventAtMs,
+      nativeTimestampSource: Number.isFinite(embeddedNativeAtMs) ? 'codex_exec_json' : 'codex_exec_stdout_observed',
+      transport: 'codex_exec_resume',
+    });
   }
 
   async _sendCodexCliMessage(session, content, sessionId, sendContext = {}) {
@@ -13358,6 +13630,7 @@ class ProxyEngine extends EventEmitter {
     session._codexCliInterrupted = false;
     sessionStore.updateSession(sessionId, { codex_cli_interrupted: false });
     const workspacePath = session.workspace_path || process.cwd();
+    codexCli.refreshCodexModelCatalog();
     const processEpoch = crypto.randomUUID();
     const requestedModel = session.nextSendModelId
       || (session.observedModelId && session.observedModelId !== 'unknown' ? session.observedModelId : null);
@@ -13385,6 +13658,18 @@ class ProxyEngine extends EventEmitter {
       session.workspace_path = existingSummary.workspacePath || session.workspace_path;
       session.workspace_name = existingSummary.workspaceName || session.workspace_name;
     }
+    const ownerRegistryPath = this._codexOwnerRegistryPath || defaultCodexOwnerRegistryPath();
+    const intendedThreadId = shouldResume ? (session.cliSessionId || null) : null;
+    try {
+      assertProxyLineageAvailable(intendedThreadId, { registryPath: ownerRegistryPath });
+    } catch (error) {
+      return {
+        ok: false,
+        code: error.code || 'codex_owner_unavailable',
+        detail: error.message,
+        lifecycle_managed: true,
+      };
+    }
     const receiptBaseline = codexCli.captureCodexReceiptBaseline({
       filePath: session.codexCliFilePath || existingSummary?.filePath || null,
       cliSessionId: shouldResume ? (session.cliSessionId || null) : null,
@@ -13399,13 +13684,40 @@ class ProxyEngine extends EventEmitter {
       requestTimeoutMs: Math.max(1000, Number(process.env.CODEX_CLI_APP_SERVER_TIMEOUT_MS) || 120000),
       questionReceiptTimeoutMs: Math.max(1000, Number(process.env.CODEX_CLI_QUESTION_RECEIPT_TIMEOUT_MS) || 30000),
     });
+    let ownerLease = null;
+    let appServerOwner = null;
+    let ownerHeartbeat = null;
+    if (intendedThreadId) {
+      try {
+        ownerLease = acquireLineageLease(intendedThreadId, {
+          registryPath: ownerRegistryPath,
+          holderId: `proxy:${sessionId}:${processEpoch}`,
+          holderPid: process.pid,
+          leaseTtlMs: 180_000,
+        });
+        assertProxyLineageAvailable(intendedThreadId, {
+          registryPath: ownerRegistryPath,
+          leaseId: ownerLease.lease_id,
+        });
+      } catch (error) {
+        if (ownerLease) releaseLineageLease(intendedThreadId, ownerLease.lease_id, { registryPath: ownerRegistryPath });
+        return {
+          ok: false,
+          code: error.code || 'codex_owner_handoff_failed',
+          detail: error.message,
+          lifecycle_managed: true,
+        };
+      }
+    }
     session._codexAppServerTurn = turn;
     session._codexAppServerTurnCompleted = false;
     session._codexAppServerLastTurnIdentity = null;
     session._codexAppServerTerminalReconciledTurnId = null;
     session._codexAppServerTerminalCompletedAtMs = 0;
+    this._resetCodexCliLiveStream(session);
     const releaseTurn = async ({ failed = false, detail = null } = {}) => {
       if (session._codexAppServerTurn !== turn) return;
+      this._closeCodexCliMessageDelta(session, sessionId);
       session._codexAppServerTurn = null;
       session._codexAppServerTurnIdentity = null;
       session._codexAppServerTurnCompleted = false;
@@ -13418,9 +13730,31 @@ class ProxyEngine extends EventEmitter {
         this._setCodexCliActivity(sessionId, session, activity);
       }
       try { await turn.stop(); } catch {}
+      if (ownerHeartbeat) {
+        clearInterval(ownerHeartbeat);
+        ownerHeartbeat = null;
+      }
+      if (appServerOwner) {
+        try {
+          clearLiveOwner(appServerOwner.session_id, appServerOwner.owner_id, {
+            registryPath: ownerRegistryPath,
+            processEpoch: appServerOwner.process_epoch,
+          });
+        } catch {}
+        appServerOwner = null;
+      }
+      if (ownerLease) {
+        try {
+          releaseLineageLease(ownerLease.session_id || intendedThreadId, ownerLease.lease_id, {
+            registryPath: ownerRegistryPath,
+          });
+        } catch {}
+        ownerLease = null;
+      }
       if (session.messageQueue?.length) await this._processMessageQueue(sessionId);
       this._broadcastSessionSnapshot();
     };
+    this._wireCodexCliAppServerNotifications(turn, session, sessionId);
     turn.on('question_prompt', prompt => {
       if (this.sessions.get(sessionId) !== session || session._codexAppServerTurn !== turn) return;
       try {
@@ -13429,11 +13763,11 @@ class ProxyEngine extends EventEmitter {
           if (result?.native_acknowledged === true) {
             setImmediate(() => {
               if (this.sessions.get(sessionId) !== session || session._codexAppServerTurn !== turn) return;
-              this._setCodexCliActivity(sessionId, session, {
+              this._setCodexCliActivity(sessionId, session, this._codexCliHeadlessActivity({
                 kind: 'generating',
-                label: 'Codex CLI running',
+                label: 'Codex CLI running headlessly',
                 updated_at: new Date().toISOString(),
-              });
+              }));
             });
           }
           return result;
@@ -13477,6 +13811,13 @@ class ProxyEngine extends EventEmitter {
       releaseTurn({ failed: true, detail: 'Codex app-server disconnected' }).catch(() => {});
     });
 
+    session.waitingForAssistant = true;
+    this._setCodexCliActivity(sessionId, session, this._codexCliHeadlessActivity({
+      kind: 'generating',
+      label: 'Starting Codex CLI headless worker',
+      current: { kind: 'starting', label: 'Starting headless turn' },
+      updated_at: new Date().toISOString(),
+    }));
     session._codexCliPendingReceipt = {
       baseline: receiptBaseline,
       state: 'launch_accepted',
@@ -13496,8 +13837,77 @@ class ProxyEngine extends EventEmitter {
         await releaseTurn({ failed: true, detail: 'Codex CLI session changed during app-server startup' });
         return { ok: false, code: 'session_gone', detail: 'Codex CLI session changed during app-server startup' };
       }
+      if (intendedThreadId && started.thread_id !== intendedThreadId) {
+        throw Object.assign(new Error('Codex app-server resumed a different thread than the ownership lease.'), {
+          code: 'codex_owner_thread_mismatch',
+        });
+      }
+      let startedThreadPath = started.thread_path || null;
+      if (!startedThreadPath || !fs.existsSync(startedThreadPath)) {
+        // Current Codex app-server builds may omit thread.path even though the
+        // durable rollout is created immediately. Keep the new lineage under
+        // the startup transaction until its exact UUID-bearing file appears;
+        // never publish an owner without the required file identity.
+        const requestedDiscoveryMs = Number(process.env.CODEX_OWNER_ROLLOUT_DISCOVERY_TIMEOUT_MS);
+        const discoveryTimeoutMs = Number.isFinite(requestedDiscoveryMs)
+          ? Math.max(250, Math.min(15_000, Math.floor(requestedDiscoveryMs)))
+          : 5_000;
+        const discoveryDeadline = Date.now() + discoveryTimeoutMs;
+        do {
+          let summary = null;
+          try { summary = this._findCodexCliSummaryByCliId(started.thread_id); } catch {}
+          if (summary?.filePath && fs.existsSync(summary.filePath)) {
+            startedThreadPath = summary.filePath;
+            break;
+          }
+          if (Date.now() >= discoveryDeadline) break;
+          await new Promise(resolve => setTimeout(resolve, 25));
+        } while (true);
+      }
+      if (!ownerLease) {
+        assertProxyLineageAvailable(started.thread_id, { registryPath: ownerRegistryPath });
+        ownerLease = acquireLineageLease(started.thread_id, {
+          registryPath: ownerRegistryPath,
+          holderId: `proxy:${sessionId}:${processEpoch}`,
+          holderPid: process.pid,
+          leaseTtlMs: 180_000,
+        });
+        assertProxyLineageAvailable(started.thread_id, {
+          registryPath: ownerRegistryPath,
+          leaseId: ownerLease.lease_id,
+        });
+      }
+      ownerLease.session_id = started.thread_id;
+      appServerOwner = buildProxyAppServerOwner({
+        threadId: started.thread_id,
+        turnId: started.turn_id,
+        racSessionId: sessionId,
+        processEpoch,
+        connectionId: turn.connection?.connectionGeneration,
+        rootPid: process.pid,
+        nativePid: turn.connection?.child?.pid,
+        rolloutPath: startedThreadPath,
+        logicalName: logicalNameForThread(started.thread_id),
+      });
+      publishLiveOwner(appServerOwner, {
+        registryPath: ownerRegistryPath,
+        leaseId: ownerLease.lease_id,
+      });
+      releaseLineageLease(started.thread_id, ownerLease.lease_id, { registryPath: ownerRegistryPath });
+      ownerLease = null;
+      ownerHeartbeat = setInterval(() => {
+        try {
+          appServerOwner = publishLiveOwner({
+            ...appServerOwner,
+            heartbeat_at: new Date().toISOString(),
+          }, { registryPath: ownerRegistryPath });
+        } catch (error) {
+          this._log('warn', `[codex-cli] owner heartbeat failed for ${sessionId}: ${error.message}`);
+        }
+      }, 5_000);
+      ownerHeartbeat.unref?.();
       session.cliSessionId = started.thread_id;
-      session.codexCliFilePath = started.thread_path || session.codexCliFilePath || null;
+      session.codexCliFilePath = startedThreadPath || session.codexCliFilePath || null;
       session._codexAppServerTurnIdentity = {
         thread_id: started.thread_id,
         turn_id: started.turn_id,
@@ -13505,7 +13915,7 @@ class ProxyEngine extends EventEmitter {
       };
       session._codexAppServerLastTurnIdentity = { ...session._codexAppServerTurnIdentity };
       receiptBaseline.cli_session_id = started.thread_id;
-      if (started.thread_path) receiptBaseline.file_path = started.thread_path;
+      if (startedThreadPath) receiptBaseline.file_path = startedThreadPath;
       session._codexCliPendingReceipt = {
         ...session._codexCliPendingReceipt,
         state: 'native_user_turn_observed',
@@ -13521,11 +13931,12 @@ class ProxyEngine extends EventEmitter {
         session.nextSendEffortError = null;
       }
       session.waitingForAssistant = true;
-      this._setCodexCliActivity(sessionId, session, {
+      this._setCodexCliActivity(sessionId, session, this._codexCliHeadlessActivity({
         kind: 'generating',
-        label: 'Codex CLI running',
+        label: 'Codex CLI running headlessly',
+        current: { kind: 'starting', label: 'Headless worker started' },
         updated_at: new Date().toISOString(),
-      });
+      }));
       sessionStore.updateSession(sessionId, {
         cli_session_id: started.thread_id,
         codex_cli_file_path: session.codexCliFilePath,
@@ -13594,6 +14005,7 @@ class ProxyEngine extends EventEmitter {
       sessionStore.updateSession(sessionId, { cli_session_id: cliSessionId });
     }
     const workspacePath = session.workspace_path || process.cwd();
+    codexCli.refreshCodexModelCatalog();
     const startedAtMs = Date.now();
     const processEpoch = crypto.randomUUID();
     const requestedModel = session.nextSendModelId
@@ -13629,9 +14041,7 @@ class ProxyEngine extends EventEmitter {
       process_epoch: processEpoch,
       launched_at: new Date(startedAtMs).toISOString(),
     };
-    session._codexCliDeltaMessageId = null;
-    session._codexCliDeltaSeq = -1;
-    session._codexCliDeltaOpen = false;
+    this._resetCodexCliLiveStream(session);
     const stderrChunks = [];
     let stdoutBuffer = '';
     let child;
@@ -13741,6 +14151,13 @@ class ProxyEngine extends EventEmitter {
       return { ok: false, code: 'codex_cli_spawn_failed', detail: e.message };
     }
     session._codexCliChild = child;
+    session.waitingForAssistant = true;
+    this._setCodexCliActivity(sessionId, session, this._codexCliHeadlessActivity({
+      kind: 'generating',
+      label: 'Codex CLI running headlessly',
+      current: { kind: 'starting', label: 'Headless resume worker started' },
+      updated_at: new Date().toISOString(),
+    }, 'codex_exec_resume'));
     session._codexCliPendingReceipt = {
       baseline: receiptBaseline,
       state: 'launch_accepted',
@@ -14736,7 +15153,7 @@ class ProxyEngine extends EventEmitter {
       }
     }
     const fallbackActivity = session._codexCliChild || session._codexAppServerTurn
-      ? { kind: 'generating', label: 'Codex CLI running', thinkingContent: session._codexCliLiveText || '', updated_at: new Date().toISOString() }
+      ? this._codexCliHeadlessActivity({ kind: 'generating', label: 'Codex CLI running headlessly', thinkingContent: session._codexCliLiveText || '', updated_at: new Date().toISOString() }, session._codexAppServerTurn ? 'codex_app_server' : 'codex_exec_resume')
       : (session.activity?.kind === 'idle' ? session.activity : { kind: 'idle', label: '', updated_at: new Date().toISOString() });
     const observedActivity = ownedTurnCompleted && summaryActivity?.kind !== 'idle'
       ? { ...summaryActivity, kind: 'idle', label: '', updated_at: ownedTurnCompletedAt || new Date().toISOString() }
@@ -15141,12 +15558,12 @@ class ProxyEngine extends EventEmitter {
 
     let pollResult;
     try {
-      pollResult = await this._ephemeralCdpPoll(session, sessionId, {
+      pollResult = await this._persistentClaudePoll(session, sessionId, {
         includeConfig,
         includeRateLimit,
       });
     } catch (e) {
-      this._log('error', `[${sessionId}] Claude ephemeral poll error: ${e.message}`);
+      this._log('error', `[${sessionId}] Claude persistent poll error: ${e.message}`);
       session.nullPollCount = (session.nullPollCount || 0) + 1;
       if (session.nullPollCount >= 15) {
         this._log('warn', `[${sessionId}] 15 consecutive Claude poll failures - removing session for re-discovery`);
@@ -15295,9 +15712,18 @@ class ProxyEngine extends EventEmitter {
             if (effectiveMessages[i].role === 'user') session.waitingForAssistant = true;
             if (effectiveMessages[i].role === 'assistant') session.waitingForAssistant = false;
           }
-          session.lastMessageCount = effectiveMessages.length - 1;
           const last = effectiveMessages[effectiveMessages.length - 1];
-          session.pendingLast = last;
+          if (last.role === 'user') {
+            this._log('info', `[${sessionId}] New user msg (${last.content.length} chars, native receipt)`);
+            this._sendProxyMessage(sessionId, last);
+            session.lastMessageCount = effectiveMessages.length;
+            session.pendingLast = null;
+            session._pendingFirstSeenAt = null;
+            session.waitingForAssistant = true;
+          } else {
+            session.lastMessageCount = effectiveMessages.length - 1;
+            session.pendingLast = last;
+          }
         }
 
         session.lastObservedCount = effectiveMessages.length;
@@ -15341,6 +15767,9 @@ class ProxyEngine extends EventEmitter {
       }
     } else {
       this._emitActivityObservationHeartbeat(sessionId, session, { observedAt: newActivity.updated_at });
+    }
+    if (kind === 'idle' && session.messageQueue?.length) {
+      this._processMessageQueue(sessionId);
     }
 
     await this._handlePermissionDialogState(sessionId, session, perm);
@@ -15958,7 +16387,9 @@ class ProxyEngine extends EventEmitter {
                 if (this._shouldReplaceAccumulatedMessage(session.agentType, acc[accIdx], dom[domIdx])) {
                   acc[accIdx] = session.agentType === 'cursor'
                     ? this._preserveCursorObservationMetadata(acc[accIdx], dom[domIdx])
-                    : dom[domIdx];
+                    : session.agentType === 'claude'
+                      ? this._preserveObservedTimestampMetadata(acc[accIdx], dom[domIdx])
+                      : dom[domIdx];
                   session._accumulatedDirty = true;
                   if (accIdx < acc.length - 1) expandedHistoricalMessage = true;
                   if (
@@ -16037,10 +16468,28 @@ class ProxyEngine extends EventEmitter {
             session._accumulatedDirty = true;
           }
         }
+        let claudeObservation = null;
+        if (session.agentType === 'claude' && Array.isArray(session._accumulatedMessages)) {
+          claudeObservation = this._prepareClaudeMessageObservations(
+            sessionId,
+            session._accumulatedMessages,
+            {
+              sequence: session._claudeMessageObservationSeq,
+              observedAtMs: Date.now(),
+            },
+          );
+          session._claudeMessageObservationSeq = claudeObservation.sequence;
+          if (claudeObservation.changed) {
+            session._accumulatedMessages = claudeObservation.messages;
+            session._accumulatedDirty = true;
+          }
+        }
         this._maybePersistAccumulatedMessages(sessionId, session, {
-          force: cursorObservation?.newlyObserved > 0,
+          force: cursorObservation?.newlyObserved > 0 || claudeObservation?.newlyObserved > 0,
         });
-        if (cursorObservation?.newlyObserved > 0) sessionStore.flushPendingSaves();
+        if (cursorObservation?.newlyObserved > 0 || claudeObservation?.newlyObserved > 0) {
+          sessionStore.flushPendingSaves();
+        }
       }
 
       // Use accumulated messages for antigravity sessions, DOM snapshot for others
@@ -17369,12 +17818,14 @@ class ProxyEngine extends EventEmitter {
     const sendFingerprint = crypto.createHash('sha256').update(String(messageContent || ''), 'utf8').digest('hex');
     this._log('info', `[${sessionId}] Injecting cid=${client_message_id || 'legacy'} sha256=${sendFingerprint} bytes=${Buffer.byteLength(String(messageContent || ''), 'utf8')}`);
 
-    // Pre-send busy check for Codex: if the agent is busy, queue the message
-    // and type it into ProseMirror so Codex shows its native Steer button.
-    // The web UI shows queued messages with Steer buttons that click the native button.
+    // Pre-send busy check. Codex additionally types the first queued message
+    // into ProseMirror so its native Steer control remains available. Claude
+    // queueing is proxy-only so automation can never overwrite a human draft.
     const isCodexType = sessionData.agentType === 'codex' || sessionData.agentType === 'codex-desktop';
+    const isClaudeExtension = sessionData.agentType === 'claude';
+    const queuesWhenBusy = isCodexType || isClaudeExtension;
     let activityKind = sessionData.activity?.kind;
-    if (isCodexType && (activityKind === 'thinking' || activityKind === 'generating') && client_message_id) {
+    if (queuesWhenBusy && (activityKind === 'thinking' || activityKind === 'generating') && client_message_id) {
       const cachedActivityKind = activityKind;
       try {
         const freshThinking = await selectors.detectThinking(sessionData.client.Runtime, sessionData.agentType);
@@ -17394,18 +17845,18 @@ class ProxyEngine extends EventEmitter {
         this._log('warn', `[${sessionId}] [send] Native busy recheck failed; preserving ${activityKind}: ${error.message}`);
       }
     }
-    if (isCodexType && (activityKind === 'thinking' || activityKind === 'generating') && client_message_id) {
+    if (queuesWhenBusy && (activityKind === 'thinking' || activityKind === 'generating') && client_message_id) {
       if (!sessionData.messageQueue) sessionData.messageQueue = [];
       const isFirstInQueue = sessionData.messageQueue.length === 0;
       sessionData.messageQueue.push({ content: messageContent, client_message_id, queued_at: Date.now() });
       // Only type the FIRST queued message into ProseMirror (so Codex shows its
       // native Steer button). Subsequent messages stay in proxy queue — typing
       // each one would overwrite the previous in the single ProseMirror input.
-      if (isFirstInQueue) {
+      if (isFirstInQueue && isCodexType) {
         const usePageEval = sessionData.agentType === 'codex-desktop';
         await selectors.steerCodexInput(sessionData.client.Runtime, messageContent, usePageEval);
       }
-      this._log('info', `[${sessionId}] Agent is ${activityKind} — queued ${client_message_id} (depth: ${sessionData.messageQueue.length})${isFirstInQueue ? ' + typed into input' : ''}`);
+      this._log('info', `[${sessionId}] Agent is ${activityKind} — queued ${client_message_id} (depth: ${sessionData.messageQueue.length})${isFirstInQueue && isCodexType ? ' + typed into input' : ''}`);
       this._sendToRelay(proto.messageQueued(sessionId, client_message_id, messageContent));
       return;
     }
@@ -17489,10 +17940,10 @@ class ProxyEngine extends EventEmitter {
     }
 
     // Queue message if agent is busy (steer feature)
-    if (!result.ok && result.code === 'agent_busy' && client_message_id) {
+    if (!result.ok && QUEUE_ON_SEND_CODES.has(result.code) && client_message_id) {
       if (!sessionData.messageQueue) sessionData.messageQueue = [];
       sessionData.messageQueue.push({ content: messageContent, client_message_id, queued_at: Date.now() });
-      this._log('info', `[${sessionId}] Agent busy — queued message ${client_message_id} (queue depth: ${sessionData.messageQueue.length})`);
+      this._log('info', `[${sessionId}] Send deferred (${result.code}) — queued message ${client_message_id} (queue depth: ${sessionData.messageQueue.length})`);
       this._sendToRelay(proto.messageQueued(sessionId, client_message_id, messageContent));
       return;
     }
@@ -17535,7 +17986,7 @@ class ProxyEngine extends EventEmitter {
     if (client_message_id) {
       if (result.ok) {
         const deliveryEmitted = this._sendToRelay(proto.proxySendResult(sessionId, client_message_id, 'delivered', {
-          lifecycle: result.lifecycle_managed ? 'native_user_turn_observed' : 'injection_confirmed',
+          lifecycle: result.delivery_lifecycle || (result.lifecycle_managed ? 'native_user_turn_observed' : 'injection_confirmed'),
           native_receipt: result.native_receipt || null,
           process_epoch: result.process_epoch || null,
         }));
@@ -17582,13 +18033,16 @@ class ProxyEngine extends EventEmitter {
   async _processMessageQueue(sessionId) {
     const session = this.sessions.get(sessionId);
     if (!session || !session.messageQueue || session.messageQueue.length === 0) return;
+    if (session._messageQueueDraining) return;
+    session._messageQueueDraining = true;
 
-    const item = session.messageQueue.shift();
-    this._log('info', `[${sessionId}] Auto-sending queued message ${item.client_message_id}`);
+    try {
+      const item = session.messageQueue.shift();
+      this._log('info', `[${sessionId}] Auto-sending queued message ${item.client_message_id}`);
 
-    const result = await this._sendSessionMessage(session, item.content, sessionId, {
-      clientMessageId: item.client_message_id || null,
-    });
+      const result = await this._sendSessionMessage(session, item.content, sessionId, {
+        clientMessageId: item.client_message_id || null,
+      });
 
     if (result.ok && !result.lifecycle_managed) {
       session.waitingForAssistant = true;
@@ -17626,7 +18080,7 @@ class ProxyEngine extends EventEmitter {
     if (result.ok) {
       this._sendToRelay(proto.queueDelivered(sessionId, item.client_message_id));
       const deliveryEmitted = this._sendToRelay(proto.proxySendResult(sessionId, item.client_message_id, 'delivered', {
-        lifecycle: result.lifecycle_managed ? 'native_user_turn_observed' : 'injection_confirmed',
+        lifecycle: result.delivery_lifecycle || (result.lifecycle_managed ? 'native_user_turn_observed' : 'injection_confirmed'),
         native_receipt: result.native_receipt || null,
         process_epoch: result.process_epoch || null,
       }));
@@ -17660,7 +18114,7 @@ class ProxyEngine extends EventEmitter {
       }
       // Type next queued message into ProseMirror
       await this._typeNextQueuedIntoProseMirror(sessionId);
-    } else if (result.code === 'agent_busy') {
+    } else if (QUEUE_ON_SEND_CODES.has(result.code)) {
       // Agent went busy again — re-queue
       session.messageQueue.unshift(item);
     } else {
@@ -17669,6 +18123,9 @@ class ProxyEngine extends EventEmitter {
       }));
       // Type next queued message into ProseMirror even on failure
       await this._typeNextQueuedIntoProseMirror(sessionId);
+    }
+    } finally {
+      session._messageQueueDraining = false;
     }
   }
 
@@ -17736,6 +18193,7 @@ class ProxyEngine extends EventEmitter {
   async _typeNextQueuedIntoProseMirror(sessionId) {
     const session = this.sessions.get(sessionId);
     if (!session?.messageQueue?.length) return;
+    if (session.agentType !== 'codex' && session.agentType !== 'codex-desktop') return;
     const next = session.messageQueue[0];
     const usePageEval = session.agentType === 'codex-desktop';
     try {
@@ -18678,9 +19136,20 @@ class ProxyEngine extends EventEmitter {
             }
           }
         }
-        const initialMsgs  = initialListView
+        let initialMsgs  = initialListView
           ? []
           : (useStoredAccumulated ? storedAccumulated : domMsgs);
+        let initialClaudeObservation = null;
+        if (agentType === 'claude' && initialMsgs.length > 0) {
+          initialClaudeObservation = this._prepareClaudeMessageObservations(sessionId, initialMsgs, {
+            observedAtMs: Date.now(),
+          });
+          initialMsgs = initialClaudeObservation.messages;
+          if (initialClaudeObservation.changed) {
+            sessionStore.updateSession(sessionId, { accumulated_messages: initialMsgs });
+            sessionStore.flushPendingSaves();
+          }
+        }
         const initialCount = initialMsgs.length;
 
         const innerClaudeTitle = agentType === 'claude'
@@ -18723,6 +19192,7 @@ class ProxyEngine extends EventEmitter {
           lastObservedCount: initialCount,
           lastTranscriptSig: this._transcriptSignature(initialMsgs),
           _accumulatedMessages: isAccumAccum ? initialMsgs.slice() : null,
+          _claudeMessageObservationSeq: initialClaudeObservation?.sequence || 0,
           _cursorAgentHistories: agentType === 'cursor' ? { ...storedCursorAgentHistories } : null,
           nullPollCount:    0,
           pendingLast:      null,
@@ -20038,6 +20508,7 @@ module.exports = {
   cursorAgentEligible,
   CURSOR_WORKING_CONTINUITY_LEASE_MS,
   CURSOR_NATIVE_OBSERVED_SOURCE,
+  CLAUDE_EXTENSION_OBSERVED_SOURCE,
   validateAttachmentPayload,
   shouldImmediatelyStreamCursorAssistant,
   shouldImmediatelyStreamAntigravityV2Assistant,

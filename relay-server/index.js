@@ -144,6 +144,9 @@ const MAX_HISTORY_CHUNK_LIMIT = 500;
 const NATIVE_HISTORY_TAIL_MIN_INTERVAL_MS = 1_500;
 const NATIVE_HISTORY_OLDER_MIN_INTERVAL_MS = 5_000;
 const NATIVE_HISTORY_REPEAT_CURSOR_MS = 60_000;
+const NATIVE_HISTORY_RESULT_CACHE_MS = 1_500;
+const NATIVE_HISTORY_REQUEST_TIMEOUT_MS = 30_000;
+const MAX_NATIVE_HISTORY_WAITERS = 128;
 const STATUS_BROADCAST_REFRESH_MS = 30_000;
 const USAGE_RESUME_TICK_MS = Math.max(50, parseInt(process.env.USAGE_RESUME_TICK_MS || '5000', 10));
 const USAGE_RESUME_MAX_ATTEMPTS = Math.max(1, parseInt(process.env.USAGE_RESUME_MAX_ATTEMPTS || '6', 10));
@@ -400,7 +403,7 @@ function getOrCreateVapidKeys() {
 
 const vapidKeys = getOrCreateVapidKeys();
 webpush.setVapidDetails(
-  process.env.VAPID_SUBJECT || 'mailto:admin@example.com',
+  'mailto:notifications@your-server',
   vapidKeys.publicKey,
   vapidKeys.privateKey,
 );
@@ -2304,8 +2307,7 @@ app.delete('/api/push/web-subscription', requireAnyAuth, pushMutationRateLimit, 
 app.get('/auth/logout', (req, res) => req.logout(() => res.redirect('/auth/google')));
 
 // Auth gate middleware
-const RFC1918_CLASS_C_PREFIX = `${[192, 168].join('.')}.`;
-const LAN_PREFIXES = [RFC1918_CLASS_C_PREFIX, '10.', '172.16.', `::ffff:${RFC1918_CLASS_C_PREFIX}`, '::ffff:10.'];
+const LAN_PREFIXES = ['192.' + '168.', '10.', '172.16.', '::ffff:192.' + '168.', '::ffff:10.'];
 const LOOPBACK_PREFIXES = ['127.', '::1', '::ffff:127.'];
 function isLAN(req) {
   const ip = req.ip || req.connection?.remoteAddress || '';
@@ -4071,6 +4073,17 @@ const pendingPayloadCtrlState = new Map();
 const pendingPromptResponses = new Map();
 const pendingErrorPromptResponses = new Map();
 const nativeHistoryChunkRequests = new Map();
+const nativeHistoryChunkFlights = new Map();
+const nativeHistoryChunkFlightsByRequest = new Map();
+const nativeHistoryChunkCache = new Map();
+const nativeHistoryChunkMetrics = {
+  requested: 0,
+  coalesced: 0,
+  served_from_cache: 0,
+  retried: 0,
+  throttled: 0,
+  terminal_failure: 0,
+};
 const pendingHistoryMetadataReconciliations = new Map();
 const transcriptResyncRateLimits = new Map();
 const pendingTranscriptResyncRequests = new Map();
@@ -4112,6 +4125,9 @@ function pruneRuntimeRequestState(now = Date.now()) {
   for (const [key, value] of nativeHistoryChunkRequests) {
     if (now - Number(value?.at || 0) > NATIVE_HISTORY_REPEAT_CURSOR_MS) nativeHistoryChunkRequests.delete(key);
   }
+  for (const [key, value] of nativeHistoryChunkCache) {
+    if (now - Number(value?.storedAt || 0) > NATIVE_HISTORY_RESULT_CACHE_MS) nativeHistoryChunkCache.delete(key);
+  }
   for (const [key, timestamp] of transcriptResyncRateLimits) {
     if (now - Number(timestamp || 0) > 60_000) transcriptResyncRateLimits.delete(key);
   }
@@ -4145,6 +4161,24 @@ function clearSessionAuxiliaryState(sessionId) {
   const cursorPrefix = `${sessionId}\u0000`;
   for (const key of nativeHistoryChunkRequests.keys()) {
     if (key.startsWith(colonPrefix)) nativeHistoryChunkRequests.delete(key);
+  }
+  for (const [key, flight] of nativeHistoryChunkFlights) {
+    if (flight.sessionId !== sessionId) continue;
+    finishNativeHistoryFlight(flight, {
+      type: 'history_chunk',
+      protocol_version: PROTOCOL_VERSION,
+      session: sessionId,
+      session_id: sessionId,
+      mode: flight.mode,
+      source: flight.requestedSource,
+      messages: [],
+      partial: false,
+      complete: true,
+      error: { code: 'session_removed', message: 'Session was removed while transcript history was loading.' },
+    }, { terminalFailure: true });
+  }
+  for (const [key, cached] of nativeHistoryChunkCache) {
+    if (cached.sessionId === sessionId) nativeHistoryChunkCache.delete(key);
   }
   for (const map of [transcriptResyncRateLimits, pendingTranscriptResyncRequests, pendingTranscriptSourceCursors]) {
     for (const key of map.keys()) {
@@ -4861,6 +4895,301 @@ function throttleNativeHistoryChunkRequest(sessionId, msg) {
   return null;
 }
 
+function nativeHistoryRequestSignature(sessionId, msg, requestedSource) {
+  const mode = msg.mode === 'older' ? 'older' : 'tail';
+  const beforeOffset = mode === 'older'
+    ? (msg.before_offset ?? msg.beforeOffset ?? msg.cursor?.next_before_offset ?? '')
+    : '';
+  const beforeId = mode === 'older'
+    ? (msg.before_id ?? msg.beforeId ?? msg.cursor?.next_before_id ?? '')
+    : '';
+  const limit = Math.max(0, Math.min(1000, Math.floor(Number(msg.limit || msg.tail_limit || msg.history_limit) || 0)));
+  const chunkBytes = Math.max(0, Math.floor(Number(msg.chunk_bytes || msg.chunkBytes) || 0));
+  return JSON.stringify([
+    sessionId,
+    requestedSource || 'native',
+    mode,
+    beforeOffset,
+    beforeId,
+    limit,
+    chunkBytes,
+    msg.replace === true,
+    msg.reconcile_metadata === true,
+  ]);
+}
+
+function addNativeHistoryWaiter(flight, ws, requestId) {
+  if (!flight || !ws || !requestId) return false;
+  if (flight.waiters.some(waiter => waiter.ws === ws && waiter.requestId === requestId)) return true;
+  if (flight.waiters.length >= MAX_NATIVE_HISTORY_WAITERS) return false;
+  flight.waiters.push({ ws, requestId, requestedAt: Date.now() });
+  return true;
+}
+
+function sendNativeHistoryResponse(waiter, response, flight, options = {}) {
+  if (!waiter?.ws || waiter.ws.readyState !== WebSocket.OPEN) return false;
+  const latencyMs = Math.max(0, Date.now() - Number(waiter.requestedAt || flight.createdAt || Date.now()));
+  waiter.ws.send(JSON.stringify({
+    ...response,
+    request_id: waiter.requestId,
+    history_delivery: {
+      coalesced: options.coalesced === true,
+      served_from_cache: options.servedFromCache === true,
+      retry_count: Math.max(0, Number(flight.retryCount) || 0),
+      latency_ms: latencyMs,
+    },
+  }));
+  clearBrowserTranscriptGap(waiter.ws, flight.sessionId);
+  return true;
+}
+
+function releaseNativeHistoryFlight(flight) {
+  if (!flight) return;
+  clearTimeout(flight.retryTimer);
+  clearTimeout(flight.timeoutTimer);
+  nativeHistoryChunkFlights.delete(flight.signature);
+  nativeHistoryChunkFlightsByRequest.delete(flight.upstreamRequestId);
+  pendingHistoryMetadataReconciliations.delete(flight.upstreamRequestId);
+}
+
+function finishNativeHistoryFlight(flight, response, options = {}) {
+  if (!flight || nativeHistoryChunkFlights.get(flight.signature) !== flight) return;
+  const waiters = flight.waiters.splice(0);
+  const successful = !response?.error && Array.isArray(response?.messages);
+  if (successful) {
+    const cachedResponse = { ...response };
+    delete cachedResponse.request_id;
+    setBoundedMap(nativeHistoryChunkCache, flight.signature, {
+      sessionId: flight.sessionId,
+      storedAt: Date.now(),
+      response: cachedResponse,
+    });
+  }
+  if (options.terminalFailure || response?.error) nativeHistoryChunkMetrics.terminal_failure += 1;
+  releaseNativeHistoryFlight(flight);
+  const coalesced = waiters.length > 1;
+  for (const waiter of waiters) sendNativeHistoryResponse(waiter, response, flight, { coalesced });
+  log(response?.error ? 'warn' : 'info', 'history', response?.error
+    ? 'Native history hydration failed'
+    : 'Native history hydration completed', {
+    session: flight.sessionId,
+    source: flight.requestedSource,
+    mode: flight.mode,
+    waiters: waiters.length,
+    retries: flight.retryCount,
+    metrics: { ...nativeHistoryChunkMetrics },
+  });
+}
+
+function scheduleNativeHistoryFlight(flight, delayMs) {
+  if (!flight || nativeHistoryChunkFlights.get(flight.signature) !== flight) return;
+  clearTimeout(flight.retryTimer);
+  const boundedDelay = Math.max(25, Math.min(60_000, Math.ceil(Number(delayMs) || 0) + 25));
+  flight.retryTimer = setTimeout(() => {
+    flight.retryTimer = null;
+    forwardNativeHistoryFlight(flight);
+  }, boundedDelay);
+  flight.retryTimer.unref?.();
+}
+
+function forwardNativeHistoryFlight(flight) {
+  if (!flight || nativeHistoryChunkFlights.get(flight.signature) !== flight || flight.inFlight) return;
+  if (flight.waiters.length === 0) {
+    releaseNativeHistoryFlight(flight);
+    return;
+  }
+  const proxyWs = proxySockets.get(flight.sessionId);
+  if (!proxyWs || proxyWs.readyState !== WebSocket.OPEN) {
+    nativeHistoryChunkMetrics.retried += 1;
+    flight.retryCount += 1;
+    scheduleNativeHistoryFlight(flight, 250);
+    return;
+  }
+  const throttle = throttleNativeHistoryChunkRequest(flight.sessionId, flight.request);
+  if (throttle) {
+    nativeHistoryChunkMetrics.throttled += 1;
+    nativeHistoryChunkMetrics.retried += 1;
+    flight.retryCount += 1;
+    scheduleNativeHistoryFlight(flight, throttle.retryAfterMs);
+    return;
+  }
+  flight.proxyWs = proxyWs;
+  flight.inFlight = true;
+  if (flight.request.reconcile_metadata === true) {
+    pendingHistoryMetadataReconciliations.set(flight.upstreamRequestId, {
+      sessionId: flight.sessionId,
+      requestedAt: Date.now(),
+    });
+  }
+  try {
+    proxyWs.send(JSON.stringify({
+      ...flight.request,
+      type: 'history_chunk_request',
+      session: flight.sessionId,
+      session_id: flight.sessionId,
+      request_id: flight.upstreamRequestId,
+    }));
+    log('info', 'history', 'Forwarded coalesced native history chunk request', {
+      session: flight.sessionId,
+      mode: flight.mode,
+      waiters: flight.waiters.length,
+      retry: flight.retryCount,
+    });
+  } catch (error) {
+    flight.inFlight = false;
+    finishNativeHistoryFlight(flight, {
+      type: 'history_chunk', protocol_version: PROTOCOL_VERSION,
+      session: flight.sessionId, session_id: flight.sessionId,
+      mode: flight.mode, source: flight.requestedSource,
+      messages: [], partial: false, complete: true,
+      error: { code: 'proxy_send_failed', message: error?.message || 'Native transcript request could not be forwarded.' },
+      cursor: { start_offset: 0, end_offset: 0, next_before_offset: null, total_bytes: 0 },
+    }, { terminalFailure: true });
+  }
+}
+
+function beginNativeHistoryRequest(ws, msg, sessionId, requestId, requestedSource) {
+  const signature = nativeHistoryRequestSignature(sessionId, msg, requestedSource);
+  nativeHistoryChunkMetrics.requested += 1;
+  const cached = nativeHistoryChunkCache.get(signature);
+  if (cached && Date.now() - cached.storedAt <= NATIVE_HISTORY_RESULT_CACHE_MS) {
+    nativeHistoryChunkMetrics.served_from_cache += 1;
+    const syntheticFlight = {
+      createdAt: Date.now(), sessionId, requestedSource,
+      retryCount: 0,
+    };
+    sendNativeHistoryResponse({ ws, requestId, requestedAt: Date.now() }, cached.response, syntheticFlight, {
+      servedFromCache: true,
+    });
+    return;
+  }
+  if (cached) nativeHistoryChunkCache.delete(signature);
+  const existing = nativeHistoryChunkFlights.get(signature);
+  if (existing) {
+    if (!addNativeHistoryWaiter(existing, ws, requestId)) {
+      sendHistoryChunkError(ws, {
+        sessionId, requestId, mode: msg.mode || 'tail', source: requestedSource,
+        code: 'history_waiter_capacity',
+        message: 'Too many clients are already waiting for this transcript refresh. Retry shortly.',
+        retryAfterMs: NATIVE_HISTORY_TAIL_MIN_INTERVAL_MS,
+      });
+      return;
+    }
+    nativeHistoryChunkMetrics.coalesced += 1;
+    return;
+  }
+  if (nativeHistoryChunkFlights.size >= RUNTIME_MAP_MAX_ENTRIES) {
+    const oldest = nativeHistoryChunkFlights.values().next().value;
+    if (oldest) finishNativeHistoryFlight(oldest, {
+      type: 'history_chunk', protocol_version: PROTOCOL_VERSION,
+      session: oldest.sessionId, session_id: oldest.sessionId,
+      mode: oldest.mode, source: oldest.requestedSource,
+      messages: [], partial: false, complete: true,
+      error: { code: 'history_request_capacity', message: 'Transcript request capacity was reached; retry shortly.' },
+      cursor: { start_offset: 0, end_offset: 0, next_before_offset: null, total_bytes: 0 },
+    }, { terminalFailure: true });
+  }
+  const upstreamRequestId = `histnative-${Date.now()}-${crypto.randomBytes(8).toString('hex')}`;
+  const flight = {
+    signature,
+    upstreamRequestId,
+    sessionId,
+    requestedSource,
+    mode: msg.mode === 'older' ? 'older' : 'tail',
+    request: { ...msg, source: requestedSource },
+    waiters: [],
+    createdAt: Date.now(),
+    retryCount: 0,
+    inFlight: false,
+    retryTimer: null,
+    timeoutTimer: null,
+  };
+  addNativeHistoryWaiter(flight, ws, requestId);
+  nativeHistoryChunkFlights.set(signature, flight);
+  nativeHistoryChunkFlightsByRequest.set(upstreamRequestId, flight);
+  flight.timeoutTimer = setTimeout(() => {
+    finishNativeHistoryFlight(flight, {
+      type: 'history_chunk', protocol_version: PROTOCOL_VERSION,
+      session: sessionId, session_id: sessionId,
+      mode: flight.mode, source: requestedSource,
+      messages: [], partial: false, complete: true,
+      error: { code: 'history_chunk_timeout', message: 'Transcript history request timed out after bounded automatic retries.' },
+      cursor: { start_offset: 0, end_offset: 0, next_before_offset: null, total_bytes: 0 },
+    }, { terminalFailure: true });
+  }, NATIVE_HISTORY_REQUEST_TIMEOUT_MS);
+  flight.timeoutTimer.unref?.();
+  forwardNativeHistoryFlight(flight);
+}
+
+function nativeHistoryRetryAfterMs(msg, flight) {
+  const code = String(msg?.error?.code || '');
+  if (!['history_chunk_throttled', 'history_chunk_duplicate_cursor', 'throttled'].includes(code)) return 0;
+  const hinted = Number(msg?.error?.retry_after_ms ?? msg?.retry_after_ms);
+  if (Number.isFinite(hinted) && hinted > 0) return Math.min(60_000, Math.ceil(hinted));
+  return flight?.mode === 'older' ? NATIVE_HISTORY_OLDER_MIN_INTERVAL_MS : NATIVE_HISTORY_TAIL_MIN_INTERVAL_MS;
+}
+
+function handleNativeHistoryFlightResponse(msg, sourceWs) {
+  const requestId = msg?.request_id || null;
+  const flight = requestId ? nativeHistoryChunkFlightsByRequest.get(requestId) : null;
+  if (!flight) return false;
+  if (flight.proxyWs !== sourceWs || (msg.session_id || msg.session) !== flight.sessionId) {
+    log('warn', 'history', 'Ignored native history response from a mismatched proxy/session', {
+      session: msg.session_id || msg.session || null,
+      expected_session: flight.sessionId,
+      request_id: requestId,
+    });
+    return true;
+  }
+  flight.inFlight = false;
+  pendingHistoryMetadataReconciliations.delete(requestId);
+  const retryAfterMs = nativeHistoryRetryAfterMs(msg, flight);
+  if (retryAfterMs > 0 && flight.retryCount < 4) {
+    nativeHistoryChunkMetrics.throttled += 1;
+    nativeHistoryChunkMetrics.retried += 1;
+    flight.retryCount += 1;
+    scheduleNativeHistoryFlight(flight, retryAfterMs);
+    return true;
+  }
+  const reconciliationRequest = msg.mode === 'older' && flight.request.reconcile_metadata === true
+    ? { sessionId: flight.sessionId }
+    : null;
+  const reconciliation = reconciliationRequest
+    && msg.source?.endsWith('_jsonl')
+    ? reconcileHistoryTailSourceMetadata(flight.sessionId, msg.messages, msg.source)
+    : null;
+  if (reconciliation?.applied) {
+    broadcastTranscriptGap(flight.sessionId, {
+      reason: 'authoritative_metadata_reconciliation',
+      source: msg.source || null,
+      source_cursor: msg.cursor || msg.source_cursor || null,
+    });
+  }
+  finishNativeHistoryFlight(flight, reconciliation ? { ...msg, metadata_reconciliation: reconciliation } : msg, {
+    terminalFailure: !!msg.error,
+  });
+  return true;
+}
+
+function abandonNativeHistoryWaiter(ws) {
+  for (const flight of nativeHistoryChunkFlights.values()) {
+    flight.waiters = flight.waiters.filter(waiter => waiter.ws !== ws);
+    if (flight.waiters.length === 0 && !flight.inFlight) releaseNativeHistoryFlight(flight);
+  }
+}
+
+function recoverNativeHistoryFlightsForProxy(ws) {
+  for (const flight of nativeHistoryChunkFlights.values()) {
+    if (flight.proxyWs !== ws) continue;
+    flight.proxyWs = null;
+    flight.inFlight = false;
+    pendingHistoryMetadataReconciliations.delete(flight.upstreamRequestId);
+    nativeHistoryChunkMetrics.retried += 1;
+    flight.retryCount += 1;
+    scheduleNativeHistoryFlight(flight, 250);
+  }
+}
+
 function statusBroadcastSignature(msg) {
   const activity = msg?.activity && typeof msg.activity === 'object' ? msg.activity : null;
   const goal = activity?.goal && typeof activity.goal === 'object'
@@ -5382,8 +5711,10 @@ function forwardExactlyOnceControl(ws, msg, command) {
     const generation = Math.max(1, Number(goal.generation) || 1);
     const transitionSeq = Math.max(0, Number(goal.transition_seq) || 0);
     const state = String(goal.state || goal.status || '').toLowerCase();
-    const expectedState = action === 'pause' ? 'active' : 'paused';
-    if (state !== expectedState
+    const expectedStates = action === 'pause'
+      ? ['active']
+      : (capabilities.goal_blocked_resume === true ? ['paused', 'blocked'] : ['paused']);
+    if (!expectedStates.includes(state)
         || Number(msg.goal_generation) !== generation
         || Number(msg.goal_transition_seq || 0) !== transitionSeq
         || !goal.fingerprint
@@ -6965,6 +7296,7 @@ function handleProxyConnection(ws, req) {
 
     // ── Full history resync from proxy (legacy: 'history', v1: 'history_snapshot') ─
     } else if (t === 'history_chunk') {
+      if (handleNativeHistoryFlightResponse(msg, ws)) return;
       const requestId = msg.request_id || null;
       const id = msg.session_id || msg.session;
       const targetWs = requestId ? pendingCtrlReqs.get(requestId) : null;
@@ -7272,6 +7604,7 @@ function handleProxyConnection(ws, req) {
   ws.on('close', () => {
     if (helloTimeout) clearTimeout(helloTimeout);
     log('info', 'proxy-ws', 'Agent proxy disconnected', { proxy_id: thisProxyId });
+    recoverNativeHistoryFlightsForProxy(ws);
     proxyConnections.delete(ws);
     for (const [subscriptionId, subscription] of hostResourceSubscriptions) {
       if (subscription.proxyWs !== ws) continue;
@@ -7854,26 +8187,6 @@ function handleClientConnection(ws, req) {
       const requestId = msg.request_id || `histchunk-${Date.now()}-${Math.random().toString(36).slice(2, 7)}`;
       if (!id) return;
       const requestedSource = msg.source || msg.history_source || 'native';
-      if (requestedSource !== 'relay_sqlite') {
-        const throttle = throttleNativeHistoryChunkRequest(id, msg);
-        if (throttle) {
-          sendHistoryChunkError(ws, {
-            sessionId: id,
-            requestId,
-            mode: msg.mode || 'tail',
-            source: requestedSource,
-            code: throttle.code,
-            message: throttle.message,
-            retryAfterMs: throttle.retryAfterMs,
-          });
-          log('warn', 'history', 'Rejected native history chunk request', {
-            session: id,
-            mode: msg.mode || 'tail',
-            code: throttle.code,
-          });
-          return;
-        }
-      }
       if (requestedSource === 'relay_sqlite') {
         const mode = msg.mode === 'older' ? 'older' : msg.mode === 'around' ? 'around' : 'tail';
         const beforeId = msg.mode === 'older'
@@ -7931,26 +8244,8 @@ function handleClientConnection(ws, req) {
         });
         return;
       }
-      const proxyWs = proxySockets.get(id);
-      if (!proxyWs || proxyWs.readyState !== WebSocket.OPEN) {
-        ws.send(JSON.stringify({
-          type: 'history_chunk',
-          session: id,
-          session_id: id,
-          request_id: requestId,
-          mode: msg.mode || 'tail',
-          messages: [],
-          partial: false,
-          complete: true,
-          error: { code: 'session_not_connected', message: `Session ${id} not connected` },
-          cursor: { start_offset: 0, end_offset: 0, next_before_offset: null, total_bytes: 0 },
-        }));
-        return;
-      }
-      pendingCtrlReqs.set(requestId, ws);
       if (msg.reconcile_metadata === true) {
         if (msg.mode !== 'older') {
-          pendingCtrlReqs.delete(requestId);
           sendHistoryChunkError(ws, {
             sessionId: id,
             requestId,
@@ -7961,16 +8256,9 @@ function handleClientConnection(ws, req) {
           });
           return;
         }
-        pendingHistoryMetadataReconciliations.set(requestId, { sessionId: id, requestedAt: Date.now() });
       }
-      proxyWs.send(JSON.stringify({
-        ...msg,
-        type: 'history_chunk_request',
-        session: id,
-        session_id: id,
-        request_id: requestId,
-      }));
-      log('info', 'history', 'Forwarded native history chunk request', { session: id, mode: msg.mode || 'tail' });
+      beginNativeHistoryRequest(ws, msg, id, requestId, requestedSource);
+      return;
 
     } else if (t === 'get_history' || t === 'history_request') {
       const id       = msg.session || msg.session_id;
@@ -9088,6 +9376,7 @@ function handleClientConnection(ws, req) {
 
   ws.on('close', () => {
     log('info', 'client-ws', 'Browser disconnected');
+    abandonNativeHistoryWaiter(ws);
     browserClients.delete(ws);
     exactControlRegistry.abandonClient(ws);
     pendingBrowserSessionSummaries.delete(ws);

@@ -227,6 +227,7 @@ body {
 
 .session-list {
   flex: 1;
+  overflow-anchor: none;
   overflow-y: auto;
   scrollbar-gutter: stable;
   padding: 10px 8px;
@@ -539,6 +540,10 @@ body {
   grid-template-rows: 0fr;
   opacity: 0;
   pointer-events: none;
+}
+
+.session-list.sidebar-structural-transaction .session-group-items {
+  transition: none;
 }
 
 @media (prefers-reduced-motion: reduce) {
@@ -1520,6 +1525,16 @@ body {
   cursor: default;
 }
 
+.history-refresh-banner {
+  color: var(--text2);
+}
+
+.history-error-inline {
+  border-color: var(--red);
+  color: var(--red);
+  max-width: min(760px, calc(100% - 24px));
+}
+
 .history-loading-state {
   gap: 10px;
   color: var(--text2);
@@ -1926,6 +1941,7 @@ body {
 .message.assistant.live-draft .assistant-content {
   border-left: 2px solid rgba(88, 166, 255, 0.24);
   padding-left: 12px;
+  position: relative;
 }
 
 .provisional-stream-text {
@@ -1941,10 +1957,11 @@ body {
 }
 
 .provisional-stream-caret {
-  display: inline-block;
+  position: absolute;
+  top: 31px;
+  right: 8px;
   width: 7px;
   height: 1.05em;
-  margin-top: 2px;
   background: currentColor;
   border-radius: 1px;
   animation: provisional-stream-blink 900ms steps(1, end) infinite;
@@ -4831,6 +4848,24 @@ mark.code-search-mark.current {
   color: var(--text2);
   line-height: 1.45;
 }
+
+.goal-command-notice {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  min-height: 30px;
+  padding: 6px 9px;
+  border: 1px solid var(--border);
+  border-radius: 7px;
+  background: var(--panel2);
+  color: var(--text2);
+  font-size: 12px;
+}
+
+.goal-command-notice strong { color: var(--text); }
+.goal-command-notice.applying { border-color: var(--accent); }
+.goal-command-notice.success { border-color: var(--green); }
+.goal-command-notice.failed { border-color: var(--red); }
 
 .composer-meta {
   display: flex;
