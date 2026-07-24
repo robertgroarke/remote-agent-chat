@@ -1,0 +1,31 @@
+{
+  "schema_version": 1,
+  "harness": "codex-cli",
+  "installed_version": "codex-cli 0.145.0",
+  "previous_supported_version": "codex-cli 0.144.6",
+  "captured_contract": "store-backed JSONL plus app-server thread, turn, request-user-input answer, and goal RPC contracts",
+  "source": "installed 0.145.0 generated app-server schema and hidden owned disposable app-server round trip",
+  "app_server_contract": {
+    "transport": "stdio",
+    "question_method": "item/tool/requestUserInput",
+    "native_answer_receipt": "serverRequest/resolved",
+    "same_thread": true,
+    "same_turn": true,
+    "ordinary_answer_messages": 0,
+    "owned_thread_archived": true,
+    "visible_windows_opened": 0
+  },
+  "write_contracts": {
+    "send_message": {
+      "status": "read_only_compatible",
+      "commands": [
+        "send",
+        "send_message",
+        "message_send"
+      ],
+      "scope": "verified_owned_codex_cli_lineage",
+      "evidence": "Exact-version app-server schema plus one hidden owned live thread/turn/question/answer/archive round trip",
+      "does_not_claim_live_delivery": true
+    }
+  }
+}

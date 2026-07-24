@@ -6,6 +6,7 @@ const fs = require('fs');
 const { spawnSync } = require('child_process');
 const path = require('path');
 const { resolveCodexCommand } = require('../agent-proxy/codex-cli');
+const { canonicalAssetBytes } = require('../frontend/build');
 
 const root = path.join(__dirname, '..');
 const args = process.argv.slice(2);
@@ -19,6 +20,8 @@ const stages = [
   ['Session store syntax', process.execPath, ['--check', 'agent-proxy/session-store.js']],
   ['Protocol syntax', process.execPath, ['--check', 'agent-proxy/protocol.js']],
   ['Codex CLI parser and status smoke', process.execPath, ['tools/codex-cli-parser-smoke.js']],
+  ['Native interruption contract and replay smoke', process.execPath, ['tools/native-interruption-contract-smoke.js']],
+  ['Codex native connection lifecycle smoke', process.execPath, ['tools/codex-native-connection-lifecycle-smoke.js']],
   ['Canonical goal, thinking, and current-output timeline smoke', process.execPath, ['tools/live-activity-timeline-smoke.js']],
   ['Codex CLI controls and native launch smoke', process.execPath, ['tools/codex-cli-controls-smoke.js']],
   ['Frontend history reconnect smoke', process.execPath, ['tools/frontend-history-reconnect-smoke.js']],
@@ -49,8 +52,8 @@ const synchronizedAssets = [
 ];
 for (const [source, deployed] of synchronizedAssets) {
   assert.deepStrictEqual(
-    fs.readFileSync(path.join(root, source)),
-    fs.readFileSync(path.join(root, deployed)),
+    canonicalAssetBytes(fs.readFileSync(path.join(root, source))),
+    canonicalAssetBytes(fs.readFileSync(path.join(root, deployed))),
     `${deployed} must exactly match ${source}; run node frontend/build.js`,
   );
 }

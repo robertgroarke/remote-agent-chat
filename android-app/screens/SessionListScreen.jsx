@@ -10,6 +10,7 @@ import { useFocusEffect } from '@react-navigation/native';
 import AsyncStorage from '@react-native-async-storage/async-storage';
 import { RelayClient }   from '../lib/relay';
 import { createStateSequenceGate } from '../lib/state-sequence';
+import { mergeGoalProjectedActivity } from '../lib/goal-projection';
 import {
   createSessionRegistry,
   patchSessionRegistry,
@@ -25,6 +26,7 @@ import {
   partitionSidebarSessionsByWorking,
   reconcileSidebarOrderLedger,
   reconcileSidebarWorkingLedger,
+  sidebarSemanticMembershipOptions,
   sessionIsTestSession,
   sortSidebarOrderLedger,
 } from '../lib/workspace-groups';
@@ -50,9 +52,11 @@ import {
 import { resolveSessionChatTitle, sessionChatTitleMetadataPatch, titleFromSessionMessages } from '../lib/session-title';
 import { partitionPinnedSessions } from '../lib/session-pins';
 import {
+  createRecentChatMembershipLedger,
   latestVisibleMessageSessionPatch,
   normalizeLatestVisibleMessage,
   projectRecentChatOwnership,
+  reconcileRecentChatMembershipLedger,
 } from '../lib/recent-chats';
 import { formatVisibleMessageTime, parseMessageInstant } from '../lib/message-time';
 import {
@@ -424,11 +428,11 @@ function useStableSidebarGroups(groups, rankOptions, freezeStructure = false) {
   };
 }
 
-function useStableWorkingSessions(sessions, freezeStructure = false) {
+function useStableWorkingSessions(sessions, freezeStructure = false, continuityOptions = {}) {
   const [ledger, setLedger] = useState(() => createSidebarWorkingLedger(sessions));
   const projection = useMemo(
-    () => reconcileSidebarWorkingLedger(ledger, sessions, { freezeStructure }),
-    [ledger, sessions, freezeStructure],
+    () => reconcileSidebarWorkingLedger(ledger, sessions, { ...continuityOptions, freezeStructure }),
+    [ledger, sessions, freezeStructure, continuityOptions],
   );
 
   useEffect(() => {
@@ -457,6 +461,18 @@ function useSidebarFreshnessClock(activities, sessions) {
     return () => clearTimeout(timer);
   }, [activities, sessions, nowMs]);
   return nowMs;
+}
+
+function useStableRecentSessions(sessions, freezeStructure = false) {
+  const [ledger, setLedger] = useState(() => createRecentChatMembershipLedger(sessions));
+  const projection = useMemo(
+    () => reconcileRecentChatMembershipLedger(ledger, sessions, { freezeStructure }),
+    [ledger, sessions, freezeStructure],
+  );
+  useEffect(() => {
+    if (projection.ledger !== ledger) setLedger(projection.ledger);
+  }, [ledger, projection]);
+  return projection.sessions;
 }
 
 function migrateSessionKeyedObject(previous, aliasId, canonicalId, mergeValues = null) {
@@ -840,16 +856,17 @@ export default function SessionListScreen({ navigation, route }) {
         if (!sid) break;
         const kind = String(msg.activity?.kind || (msg.thinking ? 'thinking' : 'idle')).toLowerCase();
         const generating = !!msg.thinking || ['thinking', 'generating', 'running_command', 'applying_patch', 'reading_files', 'working'].includes(kind);
-        setActivities(prev => ({
-          ...prev,
-          [sid]: {
+        setActivities(prev => {
+          const incoming = {
             ...(msg.activity || {}),
             kind,
             generating,
             label: msg.label || msg.activity?.label || (generating ? 'Thinking' : ''),
             transport: normalizeFleetActivityTrace(msg.activity_trace),
-          },
-        }));
+          };
+          const merged = mergeGoalProjectedActivity(prev[sid], incoming);
+          return merged === prev[sid] ? prev : { ...prev, [sid]: merged };
+        });
         break;
       }
 
@@ -1042,14 +1059,15 @@ export default function SessionListScreen({ navigation, route }) {
         const patch = msg.patch && typeof msg.patch === 'object' ? msg.patch : {};
         if (patch.activity) {
           const kind = String(patch.activity.kind || 'idle').toLowerCase();
-          setActivities(previous => ({
-            ...previous,
-            [sid]: {
+          setActivities(previous => {
+            const incoming = {
               ...patch.activity,
               kind,
               generating: ['thinking', 'generating', 'running_command', 'applying_patch', 'reading_files', 'working'].includes(kind),
-            },
-          }));
+            };
+            const merged = mergeGoalProjectedActivity(previous[sid], incoming);
+            return merged === previous[sid] ? previous : { ...previous, [sid]: merged };
+          });
         }
         if (patch.status) setHealthMap(previous => ({ ...previous, [sid]: patch.status }));
         break;
@@ -1097,16 +1115,17 @@ export default function SessionListScreen({ navigation, route }) {
         if (msg.status) setHealthMap(previous => ({ ...previous, [sid]: msg.status }));
         if (msg.activity) {
           const kind = String(msg.activity.kind || 'idle').toLowerCase();
-          setActivities(previous => ({
-            ...previous,
-            [sid]: {
+          setActivities(previous => {
+            const incoming = {
               ...msg.activity,
               kind,
               generating: isTranscriptActivityLive(msg.activity),
               label: msg.activity.label || '',
               transport: normalizeFleetActivityTrace(msg.activity_trace),
-            },
-          }));
+            };
+            const merged = mergeGoalProjectedActivity(previous[sid], incoming);
+            return merged === previous[sid] ? previous : { ...previous, [sid]: merged };
+          });
         }
         if (Number(msg.unread_delta) > 0 && sid !== activeSessionRef.current) {
           setUnreadMap(previous => ({
@@ -1431,16 +1450,28 @@ export default function SessionListScreen({ navigation, route }) {
     nowMs: sidebarNowMs,
     requireFreshness: true,
   }), [activities, permPrompts, healthMap, connected, sidebarNowMs]);
+  const sidebarMembershipStateOptions = useMemo(
+    () => sidebarSemanticMembershipOptions(sidebarStateOptions),
+    [sidebarStateOptions],
+  );
   const {
     working: workingSessionCandidates,
     states: sidebarStateBySessionId,
   } = useMemo(
-    () => partitionSidebarSessionsByWorking(visibleSessions, sidebarStateOptions),
-    [visibleSessions, sidebarStateOptions],
+    () => partitionSidebarSessionsByWorking(visibleSessions, sidebarMembershipStateOptions),
+    [visibleSessions, sidebarMembershipStateOptions],
   );
   const { sessions: workingSessions } = useStableWorkingSessions(
     workingSessionCandidates,
     sidebarStructureLocked,
+    useMemo(() => ({
+      nowMs: sidebarNowMs,
+      entryConfirmMs: 2_000,
+      exitGraceMs: 10_000,
+      immediateExitIds: new Set(Object.entries(sidebarStateBySessionId)
+        .filter(([, state]) => state === 'idle' || state === 'needs_attention')
+        .map(([id]) => id)),
+    }), [sidebarNowMs, sidebarStateBySessionId]),
   );
   const workingSessionIds = useMemo(
     () => new Set(workingSessions.map(sessionId)),
@@ -1454,9 +1485,29 @@ export default function SessionListScreen({ navigation, route }) {
     () => new Set(allPinnedSessions.map(sessionId)),
     [allPinnedSessions],
   );
-  const recentChatOwnership = useMemo(
+  const rankedRecentChatOwnership = useMemo(
     () => projectRecentChatOwnership(visibleSessions, { workingSessionIds, pinnedSessionIds }),
     [visibleSessions, workingSessionIds, pinnedSessionIds],
+  );
+  const stableRecentCandidates = useStableRecentSessions(
+    [
+      ...rankedRecentChatOwnership.recent,
+      ...rankedRecentChatOwnership.pinned,
+      ...rankedRecentChatOwnership.remaining,
+    ],
+    sidebarStructureLocked,
+  );
+  const stableRecentSessionIds = useMemo(
+    () => stableRecentCandidates.map(sessionId),
+    [stableRecentCandidates],
+  );
+  const recentChatOwnership = useMemo(
+    () => projectRecentChatOwnership(visibleSessions, {
+      workingSessionIds,
+      pinnedSessionIds,
+      recentSessionIds: stableRecentSessionIds,
+    }),
+    [visibleSessions, workingSessionIds, pinnedSessionIds, stableRecentSessionIds],
   );
   const recentSessions = recentChatOwnership.recent;
   const pinnedSessions = recentChatOwnership.pinned;

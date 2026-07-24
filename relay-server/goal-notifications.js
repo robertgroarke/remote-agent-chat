@@ -106,6 +106,52 @@ function normalizedIso(value) {
   return Number.isFinite(ms) ? new Date(ms).toISOString() : null;
 }
 
+function normalizeGoalProjection(sessionId, value, forcedState = null) {
+  if (!sessionId || !value || typeof value !== 'object') return null;
+  const projectedSessionId = String(value.session_id || '').trim();
+  const surface = String(value.surface || '').trim();
+  const nativeThreadId = String(value.native_thread_id || '').trim();
+  const epoch = Number(value.epoch);
+  const sequence = Number(value.sequence);
+  const state = String(forcedState || value.state || '').trim().toLowerCase();
+  if (projectedSessionId !== String(sessionId)
+      || !surface
+      || !nativeThreadId
+      || !Number.isSafeInteger(epoch)
+      || epoch <= 0
+      || !Number.isSafeInteger(sequence)
+      || sequence <= 0
+      || !['present', 'clear'].includes(state)) return null;
+  return {
+    schema_version: 1,
+    session_id: projectedSessionId,
+    surface,
+    native_thread_id: nativeThreadId,
+    epoch,
+    sequence,
+    state,
+    observed_at: normalizedIso(value.observed_at) || null,
+    reason: String(value.reason || '').trim().slice(0, 120) || null,
+    goal_fingerprint: String(value.goal_fingerprint || value.prior_fingerprint || '').trim() || null,
+    goal_generation: Math.max(
+      0,
+      Number(value.goal_generation ?? value.prior_generation) || 0,
+    ) || null,
+  };
+}
+
+function compareGoalProjectionOrder(left, right) {
+  if (!left && !right) return 0;
+  if (!left) return -1;
+  if (!right) return 1;
+  if (left.epoch !== right.epoch) return left.epoch < right.epoch ? -1 : 1;
+  if (left.sequence !== right.sequence) return left.sequence < right.sequence ? -1 : 1;
+  const leftTime = Date.parse(left.observed_at || '') || 0;
+  const rightTime = Date.parse(right.observed_at || '') || 0;
+  if (leftTime !== rightTime) return leftTime < rightTime ? -1 : 1;
+  return 0;
+}
+
 function telemetryMetadata(value) {
   if (!value || typeof value !== 'object') return {};
   const safe = {};
@@ -186,11 +232,14 @@ class GoalNotificationCoordinator {
     db.prepare('DELETE FROM semantic_notification_telemetry WHERE occurred_at < ?')
       .run(new Date(this.now() - 30 * 24 * 60 * 60 * 1000).toISOString());
     this.getGoal = db.prepare('SELECT * FROM goal_lifecycle_state WHERE session_id = ?');
+    this.deleteGoal = db.prepare('DELETE FROM goal_lifecycle_state WHERE session_id = ?');
     this.upsertGoal = db.prepare(`
       INSERT INTO goal_lifecycle_state
         (session_id, fingerprint, generation, objective_hash, objective, state, raw_state, transition_seq,
-         transition_id, source, native_updated_at, native_cursor_json, observed_at, updated_at)
-      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+         transition_id, source, native_updated_at, native_cursor_json, observed_at, updated_at,
+         projection_surface, projection_native_thread_id, projection_epoch, projection_sequence,
+         projection_observed_at)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
       ON CONFLICT(session_id) DO UPDATE SET
         fingerprint = excluded.fingerprint,
         generation = excluded.generation,
@@ -204,6 +253,28 @@ class GoalNotificationCoordinator {
         native_updated_at = excluded.native_updated_at,
         native_cursor_json = excluded.native_cursor_json,
         observed_at = excluded.observed_at,
+        updated_at = excluded.updated_at,
+        projection_surface = excluded.projection_surface,
+        projection_native_thread_id = excluded.projection_native_thread_id,
+        projection_epoch = excluded.projection_epoch,
+        projection_sequence = excluded.projection_sequence,
+        projection_observed_at = excluded.projection_observed_at
+    `);
+    this.getGoalTombstone = db.prepare('SELECT * FROM goal_lifecycle_tombstone WHERE session_id = ?');
+    this.upsertGoalTombstone = db.prepare(`
+      INSERT INTO goal_lifecycle_tombstone
+        (session_id, surface, native_thread_id, epoch, sequence, prior_fingerprint,
+         prior_generation, observed_at, reason, updated_at)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      ON CONFLICT(session_id) DO UPDATE SET
+        surface = excluded.surface,
+        native_thread_id = excluded.native_thread_id,
+        epoch = excluded.epoch,
+        sequence = excluded.sequence,
+        prior_fingerprint = excluded.prior_fingerprint,
+        prior_generation = excluded.prior_generation,
+        observed_at = excluded.observed_at,
+        reason = excluded.reason,
         updated_at = excluded.updated_at
     `);
     this.getTurn = db.prepare('SELECT * FROM session_turn_lifecycle WHERE session_id = ?');
@@ -255,7 +326,12 @@ class GoalNotificationCoordinator {
         native_updated_at  TEXT,
         native_cursor_json TEXT,
         observed_at        TEXT NOT NULL,
-        updated_at         TEXT NOT NULL
+        updated_at         TEXT NOT NULL,
+        projection_surface TEXT,
+        projection_native_thread_id TEXT,
+        projection_epoch   INTEGER,
+        projection_sequence INTEGER,
+        projection_observed_at TEXT
       );
       CREATE TABLE IF NOT EXISTS session_turn_lifecycle (
         session_id          TEXT PRIMARY KEY,
@@ -263,6 +339,18 @@ class GoalNotificationCoordinator {
         active_anchor       TEXT,
         activity_updated_at TEXT,
         updated_at          TEXT NOT NULL
+      );
+      CREATE TABLE IF NOT EXISTS goal_lifecycle_tombstone (
+        session_id         TEXT PRIMARY KEY,
+        surface            TEXT NOT NULL,
+        native_thread_id   TEXT NOT NULL,
+        epoch              INTEGER NOT NULL,
+        sequence           INTEGER NOT NULL,
+        prior_fingerprint  TEXT,
+        prior_generation   INTEGER,
+        observed_at        TEXT,
+        reason             TEXT,
+        updated_at         TEXT NOT NULL
       );
       CREATE TABLE IF NOT EXISTS semantic_notification_events (
         dedupe_key  TEXT PRIMARY KEY,
@@ -303,6 +391,17 @@ class GoalNotificationCoordinator {
     );
     if (!goalColumns.has('generation')) {
       this.db.exec('ALTER TABLE goal_lifecycle_state ADD COLUMN generation INTEGER NOT NULL DEFAULT 1');
+    }
+    for (const [column, type] of [
+      ['projection_surface', 'TEXT'],
+      ['projection_native_thread_id', 'TEXT'],
+      ['projection_epoch', 'INTEGER'],
+      ['projection_sequence', 'INTEGER'],
+      ['projection_observed_at', 'TEXT'],
+    ]) {
+      if (!goalColumns.has(column)) {
+        this.db.exec(`ALTER TABLE goal_lifecycle_state ADD COLUMN ${column} ${type}`);
+      }
     }
     const telemetryColumns = new Set(
       this.db.prepare('PRAGMA table_info(semantic_notification_telemetry)').all().map(info => info.name),
@@ -346,7 +445,97 @@ class GoalNotificationCoordinator {
     return this._goalFromRow(this.getGoal.get(sessionId));
   }
 
-  _persistGoal(sessionId, goal) {
+  _goalTombstoneFromRow(row) {
+    if (!row) return null;
+    return {
+      schema_version: 1,
+      session_id: row.session_id,
+      surface: row.surface,
+      native_thread_id: row.native_thread_id,
+      epoch: Number(row.epoch),
+      sequence: Number(row.sequence),
+      state: 'clear',
+      prior_fingerprint: row.prior_fingerprint || null,
+      prior_generation: Math.max(0, Number(row.prior_generation) || 0) || null,
+      observed_at: row.observed_at || null,
+      reason: row.reason || null,
+      updated_at: row.updated_at,
+    };
+  }
+
+  currentGoalTombstone(sessionId) {
+    return this._goalTombstoneFromRow(this.getGoalTombstone.get(sessionId));
+  }
+
+  currentGoalProjection(sessionId) {
+    const row = this.getGoal.get(sessionId);
+    if (!row?.projection_surface) return null;
+    return normalizeGoalProjection(sessionId, {
+      session_id: sessionId,
+      surface: row.projection_surface,
+      native_thread_id: row.projection_native_thread_id,
+      epoch: row.projection_epoch,
+      sequence: row.projection_sequence,
+      state: 'present',
+      observed_at: row.projection_observed_at,
+      goal_fingerprint: row.fingerprint,
+      goal_generation: row.generation,
+    }, 'present');
+  }
+
+  _clearGoal(sessionId, incomingTombstone, { code = 'goal_cleared' } = {}) {
+    const nowIso = new Date(this.now()).toISOString();
+    const tombstone = normalizeGoalProjection(sessionId, incomingTombstone, 'clear');
+    const previousTombstone = this.currentGoalTombstone(sessionId);
+    const currentProjection = this.currentGoalProjection(sessionId);
+    if ((!tombstone && currentProjection)
+        || (tombstone && currentProjection
+          && compareGoalProjectionOrder(tombstone, currentProjection) < 0)) {
+      return {
+        goal: this.currentGoal(sessionId),
+        event: null,
+        code: tombstone ? 'stale_goal_clear' : 'unproven_goal_clear_ignored',
+        tombstone: previousTombstone,
+      };
+    }
+    if (tombstone && previousTombstone
+        && compareGoalProjectionOrder(tombstone, previousTombstone) <= 0) {
+      return {
+        goal: this.currentGoal(sessionId),
+        event: null,
+        code: 'stale_goal_clear',
+        tombstone: previousTombstone,
+      };
+    }
+    this.deleteGoal.run(sessionId);
+    if (tombstone) {
+      this.upsertGoalTombstone.run(
+        sessionId,
+        tombstone.surface,
+        tombstone.native_thread_id,
+        tombstone.epoch,
+        tombstone.sequence,
+        tombstone.goal_fingerprint,
+        tombstone.goal_generation,
+        tombstone.observed_at,
+        tombstone.reason,
+        nowIso,
+      );
+    }
+    return {
+      goal: null,
+      event: null,
+      code,
+      tombstone: tombstone ? {
+        ...tombstone,
+        prior_fingerprint: tombstone.goal_fingerprint,
+        prior_generation: tombstone.goal_generation,
+        updated_at: nowIso,
+      } : previousTombstone,
+    };
+  }
+
+  _persistGoal(sessionId, goal, projection = null) {
     this.upsertGoal.run(
       sessionId,
       goal.fingerprint,
@@ -362,6 +551,11 @@ class GoalNotificationCoordinator {
       goal.native_cursor ? JSON.stringify(goal.native_cursor) : null,
       goal.observed_at,
       goal.updated_at,
+      projection?.surface || null,
+      projection?.native_thread_id || null,
+      projection?.epoch || null,
+      projection?.sequence || null,
+      projection?.observed_at || null,
     );
   }
 
@@ -553,11 +747,42 @@ class GoalNotificationCoordinator {
     hydrateOnly = false,
     reconcileLive = false,
     harness = 'unknown',
+    projection = null,
   } = {}) {
     const nowIso = new Date(this.now()).toISOString();
     const current = normalizeGoalRecord(sessionId, incomingGoal, nowIso);
     if (!current) return { goal: this.currentGoal(sessionId), event: null, code: 'missing_goal' };
+    const normalizedProjection = normalizeGoalProjection(sessionId, projection, 'present');
+    if (harness === 'codex-desktop' && (!normalizedProjection
+        || normalizedProjection.surface !== 'codex-desktop'
+        || normalizedProjection.goal_fingerprint !== current.fingerprint
+        || normalizedProjection.goal_generation !== current.generation)) {
+      if (this.currentGoalProjection(sessionId)) {
+        return {
+          goal: this.currentGoal(sessionId),
+          event: null,
+          code: 'unowned_codex_desktop_goal_ignored',
+          tombstone: this.currentGoalTombstone(sessionId),
+        };
+      }
+      return this._clearGoal(sessionId, null, { code: 'unowned_codex_desktop_goal' });
+    }
+    const tombstone = this.currentGoalTombstone(sessionId);
+    if (normalizedProjection && tombstone
+        && compareGoalProjectionOrder(normalizedProjection, tombstone) <= 0) {
+      return {
+        goal: this.currentGoal(sessionId),
+        event: null,
+        code: 'tombstoned_goal_replay',
+        tombstone,
+      };
+    }
     const previous = this.currentGoal(sessionId);
+    const previousProjection = this.currentGoalProjection(sessionId);
+    if (normalizedProjection && previousProjection
+        && compareGoalProjectionOrder(normalizedProjection, previousProjection) < 0) {
+      return { goal: previous, event: null, code: 'out_of_order_projection' };
+    }
     const incomingTime = Date.parse(current.native_updated_at || current.observed_at || '') || 0;
     const previousTime = Date.parse(previous?.native_updated_at || previous?.observed_at || '') || 0;
     if (previous && previous.fingerprint !== current.fingerprint) {
@@ -578,12 +803,12 @@ class GoalNotificationCoordinator {
       if (outOfOrder) return { goal: previous, event: null, code: 'out_of_order' };
       if (current.transition_id === previous.transition_id) {
         const duplicate = { ...current, transition_seq: Math.max(previous.transition_seq, current.transition_seq) };
-        this._persistGoal(sessionId, duplicate);
+        this._persistGoal(sessionId, duplicate, normalizedProjection);
         return { goal: duplicate, event: null, code: 'duplicate' };
       }
     }
 
-    this._persistGoal(sessionId, current);
+    this._persistGoal(sessionId, current, normalizedProjection);
     const transitionIsFresh = Math.abs(this.now() - (incomingTime || this.now())) <= this.liveWindowMs;
     const reconcileHydration = hydrateOnly
       && reconcileLive
@@ -630,11 +855,30 @@ class GoalNotificationCoordinator {
   } = {}) {
     const nowMs = this.now();
     const nowIso = new Date(nowMs).toISOString();
-    const goalResult = activity?.goal
-      ? this.observeGoal(sessionId, activity.goal, {
-          sessionName, hydrateOnly, reconcileLive, harness,
-        })
-      : { goal: this.currentGoal(sessionId), event: null, code: 'missing_goal' };
+    const hasGoal = !!activity && Object.prototype.hasOwnProperty.call(activity, 'goal');
+    const projection = normalizeGoalProjection(sessionId, activity?.goal_projection);
+    const tombstone = normalizeGoalProjection(sessionId, activity?.goal_tombstone, 'clear');
+    let goalResult;
+    if (tombstone || projection?.state === 'clear' || (hasGoal && activity.goal === null)) {
+      const clearProjection = tombstone || projection;
+      if (harness === 'codex-desktop' && (!clearProjection
+          || clearProjection.surface !== 'codex-desktop')) {
+        goalResult = this._clearGoal(sessionId, null, { code: 'unproven_codex_desktop_goal_clear' });
+      } else {
+        goalResult = this._clearGoal(sessionId, clearProjection, { code: 'goal_cleared' });
+      }
+    } else if (hasGoal && activity.goal) {
+      goalResult = this.observeGoal(sessionId, activity.goal, {
+        sessionName, hydrateOnly, reconcileLive, harness, projection,
+      });
+    } else {
+      goalResult = {
+        goal: this.currentGoal(sessionId),
+        event: null,
+        code: 'missing_goal',
+        tombstone: this.currentGoalTombstone(sessionId),
+      };
+    }
     const previousTurn = this.getTurn.get(sessionId);
     const turnCapability = turnReadyCapabilityForHarness(harness);
     const kind = String(activity?.kind || 'idle').trim().toLowerCase() || 'idle';
@@ -694,6 +938,7 @@ class GoalNotificationCoordinator {
       suppressions: suppressedTurnReady ? [suppressedTurnReady] : [],
       turn_capability: turnCapability,
       code: goalResult.code,
+      goal_tombstone: goalResult.goal ? null : (goalResult.tombstone || null),
     };
   }
 
@@ -703,7 +948,19 @@ class GoalNotificationCoordinator {
       .map(row => {
         try { return JSON.parse(row.payload_json); } catch { return null; }
       })
-      .filter(event => event && event.event_type !== 'turn_ready');
+      .filter(event => {
+        if (!event || event.event_type === 'turn_ready') return false;
+        if (!String(event.event_type || '').startsWith('goal_')) return true;
+        const sessionId = String(event.session_id || event.session || '').trim();
+        const tombstone = sessionId ? this.currentGoalTombstone(sessionId) : null;
+        if (!tombstone) return true;
+        const eventFingerprint = String(event.goal?.fingerprint || '').trim();
+        const priorFingerprint = String(tombstone.prior_fingerprint || '').trim();
+        if (eventFingerprint && priorFingerprint && eventFingerprint === priorFingerprint) return false;
+        const eventTime = Date.parse(event.created_at || '') || 0;
+        const clearTime = Date.parse(tombstone.observed_at || tombstone.updated_at || '') || 0;
+        return !(eventTime > 0 && clearTime > 0 && eventTime <= clearTime);
+      });
   }
 }
 

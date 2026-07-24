@@ -3,6 +3,10 @@
 const assert = require('assert');
 const Database = require('../relay-server/node_modules/better-sqlite3');
 const { SessionAliasReconciler } = require('../relay-server/session-alias-reconciler');
+const {
+  canMigrateSurfaceScopedState,
+  isSurfaceScopedSessionMessage,
+} = require('../relay-server/session-surface-state');
 
 const aliasId = process.env.RAC_IDENTITY_ALIAS_SESSION_ID || 'bbbbbbbb-cccc-4ddd-8eee-ffffffffffff';
 const canonicalId = process.env.RAC_IDENTITY_CANONICAL_SESSION_ID || 'aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee';
@@ -138,6 +142,93 @@ const staleCollision = reconciler.reconcile({
 });
 assert.strictEqual(staleCollision.accepted, false);
 assert.strictEqual(staleCollision.reason, 'stale_alias_generation');
+const unverifiedRelease = reconciler.release({
+  alias_session_id: aliasId,
+  prior_canonical_session_id: canonicalId,
+  current_surface: 'codex_cli',
+  owner_evidence: { verified: false, observed_at: '2026-07-21T18:00:02.000Z' },
+});
+assert.strictEqual(unverifiedRelease.accepted, false);
+assert.strictEqual(unverifiedRelease.reason, 'verified_cli_owner_required');
+const staleRelease = reconciler.release({
+  alias_session_id: aliasId,
+  prior_canonical_session_id: canonicalId,
+  current_surface: 'codex_cli',
+  owner_evidence: { verified: true, observed_at: '2026-07-20T18:00:02.000Z' },
+});
+assert.strictEqual(staleRelease.accepted, false);
+assert.strictEqual(staleRelease.reason, 'stale_alias_release');
+const releaseEvent = {
+  alias_session_id: aliasId,
+  prior_canonical_session_id: canonicalId,
+  canonical_conversation_id: `codex:${nativeId}`,
+  canonical_native_id: nativeId,
+  current_surface: 'codex_cli',
+  release_reason: 'verified_cli_owner_restored',
+  owner_evidence: { verified: true, observed_at: '2026-07-21T18:00:02.000Z' },
+};
+const release = reconciler.release(releaseEvent);
+assert.strictEqual(release.accepted, true);
+assert.strictEqual(release.reason, 'released');
+assert.strictEqual(reconciler.resolve(aliasId), aliasId);
+assert.strictEqual(reconciler.aliases.has(aliasId), false);
+const tombstone = db.prepare('SELECT active, released_at FROM session_aliases WHERE alias_session_id = ?').get(aliasId);
+assert.strictEqual(tombstone.active, 0);
+assert(tombstone.released_at);
+const releaseReplay = reconciler.release(releaseEvent);
+assert.strictEqual(releaseReplay.accepted, true);
+assert.strictEqual(releaseReplay.reason, 'idempotent_release_replay');
+const staleAliasReplay = reconciler.reconcile(event);
+assert.strictEqual(staleAliasReplay.accepted, false);
+assert.strictEqual(staleAliasReplay.reason, 'stale_alias_generation');
+
+assert.strictEqual(isSurfaceScopedSessionMessage({ type: 'agent_config' }), true);
+assert.strictEqual(isSurfaceScopedSessionMessage({ type: 'message' }), false);
+assert.strictEqual(canMigrateSurfaceScopedState(
+  { agent_type: 'codex_cli' },
+  { agent_type: 'codex-desktop' },
+), false, 'cross-surface aliases must not migrate capability/config state');
+assert.strictEqual(canMigrateSurfaceScopedState(
+  { agent_type: 'codex-desktop' },
+  { agent_type: 'codex-desktop' },
+), true, 'same-surface aliases may retain their config state');
+
+db.close();
+
+const legacyDb = new Database(':memory:');
+legacyDb.exec(`
+  CREATE TABLE session_aliases (
+    alias_session_id TEXT PRIMARY KEY,
+    canonical_session_id TEXT NOT NULL,
+    canonical_conversation_id TEXT,
+    canonical_native_id TEXT,
+    current_surface TEXT,
+    suppression_reason TEXT NOT NULL,
+    generation_clock REAL NOT NULL DEFAULT 0,
+    receipt_hash TEXT NOT NULL,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL
+  );
+`);
+legacyDb.prepare('INSERT INTO session_aliases VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)')
+  .run(
+    aliasId,
+    canonicalId,
+    `codex:${nativeId}`,
+    nativeId,
+    'codex_desktop',
+    'legacy_active_alias',
+    1,
+    'legacy-receipt',
+    '2026-07-20T18:00:00.000Z',
+    '2026-07-20T18:00:00.000Z',
+  );
+const migratedLegacyReconciler = new SessionAliasReconciler(legacyDb);
+const migratedColumns = new Set(legacyDb.prepare('PRAGMA table_info(session_aliases)').all().map(row => row.name));
+assert(migratedColumns.has('active'));
+assert(migratedColumns.has('released_at'));
+assert.strictEqual(migratedLegacyReconciler.resolve(aliasId), canonicalId);
+legacyDb.close();
 
 console.log(JSON.stringify({
   ok: true,
@@ -147,5 +238,9 @@ console.log(JSON.stringify({
   messages_after_dedupe: 2,
   idempotent_replay: true,
   stale_generation_rejected: true,
+  verified_owner_release: true,
+  release_tombstone_active: true,
+  stale_alias_replay_rejected: true,
+  legacy_schema_migration: true,
+  cross_surface_config_isolated: true,
 }, null, 2));
-db.close();

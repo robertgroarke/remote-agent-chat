@@ -17,6 +17,7 @@
   },
   "expected_observed": {
     "native_thread_id": "local:client-new-thread:fixture",
+    "native_turn_id": "019f0000-0000-7000-8000-000000000001",
     "native_signature": "fixture-native-signature",
     "title": "Choose the validation branch.",
     "questions": [

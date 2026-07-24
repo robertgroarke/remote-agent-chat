@@ -1,0 +1,14 @@
+{
+  "surface": "codex-desktop",
+  "version": "26.715.9868.0",
+  "cases": [
+    {"name":"reported-5-of-5","turn":"turn-current","html":"<div class=\"group/activity-header\" data-codex-activity-header=\"native-reconnect\"><svg class=\"animate-spin\" aria-hidden=\"true\"></svg><span>Reconnecting <span aria-hidden=\"true\">5</span>/5</span></div>","state":"reconnecting","attempt":5,"attempt_limit":5},
+    {"name":"attempt-1","turn":"turn-current","html":"<div class=\"group/activity-header\" data-codex-activity-header=\"native-reconnect\"><svg aria-hidden=\"true\"></svg><span>Reconnecting 1/5</span></div>","state":"reconnecting","attempt":1,"attempt_limit":5},
+    {"name":"reconnected","turn":"turn-current","html":"<div class=\"group/activity-header\" data-codex-activity-header=\"native-reconnect\"><svg aria-hidden=\"true\"></svg><span>Reconnected</span></div>","state":"reconnected"},
+    {"name":"failed","turn":"turn-current","html":"<div class=\"group/activity-header\" data-codex-activity-header=\"native-reconnect\"><svg aria-hidden=\"true\"></svg><span>Failed to reconnect</span></div>","state":"failed"},
+    {"name":"missing-counter","turn":"turn-current","html":"<div class=\"group/activity-header\" data-codex-activity-header=\"native-reconnect\"><svg aria-hidden=\"true\"></svg><span>Reconnecting <span aria-hidden=\"true\"></span>/5</span></div>","diagnostic":"native_connection_counter_missing"},
+    {"name":"background-decoy","turn":"turn-current","before":"<aside><div class=\"group/activity-header\"><svg></svg><span>Reconnecting 5/5</span></div></aside>","html":"<div class=\"group/activity-header\"><span>Reviewing stable output</span></div>","state":null},
+    {"name":"hidden-decoy","turn":"turn-current","before":"<div style=\"display:none\"><div class=\"group/activity-header\"><svg></svg><span>Reconnecting 5/5</span></div></div>","html":"<div class=\"group/activity-header\"><span>Reviewing stable output</span></div>","state":null},
+    {"name":"historical-decoy","turn":"turn-current","before":"<div data-turn-key=\"turn-old\"><div class=\"group/activity-header\"><svg></svg><span>Reconnecting 4/5</span></div></div>","html":"<div class=\"group/activity-header\"><span>Reviewing stable output</span></div>","state":null}
+  ]
+}

@@ -102,12 +102,57 @@ function adaptLegacyQuestionPermissionPrompt(raw) {
 }
 
 class QuestionPromptRegistry {
-  constructor({ now = () => Date.now(), maxEntries = 4096, terminalTtlMs = 5 * 60 * 1000 } = {}) {
+  constructor({
+    now = () => Date.now(),
+    maxEntries = 4096,
+    terminalTtlMs = 5 * 60 * 1000,
+    tombstoneTtlMs = 30 * 24 * 60 * 60 * 1000,
+    initialTombstones = [],
+    onTombstone = null,
+  } = {}) {
     this.now = now;
     this.maxEntries = Math.max(32, Number(maxEntries) || 4096);
     this.terminalTtlMs = Math.max(1000, Number(terminalTtlMs) || 5 * 60 * 1000);
+    this.tombstoneTtlMs = Math.max(this.terminalTtlMs, Number(tombstoneTtlMs) || 30 * 24 * 60 * 60 * 1000);
+    this.onTombstone = typeof onTombstone === 'function' ? onTombstone : null;
     this.entries = new Map();
     this.requestBindings = new Map();
+    this.tombstones = new Map();
+    for (const raw of Array.isArray(initialTombstones) ? initialTombstones : []) {
+      if (!raw?.session_id || !raw?.prompt_id || !raw?.generation || !raw?.lifecycle || !raw?.terminal_at) continue;
+      this.tombstones.set(keyFor(raw.session_id, raw.prompt_id), {
+        session_id: String(raw.session_id),
+        prompt_id: String(raw.prompt_id),
+        generation: String(raw.generation),
+        lifecycle: String(raw.lifecycle),
+        terminal_at: String(raw.terminal_at),
+        error_code: raw.error_code ? String(raw.error_code) : null,
+      });
+    }
+    this.prune();
+  }
+
+  _recordTombstone(entry) {
+    if (!entry?.terminalAt || !entry?.prompt) return null;
+    const key = keyFor(entry.prompt.session_id, entry.prompt.prompt_id);
+    const existing = this.tombstones.get(key);
+    if (existing) {
+      if (existing.generation !== entry.prompt.generation) {
+        fail('prompt_id_collision', 'prompt ID was reused for a different generation');
+      }
+      return existing;
+    }
+    const tombstone = {
+      session_id: entry.prompt.session_id,
+      prompt_id: entry.prompt.prompt_id,
+      generation: entry.prompt.generation,
+      lifecycle: entry.lifecycle,
+      terminal_at: entry.terminalAt,
+      error_code: entry.errorCode || null,
+    };
+    this.tombstones.set(key, tombstone);
+    if (this.onTombstone) this.onTombstone({ ...tombstone });
+    return tombstone;
   }
 
   open(rawPrompt) {
@@ -120,6 +165,22 @@ class QuestionPromptRegistry {
       throw safeError(error);
     }
     const key = keyFor(prompt.session_id, prompt.prompt_id);
+    const tombstone = this.tombstones.get(key);
+    if (tombstone) {
+      if (tombstone.generation !== prompt.generation) {
+        fail('prompt_id_collision', 'prompt ID was reused for a different generation');
+      }
+      return {
+        status: 'terminal_duplicate',
+        prompt: {
+          ...prompt,
+          lifecycle: tombstone.lifecycle,
+          terminal_at: tombstone.terminal_at,
+          ...(tombstone.error_code ? { error_code: tombstone.error_code } : {}),
+        },
+        replaced: [],
+      };
+    }
     const existing = this.entries.get(key);
     if (existing) {
       if (existing.prompt.generation !== prompt.generation) {
@@ -136,6 +197,7 @@ class QuestionPromptRegistry {
       entry.errorCode = 'replaced_by_native_prompt';
       entry.error = 'The native surface replaced this question.';
       if (entry.requestId) this.requestBindings.delete(entry.requestId);
+      this._recordTombstone(entry);
       replaced.push(publicView(entry));
     }
     const entry = {
@@ -186,6 +248,18 @@ class QuestionPromptRegistry {
       this.entries.set(destinationKey, entry);
       migrated += 1;
     }
+    for (const [key, tombstone] of [...this.tombstones]) {
+      if (tombstone.session_id !== aliasSessionId) continue;
+      const destinationKey = keyFor(canonicalSessionId, tombstone.prompt_id);
+      const existing = this.tombstones.get(destinationKey);
+      this.tombstones.delete(key);
+      if (existing && existing.generation !== tombstone.generation) continue;
+      if (existing && Date.parse(existing.terminal_at) >= Date.parse(tombstone.terminal_at)) continue;
+      const migratedTombstone = { ...tombstone, session_id: canonicalSessionId };
+      this.tombstones.set(destinationKey, migratedTombstone);
+      if (this.onTombstone) this.onTombstone({ ...migratedTombstone });
+      migrated += 1;
+    }
     return migrated;
   }
 
@@ -206,6 +280,7 @@ class QuestionPromptRegistry {
       entry.terminalAt = new Date(this.now()).toISOString();
       entry.errorCode = 'native_deadline_elapsed';
       entry.error = 'The native question deadline elapsed.';
+      this._recordTombstone(entry);
       fail('prompt_expired', 'question prompt expired before this response');
     }
     let response;
@@ -252,6 +327,7 @@ class QuestionPromptRegistry {
     entry.error = ok ? null : String(error || 'The native question did not accept the response.').slice(0, 500);
     entry.nativeAttempted = nativeAttempted == null ? entry.nativeAttempted : nativeAttempted === true;
     entry.retryable = !ok && retryable === true && entry.nativeAttempted === false;
+    this._recordTombstone(entry);
     return publicView(entry);
   }
 
@@ -267,13 +343,42 @@ class QuestionPromptRegistry {
     });
   }
 
-  terminalFromSource({ session_id: sessionId, prompt_id: promptId, generation, lifecycle, error_code: errorCode, error } = {}) {
-    const entry = this.entries.get(keyFor(sessionId, promptId));
-    if (!entry) return null;
-    if (entry.prompt.generation !== generation) fail('stale_generation', 'source terminal state has a stale generation');
+  terminalFromSource({
+    session_id: sessionId,
+    prompt_id: promptId,
+    generation,
+    lifecycle,
+    terminal_at: terminalAt,
+    error_code: errorCode,
+    error,
+  } = {}) {
     if (!['answered', 'auto_resolved', 'cancelled', 'expired', 'failed'].includes(lifecycle)) {
       fail('invalid_terminal_lifecycle', 'source lifecycle is not terminal');
     }
+    if (!sessionId || !promptId || !generation) fail('invalid_question_prompt_state', 'terminal prompt identity is incomplete');
+    const key = keyFor(sessionId, promptId);
+    const entry = this.entries.get(key);
+    if (!entry) {
+      const existing = this.tombstones.get(key);
+      if (existing) {
+        if (existing.generation !== generation) fail('stale_generation', 'source terminal state has a stale generation');
+        return { ...existing };
+      }
+      const tombstone = {
+        session_id: sessionId,
+        prompt_id: promptId,
+        generation,
+        lifecycle,
+        terminal_at: terminalAt && Number.isFinite(Date.parse(terminalAt))
+          ? terminalAt
+          : new Date(this.now()).toISOString(),
+        error_code: errorCode ? String(errorCode).slice(0, 120) : null,
+      };
+      this.tombstones.set(key, tombstone);
+      if (this.onTombstone) this.onTombstone({ ...tombstone });
+      return { ...tombstone };
+    }
+    if (entry.prompt.generation !== generation) fail('stale_generation', 'source terminal state has a stale generation');
     if (['answered', 'auto_resolved', 'cancelled', 'expired', 'failed'].includes(entry.lifecycle)) {
       if (entry.lifecycle === lifecycle) return publicView(entry);
       fail('terminal_prompt', `question prompt is already ${entry.lifecycle}`);
@@ -286,6 +391,7 @@ class QuestionPromptRegistry {
     entry.terminalAt = new Date(this.now()).toISOString();
     entry.errorCode = errorCode ? String(errorCode).slice(0, 120) : null;
     entry.error = error ? String(error).slice(0, 500) : null;
+    this._recordTombstone(entry);
     return publicView(entry);
   }
 
@@ -299,6 +405,7 @@ class QuestionPromptRegistry {
     entry.terminalAt = new Date(this.now()).toISOString();
     entry.errorCode = 'native_deadline_elapsed';
     entry.error = 'The native question deadline elapsed.';
+    this._recordTombstone(entry);
     return publicView(entry);
   }
 
@@ -313,6 +420,7 @@ class QuestionPromptRegistry {
       entry.errorCode = code;
       entry.error = message;
       entry.retryable = false;
+      this._recordTombstone(entry);
       failed.push(publicView(entry));
     }
     return failed;
@@ -329,6 +437,7 @@ class QuestionPromptRegistry {
       entry.errorCode = 'adapter_disconnected_during_submit';
       entry.error = 'The native question adapter disconnected before a receipt arrived.';
       entry.retryable = false;
+      this._recordTombstone(entry);
       failed.push(publicView(entry));
     }
     return failed;
@@ -354,6 +463,7 @@ class QuestionPromptRegistry {
       entry.errorCode = 'native_receipt_timeout';
       entry.error = 'The native question response receipt timed out.';
       entry.retryable = false;
+      this._recordTombstone(entry);
       failed.push(publicView(entry));
     }
     return failed;
@@ -365,11 +475,18 @@ class QuestionPromptRegistry {
       if (now - Date.parse(entry.terminalAt) < this.terminalTtlMs) continue;
       this.entries.delete(key);
     }
+    for (const [key, tombstone] of this.tombstones) {
+      if (now - Date.parse(tombstone.terminal_at) < this.tombstoneTtlMs) continue;
+      this.tombstones.delete(key);
+    }
     while (this.entries.size > this.maxEntries) {
       const oldest = this.entries.keys().next().value;
       const entry = this.entries.get(oldest);
       if (entry?.requestId) this.requestBindings.delete(entry.requestId);
       this.entries.delete(oldest);
+    }
+    while (this.tombstones.size > this.maxEntries) {
+      this.tombstones.delete(this.tombstones.keys().next().value);
     }
   }
 }

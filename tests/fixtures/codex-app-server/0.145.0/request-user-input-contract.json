@@ -1,0 +1,19 @@
+{
+  "fixture_version": 1,
+  "derived_from": "codex app-server generate-json-schema --experimental",
+  "codex_cli_version": "0.145.0",
+  "method": "item/tool/requestUserInput",
+  "request_envelope_required": ["id", "method", "params"],
+  "params_required": ["itemId", "questions", "threadId", "turnId"],
+  "params_optional": ["autoResolutionMs"],
+  "question_required": ["header", "id", "question"],
+  "question_optional": ["isOther", "isSecret", "options"],
+  "option_required": ["description", "label"],
+  "response_required": ["answers"],
+  "answer_required": ["answers"],
+  "generated_schema_sha256": {
+    "ToolRequestUserInputParams.json": "21E569E32C05D51C1EE5E587730C182B911EDE97A4DF267F6E4EF24E1717F34E",
+    "ToolRequestUserInputResponse.json": "14EDE53C2E51B289FB3C80903292D4B0F0B387EAE217DBB257C201B2B7C65BF1",
+    "ServerRequest.json": "5ABE765FF9BD94B88F2F2FB417025EC011EAC172925FFDFC74D7CCF2542BC114"
+  }
+}

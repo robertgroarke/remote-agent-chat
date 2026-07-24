@@ -109,6 +109,135 @@ function asIdSet(value) {
   return new Set(Array.from(value, item => String(item || '')));
 }
 
+function asIdList(value) {
+  if (!value || typeof value[Symbol.iterator] !== 'function') return [];
+  return [...new Set(Array.from(value, item => String(item || '')).filter(Boolean))];
+}
+
+function latestVisibleMessageRevision(session) {
+  const latest = normalizeLatestVisibleMessage(session);
+  return latest ? `${latest.atMs}|${latest.kind}|${latest.source}` : '';
+}
+
+function uniqueSessionInventory(sessions) {
+  const seen = new Set();
+  return (Array.isArray(sessions) ? sessions : []).filter(session => {
+    const id = sessionIdOf(session);
+    if (!id || seen.has(id)) return false;
+    seen.add(id);
+    return true;
+  });
+}
+
+function createRecentChatMembershipLedger(sessions, options = {}) {
+  const inventory = uniqueSessionInventory(sessions);
+  const limit = Number.isSafeInteger(options.limit) && options.limit >= 0
+    ? options.limit : DEFAULT_RECENT_CHAT_LIMIT;
+  const ranked = rankRecentChatSessions(inventory);
+  const sessionOrder = ranked.slice(0, limit).map(sessionIdOf);
+  return {
+    version: 1,
+    revision: Number(options.revision || 0),
+    limit,
+    sessionOrder,
+    knownSessionIds: inventory.map(sessionIdOf),
+    messageRevisionById: Object.fromEntries(inventory.map(session => [
+      sessionIdOf(session), latestVisibleMessageRevision(session),
+    ]).filter(([, revision]) => !!revision)),
+    fallbackSessionById: Object.fromEntries(sessionOrder.map(id => [
+      id, inventory.find(session => sessionIdOf(session) === id),
+    ]).filter(([, session]) => !!session)),
+  };
+}
+
+function reconcileRecentChatMembershipLedger(ledger, sessions, options = {}) {
+  const inventory = uniqueSessionInventory(sessions);
+  const sourceById = Object.fromEntries(inventory.map(session => [sessionIdOf(session), session]));
+  const current = ledger?.version === 1
+    ? ledger : createRecentChatMembershipLedger(inventory, options);
+  const limit = Number.isSafeInteger(options.limit) && options.limit >= 0
+    ? options.limit : Number(current.limit ?? DEFAULT_RECENT_CHAT_LIMIT);
+  const ranked = rankRecentChatSessions(inventory);
+  const rankedIds = ranked.map(sessionIdOf);
+  if ((current.sessionOrder || []).length === 0 && rankedIds.length > 0) {
+    const cold = createRecentChatMembershipLedger(inventory, {
+      limit,
+      revision: Number(current.revision || 0) + 1,
+    });
+    return { ledger: cold, sessions: cold.sessionOrder.map(id => sourceById[id]), structuralChanged: true };
+  }
+
+  const knownSessionIds = new Set(current.knownSessionIds || []);
+  const currentRevisions = current.messageRevisionById || {};
+  const observedRevisions = {};
+  const semanticIds = [];
+  for (const session of inventory) {
+    const id = sessionIdOf(session);
+    const revision = latestVisibleMessageRevision(session);
+    if (!revision) continue;
+    observedRevisions[id] = revision;
+    if (!knownSessionIds.has(id) || (currentRevisions[id] && currentRevisions[id] !== revision)) {
+      semanticIds.push(id);
+    }
+  }
+
+  if (options.freezeStructure && semanticIds.length > 0) {
+    return {
+      ledger: current,
+      sessions: (current.sessionOrder || []).map(id => sourceById[id]
+        || current.fallbackSessionById?.[id]).filter(Boolean),
+      structuralChanged: false,
+      deferred: true,
+    };
+  }
+
+  const semanticSet = new Set(semanticIds);
+  const promoted = rankedIds.filter(id => semanticSet.has(id));
+  const sessionOrder = [...promoted];
+  for (const id of current.sessionOrder || []) {
+    if (!semanticSet.has(id) && !sessionOrder.includes(id)) sessionOrder.push(id);
+  }
+  for (const id of rankedIds) {
+    if (sessionOrder.length >= limit) break;
+    if (!sessionOrder.includes(id)) sessionOrder.push(id);
+  }
+  sessionOrder.splice(limit);
+
+  const nextKnown = [...knownSessionIds];
+  for (const id of Object.keys(sourceById)) if (!knownSessionIds.has(id)) nextKnown.push(id);
+  const nextRevisions = { ...currentRevisions, ...observedRevisions };
+  const structuralChanged = sessionOrder.join('|') !== (current.sessionOrder || []).join('|');
+  const observationsChanged = nextKnown.length !== knownSessionIds.size
+    || Object.entries(observedRevisions).some(([id, revision]) => currentRevisions[id] !== revision);
+  if (!structuralChanged && !observationsChanged && Number(current.limit) === limit) {
+    return {
+      ledger: current,
+      sessions: sessionOrder.map(id => sourceById[id]
+        || current.fallbackSessionById?.[id]).filter(Boolean),
+      structuralChanged: false,
+      deferred: false,
+    };
+  }
+
+  const next = {
+    version: 1,
+    revision: Number(current.revision || 0) + (structuralChanged ? 1 : 0),
+    limit,
+    sessionOrder,
+    knownSessionIds: nextKnown,
+    messageRevisionById: nextRevisions,
+    fallbackSessionById: Object.fromEntries(sessionOrder.map(id => [
+      id, sourceById[id] || current.fallbackSessionById?.[id],
+    ]).filter(([, session]) => !!session)),
+  };
+  return {
+    ledger: next,
+    sessions: sessionOrder.map(id => sourceById[id] || next.fallbackSessionById[id]).filter(Boolean),
+    structuralChanged,
+    deferred: false,
+  };
+}
+
 function projectRecentChatOwnership(sessions, options = {}) {
   const workingSessionIds = asIdSet(options.workingSessionIds);
   const pinnedSessionIds = asIdSet(options.pinnedSessionIds);
@@ -128,7 +257,12 @@ function projectRecentChatOwnership(sessions, options = {}) {
 
   const working = visible.filter(session => workingSessionIds.has(sessionIdOf(session)));
   const nonWorking = visible.filter(session => !workingSessionIds.has(sessionIdOf(session)));
-  const recent = rankRecentChatSessions(nonWorking).slice(0, limit);
+  const explicitRecentIds = options.recentSessionIds == null
+    ? null : asIdList(options.recentSessionIds);
+  const nonWorkingById = new Map(nonWorking.map(session => [sessionIdOf(session), session]));
+  const recent = explicitRecentIds == null
+    ? rankRecentChatSessions(nonWorking).slice(0, limit)
+    : explicitRecentIds.map(id => nonWorkingById.get(id)).filter(Boolean).slice(0, limit);
   const recentIds = new Set(recent.map(sessionIdOf));
   const afterRecent = nonWorking.filter(session => !recentIds.has(sessionIdOf(session)));
   const pinned = afterRecent
@@ -150,8 +284,11 @@ export {
   VISIBLE_MESSAGE_KINDS,
   canonicalMessageKind,
   compareRecentChatSessions,
+  createRecentChatMembershipLedger,
   latestVisibleMessageSessionPatch,
+  latestVisibleMessageRevision,
   normalizeLatestVisibleMessage,
   projectRecentChatOwnership,
   rankRecentChatSessions,
+  reconcileRecentChatMembershipLedger,
 };

@@ -75,6 +75,18 @@ const canonicalTypes = [
 
 assert(hasAll(androidBubble, canonicalTypes.map(type => `case '${type}'`)),
   'Android must render every canonical structured block');
+assert(hasAll(androidActivity, [
+  "activity?.interruption?.resolution_state === 'unresolved'",
+  'testID="native-interruption-row"',
+  'interruption.safe_display_text',
+  'Needs attention',
+]), 'Android must render unresolved native interruptions as an accessible current-session banner');
+assert(hasAll(webApp, [
+  "activity?.interruption?.resolution_state === 'unresolved'",
+  'data-live-channel="native-interruption"',
+  'interruption.safe_display_text',
+  'Needs attention',
+]), 'Web must render the same unresolved native interruption contract');
 assert.match(androidRelay, /client_message_id:\s*clientMsgId/,
   'Android sends must use the relay client_message_id contract');
 assert.strictEqual(count(androidChat, /case 'agent_control_result'/g), 1,
@@ -618,6 +630,8 @@ const rows = [
     'Both clients prefer canonical prompt blocks, restore prompts, submit choices, clear success, and surface failed responses.'],
   ['Canonical permission, notice, and actionable-error surfaces', 'PARITY',
     'Proxy events carry prompt/notice/error blocks; web and Android preserve the specialized controls while preferring typed labels and content.'],
+  ['Native interruption transcript and current-session banner', 'PARITY',
+    'Web and Android render the same versioned unresolved interruption record as a dated error block plus an accessible Needs-attention banner, while resolved tombstones remain passive.'],
   ['Interrupt', 'PARITY',
     'Both clients issue agent_interrupt from the active session surface.'],
   ['Model, mode, permission, effort, access, and workspace controls', 'PARITY',

@@ -46,9 +46,12 @@ function latestMessageTimestamp(messages) {
 
 function sidebarSessionState(session, options = {}) {
   const id = sessionIdOf(session);
-  const sourceActivity = options.activities?.[id]
-    || (typeof session === 'object' ? session.activity : null)
-    || { kind: 'idle' };
+  const activityMap = options.activities && typeof options.activities === 'object'
+    ? options.activities : {};
+  const hasLiveActivity = Object.prototype.hasOwnProperty.call(activityMap, id);
+  const sourceActivity = hasLiveActivity
+    ? (activityMap[id] || { kind: 'idle' })
+    : ((typeof session === 'object' ? session.activity : null) || { kind: 'idle' });
   const thinking = !!options.thinking?.[id];
   const activity = thinking && !sourceActivity.generating
     ? { ...sourceActivity, kind: ACTIVE_ACTIVITY_KINDS.has(String(sourceActivity.kind || '').toLowerCase()) ? sourceActivity.kind : 'thinking', generating: true }
@@ -79,6 +82,10 @@ function partitionSidebarSessionsByWorking(sessions, options = {}) {
   return { working, nonWorking, states };
 }
 
+function sidebarSemanticMembershipOptions(options = {}) {
+  return { ...options, requireFreshness: false };
+}
+
 function createSidebarWorkingLedger(workingSessions, options = {}) {
   const sessions = Array.isArray(workingSessions) ? workingSessions : [];
   const sessionOrder = sessions.map(sessionIdOf).filter(Boolean);
@@ -89,6 +96,8 @@ function createSidebarWorkingLedger(workingSessions, options = {}) {
     fallbackSessionById: Object.fromEntries(sessions
       .map(session => [sessionIdOf(session), session])
       .filter(([id]) => id)),
+    pendingEntrySinceById: {},
+    missingSinceById: {},
   };
 }
 
@@ -100,19 +109,10 @@ function reconcileSidebarWorkingLedger(ledger, workingSessions, options = {}) {
   const desiredIds = Object.keys(sourceById);
   const current = ledger?.version === 1 ? ledger : createSidebarWorkingLedger(sessions, options);
   const currentIds = Array.isArray(current.sessionOrder) ? current.sessionOrder : [];
-  const membershipChanged = desiredIds.length !== currentIds.length
+  const rawMembershipChanged = desiredIds.length !== currentIds.length
     || desiredIds.some(id => !currentIds.includes(id));
 
-  if (!membershipChanged) {
-    return {
-      ledger: current,
-      sessions: currentIds.map(id => sourceById[id] || current.fallbackSessionById?.[id]).filter(Boolean),
-      structuralChanged: false,
-      deferred: false,
-    };
-  }
-
-  if (options.freezeStructure) {
+  if (rawMembershipChanged && options.freezeStructure) {
     return {
       ledger: current,
       sessions: currentIds.map(id => sourceById[id] || current.fallbackSessionById?.[id]).filter(Boolean),
@@ -121,25 +121,73 @@ function reconcileSidebarWorkingLedger(ledger, workingSessions, options = {}) {
     };
   }
 
+  const nowMs = Number.isFinite(Number(options.nowMs)) ? Number(options.nowMs) : Date.now();
+  const entryConfirmMs = Math.max(0, Number(options.entryConfirmMs) || 0);
+  const exitGraceMs = Math.max(0, Number(options.exitGraceMs) || 0);
+  const immediateExitIds = options.immediateExitIds instanceof Set
+    ? options.immediateExitIds : new Set(options.immediateExitIds || []);
   const desiredSet = new Set(desiredIds);
-  const sessionOrder = currentIds.filter(id => desiredSet.has(id));
-  for (const id of desiredIds) {
-    if (!sessionOrder.includes(id)) sessionOrder.push(id);
+  const pendingEntrySinceById = {};
+  const missingSinceById = {};
+  const effectiveDesiredSet = new Set();
+
+  for (const id of currentIds) {
+    if (desiredSet.has(id)) {
+      effectiveDesiredSet.add(id);
+      continue;
+    }
+    if (immediateExitIds.has(id) || exitGraceMs <= 0) continue;
+    const missingSince = Number(current.missingSinceById?.[id]) || nowMs;
+    if (nowMs - missingSince < exitGraceMs) {
+      missingSinceById[id] = missingSince;
+      effectiveDesiredSet.add(id);
+    }
   }
+
+  for (const id of desiredIds) {
+    if (effectiveDesiredSet.has(id)) continue;
+    if (currentIds.includes(id) || entryConfirmMs <= 0) {
+      effectiveDesiredSet.add(id);
+      continue;
+    }
+    const pendingSince = Number(current.pendingEntrySinceById?.[id]) || nowMs;
+    if (nowMs - pendingSince >= entryConfirmMs) effectiveDesiredSet.add(id);
+    else pendingEntrySinceById[id] = pendingSince;
+  }
+
+  const sessionOrder = currentIds.filter(id => effectiveDesiredSet.has(id));
+  for (const id of desiredIds) if (effectiveDesiredSet.has(id) && !sessionOrder.includes(id)) sessionOrder.push(id);
+  const structuralChanged = sessionOrder.length !== currentIds.length
+    || sessionOrder.some((id, index) => currentIds[index] !== id);
+  const metadataChanged = JSON.stringify(pendingEntrySinceById) !== JSON.stringify(current.pendingEntrySinceById || {})
+    || JSON.stringify(missingSinceById) !== JSON.stringify(current.missingSinceById || {});
+  const fallbackSessionById = Object.fromEntries(sessionOrder.map(id => [
+    id,
+    sourceById[id] || current.fallbackSessionById?.[id],
+  ]).filter(([, session]) => !!session));
+
+  if (!structuralChanged && !metadataChanged) {
+    return {
+      ledger: current,
+      sessions: currentIds.map(id => sourceById[id] || current.fallbackSessionById?.[id]).filter(Boolean),
+      structuralChanged: false,
+      deferred: false,
+    };
+  }
+
   const next = {
     version: 1,
-    revision: Number(current.revision || 0) + 1,
+    revision: Number(current.revision || 0) + (structuralChanged ? 1 : 0),
     sessionOrder,
-    fallbackSessionById: Object.fromEntries(sessionOrder.map(id => [
-      id,
-      sourceById[id] || current.fallbackSessionById?.[id],
-    ]).filter(([, session]) => !!session)),
+    fallbackSessionById,
+    pendingEntrySinceById,
+    missingSinceById,
   };
   return {
     ledger: next,
     sessions: sessionOrder.map(id => sourceById[id] || next.fallbackSessionById[id]).filter(Boolean),
-    structuralChanged: true,
-    deferred: false,
+    structuralChanged,
+    deferred: rawMembershipChanged && !structuralChanged,
   };
 }
 
@@ -508,6 +556,7 @@ export {
   partitionSidebarSessionsByWorking,
   reconcileSidebarOrderLedger,
   reconcileSidebarWorkingLedger,
+  sidebarSemanticMembershipOptions,
   sidebarMembershipSignature,
   sidebarOrderSnapshot,
   sidebarSessionRank,

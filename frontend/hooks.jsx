@@ -127,7 +127,7 @@ export function shouldMergeHistorySnapshot(type, msg, priorHistoryMeta) {
   );
 }
 
-function stableHistoryMessageId(msg) {
+export function stableHistoryMessageId(msg) {
   if (!msg) return '';
   if (msg.source_message_id) return `source\u0001${msg.source_message_id}`;
   if (msg.native_source_id) return `native\u0001${msg.native_source_id}`;
@@ -137,6 +137,65 @@ function stableHistoryMessageId(msg) {
   if (msg.client_message_id) return `client\u0001${msg.client_message_id}`;
   if (msg.client_msg_id) return `client\u0001${msg.client_msg_id}`;
   return '';
+}
+
+function historyMessageValueEqual(left, right) {
+  return left === right || sessionRegistryValueEqual(left ?? null, right ?? null);
+}
+
+export function reconcileCanonicalHistory(previousMessages, incomingMessages) {
+  const previous = Array.isArray(previousMessages) ? previousMessages : [];
+  const rawIncoming = Array.isArray(incomingMessages) ? incomingMessages : [];
+  const sequenced = rawIncoming.map((message, index) => ({
+    message,
+    index,
+    sequence: Number(message?.sequence),
+  }));
+  const canOrderBySequence = sequenced.length > 1
+    && sequenced.every(item => Number.isFinite(item.sequence));
+  const incoming = canOrderBySequence
+    ? sequenced.sort((left, right) => left.sequence - right.sequence || left.index - right.index)
+      .map(item => item.message)
+    : rawIncoming;
+  const previousById = new Map();
+  previous.forEach(message => {
+    const id = stableHistoryMessageId(message);
+    if (id && !previousById.has(id)) previousById.set(id, message);
+  });
+  const seen = new Set();
+  const canonical = [];
+  incoming.forEach(message => {
+    const id = stableHistoryMessageId(message);
+    if (id && seen.has(id)) return;
+    if (id) seen.add(id);
+    const prior = id ? previousById.get(id) : null;
+    canonical.push(prior && historyMessageValueEqual(prior, message) ? prior : message);
+  });
+  if (canonical.length === previous.length
+      && canonical.every((message, index) => message === previous[index])) return previous;
+  return canonical;
+}
+
+export function questionPromptIdentity(prompt, sessionOverride = '') {
+  const sessionId = sessionOverride || prompt?.session_id || prompt?.session || '';
+  const promptId = prompt?.prompt_id || '';
+  const generation = prompt?.generation || '';
+  return sessionId && promptId && generation ? `${sessionId}\0${promptId}\0${generation}` : '';
+}
+
+export function rememberQuestionPromptTombstone(tombstones, prompt, now = Date.now(), limit = 4096) {
+  const identity = questionPromptIdentity(prompt);
+  if (!identity || typeof tombstones?.set !== 'function' || typeof tombstones?.has !== 'function') return false;
+  if (!tombstones.has(identity)) tombstones.set(identity, Number(now) || Date.now());
+  while (tombstones.size > Math.max(32, Number(limit) || 4096)) {
+    tombstones.delete(tombstones.keys().next().value);
+  }
+  return true;
+}
+
+export function questionPromptIsTombstoned(tombstones, prompt) {
+  const identity = questionPromptIdentity(prompt);
+  return !!identity && typeof tombstones?.has === 'function' && tombstones.has(identity);
 }
 
 export function historyMessagesOverlapMatch(left, right) {
@@ -200,8 +259,26 @@ export function mergeHistoryTailByOverlap(existing, incoming) {
       }
     }
     if (!matches) continue;
-    if (overlap === nextIncoming.length) return current;
-    return [...current, ...nextIncoming.slice(overlap)];
+    const overlapStart = current.length - overlap;
+    let changed = false;
+    const reconciledOverlap = nextIncoming.slice(0, overlap).map((incomingMessage, index) => {
+      const currentMessage = current[overlapStart + index];
+      const currentId = stableHistoryMessageId(currentMessage);
+      const incomingId = stableHistoryMessageId(incomingMessage);
+      if (currentId && currentId === incomingId && !historyMessageValueEqual(currentMessage, incomingMessage)) {
+        const currentHasCitation = Array.isArray(currentMessage?.content_blocks)
+          && currentMessage.content_blocks.some(block => block?.type === 'memory_citation');
+        const incomingHasCitation = Array.isArray(incomingMessage?.content_blocks)
+          && incomingMessage.content_blocks.some(block => block?.type === 'memory_citation');
+        if (currentHasCitation && !incomingHasCitation) return currentMessage;
+        changed = true;
+        return incomingMessage;
+      }
+      return currentMessage;
+    });
+    const appended = nextIncoming.slice(overlap);
+    if (!changed && appended.length === 0) return current;
+    return [...current.slice(0, overlapStart), ...reconciledOverlap, ...appended];
   }
   return null;
 }
@@ -240,17 +317,28 @@ export function sessionMetadataActivityMaps(sessionList, previousActivities = {}
       kind,
       label,
       updatedAt: session.activity.updated_at || null,
-      observed_at: session.activity.observed_at || previousActivities[session.session_id]?.observed_at || null,
+      observed_at: session.activity.observed_at || null,
       startedAt: session.activity.started_at || null,
       interruptHint: session.activity.interrupt_hint || '',
       goal: session.activity.goal || null,
       goal_run: session.activity.goal_run || null,
+      ...(session.activity.goal_projection
+        ? { goal_projection: session.activity.goal_projection }
+        : {}),
+      ...(session.activity.goal_tombstone
+        ? { goal_tombstone: session.activity.goal_tombstone }
+        : {}),
       thinking: session.activity.thinking || null,
+      connection: session.activity.connection || null,
+      connection_tombstone: session.activity.connection_tombstone || null,
+      interruption: session.activity.interruption || null,
+      interruption_tombstone: session.activity.interruption_tombstone || null,
       current: session.activity.current || null,
       step: session.activity.step || null,
       usage: session.activity.usage || null,
       task_list: session.activity.task_list || null,
       context_card: session.activity.context_card || null,
+      work_context: session.activity.work_context || null,
       thinkingContent: session.activity.thinking?.text || session.activity.thinkingContent || '',
       transport: session.activity.transport || previousActivities[session.session_id]?.transport || null,
     };
@@ -260,6 +348,59 @@ export function sessionMetadataActivityMaps(sessionList, previousActivities = {}
       : false;
   });
   return { activities, thinkingContent, thinking };
+}
+
+function goalProjectionClock(activity) {
+  if (!activity || typeof activity !== 'object') return null;
+  const projection = activity.goal_tombstone || activity.goal_projection;
+  const epoch = Number(projection?.epoch);
+  const sequence = Number(projection?.sequence);
+  if (!Number.isSafeInteger(epoch) || epoch <= 0
+      || !Number.isSafeInteger(sequence) || sequence <= 0) return null;
+  const state = activity.goal_tombstone || projection?.state === 'clear' || activity.goal === null
+    ? 'clear'
+    : 'present';
+  return { epoch, sequence, state };
+}
+
+function compareActivityMetadataOrder(incoming, previous) {
+  const nextClock = goalProjectionClock(incoming);
+  const previousClock = goalProjectionClock(previous);
+  if (nextClock && previousClock) {
+    if (nextClock.epoch !== previousClock.epoch) return nextClock.epoch < previousClock.epoch ? -1 : 1;
+    if (nextClock.sequence !== previousClock.sequence) return nextClock.sequence < previousClock.sequence ? -1 : 1;
+    if (nextClock.state !== previousClock.state) return nextClock.state === 'clear' ? 1 : -1;
+  } else if (nextClock || previousClock) {
+    return nextClock ? 1 : -1;
+  }
+  const nextTime = Date.parse(incoming?.observed_at || incoming?.updatedAt || '') || 0;
+  const previousTime = Date.parse(previous?.observed_at || previous?.updatedAt || '') || 0;
+  if (nextTime !== previousTime) return nextTime < previousTime ? -1 : 1;
+  return 0;
+}
+
+export function mergeSessionMetadataFallbackMap(previousMap, incomingMap, options = {}) {
+  const previous = previousMap && typeof previousMap === 'object' ? previousMap : {};
+  const incoming = incomingMap && typeof incomingMap === 'object' ? incomingMap : {};
+  const authoritative = options.authoritative === true;
+  let next = previous;
+  for (const [id, value] of Object.entries(incoming)) {
+    // Full session snapshots are fallback hydration, not a newer activity
+    // generation. Once a live status event (including the explicit false idle
+    // tombstone) owns this key, a polling refresh must not resurrect stale
+    // working/thinking metadata. A first-class session_patch is authoritative
+    // and opts into replacement below.
+    const hasPrevious = Object.prototype.hasOwnProperty.call(previous, id);
+    if (!authoritative && hasPrevious) continue;
+    if (authoritative && hasPrevious
+        && value && typeof value === 'object'
+        && previous[id] && typeof previous[id] === 'object'
+        && compareActivityMetadataOrder(value, previous[id]) < 0) continue;
+    if (Object.is(previous[id], value)) continue;
+    if (next === previous) next = { ...previous };
+    next[id] = value;
+  }
+  return next;
 }
 
 export function useRelay() {
@@ -328,6 +469,7 @@ export function useRelay() {
     const deliveryStatesRef = useRef({});
     const deliverySessionsRef = useRef({});
     const permissionPromptsRef = useRef({});
+    const questionPromptTombstonesRef = useRef(new Map());
     const configControlStatesRef = useRef({});
     const configControlTimers = useRef({});
     const agentConfigsRef = useRef({});
@@ -440,6 +582,14 @@ export function useRelay() {
       permissionPromptsRef.current = migrateSessionKeyedObject(
         permissionPromptsRef.current, aliasId, canonicalId, preferCanonical,
       );
+      for (const [identity, terminalAt] of [...questionPromptTombstonesRef.current]) {
+        if (!identity.startsWith(`${aliasId}\0`)) continue;
+        const canonicalIdentity = `${canonicalId}${identity.slice(aliasId.length)}`;
+        if (!questionPromptTombstonesRef.current.has(canonicalIdentity)) {
+          questionPromptTombstonesRef.current.set(canonicalIdentity, terminalAt);
+        }
+        questionPromptTombstonesRef.current.delete(identity);
+      }
       agentConfigsRef.current = migrateSessionKeyedObject(
         agentConfigsRef.current, aliasId, canonicalId, preferCanonical,
       );
@@ -1022,14 +1172,15 @@ export function useRelay() {
       };
     }, [connect]);
 
-    function mergeSessionMetadataActivity(sessionList) {
+    function mergeSessionMetadataActivity(sessionList, options = {}) {
       const normalized = sessionMetadataActivityMaps(sessionList);
-      setActivities(prev => shallowMapMerge(
+      setActivities(prev => mergeSessionMetadataFallbackMap(
         prev,
         sessionMetadataActivityMaps(sessionList, prev).activities,
+        options,
       ));
-      setThinkingContent(prev => shallowMapMerge(prev, normalized.thinkingContent));
-      setThinking(prev => shallowMapMerge(prev, normalized.thinking));
+      setThinkingContent(prev => mergeSessionMetadataFallbackMap(prev, normalized.thinkingContent, options));
+      setThinking(prev => mergeSessionMetadataFallbackMap(prev, normalized.thinking, options));
     }
 
     function clearRemovedSessionActivity(sessionList) {
@@ -2131,7 +2282,7 @@ export function useRelay() {
       if (t === 'session_list') {
         clearRemovedSessionActivity(msg.sessions || []);
         setSessionRegistry(prev => reconcileSessionRegistry(prev, msg.sessions || []));
-        mergeSessionMetadataActivity(msg.sessions || []);
+        mergeSessionMetadataActivity(msg.sessions || [], { authoritative: true });
         mergeSessionConfigHints(msg.sessions || []);
         mergeSessionChatLists(msg.sessions || []);
         mergeSessionHealth(msg.sessions || []);
@@ -2153,7 +2304,7 @@ export function useRelay() {
       if (t === 'session_snapshot' || t === 'proxy_session_snapshot') {
         clearRemovedSessionActivity(msg.sessions || []);
         setSessionRegistry(prev => reconcileSessionRegistry(prev, msg.sessions || []));
-        mergeSessionMetadataActivity(msg.sessions || []);
+        mergeSessionMetadataActivity(msg.sessions || [], { authoritative: true });
         mergeSessionConfigHints(msg.sessions || []);
         mergeSessionChatLists(msg.sessions || []);
         mergeSessionHealth(msg.sessions || []);
@@ -2189,7 +2340,7 @@ export function useRelay() {
         }
         if (msg.sessions && msg.sessions.length > 0) {
           setSessionRegistry(prev => reconcileSessionRegistry(prev, msg.sessions));
-          mergeSessionMetadataActivity(msg.sessions);
+          mergeSessionMetadataActivity(msg.sessions, { authoritative: true });
           mergeSessionConfigHints(msg.sessions);
           mergeSessionChatLists(msg.sessions);
           mergeSessionHealth(msg.sessions);
@@ -2216,30 +2367,33 @@ export function useRelay() {
         if (msg.agent_configs && typeof msg.agent_configs === 'object') {
           setAgentConfigs(prev => ({ ...prev, ...msg.agent_configs }));
         }
-        // Restore handshake prompts without treating a temporarily incomplete
-        // snapshot as a terminal edge for a first-class native question. Only
-        // an explicit question_prompt_state may clear an unresolved question.
+        // The connection acknowledgement is the relay's authoritative open set.
+        // Never preserve a question omitted by this snapshot: a terminal native
+        // generation may have completed while this browser was disconnected.
         {
-          const restored = {};
-          (msg.open_prompts || []).forEach(p => {
-            const sid = p.session_id || p.session;
-            if (sid) restored[sid] = { ...p, received_at: Date.now() };
-          });
-          (msg.open_question_prompts || [])
-            .filter(p => !p.lifecycle || ['open', 'submitting'].includes(p.lifecycle))
-            .forEach(p => {
-              const sid = p.session_id || p.session;
-              if (sid) restored[sid] = { ...p, received_at: Date.now() };
-            });
           setPermissionPrompts(previous => {
-            const next = { ...restored };
-            Object.entries(previous).forEach(([sid, prompt]) => {
-              if (next[sid]) return;
-              if (prompt?.type === 'question_prompt'
-                  && (!prompt.lifecycle || ['open', 'submitting'].includes(prompt.lifecycle))) {
-                next[sid] = prompt;
-              }
-            });
+            const next = {};
+            const restore = prompt => {
+              const sid = prompt?.session_id || prompt?.session;
+              if (!sid) return;
+              const current = previous[sid];
+              const sameIdentity = current?.prompt_id === prompt.prompt_id
+                && (prompt.type !== 'question_prompt' || current?.generation === prompt.generation);
+              const receivedAt = sameIdentity ? current.received_at : Date.now();
+              const candidate = { ...prompt, received_at: receivedAt };
+              next[sid] = sameIdentity && sessionRegistryValueEqual(current, candidate) ? current : candidate;
+            };
+            (msg.open_prompts || []).forEach(restore);
+            (msg.open_question_prompts || [])
+              .filter(prompt => (!prompt.lifecycle || ['open', 'submitting'].includes(prompt.lifecycle))
+                && !questionPromptIsTombstoned(questionPromptTombstonesRef.current, prompt))
+              .forEach(restore);
+            const previousKeys = Object.keys(previous);
+            const nextKeys = Object.keys(next);
+            if (previousKeys.length === nextKeys.length
+                && nextKeys.every(sid => previous[sid] === next[sid])) {
+              return previous;
+            }
             return next;
           });
         }
@@ -2261,7 +2415,7 @@ export function useRelay() {
         setSessionRegistry(prev => patchSessionRegistry(prev, msg));
         const patch = msg.patch && typeof msg.patch === 'object' ? msg.patch : {};
         const projected = { session_id: id, ...patch };
-        if (patch.activity) mergeSessionMetadataActivity([projected]);
+        if (patch.activity) mergeSessionMetadataActivity([projected], { authoritative: true });
         if (patch.model_id !== undefined || patch.permission_mode !== undefined || patch.capabilities !== undefined) {
           mergeSessionConfigHints([projected]);
         }
@@ -2385,8 +2539,12 @@ export function useRelay() {
           const mergedRaw = shouldMergeTailSnapshot
             ? mergeHistoryTailSnapshot(prev[id], nextMessages)
             : nextMessages;
-          const merged = removeSupersededCliTranscriptPlaceholders(
+          const prepared = removeSupersededCliTranscriptPlaceholders(
             preserveOptimisticMessagesAcrossHistory(mergedRaw, prev[id]),
+          );
+          const merged = reconcileCanonicalHistory(
+            forceCursorIdentityReplace ? [] : prev[id],
+            prepared,
           );
           if (merged === prev[id]) return prev;
           return { ...prev, [id]: merged };
@@ -2504,7 +2662,7 @@ export function useRelay() {
         const estimatedMessages = replaceTail ? incoming : mergeHistoryChunk(messages[id], incoming, mode);
         const estimatedLength = estimatedMessages.length;
         setMessages(prev => {
-          const merged = removeSupersededCliTranscriptPlaceholders(
+          const prepared = removeSupersededCliTranscriptPlaceholders(
             preserveOptimisticMessagesAcrossHistory(
               replaceTail
                 ? reconcileHistoryTailReplacement(prev[id], incoming, currentChunkState, msg.source)
@@ -2512,6 +2670,7 @@ export function useRelay() {
               prev[id],
             )
           );
+          const merged = reconcileCanonicalHistory(prev[id], prepared);
           if (merged === prev[id]) return prev;
           return { ...prev, [id]: merged };
         });
@@ -2563,7 +2722,8 @@ export function useRelay() {
         const newMsgs = rawDelta.map(event => event?.message || event).filter(Boolean);
         const estimated = mergeHistoryChunk(messages[id], newMsgs, 'tail');
         setMessages(prev => {
-          const merged = removeSupersededCliTranscriptPlaceholders(mergeHistoryChunk(prev[id], newMsgs, 'tail'));
+          const prepared = removeSupersededCliTranscriptPlaceholders(mergeHistoryChunk(prev[id], newMsgs, 'tail'));
+          const merged = reconcileCanonicalHistory(prev[id], prepared);
           if (merged === prev[id]) return prev;
           return { ...prev, [id]: merged };
         });
@@ -2614,12 +2774,23 @@ export function useRelay() {
               interruptHint: msg.activity?.interrupt_hint || '',
               goal: msg.activity?.goal || null,
               goal_run: msg.activity?.goal_run || null,
+              ...(msg.activity?.goal_projection
+                ? { goal_projection: msg.activity.goal_projection }
+                : {}),
+              ...(msg.activity?.goal_tombstone
+                ? { goal_tombstone: msg.activity.goal_tombstone }
+                : {}),
               thinking: msg.activity?.thinking || null,
+              connection: msg.activity?.connection || null,
+              connection_tombstone: msg.activity?.connection_tombstone || null,
+              interruption: msg.activity?.interruption || null,
+              interruption_tombstone: msg.activity?.interruption_tombstone || null,
               current: msg.activity?.current || null,
               step: msg.activity?.step || null,
               usage: msg.activity?.usage || null,
               task_list: msg.activity?.task_list || null,
               context_card: msg.activity?.context_card || null,
+              work_context: msg.activity?.work_context || null,
               thinkingContent: msg.activity?.thinking?.text || msg.activity?.thinkingContent || '',
               transport: normalizeFleetActivityTrace(msg.activity_trace),
             }
@@ -2627,7 +2798,9 @@ export function useRelay() {
         if (isThinking) {
           clearTimeout(thinkingTimers.current[id]);
           setThinking(prev => Object.is(prev[id], label) ? prev : ({ ...prev, [id]: label }));
-          setActivities(prev => shallowMapMerge(prev, { [id]: activity }));
+          setActivities(prev => mergeSessionMetadataFallbackMap(
+            prev, { [id]: activity }, { authoritative: true },
+          ));
           // Store Claude Code thinking content text
           const nextThinkingContent = msg.activity?.thinking?.text ?? msg.thinking_content ?? msg.activity?.thinkingContent;
           if (nextThinkingContent != null) {
@@ -2636,12 +2809,20 @@ export function useRelay() {
         } else if (activityKind === 'idle') {
           clearTimeout(thinkingTimers.current[id]);
           setThinking(prev => prev[id] === false ? prev : ({ ...prev, [id]: false }));
-          setActivities(prev => shallowMapMerge(prev, { [id]: activity }));
+          setActivities(prev => mergeSessionMetadataFallbackMap(
+            prev, { [id]: activity }, { authoritative: true },
+          ));
           setThinkingContent(prev => prev[id] === '' ? prev : ({ ...prev, [id]: '' }));
-        } else if (msg.activity?.goal || msg.activity?.task_list || msg.activity?.step || msg.activity?.usage) {
+        } else if (Object.prototype.hasOwnProperty.call(msg.activity || {}, 'goal')
+            || msg.activity?.goal_projection || msg.activity?.goal_tombstone
+            || msg.activity?.task_list || msg.activity?.step || msg.activity?.usage
+            || msg.activity?.connection || msg.activity?.interruption
+            || msg.activity?.interruption_tombstone) {
           clearTimeout(thinkingTimers.current[id]);
           setThinking(prev => prev[id] === false ? prev : ({ ...prev, [id]: false }));
-          setActivities(prev => shallowMapMerge(prev, { [id]: activity }));
+          setActivities(prev => mergeSessionMetadataFallbackMap(
+            prev, { [id]: activity }, { authoritative: true },
+          ));
         } else {
           clearTimeout(thinkingTimers.current[id]);
           thinkingTimers.current[id] = setTimeout(() => {
@@ -2656,6 +2837,7 @@ export function useRelay() {
 
       // ── Permission prompts ───────────────────────────────────────────────────
       if (t === 'permission_prompt') {
+        if (msg.kind === 'question') return;
         const sid = msg.session_id || msg.session;
         if (sid) setPermissionPrompts(prev => ({ ...prev, [sid]: { ...msg, received_at: Date.now() } }));
         return;
@@ -2663,43 +2845,57 @@ export function useRelay() {
 
       if (t === 'question_prompt') {
         const sid = msg.session_id || msg.session;
-        if (sid) setPermissionPrompts(prev => {
+        const isOpen = !msg.lifecycle || ['open', 'submitting'].includes(msg.lifecycle);
+        if (!sid || !questionPromptIdentity(msg)) return;
+        if (!isOpen || questionPromptIsTombstoned(questionPromptTombstonesRef.current, msg)) {
+          if (!isOpen) rememberQuestionPromptTombstone(questionPromptTombstonesRef.current, msg);
+          setPermissionPrompts(prev => {
+            const current = prev[sid];
+            if (current?.prompt_id !== msg.prompt_id || current?.generation !== msg.generation) return prev;
+            const { [sid]: _, ...rest } = prev;
+            return rest;
+          });
+          return;
+        }
+        setPermissionPrompts(prev => {
           const current = prev[sid];
           const samePrompt = current?.prompt_id === msg.prompt_id && current?.generation === msg.generation;
-          return {
-            ...prev,
-            [sid]: {
-              ...(samePrompt ? current : {}),
-              ...msg,
-              received_at: samePrompt ? current.received_at : Date.now(),
-              ...(msg.lifecycle === 'submitting'
-                ? { submitting_choice_id: current?.submitting_choice_id || 'question_answers' }
-                : {}),
-            },
+          const nextPrompt = {
+            ...(samePrompt ? current : {}),
+            ...msg,
+            received_at: samePrompt ? current.received_at : Date.now(),
+            ...(msg.lifecycle === 'submitting'
+              ? { submitting_choice_id: current?.submitting_choice_id || 'question_answers' }
+              : {}),
           };
+          if (samePrompt && sessionRegistryValueEqual(current, nextPrompt)) return prev;
+          return { ...prev, [sid]: nextPrompt };
         });
         return;
       }
 
       if (t === 'question_prompt_state') {
         const sid = msg.session_id || msg.session;
-        if (sid && msg.lifecycle === 'failed') {
+        if (!sid || !questionPromptIdentity(msg)) return;
+        if (['open', 'submitting'].includes(msg.lifecycle)
+            && !questionPromptIsTombstoned(questionPromptTombstonesRef.current, msg)) {
           setPermissionPrompts(prev => {
             const current = prev[sid];
             const samePrompt = current?.prompt_id === msg.prompt_id && current?.generation === msg.generation;
-            if (current && !samePrompt) return prev;
-            return {
-              ...prev,
-              [sid]: {
-                ...(samePrompt ? current : {}),
-                ...msg,
-                type: 'question_prompt',
-                received_at: samePrompt ? current.received_at : Date.now(),
-                submitting_choice_id: null,
-              },
+            if (!samePrompt) return prev;
+            const nextPrompt = {
+              ...current,
+              ...msg,
+              type: 'question_prompt',
+              received_at: current.received_at,
+              submitting_choice_id: msg.lifecycle === 'submitting'
+                ? (current.submitting_choice_id || 'question_answers')
+                : null,
             };
+            return sessionRegistryValueEqual(current, nextPrompt) ? prev : { ...prev, [sid]: nextPrompt };
           });
-        } else if (sid && !['open', 'submitting'].includes(msg.lifecycle)) {
+        } else if (!['open', 'submitting'].includes(msg.lifecycle)) {
+          rememberQuestionPromptTombstone(questionPromptTombstonesRef.current, msg);
           setPermissionPrompts(prev => {
             const current = prev[sid];
             if (current?.prompt_id !== msg.prompt_id || current?.generation !== msg.generation) return prev;
@@ -3163,6 +3359,12 @@ export function useRelay() {
           : (Array.isArray(msg.message?.content_blocks) ? msg.message.content_blocks : null);
         const clientMessageId = msg.client_message_id || msg.message?.client_message_id || null;
         const deliveryStatus = msg.status || msg.message?.status || null;
+        const sourceMessageId = msg.source_message_id || msg.message?.source_message_id || null;
+        const nativeSourceId = msg.native_source_id || msg.message?.native_source_id || null;
+        const sourceCursor = msg.source_cursor || msg.message?.source_cursor || null;
+        const messageSource = msg.source || msg.message?.source || null;
+        const serverMessageId = msg.server_message_id ?? msg.message?.server_message_id ?? null;
+        const messageSequence = msg.sequence ?? msg.message?.sequence ?? null;
         const nativeDelivered = deliveryStatus === 'delivered' || deliveryStatus === 'agent_started';
         if (!id || !role || !content) return;
         if (role === 'assistant') clearProvisionalStream(id);
@@ -3170,17 +3372,17 @@ export function useRelay() {
           role,
           content,
           ...(contentBlocks ? { content_blocks: contentBlocks } : {}),
-          ...(msg.source_message_id ? { source_message_id: msg.source_message_id } : {}),
-          ...(msg.native_source_id ? { native_source_id: msg.native_source_id } : {}),
-          ...(msg.source_cursor ? { source_cursor: msg.source_cursor } : {}),
-          ...(msg.source ? { source: msg.source } : {}),
-          ...(msg.server_message_id != null ? { server_message_id: msg.server_message_id } : {}),
+          ...(sourceMessageId ? { source_message_id: sourceMessageId } : {}),
+          ...(nativeSourceId ? { native_source_id: nativeSourceId } : {}),
+          ...(sourceCursor ? { source_cursor: sourceCursor } : {}),
+          ...(messageSource ? { source: messageSource } : {}),
+          ...(serverMessageId != null ? { server_message_id: serverMessageId } : {}),
           ...(clientMessageId ? { client_message_id: clientMessageId } : {}),
           ...(deliveryStatus ? { status: deliveryStatus } : {}),
-          ...(msg.sequence != null ? { sequence: msg.sequence } : {}),
-          ...(msg.created_at != null ? { created_at: msg.created_at } : {}),
-          ...(msg.timestamp != null ? { timestamp: msg.timestamp } : {}),
-          ...(msg.ts != null ? { ts: msg.ts } : {}),
+          ...(messageSequence != null ? { sequence: messageSequence } : {}),
+          ...((msg.created_at ?? msg.message?.created_at) != null ? { created_at: msg.created_at ?? msg.message?.created_at } : {}),
+          ...((msg.timestamp ?? msg.message?.timestamp) != null ? { timestamp: msg.timestamp ?? msg.message?.timestamp } : {}),
+          ...((msg.ts ?? msg.message?.ts) != null ? { ts: msg.ts ?? msg.message?.ts } : {}),
         });
 
         setMessages(prev => {
@@ -3221,24 +3423,34 @@ export function useRelay() {
             }
           }
           const stableIncomingId = stableHistoryMessageId(incomingMessage);
-          if (existing.some(message => (
-            stableIncomingId
-              ? stableHistoryMessageId(message) === stableIncomingId
-              : message.role === role && message.content === content
-          ))) {
+          if (stableIncomingId) {
+            const existingIndex = existing.findIndex(message => stableHistoryMessageId(message) === stableIncomingId);
+            if (existingIndex >= 0) {
+              if (historyMessageValueEqual(existing[existingIndex], incomingMessage)) return prev;
+              const existingHasCitation = Array.isArray(existing[existingIndex]?.content_blocks)
+                && existing[existingIndex].content_blocks.some(block => block?.type === 'memory_citation');
+              const incomingHasCitation = Array.isArray(incomingMessage?.content_blocks)
+                && incomingMessage.content_blocks.some(block => block?.type === 'memory_citation');
+              if (existingHasCitation && !incomingHasCitation) return prev;
+              const updated = [...existing];
+              updated[existingIndex] = { ...existing[existingIndex], ...incomingMessage };
+              return { ...prev, [id]: reconcileCanonicalHistory(existing, updated) };
+            }
+          } else if (existing.some(message => message.role === role && message.content === content)) {
             return prev;
           }
+          const appended = removeSupersededCliTranscriptPlaceholders([
+            ...existing,
+            {
+              ...incomingMessage,
+              ...(role === 'user' && clientMessageId ? { _cid: clientMessageId } : {}),
+              _delivered: role === 'user' && nativeDelivered,
+              _agentStarted: role === 'user' && deliveryStatus === 'agent_started',
+            },
+          ]);
           return {
             ...prev,
-            [id]: removeSupersededCliTranscriptPlaceholders([
-              ...existing,
-              {
-                ...incomingMessage,
-                ...(role === 'user' && clientMessageId ? { _cid: clientMessageId } : {}),
-                _delivered: role === 'user' && nativeDelivered,
-                _agentStarted: role === 'user' && deliveryStatus === 'agent_started',
-              },
-            ]),
+            [id]: reconcileCanonicalHistory(existing, appended),
           };
         });
 

@@ -71,6 +71,10 @@ const { ScheduledSendStore } = require('./scheduled-sends');
 const { pruneDirectory } = require('./storage-retention');
 const { GoalNotificationCoordinator } = require('./goal-notifications');
 const { SessionAliasReconciler } = require('./session-alias-reconciler');
+const {
+  canMigrateSurfaceScopedState,
+  isSurfaceScopedSessionMessage,
+} = require('./session-surface-state');
 const { ExactlyOnceControlRegistry } = require('./exactly-once-control');
 const {
   NavigationEpochRegistry,
@@ -144,7 +148,7 @@ const DEFAULT_HISTORY_CHUNK_LIMIT = 120;
 const MAX_HISTORY_CHUNK_LIMIT = 500;
 const NATIVE_HISTORY_TAIL_MIN_INTERVAL_MS = 1_500;
 const NATIVE_HISTORY_OLDER_MIN_INTERVAL_MS = 5_000;
-const NATIVE_HISTORY_REPEAT_CURSOR_MS = 60_000;
+const NATIVE_HISTORY_REQUEST_STATE_TTL_MS = 60_000;
 const NATIVE_HISTORY_RESULT_CACHE_MS = 1_500;
 const NATIVE_HISTORY_REQUEST_TIMEOUT_MS = 30_000;
 const MAX_NATIVE_HISTORY_WAITERS = 128;
@@ -279,6 +283,17 @@ db.exec(`
     updated_at        INTEGER NOT NULL DEFAULT (unixepoch()),
     PRIMARY KEY (session, source)
   );
+  CREATE TABLE IF NOT EXISTS question_prompt_tombstones (
+    session_id  TEXT NOT NULL,
+    prompt_id   TEXT NOT NULL,
+    generation  TEXT NOT NULL,
+    lifecycle   TEXT NOT NULL,
+    terminal_at TEXT NOT NULL,
+    error_code  TEXT,
+    PRIMARY KEY (session_id, prompt_id)
+  );
+  CREATE INDEX IF NOT EXISTS idx_question_prompt_tombstones_terminal
+    ON question_prompt_tombstones(terminal_at);
 `);
 
 // ── Android app auth tables (A12-01) ──────────────────────────────────────────
@@ -3271,7 +3286,10 @@ const SESSION_SUMMARY_SNIPPET_CHARS = 192;
 const SESSION_SUMMARY_BROADCAST_COALESCE_MS = 100;
 
 function canonicalizeSessionMessage(message) {
-  if (!message || typeof message !== 'object' || message.type === 'session_alias_reconciled') return message;
+  if (!message || typeof message !== 'object'
+      || message.type === 'session_alias_reconciled'
+      || message.type === 'session_alias_released'
+      || isSurfaceScopedSessionMessage(message)) return message;
   let changed = false;
   const next = { ...message };
   for (const key of ['session', 'session_id']) {
@@ -3347,8 +3365,10 @@ function migrateRuntimeSessionAlias(aliasId, canonicalId, event) {
     (canonical, alias) => Math.max(Number(canonical) || 0, Number(alias) || 0)) ? 1 : 0;
   counts.maps += moveRuntimeSessionEntry(sessionTurnGeneration, aliasId, canonicalId,
     (canonical, alias) => Math.max(Number(canonical) || 0, Number(alias) || 0)) ? 1 : 0;
-  counts.maps += moveRuntimeSessionEntry(agentConfigs, aliasId, canonicalId,
-    (canonical, alias) => ({ ...(alias || {}), ...(canonical || {}), session_id: canonicalId, session: canonicalId })) ? 1 : 0;
+  if (canMigrateSurfaceScopedState(aliasMeta, canonicalMeta)) {
+    counts.maps += moveRuntimeSessionEntry(agentConfigs, aliasId, canonicalId,
+      (canonical, alias) => ({ ...(alias || {}), ...(canonical || {}), session_id: canonicalId, session: canonicalId })) ? 1 : 0;
+  }
   counts.maps += moveRuntimeSessionEntry(cachedChatLists, aliasId, canonicalId,
     (canonical, alias) => ({ ...(alias || {}), ...(canonical || {}), session_id: canonicalId, session: canonicalId })) ? 1 : 0;
   counts.maps += moveRuntimeSessionEntry(recentResumeSessions, aliasId, canonicalId) ? 1 : 0;
@@ -4171,7 +4191,38 @@ const pendingPrompts  = new Map();
 // First-class model/native questions are isolated from permission prompts. The
 // registry never serializes submitted answers and atomically claims one browser
 // response before it can be forwarded to a native adapter.
-const questionPromptRegistry = new QuestionPromptRegistry({ maxEntries: 4096 });
+const QUESTION_PROMPT_TOMBSTONE_TTL_MS = 30 * 24 * 60 * 60 * 1000;
+const stmtUpsertQuestionPromptTombstone = db.prepare(`
+  INSERT INTO question_prompt_tombstones
+    (session_id, prompt_id, generation, lifecycle, terminal_at, error_code)
+  VALUES
+    (@session_id, @prompt_id, @generation, @lifecycle, @terminal_at, @error_code)
+  ON CONFLICT(session_id, prompt_id) DO UPDATE SET
+    generation = excluded.generation,
+    lifecycle = excluded.lifecycle,
+    terminal_at = excluded.terminal_at,
+    error_code = excluded.error_code
+  WHERE julianday(excluded.terminal_at) >= julianday(question_prompt_tombstones.terminal_at)
+`);
+db.prepare(`
+  DELETE FROM question_prompt_tombstones
+  WHERE julianday(terminal_at) < julianday('now', '-30 days')
+`).run();
+const initialQuestionPromptTombstones = db.prepare(`
+  SELECT session_id, prompt_id, generation, lifecycle, terminal_at, error_code FROM (
+    SELECT session_id, prompt_id, generation, lifecycle, terminal_at, error_code
+    FROM question_prompt_tombstones
+    ORDER BY terminal_at DESC
+    LIMIT 4096
+  )
+  ORDER BY terminal_at ASC
+`).all();
+const questionPromptRegistry = new QuestionPromptRegistry({
+  maxEntries: 4096,
+  tombstoneTtlMs: QUESTION_PROMPT_TOMBSTONE_TTL_MS,
+  initialTombstones: initialQuestionPromptTombstones,
+  onTombstone: tombstone => stmtUpsertQuestionPromptTombstone.run(tombstone),
+});
 const questionPromptTimers = new Map();
 // Open session error prompts: `${session_id}:${prompt_id}` → { prompt }
 const pendingErrorPrompts = new Map();
@@ -4272,7 +4323,7 @@ function pruneRuntimeRequestState(now = Date.now()) {
     }
   }
   for (const [key, value] of nativeHistoryChunkRequests) {
-    if (now - Number(value?.at || 0) > NATIVE_HISTORY_REPEAT_CURSOR_MS) nativeHistoryChunkRequests.delete(key);
+    if (now - Number(value?.at || 0) > NATIVE_HISTORY_REQUEST_STATE_TTL_MS) nativeHistoryChunkRequests.delete(key);
   }
   for (const [key, value] of nativeHistoryChunkCache) {
     if (now - Number(value?.storedAt || 0) > NATIVE_HISTORY_RESULT_CACHE_MS) nativeHistoryChunkCache.delete(key);
@@ -4381,6 +4432,8 @@ function compactSummaryGoal(goal) {
   if (fingerprint) compact.fingerprint = fingerprint;
   const generation = Number(goal.generation);
   if (Number.isFinite(generation) && generation > 0) compact.generation = Math.floor(generation);
+  const transitionSeq = Number(goal.transition_seq);
+  if (Number.isSafeInteger(transitionSeq) && transitionSeq >= 0) compact.transition_seq = transitionSeq;
   return compact;
 }
 
@@ -4510,10 +4563,47 @@ function compactSummaryGoalRun(goalRun) {
   };
 }
 
+function compactGoalProjection(value, forcedState = null) {
+  if (!value || typeof value !== 'object' || value.schema_version !== 1) return null;
+  const sessionId = String(value.session_id || '').trim().slice(0, 160);
+  const surface = String(value.surface || '').trim().slice(0, 48);
+  const nativeThreadId = String(value.native_thread_id || '').trim().slice(0, 200);
+  const epoch = Number(value.epoch);
+  const sequence = Number(value.sequence);
+  const state = String(forcedState || value.state || '').trim().toLowerCase();
+  if (!sessionId || !surface || !nativeThreadId
+      || !Number.isSafeInteger(epoch) || epoch <= 0
+      || !Number.isSafeInteger(sequence) || sequence <= 0
+      || !['present', 'clear'].includes(state)) return null;
+  return {
+    schema_version: 1,
+    session_id: sessionId,
+    surface,
+    native_thread_id: nativeThreadId,
+    epoch,
+    sequence,
+    state,
+    ...(value.native_thread_title
+      ? { native_thread_title: String(value.native_thread_title).trim().slice(0, 200) }
+      : {}),
+    ...(value.observed_at ? { observed_at: value.observed_at } : {}),
+    ...(value.reason ? { reason: String(value.reason).trim().slice(0, 120) } : {}),
+    ...((value.goal_fingerprint || value.prior_fingerprint)
+      ? { goal_fingerprint: String(value.goal_fingerprint || value.prior_fingerprint).trim().slice(0, 160) }
+      : {}),
+    ...(Number(value.goal_generation ?? value.prior_generation) > 0
+      ? { goal_generation: Math.floor(Number(value.goal_generation ?? value.prior_generation)) }
+      : {}),
+  };
+}
+
 function compactSummaryActivity(activity, fallbackLabel = '') {
   if (!activity || typeof activity !== 'object') return null;
+  const hasGoal = Object.prototype.hasOwnProperty.call(activity, 'goal');
   const goal = compactSummaryGoal(activity.goal);
   const goalRun = compactSummaryGoalRun(activity.goal_run);
+  const goalProjection = compactGoalProjection(activity.goal_projection);
+  const goalTombstone = compactGoalProjection(activity.goal_tombstone, 'clear');
   const workContext = normalizeFleetWorkContext(activity.work_context);
   const compact = {
     kind: activity.kind || 'idle',
@@ -4522,8 +4612,14 @@ function compactSummaryActivity(activity, fallbackLabel = '') {
     ...(activity.updated_at ? { updated_at: activity.updated_at } : {}),
     ...(activity.observed_at ? { observed_at: activity.observed_at } : {}),
     ...(activity.interrupt_hint ? { interrupt_hint: activity.interrupt_hint } : {}),
-    ...(goal ? { goal } : {}),
+    ...(activity.connection ? { connection: activity.connection } : {}),
+    ...(activity.connection_tombstone ? { connection_tombstone: activity.connection_tombstone } : {}),
+    ...(activity.interruption ? { interruption: activity.interruption } : {}),
+    ...(activity.interruption_tombstone ? { interruption_tombstone: activity.interruption_tombstone } : {}),
+    ...(hasGoal ? { goal } : {}),
     ...(goalRun ? { goal_run: goalRun } : {}),
+    ...(goalProjection ? { goal_projection: goalProjection } : {}),
+    ...(goalTombstone ? { goal_tombstone: goalTombstone } : {}),
     ...(workContext ? { work_context: workContext } : {}),
     ...(activity.usage ? { usage: activity.usage } : {}),
   };
@@ -4963,13 +5059,6 @@ function sendHistoryChunkError(ws, { sessionId, requestId, mode = 'tail', source
   }));
 }
 
-function nativeHistoryCursorSig(msg) {
-  if (!msg || msg.mode !== 'older') return '';
-  const beforeOffset = msg.before_offset ?? msg.beforeOffset ?? msg.cursor?.next_before_offset ?? '';
-  const beforeId = msg.before_id ?? msg.beforeId ?? msg.cursor?.next_before_id ?? '';
-  return `${beforeOffset}\u0001${beforeId}`;
-}
-
 function validateFileBackedTranscriptResync(msg, sessionId) {
   const source = normalizeSourceName(msg?.source);
   if (msg?.type !== 'history_snapshot' || !source?.endsWith('_jsonl')) {
@@ -5018,7 +5107,6 @@ function throttleNativeHistoryChunkRequest(sessionId, msg) {
   }
   const now = Date.now();
   const key = `${sessionId}:${mode}`;
-  const cursorSig = nativeHistoryCursorSig(msg);
   const minInterval = mode === 'older'
     ? NATIVE_HISTORY_OLDER_MIN_INTERVAL_MS
     : NATIVE_HISTORY_TAIL_MIN_INTERVAL_MS;
@@ -5032,15 +5120,12 @@ function throttleNativeHistoryChunkRequest(sessionId, msg) {
         retryAfterMs: minInterval - elapsed,
       };
     }
-    if (mode === 'older' && cursorSig && previous.cursorSig === cursorSig && elapsed < NATIVE_HISTORY_REPEAT_CURSOR_MS) {
-      return {
-        code: 'history_chunk_duplicate_cursor',
-        message: 'Duplicate older native history cursor ignored.',
-        retryAfterMs: NATIVE_HISTORY_REPEAT_CURSOR_MS - elapsed,
-      };
-    }
   }
-  setBoundedMap(nativeHistoryChunkRequests, key, { at: now, cursorSig });
+  // The flight signature already coalesces concurrent requests and the result
+  // cache absorbs immediate replays. Do not tombstone an older-history cursor
+  // across completed flights: a refresh, reconnect, or second tab must be able
+  // to request the same native window after the bounded rate interval.
+  setBoundedMap(nativeHistoryChunkRequests, key, { at: now });
   return null;
 }
 
@@ -5388,6 +5473,21 @@ function statusBroadcastSignature(msg) {
       task_list: activity.task_list || null,
       context_card: activity.context_card || null,
       thinking: activity.thinking || null,
+      connection: activity.connection || null,
+      connection_tombstone: activity.connection_tombstone ? {
+        state: activity.connection_tombstone.state || '',
+        generation: activity.connection_tombstone.generation || '',
+        generation_seq: activity.connection_tombstone.generation_seq || 0,
+        attempt: activity.connection_tombstone.attempt || null,
+        attempt_limit: activity.connection_tombstone.attempt_limit || null,
+      } : null,
+      interruption: activity.interruption || null,
+      interruption_tombstone: activity.interruption_tombstone ? {
+        event_id: activity.interruption_tombstone.event_id || '',
+        resolution_state: activity.interruption_tombstone.resolution_state || '',
+        transition_seq: activity.interruption_tombstone.transition_seq || 0,
+        resolved_at: activity.interruption_tombstone.resolved_at || null,
+      } : null,
       current: activity.current || null,
       step: activity.step || null,
       usage: activity.usage || null,
@@ -6015,7 +6115,7 @@ const KNOWN_PROXY_TYPES = new Set([
   'status', 'proxy_status',
   'message', 'proxy_message', 'message_delta',
   'session_launch_ack', 'session_launch_failed', 'session_closed', 'session_meta_backfill',
-  'session_alias_reconciled',
+  'session_alias_reconciled', 'session_alias_released',
   'permission_prompt', 'permission_prompt_expired', 'question_prompt', 'question_prompt_state',
   'session_error_prompt', 'session_error_prompt_cleared', 'agent_config', 'agent_control_result',
   'history', 'history_snapshot', 'history_chunk',
@@ -6217,7 +6317,9 @@ function handleProxyConnection(ws, req) {
     try { msg = JSON.parse(data.toString()); } catch { return; }
     const proxyMessageReceivedAtMs = Date.now();
     const t = msg.type;
-    if (t !== 'session_alias_reconciled') msg = canonicalizeSessionMessage(msg);
+    if (t !== 'session_alias_reconciled' && t !== 'session_alias_released') {
+      msg = canonicalizeSessionMessage(msg);
+    }
 
     // SEC-02: Before authentication, only accept hello messages
     if (!ws._authenticated) {
@@ -6338,6 +6440,41 @@ function handleProxyConnection(ws, req) {
         reason: result.reason,
         database: result.counts,
         runtime: runtimeCounts,
+      });
+      queueSessionListBroadcast();
+
+    } else if (t === 'session_alias_released') {
+      const result = sessionAliases.release(msg);
+      if (!result.accepted) {
+        log('warn', 'session-alias', 'Rejected canonical session alias release', {
+          alias_session_id: result.alias_session_id || msg.alias_session_id || null,
+          canonical_session_id: result.canonical_session_id
+            || msg.prior_canonical_session_id
+            || msg.canonical_session_id
+            || null,
+          reason: result.reason,
+        });
+        return;
+      }
+      const aliasId = result.alias.alias_session_id;
+      const canonicalId = result.alias.canonical_session_id;
+      broadcastToBrowsers({
+        type: 'session_alias_released',
+        protocol_version: PROTOCOL_VERSION,
+        alias_session_id: aliasId,
+        prior_canonical_session_id: canonicalId,
+        canonical_conversation_id: result.alias.canonical_conversation_id,
+        canonical_native_id: result.alias.canonical_native_id,
+        current_surface: result.alias.current_surface,
+        release_reason: result.alias.suppression_reason,
+        generation: result.alias.generation_clock,
+        server_ts: new Date().toISOString(),
+      });
+      log('info', 'session-alias', 'Canonical session alias released by verified live owner', {
+        alias_session_id: aliasId,
+        canonical_session_id: canonicalId,
+        reason: result.reason,
+        generation: result.alias.generation_clock,
       });
       queueSessionListBroadcast();
 
@@ -6751,17 +6888,27 @@ function handleProxyConnection(ws, req) {
             updated_at: s.last_seen_at || s.updated_at,
           } : null);
           if (snapshotActivity) {
+            const snapshotHarness = sessionMeta.get(id)?.agent_type || 'unknown';
             const hydrated = goalNotifications.observeActivity(id, snapshotActivity, {
               sessionName: notificationSessionName(id),
               hydrateOnly: true,
               reconcileLive: !sessionIdIsTestSession(id),
-              harness: sessionMeta.get(id)?.agent_type || 'unknown',
+              harness: snapshotHarness,
             });
             hydrated.events.forEach(dispatchSemanticNotification);
-            if (hydrated.goal) {
+            const snapshotCapabilities = agentConfigs.get(id)?.capabilities
+              || sessionMeta.get(id)?.capabilities
+              || null;
+            if (goalLifecycleSupported(snapshotHarness, snapshotCapabilities)) {
               sessionMeta.set(id, {
                 ...sessionMeta.get(id),
-                activity: { ...snapshotActivity, goal: hydrated.goal },
+                activity: {
+                  ...snapshotActivity,
+                  goal: hydrated.goal,
+                  ...(hydrated.goal_tombstone
+                    ? { goal_tombstone: hydrated.goal_tombstone }
+                    : {}),
+                },
               });
             }
           }
@@ -6877,7 +7024,18 @@ function handleProxyConnection(ws, req) {
           hydrateOnly: sessionIdIsTestSession(id),
           harness: sessionMeta.get(id)?.agent_type || msg.agent_type || 'unknown',
         });
-        if (semantic.goal) broadcastActivity = { ...broadcastActivity, goal: semantic.goal };
+        if (goalCapable) {
+          broadcastActivity = {
+            ...broadcastActivity,
+            goal: semantic.goal,
+            ...(semantic.goal_tombstone
+              ? { goal_tombstone: semantic.goal_tombstone }
+              : {}),
+          };
+        } else if (Object.prototype.hasOwnProperty.call(broadcastActivity, 'goal')) {
+          const { goal: ignoredGoal, ...withoutGoal } = broadcastActivity;
+          broadcastActivity = withoutGoal;
+        }
         broadcastActivity = {
           ...broadcastActivity,
           work_context: projectFleetWorkContext({
@@ -7566,10 +7724,13 @@ function handleProxyConnection(ws, req) {
         return;
       }
       const isLargeHistory = messages.length > UNSOLICITED_HISTORY_TAIL_LIMIT;
+      const forceFullReplace = msg.replace_all === true;
       let existing = null;
       let existingLength = 0;
       let alreadyMatches = false;
-      if (messages.length > 0 && isLargeHistory) {
+      if (forceFullReplace) {
+        existingLength = getHistoryCount(id);
+      } else if (messages.length > 0 && isLargeHistory) {
         const quick = historiesTailLikelyMatch(id, messages);
         existingLength = quick.existingCount;
         alreadyMatches = quick.match;
@@ -7583,7 +7744,7 @@ function handleProxyConnection(ws, req) {
       // list-view transitions intentionally send [] to clear the previous
       // conversation; ignoring that snapshot causes the next native turns to
       // be appended behind stale SQLite history and appear duplicated.
-      const incrementalPlan = !alreadyMatches
+      const incrementalPlan = !alreadyMatches && !forceFullReplace
         ? getIncrementalHistoryPlan(id, messages, existingLength)
         : null;
       if (incrementalPlan && incrementalPlan.rows.length > 0) {

@@ -233,6 +233,9 @@ function renderBlock(block, i, isUser, theme) {
       }
       return renderStructuredCard(block, i, 'Notice', 'notice', theme.markdown);
 
+    case 'memory_citation':
+      return renderStructuredCard(block, i, 'Sources', 'notice', theme.markdown);
+
     case 'error':
       if (theme.nativeAntigravityError) {
         return <AntigravityErrorBlock key={i} block={block} theme={theme} />;

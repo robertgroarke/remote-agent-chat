@@ -14,6 +14,10 @@ const dataDir = fs.mkdtempSync(path.join(os.tmpdir(), 'rac-source-idempotency-')
 const port = 37100 + Math.floor(Math.random() * 300);
 const origin = `http://127.0.0.1:${port}`;
 const sessionId = 'source-idempotency-session';
+const replaceSessionId = 'source-authoritative-replace-session';
+const releasedAliasSessionId = 'bbbbbbbb-cccc-4ddd-8eee-ffffffffffff';
+const releasedCanonicalSessionId = 'aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee';
+const releasedNativeId = '11111111-2222-4333-8444-555555555555';
 const logs = [];
 
 const sleep = ms => new Promise(resolve => setTimeout(resolve, ms));
@@ -126,7 +130,16 @@ async function connectPair(run) {
   }, 15_000, 'relay health');
   const proxy = await openSocket('/proxy-ws', 'proxy', `source-idempotency-proxy-${Date.now()}`);
   const browser = await openSocket('/client-ws', 'browser', `source-idempotency-browser-${Date.now()}`);
-  browser.ws.send(JSON.stringify({ type: 'subscribe', request_id: `subscribe-${Date.now()}`, sessions: [sessionId] }));
+  browser.ws.send(JSON.stringify({
+    type: 'subscribe',
+    request_id: `subscribe-${Date.now()}`,
+    sessions: [
+      sessionId,
+      replaceSessionId,
+      releasedAliasSessionId,
+      releasedCanonicalSessionId,
+    ],
+  }));
   await waitFor(() => browser.messages.some(message => message.type === 'subscription_ack'), 5000, 'subscription ack');
   return { proxy, browser };
 }
@@ -148,7 +161,12 @@ async function main() {
       type: 'proxy_session_snapshot',
       protocol_version: 1,
       proxy_id: 'source-idempotency-proxy',
-      sessions: [{ session_id: sessionId, agent_type: 'codex_cli' }],
+      sessions: [
+        { session_id: sessionId, agent_type: 'codex_cli' },
+        { session_id: replaceSessionId, agent_type: 'codex_cli' },
+        { session_id: releasedAliasSessionId, agent_type: 'codex_cli' },
+        { session_id: releasedCanonicalSessionId, agent_type: 'codex-desktop' },
+      ],
     }));
     await sleep(100);
     const first = sourceFrame('codex_cli:stable:first', 0);
@@ -195,19 +213,34 @@ async function main() {
       user_initiated: true,
       reconcile_metadata: true,
     }));
-    await waitFor(
-      () => pair.proxy.messages.some(message => message.type === 'history_chunk_request'
-        && message.request_id === reconcileRequestId && message.reconcile_metadata === true),
-      5000,
-      'metadata reconciliation native request',
-    );
+    let forwardedReconcileRequest;
+    try {
+      forwardedReconcileRequest = await waitFor(
+        () => pair.proxy.messages.find(message => message.type === 'history_chunk_request'
+          && message.session_id === sessionId && message.reconcile_metadata === true),
+        5000,
+        'metadata reconciliation native request',
+      );
+    } catch (error) {
+      throw new Error(`${error.message}; proxy=${JSON.stringify(pair.proxy.messages.slice(-8).map(message => ({
+        type: message.type,
+        session: message.session_id || message.session || null,
+        request_id: message.request_id || null,
+        error: message.error?.code || message.code || null,
+      })))}; browser=${JSON.stringify(pair.browser.messages.slice(-8).map(message => ({
+        type: message.type,
+        session: message.session_id || message.session || null,
+        request_id: message.request_id || null,
+        error: message.error?.code || message.code || null,
+      })))}; relay=${logs.join('').slice(-3000)}`);
+    }
     const observerStart = observer.messages.length;
     pair.proxy.ws.send(JSON.stringify({
       type: 'history_chunk',
       protocol_version: 1,
       session: sessionId,
       session_id: sessionId,
-      request_id: reconcileRequestId,
+      request_id: forwardedReconcileRequest.request_id,
       source: 'codex_cli_jsonl',
       mode: 'older',
       messages: correctedRows,
@@ -236,6 +269,248 @@ async function main() {
       'request-scoped native history must not fan out to another subscriber',
     );
 
+    // A schema migration is an explicit full replacement. Keep the last 60
+    // identities unchanged while changing the first 60 so the relay's normal
+    // 50-row tail optimization would incorrectly report a match without the
+    // replace_all contract.
+    const originalCanonicalRows = Array.from({ length: 120 }, (_, index) => ({
+      role: index % 2 ? 'assistant' : 'user',
+      content: `canonical row ${index}`,
+      source_message_id: `canonical-v1:${index}`,
+      source: 'codex_cli_jsonl',
+    }));
+    pair.proxy.ws.send(JSON.stringify({
+      type: 'history_snapshot',
+      protocol_version: 1,
+      session: replaceSessionId,
+      session_id: replaceSessionId,
+      messages: originalCanonicalRows,
+    }));
+    await sleep(150);
+    const replacementCanonicalRows = originalCanonicalRows.map((row, index) => ({
+      ...row,
+      source_message_id: index < 60 ? `canonical-v2:${index}` : row.source_message_id,
+    }));
+    pair.proxy.ws.send(JSON.stringify({
+      type: 'history_snapshot',
+      protocol_version: 1,
+      session: replaceSessionId,
+      session_id: replaceSessionId,
+      messages: replacementCanonicalRows,
+      replace_all: true,
+    }));
+    await sleep(150);
+    const replaceRequestId = `replace-history-${Date.now()}`;
+    pair.browser.ws.send(JSON.stringify({
+      type: 'history_request',
+      session: replaceSessionId,
+      session_id: replaceSessionId,
+      request_id: replaceRequestId,
+      full: true,
+    }));
+    const replacedHistory = await waitFor(
+      () => pair.browser.messages.find(message => (
+        message.type === 'history' && message.request_id === replaceRequestId
+      )),
+      5000,
+      'replace_all authoritative history',
+    );
+    assert.deepStrictEqual(
+      replacedHistory.messages.map(message => message.source_message_id),
+      replacementCanonicalRows.map(message => message.source_message_id),
+      'replace_all must not trust a matching 50-row tail when earlier canonical identities changed',
+    );
+
+    const aliasReconcileEvent = {
+      type: 'session_alias_reconciled',
+      protocol_version: 1,
+      alias_session_id: releasedAliasSessionId,
+      canonical_session_id: releasedCanonicalSessionId,
+      canonical_conversation_id: `codex:${releasedNativeId}`,
+      canonical_native_id: releasedNativeId,
+      current_surface: 'codex_desktop',
+      suppression_reason: 'shared_archive_without_current_cli_owner',
+      owner_evidence: { observed_at: '2026-07-23T12:00:00.000Z' },
+    };
+    pair.proxy.ws.send(JSON.stringify({
+      type: 'history_snapshot',
+      protocol_version: 1,
+      session: releasedCanonicalSessionId,
+      session_id: releasedCanonicalSessionId,
+      messages: [{
+        role: 'assistant',
+        content: 'desktop retained row',
+        source_message_id: 'codex-desktop:retained',
+      }],
+      replace_all: true,
+    }));
+    pair.proxy.ws.send(JSON.stringify({
+      type: 'history_snapshot',
+      protocol_version: 1,
+      session: releasedAliasSessionId,
+      session_id: releasedAliasSessionId,
+      messages: [{
+        role: 'assistant',
+        content: 'archive-only CLI row',
+        source_message_id: 'codex_cli:archive-only',
+        source: 'codex_cli_jsonl',
+      }],
+      replace_all: true,
+    }));
+    pair.proxy.ws.send(JSON.stringify(aliasReconcileEvent));
+    await waitFor(
+      () => pair.browser.messages.some(message => (
+        message.type === 'session_alias_reconciled'
+        && message.alias_session_id === releasedAliasSessionId
+      )),
+      5000,
+      'cross-surface alias reconciliation',
+    );
+    pair.proxy.ws.send(JSON.stringify({
+      type: 'session_alias_released',
+      protocol_version: 1,
+      alias_session_id: releasedAliasSessionId,
+      prior_canonical_session_id: releasedCanonicalSessionId,
+      canonical_conversation_id: `codex:${releasedNativeId}`,
+      canonical_native_id: releasedNativeId,
+      current_surface: 'codex_cli',
+      release_reason: 'verified_cli_owner_restored',
+      owner_evidence: {
+        verified: false,
+        observed_at: '2026-07-23T12:00:01.000Z',
+      },
+    }));
+    await sleep(100);
+    assert.strictEqual(
+      pair.browser.messages.filter(message => (
+        message.type === 'session_alias_released'
+        && message.alias_session_id === releasedAliasSessionId
+      )).length,
+      0,
+      'an unverified release must fail closed',
+    );
+    const aliasReleaseEvent = {
+      type: 'session_alias_released',
+      protocol_version: 1,
+      alias_session_id: releasedAliasSessionId,
+      prior_canonical_session_id: releasedCanonicalSessionId,
+      canonical_conversation_id: `codex:${releasedNativeId}`,
+      canonical_native_id: releasedNativeId,
+      current_surface: 'codex_cli',
+      release_reason: 'verified_cli_owner_restored',
+      owner_evidence: {
+        verified: true,
+        observed_at: '2026-07-23T12:00:02.000Z',
+      },
+    };
+    pair.proxy.ws.send(JSON.stringify(aliasReleaseEvent));
+    await waitFor(
+      () => pair.browser.messages.some(message => (
+        message.type === 'session_alias_released'
+        && message.alias_session_id === releasedAliasSessionId
+      )),
+      5000,
+      'verified cross-surface alias release',
+    );
+    const restoredAliasRows = Array.from({ length: 3 }, (_, index) => ({
+      role: index % 2 ? 'assistant' : 'user',
+      content: `restored CLI row ${index}`,
+      source_message_id: `codex_cli:restored:${index}`,
+      source: 'codex_cli_jsonl',
+    }));
+    pair.proxy.ws.send(JSON.stringify({
+      type: 'history_snapshot',
+      protocol_version: 1,
+      session: releasedAliasSessionId,
+      session_id: releasedAliasSessionId,
+      messages: restoredAliasRows,
+      replace_all: true,
+    }));
+    pair.proxy.ws.send(JSON.stringify({
+      type: 'history_snapshot',
+      protocol_version: 1,
+      session: releasedCanonicalSessionId,
+      session_id: releasedCanonicalSessionId,
+      messages: [],
+      replace_all: true,
+    }));
+    await sleep(150);
+    const restoredAliasRequestId = `released-alias-${Date.now()}`;
+    const clearedCanonicalRequestId = `released-canonical-${Date.now()}`;
+    pair.browser.ws.send(JSON.stringify({
+      type: 'history_request',
+      session: releasedAliasSessionId,
+      session_id: releasedAliasSessionId,
+      request_id: restoredAliasRequestId,
+      full: true,
+    }));
+    pair.browser.ws.send(JSON.stringify({
+      type: 'history_request',
+      session: releasedCanonicalSessionId,
+      session_id: releasedCanonicalSessionId,
+      request_id: clearedCanonicalRequestId,
+      full: true,
+    }));
+    const restoredAliasHistory = await waitFor(
+      () => pair.browser.messages.find(message => (
+        message.type === 'history' && message.request_id === restoredAliasRequestId
+      )),
+      5000,
+      'released alias history',
+    );
+    const clearedCanonicalHistory = await waitFor(
+      () => pair.browser.messages.find(message => (
+        message.type === 'history' && message.request_id === clearedCanonicalRequestId
+      )),
+      5000,
+      'cleared prior canonical history',
+    );
+    assert.deepStrictEqual(
+      restoredAliasHistory.messages.map(message => message.source_message_id),
+      restoredAliasRows.map(message => message.source_message_id),
+      'verified owner release must restore an independent CLI transcript key',
+    );
+    assert.deepStrictEqual(clearedCanonicalHistory.messages, [],
+      'the Desktop canonical key must accept its independent authoritative clear');
+
+    pair.proxy.ws.send(JSON.stringify(aliasReconcileEvent));
+    await sleep(100);
+    const postTombstoneRows = [...restoredAliasRows, {
+      role: 'assistant',
+      content: 'row after stale alias replay',
+      source_message_id: 'codex_cli:restored:3',
+      source: 'codex_cli_jsonl',
+    }];
+    pair.proxy.ws.send(JSON.stringify({
+      type: 'history_snapshot',
+      protocol_version: 1,
+      session: releasedAliasSessionId,
+      session_id: releasedAliasSessionId,
+      messages: postTombstoneRows,
+      replace_all: true,
+    }));
+    await sleep(150);
+    const tombstoneRequestId = `release-tombstone-${Date.now()}`;
+    pair.browser.ws.send(JSON.stringify({
+      type: 'history_request',
+      session: releasedAliasSessionId,
+      session_id: releasedAliasSessionId,
+      request_id: tombstoneRequestId,
+      full: true,
+    }));
+    const tombstoneHistory = await waitFor(
+      () => pair.browser.messages.find(message => (
+        message.type === 'history' && message.request_id === tombstoneRequestId
+      )),
+      5000,
+      'release tombstone history',
+    );
+    assert.deepStrictEqual(
+      tombstoneHistory.messages.map(message => message.source_message_id),
+      postTombstoneRows.map(message => message.source_message_id),
+      'a stale alias replay must not resurrect cross-surface canonicalization',
+    );
+
     await closeSocket(observer.ws);
     observer = null;
     await closeSocket(pair.browser.ws);
@@ -245,6 +520,68 @@ async function main() {
 
     relay = startRelay();
     pair = await connectPair(relay);
+    pair.proxy.ws.send(JSON.stringify(aliasReconcileEvent));
+    await sleep(100);
+    const postRestartAliasRows = [...postTombstoneRows, {
+      role: 'assistant',
+      content: 'row after relay restart',
+      source_message_id: 'codex_cli:restored:4',
+      source: 'codex_cli_jsonl',
+    }];
+    pair.proxy.ws.send(JSON.stringify({
+      type: 'history_snapshot',
+      protocol_version: 1,
+      session: releasedAliasSessionId,
+      session_id: releasedAliasSessionId,
+      messages: postRestartAliasRows,
+      replace_all: true,
+    }));
+    pair.proxy.ws.send(JSON.stringify({
+      type: 'history_snapshot',
+      protocol_version: 1,
+      session: releasedCanonicalSessionId,
+      session_id: releasedCanonicalSessionId,
+      messages: [],
+      replace_all: true,
+    }));
+    await sleep(150);
+    const postRestartAliasRequestId = `release-restart-alias-${Date.now()}`;
+    const postRestartCanonicalRequestId = `release-restart-canonical-${Date.now()}`;
+    pair.browser.ws.send(JSON.stringify({
+      type: 'history_request',
+      session: releasedAliasSessionId,
+      session_id: releasedAliasSessionId,
+      request_id: postRestartAliasRequestId,
+      full: true,
+    }));
+    pair.browser.ws.send(JSON.stringify({
+      type: 'history_request',
+      session: releasedCanonicalSessionId,
+      session_id: releasedCanonicalSessionId,
+      request_id: postRestartCanonicalRequestId,
+      full: true,
+    }));
+    const postRestartAliasHistory = await waitFor(
+      () => pair.browser.messages.find(message => (
+        message.type === 'history' && message.request_id === postRestartAliasRequestId
+      )),
+      5000,
+      'release tombstone after relay restart',
+    );
+    const postRestartCanonicalHistory = await waitFor(
+      () => pair.browser.messages.find(message => (
+        message.type === 'history' && message.request_id === postRestartCanonicalRequestId
+      )),
+      5000,
+      'canonical history after relay restart',
+    );
+    assert.deepStrictEqual(
+      postRestartAliasHistory.messages.map(message => message.source_message_id),
+      postRestartAliasRows.map(message => message.source_message_id),
+      'the release tombstone must survive relay restart and reject stale re-aliasing',
+    );
+    assert.deepStrictEqual(postRestartCanonicalHistory.messages, []);
+
     const historyRequestId = `history-${Date.now()}`;
     pair.browser.ws.send(JSON.stringify({
       type: 'history_request',
@@ -306,6 +643,11 @@ async function main() {
       source_timestamp: rows[0].ts,
       unique_index: 'idx_source_message',
       history_replay_source_cursor_object: true,
+      replace_all_rows: 120,
+      replace_all_early_identity_changes: 60,
+      verified_owner_alias_release_rows: 5,
+      stale_alias_replay_resurrections: 0,
+      release_tombstone_survived_relay_restart: true,
       windows_opened: 0,
     }, null, 2));
   } finally {

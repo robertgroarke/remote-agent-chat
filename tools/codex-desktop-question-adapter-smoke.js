@@ -11,6 +11,7 @@ process.env.SESSION_STORE_PATH = path.join(tempRoot, 'session-store.json');
 const selectors = require('../agent-proxy/selectors');
 const {
   ProxyEngine,
+  codexDesktopQuestionIdentity,
   detectCodexDesktopInstalledVersion,
 } = require('../agent-proxy/proxy-engine');
 const { selectPlanMode } = require('./codex-desktop-question-owned-probe');
@@ -35,6 +36,10 @@ function harness(sessionId = 'desktop-question-session') {
   engine.activeErrorPrompts = new Map();
   engine.sent = [];
   engine.logs = [];
+  // This isolated fixture validates the native adapter itself. App-update
+  // capability gating has a separate contract smoke and must not make this
+  // selector-level regression depend on mutable machine-wide sentinel state.
+  engine._validationGateForAgentType = () => ({ gated: false });
   engine._sendToRelay = message => { engine.sent.push(message); return true; };
   engine._log = (level, message) => engine.logs.push({ level, message });
   engine.freshQuestionClients = [];
@@ -256,13 +261,16 @@ function settle() {
     assert.strictEqual(prompt.cancel_supported, true);
     assert.strictEqual(prompt.auto_resolution_ms, null);
     assert.strictEqual(prompt.deadline_at, null);
+    const expectedIdentity = codexDesktopQuestionIdentity(session.session_id, fixture.expected_observed);
+    assert.strictEqual(prompt.prompt_id, expectedIdentity.promptId);
+    assert.strictEqual(prompt.generation, expectedIdentity.generation);
     assert.strictEqual(session.activity.kind, 'waiting_for_user');
     assert.strictEqual(engine.activePermissionPrompts.size, 0);
 
     engine._handleRelayMessage(response(prompt, 'desktop-response'));
     await settle();
     await settle();
-    assert.strictEqual(nativeCalls, 1);
+    assert.strictEqual(nativeCalls, 1, `native answer was not attempted: ${JSON.stringify({ sent: engine.sent, logs: engine.logs })}`);
     const receipt = engine.sent.find(message =>
       message.command === 'question_response' && message.request_id === 'desktop-response');
     assert.strictEqual(receipt.result, 'ok');
@@ -270,6 +278,14 @@ function settle() {
     assert.strictEqual(receipt.native_receipt.request_card_disappeared, true);
     assert.strictEqual(session.activity.kind, 'thinking');
     assert.strictEqual(engine.activeQuestionPromptAdapters.has(session.session_id), false);
+    await engine._handleCodexDesktopQuestionState(
+      session.session_id,
+      session,
+      fixture.expected_observed,
+    );
+    assert.strictEqual(engine.sent.filter(message => message.type === 'question_prompt').length, 1,
+      'terminal native prompt replay was resurrected');
+    assert.notStrictEqual(session.activity.kind, 'waiting_for_user');
 
     engine._handleRelayMessage(response(prompt, 'desktop-duplicate'));
     assert.strictEqual(nativeCalls, 1, 'duplicate response reached the native adapter');

@@ -88,6 +88,50 @@ for (const surface of ['codex_cli', 'codex', 'codex-desktop']) {
   }
 }
 
+const persistedTombstones = [];
+const durableRegistry = new QuestionPromptRegistry({
+  now: () => clock,
+  maxEntries: 2048,
+  tombstoneTtlMs: 30 * 24 * 60 * 60 * 1000,
+  onTombstone: tombstone => persistedTombstones.push(tombstone),
+});
+const durablePrompt = prompt('codex_cli', 4000, {
+  session_id: 'durable-terminal-session',
+  prompt_id: 'durable-native-prompt',
+  generation: 'durable-native-turn',
+});
+assert.strictEqual(durableRegistry.open(durablePrompt).status, 'opened');
+assert.strictEqual(durableRegistry.terminalFromSource({
+  session_id: durablePrompt.session_id,
+  prompt_id: durablePrompt.prompt_id,
+  generation: durablePrompt.generation,
+  lifecycle: 'cancelled',
+}).lifecycle, 'cancelled');
+assert.strictEqual(persistedTombstones.length, 1);
+const restartedRegistry = new QuestionPromptRegistry({
+  now: () => clock,
+  maxEntries: 2048,
+  tombstoneTtlMs: 30 * 24 * 60 * 60 * 1000,
+  initialTombstones: persistedTombstones,
+});
+for (let replay = 0; replay < 1000; replay += 1) {
+  const terminalDuplicate = restartedRegistry.open(durablePrompt);
+  assert.strictEqual(terminalDuplicate.status, 'terminal_duplicate');
+  assert.strictEqual(terminalDuplicate.prompt.lifecycle, 'cancelled');
+}
+const terminalBeforeOpen = prompt('codex-desktop', 4001, {
+  session_id: 'terminal-before-open-session',
+  prompt_id: 'terminal-before-open-prompt',
+  generation: 'terminal-before-open-turn',
+});
+assert.strictEqual(restartedRegistry.terminalFromSource({
+  session_id: terminalBeforeOpen.session_id,
+  prompt_id: terminalBeforeOpen.prompt_id,
+  generation: terminalBeforeOpen.generation,
+  lifecycle: 'answered',
+}).lifecycle, 'answered');
+assert.strictEqual(restartedRegistry.open(terminalBeforeOpen).status, 'terminal_duplicate');
+
 const secretResult = registry.open(prompt('codex_cli', 999, {
   questions: [{
     id: 'secret', header: 'Secret', question: 'Enter a secret.', options: null, isSecret: true,
@@ -248,6 +292,8 @@ console.log(JSON.stringify({
   reconnect_submit_failed_closed: true,
   submit_receipt_timeout_failed_closed: true,
   terminal_duplicate_not_resurrected: true,
+  durable_terminal_replays_rejected: 1000,
+  terminal_before_open_fail_closed: true,
   deadline_failed_closed: true,
   native_deadline_receipt_grace_ms: NATIVE_DEADLINE_RECEIPT_GRACE_MS,
   browser_response_window_extended: false,

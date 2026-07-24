@@ -110,13 +110,57 @@ const mergeHistoryTailByOverlap = moduleRecord.exports.mergeHistoryTailByOverlap
 const removeSupersededCliTranscriptPlaceholders = moduleRecord.exports.removeSupersededCliTranscriptPlaceholders;
 const shouldRefreshNativeCliPlaceholder = moduleRecord.exports.shouldRefreshNativeCliPlaceholder;
 const sessionMetadataActivityMaps = moduleRecord.exports.sessionMetadataActivityMaps;
+const mergeSessionMetadataFallbackMap = moduleRecord.exports.mergeSessionMetadataFallbackMap;
+const reconcileCanonicalHistory = moduleRecord.exports.reconcileCanonicalHistory;
+const rememberQuestionPromptTombstone = moduleRecord.exports.rememberQuestionPromptTombstone;
+const questionPromptIsTombstoned = moduleRecord.exports.questionPromptIsTombstoned;
 const reconnectDelays = moduleRecord.exports.RELAY_RECONNECT_DELAYS_MS;
 assert.equal(typeof shouldMergeHistorySnapshot, 'function');
 assert.equal(typeof mergeHistoryTailByOverlap, 'function');
 assert.equal(typeof removeSupersededCliTranscriptPlaceholders, 'function');
 assert.equal(typeof shouldRefreshNativeCliPlaceholder, 'function');
 assert.equal(typeof sessionMetadataActivityMaps, 'function');
+assert.equal(typeof mergeSessionMetadataFallbackMap, 'function');
+assert.equal(typeof reconcileCanonicalHistory, 'function');
+assert.equal(typeof rememberQuestionPromptTombstone, 'function');
+assert.equal(typeof questionPromptIsTombstoned, 'function');
 assert.deepEqual(reconnectDelays, [250, 500, 1000, 2000, 3000], 'relay reconnect must begin below the 3-second recovery target');
+const canonicalFixture = Array.from({ length: 96 }, (_, index) => ({
+  source_message_id: `native-message-${index + 1}`,
+  sequence: index + 1,
+  role: index % 2 === 0 ? 'user' : 'assistant',
+  content: `canonical transcript row ${index + 1}`,
+}));
+let canonicalTranscript = reconcileCanonicalHistory([], canonicalFixture);
+for (let replay = 0; replay < 1000; replay += 1) {
+  const reordered = [...canonicalFixture].sort((left, right) => (
+    ((left.sequence * 1103515245 + replay * 12345) >>> 0)
+      - ((right.sequence * 1103515245 + replay * 12345) >>> 0)
+  ));
+  const withOverlapDuplicates = replay % 7 === 0
+    ? [...reordered, reordered[0], reordered[reordered.length - 1]]
+    : reordered;
+  canonicalTranscript = reconcileCanonicalHistory(canonicalTranscript, withOverlapDuplicates);
+  assert.deepEqual(
+    canonicalTranscript.map(message => message.source_message_id),
+    canonicalFixture.map(message => message.source_message_id),
+    `replayed transcript ${replay + 1} must retain canonical native order and identity`,
+  );
+}
+const tombstones = new Map();
+const terminalPrompt = {
+  session_id: 'codex-cli-terminal-fixture',
+  prompt_id: 'native-prompt-1',
+  generation: 'native-turn-1',
+  lifecycle: 'answered',
+};
+assert.equal(rememberQuestionPromptTombstone(tombstones, terminalPrompt), true);
+for (let replay = 0; replay < 1000; replay += 1) {
+  assert.equal(questionPromptIsTombstoned(tombstones, {
+    ...terminalPrompt,
+    lifecycle: replay % 2 === 0 ? 'open' : 'submitting',
+  }), true, `prompt replay ${replay + 1} must remain terminal`);
+}
 assert.deepEqual(
   sessionMetadataActivityMaps([
     { session_id: 'active-cli', activity: {
@@ -124,6 +168,7 @@ assert.deepEqual(
       observed_at: '2026-07-19T06:00:00.000Z',
       goal: { state: 'active', fingerprint: 'goal-fixture', generation: 1 },
       goal_run: { schema_version: 1, run_id: 'run-fixture', goal_fingerprint: 'goal-fixture', goal_generation: 1, lifecycle: 'running_turn', lease_active: true },
+      work_context: { kind: 'response', label: 'Current response', text: 'Running validation', source: 'current_response' },
     } },
     { session_id: 'idle-cli', activity: { kind: 'idle', label: '', thinkingContent: '' } },
   ], {
@@ -131,13 +176,36 @@ assert.deepEqual(
   }),
   {
     activities: {
-        'active-cli': { kind: 'generating', label: 'Working', updatedAt: null, observed_at: '2026-07-19T06:00:00.000Z', startedAt: null, interruptHint: '', goal: { state: 'active', fingerprint: 'goal-fixture', generation: 1 }, goal_run: { schema_version: 1, run_id: 'run-fixture', goal_fingerprint: 'goal-fixture', goal_generation: 1, lifecycle: 'running_turn', lease_active: true }, thinking: null, current: null, step: null, usage: null, task_list: null, context_card: null, thinkingContent: 'running', transport: { latency_ms: 73 } },
-        'idle-cli': { kind: 'idle', label: '', updatedAt: null, observed_at: null, startedAt: null, interruptHint: '', goal: null, goal_run: null, thinking: null, current: null, step: null, usage: null, task_list: null, context_card: null, thinkingContent: '', transport: null },
+        'active-cli': { kind: 'generating', label: 'Working', updatedAt: null, observed_at: '2026-07-19T06:00:00.000Z', startedAt: null, interruptHint: '', goal: { state: 'active', fingerprint: 'goal-fixture', generation: 1 }, goal_run: { schema_version: 1, run_id: 'run-fixture', goal_fingerprint: 'goal-fixture', goal_generation: 1, lifecycle: 'running_turn', lease_active: true }, thinking: null, connection: null, connection_tombstone: null, interruption: null, interruption_tombstone: null, current: null, step: null, usage: null, task_list: null, context_card: null, work_context: { kind: 'response', label: 'Current response', text: 'Running validation', source: 'current_response' }, thinkingContent: 'running', transport: { latency_ms: 73 } },
+        'idle-cli': { kind: 'idle', label: '', updatedAt: null, observed_at: null, startedAt: null, interruptHint: '', goal: null, goal_run: null, thinking: null, connection: null, connection_tombstone: null, interruption: null, interruption_tombstone: null, current: null, step: null, usage: null, task_list: null, context_card: null, work_context: null, thinkingContent: '', transport: null },
     },
     thinkingContent: { 'active-cli': 'running', 'idle-cli': '' },
     thinking: { 'active-cli': 'Working', 'idle-cli': false },
   },
   'session snapshots must explicitly clear stale thinking state for idle sessions',
+);
+const liveActivityTombstone = { 'idle-cli': false };
+const staleMetadataActivity = { 'idle-cli': { kind: 'generating' }, 'new-cli': { kind: 'working' } };
+const fallbackMergedActivity = mergeSessionMetadataFallbackMap(liveActivityTombstone, staleMetadataActivity);
+assert.strictEqual(
+  fallbackMergedActivity['idle-cli'],
+  false,
+  'polling session metadata must not resurrect an explicit live idle tombstone',
+);
+assert.deepEqual(
+  fallbackMergedActivity['new-cli'],
+  { kind: 'working' },
+  'session metadata must still hydrate a session that has no live activity key',
+);
+assert.strictEqual(
+  mergeSessionMetadataFallbackMap(fallbackMergedActivity, staleMetadataActivity),
+  fallbackMergedActivity,
+  'an unchanged fallback refresh must preserve map referential equality',
+);
+assert.deepEqual(
+  mergeSessionMetadataFallbackMap(liveActivityTombstone, staleMetadataActivity, { authoritative: true }),
+  staleMetadataActivity,
+  'a first-class session activity patch must remain authoritative',
 );
 const staleCodexPlaceholder = {
   role: 'assistant',

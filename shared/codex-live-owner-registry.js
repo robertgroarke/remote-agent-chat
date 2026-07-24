@@ -7,6 +7,7 @@ const { randomUUID } = require('crypto');
 
 const SCHEMA_VERSION = 1;
 const OWNER_KINDS = new Set(['rotator_exec', 'proxy_app_server', 'interactive_tui']);
+const DIRECT_OWNER_KINDS = new Set(['rotator_exec', 'interactive_tui']);
 const OWNER_STATES = new Set(['active', 'transferring', 'quiescent', 'terminal']);
 const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 const DEFAULT_HEARTBEAT_TTL_MS = 30_000;
@@ -14,6 +15,12 @@ const DEFAULT_REGISTRY_TTL_MS = 60_000;
 const DEFAULT_LEASE_TTL_MS = 15_000;
 const DEFAULT_LOCK_TIMEOUT_MS = 5_000;
 const DEFAULT_STALE_LOCK_MS = 30_000;
+const DEFAULT_WRITE_RETRIES = 8;
+const DEFAULT_WRITE_RETRY_BASE_MS = 20;
+const DEFAULT_STALE_TEMP_MS = 60_000;
+const DEFAULT_TEMP_CLEANUP_INTERVAL_MS = 60_000;
+const TRANSIENT_REPLACE_ERRORS = new Set(['EPERM', 'EACCES', 'EBUSY']);
+const lastTempCleanupAt = new Map();
 
 function defaultRegistryPath(env = process.env) {
   if (env.RAC_CODEX_OWNER_REGISTRY) return path.resolve(env.RAC_CODEX_OWNER_REGISTRY);
@@ -61,6 +68,7 @@ function normalizeAuthority(value) {
 function emptyRegistry(now = new Date().toISOString()) {
   return {
     schema_version: SCHEMA_VERSION,
+    generation: 0,
     updated_at: now,
     authority: normalizeAuthority({ state: 'not_ready' }),
     lineages: {},
@@ -93,6 +101,17 @@ function optionalText(value) {
 function optionalPid(value) {
   const number = Number(value);
   return Number.isInteger(number) && number > 0 ? number : null;
+}
+
+function sameDirectOwnerProcess(left, right) {
+  if (!left || !right) return false;
+  if (!DIRECT_OWNER_KINDS.has(left.owner_kind) || left.owner_kind !== right.owner_kind) return false;
+  if (!left.root_pid || left.root_pid !== right.root_pid) return false;
+  if (left.session_id !== right.session_id) return false;
+  for (const field of ['thread_id', 'rollout_identity', 'native_pid']) {
+    if (left[field] && right[field] && left[field] !== right[field]) return false;
+  }
+  return true;
 }
 
 function normalizeOwner(value) {
@@ -129,6 +148,22 @@ function normalizeOwner(value) {
       ? new Date(Date.parse(value.terminal_at)).toISOString()
       : null,
     proof: optionalText(value?.proof),
+    ownership_health: ['healthy', 'degraded', 'recovered'].includes(value?.ownership_health)
+      ? value.ownership_health
+      : 'healthy',
+    ownership_retry_count: Math.max(0, Number.isInteger(Number(value?.ownership_retry_count))
+      ? Number(value.ownership_retry_count)
+      : 0),
+    ownership_degraded_since: Number.isFinite(Date.parse(value?.ownership_degraded_since || ''))
+      ? new Date(Date.parse(value.ownership_degraded_since)).toISOString()
+      : null,
+    ownership_recovered_at: Number.isFinite(Date.parse(value?.ownership_recovered_at || ''))
+      ? new Date(Date.parse(value.ownership_recovered_at)).toISOString()
+      : null,
+    ownership_error_code: optionalText(value?.ownership_error_code),
+    runtime_generation: optionalText(value?.runtime_generation),
+    model: optionalText(value?.model),
+    effort: optionalText(value?.effort),
   };
 }
 
@@ -143,6 +178,8 @@ function validateRegistry(value) {
     throw new Error('Codex owner registry updated_at is required');
   }
   const normalized = emptyRegistry(new Date(Date.parse(value.updated_at)).toISOString());
+  const generation = Number(value.generation);
+  normalized.generation = Number.isSafeInteger(generation) && generation >= 0 ? generation : 0;
   normalized.authority = normalizeAuthority(value.authority);
   for (const [sessionId, lineage] of Object.entries(value.lineages)) {
     if (!UUID_RE.test(sessionId)) throw new Error(`Invalid Codex owner lineage: ${sessionId}`);
@@ -162,11 +199,285 @@ function loadOwnerRegistry(registryPath = defaultRegistryPath()) {
   return validateRegistry(JSON.parse(fs.readFileSync(registryPath, 'utf8')));
 }
 
-function atomicWriteJson(filePath, value) {
-  fs.mkdirSync(path.dirname(filePath), { recursive: true });
-  const tempPath = `${filePath}.${process.pid}.${Date.now()}.tmp`;
-  fs.writeFileSync(tempPath, `${JSON.stringify(value, null, 2)}\n`, 'utf8');
-  fs.renameSync(tempPath, filePath);
+function processIsAlive(pid) {
+  if (!Number.isInteger(pid) || pid <= 0) return false;
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch (error) {
+    return error?.code === 'EPERM';
+  }
+}
+
+function ownerTempIdentity(registryPath, name) {
+  const escaped = path.basename(registryPath).replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+  const match = String(name || '').match(new RegExp(`^${escaped}\\.(\\d+)\\.(\\d+)(?:\\.[^.]+)*\\.tmp$`));
+  if (!match) return null;
+  return { pid: Number(match[1]), created_at_ms: Number(match[2]) };
+}
+
+function cleanupOwnerRegistryTempFiles(registryPath, options = {}) {
+  const fsOps = options.fsOps || fs;
+  const directory = path.dirname(registryPath);
+  if (!fsOps.existsSync(directory)) return { examined: 0, removed: 0, retained_live: 0, retained_young: 0 };
+  const nowMs = Number(options.nowMs) || Date.now();
+  const staleTempMs = Math.max(0, Number(options.staleTempMs) || DEFAULT_STALE_TEMP_MS);
+  const alive = options.processIsAlive || processIsAlive;
+  const result = { examined: 0, removed: 0, retained_live: 0, retained_young: 0 };
+  for (const name of fsOps.readdirSync(directory)) {
+    const identity = ownerTempIdentity(registryPath, name);
+    if (!identity) continue;
+    result.examined += 1;
+    if (alive(identity.pid) !== false) {
+      result.retained_live += 1;
+      continue;
+    }
+    if (nowMs - identity.created_at_ms < staleTempMs) {
+      result.retained_young += 1;
+      continue;
+    }
+    try {
+      fsOps.unlinkSync(path.join(directory, name));
+      result.removed += 1;
+    } catch {}
+  }
+  return result;
+}
+
+function maybeCleanupOwnerRegistryTempFiles(registryPath, options = {}) {
+  const nowMs = Number(options.nowMs) || Date.now();
+  const intervalMs = Math.max(1, Number(options.tempCleanupIntervalMs) || DEFAULT_TEMP_CLEANUP_INTERVAL_MS);
+  const previous = lastTempCleanupAt.get(registryPath) || 0;
+  if (options.forceTempCleanup !== true && nowMs - previous < intervalMs) {
+    return { examined: 0, removed: 0, retained_live: 0, retained_young: 0, throttled: true };
+  }
+  const result = cleanupOwnerRegistryTempFiles(registryPath, { ...options, nowMs });
+  lastTempCleanupAt.set(registryPath, nowMs);
+  return { ...result, throttled: false };
+}
+
+function retryTransientPhase(phase, operation, options, telemetry, generation) {
+  const retries = Math.max(1, Number(options.writeRetries) || DEFAULT_WRITE_RETRIES);
+  const baseDelayMs = Math.max(1, Number(options.writeRetryBaseMs) || DEFAULT_WRITE_RETRY_BASE_MS);
+  const wait = options.pause || pause;
+  let lastError = null;
+  for (let attempt = 1; attempt <= retries; attempt += 1) {
+    try {
+      return { value: operation(attempt), retry_count: attempt - 1 };
+    } catch (error) {
+      lastError = error;
+      if (!TRANSIENT_REPLACE_ERRORS.has(error?.code)) throw error;
+      if (attempt >= retries) break;
+      telemetry({
+        event: 'registry_write_retry', phase, retry_count: attempt,
+        error_code: error.code, generation,
+      });
+      const jitter = (process.pid + attempt * 17) % 11;
+      wait(baseDelayMs * attempt + jitter);
+    }
+  }
+  const exhausted = new Error(`Codex owner registry ${phase} failed after ${retries} attempts`);
+  exhausted.code = 'CODEX_OWNER_WRITE_RETRY_EXHAUSTED';
+  exhausted.phase = phase;
+  exhausted.cause = lastError;
+  exhausted.retry_count = retries;
+  telemetry({
+    event: 'registry_write_exhausted', phase, retry_count: retries,
+    error_code: lastError?.code || 'unknown', generation,
+  });
+  throw exhausted;
+}
+
+function atomicReplaceBytes(filePath, content, options = {}, validateBytes = null) {
+  const fsOps = options.fsOps || fs;
+  const payload = Buffer.isBuffer(content) ? content : Buffer.from(content);
+  const nowMs = Number(options.nowMs) || Date.now();
+  const telemetry = typeof options.onTelemetry === 'function' ? options.onTelemetry : () => {};
+  const generation = Math.max(0, Number(options.generation) || 0);
+  const uuid = options.randomUUID || randomUUID;
+  let tempPath = null;
+  let committed = false;
+  let retryCount = 0;
+  try {
+    const prepared = retryTransientPhase('candidate_prepare', attempt => {
+      tempPath = `${filePath}.${process.pid}.${nowMs}.${attempt}.${uuid()}.tmp`;
+      let descriptor = null;
+      try {
+        fsOps.mkdirSync(path.dirname(filePath), { recursive: true });
+        descriptor = fsOps.openSync(tempPath, 'wx');
+        fsOps.writeFileSync(descriptor, payload);
+        if (options.skipFsync !== true && typeof fsOps.fsyncSync === 'function') fsOps.fsyncSync(descriptor);
+        fsOps.closeSync(descriptor);
+        descriptor = null;
+        const candidate = fsOps.readFileSync(tempPath);
+        if (!Buffer.from(candidate).equals(payload)) throw new Error('Codex owner registry candidate verification failed');
+        if (validateBytes) validateBytes(Buffer.from(candidate));
+        return tempPath;
+      } catch (error) {
+        if (descriptor != null) try { fsOps.closeSync(descriptor); } catch {}
+        if (tempPath && fsOps.existsSync(tempPath)) {
+          try { fsOps.unlinkSync(tempPath); } catch {}
+        }
+        throw error;
+      }
+    }, options, telemetry, generation);
+    retryCount += prepared.retry_count;
+
+    const replaced = retryTransientPhase('replace', () => {
+      fsOps.renameSync(tempPath, filePath);
+      committed = true;
+      return true;
+    }, options, telemetry, generation);
+    retryCount += replaced.retry_count;
+
+    const verified = retryTransientPhase('committed_readback', () => {
+      const observed = fsOps.readFileSync(filePath);
+      if (!Buffer.from(observed).equals(payload)) throw new Error('Codex owner registry replacement verification failed');
+      if (validateBytes) validateBytes(Buffer.from(observed));
+      return true;
+    }, options, telemetry, generation);
+    retryCount += verified.retry_count;
+    telemetry({ event: 'registry_write_succeeded', retry_count: retryCount, generation });
+    return { retry_count: retryCount, generation };
+  } finally {
+    if (!committed && tempPath && fsOps.existsSync(tempPath)) {
+      try {
+        retryTransientPhase('candidate_cleanup', () => {
+          fsOps.unlinkSync(tempPath);
+          return true;
+        }, options, telemetry, generation);
+      } catch (error) {
+        telemetry({
+          event: 'registry_cleanup_deferred', phase: 'candidate_cleanup',
+          error_code: error?.cause?.code || error?.code || 'unknown', generation,
+        });
+      }
+    }
+  }
+}
+
+function atomicReplaceText(filePath, serialized, options = {}, validateText = null) {
+  return atomicReplaceBytes(filePath, Buffer.from(serialized, 'utf8'), options, candidate => {
+    if (validateText) validateText(candidate.toString('utf8'));
+  });
+}
+
+function atomicWriteJson(filePath, value, options = {}) {
+  const serialized = `${JSON.stringify(value, null, 2)}\n`;
+  return atomicReplaceText(filePath, serialized, {
+    ...options,
+    generation: value?.generation || 0,
+  }, candidate => validateRegistry(JSON.parse(candidate)));
+}
+
+function ownerDegradationDirectory(registryPath) {
+  return `${registryPath}.degraded`;
+}
+
+function ownerDegradationPath(registryPath, owner) {
+  const normalized = normalizeOwner(owner);
+  const identity = String(normalized.process_epoch || normalized.owner_id)
+    .replace(/[^a-z0-9._-]+/gi, '_').slice(0, 160);
+  return path.join(ownerDegradationDirectory(registryPath), `${normalized.session_id}.${identity}.json`);
+}
+
+function normalizeOwnerDegradation(value) {
+  const sessionId = optionalText(value?.session_id);
+  const ownerId = optionalText(value?.owner_id);
+  const degradedAt = optionalText(value?.degraded_at);
+  if (!UUID_RE.test(sessionId || '')) throw new Error('Owner degradation session_id must be a UUID');
+  if (!ownerId) throw new Error('Owner degradation owner_id is required');
+  if (!Number.isFinite(Date.parse(degradedAt || ''))) throw new Error('Owner degradation degraded_at is required');
+  return {
+    schema_version: 1,
+    session_id: sessionId,
+    owner_id: ownerId,
+    process_epoch: optionalText(value?.process_epoch),
+    root_pid: optionalPid(value?.root_pid),
+    native_pid: optionalPid(value?.native_pid),
+    degraded_at: new Date(Date.parse(degradedAt)).toISOString(),
+    error_code: optionalText(value?.error_code) || 'owner_write_failed',
+    retry_count: Math.max(1, Number(value?.retry_count) || 1),
+    health_status: ['owner_registry_degraded', 'legacy_runtime'].includes(value?.health_status)
+      ? value.health_status
+      : 'owner_registry_degraded',
+    recovery_action: ['retry_automatic', 'operator_reopen_required'].includes(value?.recovery_action)
+      ? value.recovery_action
+      : 'retry_automatic',
+    runtime_generation: optionalText(value?.runtime_generation),
+    last_good_heartbeat_at: Number.isFinite(Date.parse(value?.last_good_heartbeat_at || ''))
+      ? new Date(Date.parse(value.last_good_heartbeat_at)).toISOString()
+      : null,
+  };
+}
+
+function publishOwnerDegradation(owner, error, options = {}) {
+  const registryPath = options.registryPath || defaultRegistryPath(options.env);
+  const record = normalizeOwnerDegradation({
+    session_id: owner.session_id,
+    owner_id: owner.owner_id,
+    process_epoch: owner.process_epoch,
+    root_pid: owner.root_pid,
+    native_pid: owner.native_pid,
+    degraded_at: owner.ownership_degraded_since || new Date(Number(options.nowMs) || Date.now()).toISOString(),
+    error_code: error?.cause?.code || error?.code || owner.ownership_error_code || 'owner_write_failed',
+    retry_count: owner.ownership_retry_count || 1,
+    health_status: options.healthStatus,
+    recovery_action: options.recoveryAction,
+    runtime_generation: owner.runtime_generation || options.runtimeGeneration,
+    last_good_heartbeat_at: owner.heartbeat_at,
+  });
+  const degradationPath = ownerDegradationPath(registryPath, owner);
+  const serialized = `${JSON.stringify(record, null, 2)}\n`;
+  atomicReplaceText(degradationPath, serialized, options, candidate => {
+    normalizeOwnerDegradation(JSON.parse(candidate));
+  });
+  return { ...record, path: degradationPath };
+}
+
+function clearOwnerDegradation(owner, options = {}) {
+  const registryPath = options.registryPath || defaultRegistryPath(options.env);
+  const degradationPath = ownerDegradationPath(registryPath, owner);
+  const fsOps = options.fsOps || fs;
+  if (!fsOps.existsSync(degradationPath)) return false;
+  const telemetry = typeof options.onTelemetry === 'function' ? options.onTelemetry : () => {};
+  retryTransientPhase('degradation_cleanup', () => {
+    fsOps.unlinkSync(degradationPath);
+    return true;
+  }, options, telemetry, 0);
+  return true;
+}
+
+function loadOwnerDegradations(sessionId, options = {}) {
+  const registryPath = options.registryPath || defaultRegistryPath(options.env);
+  const directory = ownerDegradationDirectory(registryPath);
+  const fsOps = options.fsOps || fs;
+  if (!fsOps.existsSync(directory)) return [];
+  const alive = options.processIsAlive || processIsAlive;
+  const prefix = `${sessionId}.`;
+  const records = [];
+  for (const name of fsOps.readdirSync(directory)) {
+    if (!name.startsWith(prefix) || !name.endsWith('.json')) continue;
+    const filePath = path.join(directory, name);
+    try {
+      const record = normalizeOwnerDegradation(JSON.parse(fsOps.readFileSync(filePath, 'utf8')));
+      const pid = record.native_pid || record.root_pid;
+      if (!pid || alive(pid) !== false) records.push({ ...record, path: filePath });
+    } catch (error) {
+      // A corrupt degradation tombstone is itself an ownership ambiguity.
+      records.push({
+        schema_version: 1,
+        session_id: sessionId,
+        owner_id: 'invalid_degradation_tombstone',
+        degraded_at: null,
+        error_code: 'degradation_tombstone_invalid',
+        retry_count: 0,
+        path: filePath,
+        detail: error.message,
+      });
+    }
+  }
+  return records;
 }
 
 function pause(milliseconds) {
@@ -178,20 +489,39 @@ function withRegistryLock(registryPath, callback, options = {}) {
   const lockPath = `${registryPath}.lock`;
   const timeoutMs = Math.max(1, Number(options.timeoutMs) || DEFAULT_LOCK_TIMEOUT_MS);
   const staleMs = Math.max(1, Number(options.staleMs) || DEFAULT_STALE_LOCK_MS);
+  const pollMs = Math.max(1, Number(options.lockPollMs) || 25);
   const deadline = Date.now() + timeoutMs;
   fs.mkdirSync(path.dirname(registryPath), { recursive: true });
   let descriptor;
+  let lastContention = null;
   while (descriptor == null) {
+    let candidateDescriptor = null;
     try {
-      descriptor = fs.openSync(lockPath, 'wx');
-      fs.writeFileSync(descriptor, `${JSON.stringify({ pid: process.pid, acquired_at: new Date().toISOString() })}\n`);
+      candidateDescriptor = fs.openSync(lockPath, 'wx');
+      fs.writeFileSync(candidateDescriptor, `${JSON.stringify({ pid: process.pid, acquired_at: new Date().toISOString() })}\n`);
+      descriptor = candidateDescriptor;
+      candidateDescriptor = null;
     } catch (error) {
-      if (error.code !== 'EEXIST') throw error;
+      if (candidateDescriptor != null) {
+        try { fs.closeSync(candidateDescriptor); } catch {}
+        try { fs.unlinkSync(lockPath); } catch {}
+      }
+      if (!['EEXIST', 'EPERM', 'EACCES', 'EBUSY'].includes(error.code)) throw error;
+      lastContention = error;
       try {
-        if (Date.now() - fs.statSync(lockPath).mtimeMs > staleMs) fs.unlinkSync(lockPath);
+        const lockAgeMs = Date.now() - fs.statSync(lockPath).mtimeMs;
+        const lockRecord = JSON.parse(fs.readFileSync(lockPath, 'utf8'));
+        const alive = (options.processIsAlive || processIsAlive)(Number(lockRecord?.pid));
+        if (lockAgeMs > staleMs && alive === false) fs.unlinkSync(lockPath);
       } catch {}
-      if (Date.now() >= deadline) throw new Error(`Timed out acquiring Codex owner registry lock: ${lockPath}`);
-      pause(25);
+      if (Date.now() >= deadline) {
+        const timeout = new Error(`Timed out acquiring Codex owner registry lock: ${lockPath}`);
+        timeout.code = 'CODEX_OWNER_LOCK_TIMEOUT';
+        timeout.cause = lastContention;
+        throw timeout;
+      }
+      const jitter = (process.pid + Date.now()) % 7;
+      (options.pause || pause)(pollMs + jitter);
     }
   }
   try { return callback(); }
@@ -222,8 +552,12 @@ function updateOwnerRegistry(registryPath, update, options = {}) {
     }
     const result = update(registry) || registry;
     result.updated_at = new Date().toISOString();
+    result.generation = Math.max(0, Number(registry.generation) || 0) + 1;
     const validated = validateRegistry(result);
-    atomicWriteJson(registryPath, validated);
+    atomicWriteJson(registryPath, validated, options);
+    // Cleanup follows authoritative candidate validation and committed readback.
+    // A failed update never sweeps forensic temp evidence first.
+    maybeCleanupOwnerRegistryTempFiles(registryPath, options);
     return validated;
   }, options);
 }
@@ -242,11 +576,28 @@ function publishLiveOwner(owner, options = {}) {
       error.code = 'CODEX_OWNER_LEASE_BUSY';
       throw error;
     }
-    const owners = lineage.owners.filter(item => item.owner_id !== normalized.owner_id);
+    const owners = lineage.owners.filter(item => (
+      item.owner_id !== normalized.owner_id
+      && !sameDirectOwnerProcess(item, normalized)
+    ));
     owners.push(normalized);
     registry.lineages[normalized.session_id] = { owners, lease: lineage.lease || null };
+    if (registry.authority?.state === 'ready') {
+      const heartbeatAt = new Date(Number(options.nowMs) || Date.now()).toISOString();
+      registry.authority = normalizeAuthority({
+        ...registry.authority,
+        producer_id: `owner-heartbeat:${normalized.owner_kind}`,
+        producer_pid: normalized.root_pid || normalized.native_pid,
+        process_epoch: normalized.process_epoch,
+        heartbeat_at: heartbeatAt,
+        runtime_generation: normalized.runtime_generation || registry.authority.runtime_generation,
+        scanned_lineages: Object.keys(registry.lineages).length,
+        proof: 'owner_heartbeat_plus_exact_rollout',
+      });
+    }
     return registry;
   }, options);
+  clearOwnerDegradation(normalized, { ...options, registryPath });
   return normalized;
 }
 
@@ -265,11 +616,32 @@ function clearLiveOwner(sessionId, ownerId, options = {}) {
     if (!lineage.owners.length && !lineage.lease) delete registry.lineages[sessionId];
     return registry;
   }, options);
+  try {
+    clearOwnerDegradation({
+      session_id: sessionId,
+      owner_id: ownerId,
+      owner_kind: 'interactive_tui',
+      state: 'terminal',
+      started_at: new Date().toISOString(),
+      heartbeat_at: new Date().toISOString(),
+      process_epoch: options.processEpoch || ownerId,
+    }, { ...options, registryPath });
+  } catch {}
   return cleared;
 }
 
 function resolveLineageOwner(sessionId, options = {}) {
   const registryPath = options.registryPath || defaultRegistryPath(options.env);
+  const degradations = loadOwnerDegradations(sessionId, { ...options, registryPath });
+  if (degradations.length) {
+    return {
+      state: 'unavailable',
+      owners: [],
+      error: 'owner_registry_degraded',
+      degradations,
+      registry_path: registryPath,
+    };
+  }
   if (!fs.existsSync(registryPath)) {
     return { state: 'unavailable', owners: [], error: 'owner_registry_missing', registry_path: registryPath };
   }
@@ -297,6 +669,7 @@ function resolveLineageOwner(sessionId, options = {}) {
     authority,
     registry_path: registryPath,
     registry_updated_at: registry.updated_at,
+    registry_generation: registry.generation || 0,
   };
   if (authority.state !== 'ready') {
     return { state: 'unavailable', owners: [], error: 'owner_registry_not_ready', ...details };
@@ -392,23 +765,38 @@ module.exports = {
   DEFAULT_HEARTBEAT_TTL_MS,
   DEFAULT_LEASE_TTL_MS,
   DEFAULT_REGISTRY_TTL_MS,
+  DEFAULT_STALE_TEMP_MS,
+  DEFAULT_TEMP_CLEANUP_INTERVAL_MS,
+  DEFAULT_WRITE_RETRIES,
   OWNER_KINDS,
   OWNER_STATES,
   SCHEMA_VERSION,
   acquireLineageLease,
   atomicWriteJson,
+  atomicReplaceBytes,
+  atomicReplaceText,
   clearLiveOwner,
+  clearOwnerDegradation,
+  cleanupOwnerRegistryTempFiles,
   defaultRegistryPath,
   emptyRegistry,
   expireStaleOwners,
   loadOwnerRegistry,
+  loadOwnerDegradations,
   markRegistryAuthorityReady,
+  maybeCleanupOwnerRegistryTempFiles,
   normalizeAuthority,
   normalizeOwner,
+  ownerTempIdentity,
+  ownerDegradationDirectory,
+  ownerDegradationPath,
+  processIsAlive,
   publishLiveOwner,
+  publishOwnerDegradation,
   releaseLineageLease,
   resolveLineageOwner,
   rolloutFileIdentity,
+  sameDirectOwnerProcess,
   updateOwnerRegistry,
   validateRegistry,
   withRegistryLock,

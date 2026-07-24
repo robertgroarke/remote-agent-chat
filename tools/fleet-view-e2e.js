@@ -97,7 +97,6 @@ async function captureFleetVisualMatrix(browser, origin, screenshotDir, refreshL
   if (screenshotDir) fs.mkdirSync(screenshotDir, { recursive: true });
   const rows = [];
   for (const visualCase of cases) {
-    await refreshLiveFixtures?.();
     const context = await browser.newContext({
       viewport: { width: visualCase.css[0], height: visualCase.css[1] },
       deviceScaleFactor: visualCase.scale,
@@ -116,6 +115,7 @@ async function captureFleetVisualMatrix(browser, origin, screenshotDir, refreshL
       const page = await context.newPage();
       await page.goto(origin, { waitUntil: 'domcontentloaded', timeout: 30_000 });
       await page.getByRole('button', { name: 'Fleet view' }).waitFor({ state: 'attached', timeout: 10_000 });
+      await refreshLiveFixtures?.();
       if (visualCase.css[0] <= 600) {
         await page.locator('.hamburger').click();
         await page.locator('.sidebar.open').waitFor();
@@ -403,7 +403,7 @@ async function main() {
       activity: { kind: 'thinking', label: 'Waiting for thread selection' },
     }));
     [
-      ['fleet-goal-two', { kind: 'idle', label: '', started_at: new Date(now - 45_000).toISOString(), goal: { status: 'active', state: 'active', objective: 'Ship the verified release', token_budget: 12000, fingerprint: 'fleet-release-goal', generation: 1, transition_seq: 2, progress_percent: 40, updated_at: new Date(now).toISOString() }, goal_run: { schema_version: 1, run_id: 'fleet-release-run', goal_fingerprint: 'fleet-release-goal', goal_generation: 1, lifecycle: 'verifying', lease_active: true, owner_state: 'verifying', transition_seq: 2, transition_id: 'fleet-release-verifying', lease_started_at: new Date(now - 45_000).toISOString() } }],
+      ['fleet-goal-two', { kind: 'idle', label: '', started_at: new Date(now - 45_000).toISOString(), goal: { status: 'active', state: 'active', objective: 'Ship the verified release', token_budget: 12000, fingerprint: 'fleet-release-goal', generation: 1, transition_seq: 2, progress_percent: 40, updated_at: new Date(now).toISOString() }, goal_run: { schema_version: 1, run_id: 'fleet-release-run', goal_fingerprint: 'fleet-release-goal', goal_generation: 1, lifecycle: 'verifying', lease_active: true, owner_state: 'verifying', transition_seq: 2, transition_id: 'fleet-release-verifying', lease_started_at: new Date(now - 45_000).toISOString() }, goal_projection: { schema_version: 1, session_id: 'fleet-goal-two', surface: 'codex-desktop', native_thread_id: 'fleet-goal-two-thread', epoch: 1, sequence: 2, state: 'present', goal_fingerprint: 'fleet-release-goal', goal_generation: 1, observed_at: new Date(now).toISOString() } }],
       ['fleet-cursor-work', { kind: 'working', label: 'Reviewing diff', current: { kind: 'tool', label: 'Reviewing active diff', since: new Date(now).toISOString() } }],
       ['fleet-antigravity-work', { kind: 'generating', label: 'Drafting response', current: { kind: 'response', label: 'Drafting the current response', since: new Date(now).toISOString() } }],
       ['fleet-attention-two', { kind: 'blocked', label: 'Dependency unavailable', goal: { status: 'blocked', state: 'blocked', objective: 'Resume after dependency recovery', block_reason: 'Dependency unavailable', token_budget: 6000, fingerprint: 'fleet-blocked-goal', generation: 1, transition_seq: 3, updated_at: new Date(now).toISOString() } }],
@@ -444,23 +444,24 @@ async function main() {
           current: { kind: 'response', label: 'Running the mobile parity audit', since: new Date(refreshedAt).toISOString() },
         }],
         ['fleet-readonly', { kind: 'thinking', label: 'Waiting for thread selection' }],
-        ['fleet-goal-two', { kind: 'idle', label: '', started_at: new Date(refreshedAt - 45_000).toISOString(), goal: { status: 'active', state: 'active', objective: 'Ship the verified release', token_budget: 12000, fingerprint: 'fleet-release-goal', generation: 1, transition_seq: 2, progress_percent: 40, updated_at: new Date(refreshedAt).toISOString() }, goal_run: { schema_version: 1, run_id: 'fleet-release-run', goal_fingerprint: 'fleet-release-goal', goal_generation: 1, lifecycle: 'verifying', lease_active: true, owner_state: 'verifying', transition_seq: 2, transition_id: 'fleet-release-verifying', lease_started_at: new Date(refreshedAt - 45_000).toISOString() } }],
+        ['fleet-goal-two', { kind: 'idle', label: '', started_at: new Date(refreshedAt - 45_000).toISOString(), goal: { status: 'active', state: 'active', objective: 'Ship the verified release', token_budget: 12000, fingerprint: 'fleet-release-goal', generation: 1, transition_seq: 2, progress_percent: 40, updated_at: new Date(refreshedAt).toISOString() }, goal_run: { schema_version: 1, run_id: 'fleet-release-run', goal_fingerprint: 'fleet-release-goal', goal_generation: 1, lifecycle: 'verifying', lease_active: true, owner_state: 'verifying', transition_seq: 2, transition_id: 'fleet-release-verifying', lease_started_at: new Date(refreshedAt - 45_000).toISOString() }, goal_projection: { schema_version: 1, session_id: 'fleet-goal-two', surface: 'codex-desktop', native_thread_id: 'fleet-goal-two-thread', epoch: 1, sequence: 2, state: 'present', goal_fingerprint: 'fleet-release-goal', goal_generation: 1, observed_at: new Date(refreshedAt).toISOString() } }],
         ['fleet-cursor-work', { kind: 'working', label: 'Reviewing diff', current: { kind: 'tool', label: 'Reviewing active diff', since: new Date(refreshedAt).toISOString() } }],
         ['fleet-antigravity-work', { kind: 'generating', label: 'Drafting response', current: { kind: 'response', label: 'Drafting the current response', since: new Date(refreshedAt).toISOString() } }],
         ['fleet-attention-two', { kind: 'blocked', label: 'Dependency unavailable', goal: { status: 'blocked', state: 'blocked', objective: 'Resume after dependency recovery', block_reason: 'Dependency unavailable', token_budget: 6000, fingerprint: 'fleet-blocked-goal', generation: 1, transition_seq: 3, updated_at: new Date(refreshedAt).toISOString() } }],
       ].forEach(([session, activity]) => proxy.send(JSON.stringify({
         type: 'status', session, thinking: ['thinking', 'generating', 'working'].includes(activity.kind),
-        activity_trace: { proxy_emitted_at_ms: Date.now() }, activity,
+        activity_trace: { proxy_emitted_at_ms: Date.now() },
+        activity: { ...activity, observed_at: new Date(refreshedAt).toISOString() },
       })));
       await new Promise(resolve => setTimeout(resolve, 100));
     };
     const visualMatrix = await captureFleetVisualMatrix(
       browser, `http://127.0.0.1:${port}/`, screenshotDir, refreshLiveFixtures,
     );
-    await refreshLiveFixtures();
     const browserContext = await browser.newContext({ viewport: { width: 390, height: 844 }, hasTouch: true });
     const page = await browserContext.newPage();
     await page.goto(`http://127.0.0.1:${port}/`, { waitUntil: 'networkidle' });
+    await refreshLiveFixtures();
     await page.locator('.hamburger').click();
     await page.locator('.sidebar.open').waitFor();
     const workingSection = page.locator('.working-session-group');

@@ -31,7 +31,14 @@ export function mergeTranscriptMessages(existing, incoming) {
       const key = stableTranscriptMessageKey(message);
       if (key && indexes.has(key)) {
         const index = indexes.get(key);
-        merged[index] = { ...merged[index], ...message };
+        const current = merged[index];
+        const currentHasCitation = Array.isArray(current?.content_blocks)
+          && current.content_blocks.some(block => block?.type === 'memory_citation');
+        const incomingHasCitation = Array.isArray(message?.content_blocks)
+          && message.content_blocks.some(block => block?.type === 'memory_citation');
+        merged[index] = currentHasCitation && !incomingHasCitation
+          ? { ...current, ...message, content: current.content, content_blocks: current.content_blocks }
+          : { ...current, ...message };
         return;
       }
       if (key) indexes.set(key, merged.length);

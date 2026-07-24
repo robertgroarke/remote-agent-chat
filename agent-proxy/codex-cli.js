@@ -9,6 +9,11 @@ const { normalizeNativeLaunchMode, backgroundNativeLaunchResult } = require('./n
 const { assertOperatorForegroundLaunch } = require('./windows-automation-launch-policy');
 const { setBoundedMap } = require('./bounded-map');
 const { canonicalGoalRecord } = require('./goal-lifecycle');
+const {
+  normalizeNativeInterruption,
+  resolveNativeInterruption,
+  reduceNativeInterruption,
+} = require('../shared/native-interruption');
 
 let chokidar = null;
 try { chokidar = require('chokidar'); } catch {}
@@ -49,6 +54,7 @@ const CODEX_CLI_ACCESS_MODES = [
 
 const SUMMARY_CACHE = new Map();
 const TAIL_SUMMARY_CACHE = new Map();
+const INTERRUPTION_INDEX_CACHE = new Map();
 const CONFIG_OBSERVATION_CACHE = new Map();
 const GOAL_RECOVERY_CACHE = new Map();
 const SESSION_INDEX_CACHE = { sig: '', map: new Map() };
@@ -355,20 +361,131 @@ function codexNativePairFamily(kind, role) {
   return '';
 }
 
+function normalizeMemoryCitation(value) {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return null;
+  const entries = (Array.isArray(value.entries) ? value.entries : []).map(entry => {
+    if (!entry || typeof entry !== 'object' || Array.isArray(entry)) return null;
+    const sourcePath = String(entry.path || entry.source || '').trim().slice(0, 1000);
+    const lineStart = Math.max(0, Math.floor(Number(entry.lineStart ?? entry.line_start) || 0));
+    const lineEnd = Math.max(lineStart, Math.floor(Number(entry.lineEnd ?? entry.line_end) || lineStart));
+    const note = String(entry.note || '').trim().slice(0, 2000);
+    const reference = String(entry.reference || '').trim().slice(0, 3000);
+    if (!sourcePath && !reference) return null;
+    return {
+      ...(sourcePath ? { path: sourcePath } : {}),
+      ...(lineStart ? { line_start: lineStart, line_end: lineEnd || lineStart } : {}),
+      ...(note ? { note } : {}),
+      ...(reference ? { reference } : {}),
+    };
+  }).filter(Boolean).slice(0, 100);
+  const rolloutIds = (Array.isArray(value.rolloutIds) ? value.rolloutIds
+    : Array.isArray(value.rollout_ids) ? value.rollout_ids : [])
+    .map(id => String(id || '').trim().slice(0, 200))
+    .filter(Boolean)
+    .slice(0, 100);
+  if (entries.length === 0 && rolloutIds.length === 0) return null;
+  return { entries, rollout_ids: rolloutIds };
+}
+
+function parseMemoryCitationProtocol(protocol) {
+  const match = String(protocol || '').match(
+    /^<oai-mem-citation>\s*<citation_entries>\s*([\s\S]*?)\s*<\/citation_entries>\s*<rollout_ids>\s*([\s\S]*?)\s*<\/rollout_ids>\s*<\/oai-mem-citation>$/,
+  );
+  if (!match || /<\/?oai-mem-citation>/.test(match[1]) || /<\/?oai-mem-citation>/.test(match[2])) return null;
+  const entries = match[1].split(/\r?\n/).map(line => line.trim()).filter(Boolean).map(line => {
+    const parsed = line.match(/^(.+?):(\d+)(?:-(\d+))?\|note=\[([\s\S]*)\]$/);
+    if (!parsed) return { reference: line };
+    return {
+      path: parsed[1],
+      line_start: Number(parsed[2]),
+      line_end: Number(parsed[3] || parsed[2]),
+      note: parsed[4],
+    };
+  });
+  const rolloutIds = match[2].split(/\r?\n/).map(line => line.trim()).filter(Boolean);
+  return normalizeMemoryCitation({ entries, rollout_ids: rolloutIds });
+}
+
+function splitMemoryCitationTrailer(value) {
+  const content = String(value || '');
+  const match = /(?:\r?\n){2}(<oai-mem-citation>[\s\S]*<\/oai-mem-citation>)\s*$/.exec(content);
+  if (!match) return { content, citation: null, protocol: null };
+  const citation = parseMemoryCitationProtocol(match[1]);
+  if (!citation) return { content, citation: null, protocol: null };
+  return {
+    content: content.slice(0, match.index),
+    citation,
+    protocol: match[1],
+  };
+}
+
+function memoryCitationContent(citation) {
+  if (!citation) return '';
+  const entryLines = citation.entries.map(entry => {
+    const location = entry.path
+      ? `${entry.path}${entry.line_start ? `:${entry.line_start}${entry.line_end > entry.line_start ? `-${entry.line_end}` : ''}` : ''}`
+      : entry.reference;
+    return `- ${location}${entry.note ? ` — ${entry.note}` : ''}`;
+  });
+  const rolloutLines = citation.rollout_ids.map(id => `- ${id}`);
+  return [
+    ...(entryLines.length ? ['Memory references', ...entryLines] : []),
+    ...(entryLines.length && rolloutLines.length ? [''] : []),
+    ...(rolloutLines.length ? ['Rollouts', ...rolloutLines] : []),
+  ].join('\n');
+}
+
+function memoryCitationBlock(citation) {
+  if (!citation) return null;
+  return {
+    type: 'memory_citation',
+    title: 'Sources',
+    entries: citation.entries,
+    rollout_ids: citation.rollout_ids,
+    content: memoryCitationContent(citation),
+  };
+}
+
+function canonicalAssistantContent(content, structuredCitation = null) {
+  const split = splitMemoryCitationTrailer(content);
+  const structured = normalizeMemoryCitation(structuredCitation);
+  const citation = structured || split.citation;
+  const rawBody = split.citation ? split.content : String(content || '');
+  // The event form uses the same two trailing newlines as a separator before
+  // its out-of-band citation metadata. Remove that separator only when the
+  // event actually carries a structured citation.
+  const body = structured ? rawBody.replace(/(?:\r?\n){2}$/, '') : rawBody;
+  const citationBlock = memoryCitationBlock(citation);
+  return {
+    content: body,
+    content_blocks: [
+      ...(body ? [{ type: 'markdown', content: body }] : []),
+      ...(citationBlock ? [citationBlock] : []),
+    ],
+    memory_citation: citation,
+    citation_protocol_stripped: !!split.citation,
+  };
+}
+
+function nativePairOrdinal(state, turnId, family, phase, kind) {
+  if (!state?.nativePairOrdinals) return 0;
+  const representation = String(kind || '').split('.')[0] || 'unknown';
+  const key = `${turnId}\u0000${family}\u0000${phase}\u0000${representation}`;
+  const next = (state.nativePairOrdinals.get(key) || 0) + 1;
+  state.nativePairOrdinals.set(key, next);
+  return next;
+}
+
 function stampNativeMessage(messages, next) {
   const context = messages?.[CODEX_NATIVE_CONTEXT];
   if (!context) return;
   const identity = nativeEntryIdentity(context.entry, context.offsets);
   if (!next.native_source_id) next.native_source_id = identity.id;
   if (!next.native_source_kind) next.native_source_kind = identity.kind;
-  if (!next.source_message_id) {
-    const basis = `${context.state?.cliSessionId || context.state?.fileCliSessionId || ''}\u0000${next.native_source_id}`;
-    next.source_message_id = `codex_cli:${crypto.createHash('sha256').update(basis).digest('hex').substring(0, 32)}`;
-  }
   const producerTime = new Date(context.entry?.timestamp || '').getTime();
   const producerTimestamp = Number.isFinite(producerTime) ? new Date(producerTime).toISOString() : null;
   if (producerTimestamp) next.created_at = producerTimestamp;
-  const nativeTurnId = String(context.state?.currentTurnId || '').trim() || null;
+  const nativeTurnId = String(next.native_turn_id || context.state?.currentTurnId || '').trim() || null;
   const lifecycleGeneration = Math.max(0, Number(context.state?.currentTurnGeneration) || 0);
   const sourceCursor = {
     start_offset: Math.max(0, Number(context.offsets?.start_offset) || 0),
@@ -377,6 +494,25 @@ function stampNativeMessage(messages, next) {
   next.native_turn_id = nativeTurnId;
   next.lifecycle_generation = lifecycleGeneration;
   next.native_source_cursor = sourceCursor;
+  const pairFamily = codexNativePairFamily(next.native_source_kind, next.role);
+  const nativePhase = String(next.native_phase || context.entry?.payload?.phase || '').trim() || 'unphased';
+  next.native_phase = nativePhase;
+  if (!next.source_message_id) {
+    const basis = `${context.state?.cliSessionId || context.state?.fileCliSessionId || ''}\u0000${next.native_source_id}`;
+    next.source_message_id = `codex_cli:${crypto.createHash('sha256').update(basis).digest('hex').substring(0, 32)}`;
+  }
+  if (nativeTurnId && pairFamily) {
+    const ordinal = nativePairOrdinal(context.state, nativeTurnId, pairFamily, nativePhase, next.native_source_kind);
+    next.native_pair_ordinal = ordinal;
+    const logicalBasis = [
+      context.state?.cliSessionId || context.state?.fileCliSessionId || '',
+      nativeTurnId,
+      pairFamily,
+      nativePhase,
+      ordinal,
+    ].join('\u0000');
+    next.native_logical_id = `codex_cli_pair:${crypto.createHash('sha256').update(logicalBasis).digest('hex').substring(0, 32)}`;
+  }
   next.surface_provenance = {
     family: 'codex',
     surface: 'codex_cli',
@@ -414,6 +550,8 @@ function semanticMessageBody(message) {
     'native_sources',
     'producer_timestamp',
     'surface_provenance',
+    'native_pair_ordinal',
+    'native_logical_id',
   ]);
   const blocks = (Array.isArray(message?.content_blocks) ? message.content_blocks : []).map(block => {
     if (!block || typeof block !== 'object') return block;
@@ -422,17 +560,58 @@ function semanticMessageBody(message) {
   return compactJson({ role: message?.role || '', content: message?.content || '', blocks });
 }
 
-function reasoningPairCompatible(left, right) {
-  if (!left || !right || semanticMessageBody(left) !== semanticMessageBody(right)) return false;
-  const leftTurn = String(left.native_turn_id || '').trim();
-  const rightTurn = String(right.native_turn_id || '').trim();
-  if (leftTurn && rightTurn) return leftTurn === rightTurn;
-  const leftAt = Date.parse(left.created_at || '') || Number(left.ts || 0) * 1000;
-  const rightAt = Date.parse(right.created_at || '') || Number(right.ts || 0) * 1000;
-  return Number.isFinite(leftAt) && Number.isFinite(rightAt) && Math.abs(leftAt - rightAt) <= 1000;
+function hasMemoryCitation(message) {
+  return !!normalizeMemoryCitation(message?.memory_citation)
+    || (Array.isArray(message?.content_blocks) && message.content_blocks.some(block => block?.type === 'memory_citation'));
 }
 
-function mergeNativePair(target, incoming) {
+function boundedCitationPair(left, right) {
+  const leftAt = Date.parse(left?.created_at || '') || Number(left?.ts || 0) * 1000;
+  const rightAt = Date.parse(right?.created_at || '') || Number(right?.ts || 0) * 1000;
+  if (!Number.isFinite(leftAt) || !Number.isFinite(rightAt) || Math.abs(leftAt - rightAt) > 1000) return false;
+  const leftOffset = Math.max(0, Number(left?.native_source_cursor?.start_offset) || 0);
+  const rightOffset = Math.max(0, Number(right?.native_source_cursor?.start_offset) || 0);
+  return leftOffset > 0 && rightOffset > 0 && Math.abs(leftOffset - rightOffset) <= 1024 * 1024;
+}
+
+function nativePairCompatibility(left, right) {
+  if (!left || !right) return { compatible: false, citation_enrichment: false };
+  const exactBody = semanticMessageBody(left) === semanticMessageBody(right);
+  const citationEnrichment = hasMemoryCitation(left) || hasMemoryCitation(right);
+  const leftTurn = String(left.native_turn_id || '').trim();
+  const rightTurn = String(right.native_turn_id || '').trim();
+  if (citationEnrichment) {
+    const sameContent = String(left.content || '') === String(right.content || '');
+    const leftPhase = String(left.native_phase || '').trim();
+    const rightPhase = String(right.native_phase || '').trim();
+    return {
+      compatible: !!(
+        sameContent
+        && leftTurn
+        && leftTurn === rightTurn
+        && leftPhase
+        && leftPhase === rightPhase
+        && boundedCitationPair(left, right)
+      ),
+      citation_enrichment: true,
+    };
+  }
+  if (!exactBody) return { compatible: false, citation_enrichment: false };
+  if (leftTurn && rightTurn) return { compatible: leftTurn === rightTurn, citation_enrichment: false };
+  const leftAt = Date.parse(left.created_at || '') || Number(left.ts || 0) * 1000;
+  const rightAt = Date.parse(right.created_at || '') || Number(right.ts || 0) * 1000;
+  return {
+    compatible: Number.isFinite(leftAt) && Number.isFinite(rightAt) && Math.abs(leftAt - rightAt) <= 1000,
+    citation_enrichment: false,
+  };
+}
+
+function reasoningPairCompatible(left, right) {
+  return nativePairCompatibility(left, right).compatible;
+}
+
+function mergeNativePair(target, incoming, counters = null, compatibility = null) {
+  const firstObservedSourceMessageId = target.source_message_id;
   const sources = [
     ...(Array.isArray(target.native_sources) ? target.native_sources : [{
       id: target.native_source_id,
@@ -451,14 +630,40 @@ function mergeNativePair(target, incoming) {
   const responseSource = incoming.native_source_kind?.startsWith('response_item.') ? incoming
     : target.native_source_kind?.startsWith('response_item.') ? target
     : incoming;
-  for (const key of ['native_source_id', 'source_message_id', 'native_source_kind', 'native_source_cursor']) {
+  const eventCitation = normalizeMemoryCitation(
+    incoming.native_source_kind?.startsWith('event_msg.') ? incoming.memory_citation
+      : target.native_source_kind?.startsWith('event_msg.') ? target.memory_citation
+      : null,
+  );
+  for (const key of ['native_source_id', 'native_source_kind', 'native_source_cursor']) {
     if (responseSource[key]) target[key] = responseSource[key];
+  }
+  const responseCitation = normalizeMemoryCitation(responseSource.memory_citation);
+  if (responseSource.role === 'assistant') {
+    const canonical = canonicalAssistantContent(responseSource.content, responseCitation || eventCitation);
+    target.content = canonical.content;
+    target.content_blocks = canonical.content_blocks;
+    if (canonical.memory_citation) target.memory_citation = canonical.memory_citation;
+    else delete target.memory_citation;
   }
   if (incoming.created_at && (!target.created_at || Date.parse(incoming.created_at) < Date.parse(target.created_at))) {
     target.created_at = incoming.created_at;
   }
   if (incoming.ts != null && (target.ts == null || incoming.ts < target.ts)) target.ts = incoming.ts;
+  // Do not assign a shared logical ID until the two representations have
+  // actually passed the pairing contract. Ordinary pairs retain the first
+  // native record's pre-upgrade ID so deployed histories do not remount. The
+  // citation-enriched pair needs one new identity because the legacy producer
+  // emitted its structured event and protocol response as two distinct rows.
+  target.source_message_id = compatibility?.citation_enrichment
+    ? (target.native_logical_id || incoming.native_logical_id || firstObservedSourceMessageId)
+    : firstObservedSourceMessageId;
   target.native_source_paired = true;
+  if (counters) {
+    counters.native_pair_observed += 1;
+    counters.duplicate_suppressed += 1;
+    if (compatibility?.citation_enrichment) counters.canonical_row_enriched += 1;
+  }
   const block = target.content_blocks?.find(item => item?.type === 'thinking' && item.activity_summary === true);
   if (block) {
     block.native_source_id = target.native_source_id;
@@ -473,9 +678,21 @@ function pushDedup(messages, next) {
   if ((!next?.content || !next.content.trim()) && !Array.isArray(next?.content_blocks)) return;
   if (next.role === 'user' && isCodexContextNoise(next.content)) return;
   stampNativeMessage(messages, next);
+  const counters = messages?.[CODEX_NATIVE_CONTEXT]?.state?.nativePairCounters || null;
+  const replayedSource = next.native_source_id && messages.find(message => (
+    (message?.native_source_kind === next.native_source_kind && message.native_source_id === next.native_source_id)
+    || (Array.isArray(message?.native_sources)
+      && message.native_sources.some(source => source?.kind === next.native_source_kind && source?.id === next.native_source_id))
+  ));
+  if (replayedSource) {
+    if (counters) counters.duplicate_suppressed += 1;
+    delete next._preserve_identical;
+    return;
+  }
   const last = messages[messages.length - 1];
   const sameBody = last && semanticMessageBody(last) === semanticMessageBody(next);
   const nextFamily = codexNativePairFamily(next?.native_source_kind, next?.role);
+  let ambiguousCitationPair = false;
   if (nextFamily) {
     // Native Codex can interleave lifecycle/status records between the event
     // and response_item representations of one logical source record. Search
@@ -483,18 +700,27 @@ function pushDedup(messages, next) {
     for (let index = messages.length - 1; index >= Math.max(0, messages.length - 12); index -= 1) {
       const candidate = messages[index];
       const candidateFamily = codexNativePairFamily(candidate?.native_source_kind, candidate?.role);
+      const compatibility = nativePairCompatibility(candidate, next);
       if (
         !candidate?.native_source_paired
         && candidateFamily === nextFamily
         && candidate.native_source_kind !== next.native_source_kind
-        && reasoningPairCompatible(candidate, next)
+        && compatibility.compatible
       ) {
-        mergeNativePair(candidate, next);
+        mergeNativePair(candidate, next, counters, compatibility);
         delete next._preserve_identical;
         return;
       }
+      if (
+        !candidate?.native_source_paired
+        && candidateFamily === nextFamily
+        && candidate.native_source_kind !== next.native_source_kind
+        && compatibility.citation_enrichment
+        && String(candidate.content || '') === String(next.content || '')
+      ) ambiguousCitationPair = true;
     }
   }
+  if (ambiguousCitationPair && counters) counters.ambiguous_pair_retained += 1;
   if (sameBody && next._preserve_identical !== true) return;
   delete next._preserve_identical;
   messages.push(next);
@@ -818,6 +1044,107 @@ function stoppedStatusBlock(label = 'Interrupted') {
   };
 }
 
+function nativeInterruptionPayload(payload) {
+  if (!payload || typeof payload !== 'object') return null;
+  const nested = payload.error && typeof payload.error === 'object' ? payload.error : null;
+  const message = nested?.message
+    || nested?.text
+    || (typeof payload.error === 'string' ? payload.error : null)
+    || payload.message
+    || payload.text
+    || null;
+  if (!String(message || '').trim()) return null;
+  return {
+    message: String(message),
+    provider_error_code: nested?.codex_error_info
+      || payload.codex_error_info
+      || nested?.code
+      || payload.code
+      || null,
+  };
+}
+
+function interruptionMessageForEvent(state, eventId) {
+  for (let index = state.messages.length - 1; index >= 0; index -= 1) {
+    const message = state.messages[index];
+    const block = (Array.isArray(message?.content_blocks) ? message.content_blocks : [])
+      .find(candidate => candidate?.interruption?.event_id === eventId);
+    if (block) return { message, block };
+  }
+  return null;
+}
+
+function recordNativeInterruption(state, payload, ts, tsMs, sourceKind) {
+  const raw = nativeInterruptionPayload(payload);
+  if (!raw) return null;
+  const nativeContext = state.messages?.[CODEX_NATIVE_CONTEXT] || null;
+  const sourceIdentity = nativeEntryIdentity(nativeContext?.entry, nativeContext?.offsets);
+  const turnId = String(payload?.turn_id || state.currentTurnId || '').trim() || null;
+  const interruption = normalizeNativeInterruption({
+    session_id: state.cliSessionId || state.fileCliSessionId || null,
+    surface: 'codex_cli',
+    native_thread_id: state.cliSessionId || state.fileCliSessionId || null,
+    turn_id: turnId,
+    goal_fingerprint: state.activeGoal?.fingerprint || null,
+    native_timestamp: tsMs ? new Date(tsMs).toISOString() : null,
+    observed_at: tsMs ? new Date(tsMs).toISOString() : null,
+    message: raw.message,
+    provider_error_code: raw.provider_error_code,
+    source_kind: sourceKind,
+    source_id: sourceIdentity.id,
+    immutable_native: true,
+  });
+  const previous = state.interruptionRegistry.get(interruption.event_id) || null;
+  const reduced = reduceNativeInterruption(previous, interruption);
+  state.interruptionRegistry.set(interruption.event_id, reduced.value);
+  if (previous) {
+    if (reduced.value?.resolution_state === 'unresolved' && reduced.value.blocking === true) {
+      state.activeInterruption = reduced.value;
+    }
+    return reduced.value;
+  }
+  const block = {
+    type: 'error',
+    title: interruption.category === 'unknown_terminal' && raw.provider_error_code
+      ? `Error: ${String(raw.provider_error_code).slice(0, 80)}`
+      : interruption.title,
+    content: interruption.safe_display_text,
+    status: 'error',
+    collapsed: false,
+    interruption,
+  };
+  pushDedup(state.messages, {
+    role: 'assistant',
+    content: `[Error]\n\n${interruption.safe_display_text}`,
+    content_blocks: [block],
+    native_source_kind: sourceKind,
+    native_turn_id: turnId,
+    native_interruption: interruption,
+    _preserve_identical: true,
+    ts,
+  });
+  if (interruption.blocking === true && interruption.resolution_state === 'unresolved') {
+    state.activeInterruption = interruption;
+  }
+  return interruption;
+}
+
+function resolveActiveNativeInterruption(state, input = {}) {
+  const active = state.activeInterruption;
+  if (!active || active.resolution_state !== 'unresolved') return null;
+  const resolved = resolveNativeInterruption(active, input);
+  state.interruptionRegistry.set(resolved.event_id, resolved);
+  const rendered = interruptionMessageForEvent(state, resolved.event_id);
+  if (rendered) {
+    rendered.block.interruption = resolved;
+    rendered.block.status = 'resolved';
+    rendered.message.native_interruption = resolved;
+  }
+  state.activeInterruption = null;
+  state.interruptionTombstone = resolved;
+  return resolved;
+}
+
 function planBlock(taskList, { title = 'Plan' } = {}) {
   return {
     type: 'plan',
@@ -1060,12 +1387,30 @@ function buildCodexCliActivity(state, { nowMs = Date.now() } = {}) {
   const goal = activityGoal(state.activeGoal);
   const step = activityStep(state.latestPlan);
   const usage = activityUsage(state);
+  const interruption = state.activeInterruption?.resolution_state === 'unresolved'
+    && state.activeInterruption?.blocking === true
+    ? state.activeInterruption
+    : null;
+  if (interruption && !activeTool && !turnActive && !reasoningActive && !userAwaitingAssistant) {
+    return {
+      kind: 'failed',
+      label: interruption.title || 'Needs attention',
+      updated_at: interruption.native_timestamp || isoFromMs(state.lastEventAt),
+      interruption,
+      ...(state.interruptionTombstone ? { interruption_tombstone: state.interruptionTombstone } : {}),
+      ...(state.latestPlan ? { task_list: state.latestPlan } : {}),
+      ...(step ? { step } : {}),
+      ...(goal ? { goal } : {}),
+      ...(usage ? { usage } : {}),
+    };
+  }
   if (!activeTool && !turnActive && !reasoningActive && !userAwaitingAssistant) {
     if (state.latestPlan || goal || usage) {
       return {
         kind: 'idle',
         label: '',
         updated_at: isoFromMs(state.lastEventAt),
+        ...(state.interruptionTombstone ? { interruption_tombstone: state.interruptionTombstone } : {}),
         ...(state.latestPlan ? { task_list: state.latestPlan } : {}),
         ...(step ? { step } : {}),
         ...(goal ? { goal } : {}),
@@ -1107,6 +1452,7 @@ function buildCodexCliActivity(state, { nowMs = Date.now() } = {}) {
     updated_at: isoFromMs(updatedMs || nowMs),
     started_at: isoFromMs(activeStartedMs),
     interrupt_hint: 'esc to interrupt',
+    ...(state.interruptionTombstone ? { interruption_tombstone: state.interruptionTombstone } : {}),
   };
   if (reasoningText) {
     activity.thinking = {
@@ -1245,8 +1591,19 @@ function createParseState(filePath) {
     firstUserText: '',
     toolCalls: new Map(),
     pendingToolCalls: new Map(),
+    nativePairOrdinals: new Map(),
+    nativePairCounters: {
+      native_pair_observed: 0,
+      canonical_row_enriched: 0,
+      duplicate_suppressed: 0,
+      ambiguous_pair_retained: 0,
+      replay_reconnect_correction: 0,
+    },
     latestPlan: null,
     activeGoal: null,
+    interruptionRegistry: new Map(),
+    activeInterruption: null,
+    interruptionTombstone: null,
     lastGoalTranscriptKey: '',
     threadName: '',
     tokenUsage: null,
@@ -1344,7 +1701,9 @@ function applyEntryToState(state, entry) {
     if (payload.type === 'message') {
       if (payload.role === 'developer' || payload.role === 'system') return;
       const role = payload.role === 'user' ? 'user' : 'assistant';
-      const content = responseMessageText(payload);
+      const rawContent = responseMessageText(payload);
+      const canonical = role === 'assistant' ? canonicalAssistantContent(rawContent) : null;
+      const content = canonical ? canonical.content : rawContent;
       if (role === 'user') state.lastUserAt = tsMs || state.lastUserAt;
       else {
         state.lastAssistantAt = tsMs || state.lastAssistantAt;
@@ -1354,7 +1713,12 @@ function applyEntryToState(state, entry) {
       pushDedup(state.messages, {
         role,
         content,
-        ...(role === 'assistant' && content ? { content_blocks: [{ type: 'markdown', content }] } : {}),
+        ...(role === 'assistant' && canonical?.content_blocks?.length ? { content_blocks: canonical.content_blocks } : {}),
+        ...(canonical?.memory_citation ? { memory_citation: canonical.memory_citation } : {}),
+        ...(payload.internal_chat_message_metadata_passthrough?.turn_id
+          ? { native_turn_id: String(payload.internal_chat_message_metadata_passthrough.turn_id) }
+          : {}),
+        ...(payload.phase ? { native_phase: String(payload.phase) } : {}),
         ...(payload.id ? { native_source_id: `response_item.message:id:${String(payload.id)}` } : {}),
         native_source_kind: 'response_item.message',
         _preserve_identical: true,
@@ -1441,12 +1805,16 @@ function applyEntryToState(state, entry) {
       });
     } else if (payload.type === 'agent_message') {
       state.lastAssistantAt = tsMs || state.lastAssistantAt;
-      const content = payload.message || payload.text || '';
+      const canonical = canonicalAssistantContent(payload.message || payload.text || '', payload.memory_citation);
+      const content = canonical.content;
       if (content) state.lastAssistantText = content;
       pushDedup(state.messages, {
         role: 'assistant',
         content,
-        ...(content ? { content_blocks: [{ type: 'markdown', content }] } : {}),
+        ...(canonical.content_blocks.length ? { content_blocks: canonical.content_blocks } : {}),
+        ...(canonical.memory_citation ? { memory_citation: canonical.memory_citation } : {}),
+        ...(payload.turn_id ? { native_turn_id: String(payload.turn_id) } : {}),
+        ...(payload.phase ? { native_phase: String(payload.phase) } : {}),
         native_source_kind: 'event_msg.agent_message',
         _preserve_identical: true,
         ts,
@@ -1554,12 +1922,35 @@ function applyEntryToState(state, entry) {
       const resetAt = primary?.resets_at || secondary?.resets_at;
       state.rateLimitedUntil = state.rateLimitActive && resetAt ? isoFromMs(msFromUnixSeconds(resetAt)) : null;
     } else if (payload.type === 'task_started') {
+      const nextTurnId = String(payload.turn_id || '').trim() || null;
+      if (
+        state.activeInterruption
+        && (!state.activeInterruption.turn_id || !nextTurnId || state.activeInterruption.turn_id !== nextTurnId)
+      ) {
+        resolveActiveNativeInterruption(state, {
+          timestamp: tsMs ? new Date(tsMs).toISOString() : null,
+          resolution_reason: 'later_native_turn_started',
+        });
+      }
       state.taskStartedAt = eventTimeMsFromUnixSeconds(payload.started_at, tsMs) || state.taskStartedAt;
-      state.taskStartedTurnId = String(payload.turn_id || '').trim() || state.taskStartedTurnId;
+      const taskTurnId = nextTurnId || '';
+      state.taskStartedTurnId = taskTurnId || state.taskStartedTurnId;
+      if (taskTurnId && taskTurnId !== state.currentTurnId) {
+        state.currentTurnId = taskTurnId;
+        state.currentTurnGeneration += 1;
+      }
     } else if (payload.type === 'task_complete') {
       state.taskCompletedAt = eventTimeMsFromUnixSeconds(payload.completed_at, tsMs) || state.taskCompletedAt;
       state.taskCompletedTurnId = String(payload.turn_id || '').trim() || state.taskCompletedTurnId;
       state.pendingToolCalls.clear();
+      if (nativeInterruptionPayload(payload)) {
+        recordNativeInterruption(state, payload, ts, tsMs, 'event_msg.task_complete.error');
+      } else if (state.activeInterruption) {
+        resolveActiveNativeInterruption(state, {
+          timestamp: tsMs ? new Date(tsMs).toISOString() : null,
+          resolution_reason: 'later_native_turn_completed',
+        });
+      }
     } else if (payload.type === 'turn_aborted') {
       state.taskCompletedAt = tsMs || state.taskCompletedAt;
       state.pendingToolCalls.clear();
@@ -1573,18 +1964,7 @@ function applyEntryToState(state, entry) {
         ts,
       });
     } else if (payload.type === 'error') {
-      const content = payload.message || payload.text || payload.error || 'Codex CLI reported an error.';
-      pushDedup(state.messages, {
-        role: 'assistant',
-        content: `[Error]\n\n${content}`,
-        content_blocks: [{
-          type: 'error',
-          title: payload.codex_error_info ? `Error: ${payload.codex_error_info}` : 'Error',
-          content,
-          status: 'error',
-        }],
-        ts,
-      });
+      recordNativeInterruption(state, payload, ts, tsMs, 'event_msg.error');
     } else if (payload.type === 'context_compacted') {
       const content = compactedBlock(payload).content;
       pushDedup(state.messages, {
@@ -2399,6 +2779,70 @@ function recoverLatestGoalState(filePath, stat) {
   return goal;
 }
 
+function indexedInterruptionEntry(entry) {
+  if (!entry || typeof entry !== 'object') return false;
+  if (entry.type === 'session_meta') return true;
+  if (entry.type !== 'event_msg') return false;
+  return ['task_started', 'task_complete', 'error'].includes(String(entry.payload?.type || ''));
+}
+
+function readInterruptionIndex(filePath, stat) {
+  const prior = INTERRUPTION_INDEX_CACHE.get(filePath);
+  const canAppend = !!prior
+    && stat.size >= prior.offset
+    && stat.size >= prior.size
+    && prior.anchor === fileCursorAnchor(filePath, prior.offset)
+    && !(stat.size === prior.size && stat.mtimeMs !== prior.mtimeMs);
+  const state = canAppend ? prior.state : createParseState(filePath);
+  const scan = scanJsonlEntries(filePath, (entry, offsets) => {
+    if (!indexedInterruptionEntry(entry)) return undefined;
+    return applyScannedEntryToState(state, entry, offsets);
+  }, {
+    startOffset: canAppend ? prior.offset : 0,
+    processFinalLine: true,
+  });
+  const next = {
+    state,
+    offset: scan.offset,
+    size: stat.size,
+    mtimeMs: stat.mtimeMs,
+    anchor: fileCursorAnchor(filePath, scan.offset),
+    mode: canAppend ? (stat.size > prior.size ? 'append' : 'unchanged') : (prior ? 'recovery' : 'baseline'),
+    bytesRead: canAppend ? Math.max(0, stat.size - prior.offset) : stat.size,
+  };
+  setBoundedMap(INTERRUPTION_INDEX_CACHE, filePath, next, 32);
+  return next;
+}
+
+function mergeIndexedInterruptions(state, indexed) {
+  if (!indexed?.state) return;
+  const indexedState = indexed.state;
+  const existingEvents = new Set(state.messages.flatMap(message => (
+    (Array.isArray(message?.content_blocks) ? message.content_blocks : [])
+      .map(block => block?.interruption?.event_id)
+      .filter(Boolean)
+  )));
+  for (const message of indexedState.messages) {
+    const eventId = (Array.isArray(message?.content_blocks) ? message.content_blocks : [])
+      .find(block => block?.interruption)?.interruption?.event_id;
+    if (!eventId || existingEvents.has(eventId)) continue;
+    state.messages.push(message);
+    existingEvents.add(eventId);
+  }
+  state.messages.sort((left, right) => {
+    const leftOffset = Number(left?.native_source_cursor?.start_offset ?? left?._native_start_offset);
+    const rightOffset = Number(right?.native_source_cursor?.start_offset ?? right?._native_start_offset);
+    if (Number.isFinite(leftOffset) && Number.isFinite(rightOffset) && leftOffset !== rightOffset) {
+      return leftOffset - rightOffset;
+    }
+    return (Date.parse(left?.created_at || '') || Number(left?.ts || 0) * 1000)
+      - (Date.parse(right?.created_at || '') || Number(right?.ts || 0) * 1000);
+  });
+  state.interruptionRegistry = new Map(indexedState.interruptionRegistry);
+  state.activeInterruption = indexedState.activeInterruption;
+  state.interruptionTombstone = indexedState.interruptionTombstone;
+}
+
 function parseCodexJsonlTail(filePath, tailBytes = DEFAULT_HYDRATE_TAIL_BYTES) {
   const stat = safeStat(filePath);
   if (!stat) return null;
@@ -2445,6 +2889,8 @@ function parseCodexJsonlTail(filePath, tailBytes = DEFAULT_HYDRATE_TAIL_BYTES) {
     startOffset: scanStartOffset,
     processFinalLine: true,
   });
+  const interruptionIndex = readInterruptionIndex(filePath, stat);
+  mergeIndexedInterruptions(state, interruptionIndex);
   setBoundedMap(TAIL_SUMMARY_CACHE, filePath, {
     state,
     startOffset,
@@ -2472,6 +2918,8 @@ function parseCodexJsonlTail(filePath, tailBytes = DEFAULT_HYDRATE_TAIL_BYTES) {
       window_start_offset: startOffset,
       retained_window_bytes: Math.max(0, scan.offset - startOffset),
       retained_window_limit_bytes: boundedTailBytes * ACTIVE_TAIL_REBASE_FACTOR,
+      interruption_index_mode: interruptionIndex.mode,
+      interruption_index_bytes_read: interruptionIndex.bytesRead,
     },
   };
 }
@@ -2541,6 +2989,63 @@ function parseCodexJsonlChunk(filePath, {
   };
 }
 
+function canonicalMessageStartOffset(message) {
+  const offsets = [
+    message?.native_source_cursor?.start_offset,
+    ...(Array.isArray(message?.native_sources)
+      ? message.native_sources.map(source => source?.cursor?.start_offset)
+      : []),
+  ]
+    .map(value => Number(value))
+    .filter(value => Number.isFinite(value) && value >= 0);
+  return offsets.length > 0 ? Math.min(...offsets) : null;
+}
+
+function readCanonicalHistoryChunk(filePath, {
+  beforeOffset = null,
+  limit = 160,
+  maxHydrateBytes = DEFAULT_HYDRATE_MAX_BYTES,
+} = {}) {
+  const stat = safeStat(filePath);
+  if (!stat) return null;
+  const summary = readSessionSummary(filePath, {
+    maxHydrateBytes,
+    preferTailBytes: 0,
+  });
+  if (!summary?.messagesHydrated || summary.messagesPartial || !Array.isArray(summary.messages)) return null;
+  const explicitBefore = beforeOffset == null ? null : Number(beforeOffset);
+  const endOffset = Number.isFinite(explicitBefore)
+    ? Math.max(0, Math.min(stat.size, explicitBefore))
+    : stat.size;
+  const boundedLimit = Math.max(1, Math.min(1000, Math.floor(Number(limit) || 160)));
+  const messages = summary.messages;
+  let endIndex = messages.length;
+  for (let index = 0; index < messages.length; index += 1) {
+    const offset = canonicalMessageStartOffset(messages[index]);
+    if (offset != null && offset >= endOffset) {
+      endIndex = index;
+      break;
+    }
+  }
+  const startIndex = Math.max(0, endIndex - boundedLimit);
+  const selected = messages.slice(startIndex, endIndex);
+  const messageStartOffsets = selected.map(message => canonicalMessageStartOffset(message) ?? 0);
+  const startOffset = messageStartOffsets.length > 0 ? messageStartOffsets[0] : endOffset;
+  return {
+    state: { messages: selected },
+    stat,
+    startOffset,
+    endOffset,
+    nextBeforeOffset: startIndex > 0 ? startOffset : null,
+    messageStartOffsets,
+    bytesRead: stat.size,
+    eventsRead: null,
+    requestedMinimumMessages: boundedLimit,
+    totalMessages: messages.length,
+    canonical: true,
+  };
+}
+
 function tailSessionSummary(filePath, stat, maxHydrateBytes, tailBytes, hydrateSkippedReason) {
   const summary = readLightweightSessionSummary(filePath, stat);
   const tail = parseCodexJsonlTail(filePath, tailBytes);
@@ -2581,6 +3086,9 @@ function tailSessionSummary(filePath, stat, maxHydrateBytes, tailBytes, hydrateS
     taskStartedAt: tailState?.taskStartedAt ? new Date(tailState.taskStartedAt).toISOString() : null,
     taskCompletedTurnId: tailState?.taskCompletedTurnId || null,
     taskCompletedAt: tailState?.taskCompletedAt ? new Date(tailState.taskCompletedAt).toISOString() : null,
+    native_pair_counters: tailState?.nativePairCounters ? { ...tailState.nativePairCounters } : null,
+    interruption: tailState?.activeInterruption || null,
+    interruption_tombstone: tailState?.interruptionTombstone || null,
     sourceCursor: tail?.sourceCursor || null,
   };
 }
@@ -2634,6 +3142,9 @@ function readSessionSummary(filePath, { includeMessages = true, maxHydrateBytes 
     taskStartedAt: state.taskStartedAt ? new Date(state.taskStartedAt).toISOString() : null,
     taskCompletedTurnId: state.taskCompletedTurnId || null,
     taskCompletedAt: state.taskCompletedAt ? new Date(state.taskCompletedAt).toISOString() : null,
+    native_pair_counters: { ...state.nativePairCounters },
+    interruption: state.activeInterruption || null,
+    interruption_tombstone: state.interruptionTombstone || null,
     sourceCursor: detailed.sourceCursor || null,
   };
   return summary;
@@ -3599,6 +4110,7 @@ module.exports = {
   findLatestSessionForTitle,
   parseCodexJsonl,
   parseCodexJsonlChunk,
+  readCanonicalHistoryChunk,
   readSessionIndex,
   readCliHistory,
   recentInteractiveSessionIds,
@@ -3616,6 +4128,9 @@ module.exports = {
   readLightweightSessionSummary,
   buildSessionProvenance,
   normalizeCodexModelAlias,
+  splitMemoryCitationTrailer,
+  normalizeMemoryCitation,
+  nativePairCompatibility,
   contentFingerprint,
   captureCodexReceiptBaseline,
   inspectCodexReceipt,

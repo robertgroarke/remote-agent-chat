@@ -329,6 +329,123 @@ assert.strictEqual(completedWithoutAssistantSummary.messages.length, 1);
 assert.strictEqual(completedWithoutAssistantSummary.messages[0].role, 'user');
 try { fs.unlinkSync(completedWithoutAssistantFixture); } catch {}
 
+const interruptedTaskFixture = path.join(os.tmpdir(), `codex-cli-task-complete-error-${Date.now()}.jsonl`);
+const interruptedTaskBase = now - 90000;
+const interruptedSessionId = '00000000-0000-4000-8000-000000000106';
+const interruptedTurnId = 'interrupted-provider-turn';
+const interruptedMessage = 'stream disconnected before completion: error sending request for url (https://chatgpt.com/backend-api/codex/responses)';
+const interruptedEntries = [
+  { timestamp: new Date(interruptedTaskBase).toISOString(), type: 'session_meta', payload: { id: interruptedSessionId, cwd: process.cwd(), model: 'gpt-5.6-sol' } },
+  { timestamp: new Date(interruptedTaskBase + 500).toISOString(), type: 'event_msg', payload: { type: 'thread_goal_updated', goal: { objective: 'Keep the interrupted goal recoverable', status: 'active', createdAt: Math.floor(interruptedTaskBase / 1000), updatedAt: Math.floor((interruptedTaskBase + 500) / 1000) } } },
+  { timestamp: new Date(interruptedTaskBase + 1000).toISOString(), type: 'event_msg', payload: { type: 'task_started', turn_id: interruptedTurnId, started_at: Math.floor((interruptedTaskBase + 1000) / 1000) } },
+  { timestamp: new Date(interruptedTaskBase + 1500).toISOString(), type: 'response_item', payload: { type: 'message', role: 'user', content: [{ type: 'input_text', text: 'Continue the interrupted goal' }] } },
+  { timestamp: new Date(interruptedTaskBase + 2500).toISOString(), type: 'event_msg', payload: {
+    type: 'task_complete',
+    turn_id: interruptedTurnId,
+    last_agent_message: null,
+    error: { message: interruptedMessage, codex_error_info: 'other' },
+    completed_at: Math.floor((interruptedTaskBase + 2500) / 1000),
+  } },
+];
+fs.writeFileSync(interruptedTaskFixture, interruptedEntries.map(entry => JSON.stringify(entry)).join('\n') + '\n');
+const interruptedSummary = codexCli.readSessionSummary(interruptedTaskFixture);
+const interruptedBlocks = interruptedSummary.messages.flatMap(message => (
+  Array.isArray(message.content_blocks) ? message.content_blocks.filter(block => block?.interruption) : []
+));
+assert.strictEqual(interruptedBlocks.length, 1, 'task_complete.error must create exactly one typed interruption block');
+assert.strictEqual(interruptedBlocks[0].content, interruptedMessage);
+assert.strictEqual(interruptedBlocks[0].interruption.schema_version, 1);
+assert.strictEqual(interruptedBlocks[0].interruption.surface, 'codex_cli');
+assert.strictEqual(interruptedBlocks[0].interruption.turn_id, interruptedTurnId);
+assert.strictEqual(interruptedBlocks[0].interruption.category, 'stream_interruption');
+assert.strictEqual(interruptedBlocks[0].interruption.blocking, true);
+assert.strictEqual(interruptedBlocks[0].interruption.resolution_state, 'unresolved');
+assert.strictEqual(interruptedSummary.activity.kind, 'failed');
+assert.strictEqual(interruptedSummary.activity.interruption.event_id, interruptedBlocks[0].interruption.event_id);
+assert.strictEqual(interruptedSummary.activity.goal.state, 'active', 'provider interruption must not fabricate goal completion');
+const interruptedSourceMessageId = interruptedSummary.messages.find(message => message.native_interruption)?.source_message_id;
+assert(interruptedSourceMessageId, 'interruption transcript row must have a stable native source message id');
+
+fs.appendFileSync(interruptedTaskFixture, JSON.stringify({
+  timestamp: new Date(interruptedTaskBase + 2600).toISOString(),
+  type: 'event_msg',
+  payload: { type: 'error', turn_id: interruptedTurnId, message: interruptedMessage, codex_error_info: 'other' },
+}) + '\n');
+const replayedInterruptedSummary = codexCli.readSessionSummary(interruptedTaskFixture);
+assert.strictEqual(
+  replayedInterruptedSummary.messages.flatMap(message => (
+    Array.isArray(message.content_blocks) ? message.content_blocks.filter(block => block?.interruption) : []
+  )).length,
+  1,
+  'standalone error replay of task_complete.error must not duplicate the interruption',
+);
+assert.strictEqual(
+  replayedInterruptedSummary.messages.find(message => message.native_interruption)?.source_message_id,
+  interruptedSourceMessageId,
+  'interruption identity must remain stable after duplicate native representation',
+);
+
+fs.appendFileSync(interruptedTaskFixture, [
+  { timestamp: new Date(interruptedTaskBase + 4000).toISOString(), type: 'event_msg', payload: { type: 'task_started', turn_id: 'recovery-turn', started_at: Math.floor((interruptedTaskBase + 4000) / 1000) } },
+  { timestamp: new Date(interruptedTaskBase + 5000).toISOString(), type: 'event_msg', payload: { type: 'task_complete', turn_id: 'recovery-turn', last_agent_message: 'Recovered.', completed_at: Math.floor((interruptedTaskBase + 5000) / 1000) } },
+].map(entry => JSON.stringify(entry)).join('\n') + '\n');
+const recoveredInterruptedSummary = codexCli.readSessionSummary(interruptedTaskFixture);
+const recoveredBlock = recoveredInterruptedSummary.messages
+  .flatMap(message => Array.isArray(message.content_blocks) ? message.content_blocks : [])
+  .find(block => block?.interruption?.event_id === interruptedBlocks[0].interruption.event_id);
+assert.strictEqual(recoveredInterruptedSummary.interruption, null, 'later native progress must clear the active interruption');
+assert.strictEqual(recoveredBlock.status, 'resolved');
+assert.strictEqual(recoveredBlock.interruption.resolution_state, 'resolved');
+assert.strictEqual(recoveredBlock.interruption.tombstone, true);
+assert.strictEqual(
+  recoveredInterruptedSummary.messages.find(message => message.native_interruption)?.source_message_id,
+  interruptedSourceMessageId,
+  'resolving an interruption must update the same transcript identity',
+);
+try { fs.unlinkSync(interruptedTaskFixture); } catch {}
+
+const indexedInterruptionFixture = path.join(os.tmpdir(), `codex-cli-indexed-interruption-${Date.now()}.jsonl`);
+const indexedBase = now - 70000;
+const indexedEntries = [
+  { timestamp: new Date(indexedBase).toISOString(), type: 'session_meta', payload: { id: '00000000-0000-4000-8000-000000000107', cwd: process.cwd() } },
+  { timestamp: new Date(indexedBase + 100).toISOString(), type: 'event_msg', payload: { type: 'task_started', turn_id: 'indexed-failure-turn' } },
+  { timestamp: new Date(indexedBase + 200).toISOString(), type: 'event_msg', payload: { type: 'task_complete', turn_id: 'indexed-failure-turn', last_agent_message: null, error: { message: interruptedMessage, codex_error_info: 'other' } } },
+  ...Array.from({ length: 5000 }, (_, index) => ({
+    timestamp: new Date(indexedBase + 300 + index).toISOString(),
+    type: 'event_msg',
+    payload: { type: 'unrelated_fixture_noise', sequence: index, padding: 'x'.repeat(220) },
+  })),
+  { timestamp: new Date(indexedBase + 6000).toISOString(), type: 'event_msg', payload: { type: 'task_started', turn_id: 'indexed-recovery-turn' } },
+  { timestamp: new Date(indexedBase + 7000).toISOString(), type: 'event_msg', payload: { type: 'task_complete', turn_id: 'indexed-recovery-turn', last_agent_message: 'Recovered.' } },
+];
+fs.writeFileSync(indexedInterruptionFixture, indexedEntries.map(entry => JSON.stringify(entry)).join('\n') + '\n');
+const indexedTail = codexCli.readSessionSummary(indexedInterruptionFixture, {
+  maxHydrateBytes: 1,
+  preferTailBytes: 1024 * 1024,
+});
+const indexedBlocks = indexedTail.messages.flatMap(message => (
+  Array.isArray(message.content_blocks) ? message.content_blocks.filter(block => block?.interruption) : []
+));
+assert(indexedTail.sourceCursor.start_offset > 0, 'indexed interruption fixture must begin outside the bounded tail');
+assert.strictEqual(indexedBlocks.length, 1, 'bounded tail must retain one indexed historical interruption');
+assert.strictEqual(indexedBlocks[0].interruption.resolution_state, 'resolved');
+assert.strictEqual(indexedBlocks[0].interruption.tombstone, true);
+assert.strictEqual(indexedTail.sourceCursor.interruption_index_mode, 'baseline');
+const indexedTailReplay = codexCli.readSessionSummary(indexedInterruptionFixture, {
+  maxHydrateBytes: 1,
+  preferTailBytes: 1024 * 1024,
+});
+assert.strictEqual(
+  indexedTailReplay.messages.flatMap(message => (
+    Array.isArray(message.content_blocks) ? message.content_blocks.filter(block => block?.interruption) : []
+  )).length,
+  1,
+  'unchanged bounded-tail replay must not duplicate the indexed interruption',
+);
+assert.strictEqual(indexedTailReplay.sourceCursor.interruption_index_mode, 'unchanged');
+assert.strictEqual(indexedTailReplay.sourceCursor.interruption_index_bytes_read, 0);
+try { fs.unlinkSync(indexedInterruptionFixture); } catch {}
+
 const usageFixture = path.join(os.tmpdir(), `codex-cli-usage-${Date.now()}.jsonl`);
 const usageReset = Math.floor((now + 3600000) / 1000);
 fs.writeFileSync(usageFixture, [
@@ -467,5 +584,164 @@ assert.deepStrictEqual(
   ['response_item.message:id:assistant-answer-a', 'response_item.message:id:assistant-answer-b'],
 );
 try { fs.unlinkSync(pairedMessageFixture); } catch {}
+
+function memoryCitationProtocol(index) {
+  return [
+    '<oai-mem-citation>',
+    '<citation_entries>',
+    `MEMORY.md:${index + 10}-${index + 11}|note=[fixture ${index}]`,
+    '</citation_entries>',
+    '<rollout_ids>',
+    `00000000-0000-4000-8000-${String(index).padStart(12, '0')}`,
+    '</rollout_ids>',
+    '</oai-mem-citation>',
+  ].join('\n');
+}
+
+function memoryCitationMetadata(index) {
+  return {
+    entries: [{ path: 'MEMORY.md', lineStart: index + 10, lineEnd: index + 11, note: `fixture ${index}` }],
+    rolloutIds: [`00000000-0000-4000-8000-${String(index).padStart(12, '0')}`],
+  };
+}
+
+function citationPairEntries(index, { responseFirst = false, turnId = `citation-turn-${index}` } = {}) {
+  const body = `Citation-enriched answer ${index}.`;
+  const event = {
+    timestamp: new Date(now + index * 20).toISOString(),
+    type: 'event_msg',
+    payload: {
+      id: `citation-event-${index}`,
+      type: 'agent_message',
+      phase: 'final_answer',
+      message: body,
+      memory_citation: memoryCitationMetadata(index),
+    },
+  };
+  const response = {
+    timestamp: new Date(now + index * 20 + 5).toISOString(),
+    type: 'response_item',
+    payload: {
+      id: `citation-response-${index}`,
+      type: 'message',
+      role: 'assistant',
+      phase: 'final_answer',
+      internal_chat_message_metadata_passthrough: { turn_id: turnId },
+      content: [{ type: 'output_text', text: `${body}\n\n${memoryCitationProtocol(index)}` }],
+    },
+  };
+  return [
+    { timestamp: new Date(now + index * 20 - 5).toISOString(), type: 'turn_context', payload: { turn_id: turnId } },
+    ...(responseFirst ? [response, event] : [event, response]),
+  ];
+}
+
+const citationPairFixture = path.join(os.tmpdir(), `codex-cli-memory-citation-pair-${Date.now()}.jsonl`);
+fs.writeFileSync(citationPairFixture, [
+  { timestamp: iso(-1000), type: 'session_meta', payload: { id: '00000000-0000-4000-8000-000000000205', cwd: process.cwd(), model: 'gpt-5.6-sol' } },
+  ...citationPairEntries(1),
+].map(entry => JSON.stringify(entry)).join('\n') + '\n');
+const citationPairSummary = codexCli.readSessionSummary(citationPairFixture);
+const citationPairAnswers = citationPairSummary.messages.filter(message => message.content === 'Citation-enriched answer 1.');
+assert.strictEqual(citationPairAnswers.length, 1, 'the structured event and citation-enriched response must be one answer');
+assert.strictEqual(citationPairAnswers[0].native_source_id, 'response_item.message:id:citation-response-1');
+assert.strictEqual(citationPairAnswers[0].native_source_paired, true);
+assert.strictEqual(citationPairAnswers[0].content_blocks.filter(block => block.type === 'markdown').length, 1);
+assert.strictEqual(citationPairAnswers[0].content_blocks.filter(block => block.type === 'memory_citation').length, 1);
+assert(!JSON.stringify(citationPairAnswers).includes('<oai-mem-citation>'), 'the raw memory citation protocol must not reach clients');
+assert.deepStrictEqual(citationPairSummary.native_pair_counters, {
+  native_pair_observed: 1,
+  canonical_row_enriched: 1,
+  duplicate_suppressed: 1,
+  ambiguous_pair_retained: 0,
+  replay_reconnect_correction: 0,
+});
+try { fs.unlinkSync(citationPairFixture); } catch {}
+
+const citationChunkBoundaryFixture = path.join(os.tmpdir(), `codex-cli-memory-citation-chunk-${Date.now()}.jsonl`);
+const boundaryTurnId = 'citation-chunk-boundary-turn';
+const boundaryPair = citationPairEntries(2, { turnId: boundaryTurnId });
+const boundaryEntries = [
+  { timestamp: iso(-1000), type: 'session_meta', payload: { id: '00000000-0000-4000-8000-000000000208', cwd: process.cwd(), model: 'gpt-5.6-sol' } },
+  { timestamp: iso(0), type: 'turn_context', payload: { turn_id: boundaryTurnId } },
+  ...Array.from({ length: 180 }, (_, index) => ({
+    timestamp: iso(index + 1), type: 'event_msg',
+    payload: { type: 'token_count', info: { total_token_usage: { total_tokens: index } }, padding: 'x'.repeat(2048) },
+  })),
+  boundaryPair[1],
+  boundaryPair[2],
+];
+fs.writeFileSync(citationChunkBoundaryFixture, boundaryEntries.map(entry => JSON.stringify(entry)).join('\n') + '\n');
+const boundaryFull = codexCli.readSessionSummary(citationChunkBoundaryFixture, { maxHydrateBytes: 8 * 1024 * 1024 });
+const boundaryCanonicalChunk = codexCli.readCanonicalHistoryChunk(citationChunkBoundaryFixture, {
+  limit: 160,
+  maxHydrateBytes: 8 * 1024 * 1024,
+});
+const boundaryFullAnswers = boundaryFull.messages.filter(message => message.content === 'Citation-enriched answer 2.');
+const boundaryChunkAnswers = boundaryCanonicalChunk.state.messages.filter(message => message.content === 'Citation-enriched answer 2.');
+assert.strictEqual(boundaryFullAnswers.length, 1);
+assert.strictEqual(boundaryChunkAnswers.length, 1,
+  'canonical history paging split a citation pair whose turn context preceded the byte window');
+assert.strictEqual(boundaryChunkAnswers[0].source_message_id, boundaryFullAnswers[0].source_message_id,
+  'canonical history paging changed the full-archive stable identity');
+assert.strictEqual(boundaryCanonicalChunk.nextBeforeOffset, null);
+assert.strictEqual(boundaryCanonicalChunk.totalMessages, boundaryFull.messages.length);
+try { fs.unlinkSync(citationChunkBoundaryFixture); } catch {}
+
+const citationPermutationFixture = path.join(os.tmpdir(), `codex-cli-memory-citation-permutations-${Date.now()}.jsonl`);
+const citationPermutationEntries = [
+  { timestamp: iso(-1000), type: 'session_meta', payload: { id: '00000000-0000-4000-8000-000000000206', cwd: process.cwd(), model: 'gpt-5.6-sol' } },
+];
+for (let index = 0; index < 200; index++) {
+  const pair = citationPairEntries(index + 100, { responseFirst: index >= 100 });
+  citationPermutationEntries.push(pair[0], pair[1], { ...pair[1], payload: { ...pair[1].payload } }, pair[2], { ...pair[2], payload: { ...pair[2].payload } });
+}
+fs.writeFileSync(citationPermutationFixture, citationPermutationEntries.map(entry => JSON.stringify(entry)).join('\n') + '\n');
+const citationPermutationSummary = codexCli.readSessionSummary(citationPermutationFixture);
+const permutationAnswers = citationPermutationSummary.messages.filter(message => /^Citation-enriched answer /.test(message.content || ''));
+assert.strictEqual(permutationAnswers.length, 200, '100 event-first and 100 response-first replay permutations must each settle to one row');
+assert.strictEqual(new Set(permutationAnswers.map(message => message.source_message_id)).size, 200, 'every native turn must keep a distinct logical identity');
+assert(permutationAnswers.every(message => message.content_blocks.filter(block => block.type === 'memory_citation').length === 1));
+assert(!JSON.stringify(permutationAnswers).includes('<oai-mem-citation>'));
+assert.deepStrictEqual(citationPermutationSummary.native_pair_counters, {
+  native_pair_observed: 200,
+  canonical_row_enriched: 200,
+  duplicate_suppressed: 600,
+  ambiguous_pair_retained: 0,
+  replay_reconnect_correction: 0,
+});
+try { fs.unlinkSync(citationPermutationFixture); } catch {}
+
+const citationNegativeFixture = path.join(os.tmpdir(), `codex-cli-memory-citation-negatives-${Date.now()}.jsonl`);
+const differentTurnBody = 'A different-turn citation answer.';
+const missingTurnBody = 'A missing-turn citation answer.';
+const malformedBody = 'A malformed-trailer answer.';
+fs.writeFileSync(citationNegativeFixture, [
+  { timestamp: iso(-1000), type: 'session_meta', payload: { id: '00000000-0000-4000-8000-000000000207', cwd: process.cwd(), model: 'gpt-5.6-sol' } },
+  { timestamp: iso(1), type: 'event_msg', payload: { type: 'agent_message', phase: 'final_answer', message: missingTurnBody, memory_citation: memoryCitationMetadata(401) } },
+  { timestamp: iso(6), type: 'response_item', payload: { id: 'missing-turn-response', type: 'message', role: 'assistant', phase: 'final_answer', content: [{ type: 'output_text', text: `${missingTurnBody}\n\n${memoryCitationProtocol(401)}` }] } },
+  { timestamp: iso(1000), type: 'turn_context', payload: { turn_id: 'different-turn-event' } },
+  { timestamp: iso(1001), type: 'event_msg', payload: { type: 'agent_message', phase: 'final_answer', message: differentTurnBody, memory_citation: memoryCitationMetadata(400) } },
+  { timestamp: iso(1002), type: 'turn_context', payload: { turn_id: 'different-turn-response' } },
+  { timestamp: iso(1006), type: 'response_item', payload: { id: 'different-turn-response', type: 'message', role: 'assistant', phase: 'final_answer', internal_chat_message_metadata_passthrough: { turn_id: 'different-turn-response' }, content: [{ type: 'output_text', text: `${differentTurnBody}\n\n${memoryCitationProtocol(400)}` }] } },
+  { timestamp: iso(3001), type: 'event_msg', payload: { type: 'agent_message', phase: 'final_answer', message: malformedBody } },
+  { timestamp: iso(3006), type: 'response_item', payload: { id: 'malformed-citation-response', type: 'message', role: 'assistant', phase: 'final_answer', content: [{ type: 'output_text', text: `${malformedBody}\n\n<oai-mem-citation><citation_entries>broken` }] } },
+  { timestamp: iso(4000), type: 'turn_context', payload: { turn_id: 'event-only-turn' } },
+  { timestamp: iso(4001), type: 'event_msg', payload: { type: 'agent_message', phase: 'final_answer', message: 'Event-only answer.', memory_citation: memoryCitationMetadata(402) } },
+].map(entry => JSON.stringify(entry)).join('\n') + '\n');
+const citationNegativeSummary = codexCli.readSessionSummary(citationNegativeFixture);
+assert.strictEqual(
+  new Set(citationNegativeSummary.messages.map(message => message.source_message_id)).size,
+  citationNegativeSummary.messages.length,
+  'unpaired native representations must retain distinct stable IDs',
+);
+assert.strictEqual(citationNegativeSummary.messages.filter(message => message.content === differentTurnBody).length, 2, 'different-turn citation answers must remain distinct');
+assert.strictEqual(citationNegativeSummary.messages.filter(message => message.content === missingTurnBody).length, 2, 'missing-turn citation answers must remain distinct');
+assert.strictEqual(citationNegativeSummary.messages.filter(message => String(message.content || '').includes(malformedBody)).length, 2, 'a malformed citation response must remain visible');
+const eventOnlyAnswer = citationNegativeSummary.messages.find(message => message.content === 'Event-only answer.');
+assert(eventOnlyAnswer, 'an event-only answer must never be swallowed');
+assert.strictEqual(eventOnlyAnswer.content_blocks.filter(block => block.type === 'memory_citation').length, 1);
+assert(citationNegativeSummary.native_pair_counters.ambiguous_pair_retained >= 2);
+try { fs.unlinkSync(citationNegativeFixture); } catch {}
 
 console.log(`Codex CLI parser smoke passed (${summary.messages.length} messages, tail=${tailSummary.messages.length})`);

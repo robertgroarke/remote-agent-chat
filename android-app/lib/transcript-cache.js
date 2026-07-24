@@ -31,7 +31,14 @@ export function mergeTranscriptMessages(existing, incoming) {
       const key = stableTranscriptMessageKey(message);
       if (key && indexes.has(key)) {
         const index = indexes.get(key);
-        merged[index] = { ...merged[index], ...message };
+        const current = merged[index];
+        const currentHasCitation = Array.isArray(current?.content_blocks)
+          && current.content_blocks.some(block => block?.type === 'memory_citation');
+        const incomingHasCitation = Array.isArray(message?.content_blocks)
+          && message.content_blocks.some(block => block?.type === 'memory_citation');
+        merged[index] = currentHasCitation && !incomingHasCitation
+          ? { ...current, ...message, content: current.content, content_blocks: current.content_blocks }
+          : { ...current, ...message };
         return;
       }
       if (key) indexes.set(key, merged.length);
@@ -113,6 +120,19 @@ export function deleteCachedTranscript(sessionId) {
   return true;
 }
 
+export function migrateCachedTranscript(aliasSessionId, canonicalSessionId) {
+  const aliasId = normalizedSessionId(aliasSessionId);
+  const canonicalId = normalizedSessionId(canonicalSessionId);
+  if (!aliasId || !canonicalId || aliasId === canonicalId) return getTranscriptSnapshot(canonicalId);
+  const aliasMessages = transcriptCache.get(aliasId) || [];
+  const canonicalMessages = transcriptCache.get(canonicalId) || [];
+  if (aliasMessages.length > 0) {
+    setCachedTranscript(canonicalId, mergeTranscriptMessages(canonicalMessages, aliasMessages));
+  }
+  deleteCachedTranscript(aliasId);
+  return getTranscriptSnapshot(canonicalId);
+}
+
 function transcriptMapSnapshot() {
   return Object.fromEntries([...transcriptCache.entries()]);
 }
@@ -164,22 +184,6 @@ export function mergeCachedTranscript(sessionId, messages, options = {}) {
     : mergeTranscriptMessages(previous, messages);
   setCachedTranscript(id, next, options.limit);
   return next;
-}
-
-export function migrateCachedTranscript(aliasSessionId, canonicalSessionId) {
-  const aliasId = normalizedSessionId(aliasSessionId);
-  const canonicalId = normalizedSessionId(canonicalSessionId);
-  if (!aliasId || !canonicalId || aliasId === canonicalId) {
-    return getCachedTranscript(canonicalId) || [];
-  }
-  const aliasMessages = transcriptCache.get(aliasId) || [];
-  const canonicalMessages = transcriptCache.get(canonicalId) || [];
-  const merged = mergeTranscriptMessages(canonicalMessages, aliasMessages);
-  if (aliasMessages.length > 0 || canonicalMessages.length > 0) {
-    setCachedTranscript(canonicalId, merged);
-  }
-  if (transcriptCache.delete(aliasId)) notifyTranscript(aliasId);
-  return merged;
 }
 
 export function appendCachedTranscript(sessionId, message, options = {}) {

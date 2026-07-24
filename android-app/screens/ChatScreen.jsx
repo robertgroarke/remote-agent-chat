@@ -12,6 +12,7 @@ import * as FileSystem     from 'expo-file-system';
 import AsyncStorage        from '@react-native-async-storage/async-storage';
 import { RelayClient }      from '../lib/relay';
 import { createStateSequenceGate } from '../lib/state-sequence';
+import { mergeGoalProjectedActivity } from '../lib/goal-projection';
 import { getStoredJwt, signOut, RELAY_URL } from '../lib/auth';
 import MessageBubble         from '../components/MessageBubble';
 import ActivityRow           from '../components/ActivityRow';
@@ -847,7 +848,7 @@ export default function ChatScreen({ route, navigation }) {
         )) clearProvisionalStream();
         if (msg.activity && typeof msg.activity === 'object') {
           const kind = msg.activity.kind || (msg.thinking ? 'thinking' : 'idle');
-          setActivity({
+          setActivity(previous => mergeGoalProjectedActivity(previous, {
             ...msg.activity,
             kind,
             generating: msg.activity.generating ?? msg.thinking ?? ![
@@ -858,19 +859,19 @@ export default function ChatScreen({ route, navigation }) {
               ?? msg.activity.thinkingContent
               ?? msg.activity.thinking_content
               ?? '',
-          });
+          }));
         } else if (msg.thinking) {
           const now = new Date().toISOString();
-          setActivity({
+          setActivity(previous => mergeGoalProjectedActivity(previous, {
             kind: 'thinking',
             generating: true,
             label: msg.label || 'Thinking',
             started_at: now,
             updated_at: now,
             thinkingContent: msg.thinking_content || '',
-          });
+          }));
         } else {
-          setActivity(null);
+          setActivity(previous => mergeGoalProjectedActivity(previous, null));
         }
         break;
       }
@@ -2453,20 +2454,30 @@ function getLang(name) {
 }
 
 function mergeSorted(msgs) {
-  const seen = new Set();
-  return msgs
-    .filter(m => {
-      const key = m.source_message_id ? `source:${m.source_message_id}`
-        : m.native_source_id ? `native:${m.native_source_id}`
-        : m.id != null ? `id:${m.id}`
-        : m.server_message_id != null ? `server:${m.server_message_id}`
-        : m.sequence != null ? `seq:${m.sequence}`
-        : m._cid ? `client:${m._cid}`
-        : `ts:${messageInstant(m)?.iso || 'unknown'}:${m.role}:${String(m.content)}`;
-      if (seen.has(key)) return false;
-      seen.add(key);
-      return true;
-    })
+  const merged = [];
+  const indexes = new Map();
+  msgs.forEach(m => {
+    const key = m.source_message_id ? `source:${m.source_message_id}`
+      : m.native_source_id ? `native:${m.native_source_id}`
+      : m.id != null ? `id:${m.id}`
+      : m.server_message_id != null ? `server:${m.server_message_id}`
+      : m.sequence != null ? `seq:${m.sequence}`
+      : m._cid ? `client:${m._cid}`
+      : `ts:${messageInstant(m)?.iso || 'unknown'}:${m.role}:${String(m.content)}`;
+    if (!indexes.has(key)) {
+      indexes.set(key, merged.length);
+      merged.push(m);
+      return;
+    }
+    const index = indexes.get(key);
+    const current = merged[index];
+    const currentHasCitation = Array.isArray(current?.content_blocks)
+      && current.content_blocks.some(block => block?.type === 'memory_citation');
+    const incomingHasCitation = Array.isArray(m?.content_blocks)
+      && m.content_blocks.some(block => block?.type === 'memory_citation');
+    if (incomingHasCitation && !currentHasCitation) merged[index] = { ...current, ...m };
+  });
+  return merged
     .sort((a, b) => (a.sequence ?? 0) - (b.sequence ?? 0));
 }
 

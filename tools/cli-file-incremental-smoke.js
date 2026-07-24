@@ -10,6 +10,7 @@ const claudeCli = require('../agent-proxy/claude-cli');
 const codexCli = require('../agent-proxy/codex-cli');
 const cursorCli = require('../agent-proxy/cursor-cli');
 const proto = require('../agent-proxy/protocol');
+const sessionStore = require('../agent-proxy/session-store');
 const { ProxyEngine } = require('../agent-proxy/proxy-engine');
 
 const outputArgIndex = process.argv.indexOf('--output');
@@ -123,6 +124,8 @@ try {
     outbound.push(proto.historySnapshot(sessionId, messages, {
       resyncId: options.resyncId,
       resyncReason: options.resyncReason,
+      replaceAll: options.replaceAll,
+      includeLegacyHistory: options.includeLegacyHistory,
       source: options.source,
       sourceCursor: options.sourceCursor,
       sourceBytes: options.sourceBytes,
@@ -136,6 +139,265 @@ try {
       'codex_cli', codexPath, codexBaselineMessages, codexBaseline.sourceCursor
     ),
   };
+  const migrationEngine = Object.create(ProxyEngine.prototype);
+  const migrationFrames = [];
+  migrationEngine._log = () => {};
+  migrationEngine.relayReady = true;
+  migrationEngine.relayWs = { readyState: 1 };
+  migrationEngine._sendHistorySnapshot = (sessionId, messages, reason, options) => {
+    const frame = proto.historySnapshot(sessionId, messages, {
+      resyncId: options.resyncId,
+      resyncReason: options.resyncReason,
+      replaceAll: options.replaceAll,
+      includeLegacyHistory: options.includeLegacyHistory,
+      source: options.source,
+      sourceCursor: options.sourceCursor,
+      sourceBytes: options.sourceBytes,
+      rateLimitMs: options.rateLimitMs,
+    });
+    frame.test_direct_transport = options.directTransport === true;
+    migrationFrames.push(frame);
+    return true;
+  };
+  const canonicalMigrationSession = { agentType: 'codex_cli' };
+  const canonicalMigrationResult = migrationEngine._sendFileBackedTranscriptUpdate(
+    'canonical-migration-session',
+    canonicalMigrationSession,
+    [{
+      role: 'assistant',
+      content: 'Canonical answer without a citation.',
+      source_message_id: 'codex_cli_pair:fixture-canonical',
+      native_source_paired: true,
+      content_blocks: [{ type: 'markdown', content: 'Canonical answer without a citation.' }],
+    }],
+    {
+      agentType: 'codex_cli', filePath: codexPath,
+      sourceCursor: { mode: 'baseline', start_offset: 0, end_offset: 460, file_size: 460 },
+      reason: 'fixture baseline',
+    },
+  );
+  assert.strictEqual(canonicalMigrationResult.mode, 'canonical_schema_migration');
+  assert.strictEqual(migrationFrames.length, 1, 'canonical baseline must emit one authoritative migration');
+  assert.strictEqual(migrationFrames[0].source, 'codex_cli_jsonl');
+  assert.strictEqual(migrationFrames[0].test_direct_transport, true);
+  assert.strictEqual(migrationFrames[0].replace_all, true);
+  assert.strictEqual(Object.prototype.hasOwnProperty.call(migrationFrames[0], 'history'), false);
+  assert.match(migrationFrames[0].resync_reason, /canonical-v2 authoritative identity migration/);
+  assert.strictEqual(migrationFrames[0].messages.length, 1);
+  const pendingSession = {
+    _fileTranscriptState: migrationEngine._fileTranscriptState(
+      'codex_cli', codexPath, [{
+        role: 'assistant',
+        content: 'Canonical cited answer.',
+        source_message_id: 'codex_cli_pair:fixture-pending-citation',
+        native_source_paired: true,
+        content_blocks: [
+          { type: 'markdown', content: 'Canonical cited answer.' },
+          { type: 'memory_citation', title: 'Sources', entries: [], rollout_ids: [] },
+        ],
+      }],
+      { mode: 'baseline', start_offset: 0, end_offset: 460, file_size: 460 },
+    ),
+  };
+  migrationEngine.relayReady = false;
+  migrationEngine.sessions = new Map([['pending-canonical-session', pendingSession]]);
+  const pendingMigration = migrationEngine._migrateCodexCliCanonicalTranscript(
+    'pending-canonical-session', pendingSession, pendingSession._fileTranscriptState, 'initial registration',
+  );
+  assert.strictEqual(pendingMigration.mode, 'canonical_schema_migration_pending');
+  assert.strictEqual(pendingSession._codexCliCanonicalMigrationPending, true);
+  migrationEngine.relayReady = true;
+  migrationEngine._flushCodexCliCanonicalMigrations();
+  assert.strictEqual(pendingSession._codexCliCanonicalMigrationPending, false);
+  assert.strictEqual(pendingSession._codexCliCanonicalMigrationAttempted, true);
+  assert.strictEqual(migrationFrames.length, 2, 'relay handshake must flush pending canonical migration once');
+  const originalReadSessionSummary = codexCli.readSessionSummary;
+  const fullCitationMessages = [
+    {
+      role: 'assistant', content: 'Full canonical cited answer.',
+      source_message_id: 'codex_cli_pair:fixture-full-citation', native_source_paired: true,
+      content_blocks: [
+        { type: 'markdown', content: 'Full canonical cited answer.' },
+        { type: 'memory_citation', title: 'Sources', entries: [], rollout_ids: [] },
+      ],
+    },
+    { role: 'user', content: 'Older retained row.', source_message_id: 'codex_cli:fixture-older-row' },
+  ];
+  codexCli.readSessionSummary = () => ({
+    messages: fullCitationMessages,
+    messagesHydrated: true,
+    messagesPartial: false,
+    sourceCursor: { mode: 'full', start_offset: 0, end_offset: 2048, file_size: 2048, partial: false },
+  });
+  let fullMigrationResult;
+  try {
+    const boundedCitationState = migrationEngine._fileTranscriptState(
+      'codex_cli', codexPath, [fullCitationMessages[0]],
+      { mode: 'tail', start_offset: 1024, end_offset: 2048, file_size: 2048, partial: true, window_start_offset: 1024 },
+    );
+    fullMigrationResult = migrationEngine._migrateCodexCliCanonicalTranscript(
+      'full-canonical-session', {}, boundedCitationState, 'initial registration',
+    );
+  } finally {
+    codexCli.readSessionSummary = originalReadSessionSummary;
+  }
+  assert.strictEqual(fullMigrationResult.mode, 'canonical_schema_migration');
+  assert.strictEqual(fullMigrationResult.sent, 2, 'bounded canonical migration must hydrate the complete archive');
+  assert.strictEqual(migrationFrames.length, 3);
+  assert.strictEqual(migrationFrames[2].messages.length, 2);
+  assert.strictEqual(migrationFrames[2].test_direct_transport, true);
+
+  const orderingEngine = Object.create(ProxyEngine.prototype);
+  const orderedFrames = [];
+  const orderingSessionId = 'desktop-authoritative-boundary';
+  orderingEngine._log = () => {};
+  orderingEngine.sessions = new Map([[orderingSessionId, { agentType: 'codex-desktop' }]]);
+  orderingEngine._canonicalSuppressedSessionIds = new Set();
+  orderingEngine.relayReady = true;
+  orderingEngine.relayWs = {
+    readyState: 1,
+    bufferedAmount: 0,
+    send: encoded => orderedFrames.push(JSON.parse(encoded)),
+  };
+  orderingEngine._promoteSessionChatTitle = () => false;
+  orderingEngine._pendingRelayBulk = new Map([[
+    `history_snapshot:${orderingSessionId}`,
+    { encoded: '{"type":"history_snapshot","messages":[{"content":"stale"}]}', byteLen: 64 },
+  ]]);
+  orderingEngine._relayBulkDeferralLogAt = new Map([[
+    `history_snapshot:${orderingSessionId}`,
+    Date.now(),
+  ]]);
+  assert.strictEqual(orderingEngine._sendHistorySnapshot(
+    orderingSessionId,
+    [],
+    'codex desktop native thread change',
+    { directTransport: true, replaceAll: true },
+  ), true);
+  assert.strictEqual(orderingEngine._pendingRelayBulk.has(`history_snapshot:${orderingSessionId}`), false,
+    'a newer direct authoritative boundary must cancel the older deferred bulk snapshot');
+  assert.strictEqual(orderingEngine._relayBulkDeferralLogAt.has(`history_snapshot:${orderingSessionId}`), false);
+  assert.strictEqual(orderedFrames.length, 1);
+  assert.strictEqual(orderedFrames[0].replace_all, true);
+  assert.deepStrictEqual(orderedFrames[0].messages, []);
+
+  const desktopBoundaryEngine = Object.create(ProxyEngine.prototype);
+  const desktopBoundaryFrames = [];
+  desktopBoundaryEngine._log = () => {};
+  desktopBoundaryEngine._sendHistorySnapshot = (sessionId, messages, reason, options) => {
+    desktopBoundaryFrames.push({ sessionId, messages, reason, options });
+    return true;
+  };
+  const desktopSession = {
+    agentType: 'codex-desktop',
+    _activeThreadKey: 'local:00000000-0000-4000-8000-000000000111',
+    _accumulatedMessages: [{ role: 'assistant', content: 'former thread' }],
+    lastMessageCount: 1,
+    lastObservedCount: 1,
+    lastTranscriptSig: 'former',
+  };
+  const originalUpdateSession = sessionStore.updateSession;
+  sessionStore.updateSession = () => {};
+  try {
+    desktopBoundaryEngine._applyCodexDesktopActiveThread(
+      orderingSessionId,
+      desktopSession,
+      { id: 'local:00000000-0000-4000-8000-000000000222', title: 'Replacement thread' },
+      { refreshMetadata: false },
+    );
+  } finally {
+    sessionStore.updateSession = originalUpdateSession;
+  }
+  assert.strictEqual(desktopBoundaryFrames.length, 1);
+  assert.deepStrictEqual(desktopBoundaryFrames[0].messages, []);
+  assert.strictEqual(desktopBoundaryFrames[0].options.directTransport, true);
+  assert.strictEqual(desktopBoundaryFrames[0].options.replaceAll, true);
+  assert.strictEqual(desktopSession.lastMessageCount, 0);
+  assert.strictEqual(desktopSession._activeThreadKey, 'local:00000000-0000-4000-8000-000000000222');
+
+  const releasedAliasSessionId = 'bbbbbbbb-cccc-4ddd-8eee-ffffffffffff';
+  const releasedCanonicalSessionId = 'aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee';
+  const releasedNativeId = '11111111-2222-4333-8444-555555555555';
+  const releaseEngine = Object.create(ProxyEngine.prototype);
+  let releasedFrame = null;
+  let releasedStorePatch = null;
+  releaseEngine._canonicalSuppressedSessionIds = new Set([releasedAliasSessionId]);
+  releaseEngine._lastSessionSnapshotSig = 'before-release';
+  releaseEngine.sessions = new Map([[
+    releasedAliasSessionId,
+    { agentType: 'codex_cli', canonical_suppressed: true },
+  ]]);
+  releaseEngine._sendToRelay = frame => {
+    releasedFrame = frame;
+    return true;
+  };
+  releaseEngine._log = () => {};
+  const originalGetSession = sessionStore.getSession;
+  const originalUpdateReleaseSession = sessionStore.updateSession;
+  sessionStore.getSession = id => (id === releasedAliasSessionId ? {
+    session_id: releasedAliasSessionId,
+    canonical_suppressed: true,
+    canonical_session_id: releasedCanonicalSessionId,
+  } : null);
+  sessionStore.updateSession = (id, patch) => {
+    assert.strictEqual(id, releasedAliasSessionId);
+    releasedStorePatch = patch;
+  };
+  try {
+    assert.strictEqual(releaseEngine._releaseCodexCliCanonicalAlias(
+      releasedAliasSessionId,
+      releasedNativeId,
+      {
+        verified: true,
+        generation: '2026-07-23T12:00:00.000Z',
+        observed_at: '2026-07-23T12:00:00.000Z',
+        native_pid: 1234,
+      },
+    ), true);
+  } finally {
+    sessionStore.getSession = originalGetSession;
+    sessionStore.updateSession = originalUpdateReleaseSession;
+  }
+  assert.strictEqual(releasedFrame.type, 'session_alias_released');
+  assert.strictEqual(releasedFrame.alias_session_id, releasedAliasSessionId);
+  assert.strictEqual(releasedFrame.prior_canonical_session_id, releasedCanonicalSessionId);
+  assert.strictEqual(releasedFrame.current_surface, 'codex_cli');
+  assert.strictEqual(releasedFrame.owner_evidence.verified, true);
+  assert.strictEqual(releasedStorePatch.canonical_suppressed, false);
+  assert.strictEqual(releasedStorePatch.canonical_session_id, releasedAliasSessionId);
+  assert.strictEqual(releaseEngine._canonicalSuppressedSessionIds.has(releasedAliasSessionId), false);
+  assert.strictEqual(releaseEngine._lastSessionSnapshotSig, null);
+
+  const flushOrderEngine = Object.create(ProxyEngine.prototype);
+  const flushOrder = [];
+  flushOrderEngine.relayReady = true;
+  flushOrderEngine.relayWs = {
+    readyState: 1,
+    bufferedAmount: 0,
+    send: encoded => flushOrder.push(JSON.parse(encoded).type),
+  };
+  flushOrderEngine._pendingPreReadyAliasEvents = new Map([[
+    releasedAliasSessionId,
+    JSON.stringify(releasedFrame),
+  ]]);
+  flushOrderEngine._pendingPreReadyHistory = new Map([[
+    releasedAliasSessionId,
+    JSON.stringify({
+      type: 'history_snapshot',
+      session_id: releasedAliasSessionId,
+      messages: [],
+      replace_all: true,
+    }),
+  ]]);
+  flushOrderEngine._pendingPreReadyEvents = new Map();
+  flushOrderEngine._pendingRelayBulk = new Map();
+  flushOrderEngine._log = () => {};
+  flushOrderEngine._flushPendingRelayBulk = () => {};
+  flushOrderEngine._flushPendingPreReadyAliasEvents();
+  flushOrderEngine._flushPendingPreReadyHistory();
+  assert.deepStrictEqual(flushOrder, ['session_alias_released', 'history_snapshot'],
+    'alias release must reach the relay before authoritative history');
+
   const appendResult = engine._sendFileBackedTranscriptUpdate(
     'incremental-session', transportSession, codexAppend.messages,
     { agentType: 'codex_cli', filePath: codexPath, sourceCursor: codexAppend.sourceCursor, reason: 'fixture append' },
@@ -435,6 +697,20 @@ try {
       reason: recoveryFrame.resync_reason,
       bytes_read: recoveryFrame.source_bytes,
       rate_limit_ms: recoveryFrame.resync_rate_limit_ms,
+    },
+    canonical_schema_migration: {
+      mode: canonicalMigrationResult.mode,
+      rows: migrationFrames[0].messages.length,
+      source: migrationFrames[0].source,
+      replace_all: migrationFrames[0].replace_all === true,
+      legacy_history_omitted: !Object.prototype.hasOwnProperty.call(migrationFrames[0], 'history'),
+    },
+    authoritative_ordering: {
+      stale_bulk_cancelled: true,
+      desktop_thread_boundary_frames: desktopBoundaryFrames.length,
+      replace_all: orderedFrames[0].replace_all === true,
+      alias_release_before_history: flushOrder.join('>'),
+      verified_owner_alias_release: releasedFrame.type,
     },
     stable_source_identity: appendedFrame.source_message_id,
     restart_stable_source_identity: restartedFrame.source_message_id,

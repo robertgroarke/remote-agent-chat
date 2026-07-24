@@ -1097,13 +1097,45 @@ async function detectThinking(Runtime, agentType) {
       const raw = await evalFn(Runtime, `
         var isDesktopApp = ${JSON.stringify(agentType === 'codex-desktop')};
         var isCodexExtension = ${JSON.stringify(agentType === 'codex')};
+        var goalObservedAt = new Date().toISOString();
+        var activeGoalThreadRows = isDesktopApp
+          ? Array.from(d.querySelectorAll(
+              '[data-app-action-sidebar-thread-row][data-app-action-sidebar-thread-active="true"], '
+              + '[data-app-action-sidebar-thread-row][aria-current="page"]'
+            ))
+          : [];
+        var activeGoalThreadRow = activeGoalThreadRows.length === 1 ? activeGoalThreadRows[0] : null;
+        var activeGoalThreadId = activeGoalThreadRow
+          ? String(activeGoalThreadRow.getAttribute('data-app-action-sidebar-thread-id') || '').trim()
+          : '';
+        var activeGoalThreadTitle = activeGoalThreadRow
+          ? String(activeGoalThreadRow.getAttribute('data-app-action-sidebar-thread-title')
+            || activeGoalThreadRow.innerText || activeGoalThreadRow.textContent || '').replace(/\\s+/g, ' ').trim()
+          : '';
+        var goalObservation = {
+          schema_version: 1,
+          surface: isDesktopApp ? 'codex-desktop' : 'codex',
+          native_thread_id: activeGoalThreadId,
+          native_thread_title: activeGoalThreadTitle.substring(0, 240),
+          active_thread_proven: !isDesktopApp || (!!activeGoalThreadId && activeGoalThreadRows.length === 1),
+          ownership_state: 'clear',
+          reason: isDesktopApp
+            ? (!activeGoalThreadId
+              ? (activeGoalThreadRows.length > 1 ? 'ambiguous_active_thread' : 'active_thread_missing')
+              : 'goal_absent')
+            : 'goal_absent',
+          observed_at: goalObservedAt,
+        };
         function readGoalSurface() {
           function visible(el) {
             if (!el || !el.getBoundingClientRect) return false;
             var rect = el.getBoundingClientRect();
             if (rect.width <= 0 || rect.height <= 0) return false;
             var style = window.getComputedStyle ? window.getComputedStyle(el) : null;
-            return !style || (style.display !== 'none' && style.visibility !== 'hidden' && style.opacity !== '0');
+            if (style && (style.display === 'none' || style.visibility === 'hidden' || style.opacity === '0')) return false;
+            var viewportWidth = Math.max(d.documentElement ? d.documentElement.clientWidth : 0, window.innerWidth || 0);
+            var viewportHeight = Math.max(d.documentElement ? d.documentElement.clientHeight : 0, window.innerHeight || 0);
+            return rect.right > 0 && rect.bottom > 0 && rect.left < viewportWidth && rect.top < viewportHeight;
           }
           function norm(text) {
             return String(text || '').replace(/\\s+/g, ' ').trim();
@@ -1164,7 +1196,17 @@ async function detectThinking(Runtime, agentType) {
             return /^[+-]?\\d+\\s*[dhms]\\b/i.test(norm(text));
           }
 
-          var composer = d.querySelector('.ProseMirror, textarea[aria-label*="follow-up" i], textarea[placeholder*="follow-up" i]');
+          if (isDesktopApp && (!activeGoalThreadId || activeGoalThreadRows.length !== 1)) return null;
+          var composers = Array.from(d.querySelectorAll(
+            '.ProseMirror, textarea[aria-label*="follow-up" i], textarea[placeholder*="follow-up" i]'
+          )).filter(visible);
+          if (isDesktopApp && composers.length !== 1) {
+            goalObservation.reason = composers.length > 1 ? 'ambiguous_active_composer' : 'active_composer_missing';
+            return null;
+          }
+          var composer = composers[0] || d.querySelector(
+            '.ProseMirror, textarea[aria-label*="follow-up" i], textarea[placeholder*="follow-up" i]'
+          );
           var composerRect = composer && composer.getBoundingClientRect ? composer.getBoundingClientRect() : null;
           var labels = Array.from(d.querySelectorAll('span, div, button')).filter(function(el) {
             if (!visible(el)) return false;
@@ -1178,6 +1220,11 @@ async function detectThinking(Runtime, agentType) {
             return norm(a.textContent).length - norm(b.textContent).length;
           });
           if (labels.length === 0) return null;
+          if (isDesktopApp && labels.length !== 1) {
+            goalObservation.reason = 'ambiguous_goal_surfaces';
+            goalObservation.candidate_count = labels.length;
+            return null;
+          }
 
           var labelNode = labels[0];
           var label = norm(labelNode.innerText || labelNode.textContent);
@@ -1235,7 +1282,7 @@ async function detectThinking(Runtime, agentType) {
           var candidates = goalCandidates(compactRoot);
           if (candidates.length === 0 && compactRoot !== root) candidates = goalCandidates(root);
           var objective = candidates.length > 0 ? candidates[0].text : '';
-          return {
+          var result = {
             label: label,
             text: objective,
             state: goalStatus(label),
@@ -1244,10 +1291,123 @@ async function detectThinking(Runtime, agentType) {
             source: isDesktopApp ? 'codex_desktop_dom' : 'codex_extension_dom',
             objective: objective,
             time_used_seconds: seconds,
-            observed_at: new Date().toISOString(),
+            observed_at: goalObservedAt,
           };
+          if (isDesktopApp) {
+            result.native_thread_id = activeGoalThreadId;
+            result.native_thread_title = activeGoalThreadTitle.substring(0, 240);
+            result.active_thread_proven = true;
+            goalObservation.ownership_state = 'owned';
+            goalObservation.reason = 'exact_active_thread_goal';
+          }
+          return result;
         }
         var goalSurface = readGoalSurface();
+        function readNativeConnectionLifecycle() {
+          function visible(el) {
+            if (!el || !el.getBoundingClientRect || el.offsetParent === null) return false;
+            var rect = el.getBoundingClientRect();
+            if (rect.width <= 0 || rect.height <= 0) return false;
+            var style = window.getComputedStyle ? window.getComputedStyle(el) : null;
+            return !style || (style.display !== 'none' && style.visibility !== 'hidden' && style.opacity !== '0');
+          }
+          function norm(text) {
+            return String(text || '').replace(/\u00a0/g, ' ').replace(/\\s+/g, ' ').trim();
+          }
+          function tinyHash(text) {
+            var h = 2166136261;
+            text = String(text || '');
+            for (var i = 0; i < text.length; i++) {
+              h ^= text.charCodeAt(i);
+              h = Math.imul(h, 16777619);
+            }
+            return (h >>> 0).toString(36);
+          }
+          var conversation = d.querySelector('[data-thread-find-target="conversation"]');
+          if (!conversation) return { lifecycle: null, diagnostic: null, root: null };
+          var units = Array.from(conversation.querySelectorAll('[data-content-search-unit-key]'));
+          var latestTurnId = units.length > 0
+            ? String(units[units.length - 1].getAttribute('data-content-search-unit-key') || '').split(':')[0]
+            : '';
+          var headers = Array.from(conversation.querySelectorAll(
+            '[class*="group/activity-header"], [data-testid*="activity-header" i], [data-codex-activity-header]'
+          )).filter(function(el) {
+            if (!visible(el)) return false;
+            if (el.closest('nav, aside, [data-app-action-sidebar-thread-row], [aria-hidden="true"]')) return false;
+            var owner = el.closest('[data-turn-key], [data-content-search-turn-key], [data-content-search-unit-key]');
+            var ownerKey = owner && (
+              owner.getAttribute('data-turn-key')
+              || owner.getAttribute('data-content-search-turn-key')
+              || owner.getAttribute('data-content-search-unit-key')
+            ) || '';
+            var ownerTurnId = String(ownerKey).split(':')[0];
+            return !latestTurnId || !ownerTurnId || ownerTurnId === latestTurnId;
+          });
+          for (var hi = headers.length - 1; hi >= 0; hi--) {
+            var header = headers[hi];
+            var hasConnectionGlyph = !!header.querySelector(
+              'svg, [data-icon*="wifi" i], [data-icon*="connect" i], [aria-label*="connection" i], [class*="wifi" i], [class*="connection" i]'
+            );
+            if (!hasConnectionGlyph) continue;
+            var representations = [header.innerText, header.textContent];
+            Array.from(header.querySelectorAll('[aria-label], [title], [data-value]')).forEach(function(node) {
+              representations.push(node.getAttribute('aria-label'));
+              representations.push(node.getAttribute('title'));
+              representations.push(node.getAttribute('data-value'));
+            });
+            representations = representations.map(norm).filter(Boolean);
+            var text = representations.find(function(value) { return /\\bReconnecting\\b/i.test(value); })
+              || representations.find(function(value) { return /\\b(?:Reconnected|Connected|Connection failed|Reconnect failed|Failed to reconnect)\\b/i.test(value); })
+              || '';
+            if (!text) continue;
+            var owner = header.closest('[data-turn-key], [data-content-search-turn-key], [data-content-search-unit-key]');
+            var ownerKey = owner && (
+              owner.getAttribute('data-turn-key')
+              || owner.getAttribute('data-content-search-turn-key')
+              || owner.getAttribute('data-content-search-unit-key')
+            ) || '';
+            var turnId = String(ownerKey).split(':')[0] || null;
+            var sourceToken = header.getAttribute('data-codex-activity-header')
+              || header.getAttribute('data-testid') || header.id || tinyHash(ownerKey + ':' + hi);
+            var reconnect = representations.map(function(value) {
+              return { value: value, match: value.match(/\\bReconnecting\\s+(\\d+)\\s*[/]\\s*(\\d+)\\b/i) };
+            }).find(function(item) { return item.match; });
+            var state = reconnect || /\\bReconnecting\\b/i.test(text) ? 'reconnecting'
+              : /\\b(?:Connection failed|Reconnect failed|Failed to reconnect)\\b/i.test(text) ? 'failed'
+                : 'reconnected';
+            var sourceId = 'codex_native_connection:' + (turnId || 'active') + ':' + tinyHash(sourceToken);
+            if (state === 'reconnecting' && !reconnect) {
+              return { lifecycle: null, root: header, diagnostic: {
+                code: 'native_connection_counter_missing', native_turn_id: turnId,
+                native_source_id: sourceId, provenance: isDesktopApp ? 'codex_desktop_dom' : 'codex_extension_dom'
+              } };
+            }
+            var attempt = reconnect ? Number(reconnect.match[1]) : null;
+            var attemptLimit = reconnect ? Number(reconnect.match[2]) : null;
+            if (reconnect && (!Number.isInteger(attempt) || !Number.isInteger(attemptLimit)
+                || attempt < 1 || attemptLimit < 1 || attempt > attemptLimit || attemptLimit > 100)) {
+              return { lifecycle: null, root: header, diagnostic: {
+                code: 'native_connection_counter_invalid', native_turn_id: turnId,
+                native_source_id: sourceId, provenance: isDesktopApp ? 'codex_desktop_dom' : 'codex_extension_dom'
+              } };
+            }
+            var label = state === 'reconnecting' ? 'Reconnecting ' + attempt + '/' + attemptLimit
+              : state === 'failed' ? 'Native connection failed' : 'Reconnected';
+            return { root: header, diagnostic: null, lifecycle: {
+              state: state, attempt: attempt, attempt_limit: attemptLimit, label: label,
+              producer_timestamp: new Date().toISOString(), native_turn_id: turnId,
+              native_source_id: sourceId,
+              native_source_cursor: { mode: 'live_dom', unit_key: ownerKey || null, header_key: sourceToken },
+              provenance: isDesktopApp ? 'codex_desktop_dom' : 'codex_extension_dom',
+              surface_provenance: { family: 'codex', surface: isDesktopApp ? 'codex_desktop' : 'codex_vscode', source: isDesktopApp ? 'codex_desktop_dom' : 'codex_extension_dom' }
+            } };
+          }
+          return { lifecycle: null, diagnostic: null, root: null };
+        }
+        var nativeConnectionObservation = readNativeConnectionLifecycle();
+        var nativeConnection = nativeConnectionObservation.lifecycle;
+        var nativeConnectionDiagnostic = nativeConnectionObservation.diagnostic;
+        var nativeConnectionRoot = nativeConnectionObservation.root;
         function readActivitySummary() {
           function visible(el) {
             if (!el || !el.getBoundingClientRect || el.offsetParent === null) return false;
@@ -1290,6 +1450,7 @@ async function detectThinking(Runtime, agentType) {
           });
           for (var ci = candidates.length - 1; ci >= 0; ci--) {
             var candidate = candidates[ci];
+            if (nativeConnectionRoot && candidate === nativeConnectionRoot) continue;
             var clone = candidate.cloneNode(true);
             Array.from(clone.querySelectorAll('button, svg, path, [aria-hidden="true"]')).forEach(function(node) {
               if (node && node.parentNode) node.parentNode.removeChild(node);
@@ -1389,7 +1550,10 @@ async function detectThinking(Runtime, agentType) {
             d.querySelector('main') ||
             d.body;
           var spinner = Array.from(spinnerRoot.querySelectorAll('[class*="animate-spin"]'))
-            .find(function(el) { return el.offsetParent !== null && !el.closest('nav'); });
+            .find(function(el) {
+              return el.offsetParent !== null && !el.closest('nav')
+                && (!nativeConnectionRoot || !nativeConnectionRoot.contains(el));
+            });
           if (spinner) {
             isThinking = true;
             hasSpinnerSignal = true;
@@ -1421,7 +1585,12 @@ async function detectThinking(Runtime, agentType) {
           }
         }
 
-        if (!isThinking) return JSON.stringify({ thinking: false, label: '', goal: goalSurface });
+        if (!isThinking) return JSON.stringify({
+          thinking: false, label: '', goal: goalSurface,
+          native_connection: nativeConnection,
+          native_connection_diagnostic: nativeConnectionDiagnostic,
+          goal_observation: goalObservation
+        });
 
         // Enhanced activity detection: extract granular activity label + command content.
         var label = 'Generating';
@@ -1614,7 +1783,12 @@ async function detectThinking(Runtime, agentType) {
         if (isDesktopApp && !hasStopSignal && !hasSpinnerSignal && !hasShimmerSignal) {
           var hasActiveLabel = /^(Running command|Reading|Writing|Editing|Searching|Creating|Applying|Tool:)/i.test(label);
           if (!hasActiveLabel && !liveDraft) {
-            return JSON.stringify({ thinking: false, label: '', thinkingContent: '', goal: goalSurface });
+            return JSON.stringify({
+              thinking: false, label: '', thinkingContent: '', goal: goalSurface,
+              native_connection: nativeConnection,
+              native_connection_diagnostic: nativeConnectionDiagnostic,
+              goal_observation: goalObservation
+            });
           }
         }
 
@@ -1631,7 +1805,10 @@ async function detectThinking(Runtime, agentType) {
           reasoningText: reasoningText,
           current: current,
           activitySummary: activitySummary,
+          native_connection: nativeConnection,
+          native_connection_diagnostic: nativeConnectionDiagnostic,
           goal: goalSurface,
+          goal_observation: goalObservation,
         });
       `);
       try { return JSON.parse(raw); } catch (error) {
@@ -4025,6 +4202,9 @@ const CODEX_DESKTOP_READ_EXPR = `
     var turnTs = units.length > 0
       ? _turnTsFromKey(units[0].getAttribute('data-content-search-unit-key'))
       : null;
+    var nativeTurnId = units.length > 0
+      ? String(units[0].getAttribute('data-content-search-unit-key') || '').split(':')[0]
+      : (_turnGroupOrder[ti] || '');
     function pushAssistantSegment(value, dedupeAny) {
       if (!value) return;
       var cleaned = cleanText(value, 'assistant');
@@ -4132,11 +4312,21 @@ const CODEX_DESKTOP_READ_EXPR = `
     if (userParts.length > 0) {
       var userMsg = { role: 'user', content: userParts.join('\\n\\n') };
       if (turnTs) userMsg.ts = turnTs;
+      if (nativeTurnId) {
+        userMsg.native_turn_id = nativeTurnId;
+        userMsg.native_source_id = 'codex_desktop_dom:' + nativeTurnId + ':user';
+        userMsg.source_message_id = 'codex-desktop-dom:' + nativeTurnId + ':user';
+      }
       msgs.push(userMsg);
     }
     for (var asi = 0; asi < assistantSegments.length; asi++) {
       var asstMsg = { role: 'assistant', content: assistantSegments[asi] };
       if (turnTs) asstMsg.ts = turnTs;
+      if (nativeTurnId) {
+        asstMsg.native_turn_id = nativeTurnId;
+        asstMsg.native_source_id = 'codex_desktop_dom:' + nativeTurnId + ':assistant:' + (asi + 1);
+        asstMsg.source_message_id = 'codex-desktop-dom:' + nativeTurnId + ':assistant:' + (asi + 1);
+      }
       msgs.push(asstMsg);
     }
   }
@@ -8128,23 +8318,113 @@ async function sendCodexDesktopTrustedInput(cdpClient, Runtime, text, sessionId,
     return { ok: false, code: 'send_failed', detail: error.message || 'trusted Enter failed' };
   }
 
-  for (let attempt = 0; attempt < confirmationAttempts; attempt += 1) {
-    if (confirmationIntervalMs > 0) await new Promise(resolve => setTimeout(resolve, confirmationIntervalMs));
+  const confirmPersisted = async (startAttempt, endAttempt, method) => {
+    for (let attempt = startAttempt; attempt < endAttempt; attempt += 1) {
+      if (confirmationIntervalMs > 0) await new Promise(resolve => setTimeout(resolve, confirmationIntervalMs));
+      try {
+        // A Codex Desktop target can rotate after trusted submit while the
+        // native turn continues and persists. Re-resolve the live client and
+        // periodically bypass the cheap read signature.
+        const bypassCache = attempt === 0 || (attempt + 1) % 4 === 0;
+        const observedMatches = _countMatchingCodexUserMessages(await readRecent({ bypassCache }), text);
+        if (observedMatches > baselineMatches) return { ok: true, method };
+      } catch {}
+    }
+    return null;
+  };
+
+  // Give Enter a short receipt window. Some Codex Desktop builds accept the
+  // trusted text but ignore trusted Enter, leaving the exact draft visible.
+  // Waiting the full receipt timeout in that state only strands the message.
+  const enterConfirmationAttempts = Math.min(
+    confirmationAttempts,
+    Math.max(1, Number(options.codexEnterConfirmationAttempts) || Math.min(4, Math.ceil(confirmationAttempts / 4))),
+  );
+  const enterReceipt = await confirmPersisted(0, enterConfirmationAttempts, 'cdp_input_enter_confirmed');
+  if (enterReceipt) return enterReceipt;
+
+  let clickFallbackAttempted = false;
+  let clickFallbackCode = 'trusted_mouse_not_supported';
+  let clickInput = Input;
+  let clickRuntime = Runtime;
+  if (confirmationClientProvider) {
     try {
-      // A Codex Desktop target can rotate after trusted Enter while the native
-      // turn continues and persists. Re-resolve the live client above and force
-      // a bounded full read periodically so neither a dead socket nor a stale
-      // cheap signature can turn a delivered message into a false failure.
-      const bypassCache = attempt === 0 || (attempt + 1) % 4 === 0;
-      const observedMatches = _countMatchingCodexUserMessages(await readRecent({ bypassCache }), text);
-      if (observedMatches > baselineMatches) return { ok: true, method: 'cdp_input_enter_confirmed' };
+      const liveClient = confirmationClientProvider();
+      clickInput = liveClient?.Input || clickInput;
+      clickRuntime = liveClient?.Runtime || clickRuntime;
     } catch {}
   }
+  if (typeof clickInput?.dispatchMouseEvent === 'function') {
+    const clickTargetRaw = await evalInPage(clickRuntime, `
+      // __REMOTE_AGENT_CODEX_COMPOSER_CLICK_FALLBACK__
+      function norm(value) { return String(value || '').replace(/\\s+/g, ' ').trim(); }
+      function visible(el) {
+        if (!el || !el.isConnected) return false;
+        var style = getComputedStyle(el);
+        var rect = el.getBoundingClientRect();
+        return style.display !== 'none' && style.visibility !== 'hidden' && rect.width > 0 && rect.height > 0;
+      }
+      var wanted = ${JSON.stringify(String(text || '').replace(/\s+/g, ' ').trim())};
+      var input = Array.from(d.querySelectorAll('.ProseMirror[data-codex-composer="true"], .ProseMirror')).find(visible);
+      if (!input) return JSON.stringify({ ok: false, code: 'input_not_found' });
+      if (norm(input.innerText || input.textContent || '') !== wanted) {
+        return JSON.stringify({ ok: false, code: 'composer_changed' });
+      }
+      var root = input.closest('.composer-surface-chrome') || input.closest('[data-codex-composer-root]');
+      if (!root) return JSON.stringify({ ok: false, code: 'composer_root_not_found' });
+      var buttons = Array.from(root.querySelectorAll('button')).filter(visible);
+      var submit = buttons.filter(function(button) {
+        return !button.hasAttribute('data-composer-navigation-target')
+          && !button.hasAttribute('data-codex-intelligence-trigger')
+          && !button.hasAttribute('aria-haspopup');
+      }).pop();
+      if (!submit) return JSON.stringify({ ok: false, code: 'send_button_failed' });
+      if (submit.disabled || submit.getAttribute('aria-disabled') === 'true') {
+        return JSON.stringify({ ok: false, code: 'send_button_disabled' });
+      }
+      if (submit.querySelector('svg rect') || /stop/i.test(submit.getAttribute('aria-label') || '')) {
+        return JSON.stringify({ ok: false, code: 'agent_busy' });
+      }
+      var path = submit.querySelector('svg path');
+      var pathD = path ? (path.getAttribute('d') || '') : '';
+      var knownSend = !pathD || pathD.indexOf('M9.334') === 0 || pathD.indexOf('M4.5 ') === 0;
+      if (!knownSend) return JSON.stringify({ ok: false, code: 'unknown_submit_control' });
+      var rect = submit.getBoundingClientRect();
+      return JSON.stringify({ ok: true, code: 'ready', x: rect.left + rect.width / 2, y: rect.top + rect.height / 2 });
+    `);
+    let clickTarget;
+    try { clickTarget = JSON.parse(clickTargetRaw || '{}'); } catch { clickTarget = {}; }
+    clickFallbackCode = clickTarget.code || 'click_target_invalid';
+    if (clickTarget.ok && Number.isFinite(clickTarget.x) && Number.isFinite(clickTarget.y)) {
+      try {
+        await clickInput.dispatchMouseEvent({ type: 'mouseMoved', x: clickTarget.x, y: clickTarget.y });
+        await clickInput.dispatchMouseEvent({ type: 'mousePressed', x: clickTarget.x, y: clickTarget.y, button: 'left', clickCount: 1 });
+        await clickInput.dispatchMouseEvent({ type: 'mouseReleased', x: clickTarget.x, y: clickTarget.y, button: 'left', clickCount: 1 });
+        clickFallbackAttempted = true;
+        clickFallbackCode = 'trusted_mouse_dispatched';
+      } catch (error) {
+        clickFallbackCode = error.message || 'trusted mouse submit failed';
+      }
+    }
+  }
+
+  const finalConfirmationAttempts = clickFallbackAttempted
+    ? Math.max(confirmationAttempts, enterConfirmationAttempts + 1)
+    : confirmationAttempts;
+  const finalReceipt = await confirmPersisted(
+    enterConfirmationAttempts,
+    finalConfirmationAttempts,
+    clickFallbackAttempted ? 'cdp_input_click_confirmed' : 'cdp_input_enter_confirmed',
+  );
+  if (finalReceipt) return finalReceipt;
+
   return {
     ok: false,
     code: 'native_user_turn_not_observed',
     detail: 'Trusted submit did not produce a new persisted Codex Desktop user turn',
     baseline_matches: baselineMatches,
+    click_fallback_attempted: clickFallbackAttempted,
+    click_fallback_code: clickFallbackCode,
   };
 }
 
@@ -11175,6 +11455,27 @@ const CODEX_DESKTOP_QUESTION_EXPR = `
   if (!nativeThreadId) return JSON.stringify({ error: 'active_thread_missing' });
   if (cards.length !== 1) return JSON.stringify({ error: 'ambiguous_request_cards', count: cards.length });
   var card = cards[0];
+  var nativeTurnOwner = card.closest('[data-content-search-turn-key], [data-turn-key], [data-content-search-unit-key]');
+  var nativeTurnKey = nativeTurnOwner
+    ? String(nativeTurnOwner.getAttribute('data-content-search-turn-key')
+      || nativeTurnOwner.getAttribute('data-turn-key')
+      || nativeTurnOwner.getAttribute('data-content-search-unit-key') || '').trim()
+    : '';
+  if (!nativeTurnKey) {
+    var conversation = card.closest('[data-thread-find-target="conversation"]')
+      || d.querySelector('[data-thread-find-target="conversation"]');
+    var precedingUnits = conversation
+      ? Array.from(conversation.querySelectorAll('[data-content-search-unit-key]')).filter(function(unit) {
+          return !!(unit.compareDocumentPosition(card) & 4);
+        })
+      : [];
+    var preceding = precedingUnits.length ? precedingUnits[precedingUnits.length - 1] : null;
+    nativeTurnKey = preceding
+      ? String(preceding.getAttribute('data-content-search-unit-key') || '').trim()
+      : '';
+  }
+  var nativeTurnId = nativeTurnKey.split(':')[0] || '';
+  if (!nativeTurnId) return JSON.stringify({ error: 'native_turn_missing' });
   var rows = Array.from(card.querySelectorAll('[role="radio"], [role="checkbox"]')).filter(cdqVisible);
   var heading = Array.from(card.querySelectorAll('[class*="font-medium"], h1, h2, h3, h4')).find(function(el) {
     var value = cdqText(el);
@@ -11213,6 +11514,7 @@ const CODEX_DESKTOP_QUESTION_EXPR = `
   var multi = rows.some(function(row) { return row.getAttribute('role') === 'checkbox'; });
   var signature = JSON.stringify({
     thread: nativeThreadId,
+    turn: nativeTurnId,
     question: questionText,
     choices: choices.map(function(choice) {
       return [choice.label, choice.description, choice.native_role];
@@ -11221,6 +11523,7 @@ const CODEX_DESKTOP_QUESTION_EXPR = `
   });
   return JSON.stringify({
     native_thread_id: nativeThreadId,
+    native_turn_id: nativeTurnId,
     native_thread_title: nativeThreadTitle.substring(0, 240),
     active_thread_proven: true,
     native_signature: signature,
@@ -11256,7 +11559,7 @@ async function detectCodexDesktopQuestion(Runtime) {
 }
 
 async function respondToCodexDesktopQuestion(Runtime, response, expected) {
-  if (!expected?.native_thread_id || !expected?.native_signature) {
+  if (!expected?.native_thread_id || !expected?.native_turn_id || !expected?.native_signature) {
     return { ok: false, native_attempted: false, retryable: false, code: 'question_identity_missing', detail: 'Native question identity is missing' };
   }
   const current = await detectCodexDesktopQuestion(Runtime);
@@ -11264,8 +11567,9 @@ async function respondToCodexDesktopQuestion(Runtime, response, expected) {
     return { ok: false, native_attempted: false, retryable: false, code: current?.error || 'native_question_missing', detail: 'The native Codex Desktop question is no longer open' };
   }
   if (current.native_thread_id !== expected.native_thread_id
+      || current.native_turn_id !== expected.native_turn_id
       || current.native_signature !== expected.native_signature) {
-    return { ok: false, native_attempted: false, retryable: false, code: 'stale_native_question', detail: 'The active native thread or question changed' };
+    return { ok: false, native_attempted: false, retryable: false, code: 'stale_native_question', detail: 'The active native thread, turn, or question changed' };
   }
   const action = response?.action || 'answer';
   let nativeAction;
@@ -11347,7 +11651,11 @@ async function respondToCodexDesktopQuestion(Runtime, response, expected) {
   for (let attempt = 0; attempt < 60; attempt += 1) {
     await new Promise(resolve => setTimeout(resolve, 50));
     const followup = await detectCodexDesktopQuestion(Runtime);
-    if (!followup || (!followup.error && followup.native_signature !== expected.native_signature)) {
+    if (!followup || (!followup.error && (
+      followup.native_thread_id !== expected.native_thread_id
+      || followup.native_turn_id !== expected.native_turn_id
+      || followup.native_signature !== expected.native_signature
+    ))) {
       return {
         ok: true,
         native_attempted: true,

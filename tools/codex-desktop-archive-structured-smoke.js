@@ -13,6 +13,7 @@ const {
 
 const THREAD_ID = '019f51a6-8834-7c21-95fc-78fa8b3daba9';
 const THINKING_THREAD_ID = '019f51a6-8834-7c21-95fc-78fa8b3dabb0';
+const LARGE_THREAD_ID = '019f51a6-8834-7c21-95fc-78fa8b3dabb1';
 const shellCall = {
   role: 'assistant',
   content: '[Tool: exec]',
@@ -127,6 +128,15 @@ try {
     native_source_id: 'response_item.reasoning:id:summary',
     producer_timestamp: '2026-07-21T11:47:22.971Z',
   };
+  const largeNativeArchive = Array.from({ length: 3000 }, (_, index) => ({
+    role: index % 2 === 0 ? 'user' : 'assistant',
+    content: `Large exact native transcript row ${index + 1} with enough stable content to anchor the immutable archive.`,
+    source_message_id: `large-native-source-${index + 1}`,
+    native_source_id: `large-native-item-${index + 1}`,
+    native_turn_id: `large-native-turn-${Math.floor(index / 2) + 1}`,
+    sequence: index + 1,
+    ts: 1000 + index,
+  }));
   codexCli.findSessionByCliId = id => {
     if (id === THREAD_ID) return {
       cliSessionId: THREAD_ID,
@@ -144,6 +154,14 @@ try {
         content_blocks: [...thinkingTerminal.content_blocks, activitySummary],
       }],
     };
+    if (id === LARGE_THREAD_ID) return {
+      cliSessionId: LARGE_THREAD_ID,
+      filePath: 'large-exact-fixture.jsonl',
+      updatedAt: '2026-07-22T08:00:00.000Z',
+      sizeBytes: 4_000_000,
+      messages: largeNativeArchive,
+      messagesPartial: false,
+    };
     return null;
   };
   codexCli.findLatestSessionForTitle = () => {
@@ -151,6 +169,21 @@ try {
   };
   const engine = Object.create(ProxyEngine.prototype);
   engine._log = () => {};
+  const visibleDelegatedUser = {
+    role: 'user',
+    content: 'Continue the exact Desktop fidelity investigation without changing the protected session or inventing a new native prompt.',
+    ts: 1784602339,
+  };
+  const nativeDelegatedUser = {
+    ...visibleDelegatedUser,
+    content: `<codex_delegation><input>${visibleDelegatedUser.content}</input></codex_delegation>`,
+  };
+  assert.equal(engine._codexDesktopArchiveUserIndex([nativeDelegatedUser], visibleDelegatedUser), 0,
+    'a timestamp-bound native delegation envelope must cover its stripped Desktop user card');
+  assert.equal(engine._codexDesktopArchiveUserIndex(
+    [{ ...nativeDelegatedUser, ts: visibleDelegatedUser.ts - 2 }],
+    visibleDelegatedUser,
+  ), -1, 'a repeated suffix from another timestamp must not authorize archive replacement');
   const dom = [
     { role: 'assistant', content: 'Edited 1 file', content_blocks: [{ type: 'markdown', content: 'Edited 1 file' }] },
     { role: 'assistant', content: 'Context remaining', content_blocks: [{ type: 'markdown', content: 'Context remaining' }] },
@@ -173,6 +206,69 @@ try {
     'reasoning richness recovery should not depend on archive message count');
   assert(reasoningRecovered[1].content_blocks.some(block => block.activity_summary === true),
     'exact archive must win when only the reasoning-summary block is missing from a tool-rich DOM');
+
+  const largeSession = {
+    agentType: 'codex-desktop',
+    _activeThreadKey: `local:${LARGE_THREAD_ID}`,
+    _activeThreadTitle: 'Large exact native transcript',
+  };
+  const largeRecovered = engine._maybeUseCodexDesktopArchive(
+    'large-exact-fixture-session',
+    largeSession,
+    largeNativeArchive.slice(-2),
+  );
+  assert.equal(largeRecovered.length, largeNativeArchive.length,
+    'an exact immutable Desktop archive must never be clipped to 2,000 rows');
+  assert.equal(largeSession._codexDesktopArchiveAuthoritative, true);
+  const firstCanonical = engine._reconcileCodexDesktopCanonicalTranscript(
+    Array.from({ length: 56 }, (_, index) => ({ role: 'assistant', content: `legacy duplicate ${index}` })),
+    largeRecovered,
+    { authoritative: true },
+  );
+  assert.equal(firstCanonical.messages.length, largeNativeArchive.length);
+  assert.equal(new Set(firstCanonical.messages.map(message => message.source_message_id)).size, largeNativeArchive.length);
+  const repeatedCanonical = engine._reconcileCodexDesktopCanonicalTranscript(
+    firstCanonical.messages,
+    JSON.parse(JSON.stringify(largeRecovered)),
+    { authoritative: true },
+  );
+  assert.equal(repeatedCanonical.changed, false,
+    'an unchanged native archive poll must retain the canonical message array and row identities');
+  assert.equal(repeatedCanonical.messages, firstCanonical.messages);
+
+  const canonicalArchiveRows = largeNativeArchive.slice(-2);
+  const matchingDomRows = canonicalArchiveRows.map((message, index) => ({
+    role: message.role,
+    content: message.content,
+    native_turn_id: message.native_turn_id,
+    native_source_id: `codex_desktop_dom:${message.native_turn_id}:${message.role}:${index + 1}`,
+    source_message_id: `codex-desktop-dom:${message.native_turn_id}:${message.role}:${index + 1}`,
+    sequence: message.sequence,
+    ts: message.ts,
+  }));
+  let alternatingCanonical = engine._reconcileCodexDesktopCanonicalTranscript(
+    [], canonicalArchiveRows, { authoritative: true },
+  ).messages;
+  const alternatingIdentity = alternatingCanonical.map(message => message.source_message_id);
+  for (let replay = 0; replay < 1000; replay += 1) {
+    const domReplay = engine._reconcileCodexDesktopCanonicalTranscript(
+      alternatingCanonical, JSON.parse(JSON.stringify(matchingDomRows)), { authoritative: false },
+    );
+    assert.equal(domReplay.changed, false,
+      `semantic DOM overlap ${replay + 1} must retain authoritative native row identity`);
+    assert.equal(domReplay.messages, alternatingCanonical);
+    const archiveReplay = engine._reconcileCodexDesktopCanonicalTranscript(
+      alternatingCanonical, JSON.parse(JSON.stringify(canonicalArchiveRows)), { authoritative: true },
+    );
+    assert.equal(archiveReplay.changed, false,
+      `authoritative archive replay ${replay + 1} must not replace canonical rows`);
+    assert.equal(archiveReplay.messages, alternatingCanonical);
+  }
+  assert.deepEqual(
+    alternatingCanonical.map(message => message.source_message_id),
+    alternatingIdentity,
+    '1,000 alternating DOM/archive observations must preserve the native identity sequence',
+  );
 
   const vsCodeRecovered = engine._maybeUseCodexDesktopArchive('thinking-vscode-fixture-session', {
     agentType: 'codex',

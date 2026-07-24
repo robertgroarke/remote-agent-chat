@@ -90,6 +90,7 @@ class CodexAppServerConnection extends EventEmitter {
   constructor({
     sessionId,
     cwd = process.cwd(),
+    codexGlobalArgs = [],
     clientName = 'remote-agent-chat',
     clientVersion = '1.0.0',
     requestTimeoutMs = 30000,
@@ -99,6 +100,10 @@ class CodexAppServerConnection extends EventEmitter {
     this.sessionId = String(sessionId || '').trim();
     if (!this.sessionId) fail('invalid_session_id', 'An RAC session ID is required');
     this.cwd = cwd;
+    if (!Array.isArray(codexGlobalArgs) || codexGlobalArgs.some(value => typeof value !== 'string')) {
+      fail('invalid_codex_global_args', 'Codex app-server global arguments must be strings');
+    }
+    this.codexGlobalArgs = [...codexGlobalArgs];
     this.clientName = clientName;
     this.clientVersion = clientVersion;
     this.requestTimeoutMs = Math.max(1000, Number(requestTimeoutMs) || 30000);
@@ -137,7 +142,11 @@ class CodexAppServerConnection extends EventEmitter {
       connectionGeneration: this.connectionGeneration,
     });
     const invocation = resolveCodexInvocation();
-    this.child = spawn(invocation.command, [...invocation.prefix, 'app-server', '--stdio'], {
+    this.child = spawn(invocation.command, [
+      ...invocation.prefix,
+      ...this.codexGlobalArgs,
+      'app-server', '--stdio',
+    ], {
       cwd: this.cwd,
       windowsHide: true,
       shell: false,

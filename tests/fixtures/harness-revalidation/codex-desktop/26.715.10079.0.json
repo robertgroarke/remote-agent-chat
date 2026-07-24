@@ -1,0 +1,43 @@
+{
+  "schema_version": 1,
+  "harness": "codex-desktop",
+  "installed_version": "26.715.10079.0",
+  "captured_contract": "Desktop transcript, composer, question, goal, native stop, active-thread and persisted user-turn receipt selectors",
+  "source": "installed read-only active-thread and immutable archive probe",
+  "reader_contract": {
+    "conversation_selector": "[data-thread-find-target=\"conversation\"]",
+    "unit_selector": "[data-content-search-unit-key]",
+    "role_source": "terminal data-content-search-unit-key segment",
+    "turn_identity_source": "UUIDv7 data-content-search-unit-key prefix",
+    "observed_units": 60,
+    "observed_conversations": 1,
+    "observed_roles": {
+      "user": 8,
+      "assistant": 52
+    },
+    "active_thread_required": true
+  },
+  "composer_contract": {
+    "input_selector": ".ProseMirror[data-codex-composer=\"true\"]",
+    "root_selector": ".composer-surface-chrome",
+    "visible_inputs": 1,
+    "visible_buttons": 5,
+    "submit_candidates": 2,
+    "submit_present": true,
+    "empty_at_probe": true
+  },
+  "write_contracts": {
+    "send_message": {
+      "status": "read_only_compatible",
+      "commands": [
+        "send",
+        "send_message",
+        "message_send"
+      ],
+      "scope": "current_visible_thread",
+      "evidence": "Exact-version visible composer/root/submit selectors plus synthetic receipt and duplicate-suppression regressions",
+      "does_not_claim_live_delivery": true
+    }
+  },
+  "content_safe_evidence_sha256": "8be40105d8ce1114f336c6d44c6db24314ab9821f64d64534e7abc3c292c7c3b"
+}

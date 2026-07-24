@@ -1,5 +1,9 @@
 'use strict';
 
+const { loadSharedRuntimeContract } = require('./shared-runtime-contract');
+const { reduceProviderConnection } = loadSharedRuntimeContract('provider-connection-lifecycle.js');
+const { reduceNativeInterruption } = loadSharedRuntimeContract('native-interruption.js');
+
 const INACTIVE_KINDS = new Set([
   '',
   'idle',
@@ -71,8 +75,56 @@ function normalizeActivityTimeline(activity, previousActivity, now = new Date().
   const next = {
     ...activity,
     updated_at: updatedAt,
-    goal: normalizeGoal(activity.goal, previousActivity?.goal, updatedAt),
   };
+  // Goal lifecycle is tri-state. Omission means this activity update has no
+  // opinion, an object is a projection, and explicit null is a clear. Never
+  // manufacture null for an omitted field: doing so makes ordinary status
+  // frames look like authoritative tombstones downstream.
+  if (Object.prototype.hasOwnProperty.call(activity, 'goal')) {
+    next.goal = normalizeGoal(activity.goal, previousActivity?.goal, updatedAt);
+  }
+  const previousConnection = previousActivity?.connection_tombstone || previousActivity?.connection || null;
+  if (activity.connection && typeof activity.connection === 'object') {
+    const reduced = reduceProviderConnection(previousConnection, activity.connection, activity.connection);
+    const wasVisible = !!previousActivity?.connection;
+    next.connection_tombstone = reduced.connection || previousConnection;
+    next.connection = reduced.code === 'connection_duplicate_suppressed' && !wasVisible
+      ? null
+      : reduced.visible || null;
+    next.connection_reduction_code = reduced.code;
+  } else {
+    next.connection_tombstone = previousConnection;
+    next.connection = null;
+    delete next.connection_reduction_code;
+  }
+  const previousInterruption = previousActivity?.interruption_tombstone
+    || previousActivity?.interruption
+    || null;
+  const incomingInterruption = activity.interruption && typeof activity.interruption === 'object'
+    ? activity.interruption
+    : activity.interruption_tombstone && typeof activity.interruption_tombstone === 'object'
+      ? activity.interruption_tombstone
+      : null;
+  if (incomingInterruption) {
+    const reduced = reduceNativeInterruption(previousInterruption, incomingInterruption);
+    next.interruption_tombstone = reduced.value || previousInterruption;
+    next.interruption = reduced.value?.resolution_state === 'unresolved'
+      && reduced.value?.blocking === true
+      ? reduced.value
+      : null;
+    next.interruption_reduction_code = reduced.code;
+  } else if (previousInterruption) {
+    next.interruption_tombstone = previousInterruption;
+    next.interruption = previousInterruption.resolution_state === 'unresolved'
+      && previousInterruption.blocking === true
+      ? previousInterruption
+      : null;
+    next.interruption_reduction_code = 'retained_missing_update';
+  } else {
+    next.interruption_tombstone = null;
+    next.interruption = null;
+    delete next.interruption_reduction_code;
+  }
 
   if (!isActiveActivity(next)) {
     return { ...next, started_at: null, thinking: null, current: null };

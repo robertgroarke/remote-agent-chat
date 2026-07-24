@@ -94,14 +94,25 @@ class SessionAliasReconciler {
         suppression_reason TEXT NOT NULL,
         generation_clock REAL NOT NULL DEFAULT 0,
         receipt_hash TEXT NOT NULL,
+        active INTEGER NOT NULL DEFAULT 1,
+        released_at TEXT,
         created_at TEXT NOT NULL,
         updated_at TEXT NOT NULL
       );
       CREATE INDEX IF NOT EXISTS idx_session_aliases_canonical
         ON session_aliases(canonical_session_id, updated_at);
     `);
+    const aliasColumns = new Set(tableColumns(db, 'session_aliases'));
+    if (!aliasColumns.has('active')) {
+      db.exec('ALTER TABLE session_aliases ADD COLUMN active INTEGER NOT NULL DEFAULT 1');
+    }
+    if (!aliasColumns.has('released_at')) {
+      db.exec('ALTER TABLE session_aliases ADD COLUMN released_at TEXT');
+    }
+    this.records = new Map();
     for (const row of db.prepare('SELECT * FROM session_aliases').all()) {
-      this.aliases.set(row.alias_session_id, row);
+      this.records.set(row.alias_session_id, row);
+      if (Number(row.active) !== 0) this.aliases.set(row.alias_session_id, row);
     }
     this._migrate = db.transaction((aliasId, canonicalId) => this._migrateTransaction(aliasId, canonicalId));
   }
@@ -215,6 +226,7 @@ class SessionAliasReconciler {
       ['session_meta', 'session_id', latestRow],
       ['session_latest_visible_message', 'session_id', (left, right) => latestRow(left, right, ['message_at', 'updated_at'])],
       ['goal_lifecycle_state', 'session_id', (left, right) => latestRow(left, right, ['generation', 'transition_seq', 'updated_at'])],
+      ['goal_lifecycle_tombstone', 'session_id', (left, right) => latestRow(left, right, ['epoch', 'sequence', 'updated_at'])],
       ['session_turn_lifecycle', 'session_id', (left, right) => latestRow(left, right, ['updated_at'])],
     ];
     for (const [table, key, choose] of primaryTables) {
@@ -235,12 +247,15 @@ class SessionAliasReconciler {
       || event?.generation
       || event?.observed_at,
     );
-    const existing = this.aliases.get(aliasId);
-    if (existing && existing.canonical_session_id !== canonicalId
-        && clock <= Number(existing.generation_clock || 0)) {
+    const existing = this.records.get(aliasId);
+    if (existing && (
+      Number(existing.active) === 0
+      || existing.canonical_session_id !== canonicalId
+    ) && clock <= Number(existing.generation_clock || 0)) {
       return { accepted: false, reason: 'stale_alias_generation', ...existing };
     }
     const receiptHash = crypto.createHash('sha256').update(JSON.stringify({
+      active: true,
       alias_session_id: aliasId,
       canonical_session_id: canonicalId,
       canonical_conversation_id: safeText(event.canonical_conversation_id),
@@ -249,7 +264,7 @@ class SessionAliasReconciler {
       suppression_reason: safeText(event.suppression_reason, 160),
       generation_clock: clock,
     })).digest('hex');
-    if (existing?.receipt_hash === receiptHash) {
+    if (Number(existing?.active) !== 0 && existing?.receipt_hash === receiptHash) {
       return { accepted: true, reason: 'idempotent_replay', alias: existing, counts: {} };
     }
     const counts = this._migrate(aliasId, canonicalId);
@@ -263,14 +278,17 @@ class SessionAliasReconciler {
       suppression_reason: safeText(event.suppression_reason, 160) || 'canonical_alias_reconciled',
       generation_clock: Math.max(clock, Number(existing?.generation_clock || 0)),
       receipt_hash: receiptHash,
+      active: 1,
+      released_at: null,
       created_at: existing?.created_at || now,
       updated_at: now,
     };
     this.db.prepare(`
       INSERT INTO session_aliases
         (alias_session_id, canonical_session_id, canonical_conversation_id, canonical_native_id,
-         current_surface, suppression_reason, generation_clock, receipt_hash, created_at, updated_at)
-      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+         current_surface, suppression_reason, generation_clock, receipt_hash, active, released_at,
+         created_at, updated_at)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
       ON CONFLICT(alias_session_id) DO UPDATE SET
         canonical_session_id = excluded.canonical_session_id,
         canonical_conversation_id = excluded.canonical_conversation_id,
@@ -279,14 +297,132 @@ class SessionAliasReconciler {
         suppression_reason = excluded.suppression_reason,
         generation_clock = excluded.generation_clock,
         receipt_hash = excluded.receipt_hash,
+        active = excluded.active,
+        released_at = excluded.released_at,
         updated_at = excluded.updated_at
     `).run(...[
       row.alias_session_id, row.canonical_session_id, row.canonical_conversation_id, row.canonical_native_id,
       row.current_surface, row.suppression_reason, row.generation_clock, row.receipt_hash,
-      row.created_at, row.updated_at,
+      row.active, row.released_at, row.created_at, row.updated_at,
     ]);
+    this.records.set(aliasId, row);
     this.aliases.set(aliasId, row);
     return { accepted: true, reason: 'reconciled', alias: row, counts };
+  }
+
+  release(event) {
+    const aliasId = safeText(event?.alias_session_id);
+    const priorCanonicalId = safeText(event?.prior_canonical_session_id || event?.canonical_session_id);
+    const ownerEvidence = event?.owner_evidence && typeof event.owner_evidence === 'object'
+      ? event.owner_evidence
+      : {};
+    const currentSurface = safeText(event?.current_surface, 80);
+    if (!SESSION_ID_RE.test(aliasId || '') || !SESSION_ID_RE.test(priorCanonicalId || '')
+        || aliasId === priorCanonicalId) {
+      return {
+        accepted: false,
+        reason: 'invalid_alias_release_identity',
+        alias_session_id: aliasId,
+        canonical_session_id: priorCanonicalId,
+      };
+    }
+    if (ownerEvidence.verified !== true || currentSurface !== 'codex_cli') {
+      return {
+        accepted: false,
+        reason: 'verified_cli_owner_required',
+        alias_session_id: aliasId,
+        canonical_session_id: priorCanonicalId,
+      };
+    }
+    const clock = generationClock(
+      ownerEvidence.observed_at
+      || ownerEvidence.generation
+      || event?.generation
+      || event?.observed_at,
+    );
+    if (clock <= 0) {
+      return {
+        accepted: false,
+        reason: 'alias_release_generation_required',
+        alias_session_id: aliasId,
+        canonical_session_id: priorCanonicalId,
+      };
+    }
+    const existing = this.records.get(aliasId);
+    if (existing && existing.canonical_session_id !== priorCanonicalId) {
+      return {
+        accepted: false,
+        reason: 'alias_release_canonical_mismatch',
+        alias_session_id: aliasId,
+        canonical_session_id: priorCanonicalId,
+      };
+    }
+    const receiptHash = crypto.createHash('sha256').update(JSON.stringify({
+      active: false,
+      alias_session_id: aliasId,
+      canonical_session_id: priorCanonicalId,
+      canonical_conversation_id: safeText(event.canonical_conversation_id),
+      canonical_native_id: safeText(event.canonical_native_id),
+      current_surface: currentSurface,
+      suppression_reason: safeText(event.release_reason || event.suppression_reason, 160),
+      generation_clock: clock,
+    })).digest('hex');
+    if (Number(existing?.active) === 0 && existing?.receipt_hash === receiptHash) {
+      return { accepted: true, reason: 'idempotent_release_replay', alias: existing };
+    }
+    if (existing && clock <= Number(existing.generation_clock || 0)) {
+      return {
+        accepted: false,
+        reason: 'stale_alias_release',
+        alias_session_id: aliasId,
+        canonical_session_id: priorCanonicalId,
+      };
+    }
+    const now = new Date().toISOString();
+    const row = {
+      alias_session_id: aliasId,
+      canonical_session_id: priorCanonicalId,
+      canonical_conversation_id: safeText(event.canonical_conversation_id)
+        || existing?.canonical_conversation_id
+        || null,
+      canonical_native_id: safeText(event.canonical_native_id)
+        || existing?.canonical_native_id
+        || null,
+      current_surface: currentSurface,
+      suppression_reason: safeText(event.release_reason || event.suppression_reason, 160)
+        || 'verified_cli_owner_restored',
+      generation_clock: clock,
+      receipt_hash: receiptHash,
+      active: 0,
+      released_at: now,
+      created_at: existing?.created_at || now,
+      updated_at: now,
+    };
+    this.db.prepare(`
+      INSERT INTO session_aliases
+        (alias_session_id, canonical_session_id, canonical_conversation_id, canonical_native_id,
+         current_surface, suppression_reason, generation_clock, receipt_hash, active, released_at,
+         created_at, updated_at)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      ON CONFLICT(alias_session_id) DO UPDATE SET
+        canonical_session_id = excluded.canonical_session_id,
+        canonical_conversation_id = excluded.canonical_conversation_id,
+        canonical_native_id = excluded.canonical_native_id,
+        current_surface = excluded.current_surface,
+        suppression_reason = excluded.suppression_reason,
+        generation_clock = excluded.generation_clock,
+        receipt_hash = excluded.receipt_hash,
+        active = excluded.active,
+        released_at = excluded.released_at,
+        updated_at = excluded.updated_at
+    `).run(...[
+      row.alias_session_id, row.canonical_session_id, row.canonical_conversation_id, row.canonical_native_id,
+      row.current_surface, row.suppression_reason, row.generation_clock, row.receipt_hash,
+      row.active, row.released_at, row.created_at, row.updated_at,
+    ]);
+    this.records.set(aliasId, row);
+    this.aliases.delete(aliasId);
+    return { accepted: true, reason: 'released', alias: row };
   }
 }
 

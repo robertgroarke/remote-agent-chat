@@ -87,6 +87,7 @@ const {
 } = require('../shared/conversation-identity');
 const { LatestSessionOperationQueue } = require('./latest-session-operation-queue');
 const { normalizeNavigationEpoch } = require('../relay-server/navigation-epoch');
+const { reduceProviderConnection } = require('../shared/provider-connection-lifecycle');
 const {
   applyWriteCapabilityGate,
   isWriteCommand,
@@ -123,8 +124,32 @@ const NAVIGATION_SCOPED_RELAY_TYPES = new Set([
   'session_list',
   'proxy_session_snapshot',
 ]);
+const CODEX_DESKTOP_QUESTION_TOMBSTONE_TTL_MS = 30 * 24 * 60 * 60 * 1000;
+const CODEX_DESKTOP_QUESTION_TOMBSTONE_MAX = 128;
 
 function sleep(ms) { return new Promise(r => setTimeout(r, ms)); }
+
+function codexDesktopQuestionIdentity(sessionId, observed) {
+  const nativeThreadId = String(observed?.native_thread_id || '').trim();
+  const nativeTurnId = String(observed?.native_turn_id || '').trim();
+  const nativeSignature = String(observed?.native_signature || '');
+  if (!sessionId || !nativeThreadId || !nativeTurnId || !nativeSignature) return null;
+  const signatureDigest = crypto.createHash('sha256').update(nativeSignature).digest('hex');
+  const identity = `${sessionId}\0${nativeThreadId}\0${nativeTurnId}\0${signatureDigest}`;
+  const promptDigest = crypto.createHash('sha256')
+    .update(`rac-codex-desktop-question-v2\0prompt\0${identity}`)
+    .digest('hex');
+  const generation = crypto.createHash('sha256')
+    .update(`rac-codex-desktop-question-v2\0generation\0${identity}`)
+    .digest('hex');
+  return {
+    nativeThreadId,
+    nativeTurnId,
+    signatureDigest,
+    promptId: `codex-desktop-question-${promptDigest.slice(0, 32)}`,
+    generation,
+  };
+}
 
 function detectCodexDesktopInstalledVersion({
   override = process.env.CODEX_DESKTOP_SURFACE_VERSION,
@@ -182,6 +207,29 @@ function detectVsCodeCodexInstalledVersion({
     return 0;
   });
   return versions.at(-1) || 'unknown';
+}
+
+function resolveInitialCodexChatSelection(chatList) {
+  const activeChat = Array.isArray(chatList)
+    ? chatList.find(chat => chat && chat.active)
+    : null;
+  return {
+    activeChat,
+    activeChatKey: activeChat
+      ? `${activeChat.id || ''}:${activeChat.title || ''}`
+      : '',
+  };
+}
+
+function resolveStoredCodexConversationId({
+  initialActiveChatKey = '',
+  storedActiveChatKey = '',
+  storedNativeConversationId = '',
+} = {}) {
+  if (initialActiveChatKey && storedActiveChatKey && initialActiveChatKey !== storedActiveChatKey) {
+    return '';
+  }
+  return codexDesktopCliSessionId(storedNativeConversationId || '');
 }
 
 function boundOldestMap(map, maxEntries) {
@@ -651,14 +699,72 @@ function cursorNativeActivity(agent, previous = null, options = {}) {
   return { kind: 'idle', label: '', updated_at: transitionAt('idle') };
 }
 
-function applyCodexDomActivityChannels(activity, thinkingState, previousActivity = null) {
+function applyCodexDomActivityChannels(activity, thinkingState, previousActivity = null, options = {}) {
   if (!activity || typeof activity !== 'object') return activity;
   const state = thinkingState && typeof thinkingState === 'object' ? thinkingState : {};
+  const holder = options.connectionHolder && typeof options.connectionHolder === 'object'
+    ? options.connectionHolder
+    : null;
+  const priorConnection = holder?._nativeConnectionLifecycle || previousActivity?.connection || null;
+  const observedConnection = state.native_connection && typeof state.native_connection === 'object'
+    ? state.native_connection
+    : null;
+  const telemetry = typeof options.onConnectionTelemetry === 'function'
+    ? options.onConnectionTelemetry
+    : () => {};
+  if (state.native_connection_diagnostic?.code) {
+    telemetry({
+      event: state.native_connection_diagnostic.code,
+      provenance: state.native_connection_diagnostic.provenance || null,
+    });
+  }
+  if (observedConnection) {
+    const sameOwner = priorConnection
+      && priorConnection.thread_id === (
+        observedConnection.thread_id || observedConnection.native_thread_id || options.thread_id
+      )
+      && priorConnection.turn_id === (
+        observedConnection.turn_id || observedConnection.native_turn_id || options.turn_id
+      )
+      && priorConnection.source_id === (
+        observedConnection.source_id || observedConnection.native_source_id
+      );
+    const nextGenerationSeq = Number(observedConnection.generation_seq) || (
+      sameOwner && priorConnection.state === 'reconnecting'
+        ? Number(priorConnection.generation_seq) || 1
+        : Math.max(0, Number(priorConnection?.generation_seq) || 0) + 1
+    );
+    const reduced = reduceProviderConnection(priorConnection, observedConnection, {
+      session_id: options.session_id,
+      thread_id: observedConnection.thread_id
+        || observedConnection.native_thread_id
+        || options.thread_id,
+      turn_id: observedConnection.turn_id
+        || observedConnection.native_turn_id
+        || options.turn_id,
+      generation_seq: nextGenerationSeq,
+      producer_timestamp: observedConnection.producer_timestamp
+        || observedConnection.observed_at
+        || activity.updated_at,
+    });
+    if (reduced.connection && holder) holder._nativeConnectionLifecycle = reduced.connection;
+    if (reduced.visible) activity.connection = reduced.visible;
+    telemetry({
+      event: reduced.code,
+      state: reduced.visible?.state || reduced.connection?.state || null,
+      attempt: reduced.visible?.attempt || null,
+      attempt_limit: reduced.visible?.attempt_limit || null,
+      generation_seq: reduced.connection?.generation_seq || 0,
+    });
+  }
   const summary = state.activitySummary && typeof state.activitySummary === 'object'
     ? state.activitySummary
     : null;
   const summaryText = String(summary?.text || '').trim();
-  if (summaryText) {
+  const summaryIsConnection = /^Reconnecting\b/i.test(summaryText);
+  if (summaryIsConnection) {
+    telemetry({ event: 'connection_thinking_contamination_suppressed' });
+  } else if (summaryText) {
     const previousThinking = previousActivity?.thinking;
     const sameNativeSource = previousThinking?.native_source_id
       && previousThinking.native_source_id === summary.native_source_id;
@@ -689,7 +795,9 @@ function applyCodexDomActivityChannels(activity, thinkingState, previousActivity
   if (state.current && typeof state.current === 'object') {
     activity.current = { ...state.current };
   }
-  if (state.thinkingContent) activity.thinkingContent = state.thinkingContent;
+  if (state.thinkingContent && !/^Reconnecting\b/i.test(String(state.thinkingContent).trim())) {
+    activity.thinkingContent = state.thinkingContent;
+  }
   return activity;
 }
 
@@ -970,12 +1078,16 @@ const AUTOMATIC_HISTORY_SNAPSHOT_MAX_BYTES = Math.min(
 const CODEX_CLI_HISTORY_CHUNK_BYTES = envMbBytes('CODEX_CLI_HISTORY_CHUNK_MB', 1, 1, 16);
 const CODEX_CLI_HISTORY_TAIL_MIN_INTERVAL_MS = 1_500;
 const CODEX_CLI_HISTORY_OLDER_MIN_INTERVAL_MS = 5_000;
-const CODEX_CLI_HISTORY_REPEAT_CURSOR_MS = 60_000;
 const FILE_TRANSCRIPT_ASYNC_APPEND_THRESHOLD = 20;
 const FILE_TRANSCRIPT_APPEND_BATCH_ROWS = 8;
 const FILE_TRANSCRIPT_APPEND_BATCH_MS = 8;
 const FILE_TRANSCRIPT_RECOVERY_BLOCK_MS = 60_000;
 const FILE_TRANSCRIPT_RECOVERY_ROW_OVERHEAD_BYTES = 256;
+const CODEX_CLI_CANONICAL_TRANSCRIPT_SCHEMA = 'codex-cli-canonical-v2';
+const CODEX_CLI_STARTUP_MIGRATION_MAX_BYTES = Math.min(
+  RELAY_MESSAGE_MAX_BYTES,
+  envMbBytes('RAC_CODEX_CLI_STARTUP_MIGRATION_MAX_MB', 8, 1, 64),
+);
 const POLL_BUDGET_SAMPLE_MAX = 1800;
 const POLL_BUDGET_REPORT_EVERY_TICKS = 30;
 const CODEX_CLI_OWNER_MISSING_GRACE_MS = Math.min(120_000, Math.max(
@@ -1664,7 +1776,7 @@ class ProxyEngine extends EventEmitter {
       cline: 'native_stop',
     };
     const interruptMethod = interruptMethods[agentType] || null;
-    return {
+    const capabilities = {
       interrupt:              !!interruptMethod,
       interrupt_method:       interruptMethod,
       interrupt_gate:         interruptMethod ? null : 'no_verified_session_scoped_stop',
@@ -1737,6 +1849,8 @@ class ProxyEngine extends EventEmitter {
       automation_view:        agentType === 'codex-desktop',
       file_browser:           !isAntigravityV2 && hasWorkspace, // v2 exposes only a worktree label until a real path is verified
     };
+    const capabilityGate = this._applyWriteCapabilityGate || applyWriteCapabilityGate;
+    return capabilityGate(capabilities, agentType);
   }
 
   _configLogSummary(config, capabilities = null) {
@@ -2654,6 +2768,23 @@ class ProxyEngine extends EventEmitter {
   }
 
   async _handleCodexDesktopQuestionState(sessionId, session, observed) {
+    const pruneDesktopQuestionTombstones = () => {
+      const now = Date.now();
+      const previous = Array.isArray(session.codex_desktop_question_tombstones)
+        ? session.codex_desktop_question_tombstones
+        : [];
+      const retained = previous.filter(tombstone => {
+        const terminalAt = Date.parse(tombstone?.terminal_at || '');
+        return tombstone?.prompt_id && tombstone?.generation
+          && Number.isFinite(terminalAt)
+          && now - terminalAt < CODEX_DESKTOP_QUESTION_TOMBSTONE_TTL_MS;
+      }).slice(-CODEX_DESKTOP_QUESTION_TOMBSTONE_MAX);
+      if (retained.length !== previous.length) {
+        session.codex_desktop_question_tombstones = retained;
+        sessionStore.updateSession(sessionId, { codex_desktop_question_tombstones: retained });
+      }
+      return retained;
+    };
     const existing = this.activeQuestionPromptAdapters.get(sessionId);
     const isDesktopEntry = existing?.adapter_surface === 'codex-desktop';
     if (observed?.error) {
@@ -2693,11 +2824,15 @@ class ProxyEngine extends EventEmitter {
       return;
     }
     session._codexDesktopQuestionRemotePollUntil = 0;
-    const signatureDigest = crypto.createHash('sha256')
-      .update(String(observed.native_signature || ''))
-      .digest('hex');
+    const identity = codexDesktopQuestionIdentity(sessionId, observed);
+    if (!identity) {
+      this._log('warn', `[${sessionId}] [question] Codex Desktop fail-closed: native question turn identity is unavailable`);
+      return;
+    }
+    const { signatureDigest } = identity;
     if (isDesktopEntry
         && existing.native_thread_id === observed.native_thread_id
+        && existing.native_turn_id === observed.native_turn_id
         && existing.native_signature_digest === signatureDigest) {
       return;
     }
@@ -2706,6 +2841,23 @@ class ProxyEngine extends EventEmitter {
       this._clearQuestionPromptAdapter(sessionId, 'expired', { error_code: 'native_question_replaced' });
     } else if (existing) {
       this._log('warn', `[${sessionId}] [question] Refusing to replace a non-Desktop owned question adapter`);
+      return;
+    }
+    if (pruneDesktopQuestionTombstones().some(tombstone => (
+      tombstone.prompt_id === identity.promptId && tombstone.generation === identity.generation
+    ))) {
+      if (session.activity?.kind === 'waiting_for_user') {
+        const activity = {
+          kind: session.thinking ? 'thinking' : 'idle',
+          label: session.thinking ? (session.thinkingLabel || 'Generating') : '',
+          updated_at: new Date().toISOString(),
+          ...(session.activity?.goal ? { goal: session.activity.goal } : {}),
+        };
+        session.activity = activity;
+        sessionStore.updateSession(sessionId, { activity });
+        this._sendToRelay(proto.proxyStatus(sessionId, session.status || 'healthy', activity));
+      }
+      this._log('debug', `[${sessionId}] [question] Suppressed terminal Desktop prompt replay ${identity.promptId}`);
       return;
     }
 
@@ -2719,11 +2871,9 @@ class ProxyEngine extends EventEmitter {
     let prompt;
     try {
       prompt = canonicalQuestionPrompt({
-        prompt_id: crypto.randomUUID(),
+        prompt_id: identity.promptId,
         session_id: sessionId,
-        generation: crypto.createHash('sha256')
-          .update(`${this.PROXY_ID}\0${sessionId}\0${observed.native_thread_id}\0${signatureDigest}\0${crypto.randomUUID()}`)
-          .digest('hex'),
+        generation: identity.generation,
         kind: 'request_user_input',
         source: { surface: 'codex-desktop', version: this.CODEX_DESKTOP_SURFACE_VERSION },
         title: observed.title,
@@ -2743,6 +2893,7 @@ class ProxyEngine extends EventEmitter {
     const adapterIdentity = {
       adapter_surface: 'codex-desktop',
       native_thread_id: observed.native_thread_id,
+      native_turn_id: observed.native_turn_id,
       native_signature: observed.native_signature,
       native_signature_digest: signatureDigest,
       skip_label: observed.skip_label || 'Skip',
@@ -3451,6 +3602,111 @@ class ProxyEngine extends EventEmitter {
     try { return JSON.parse(JSON.stringify(Array.isArray(messages) ? messages : [])); } catch { return []; }
   }
 
+  _codexDesktopStableMessageId(message) {
+    const sourceId = String(message?.source_message_id || '').trim();
+    if (sourceId) return `source\0${sourceId}`;
+    const nativeId = String(message?.native_source_id || '').trim();
+    if (nativeId) return `native\0${nativeId}`;
+    return '';
+  }
+
+  _codexDesktopCanonicalMessageSignature(message) {
+    return JSON.stringify([
+      this._codexDesktopStableMessageId(message),
+      message?.native_turn_id || null,
+      message?.role || null,
+      message?.content || null,
+      message?.content_blocks || null,
+    ]);
+  }
+
+  _retainCodexDesktopCanonicalIdentity(canonical, observed) {
+    if (!canonical || !observed) return observed;
+    const canonicalId = this._codexDesktopStableMessageId(canonical);
+    const observedId = this._codexDesktopStableMessageId(observed);
+    if (!canonicalId || canonicalId === observedId) return observed;
+    const retained = { ...observed };
+    for (const key of [
+      'source_message_id',
+      'native_source_id',
+      'native_source_kind',
+      'native_turn_id',
+      'lifecycle_generation',
+      'native_source_cursor',
+      'surface_provenance',
+    ]) {
+      if (canonical[key] != null) retained[key] = canonical[key];
+    }
+    return retained;
+  }
+
+  _reconcileCodexDesktopCanonicalTranscript(previousMessages, observedMessages, { authoritative = false } = {}) {
+    const previous = Array.isArray(previousMessages) ? previousMessages : [];
+    const observed = Array.isArray(observedMessages) ? observedMessages : [];
+    const previousById = new Map();
+    previous.forEach(message => {
+      const id = this._codexDesktopStableMessageId(message);
+      if (id && !previousById.has(id)) previousById.set(id, message);
+    });
+
+    if (authoritative) {
+      const seen = new Set();
+      const canonical = [];
+      for (const message of observed) {
+        const id = this._codexDesktopStableMessageId(message);
+        if (id && seen.has(id)) continue;
+        if (id) seen.add(id);
+        const existing = id ? previousById.get(id) : null;
+        canonical.push(existing
+          && this._codexDesktopCanonicalMessageSignature(existing)
+            === this._codexDesktopCanonicalMessageSignature(message)
+          ? existing
+          : message);
+      }
+      const changed = canonical.length !== previous.length
+        || canonical.some((message, index) => message !== previous[index]);
+      return { messages: changed ? canonical : previous, changed };
+    }
+
+    const canonical = previous.slice();
+    const canonicalById = new Map();
+    canonical.forEach((message, index) => {
+      const id = this._codexDesktopStableMessageId(message);
+      if (id && !canonicalById.has(id)) canonicalById.set(id, index);
+    });
+    let changed = false;
+    let searchStart = 0;
+    for (const message of observed) {
+      const id = this._codexDesktopStableMessageId(message);
+      let index = id ? canonicalById.get(id) : undefined;
+      const matchedByStableId = index != null;
+      if (!matchedByStableId) index = this._findMatchingMessageIndex(canonical, message, searchStart);
+      if (index >= 0) {
+        const current = canonical[index];
+        let replacement = message;
+        if (current?.role === 'assistant' && message?.role === 'assistant') {
+          replacement = this._mergeCodexExpandedToolContent(current, message);
+        }
+        if (!matchedByStableId) {
+          replacement = this._retainCodexDesktopCanonicalIdentity(current, replacement);
+        }
+        if (this._codexDesktopCanonicalMessageSignature(current)
+            !== this._codexDesktopCanonicalMessageSignature(replacement)) {
+          canonical[index] = replacement;
+          changed = true;
+        }
+        if (id) canonicalById.set(id, index);
+        searchStart = Math.max(searchStart, index + 1);
+        continue;
+      }
+      canonical.push(message);
+      if (id) canonicalById.set(id, canonical.length - 1);
+      searchStart = canonical.length;
+      changed = true;
+    }
+    return { messages: changed ? canonical : previous, changed };
+  }
+
   _cursorObservationTimestampSeconds(message) {
     for (const value of [message?.created_at, message?.timestamp, message?.ts]) {
       if (typeof value === 'number' || (typeof value === 'string' && /^\d+(?:\.\d+)?$/.test(value.trim()))) {
@@ -3721,6 +3977,108 @@ class ProxyEngine extends EventEmitter {
     return { allowed: false, reason: 'oversized', retryAfterMs: FILE_TRANSCRIPT_RECOVERY_BLOCK_MS, maxBytes, sizeInfo };
   }
 
+  _migrateCodexCliCanonicalTranscript(sessionId, session, state, reason = 'baseline') {
+    if (!session || state?.agentType !== 'codex_cli' || session._codexCliCanonicalMigrationAttempted) return null;
+    const initialMessages = Array.isArray(state.messages) ? state.messages : [];
+    const initialIds = initialMessages.map(message => String(message?.source_message_id || '').trim());
+    const hasCanonicalIdentitySequence = initialMessages.length > 0
+      && initialIds.every(Boolean)
+      && new Set(initialIds).size === initialIds.length;
+    if (!hasCanonicalIdentitySequence) return null;
+    if (!(this.relayReady && this.relayWs && this.relayWs.readyState === WebSocket.OPEN)) {
+      session._codexCliCanonicalMigrationPending = true;
+      return { mode: 'canonical_schema_migration_pending', sent: 0 };
+    }
+    session._codexCliCanonicalMigrationPending = false;
+    let migrationState = state;
+    const boundedCursor = state.sourceCursor || null;
+    const boundedWindow = boundedCursor?.partial === true
+      || Number(boundedCursor?.window_start_offset || 0) > 0;
+    if (boundedWindow && state.filePath) {
+      try {
+        const fullSummary = codexCli.readSessionSummary(state.filePath, {
+          maxHydrateBytes: CODEX_CLI_STARTUP_MIGRATION_MAX_BYTES,
+          preferTailBytes: 0,
+        });
+        if (!fullSummary?.messagesHydrated || fullSummary.messagesPartial
+          || !Array.isArray(fullSummary.messages) || fullSummary.messages.length === 0) {
+          session._codexCliCanonicalMigrationAttempted = true;
+          this._log('warn', `[${sessionId}] Canonical transcript migration retained bounded history because the full native archive exceeds the startup budget or is unavailable`);
+          return { mode: 'canonical_schema_migration_full_history_unavailable', sent: 0 };
+        }
+        migrationState = this._fileTranscriptState(
+          'codex_cli',
+          state.filePath,
+          fullSummary.messages,
+          fullSummary.sourceCursor || null,
+          CODEX_CLI_CANONICAL_TRANSCRIPT_SCHEMA,
+        );
+      } catch (error) {
+        session._codexCliCanonicalMigrationAttempted = true;
+        this._log('warn', `[${sessionId}] Canonical transcript migration full-history read failed: ${error.message}`);
+        return { mode: 'canonical_schema_migration_full_history_failed', sent: 0 };
+      }
+    }
+    const migrationIds = migrationState.messages.map(message => String(message?.source_message_id || '').trim());
+    if (migrationIds.some(id => !id) || new Set(migrationIds).size !== migrationIds.length) {
+      session._codexCliCanonicalMigrationAttempted = true;
+      return { mode: 'canonical_schema_migration_identity_invalid', sent: 0 };
+    }
+    const sourceCursor = migrationState.sourceCursor ? { ...migrationState.sourceCursor } : null;
+    const sizeInfo = this._fileTranscriptApproximateSizeInfo(
+      migrationState.messages,
+      CODEX_CLI_STARTUP_MIGRATION_MAX_BYTES,
+    );
+    if (!sizeInfo.fits) {
+      session._codexCliCanonicalMigrationAttempted = true;
+      this._log('warn', `[${sessionId}] Canonical transcript migration skipped ${migrationState.messages.length} rows above the ${Math.round(CODEX_CLI_STARTUP_MIGRATION_MAX_BYTES / 1024 / 1024)} MiB startup budget`);
+      return { mode: 'canonical_schema_migration_oversized', sent: 0 };
+    }
+    const recoveredMessages = migrationState.messages.map((message, index) => (
+      this._fileTranscriptMessage(migrationState, message, index, sourceCursor)
+    ));
+    const resyncId = crypto.randomUUID();
+    const accepted = this._sendHistorySnapshot(
+      sessionId,
+      recoveredMessages,
+      'codex_cli canonical transcript schema migration',
+      {
+        resyncId,
+        resyncReason: `codex_cli ${CODEX_CLI_CANONICAL_TRANSCRIPT_SCHEMA} authoritative identity migration (${reason})`,
+        replaceAll: true,
+        source: 'codex_cli_jsonl',
+        sourceCursor,
+        sourceBytes: Math.max(0, Number(sourceCursor?.end_offset ?? sourceCursor?.file_size) || 0),
+        rateLimitMs: 5000,
+        includeLegacyHistory: false,
+        directTransport: true,
+      },
+    );
+    if (!accepted) return { mode: 'canonical_schema_migration_deferred', sent: 0 };
+    session._codexCliCanonicalMigrationAttempted = true;
+    session._lastFileTranscriptResyncAt = Date.now();
+    this._log('warn', `[${sessionId}] Sent bounded codex_cli canonical transcript schema migration ${resyncId} (${recoveredMessages.length} rows, ${CODEX_CLI_CANONICAL_TRANSCRIPT_SCHEMA})`);
+    return {
+      mode: 'canonical_schema_migration',
+      sent: recoveredMessages.length,
+      resync_id: resyncId,
+      schema: CODEX_CLI_CANONICAL_TRANSCRIPT_SCHEMA,
+    };
+  }
+
+  _flushCodexCliCanonicalMigrations() {
+    if (!(this.relayReady && this.relayWs && this.relayWs.readyState === WebSocket.OPEN)) return;
+    for (const [sessionId, session] of this.sessions.entries()) {
+      if (!session?._codexCliCanonicalMigrationPending || !session._fileTranscriptState) continue;
+      this._migrateCodexCliCanonicalTranscript(
+        sessionId,
+        session,
+        session._fileTranscriptState,
+        'relay handshake',
+      );
+    }
+  }
+
   _fileTranscriptMessage(state, message, index, sourceCursor) {
     const sourceMessageId = state.messageIds?.[index]
       || this._fileTranscriptMessageIds(state.agentType, state.generation, state.messages || [])[index]
@@ -3826,6 +4184,13 @@ class ProxyEngine extends EventEmitter {
       seeded.observationKey = this._fileTranscriptObservationKey(filePath, sourceCursor, currentMessages);
       session._fileTranscriptState = seeded;
       session._lastFileTranscriptObservationKey = seeded.observationKey;
+      const canonicalMigration = this._migrateCodexCliCanonicalTranscript(
+        sessionId,
+        session,
+        seeded,
+        reason,
+      );
+      if (canonicalMigration) return canonicalMigration;
       if (!allowInitialAppend || currentMessages.length === 0 || currentMessages.length > 20) {
         return { mode: 'baseline', sent: 0 };
       }
@@ -4322,6 +4687,15 @@ class ProxyEngine extends EventEmitter {
     const previousMatchesActive = codexDesktopThreadKeysMatch(previousThreadKey, activeThreadKey);
     if (previousThreadKey && !previousMatchesActive) {
       this._log('info', `[${sessionId}] Codex Desktop active thread changed; resetting transcript accumulator`);
+      // A RAC session ID is stable across native Desktop thread switches. Clear
+      // the old relay transcript before the next native snapshot so a delayed
+      // bulk frame cannot resurrect the previous conversation under that ID.
+      this._sendHistorySnapshot(
+        sessionId,
+        [],
+        'codex desktop native thread change',
+        { directTransport: true, replaceAll: true },
+      );
       this._resetTranscriptState(session, 'codex-desktop active thread change');
       sessionStore.updateSession(sessionId, {
         accumulated_messages: null,
@@ -4975,9 +5349,40 @@ class ProxyEngine extends EventEmitter {
     return entry.prompt;
   }
 
+  _recordCodexDesktopQuestionTombstone(sessionId, entry, lifecycle) {
+    if (entry?.adapter_surface !== 'codex-desktop' || !entry.prompt?.prompt_id || !entry.prompt?.generation) return false;
+    const session = this.sessions.get(sessionId);
+    if (!session) return false;
+    const now = Date.now();
+    const terminalAt = new Date(now).toISOString();
+    const prior = Array.isArray(session.codex_desktop_question_tombstones)
+      ? session.codex_desktop_question_tombstones
+      : [];
+    const retained = prior.filter(tombstone => {
+      const at = Date.parse(tombstone?.terminal_at || '');
+      if (!Number.isFinite(at) || now - at >= CODEX_DESKTOP_QUESTION_TOMBSTONE_TTL_MS) return false;
+      return !(tombstone.prompt_id === entry.prompt.prompt_id
+        && tombstone.generation === entry.prompt.generation);
+    });
+    retained.push({
+      prompt_id: entry.prompt.prompt_id,
+      generation: entry.prompt.generation,
+      lifecycle,
+      native_thread_id: entry.native_thread_id || null,
+      native_turn_id: entry.native_turn_id || null,
+      terminal_at: terminalAt,
+    });
+    session.codex_desktop_question_tombstones = retained.slice(-CODEX_DESKTOP_QUESTION_TOMBSTONE_MAX);
+    sessionStore.updateSession(sessionId, {
+      codex_desktop_question_tombstones: session.codex_desktop_question_tombstones,
+    });
+    return true;
+  }
+
   _clearQuestionPromptAdapter(sessionId, lifecycle, details = {}) {
     const entry = this.activeQuestionPromptAdapters.get(sessionId);
     if (!entry) return false;
+    this._recordCodexDesktopQuestionTombstone(sessionId, entry, lifecycle);
     this.activeQuestionPromptAdapters.delete(sessionId);
     const session = this.sessions.get(sessionId);
     if (session?._vscodeQuestionDeadlineTimer) {
@@ -4991,6 +5396,19 @@ class ProxyEngine extends EventEmitter {
       lifecycle,
       details,
     ));
+    if (session?.activity?.kind === 'waiting_for_user') {
+      const activity = {
+        kind: session.thinking || session.waitingForAssistant ? 'thinking' : 'idle',
+        label: session.thinking || session.waitingForAssistant
+          ? (session.thinkingLabel || 'Generating')
+          : '',
+        updated_at: new Date().toISOString(),
+        ...(session.activity?.goal ? { goal: session.activity.goal } : {}),
+      };
+      session.activity = activity;
+      sessionStore.updateSession(sessionId, { activity });
+      this._sendToRelay(proto.proxyStatus(sessionId, session.status || 'healthy', activity));
+    }
     return true;
   }
 
@@ -5035,7 +5453,7 @@ class ProxyEngine extends EventEmitter {
       const sessionId = msg.session_id || msg.session;
       const session = sessionId ? this.sessions.get(sessionId) : null;
       const gateResolver = this._validationGateForAgentType || validationGateForAgentType;
-      const gate = gateResolver(session?.agentType);
+      const gate = gateResolver(session?.agentType, undefined, type);
       if (session && gate.gated) {
         const error = {
           code: 'pending_revalidation',
@@ -5115,9 +5533,11 @@ class ProxyEngine extends EventEmitter {
       // on startup, so its initial-snapshot _sendToRelay calls hit before
       // we're allowed to send and would otherwise be lost).
       this._lastSessionSnapshotSig = null;
+      this._flushPendingPreReadyAliasEvents();
       this._sendSessionSnapshotNow('connection_ack');
       this._providerUsage.emit();
       this._flushPendingPreReadyHistory();
+      this._flushCodexCliCanonicalMigrations();
       // Send all known sessions from session-store for relay backfill
       this._sendSessionMetaBackfill();
       // Re-emit agent config for all active sessions
@@ -5778,6 +6198,11 @@ class ProxyEngine extends EventEmitter {
       return Promise.resolve(entry.answer(msg))
         .then(result => {
           if (result?.ok && result?.native_acknowledged === true) {
+            this._recordCodexDesktopQuestionTombstone(
+              sid,
+              entry,
+              result.lifecycle || (msg.action === 'cancel' ? 'cancelled' : 'answered'),
+            );
             this.activeQuestionPromptAdapters.delete(sid);
             this._sendToRelay({
               ...proto.agentControlResult(sid, msg.request_id, 'question_response', 'ok'),
@@ -5787,7 +6212,10 @@ class ProxyEngine extends EventEmitter {
             });
           } else {
             const nativeAttempted = result?.native_attempted !== false;
-            if (nativeAttempted) this.activeQuestionPromptAdapters.delete(sid);
+            if (nativeAttempted) {
+              this._recordCodexDesktopQuestionTombstone(sid, entry, 'failed');
+              this.activeQuestionPromptAdapters.delete(sid);
+            }
             else entry.claimed = false;
             this._sendToRelay({
               ...proto.agentControlResult(sid, msg.request_id, 'question_response', 'failed', {
@@ -5800,6 +6228,7 @@ class ProxyEngine extends EventEmitter {
           }
         })
         .catch(error => {
+          this._recordCodexDesktopQuestionTombstone(sid, entry, 'failed');
           this.activeQuestionPromptAdapters.delete(sid);
           const nativeAttempted = error.native_attempted !== false;
           this._sendToRelay({
@@ -7050,14 +7479,17 @@ class ProxyEngine extends EventEmitter {
               const observedAt = new Date().toISOString();
               const activity = applyCodexDomActivityChannels(isWorking
                 ? { kind: 'generating', label: thinkingState.label || 'Generating', updated_at: observedAt }
-                : { kind: 'idle', label: '', updated_at: observedAt }, thinkingState, sessionData.activity);
-              if (isWorking && !activity.current && /^Generating$/i.test(activity.label || '')) {
+                : { kind: 'idle', label: '', updated_at: observedAt }, thinkingState, sessionData.activity,
+              this._codexConnectionActivityOptions(sid, sessionData, thinkingState));
+              if (isWorking && !thinkingState.native_connection
+                  && !activity.current && /^Generating$/i.test(activity.label || '')) {
                 activity.current = { kind: 'answer', label: 'Answering', partial: '' };
               }
               sessionData.thinkingContent = thinkingState.thinkingContent || '';
               sessionData._liveChannelsSig = JSON.stringify({
                 thinking: activity.thinking || null,
                 current: activity.current || null,
+                connection: activity.connection || null,
               });
               sessionData.activity = activity;
               sessionStore.updateSession(sid, { accumulated_messages: freshMessages, activity });
@@ -8900,8 +9332,10 @@ class ProxyEngine extends EventEmitter {
       this.reconnectAttempt = 0;
       this.relayReady = true;
       this._lastSessionSnapshotSig = null;
+      this._flushPendingPreReadyAliasEvents();
       this._sendSessionSnapshotNow('connection_ack');
       this._flushPendingPreReadyHistory();
+      this._flushCodexCliCanonicalMigrations();
     }
   }
 
@@ -8936,13 +9370,6 @@ class ProxyEngine extends EventEmitter {
     return null;
   }
 
-  _codexCliHistoryCursorSig(msg) {
-    if (!msg || msg.mode !== 'older') return '';
-    const beforeOffset = msg.before_offset ?? msg.beforeOffset ?? msg.cursor?.next_before_offset ?? '';
-    const beforeId = msg.before_id ?? msg.beforeId ?? msg.cursor?.next_before_id ?? '';
-    return `${beforeOffset}\u0001${beforeId}`;
-  }
-
   _codexCliHistoryChunkThrottle(sessionId, msg) {
     const mode = msg.mode === 'older' ? 'older' : 'tail';
     if (mode === 'older' && !msg.user_initiated) {
@@ -8954,7 +9381,6 @@ class ProxyEngine extends EventEmitter {
     }
     const now = Date.now();
     const key = `${sessionId}:${mode}`;
-    const cursorSig = this._codexCliHistoryCursorSig(msg);
     const minInterval = mode === 'older'
       ? CODEX_CLI_HISTORY_OLDER_MIN_INTERVAL_MS
       : CODEX_CLI_HISTORY_TAIL_MIN_INTERVAL_MS;
@@ -8968,15 +9394,12 @@ class ProxyEngine extends EventEmitter {
           retryAfterMs: minInterval - elapsed,
         };
       }
-      if (mode === 'older' && cursorSig && previous.cursorSig === cursorSig && elapsed < CODEX_CLI_HISTORY_REPEAT_CURSOR_MS) {
-        return {
-          code: 'history_chunk_duplicate_cursor',
-          message: 'Duplicate older Codex CLI history cursor ignored.',
-          retryAfterMs: CODEX_CLI_HISTORY_REPEAT_CURSOR_MS - elapsed,
-        };
-      }
     }
-    this._codexCliHistoryChunkRequests.set(key, { at: now, cursorSig });
+    // The relay coalesces concurrent native-history flights and retains a
+    // bounded result cache. A completed cursor must not remain globally
+    // tombstoned here: another tab or reconnect is a distinct reader and may
+    // legitimately request the same immutable native window.
+    this._codexCliHistoryChunkRequests.set(key, { at: now });
     boundOldestMap(this._codexCliHistoryChunkRequests, RUNTIME_METADATA_MAP_MAX_ENTRIES);
     return null;
   }
@@ -9112,7 +9535,11 @@ class ProxyEngine extends EventEmitter {
       ? (msg.before_offset ?? msg.beforeOffset ?? msg.cursor?.next_before_offset ?? null)
       : null;
     try {
-      const chunk = codexCli.parseCodexJsonlChunk(filePath, {
+      const chunk = codexCli.readCanonicalHistoryChunk(filePath, {
+        beforeOffset,
+        limit: requestedLimit,
+        maxHydrateBytes: RELAY_MESSAGE_MAX_BYTES,
+      }) || codexCli.parseCodexJsonlChunk(filePath, {
         beforeOffset,
         chunkBytes,
         minimumMessages: requestedLimit,
@@ -9129,7 +9556,9 @@ class ProxyEngine extends EventEmitter {
         0,
         Number(chunk.messageStartOffsets?.[firstReturnedIndex]) || Number(chunk.startOffset) || 0,
       );
-      const nextBeforeOffset = firstReturnedOffset > 0 ? firstReturnedOffset : null;
+      const nextBeforeOffset = firstReturnedIndex > 0
+        ? (firstReturnedOffset > 0 ? firstReturnedOffset : null)
+        : (chunk.nextBeforeOffset ?? null);
       this._sendToRelay(proto.historyChunk(sessionId, {
         requestId,
         messages,
@@ -9143,7 +9572,7 @@ class ProxyEngine extends EventEmitter {
         complete: !nextBeforeOffset,
         source: 'codex_cli_jsonl',
       }));
-      this._log('info', `[${sessionId}] Sent Codex CLI history chunk (${messages.length}/${parsedMessages.length} msgs, scanned ${chunk.bytesRead || 0} bytes, ${firstReturnedOffset}-${chunk.endOffset}/${chunk.stat?.size || 0})`);
+      this._log('info', `[${sessionId}] Sent Codex CLI history chunk (${messages.length}/${parsedMessages.length} msgs, scanned ${chunk.bytesRead || 0} bytes, ${firstReturnedOffset}-${chunk.endOffset}/${chunk.stat?.size || 0}${chunk.canonical ? ', canonical full-history slice' : ', bounded fallback'})`);
     } catch (e) {
       fail('chunk_read_failed', e.message || 'Codex CLI archive chunk read failed');
     }
@@ -9329,7 +9758,11 @@ class ProxyEngine extends EventEmitter {
         }
       }
     }
-    if (type === 'session_alias_reconciled' && msg.alias_session_id && msg.canonical_session_id) {
+    if (
+      (type === 'session_alias_reconciled' || type === 'session_alias_released')
+      && msg.alias_session_id
+      && (msg.canonical_session_id || msg.prior_canonical_session_id)
+    ) {
       if (!this._pendingPreReadyAliasEvents) this._pendingPreReadyAliasEvents = new Map();
       this._pendingPreReadyAliasEvents.set(msg.alias_session_id, encoded);
       boundOldestMap(this._pendingPreReadyAliasEvents, 256);
@@ -9339,6 +9772,7 @@ class ProxyEngine extends EventEmitter {
 
   _flushPendingPreReadyHistory() {
     if (!(this.relayReady && this.relayWs && this.relayWs.readyState === WebSocket.OPEN)) return;
+    this._flushPendingPreReadyAliasEvents();
     const q = this._pendingPreReadyHistory;
     if (q && q.size > 0) {
       for (const [sid, encoded] of q.entries()) {
@@ -9369,19 +9803,23 @@ class ProxyEngine extends EventEmitter {
       }
       events.clear();
     }
+    this._flushPendingRelayBulk();
+  }
+
+  _flushPendingPreReadyAliasEvents() {
+    if (!(this.relayReady && this.relayWs && this.relayWs.readyState === WebSocket.OPEN)) return;
     const aliasEvents = this._pendingPreReadyAliasEvents;
     if (aliasEvents && aliasEvents.size > 0) {
       for (const [aliasId, encoded] of aliasEvents.entries()) {
         try {
           this.relayWs.send(encoded);
-          this._log('info', `[relay] Flushed deferred canonical alias ${aliasId}`);
+          this._log('info', `[relay] Flushed deferred canonical alias lifecycle ${aliasId}`);
         } catch (e) {
-          this._log('warn', `[relay] Failed to flush deferred canonical alias ${aliasId}: ${e.message}`);
+          this._log('warn', `[relay] Failed to flush deferred canonical alias lifecycle ${aliasId}: ${e.message}`);
         }
       }
       aliasEvents.clear();
     }
-    this._flushPendingRelayBulk();
   }
 
   _historySnapshotLimitBytes(reason = 'history') {
@@ -9389,6 +9827,7 @@ class ProxyEngine extends EventEmitter {
       return DEFERRED_HISTORY_FLUSH_MAX_BYTES;
     }
     const r = String(reason || '').toLowerCase();
+    if (r.includes('schema migration')) return RELAY_MESSAGE_MAX_BYTES;
     // User-directed navigation snapshots are allowed to be larger because they
     // are infrequent and make the selected native conversation appear.
     if (/\b(switch|new_thread|new conversation)\b/.test(r)) {
@@ -9454,6 +9893,14 @@ class ProxyEngine extends EventEmitter {
 
   _sendHistorySnapshot(sessionId, messages, reason = 'history', options = {}) {
     const fullMessages = Array.isArray(messages) ? messages : [];
+    const directTransport = options.directTransport === true;
+    const userDirected = /\b(switch|new_thread|new conversation)\b/i.test(String(reason || ''));
+    if (directTransport || userDirected || options.replaceAll === true || fullMessages.length === 0) {
+      this._pendingRelayBulk?.delete(`history_snapshot:${sessionId}`);
+      this._relayBulkDeferralLogAt?.delete(`history_snapshot:${sessionId}`);
+    }
+    const snapshotOptions = { ...options };
+    delete snapshotOptions.directTransport;
     const titleSession = this.sessions.get(sessionId);
     if (titleSession && this._promoteSessionChatTitle(sessionId, titleSession, fullMessages)) {
       this._broadcastSessionSnapshot('history title hydration');
@@ -9461,7 +9908,7 @@ class ProxyEngine extends EventEmitter {
     const buildSnapshot = (msgs, liveUpdate = null, includeLegacyHistory = true) => proto.historySnapshot(
       sessionId,
       msgs,
-      { ...(liveUpdate ? { liveUpdate } : {}), includeLegacyHistory, ...options },
+      { ...(liveUpdate ? { liveUpdate } : {}), includeLegacyHistory, ...snapshotOptions },
     );
 
     if (fullMessages.length === 0) {
@@ -9486,7 +9933,6 @@ class ProxyEngine extends EventEmitter {
       }
     }
     if (sizeInfo.fits) {
-      const userDirected = /\b(switch|new_thread|new conversation)\b/i.test(String(reason || ''));
       const agentType = this.sessions.get(sessionId)?.agentType;
       const priorityLiveUpdate = (
         agentType === 'cursor'
@@ -9502,7 +9948,7 @@ class ProxyEngine extends EventEmitter {
       }
       return this._sendToRelay(
         buildSnapshot(fullMessages, priorityLiveUpdate ? 'assistant_completion' : null, includeLegacyHistory),
-        userDirected ? {} : { bulkKey: `history_snapshot:${sessionId}` }
+        userDirected || directTransport ? {} : { bulkKey: `history_snapshot:${sessionId}` }
       );
     }
 
@@ -9693,6 +10139,29 @@ class ProxyEngine extends EventEmitter {
     return text.length >= 80;
   }
 
+  _codexDesktopArchiveUserIndex(archiveMessages, user) {
+    const archive = Array.isArray(archiveMessages) ? archiveMessages : [];
+    const exactIndex = this._findMatchingMessageIndex(archive, user);
+    if (exactIndex >= 0 || user?.role !== 'user') return exactIndex;
+
+    const visible = this._messageContentText(user).replace(/\s+/g, ' ').trim();
+    const visibleTs = Number(user?.ts);
+    if (visible.length < 80 || !Number.isFinite(visibleTs)) return -1;
+
+    // Codex Desktop strips the native <codex_delegation> envelope from the
+    // rendered user card. The immutable archive retains that envelope, so the
+    // visible text is a contiguous segment of the same timestamped native event.
+    // Keep this exception Desktop/archive scoped and timestamp-bound; generic
+    // suffix matching would be unsafe across repeated user turns.
+    return archive.findIndex(message => {
+      if (message?.role !== 'user') return false;
+      const nativeTs = Number(message?.ts);
+      if (!Number.isFinite(nativeTs) || Math.abs(nativeTs - visibleTs) > 1) return false;
+      const native = this._messageContentText(message).replace(/\s+/g, ' ').trim();
+      return native.length > visible.length && native.includes(visible);
+    });
+  }
+
   _codexDesktopArchiveAnchor(archiveMessages, domMessages) {
     const archive = Array.isArray(archiveMessages) ? archiveMessages : [];
     const dom = Array.isArray(domMessages) ? domMessages : [];
@@ -9704,7 +10173,7 @@ class ProxyEngine extends EventEmitter {
     const domUsers = dom.filter(m => m && m.role === 'user');
     for (const user of domUsers) {
       if (!this._isStrongCodexArchiveAnchor(user)) continue;
-      const idx = this._findMatchingMessageIndex(archive, user);
+      const idx = this._codexDesktopArchiveUserIndex(archive, user);
       if (idx >= 0) return idx;
     }
 
@@ -9726,7 +10195,7 @@ class ProxyEngine extends EventEmitter {
       this._isStrongCodexArchiveAnchor(m)
     );
     if (visibleUsers.length === 0) return true;
-    return visibleUsers.every(user => this._findMatchingMessageIndex(archive, user) >= 0);
+    return visibleUsers.every(user => this._codexDesktopArchiveUserIndex(archive, user) >= 0);
   }
 
   _boundedCodexDesktopArchiveMessages(archiveMessages, domMessages, anchorIdx) {
@@ -9745,6 +10214,7 @@ class ProxyEngine extends EventEmitter {
   _maybeUseCodexDesktopArchive(sessionId, session, domMessages) {
     if (!session || !['codex-desktop', 'codex'].includes(session.agentType)) return domMessages;
     const isDesktop = session.agentType === 'codex-desktop';
+    if (isDesktop) session._codexDesktopArchiveAuthoritative = false;
     session._codexDesktopArchivePollSettledActivity = null;
     const dom = Array.isArray(domMessages) ? domMessages : [];
     const now = Date.now();
@@ -9818,7 +10288,10 @@ class ProxyEngine extends EventEmitter {
         if (
           this._codexDesktopArchiveCoversVisibleUsers(cached, dom)
           && (cached.length > dom.length || cachedStructuredCount > domStructuredCount)
-        ) return cached;
+        ) {
+          if (isDesktop) session._codexDesktopArchiveAuthoritative = true;
+          return cached;
+        }
       } else if (cached && cached.length > dom.length) {
         const cachedAnchor = this._codexDesktopArchiveAnchor(cached, dom);
         if (cachedAnchor >= 0 && this._codexDesktopArchiveCoversVisibleUsers(cached, dom)) return cached;
@@ -9877,7 +10350,9 @@ class ProxyEngine extends EventEmitter {
       session._codexDesktopArchivePollSettledActivity = archiveActivity;
     }
 
-    const archiveMessages = this._boundedCodexDesktopArchiveMessages(normalizedMessages, dom, anchorIdx);
+    const archiveMessages = (exactThread || confirmedProvisionalThread)
+      ? normalizedMessages
+      : this._boundedCodexDesktopArchiveMessages(normalizedMessages, dom, anchorIdx);
     const archiveBlockCounts = codexDesktopStructuredBlockCounts(archiveMessages);
     const archiveStructuredCount = Number(archiveBlockCounts.terminal || 0)
       + Number(archiveBlockCounts.file_changes || 0)
@@ -9893,6 +10368,9 @@ class ProxyEngine extends EventEmitter {
       : null;
     session._codexDesktopArchiveBlockCounts = archiveBlockCounts;
     session._codexDesktopArchivePartial = summary.messagesPartial === true;
+    if (isDesktop && (exactThread || confirmedProvisionalThread)) {
+      session._codexDesktopArchiveAuthoritative = true;
+    }
     this._log('info', `[${sessionId}] Using ${(exactThread || confirmedProvisionalThread) ? 'exact-thread ' : ''}${isDesktop ? 'Codex Desktop' : 'Codex VS Code'} JSONL transcript (${archiveMessages.length}/${summary.messages.length} msgs; ${archiveStructuredCount} structured blocks) to preserve native structured history`);
     return archiveMessages;
   }
@@ -10332,6 +10810,37 @@ class ProxyEngine extends EventEmitter {
     };
   }
 
+  _codexConnectionActivityOptions(sessionId, session, observation = {}) {
+    return {
+      session_id: sessionId,
+      thread_id: observation.native_connection?.native_thread_id
+        || this._codexNativeConversationId(session)
+        || sessionId,
+      turn_id: observation.native_connection?.native_turn_id || session?._activeTurnId || sessionId,
+      connectionHolder: session,
+      onConnectionTelemetry: event => {
+        const name = String(event?.event || 'connection_unknown');
+        const current = session._nativeConnectionTelemetry || {
+          counts: {},
+          last_event: null,
+          updated_at: null,
+        };
+        current.counts[name] = Math.max(0, Number(current.counts[name]) || 0) + 1;
+        current.last_event = name;
+        current.updated_at = new Date().toISOString();
+        session._nativeConnectionTelemetry = current;
+        if (name !== 'connection_duplicate_suppressed') {
+          this._log(
+            'info',
+            `[codex-native-connection] event=${name} state=${event?.state || 'none'} `
+              + `attempt=${event?.attempt || 0}/${event?.attempt_limit || 0} `
+              + `generation=${event?.generation_seq || 0}`,
+          );
+        }
+      },
+    };
+  }
+
   _codexNativeConversationId(session) {
     if (!session || !['codex-desktop', 'codex', 'codex_cli'].includes(session.agentType)) return null;
     return firstUuid(
@@ -10438,6 +10947,61 @@ class ProxyEngine extends EventEmitter {
       });
     }
     return canonical || null;
+  }
+
+  _releaseCodexCliCanonicalAlias(sessionId, nativeId, ownerEvidence) {
+    if (!sessionId || ownerEvidence?.verified !== true) return false;
+    const stored = sessionStore.getSession(sessionId);
+    const priorCanonicalSessionId = stored?.canonical_session_id || null;
+    if (
+      stored?.canonical_suppressed !== true
+      || !priorCanonicalSessionId
+      || priorCanonicalSessionId === sessionId
+    ) {
+      return false;
+    }
+    const normalizedNativeId = firstUuid(nativeId);
+    const canonicalId = normalizedNativeId
+      ? canonicalConversationId('codex', normalizedNativeId)
+      : null;
+    this._canonicalSuppressedSessionIds.delete(sessionId);
+    const liveSession = this.sessions.get(sessionId);
+    if (liveSession) {
+      liveSession.canonical_suppressed = false;
+      liveSession.canonical_suppression_reason = null;
+      liveSession.canonicalSessionId = sessionId;
+      liveSession.canonicalConversationId = canonicalId;
+      liveSession.canonicalNativeId = normalizedNativeId;
+      liveSession.codexCliOwnerEvidence = ownerEvidence;
+    }
+    sessionStore.updateSession(sessionId, {
+      canonical_suppressed: false,
+      canonical_suppression_reason: null,
+      canonical_session_id: sessionId,
+      canonical_conversation_id: canonicalId,
+      canonical_native_id: normalizedNativeId,
+      canonical_provenance: null,
+      canonical_owner_evidence: ownerEvidence,
+      codex_cli_owner_evidence: ownerEvidence,
+    });
+    const released = this._sendToRelay({
+      type: 'session_alias_released',
+      protocol_version: proto.PROTOCOL_VERSION,
+      alias_session_id: sessionId,
+      prior_canonical_session_id: priorCanonicalSessionId,
+      canonical_conversation_id: canonicalId,
+      canonical_native_id: normalizedNativeId,
+      current_surface: 'codex_cli',
+      current_surface_label: 'Codex CLI',
+      release_reason: 'verified_cli_owner_restored',
+      owner_evidence: ownerEvidence,
+    });
+    this._lastSessionSnapshotSig = null;
+    this._log(
+      'info',
+      `[codex-cli] Released stale cross-surface alias ${sessionId} -> ${priorCanonicalSessionId} from verified native owner`,
+    );
+    return released || this._pendingPreReadyAliasEvents?.has(sessionId) === true;
   }
 
   _canonicalConversationClaim(session) {
@@ -11954,6 +12518,114 @@ class ProxyEngine extends EventEmitter {
     return canonical;
   }
 
+  _applyCodexDomGoalProjection(sessionId, session, observation, activity) {
+    const source = session?.agentType === 'codex-desktop'
+      ? 'codex_desktop_dom'
+      : 'codex_extension_dom';
+    if (session?.agentType !== 'codex-desktop') {
+      const goal = this._canonicalGoalForSession(sessionId, session, observation?.goal, source);
+      if (goal) activity.goal = goal;
+      return goal;
+    }
+
+    const ownership = observation?.goal_observation && typeof observation.goal_observation === 'object'
+      ? observation.goal_observation
+      : {};
+    const expectedThreadKey = String(
+      session._activeThreadKey
+      || session.codexDesktopActiveThreadKey
+      || session.codex_desktop_active_thread_key
+      || '',
+    );
+    const observedThreadKey = String(
+      ownership.native_thread_id
+      || observation?.goal?.native_thread_id
+      || '',
+    );
+    const exactOwner = ownership.active_thread_proven === true
+      && !!expectedThreadKey
+      && !!observedThreadKey
+      && codexDesktopThreadKeysMatch(expectedThreadKey, observedThreadKey)
+      && observation?.goal?.active_thread_proven !== false
+      && (!observation?.goal?.native_thread_id
+        || codexDesktopThreadKeysMatch(expectedThreadKey, observation.goal.native_thread_id));
+    const observedAt = ownership.observed_at
+      || observation?.goal?.observed_at
+      || activity.updated_at
+      || new Date().toISOString();
+    const previousProjection = session.activity?.goal_projection || null;
+    if (!Number.isFinite(Number(session._goalProjectionEpoch))) {
+      session._goalProjectionEpoch = Math.max(
+        Date.now(),
+        Number(previousProjection?.epoch || 0) + 1,
+      );
+      session._goalProjectionSequence = 0;
+      session._goalProjectionSignature = '';
+    }
+
+    let goal = null;
+    let state = 'clear';
+    let reason = String(ownership.reason || 'goal_ownership_unproven');
+    if (exactOwner && observation?.goal && ownership.ownership_state === 'owned') {
+      goal = this._canonicalGoalForSession(sessionId, session, observation.goal, source);
+      if (goal) {
+        state = 'present';
+        reason = 'exact_active_thread_goal';
+      }
+    }
+    if (!goal) {
+      session._lastCanonicalGoal = null;
+    }
+
+    const semanticSignature = JSON.stringify({
+      state,
+      session_id: sessionId,
+      native_thread_id: observedThreadKey || expectedThreadKey || null,
+      fingerprint: goal?.fingerprint || null,
+      generation: goal?.generation || null,
+      reason,
+    });
+    const projectionChanged = semanticSignature !== session._goalProjectionSignature;
+    if (projectionChanged) {
+      session._goalProjectionSignature = semanticSignature;
+      session._goalProjectionSequence = Math.max(0, Number(session._goalProjectionSequence) || 0) + 1;
+    }
+    const projection = {
+      schema_version: 1,
+      session_id: sessionId,
+      surface: 'codex-desktop',
+      native_thread_id: observedThreadKey || expectedThreadKey || null,
+      native_thread_title: ownership.native_thread_title || session._activeThreadTitle || null,
+      epoch: Number(session._goalProjectionEpoch),
+      sequence: Math.max(1, Number(session._goalProjectionSequence) || 1),
+      state,
+      reason,
+      observed_at: projectionChanged
+        ? observedAt
+        : (previousProjection?.observed_at || observedAt),
+      goal_fingerprint: goal?.fingerprint || null,
+      goal_generation: goal?.generation || null,
+    };
+    activity.goal = goal;
+    activity.goal_projection = projection;
+    if (!goal) {
+      const previousGoal = session.activity?.goal || null;
+      activity.goal_tombstone = {
+        schema_version: 1,
+        session_id: sessionId,
+        surface: 'codex-desktop',
+        native_thread_id: projection.native_thread_id,
+        epoch: projection.epoch,
+        sequence: projection.sequence,
+        prior_fingerprint: previousGoal?.fingerprint || null,
+        prior_generation: previousGoal?.generation || null,
+        observed_at: projection.observed_at,
+        reason,
+      };
+    }
+    return goal;
+  }
+
   _codexCliGoalRunOwnerState(session) {
     if (session?._codexAppServerTurn || session?._codexCliChild) {
       session._goalRunOwnerMissingSinceMs = 0;
@@ -12453,6 +13125,29 @@ class ProxyEngine extends EventEmitter {
       throw Object.assign(new Error('This thread has no goal'), {
         code: 'goal_not_found', native_attempted: false, retryable: false,
       });
+    }
+    if (session.agentType === 'codex-desktop') {
+      const projection = session.activity?.goal_projection;
+      const expectedThreadKey = String(
+        session._activeThreadKey
+        || session.codexDesktopActiveThreadKey
+        || session.codex_desktop_active_thread_key
+        || '',
+      );
+      const exactProjection = projection?.state === 'present'
+        && projection.session_id === sessionId
+        && projection.surface === 'codex-desktop'
+        && !!projection.native_thread_id
+        && codexDesktopThreadKeysMatch(expectedThreadKey, projection.native_thread_id)
+        && projection.goal_fingerprint === currentGoal.fingerprint
+        && Number(projection.goal_generation) === Math.max(1, Number(currentGoal.generation) || 1);
+      if (!exactProjection) {
+        throw Object.assign(new Error('The selected Desktop thread does not own this goal'), {
+          code: 'goal_thread_ownership_unproven',
+          native_attempted: false,
+          retryable: true,
+        });
+      }
     }
     const currentGeneration = Math.max(1, Number(currentGoal.generation) || 1);
     const requestedGeneration = Math.max(0, Number(message.goal_generation) || 0);
@@ -13143,6 +13838,17 @@ class ProxyEngine extends EventEmitter {
     if (!summary?.cliSessionId) return null;
     const ownerEvidence = this._codexCliOwnerEvidence(summary.cliSessionId);
     summary.ownerEvidence = ownerEvidence;
+    const storedConfig = sessionStore.getAllSessions().find(sess => (
+      sess.agent_type === 'codex_cli'
+      && (sess.cli_session_id === summary.cliSessionId || sess.virtual_id === `codex-cli:${summary.cliSessionId}`)
+    ));
+    const aliasReleased = storedConfig?.session_id
+      ? this._releaseCodexCliCanonicalAlias(
+        storedConfig.session_id,
+        summary.cliSessionId,
+        ownerEvidence,
+      )
+      : false;
     if (this._codexCliSummaryRequiresCanonicalSuppression(summary, ownerEvidence)) {
       this._suppressCodexCliCanonicalAlias(summary, ownerEvidence);
       return null;
@@ -13198,7 +13904,7 @@ class ProxyEngine extends EventEmitter {
         workspace_path: existing.workspace_path || null,
         workspace_name: existing.workspace_name || null,
       });
-      if (metaChanged) {
+      if (metaChanged || aliasReleased) {
         this._publishCodexCliConfig(sessionId, existing);
         this._broadcastSessionSnapshot();
       }
@@ -13222,10 +13928,6 @@ class ProxyEngine extends EventEmitter {
       }
       return existing;
     }
-    const storedConfig = sessionStore.getAllSessions().find(sess => (
-      sess.agent_type === 'codex_cli'
-      && (sess.cli_session_id === summary.cliSessionId || sess.virtual_id === `codex-cli:${summary.cliSessionId}`)
-    ));
     const sessionMeta = sessionStore.resolveVirtualSession({
       virtualId: `codex-cli:${summary.cliSessionId}`,
       agentType: 'codex_cli',
@@ -13284,7 +13986,7 @@ class ProxyEngine extends EventEmitter {
           : (summary.activity || { kind: 'idle', label: '', updated_at: summary.updatedAt || new Date().toISOString() }),
         lifecycleContext);
       if (metaChanged) this._publishCodexCliConfig(sessionId, existing);
-      if (metaChanged || dedupedAliases) this._broadcastSessionSnapshot();
+      if (metaChanged || dedupedAliases || aliasReleased) this._broadcastSessionSnapshot();
       this._recoverCodexCliPendingReceipt(sessionId, existing, summary);
       const summaryMessages = summary.messages || [];
       const effectiveMessages = summaryMessages.length > 0
@@ -13331,10 +14033,16 @@ class ProxyEngine extends EventEmitter {
         session.lastMessageCount = initialMessages.length;
       }
     }
+    this._migrateCodexCliCanonicalTranscript(
+      sessionId,
+      session,
+      session._fileTranscriptState,
+      'initial registration',
+    );
     this._publishCodexCliConfig(sessionId, session);
     this._syncCodexCliGoalDecisionPrompt(sessionId, session, session.activity);
     this._recoverCodexCliPendingReceipt(sessionId, session, summary);
-    if (dedupedAliases) this._broadcastSessionSnapshot();
+    if (dedupedAliases || aliasReleased) this._broadcastSessionSnapshot();
     return session;
   }
 
@@ -16595,7 +17303,23 @@ class ProxyEngine extends EventEmitter {
       const isAccumulating = this._isTranscriptAccumulating(session.agentType);
       let skipUnstableNoOverlap = false;
 
-      if (isAccumulating) {
+      if (isAccumulating && session.agentType === 'codex-desktop') {
+        const reconciled = this._reconcileCodexDesktopCanonicalTranscript(
+          session._accumulatedMessages,
+          messages,
+          { authoritative: session._codexDesktopArchiveAuthoritative === true },
+        );
+        session._accumulatedMessages = reconciled.messages;
+        if (reconciled.changed) {
+          session._accumulatedDirty = true;
+          session._forceHistoryResync = session._codexDesktopArchiveAuthoritative
+            ? 'codex desktop authoritative native transcript'
+            : 'codex desktop stable native message reconciliation';
+        }
+        session._accumulatorNoOverlapCandidateSig = null;
+        session._accumulatorPrefixTruncateSig = null;
+        this._maybePersistAccumulatedMessages(sessionId, session);
+      } else if (isAccumulating) {
         if (!session._accumulatedMessages) {
           // First poll — seed with whatever the DOM has
           session._accumulatedMessages = messages.slice();
@@ -17016,17 +17740,17 @@ class ProxyEngine extends EventEmitter {
                   genActivity.task_list = session.taskList;
                   genActivity.step = liveStepFromTaskList(session.taskList);
                 }
-                const canonicalGoal = this._canonicalGoalForSession(
+                const canonicalGoal = this._applyCodexDomGoalProjection(
                   sessionId,
                   session,
-                  ts.goal,
-                  session.agentType === 'codex-desktop' ? 'codex_desktop_dom' : 'codex_extension_dom',
+                  ts,
+                  genActivity,
                 );
-                if (canonicalGoal) genActivity.goal = canonicalGoal;
                 const usage = codexUsageActivity(session);
                 if (usage) genActivity.usage = usage;
-                applyCodexDomActivityChannels(genActivity, ts, session.activity);
-                if (!genActivity.current && /^Generating$/i.test(ts.label || '')) {
+                applyCodexDomActivityChannels(genActivity, ts, session.activity,
+                  this._codexConnectionActivityOptions(sessionId, session, ts));
+                if (!ts.native_connection && !genActivity.current && /^Generating$/i.test(ts.label || '')) {
                   genActivity.current = { kind: 'answer', label: 'Answering', partial: '' };
                 }
                 genActivity = this._applyGoalRunLifecycle(sessionId, session, genActivity, {
@@ -17041,12 +17765,16 @@ class ProxyEngine extends EventEmitter {
                 session.thinking = true;
                 session.thinkingLabel = genActivity.label;
                 session.thinkingContent = ts.thinkingContent || '';
-                session._goalSig = canonicalGoal ? JSON.stringify({
-                  fingerprint: canonicalGoal.fingerprint || '',
-                  state: canonicalGoal.state || canonicalGoal.status || '',
-                  transition_seq: Number(canonicalGoal.transition_seq || 0),
-                  time_used_seconds: Number(canonicalGoal.time_used_seconds || 0),
-                }) : '';
+                session._goalSig = JSON.stringify({
+                  goal: canonicalGoal ? {
+                    fingerprint: canonicalGoal.fingerprint || '',
+                    state: canonicalGoal.state || canonicalGoal.status || '',
+                    transition_seq: Number(canonicalGoal.transition_seq || 0),
+                    time_used_seconds: Number(canonicalGoal.time_used_seconds || 0),
+                  } : null,
+                  projection: genActivity.goal_projection || null,
+                  tombstone: genActivity.goal_tombstone || null,
+                });
                 session.activity = genActivity;
                 sessionStore.updateSession(sessionId, { activity: genActivity });
                 this._sendToRelay(proto.proxyStatus(sessionId, session.status || 'healthy', genActivity));
@@ -17196,17 +17924,17 @@ class ProxyEngine extends EventEmitter {
         newActivity.task_list = session.taskList;
         newActivity.step = liveStepFromTaskList(session.taskList);
       }
-      const canonicalGoal = this._canonicalGoalForSession(
+      const canonicalGoal = this._applyCodexDomGoalProjection(
         sessionId,
         session,
-        ts.goal,
-        session.agentType === 'codex-desktop' ? 'codex_desktop_dom' : 'codex_extension_dom',
+        ts,
+        newActivity,
       );
-      if (canonicalGoal) newActivity.goal = canonicalGoal;
       const usage = codexUsageActivity(session);
       if (usage) newActivity.usage = usage;
-      applyCodexDomActivityChannels(newActivity, ts, session.activity);
-      if (!newActivity.current && active && /^Generating$/i.test(label)) {
+      applyCodexDomActivityChannels(newActivity, ts, session.activity,
+        this._codexConnectionActivityOptions(sessionId, session, ts));
+      if (!ts.native_connection && !newActivity.current && active && /^Generating$/i.test(label)) {
         newActivity.current = { kind: 'answer', label: 'Answering', partial: '' };
       }
       newActivity = this._applyGoalRunLifecycle(sessionId, session, newActivity, {
@@ -17224,6 +17952,7 @@ class ProxyEngine extends EventEmitter {
       const currThinkingContent = ts.thinkingContent || '';
       const liveChannelsSig = JSON.stringify({
         thinking: newActivity.thinking || null,
+        connection: newActivity.connection || null,
         current: newActivity.current ? {
           kind: newActivity.current.kind || '',
           label: newActivity.current.label || '',
@@ -17232,12 +17961,16 @@ class ProxyEngine extends EventEmitter {
         step: newActivity.step || null,
         usage: newActivity.usage || null,
       });
-      const goalSig = canonicalGoal ? JSON.stringify({
-        fingerprint: canonicalGoal.fingerprint || '',
-        state: canonicalGoal.state || canonicalGoal.status || '',
-        transition_seq: Number(canonicalGoal.transition_seq || 0),
-        time_used_seconds: Number(canonicalGoal.time_used_seconds || 0),
-      }) : '';
+      const goalSig = JSON.stringify({
+        goal: canonicalGoal ? {
+          fingerprint: canonicalGoal.fingerprint || '',
+          state: canonicalGoal.state || canonicalGoal.status || '',
+          transition_seq: Number(canonicalGoal.transition_seq || 0),
+          time_used_seconds: Number(canonicalGoal.time_used_seconds || 0),
+        } : null,
+        projection: newActivity.goal_projection || null,
+        tombstone: newActivity.goal_tombstone || null,
+      });
       if (ts.thinking !== session.thinking || label !== session.thinkingLabel || kind !== prevKind || currThinkingContent !== prevThinkingContent || goalSig !== (session._goalSig || '') || liveChannelsSig !== (session._liveChannelsSig || '')) {
         session.thinking     = ts.thinking;
         session.thinkingLabel = label;
@@ -19259,6 +19992,7 @@ class ProxyEngine extends EventEmitter {
       if (!isAgent) continue;
 
       this._log('info', `[discover] Probing ${target.id.substring(0, 8)} ext=${ext}`);
+      const discoveryStartedAt = Date.now();
 
       let client;
       try {
@@ -19368,6 +20102,10 @@ class ProxyEngine extends EventEmitter {
             this._log('warn', `[discover] initial readCodexChatList failed for ${sessionId}: ${e.message}`);
           }
         }
+        const {
+          activeChat: initialActiveChat,
+          activeChatKey: initialActiveChatKey,
+        } = resolveInitialCodexChatSelection(initialChatList);
         let initialThreadList = null;
         let initialActiveThread = null;
         let initialActiveThreadKey = '';
@@ -19399,16 +20137,23 @@ class ProxyEngine extends EventEmitter {
         const storedCodexChatKey = agentType === 'codex' ? String(sessionMeta.codex_active_chat_key || '') : '';
         const storedCodexChatTitle = agentType === 'codex' ? String(sessionMeta.codex_active_chat_title || '') : '';
         const storedCodexNativeConversationId = agentType === 'codex'
-          && (!initialActiveChatKey || !storedCodexChatKey || initialActiveChatKey === storedCodexChatKey)
-          ? codexDesktopCliSessionId(sessionMeta.codex_native_conversation_id || '')
+          ? resolveStoredCodexConversationId({
+              initialActiveChatKey,
+              storedActiveChatKey: storedCodexChatKey,
+              storedNativeConversationId: sessionMeta.codex_native_conversation_id,
+            })
           : '';
         let storedAccumulated = Array.isArray(sessionMeta.accumulated_messages) ? sessionMeta.accumulated_messages : null;
         if (agentType === 'cursor' && storedCursorThreadKey && Array.isArray(storedCursorAgentHistories[storedCursorThreadKey])) {
           storedAccumulated = storedCursorAgentHistories[storedCursorThreadKey];
         }
+        let initialCodexDesktopThreadChanged = false;
         if (agentType === 'codex-desktop') {
           const storedThreadKey = sessionMeta.codex_desktop_active_thread_key || '';
-          if (storedAccumulated && storedThreadKey && initialActiveThreadKey && storedThreadKey !== initialActiveThreadKey) {
+          initialCodexDesktopThreadChanged = !!storedThreadKey
+            && !!initialActiveThreadKey
+            && !codexDesktopThreadKeysMatch(storedThreadKey, initialActiveThreadKey);
+          if (storedAccumulated && initialCodexDesktopThreadChanged) {
             this._log('info', `[discover] Codex Desktop active thread changed since last persist; dropping stale accumulated history for ${sessionId}`);
             storedAccumulated = null;
             sessionStore.updateSession(sessionId, {
@@ -19472,7 +20217,6 @@ class ProxyEngine extends EventEmitter {
               `initial claude title ${sessionId.substring(0, 8)}`
             ).catch(() => null)
           : null;
-        const initialActiveChat = Array.isArray(initialChatList) ? initialChatList.find(c => c && c.active) : null;
         const initialTitle = selectDurableChatTitleDetails({
           nativeTitle: [innerClaudeTitle, initialActiveChat?.title, storedCodexChatTitle],
           storedTitle: sessionMeta.chat_title,
@@ -19487,8 +20231,13 @@ class ProxyEngine extends EventEmitter {
             chat_title_source: chatTitleSource,
           });
         }
-        const initialActiveChatKey = initialActiveChat ? `${initialActiveChat.id || ''}:${initialActiveChat.title || ''}` : '';
-
+        const discoveryObservedAt = new Date().toISOString();
+        const discoveryLatencyMs = Math.max(0, Date.now() - discoveryStartedAt);
+        sessionStore.updateSession(sessionId, {
+          discovery_target_id: target.id,
+          discovery_observed_at: discoveryObservedAt,
+          discovery_latency_ms: discoveryLatencyMs,
+        });
         this.sessions.set(sessionId, {
           session_id:       sessionId,
           display_name:     sessionMeta.display_name,
@@ -19518,6 +20267,9 @@ class ProxyEngine extends EventEmitter {
           status:           'healthy',
           activity:         sessionMeta.activity || { kind: 'idle', label: '', updated_at: new Date().toISOString() },
           last_seen_at:     new Date().toISOString(),
+          discovery_target_id: target.id,
+          discovery_observed_at: discoveryObservedAt,
+          discovery_latency_ms: discoveryLatencyMs,
           windowTitle,
           agentType,
           parentId,
@@ -19540,6 +20292,10 @@ class ProxyEngine extends EventEmitter {
           _activeThreadTitle: initialActiveThread?.title || null,
           _activeThreadKey:   initialActiveThreadKey || storedCursorThreadKey,
           codexDesktopActiveThreadKey: initialActiveThreadKey,
+          codex_desktop_question_tombstones: agentType === 'codex-desktop'
+            && Array.isArray(sessionMeta.codex_desktop_question_tombstones)
+            ? sessionMeta.codex_desktop_question_tombstones.slice(-CODEX_DESKTOP_QUESTION_TOMBSTONE_MAX)
+            : [],
         });
 
         if (agentType === 'codex') {
@@ -19584,7 +20340,7 @@ class ProxyEngine extends EventEmitter {
           if (ephemeralSession) ephemeralSession.client = null;
         }
 
-        this._log('info', `[cdp] ${agentType} → ${sessionId} in "${windowTitle}" (${initialCount} existing msgs)`);
+        this._log('info', `[cdp] ${agentType} → ${sessionId} in "${windowTitle}" (${initialCount} existing msgs, discovery_latency_ms=${discoveryLatencyMs}, target=${target.id.substring(0, 8)})`);
 
         const shouldSendInitialHistory = raw && initialCount > 0 && (
           !isAccumAccum ||
@@ -19595,9 +20351,25 @@ class ProxyEngine extends EventEmitter {
           agentType === 'codex-desktop'
         );
         if (shouldSendInitialHistory) {
-          this._sendHistorySnapshot(sessionId, initialMsgs, 'initial discovery');
+          this._sendHistorySnapshot(
+            sessionId,
+            initialMsgs,
+            initialCodexDesktopThreadChanged
+              ? 'codex desktop native thread switch discovery'
+              : 'initial discovery',
+            initialCodexDesktopThreadChanged
+              ? { directTransport: true, replaceAll: true }
+              : {},
+          );
         } else if (initialListView && (agentType === 'codex' || agentType === 'codex-desktop')) {
           this._sendHistorySnapshot(sessionId, [], `${agentType} initial list view clear`);
+        } else if (initialCodexDesktopThreadChanged) {
+          this._sendHistorySnapshot(
+            sessionId,
+            [],
+            'codex desktop native thread switch discovery',
+            { directTransport: true, replaceAll: true },
+          );
         }
         if (initialChatList) {
           this._sendToRelay(proto.chatList(sessionId, initialChatList));
@@ -20100,6 +20872,10 @@ class ProxyEngine extends EventEmitter {
           ? String(initialActiveThread.id || initialActiveThread.title || '')
           : '';
         const storedActiveThreadKey = String(sessionMeta.codex_desktop_active_thread_key || '');
+        const initialCodexDesktopThreadChanged = agentType === 'codex-desktop'
+          && !!storedActiveThreadKey
+          && !!initialActiveThreadKey
+          && !codexDesktopThreadKeysMatch(storedActiveThreadKey, initialActiveThreadKey);
         const storedAccumulated = agentType === 'codex-desktop' && Array.isArray(sessionMeta.accumulated_messages)
           ? sessionMeta.accumulated_messages
           : null;
@@ -20212,9 +20988,21 @@ class ProxyEngine extends EventEmitter {
           this._sendHistorySnapshot(
             sessionId,
             initialAccumulated,
-            restoreStoredCursorAccumulator || restoreStoredAccumulator
-              ? 'restored discovery'
-              : 'initial discovery'
+            initialCodexDesktopThreadChanged
+              ? 'codex desktop native thread switch discovery'
+              : (restoreStoredCursorAccumulator || restoreStoredAccumulator
+                ? 'restored discovery'
+                : 'initial discovery'),
+            initialCodexDesktopThreadChanged
+              ? { directTransport: true, replaceAll: true }
+              : {},
+          );
+        } else if (initialCodexDesktopThreadChanged) {
+          this._sendHistorySnapshot(
+            sessionId,
+            [],
+            'codex desktop native thread switch discovery',
+            { directTransport: true, replaceAll: true },
           );
         }
 
@@ -20798,9 +21586,12 @@ class ProxyEngine extends EventEmitter {
 
 module.exports = {
   ProxyEngine,
+  codexDesktopQuestionIdentity,
   mergeCodexCliArchiveDiscoverySummaries,
   detectCodexDesktopInstalledVersion,
   detectVsCodeCodexInstalledVersion,
+  resolveInitialCodexChatSelection,
+  resolveStoredCodexConversationId,
   codexDesktopThreadKeysMatch,
   resolveCodexDesktopThreadMetadata,
   isDesktopAppPage,

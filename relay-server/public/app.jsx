@@ -10,7 +10,12 @@ import {
   retainStrongerSessionChatTitleProjection,
 } from './session-title.js';
 import { partitionPinnedSessions } from './session-pins.js';
-import { normalizeLatestVisibleMessage, projectRecentChatOwnership } from './recent-chats.js';
+import {
+  createRecentChatMembershipLedger,
+  normalizeLatestVisibleMessage,
+  projectRecentChatOwnership,
+  reconcileRecentChatMembershipLedger,
+} from './recent-chats.js';
 import {
   formatAbsoluteMessageTime,
   formatVisibleMessageTime,
@@ -31,6 +36,7 @@ import {
   partitionSidebarSessionsByWorking,
   reconcileSidebarOrderLedger,
   reconcileSidebarWorkingLedger,
+  sidebarSemanticMembershipOptions,
   sessionIsTestSession,
   sortSidebarOrderLedger,
 } from './workspace-groups.js';
@@ -249,32 +255,40 @@ function promptContinuityKey(sessionId, prompt) {
   if (prompt.type !== 'question_prompt') {
     return `${sessionId}\u0000legacy\u0000${prompt.prompt_id || prompt.request_id || prompt.id || 'prompt'}`;
   }
-  const semanticPrompt = {
-    kind: prompt.kind || 'request_user_input',
-    title: prompt.title || '',
-    source_surface: prompt.source?.surface || '',
-    questions: (prompt.questions || []).map(question => ({
-      id: question.question_id || question.id || '',
-      header: question.header || '',
-      question: question.question || question.message || '',
-      answer_mode: question.answer_mode || '',
-      multi_select: question.multi_select === true,
-      choices: (question.choices || question.options || []).map(choice => ({
-        id: choice.choice_id || choice.id || '',
-        label: choice.label || '',
-        description: choice.description || '',
-        other: choice.requires_text === true || choice.is_other === true,
-      })),
-    })),
-  };
-  return `${sessionId}\u0000question\u0000${stableContentHash(JSON.stringify(semanticPrompt))}`;
+  if (!prompt.prompt_id || !prompt.generation) return '';
+  return `${sessionId}\u0000question\u0000${prompt.prompt_id}\u0000${prompt.generation}`;
 }
 
-function setScrollTopInstant(element, value) {
+function scrollContainerName(element) {
+  if (element?.matches?.('.messages')) return 'transcript';
+  if (element?.matches?.('.session-list')) return 'sidebar';
+  return 'other';
+}
+
+function setScrollTopInstant(element, value, trace = {}) {
   if (!element) return;
   const previous = element.style.scrollBehavior;
   element.style.scrollBehavior = 'auto';
-  element.scrollTop = value;
+  const context = {
+    container: trace.container || scrollContainerName(element),
+    writer: trace.writer || 'scroll-coordinator',
+    reason: trace.reason || 'unspecified',
+    interaction_epoch: Number(trace.interactionEpoch) || 0,
+    route_session_id: trace.sessionId || null,
+    anchor_id: trace.anchorId || null,
+    anchor_offset_px: Number.isFinite(trace.anchorOffset) ? trace.anchorOffset : null,
+    bottom_gap_px: element.scrollHeight - element.scrollTop - element.clientHeight,
+    payload_generation: Number(trace.payloadGeneration) || 0,
+  };
+  const traceEnabled = typeof window !== 'undefined' && window.__RAC_TEMPORAL_CANARY__?.active;
+  if (traceEnabled) window.__RAC_SCROLL_WRITE_CONTEXT__ = context;
+  try {
+    element.scrollTop = value;
+  } finally {
+    if (traceEnabled && window.__RAC_SCROLL_WRITE_CONTEXT__ === context) {
+      delete window.__RAC_SCROLL_WRITE_CONTEXT__;
+    }
+  }
   requestAnimationFrame(() => {
     if (element.style.scrollBehavior === 'auto') {
       element.style.scrollBehavior = previous;
@@ -715,6 +729,19 @@ function ContentBlocks({
               {body && richMarkdown(body, index)}
               <ContentBlockActions actions={block.actions} />
             </div>
+          );
+        }
+        if (type === 'memory_citation') {
+          return (
+            <TranscriptDisclosure
+              key={index}
+              stateKey={`${richContentCacheIdentity}:memory-citation:${index}`}
+              className="content-block content-block-memory-citation"
+              defaultOpen={false}
+              summary={title || 'Sources'}
+            >
+              {body && richMarkdown(body, index)}
+            </TranscriptDisclosure>
           );
         }
         if (type === 'error' && isAntigravityV2) {
@@ -1555,11 +1582,11 @@ function DeliveryStatus({ msg, deliveryStates, onSteer, onRetry }) {
   return <span className="delivery recorded" title="Recorded — native delivery receipt unknown" aria-label="Recorded; native delivery receipt unknown">Recorded</span>;
 }
 
-function useStableWorkingSessions(sessions, freezeStructure = false) {
+function useStableWorkingSessions(sessions, freezeStructure = false, continuityOptions = {}) {
   const [ledger, setLedger] = React.useState(() => createSidebarWorkingLedger(sessions));
   const projection = React.useMemo(
-    () => reconcileSidebarWorkingLedger(ledger, sessions, { freezeStructure }),
-    [ledger, sessions, freezeStructure],
+    () => reconcileSidebarWorkingLedger(ledger, sessions, { ...continuityOptions, freezeStructure }),
+    [ledger, sessions, freezeStructure, continuityOptions],
   );
 
   React.useEffect(() => {
@@ -1571,6 +1598,18 @@ function useStableWorkingSessions(sessions, freezeStructure = false) {
     revision: projection.ledger.revision,
     deferred: projection.deferred,
   };
+}
+
+function useStableRecentSessions(sessions, freezeStructure = false) {
+  const [ledger, setLedger] = React.useState(() => createRecentChatMembershipLedger(sessions));
+  const projection = React.useMemo(
+    () => reconcileRecentChatMembershipLedger(ledger, sessions, { freezeStructure }),
+    [ledger, sessions, freezeStructure],
+  );
+  React.useEffect(() => {
+    if (projection.ledger !== ledger) setLedger(projection.ledger);
+  }, [ledger, projection]);
+  return projection.sessions;
 }
 
 function useSidebarFreshnessClock(activities, sessions) {
@@ -1825,7 +1864,14 @@ function VirtualTranscriptRow({ index, messageKey, onMeasure, children }) {
   return <div className="transcript-window-row" data-window-index={index} ref={rowRef}>{children}</div>;
 }
 
-function useTranscriptWindow({ messages, containerRef, sessionId, routeActive, suppressProgrammaticScrollRef }) {
+function useTranscriptWindow({
+  messages,
+  containerRef,
+  sessionId,
+  routeActive,
+  suppressProgrammaticScrollRef,
+  scrollCoordinatorRef,
+}) {
   const enabled = routeActive && messages.length > TRANSCRIPT_WINDOW_THRESHOLD;
   const enabledRef = React.useRef(enabled);
   enabledRef.current = enabled;
@@ -1853,6 +1899,20 @@ function useTranscriptWindow({ messages, containerRef, sessionId, routeActive, s
     () => suppressProgrammaticScrollRef?.current?.() !== true,
     [suppressProgrammaticScrollRef],
   );
+  const writeProgrammaticScroll = React.useCallback((list, value, reason, options = {}) => {
+    if (!list) return false;
+    if (typeof scrollCoordinatorRef?.current === 'function') {
+      return scrollCoordinatorRef.current(list, value, reason, options) === true;
+    }
+    if (!mayWriteProgrammaticScroll()) return false;
+    setScrollTopInstant(list, value, {
+      container: 'transcript',
+      writer: 'virtual-transcript-fallback',
+      reason,
+      sessionId,
+    });
+    return true;
+  }, [mayWriteProgrammaticScroll, scrollCoordinatorRef]);
 
   const keys = React.useMemo(
     () => messages.map((message, index) => `${sessionId || ''}\u0001${messageIdentityKey(message, index)}`),
@@ -1985,13 +2045,16 @@ function useTranscriptWindow({ messages, containerRef, sessionId, routeActive, s
       start: nextIndex,
       end: Math.min(messages.length, nextIndex + TRANSCRIPT_WINDOW_FALLBACK_ROWS),
     });
-    if (mayWriteProgrammaticScroll()) {
-      setScrollTopInstant(list, Math.max(0, list.scrollTop + nextOffset - previousOffset));
-    } else {
+    if (!writeProgrammaticScroll(
+      list,
+      Math.max(0, list.scrollTop + nextOffset - previousOffset),
+      'virtual-window-key-reorder',
+      { anchorId: anchor.key, anchorOffset: anchor.viewportOffset },
+    )) {
       pendingAnchorRestoreRef.current = null;
       releasePinnedIndex();
     }
-  }, [captureViewportAnchor, containerRef, enabled, keys, mayWriteProgrammaticScroll, messages.length, prefix, releasePinnedIndex, sessionId]);
+  }, [captureViewportAnchor, containerRef, enabled, keys, messages.length, prefix, releasePinnedIndex, sessionId, writeProgrammaticScroll]);
 
   React.useLayoutEffect(() => {
     const pending = pendingAnchorRestoreRef.current;
@@ -2001,57 +2064,62 @@ function useTranscriptWindow({ messages, containerRef, sessionId, routeActive, s
     const list = containerRef.current;
     const row = list?.querySelector(`.transcript-window-row[data-window-index="${index}"]`);
     if (!list || !row) return;
-    if (!mayWriteProgrammaticScroll()) {
-      pendingAnchorRestoreRef.current = null;
-      releasePinnedIndex();
-      captureViewportAnchor();
-      return;
-    }
     if (pending.atBottom) {
-      setScrollTopInstant(list, list.scrollHeight);
+      if (!writeProgrammaticScroll(list, list.scrollHeight, 'virtual-anchor-bottom', {
+        anchorId: pending.key,
+        anchorOffset: pending.viewportOffset,
+      })) {
+        pendingAnchorRestoreRef.current = null;
+        releasePinnedIndex();
+        captureViewportAnchor();
+        return;
+      }
       viewportAnchorRef.current = pending;
       return;
     }
     const currentOffset = row.getBoundingClientRect().top - list.getBoundingClientRect().top;
     const correction = currentOffset - pending.viewportOffset;
     if (Math.abs(correction) >= 0.5) {
-      setScrollTopInstant(list, Math.max(0, list.scrollTop + correction));
+      if (!writeProgrammaticScroll(list, Math.max(0, list.scrollTop + correction), 'virtual-anchor-correction', {
+        anchorId: pending.key,
+        anchorOffset: pending.viewportOffset,
+      })) {
+        pendingAnchorRestoreRef.current = null;
+        releasePinnedIndex();
+        captureViewportAnchor();
+        return;
+      }
     }
     viewportAnchorRef.current = pending;
-  }, [captureViewportAnchor, containerRef, enabled, keys, mayWriteProgrammaticScroll, prefix, range, releasePinnedIndex, sessionId]);
+  }, [captureViewportAnchor, containerRef, enabled, keys, prefix, range, releasePinnedIndex, sessionId, writeProgrammaticScroll]);
 
   React.useLayoutEffect(() => {
     const pending = pendingAnchorRestoreRef.current;
     if (!enabled || !pending?.routeRestore) return;
-    if (!mayWriteProgrammaticScroll()) {
-      pendingAnchorRestoreRef.current = null;
-      releasePinnedIndex();
-      captureViewportAnchor();
-      return;
-    }
     let active = true;
     const restoreRouteAnchor = () => {
       if (!active) return;
       const current = pendingAnchorRestoreRef.current;
       const list = containerRef.current;
       if (!current?.routeRestore || current.sessionId !== sessionId || !list) return;
-      if (!mayWriteProgrammaticScroll()) {
-        pendingAnchorRestoreRef.current = null;
-        releasePinnedIndex();
-        return;
-      }
       const index = keys.indexOf(current.key);
       const row = index >= 0
         ? list.querySelector(`.transcript-window-row[data-window-index="${index}"]`)
         : null;
       if (row) {
         if (current.atBottom) {
-          setScrollTopInstant(list, list.scrollHeight);
+          writeProgrammaticScroll(list, list.scrollHeight, 'route-anchor-bottom', {
+            allowWhenUserOwned: true,
+            retainUserOwnership: true,
+          });
         } else {
           const offset = row.getBoundingClientRect().top - list.getBoundingClientRect().top;
           const correction = offset - current.viewportOffset;
           if (Math.abs(correction) >= 0.5) {
-            setScrollTopInstant(list, Math.max(0, list.scrollTop + correction));
+            writeProgrammaticScroll(list, Math.max(0, list.scrollTop + correction), 'route-anchor-correction', {
+              allowWhenUserOwned: true,
+              retainUserOwnership: true,
+            });
           }
         }
       }
@@ -2072,7 +2140,7 @@ function useTranscriptWindow({ messages, containerRef, sessionId, routeActive, s
       if (routeRestoreFrameRef.current) cancelAnimationFrame(routeRestoreFrameRef.current);
       routeRestoreFrameRef.current = 0;
     };
-  }, [captureViewportAnchor, containerRef, enabled, keys, mayWriteProgrammaticScroll, releasePinnedIndex, sessionId]);
+  }, [captureViewportAnchor, containerRef, enabled, keys, releasePinnedIndex, sessionId, writeProgrammaticScroll]);
 
   React.useLayoutEffect(() => {
     if (!enabled) {
@@ -2117,6 +2185,17 @@ function useTranscriptWindow({ messages, containerRef, sessionId, routeActive, s
     if (!enabled) return;
     updateRange();
   }, [enabled, prefix, updateRange]);
+
+  React.useLayoutEffect(() => {
+    if (!enabled || heightRevision === 0) return;
+    const list = containerRef.current;
+    if (!list) return;
+    // Row measurements are committed through heightRevision. Correcting here
+    // happens after that final geometry is in the DOM and before paint; the
+    // shared coordinator rejects this automatically for user-owned off-tail
+    // viewports and normalizes it to the bottom only for tail-pinned intent.
+    writeProgrammaticScroll(list, list.scrollHeight, 'virtual-row-resize-settled');
+  }, [containerRef, enabled, heightRevision, writeProgrammaticScroll]);
 
   const onMeasure = React.useCallback((index, key, rawHeight, node = null) => {
     if (!enabledRef.current) return;
@@ -2165,12 +2244,17 @@ function useTranscriptWindow({ messages, containerRef, sessionId, routeActive, s
       const activeList = containerRef.current;
       const anchorDelta = pendingAnchorDeltaRef.current;
       pendingAnchorDeltaRef.current = 0;
-      if (activeList && Math.abs(anchorDelta) >= 1 && mayWriteProgrammaticScroll()) {
-        setScrollTopInstant(activeList, Math.max(0, activeList.scrollTop + anchorDelta));
+      if (activeList && Math.abs(anchorDelta) >= 1) {
+        writeProgrammaticScroll(
+          activeList,
+          Math.max(0, activeList.scrollTop + anchorDelta),
+          'virtual-row-resize-correction',
+          { anchorId: pinnedMessageKeyRef.current || viewportAnchorRef.current?.key || null },
+        );
       }
       setHeightRevision(revision => revision + 1);
     });
-  }, [containerRef, mayWriteProgrammaticScroll, messages]);
+  }, [containerRef, messages, writeProgrammaticScroll]);
 
   React.useLayoutEffect(() => {
     if (enabled || !measureFrameRef.current) return;
@@ -2204,12 +2288,15 @@ function useTranscriptWindow({ messages, containerRef, sessionId, routeActive, s
       : align === 'end'
         ? rowEnd - list.clientHeight
         : rowStart - Math.max(0, (list.clientHeight - (rowEnd - rowStart)) / 2);
-    setScrollTopInstant(list, Math.max(0, target));
+    writeProgrammaticScroll(list, Math.max(0, target), 'operator-scroll-to-message', {
+      allowWhenUserOwned: true,
+      takeUserOwnership: true,
+    });
     const start = Math.max(0, index - TRANSCRIPT_WINDOW_FALLBACK_ROWS);
     const end = Math.min(messages.length, index + TRANSCRIPT_WINDOW_FALLBACK_ROWS + 1);
     setRange({ sessionId, start, end });
     return true;
-  }, [containerRef, keys, messages.length, releasePinnedIndex, sessionId]);
+  }, [containerRef, keys, messages.length, releasePinnedIndex, sessionId, writeProgrammaticScroll]);
 
   const prepareForPrepend = React.useCallback(() => {
     captureViewportAnchor();
@@ -2604,6 +2691,10 @@ function ActivityRow({ activity, thinkingText, agentType, pinned = false }) {
         since: activity?.startedAt || activity?.updatedAt || null,
       }
     : null);
+  const connection = activity?.connection || null;
+  const interruption = activity?.interruption?.resolution_state === 'unresolved'
+    ? activity.interruption
+    : null;
   const step = activity?.step || null;
   const usage = activity?.usage || null;
   const [nowMs, setNowMs] = React.useState(Date.now());
@@ -2623,10 +2714,50 @@ function ActivityRow({ activity, thinkingText, agentType, pinned = false }) {
   const goalText = String(goal?.text || goal?.objective || '').trim();
   const thinkingElapsed = thinking ? formatActivityElapsed(thinkingTimerSource, nowMs) : '';
   const currentElapsed = current ? formatActivityElapsed(currentTimerSource, nowMs) : '';
-  if (!goal && !thinking && !current && !step && !usage) return null;
+  if (!goal && !thinking && !current && !connection && !interruption && !step && !usage) return null;
 
   return (
     <div className={`live-status-stack${pinned ? ' pinned' : ''}`} data-testid="live-status-stack">
+      {interruption && (
+        <div
+          className={`live-native-interruption-row ${interruption.severity || 'error'}`}
+          data-live-channel="native-interruption"
+          data-interruption-event-id={interruption.event_id || ''}
+          role={interruption.blocking ? 'alert' : 'status'}
+          aria-live={interruption.blocking ? 'assertive' : 'polite'}
+          aria-label={`${interruption.title || 'Harness interruption'}. ${interruption.safe_display_text || ''}`}
+        >
+          <div className="live-native-interruption-heading">
+            <span className="live-native-interruption-icon" aria-hidden="true">!</span>
+            <span className="live-status-label">{interruption.title || 'Harness interruption'}</span>
+            {interruption.blocking && <span className="live-status-meta">Needs attention</span>}
+          </div>
+          {interruption.safe_display_text && (
+            <div className="live-native-interruption-detail">{interruption.safe_display_text}</div>
+          )}
+          <div className="live-native-interruption-meta">
+            {[
+              interruption.native_timestamp ? new Date(interruption.native_timestamp).toLocaleString() : '',
+              interruption.retryable ? 'Retry may be available in the native harness' : 'Open the native session for recovery',
+            ].filter(Boolean).join(' · ')}
+          </div>
+        </div>
+      )}
+      {connection && (
+        <div
+          className={`live-native-connection-row ${connection.state || 'reconnecting'}`}
+          data-live-channel="native-connection"
+          data-connection-generation={connection.generation || ''}
+          data-connection-attempt={connection.attempt || ''}
+          role={connection.state === 'failed' ? 'alert' : 'status'}
+          aria-live={connection.state === 'failed' ? 'assertive' : 'polite'}
+          aria-label={`Codex native connection. ${connection.label || 'Connection status'}`}
+        >
+          <span className="live-native-connection-icon" aria-hidden="true">⌁</span>
+          <span className="live-status-label">{connection.label || 'Native connection status'}</span>
+          {connection.state === 'failed' && <span className="live-status-meta">Needs attention</span>}
+        </div>
+      )}
       {current && (
         <div className={`live-current-status ${current.kind || 'answer'}`} data-live-channel="current">
           <div className="live-current-tool-heading">
@@ -7630,12 +7761,16 @@ function App() {
     nowMs: sidebarNowMs,
     requireFreshness: true,
   }), [activities, thinking, permissionPrompts, errorPrompts, health, connected, sidebarNowMs]);
+  const sidebarMembershipStateOptions = React.useMemo(
+    () => sidebarSemanticMembershipOptions(sidebarStateOptions),
+    [sidebarStateOptions],
+  );
   const {
     working: workingSessionCandidates,
     states: sidebarStateBySessionId,
   } = React.useMemo(
-    () => partitionSidebarSessionsByWorking(orderedSessions, sidebarStateOptions),
-    [orderedSessions, sidebarStateOptions],
+    () => partitionSidebarSessionsByWorking(orderedSessions, sidebarMembershipStateOptions),
+    [orderedSessions, sidebarMembershipStateOptions],
   );
   const sidebarListRef = useRef(null);
   const pendingSidebarSortAnchorRef = useRef(null);
@@ -7644,6 +7779,11 @@ function App() {
   const sidebarExpectedProgrammaticScrollRef = useRef(null);
   const sidebarExpectedProgrammaticScrollFrameRef = useRef(null);
   const sidebarStructuralTransactionFrameRef = useRef(null);
+  const sidebarScrollFrameLockRef = useRef(false);
+  const sidebarScrollFrameLockReleaseRef = useRef(0);
+  const sidebarViewportAnchorRef = useRef(null);
+  const sidebarPayloadGenerationRef = useRef(0);
+  const sidebarPayloadFingerprintRef = useRef('');
   const [sidebarStructureLocked, setSidebarStructureLocked] = useState(false);
   const beginSidebarInteraction = React.useCallback(() => {
     if (sidebarInteractionTimerRef.current) clearTimeout(sidebarInteractionTimerRef.current);
@@ -7671,11 +7811,21 @@ function App() {
       if (sidebarStructuralTransactionFrameRef.current) {
         cancelAnimationFrame(sidebarStructuralTransactionFrameRef.current);
       }
+      if (sidebarScrollFrameLockReleaseRef.current) {
+        cancelAnimationFrame(sidebarScrollFrameLockReleaseRef.current);
+      }
     };
   }, [endSidebarInteraction]);
   const {
     sessions: workingSessions,
-  } = useStableWorkingSessions(workingSessionCandidates, sidebarStructureLocked);
+  } = useStableWorkingSessions(workingSessionCandidates, sidebarStructureLocked, React.useMemo(() => ({
+    nowMs: sidebarNowMs,
+    entryConfirmMs: 2_000,
+    exitGraceMs: 10_000,
+    immediateExitIds: new Set(Object.entries(sidebarStateBySessionId)
+      .filter(([, state]) => state === 'idle' || state === 'needs_attention')
+      .map(([id]) => id)),
+  }), [sidebarNowMs, sidebarStateBySessionId]));
   const workingSessionIds = React.useMemo(
     () => new Set(workingSessions.map(sessionIdOf)),
     [workingSessions],
@@ -7688,9 +7838,29 @@ function App() {
     () => new Set(allPinnedSessions.map(sessionIdOf)),
     [allPinnedSessions],
   );
-  const recentChatOwnership = React.useMemo(
+  const rankedRecentChatOwnership = React.useMemo(
     () => projectRecentChatOwnership(orderedSessions, { workingSessionIds, pinnedSessionIds }),
     [orderedSessions, workingSessionIds, pinnedSessionIds],
+  );
+  const stableRecentCandidates = useStableRecentSessions(
+    [
+      ...rankedRecentChatOwnership.recent,
+      ...rankedRecentChatOwnership.pinned,
+      ...rankedRecentChatOwnership.remaining,
+    ],
+    sidebarStructureLocked,
+  );
+  const stableRecentSessionIds = React.useMemo(
+    () => stableRecentCandidates.map(sessionIdOf),
+    [stableRecentCandidates],
+  );
+  const recentChatOwnership = React.useMemo(
+    () => projectRecentChatOwnership(orderedSessions, {
+      workingSessionIds,
+      pinnedSessionIds,
+      recentSessionIds: stableRecentSessionIds,
+    }),
+    [orderedSessions, workingSessionIds, pinnedSessionIds, stableRecentSessionIds],
   );
   const recentSessions = recentChatOwnership.recent;
   const recentSessionIds = React.useMemo(
@@ -7823,6 +7993,57 @@ function App() {
     collapsedSessionGroups,
     normalizedSidebarSearchQuery,
   ]);
+  const sidebarPayloadFingerprint = `${sidebarStructureKey}\u0001${activeSession || ''}`;
+  if (sidebarPayloadFingerprintRef.current !== sidebarPayloadFingerprint) {
+    sidebarPayloadFingerprintRef.current = sidebarPayloadFingerprint;
+    sidebarPayloadGenerationRef.current += 1;
+  }
+  const writeSidebarScroll = React.useCallback((list, value, reason, options = {}) => {
+    if (!list) return false;
+    const maxScrollTop = Math.max(0, list.scrollHeight - list.clientHeight);
+    const requested = Math.max(0, Math.min(Number(value) || 0, maxScrollTop));
+    const from = list.scrollTop;
+    if (Math.abs(from - requested) < 0.5) return true;
+    if (sidebarScrollFrameLockRef.current) return false;
+    sidebarScrollFrameLockRef.current = true;
+    if (sidebarScrollFrameLockReleaseRef.current) {
+      cancelAnimationFrame(sidebarScrollFrameLockReleaseRef.current);
+    }
+    sidebarScrollFrameLockReleaseRef.current = requestAnimationFrame(() => {
+      sidebarScrollFrameLockRef.current = false;
+      sidebarScrollFrameLockReleaseRef.current = 0;
+    });
+    sidebarExpectedProgrammaticScrollRef.current = { target: requested };
+    setScrollTopInstant(list, requested, {
+      container: 'sidebar',
+      writer: 'sidebar-scroll-coordinator',
+      reason,
+      interactionEpoch: sidebarInteractionEpochRef.current,
+      sessionId: activeSession,
+      anchorId: options.anchorSessionId || null,
+      anchorOffset: options.anchorOffset,
+      payloadGeneration: sidebarPayloadGenerationRef.current,
+    });
+    list.dispatchEvent(new CustomEvent('rac-sidebar-scroll-correction', {
+      detail: {
+        from,
+        to: list.scrollTop,
+        reason,
+        anchorSessionId: options.anchorSessionId || null,
+        explicitSort: options.explicitSort === true,
+        interactionEpoch: sidebarInteractionEpochRef.current,
+        payloadGeneration: sidebarPayloadGenerationRef.current,
+      },
+    }));
+    if (sidebarExpectedProgrammaticScrollFrameRef.current) {
+      cancelAnimationFrame(sidebarExpectedProgrammaticScrollFrameRef.current);
+    }
+    sidebarExpectedProgrammaticScrollFrameRef.current = requestAnimationFrame(() => {
+      sidebarExpectedProgrammaticScrollRef.current = null;
+      sidebarExpectedProgrammaticScrollFrameRef.current = null;
+    });
+    return true;
+  }, [activeSession, sidebarStructureKey]);
   const sidebarCardHostsRef = useRef(new Map());
   const sidebarCardPoolRef = useRef(null);
   const prepareSidebarStructureChange = React.useCallback((previousPlacements, nextPlacements) => {
@@ -7954,19 +8175,16 @@ function App() {
           Math.max(0, list.scrollHeight - list.clientHeight),
         ));
         if (Math.abs(list.scrollTop - clampedTarget) > 0.5) {
-          const from = list.scrollTop;
-          sidebarExpectedProgrammaticScrollRef.current = { target: clampedTarget };
-          list.scrollTop = clampedTarget;
-          list.dispatchEvent(new CustomEvent('rac-sidebar-scroll-correction', {
-            detail: { from, to: list.scrollTop, anchorSessionId, explicitSort: !!explicitSortAnchor },
-          }));
-          if (sidebarExpectedProgrammaticScrollFrameRef.current) {
-            cancelAnimationFrame(sidebarExpectedProgrammaticScrollFrameRef.current);
-          }
-          sidebarExpectedProgrammaticScrollFrameRef.current = requestAnimationFrame(() => {
-            sidebarExpectedProgrammaticScrollRef.current = null;
-            sidebarExpectedProgrammaticScrollFrameRef.current = null;
-          });
+          writeSidebarScroll(
+            list,
+            clampedTarget,
+            explicitSortAnchor ? 'operator-sidebar-sort-anchor' : 'sidebar-structure-anchor',
+            {
+              anchorSessionId,
+              anchorOffset: survivingAnchor?.top,
+              explicitSort: !!explicitSortAnchor,
+            },
+          );
         }
       }
     }
@@ -7986,7 +8204,81 @@ function App() {
         sidebarStructuralTransactionFrameRef.current = null;
       });
     });
-  }, [sidebarPortalSessionIds]);
+  }, [sidebarPortalSessionIds, writeSidebarScroll]);
+  const captureSidebarViewportAnchor = React.useCallback(() => {
+    const list = sidebarListRef.current;
+    if (!list) return null;
+    const listRect = list.getBoundingClientRect();
+    const card = Array.from(list.querySelectorAll('[data-session-id]')).find(node => {
+      const rect = node.getBoundingClientRect();
+      return rect.bottom > listRect.top + 1 && rect.top < listRect.bottom - 1;
+    }) || null;
+    const anchor = card ? {
+      sessionId: card.dataset.sessionId || null,
+      offset: card.getBoundingClientRect().top - listRect.top,
+      interactionEpoch: sidebarInteractionEpochRef.current,
+    } : null;
+    sidebarViewportAnchorRef.current = anchor;
+    return anchor;
+  }, []);
+  React.useLayoutEffect(() => {
+    const list = sidebarListRef.current;
+    if (!list || typeof ResizeObserver === 'undefined') return undefined;
+    captureSidebarViewportAnchor();
+    let correctionFrame = 0;
+    const preserveAnchor = () => {
+      if (correctionFrame) return;
+      correctionFrame = requestAnimationFrame(() => {
+        correctionFrame = 0;
+        const anchor = sidebarViewportAnchorRef.current;
+        if (!anchor || anchor.interactionEpoch !== sidebarInteractionEpochRef.current) {
+          captureSidebarViewportAnchor();
+          return;
+        }
+        const activeList = sidebarListRef.current;
+        const card = activeList && Array.from(activeList.querySelectorAll('[data-session-id]'))
+          .find(node => node.dataset.sessionId === anchor.sessionId);
+        if (!activeList || !card) {
+          captureSidebarViewportAnchor();
+          return;
+        }
+        const currentOffset = card.getBoundingClientRect().top - activeList.getBoundingClientRect().top;
+        const delta = currentOffset - anchor.offset;
+        if (Math.abs(delta) > 0.5) {
+          writeSidebarScroll(activeList, activeList.scrollTop + delta, 'sidebar-row-resize-anchor', {
+            anchorSessionId: anchor.sessionId,
+            anchorOffset: anchor.offset,
+          });
+        }
+        captureSidebarViewportAnchor();
+      });
+    };
+    const resizeObserver = new ResizeObserver(preserveAnchor);
+    const observe = node => {
+      if (node?.nodeType === 1 && node.matches?.('[data-session-id], .session-group-header, .sidebar-order-control')) {
+        resizeObserver.observe(node);
+      }
+      if (node?.nodeType === 1) {
+        node.querySelectorAll?.('[data-session-id], .session-group-header, .sidebar-order-control').forEach(child => resizeObserver.observe(child));
+      }
+    };
+    Array.from(list.children).forEach(observe);
+    const mutationObserver = new MutationObserver(records => {
+      records.forEach(record => {
+        Array.from(record.removedNodes || []).forEach(node => {
+          if (node?.nodeType === 1) resizeObserver.unobserve(node);
+        });
+        Array.from(record.addedNodes || []).forEach(observe);
+      });
+      preserveAnchor();
+    });
+    mutationObserver.observe(list, { childList: true, subtree: true });
+    return () => {
+      mutationObserver.disconnect();
+      resizeObserver.disconnect();
+      if (correctionFrame) cancelAnimationFrame(correctionFrame);
+    };
+  }, [captureSidebarViewportAnchor, writeSidebarScroll]);
   useEffect(() => () => {
     for (const host of sidebarCardHostsRef.current.values()) host.remove();
     sidebarCardHostsRef.current.clear();
@@ -8132,6 +8424,20 @@ function App() {
     () => orderedSessions.find(s => sessionIdOf(s) === activeSession),
     [orderedSessions, activeSession],
   );
+  const hasNativeDraftThread = !!activeSessionMeta?.is_new_chat_draft;
+  const chatRouteActive = !showAutomations
+    && !showSkills
+    && !showUsageDashboard
+    && !showHostResourceDashboard
+    && !showFleetView
+    && !showTranscriptSearch;
+  const activeTranscriptRenderKey = React.useMemo(() => {
+    const focusedThreadId = optimisticThreadFocus[activeSession];
+    const activeThread = (threadLists[activeSession] || []).find(thread => thread?.active);
+    const activeThreadId = activeThread?.cache_key || activeThread?.id;
+    const draftKey = (pendingDraftThreads[activeSession] || hasNativeDraftThread) ? 'draft' : '';
+    return `${activeSession || 'none'}:${draftKey || focusedThreadId || activeThreadId || 'default'}`;
+  }, [activeSession, threadLists, optimisticThreadFocus, pendingDraftThreads, hasNativeDraftThread]);
   const activeMessagesForScroll = activeSession ? activeTranscriptMessages : EMPTY_MESSAGES;
   const activeProvisionalStream = activeSession ? (provisionalStreams[activeSession] || null) : null;
   const activeNativeCliPlaceholder = shouldRefreshNativeCliPlaceholder(activeSessionMeta, activeMessagesForScroll);
@@ -8139,41 +8445,20 @@ function App() {
   const activeThinkingForScroll = activeSession ? (thinkingContent[activeSession] || '') : '';
   const activePermissionPromptForScroll = activeSession ? permissionPrompts[activeSession] || null : null;
   const activeErrorPromptForScroll = activeSession ? errorPrompts[activeSession] || null : null;
-  const activeLiveScrollVersion = React.useMemo(() => {
-    const activity = activeActivityForScroll && typeof activeActivityForScroll === 'object'
-      ? activeActivityForScroll
-      : null;
-    const goal = activity?.goal || null;
-    const tasks = Array.isArray(activity?.task_list?.tasks)
-      ? activity.task_list.tasks.map(task => `${task.state || ''}:${task.text || task.title || task.label || ''}`).join('|')
-      : '';
-    return [
-      activeThinkingForScroll,
-      activity?.kind || '',
-      activity?.label || '',
-      activity?.updatedAt || '',
-      activity?.startedAt || '',
-      activity?.interruptHint || '',
-      activity?.thinkingContent || '',
-      goal?.status || '',
-      goal?.label || '',
-      goal?.objective || '',
-      goal?.time_used_seconds ?? goal?.timeUsedSeconds ?? '',
-      goal?.updated_at || '',
-      tasks,
-      activePermissionPromptForScroll?.id || activePermissionPromptForScroll?.request_id || '',
-      activeErrorPromptForScroll?.id || activeErrorPromptForScroll?.request_id || '',
-      activeProvisionalStream?.messageId || '',
-      activeProvisionalStream?.content?.length || 0,
-      activeProvisionalStream?.open ? 'open' : 'closed',
-    ].join('\u0001');
-  }, [
-    activeActivityForScroll,
-    activeThinkingForScroll,
-    activePermissionPromptForScroll,
-    activeErrorPromptForScroll,
-    activeProvisionalStream,
-  ]);
+  const activeTranscriptSemanticGeometryVersion = [
+    activeSession || '',
+    activeProvisionalStream?.messageId || '',
+    activeProvisionalStream?.content?.length || 0,
+    activeActivityForScroll?.kind || '',
+    activeActivityForScroll?.thinking?.native_source_id || '',
+    activeActivityForScroll?.thinking?.text || activeThinkingForScroll || '',
+    activeActivityForScroll?.current?.native_source_id || '',
+    activeActivityForScroll?.current?.text || activeActivityForScroll?.current?.content || '',
+    activeActivityForScroll?.step?.native_source_id || activeActivityForScroll?.step?.id || '',
+    activeActivityForScroll?.step?.text || activeActivityForScroll?.step?.label || '',
+    activePermissionPromptForScroll?.prompt_id || activePermissionPromptForScroll?.id || '',
+    activeErrorPromptForScroll?.request_id || activeErrorPromptForScroll?.id || '',
+  ].join('\u0001');
   const activeTranscriptArrival = {
     sessionId: activeSession,
     messageCount: activeMessagesForScroll.length,
@@ -8184,8 +8469,15 @@ function App() {
   const messagesListRef = useRef(null);
   const isAtBottom      = useRef(true);   // updated by scroll listener before DOM changes
   const stickyToNewestRef = useRef(true); // false only after an intentional user scroll away from newest
+  const userOwnsTranscriptViewportRef = useRef(false);
   const userScrollIntentUntilRef = useRef(0);
   const programmaticScrollUntilRef = useRef(0);
+  const transcriptInteractionEpochRef = useRef(0);
+  const transcriptPayloadGenerationRef = useRef(0);
+  const transcriptPayloadFingerprintRef = useRef('');
+  const transcriptScrollFrameLockRef = useRef(false);
+  const transcriptScrollFrameLockReleaseRef = useRef(0);
+  const transcriptPendingScrollRef = useRef(null);
   const scrollPinGenerationRef = useRef(0);
   const pinnedToNewestUntilRef = useRef(0);
   const requestOlderHistoryRef = useRef(null);
@@ -8196,6 +8488,7 @@ function App() {
     clearedAt: 0,
   });
   const selectedSessionRef = useRef(activeSession);
+  const scrollListenerSessionRef = useRef(activeSession);
   const scrollSnapshotRef = useRef({
     sessionId: null,
     keys: [],
@@ -8208,6 +8501,7 @@ function App() {
   const routeScrollRestoreFrameRef = useRef(0);
   const textareaRef     = useRef(null);
   const suppressProgrammaticTranscriptScrollRef = useRef(() => false);
+  const transcriptScrollCoordinatorRef = useRef(null);
   const fileInputRef    = useRef(null);
   const transcriptArrivalRef = useRef(activeTranscriptArrival);
   const jumpBaselineRef = useRef(activeTranscriptArrival);
@@ -8217,11 +8511,102 @@ function App() {
   const pendingAttachmentReqs = useRef({});
   const seenAttachmentResults = useRef({});
   transcriptArrivalRef.current = activeTranscriptArrival;
+  const transcriptPayloadFingerprint = [
+    activeSession || '',
+    activeTranscriptArrival.messageCount,
+    activeTranscriptArrival.provisionalId,
+    activeTranscriptArrival.provisionalLength,
+    activePermissionPromptForScroll?.prompt_id || activePermissionPromptForScroll?.id || activePermissionPromptForScroll?.request_id || '',
+    activePermissionPromptForScroll?.generation || '',
+    activeErrorPromptForScroll?.id || activeErrorPromptForScroll?.request_id || '',
+    activeActivityForScroll?.kind || '',
+    activeActivityForScroll?.thinking?.native_source_id || '',
+    activeActivityForScroll?.current?.native_source_id || '',
+  ].join('\u0001');
+  if (transcriptPayloadFingerprintRef.current !== transcriptPayloadFingerprint) {
+    transcriptPayloadFingerprintRef.current = transcriptPayloadFingerprint;
+    transcriptPayloadGenerationRef.current += 1;
+  }
   suppressProgrammaticTranscriptScrollRef.current = () => (
-    !!activePermissionPromptForScroll
-    || (typeof document !== 'undefined' && document.activeElement === textareaRef.current)
+    userOwnsTranscriptViewportRef.current
+    || !!activePermissionPromptForScroll
     || Date.now() < userScrollIntentUntilRef.current
   );
+  transcriptScrollCoordinatorRef.current = (element, value, reason, options = {}) => {
+    if (!element) return false;
+    const reasonText = String(reason || 'unspecified');
+    const allowWhenUserOwned = options.allowWhenUserOwned === true;
+    const allowDuringPrompt = options.allowDuringPrompt === true;
+    // Explicit operator ownership is absolute. Background anchor, resize, and
+    // reconciliation corrections are still scroll writes and must not move the
+    // viewport until the operator deliberately returns to the live edge.
+    if (userOwnsTranscriptViewportRef.current && !allowWhenUserOwned) return false;
+    if (Date.now() < userScrollIntentUntilRef.current && !allowWhenUserOwned) return false;
+    if (activePermissionPromptForScroll && !allowDuringPrompt && !allowWhenUserOwned) return false;
+    if (options.releaseUserOwnership === true) {
+      userOwnsTranscriptViewportRef.current = false;
+      stickyToNewestRef.current = true;
+    } else if (options.takeUserOwnership === true) {
+      const requestedBottomGap = element.scrollHeight - Number(value || 0) - element.clientHeight;
+      userOwnsTranscriptViewportRef.current = requestedBottomGap >= 80;
+      stickyToNewestRef.current = requestedBottomGap < 80;
+    }
+    const from = element.scrollTop;
+    const maxScrollTop = Math.max(0, element.scrollHeight - element.clientHeight);
+    const tailPinned = stickyToNewestRef.current && !userOwnsTranscriptViewportRef.current;
+    const operatorOrRoute = /^(?:operator-|route-|genuine-prompt)/.test(reasonText);
+    const requestedValue = tailPinned && !operatorOrRoute ? element.scrollHeight : value;
+    const requested = Math.max(0, Math.min(Number(requestedValue) || 0, maxScrollTop));
+    if (Math.abs(from - requested) < 0.5) return true;
+    if (transcriptScrollFrameLockRef.current) {
+      transcriptPendingScrollRef.current = { element, value, reason: reasonText, options };
+      return true;
+    }
+    transcriptScrollFrameLockRef.current = true;
+    if (transcriptScrollFrameLockReleaseRef.current) {
+      cancelAnimationFrame(transcriptScrollFrameLockReleaseRef.current);
+    }
+    transcriptScrollFrameLockReleaseRef.current = requestAnimationFrame(() => {
+      transcriptScrollFrameLockRef.current = false;
+      transcriptScrollFrameLockReleaseRef.current = 0;
+      const pending = transcriptPendingScrollRef.current;
+      transcriptPendingScrollRef.current = null;
+      if (pending?.element?.isConnected) {
+        transcriptScrollCoordinatorRef.current?.(
+          pending.element,
+          pending.value,
+          pending.reason,
+          pending.options,
+        );
+      }
+    });
+    programmaticScrollUntilRef.current = Date.now() + 800;
+    setScrollTopInstant(element, requested, {
+      container: 'transcript',
+      writer: 'transcript-scroll-coordinator',
+      reason: reasonText,
+      interactionEpoch: transcriptInteractionEpochRef.current,
+      sessionId: selectedSessionRef.current,
+      anchorId: options.anchorId || null,
+      anchorOffset: options.anchorOffset,
+      payloadGeneration: transcriptPayloadGenerationRef.current,
+    });
+    const observer = typeof window !== 'undefined' ? window.__RAC_TEMPORAL_CANARY__ : null;
+    if (observer?.active) {
+      const writes = observer.transcriptScrollWrites || (observer.transcriptScrollWrites = []);
+      if (writes.length < 10_000) writes.push({
+        at_epoch_ms: Date.now(),
+        session_id: selectedSessionRef.current,
+        reason: reasonText,
+        from,
+        requested,
+        user_owned: userOwnsTranscriptViewportRef.current,
+        interaction_epoch: transcriptInteractionEpochRef.current,
+        payload_generation: transcriptPayloadGenerationRef.current,
+      });
+    }
+    return true;
+  };
 
   useLayoutEffect(() => {
     selectedSessionRef.current = activeSession;
@@ -8376,20 +8761,30 @@ function App() {
   useEffect(() => {
     const list = messagesListRef.current;
     if (!list) return;
+    const sessionChanged = scrollListenerSessionRef.current !== activeSession;
+    scrollListenerSessionRef.current = activeSession;
+    if (sessionChanged) {
+      userOwnsTranscriptViewportRef.current = false;
+      stickyToNewestRef.current = true;
+    }
     let touchStartY = null;
-    const markUserScrollAwayIntent = () => {
+    const markUserScrollAwayIntent = (takeOwnership = true) => {
       userScrollIntentUntilRef.current = Date.now() + 1200;
+      transcriptInteractionEpochRef.current += 1;
       // A real wheel/touch/scrollbar gesture must take precedence immediately,
       // even if it lands during the short guard for our previous auto-scroll.
       programmaticScrollUntilRef.current = 0;
       scrollPinGenerationRef.current += 1;
+      if (takeOwnership) userOwnsTranscriptViewportRef.current = true;
       if (stickyToNewestRef.current) {
         jumpBaselineRef.current = transcriptArrivalRef.current;
         setNewMessagesBelow(0);
       }
     };
     const onWheel = (event) => {
-      if (event.deltaY < -1) markUserScrollAwayIntent();
+      if (Math.abs(event.deltaY) <= 1) return;
+      const atBottom = list.scrollHeight - list.scrollTop - list.clientHeight < 80;
+      markUserScrollAwayIntent(event.deltaY < 0 || !atBottom);
     };
     const onPointerDown = (event) => {
       const rect = list.getBoundingClientRect();
@@ -8400,10 +8795,19 @@ function App() {
     };
     const onTouchMove = (event) => {
       const y = event.touches?.[0]?.clientY ?? null;
-      if (touchStartY != null && y != null && y - touchStartY > 4) markUserScrollAwayIntent();
+      if (touchStartY != null && y != null && Math.abs(y - touchStartY) > 4) {
+        const atBottom = list.scrollHeight - list.scrollTop - list.clientHeight < 80;
+        markUserScrollAwayIntent(y > touchStartY || !atBottom);
+      }
     };
     const onKeyDown = (event) => {
-      if (['ArrowUp', 'PageUp', 'Home'].includes(event.key)) markUserScrollAwayIntent();
+      const target = event.target;
+      if (target?.closest?.('textarea, input, [contenteditable="true"]')) return;
+      if (['ArrowUp', 'ArrowDown', 'PageUp', 'PageDown', 'Home', 'End', ' '].includes(event.key)) {
+        const atBottom = list.scrollHeight - list.scrollTop - list.clientHeight < 80;
+        const movesAway = ['ArrowUp', 'PageUp', 'Home'].includes(event.key);
+        markUserScrollAwayIntent(movesAway || !atBottom);
+      }
     };
     const onScroll = () => {
       const atBottom = list.scrollHeight - list.scrollTop - list.clientHeight < 80;
@@ -8413,8 +8817,10 @@ function App() {
       isAtBottom.current = atBottom;
       if (atBottom) {
         stickyToNewestRef.current = true;
+        if (userInitiated && !programmatic) userOwnsTranscriptViewportRef.current = false;
       } else if (userInitiated && !programmatic) {
         stickyToNewestRef.current = false;
+        userOwnsTranscriptViewportRef.current = true;
         pinnedToNewestUntilRef.current = 0;
       }
       if (userInitiated && !programmatic && list.scrollTop < 160) {
@@ -8442,10 +8848,16 @@ function App() {
       list.removeEventListener('touchmove', onTouchMove);
       list.removeEventListener('pointerdown', onPointerDown);
       window.removeEventListener('keydown', onKeyDown);
+      if (transcriptScrollFrameLockReleaseRef.current) {
+        cancelAnimationFrame(transcriptScrollFrameLockReleaseRef.current);
+        transcriptScrollFrameLockReleaseRef.current = 0;
+      }
+      transcriptScrollFrameLockRef.current = false;
+      transcriptPendingScrollRef.current = null;
     };
-  }, [activeSession]); // the keyed transcript element is replaced on session switches
+  }, [activeSession, activeTranscriptRenderKey, chatRouteActive]);
 
-  function stickTranscriptToNewest(keys, frameCount = 2) {
+  function stickTranscriptToNewest(keys, frameCount = 0, { operatorInitiated = false } = {}) {
     const sessionAtStart = activeSession;
     const pinGeneration = scrollPinGenerationRef.current + 1;
     scrollPinGenerationRef.current = pinGeneration;
@@ -8453,12 +8865,19 @@ function App() {
       const list = messagesListRef.current;
       if (!list
         || selectedSessionRef.current !== sessionAtStart
-        || scrollPinGenerationRef.current !== pinGeneration
-        || suppressProgrammaticTranscriptScrollRef.current()) return false;
-      programmaticScrollUntilRef.current = Date.now() + 800;
+        || scrollPinGenerationRef.current !== pinGeneration) return false;
+      const wrote = transcriptScrollCoordinatorRef.current?.(
+        list,
+        list.scrollHeight,
+        operatorInitiated ? 'operator-jump-to-live-edge' : 'live-edge-pin',
+        operatorInitiated ? {
+          allowWhenUserOwned: true,
+          releaseUserOwnership: true,
+        } : {},
+      );
+      if (!wrote) return false;
       stickyToNewestRef.current = true;
       jumpBaselineRef.current = transcriptArrivalRef.current;
-      setScrollTopInstant(list, list.scrollHeight);
       isAtBottom.current = true;
       setShowJumpButton(false);
       setNewMessagesBelow(0);
@@ -8487,7 +8906,7 @@ function App() {
     if (!list) return;
     const keys = scrollIdentityKeysForMessages(activeMessagesForScroll);
     pinnedToNewestUntilRef.current = Date.now() + 5000;
-    stickTranscriptToNewest(keys, 4);
+    stickTranscriptToNewest(keys, 2, { operatorInitiated: true });
   }
 
   // Keep transcript hydration visually stable. Tail chunks should land at the
@@ -8528,36 +8947,44 @@ function App() {
     if (suppressProgrammaticScroll) {
       // Open prompts, composer focus, and recent manual interaction own the
       // viewport. Update the observation snapshot below without writing it.
-    } else if (sameRenderedKeys && !forcePinnedToNewest && !wasAtBottom) {
-      // Older hydration chunks often change the backing array without changing
-      // the rendered tail window. Leave scrollTop alone so the browser does not
-      // visibly bounce while history backfills in the background.
+    } else if (sameRenderedKeys && !forcePinnedToNewest) {
+      // Status/config/heartbeat refreshes often rebuild backing objects while
+      // retaining the exact rendered transcript identity. They never own the
+      // viewport. Real geometry changes are handled once by the ResizeObserver
+      // below, which follows only an already tail-pinned operator intent.
     } else if (!sameSession) {
       setTranscriptPreview(null);
-      stickTranscriptToNewest(keys, 3);
+      userOwnsTranscriptViewportRef.current = false;
+      stickyToNewestRef.current = true;
+      stickTranscriptToNewest(keys, 1);
     } else if (olderPrepended) {
       stickyToNewestRef.current = false;
       pinnedToNewestUntilRef.current = 0;
       if (list.dataset.transcriptWindowed !== 'true') {
         const heightDelta = list.scrollHeight - (Number(prev.scrollHeight) || 0);
-        programmaticScrollUntilRef.current = Date.now() + 500;
-        setScrollTopInstant(list, Math.max(0, (Number(prev.scrollTop) || 0) + heightDelta));
         const anchor = nonWindowedPrependAnchorRef.current;
         const anchorRow = anchor
           ? Array.from(list.querySelectorAll('.message[data-message-key]'))
               .find(row => row.dataset.messageKey === anchor.messageKey)
           : null;
+        let target = Math.max(0, (Number(prev.scrollTop) || 0) + heightDelta);
+        let reason = 'history-prepend-compensation';
         if (anchorRow) {
           const currentViewportTop = anchorRow.getBoundingClientRect().top;
           const correction = currentViewportTop - anchor.viewportTop;
           if (Math.abs(correction) >= 0.5) {
-            setScrollTopInstant(list, Math.max(0, list.scrollTop + correction));
+            target = Math.max(0, list.scrollTop + correction);
+            reason = 'history-prepend-anchor-correction';
           }
         }
+        transcriptScrollCoordinatorRef.current?.(list, target, reason, {
+          anchorId: anchor?.messageKey || null,
+          anchorOffset: anchor?.viewportTop,
+        });
         nonWindowedPrependAnchorRef.current = null;
       }
     } else if (wasAtBottom) {
-      stickTranscriptToNewest(keys, 3);
+      stickTranscriptToNewest(keys);
     }
 
     const atBottom = list.scrollHeight - list.scrollTop - list.clientHeight < 80;
@@ -8574,7 +9001,20 @@ function App() {
       clientHeight: list.clientHeight,
       atBottom: atBottom || stickyToNewestRef.current,
     };
-  }, [activeSession, activeMessagesForScroll, activeLiveScrollVersion]);
+  }, [activeSession, activeMessagesForScroll]);
+
+  React.useLayoutEffect(() => {
+    const list = messagesListRef.current;
+    if (!list
+        || userOwnsTranscriptViewportRef.current
+        || !stickyToNewestRef.current
+        || activePermissionPromptForScroll) return;
+    transcriptScrollCoordinatorRef.current?.(
+      list,
+      list.scrollHeight,
+      'live-edge-semantic-geometry',
+    );
+  }, [activeSession, activeTranscriptSemanticGeometryVersion]);
 
   // Fetch agent config whenever the active session changes
   useEffect(() => {
@@ -9310,18 +9750,13 @@ async function uploadBinaryDraft(sessionId, base64, mimeType, filename) {
   const renderedMessages = React.useMemo(() => {
     return currentMessages.filter(msg => hasVisibleMessage(msg));
   }, [currentMessages]);
-  const chatRouteActive = !showAutomations
-    && !showSkills
-    && !showUsageDashboard
-    && !showHostResourceDashboard
-    && !showFleetView
-    && !showTranscriptSearch;
   const transcriptWindow = useTranscriptWindow({
     messages: renderedMessages,
     containerRef: messagesListRef,
     sessionId: activeSession,
     routeActive: chatRouteActive,
     suppressProgrammaticScrollRef: suppressProgrammaticTranscriptScrollRef,
+    scrollCoordinatorRef: transcriptScrollCoordinatorRef,
   });
   const captureChatRouteScroll = React.useCallback(() => {
     const list = messagesListRef.current;
@@ -9347,8 +9782,10 @@ async function uploadBinaryDraft(sessionId, base64, mimeType, filename) {
       const target = pending.atBottom
         ? activeList.scrollHeight
         : Math.min(pending.scrollTop, Math.max(0, activeList.scrollHeight - activeList.clientHeight));
-      programmaticScrollUntilRef.current = Date.now() + 800;
-      setScrollTopInstant(activeList, target);
+      transcriptScrollCoordinatorRef.current?.(activeList, target, 'route-scroll-restore', {
+        allowWhenUserOwned: true,
+        retainUserOwnership: true,
+      });
     };
     restore();
     routeScrollRestoreFrameRef.current = requestAnimationFrame(() => {
@@ -9364,6 +9801,7 @@ async function uploadBinaryDraft(sessionId, base64, mimeType, filename) {
     if (!renderProfileEnabled) return undefined;
     window.__RAC_TRANSCRIPT_WINDOW__ = {
       total: renderedMessages.length,
+      messageKeys: renderedMessages.map((message, index) => messageIdentityKey(message, index)),
       scrollToIndex: transcriptWindow.scrollToIndex,
     };
     return () => {
@@ -9371,7 +9809,7 @@ async function uploadBinaryDraft(sessionId, base64, mimeType, filename) {
         delete window.__RAC_TRANSCRIPT_WINDOW__;
       }
     };
-  }, [renderedMessages.length, transcriptWindow.scrollToIndex]);
+  }, [renderedMessages, transcriptWindow.scrollToIndex]);
   const activePrompt    = activeSession ? permissionPrompts[activeSession] || null : null;
   const activeErrorPrompt = activeSession ? errorPrompts[activeSession] || null : null;
   const activeBlockingErrorPrompt = isBlockingErrorPrompt(activeErrorPrompt) ? activeErrorPrompt : null;
@@ -9410,14 +9848,17 @@ async function uploadBinaryDraft(sessionId, base64, mimeType, filename) {
     scrollPinGenerationRef.current += 1;
     pinnedToNewestUntilRef.current = 0;
     stickyToNewestRef.current = false;
-    const operatorOwnsViewport = document.activeElement === textareaRef.current
+    const operatorOwnsViewport = userOwnsTranscriptViewportRef.current
+      || document.activeElement === textareaRef.current
       || now < userScrollIntentUntilRef.current;
     if (operatorOwnsViewport) return;
 
     // A genuinely new, settled prompt receives one initial reveal. Semantic
     // continuity makes producer re-keys and short snapshot omissions no-ops.
-    programmaticScrollUntilRef.current = now + 800;
-    setScrollTopInstant(list, 0);
+    const revealed = transcriptScrollCoordinatorRef.current?.(list, 0, 'genuine-prompt-reveal', {
+      allowDuringPrompt: true,
+    });
+    if (!revealed) return;
     isAtBottom.current = list.scrollHeight - list.clientHeight < 80;
     setShowJumpButton(false);
     setNewMessagesBelow(0);
@@ -9539,7 +9980,7 @@ async function uploadBinaryDraft(sessionId, base64, mimeType, filename) {
       const row = messagesListRef.current?.querySelector(selector);
       if (row) {
         clearInterval(timer);
-        row.scrollIntoView({ block: 'center', behavior: 'instant' });
+        if (targetIndex >= 0) transcriptWindow.scrollToIndex(targetIndex, 'center');
         clearHighlightTimer = setTimeout(() => {
           setTranscriptSearchTarget(current => (
             current?.sessionId === activeSession
@@ -9800,6 +10241,7 @@ async function uploadBinaryDraft(sessionId, base64, mimeType, filename) {
     activeActivity
     && (
       activeActivity?.goal
+      || activeActivity?.connection
       || activeActivity?.thinking
       || activeActivity?.current
       || activeActivity?.step
@@ -9809,10 +10251,20 @@ async function uploadBinaryDraft(sessionId, base64, mimeType, filename) {
       || hasSubstantiveLiveText(liveThinkingText || activeActivity.thinkingContent || '')
     )
   );
+  const activeHistoryHasOlderCursor = !!(
+    activeHistoryMeta?.cursor
+    && (
+      activeHistoryMeta.cursor.next_before_offset != null
+      || activeHistoryMeta.cursor.next_before_id != null
+    )
+  );
   const showPartialHistoryBanner = !!(
     activeSession
     && activeHistoryMeta?.partial
-    && Number(activeHistoryMeta.total || 0) > Number(activeHistoryMeta.loaded || currentMessages.length || 0)
+    && (
+      activeHistoryHasOlderCursor
+      || Number(activeHistoryMeta.total || 0) > Number(activeHistoryMeta.loaded || currentMessages.length || 0)
+    )
   );
   const partialHistoryLoaded = Number(activeHistoryMeta?.loaded || currentMessages.length || 0);
   const partialHistoryTotal = Number(activeHistoryMeta?.total || partialHistoryLoaded || 0);
@@ -9943,7 +10395,6 @@ async function uploadBinaryDraft(sessionId, base64, mimeType, filename) {
   ]);
   // Auto-fetch thread list for desktop sessions with no messages (e.g. Codex Desktop showing chat picker)
   const hasThreadCap = activeConfig?.capabilities?.thread_list;
-  const hasNativeDraftThread = !!activeSessionMeta?.is_new_chat_draft;
   const showDesktopThreadTabs = !!(
     activeSession
     && (activeSessionMeta?.agent_type === 'codex-desktop' || activeSessionMeta?.agent_type === 'cursor')
@@ -9963,13 +10414,41 @@ async function uploadBinaryDraft(sessionId, base64, mimeType, filename) {
     }
     return list;
   }, [activeSession, threadLists, optimisticThreadFocus]);
-  const activeTranscriptRenderKey = React.useMemo(() => {
-    const focusedThreadId = optimisticThreadFocus[activeSession];
-    const activeThread = (threadLists[activeSession] || []).find(thread => thread?.active);
-    const activeThreadId = activeThread?.cache_key || activeThread?.id;
-    const draftKey = (pendingDraftThreads[activeSession] || hasNativeDraftThread) ? 'draft' : '';
-    return `${activeSession || 'none'}:${draftKey || focusedThreadId || activeThreadId || 'default'}`;
-  }, [activeSession, threadLists, optimisticThreadFocus, pendingDraftThreads, hasNativeDraftThread]);
+  React.useLayoutEffect(() => {
+    if (!chatRouteActive || typeof ResizeObserver === 'undefined') return undefined;
+    const list = messagesListRef.current;
+    if (!list) return undefined;
+    const sessionAtStart = activeSession;
+    const followLiveEdge = () => {
+      if (selectedSessionRef.current !== sessionAtStart
+          || userOwnsTranscriptViewportRef.current
+          || !stickyToNewestRef.current) return;
+      // ResizeObserver runs after layout and before paint. Route the single
+      // correction directly through the frame-locked coordinator so a genuine
+      // tail append cannot expose a one-frame bottom gap.
+      transcriptScrollCoordinatorRef.current?.(list, list.scrollHeight, 'live-edge-resize-follow');
+    };
+    const resizeObserver = new ResizeObserver(followLiveEdge);
+    resizeObserver.observe(list);
+    const observe = node => {
+      if (node?.nodeType === 1) resizeObserver.observe(node);
+    };
+    Array.from(list.children).forEach(observe);
+    const mutationObserver = new MutationObserver(records => {
+      for (const record of records) {
+        Array.from(record.removedNodes || []).forEach(node => {
+          if (node?.nodeType === 1) resizeObserver.unobserve(node);
+        });
+        Array.from(record.addedNodes || []).forEach(observe);
+      }
+      followLiveEdge();
+    });
+    mutationObserver.observe(list, { childList: true });
+    return () => {
+      mutationObserver.disconnect();
+      resizeObserver.disconnect();
+    };
+  }, [activeSession, activeTranscriptRenderKey, chatRouteActive]);
   const noMessages = currentMessages.length === 0;
   React.useEffect(() => {
     if (activeSession && hasThreadCap && noMessages) {
@@ -10544,9 +11023,11 @@ async function uploadBinaryDraft(sessionId, base64, mimeType, filename) {
             const expected = sidebarExpectedProgrammaticScrollRef.current;
             if (expected && Math.abs(event.currentTarget.scrollTop - expected.target) <= 0.5) {
               sidebarExpectedProgrammaticScrollRef.current = null;
+              captureSidebarViewportAnchor();
               return;
             }
             sidebarInteractionEpochRef.current += 1;
+            captureSidebarViewportAnchor();
             beginSidebarInteraction();
             endSidebarInteraction(180);
           }}
@@ -11332,7 +11813,11 @@ async function uploadBinaryDraft(sessionId, base64, mimeType, filename) {
           )}
           {showPartialHistoryBanner && (
             <div className="history-tail-banner">
-              <span>Showing latest {partialHistoryLoaded.toLocaleString()} of {partialHistoryTotal.toLocaleString()} messages</span>
+              <span>
+                {partialHistoryTotal > partialHistoryLoaded
+                  ? <>Showing latest {partialHistoryLoaded.toLocaleString()} of {partialHistoryTotal.toLocaleString()} messages</>
+                  : <>Showing latest {partialHistoryLoaded.toLocaleString()} messages</>}
+              </span>
               <button type="button" onClick={loadOlderActiveHistory} disabled={!!activeHistoryLoading}>
                 {activeHistoryLoading ? 'Loading older messages...' : 'Load older messages'}
               </button>

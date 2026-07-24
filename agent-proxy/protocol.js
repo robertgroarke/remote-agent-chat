@@ -250,6 +250,7 @@ function historySnapshot(sessionId, messages, options = {}) {
   }
   if (options.resyncId) snapshot.resync_id = String(options.resyncId);
   if (options.resyncReason) snapshot.resync_reason = String(options.resyncReason);
+  if (options.replaceAll === true) snapshot.replace_all = true;
   if (options.source) snapshot.source = String(options.source);
   if (options.sourceCursor && typeof options.sourceCursor === 'object') snapshot.source_cursor = options.sourceCursor;
   if (Number.isFinite(Number(options.sourceBytes))) snapshot.source_bytes = Number(options.sourceBytes);

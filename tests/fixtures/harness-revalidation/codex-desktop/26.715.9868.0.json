@@ -1,0 +1,39 @@
+{
+  "schema_version": 1,
+  "harness": "codex-desktop",
+  "installed_version": "26.715.9868.0",
+  "captured_contract": "Desktop transcript, composer, question, goal, native stop, active-thread and persisted user-turn receipt selectors",
+  "source": "installed read-only active-thread loopback CDP probe",
+  "reader_contract": {
+    "conversation_selector": "[data-thread-find-target=\"conversation\"]",
+    "unit_selector": "[data-content-search-unit-key]",
+    "role_source": "terminal data-content-search-unit-key segment",
+    "turn_identity_source": "UUIDv7 data-content-search-unit-key prefix",
+    "observed_units": 28,
+    "observed_conversations": 1,
+    "active_thread_required": true
+  },
+  "composer_contract": {
+    "input_selector": ".ProseMirror[data-codex-composer=\"true\"]",
+    "root_selector": ".composer-surface-chrome",
+    "visible_inputs": 1,
+    "visible_buttons": 5,
+    "submit_candidates": 2,
+    "submit_present": true,
+    "empty_at_probe": true
+  },
+  "write_contracts": {
+    "send_message": {
+      "status": "read_only_compatible",
+      "commands": [
+        "send",
+        "send_message",
+        "message_send"
+      ],
+      "scope": "current_visible_thread",
+      "evidence": "Exact-version visible composer/root/submit selectors plus synthetic receipt and duplicate-suppression regressions",
+      "does_not_claim_live_delivery": true
+    }
+  },
+  "content_safe_evidence_sha256": "d13f532dc129c757ff8c3dd5d3bf19aafa4f727ea8bcf111f9c5c34abc8e350a"
+}

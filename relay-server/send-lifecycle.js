@@ -63,13 +63,27 @@ class SendLifecycleTracker {
       return null;
     }
     this.pending.delete(sessionId);
+    const deliveredAtMs = Date.parse(pending.deliveredAt || '');
+    const nativeStartedAt = message.activity?.started_at || message.activity?.updated_at || '';
+    const nativeStartedAtMs = Date.parse(nativeStartedAt);
+    // A proxy may keep broadcasting an old active activity while a new send is
+    // accepted. Never attach that previous turn's producer clock to the new
+    // client's terminal receipt. If the native clock predates delivery (or is
+    // absent), the relay observation time is the first truthful lower bound.
+    const observedStartedAtMs = Number.isFinite(nativeStartedAtMs)
+      && (!Number.isFinite(deliveredAtMs) || nativeStartedAtMs >= deliveredAtMs)
+      ? nativeStartedAtMs
+      : this.now();
+    const startedAtMs = Number.isFinite(deliveredAtMs)
+      ? Math.max(deliveredAtMs, observedStartedAtMs)
+      : observedStartedAtMs;
     return {
       type: 'agent_started',
       protocol_version: 1,
       session_id: sessionId,
       client_message_id: pending.clientMessageId,
       delivered_at: pending.deliveredAt,
-      started_at: message.activity?.started_at || new Date(this.now()).toISOString(),
+      started_at: new Date(startedAtMs).toISOString(),
       activity: typeof message.activity === 'object'
         ? message.activity
         : { kind: activityKind || 'working' },

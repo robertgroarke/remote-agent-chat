@@ -15,7 +15,7 @@
       "capability_gate": true
     },
     "claude-cli": {
-      "fixture": "tests/fixtures/harness-revalidation/claude-cli/2.1.207 (Claude Code).json",
+      "fixture": "tests/fixtures/harness-revalidation/claude-cli/2.1.217 (Claude Code).json",
       "tier1": ["node", "tools/claude-cli-validate-all.js", "--read-only"],
       "tier2": { "mode": "gated", "reason": "no owned disposable Claude CLI mutation target is configured", "weekday": 3 },
       "capability_gate": true
@@ -27,13 +27,13 @@
       "capability_gate": true
     },
     "codex-cli": {
-      "fixture": "tests/fixtures/harness-revalidation/codex-cli/codex-cli 0.144.6.json",
+      "fixture": "tests/fixtures/harness-revalidation/codex-cli/codex-cli 0.145.0.json",
       "tier1": ["node", "tools/codex-cli-validate-all.js", "--read-only"],
-      "tier2": { "mode": "gated", "reason": "no owned disposable Codex CLI session is configured for scheduled mutation", "weekday": 5 },
+      "tier2": { "mode": "owned_disposable", "command": ["node", "tools/codex-cli-app-server-turn-live-e2e.js"], "weekday": 5 },
       "capability_gate": true
     },
     "codex-desktop": {
-      "fixture": "tests/fixtures/harness-revalidation/codex-desktop/26.715.8383.0.json",
+      "fixture": "tests/fixtures/harness-revalidation/codex-desktop/26.715.10079.0.json",
       "tier1": ["node", "tools/codex-desktop-validate-all.js", "--read-only"],
       "tier2": { "mode": "owned_disposable", "command": ["node", "tools/codex-desktop-validate-all.js", "--send-live"], "weekday": 6 },
       "capability_gate": true

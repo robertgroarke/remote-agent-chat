@@ -1,5 +1,10 @@
 'use strict';
 
+function hasMemoryCitationBlock(row) {
+  return Array.isArray(row?.content_blocks)
+    && row.content_blocks.some(block => block?.type === 'memory_citation');
+}
+
 function historyRowsMatch(existingRows, incomingRows) {
   if (!Array.isArray(existingRows) || !Array.isArray(incomingRows)) return false;
   if (existingRows.length !== incomingRows.length) return false;
@@ -10,6 +15,10 @@ function historyRowsMatch(existingRows, incomingRows) {
       if (existing.source_message_id !== incoming.source_message_id) return false;
     }
     if (existing.role !== incoming.role || existing.content !== incoming.content) return false;
+    // A delayed provisional replay must not erase a citation enrichment that
+    // already landed for the same producer identity.
+    if (existing.source_message_id === incoming.source_message_id
+        && hasMemoryCitationBlock(existing) && !hasMemoryCitationBlock(incoming)) continue;
     const existingBlocks = JSON.stringify(existing.content_blocks || null);
     const incomingBlocks = JSON.stringify(Array.isArray(incoming.content_blocks) ? incoming.content_blocks : null);
     if (existingBlocks !== incomingBlocks) return false;

@@ -36,6 +36,10 @@ export default function ActivityRow({ activity, agentType }) {
         since: startedAt,
       }
     : null);
+  const connection = activity?.connection || null;
+  const interruption = activity?.interruption?.resolution_state === 'unresolved'
+    ? activity.interruption
+    : null;
   const goal = activity?.goal || null;
   const goalRun = activity?.goal_run || null;
   const step = activity?.step || null;
@@ -54,7 +58,7 @@ export default function ActivityRow({ activity, agentType }) {
 
   if (!activity) return null;
 
-  if (activity.rate_limited_until && !usage) {
+  if (activity.rate_limited_until && !usage && !connection) {
     return <RateLimitRow until={activity.rate_limited_until} />;
   }
 
@@ -65,10 +69,47 @@ export default function ActivityRow({ activity, agentType }) {
   const currentElapsed = current ? formatElapsed(current.since || startedAt, nowMs) : '';
   const nativeGlyph = nativeStatusGlyph(agentType);
   const nativeLabel = thinking?.label || activity?.label || 'Thinking';
-  if (!goal && !thinking && !current && !step && !usage && planTasks.length === 0) return null;
+  if (!goal && !thinking && !current && !connection && !interruption && !step && !usage && planTasks.length === 0) return null;
 
   return (
     <View style={s.stack} testID="live-status-stack">
+      {interruption ? (
+        <View
+          style={s.interruptionChannel}
+          testID="native-interruption-row"
+          accessibilityRole={interruption.blocking ? 'alert' : 'text'}
+          accessibilityLiveRegion={interruption.blocking ? 'assertive' : 'polite'}
+          accessibilityLabel={`${interruption.title || 'Harness interruption'}. ${interruption.safe_display_text || ''}`}
+        >
+          <View style={s.heading}>
+            <Text style={s.interruptionIcon}>!</Text>
+            <Text style={s.interruptionTitle}>{interruption.title || 'Harness interruption'}</Text>
+            {interruption.blocking ? <Text style={s.interruptionAttention}>Needs attention</Text> : null}
+          </View>
+          {interruption.safe_display_text ? (
+            <Text style={s.interruptionDetail} selectable>{interruption.safe_display_text}</Text>
+          ) : null}
+          <Text style={s.interruptionMeta}>
+            {[
+              interruption.native_timestamp ? new Date(interruption.native_timestamp).toLocaleString() : '',
+              interruption.retryable ? 'Retry may be available in the native harness' : 'Open the native session for recovery',
+            ].filter(Boolean).join(' · ')}
+          </Text>
+        </View>
+      ) : null}
+      {connection ? (
+        <View
+          style={[s.connectionChannel, connection.state === 'failed' && s.connectionFailed, connection.state === 'reconnected' && s.connectionRecovered]}
+          testID="native-connection-row"
+          accessibilityRole={connection.state === 'failed' ? 'alert' : 'text'}
+          accessibilityLiveRegion={connection.state === 'failed' ? 'assertive' : 'polite'}
+          accessibilityLabel={`Codex native connection. ${connection.label || 'Connection status'}`}
+        >
+          <Text style={[s.connectionIcon, connection.state === 'failed' && s.connectionIconFailed]}>{'⌁'}</Text>
+          <Text style={s.connectionLabel}>{connection.label || 'Native connection status'}</Text>
+          {connection.state === 'failed' ? <Text style={s.connectionAttention}>Needs attention</Text> : null}
+        </View>
+      ) : null}
       {current ? (
         <View style={current.kind === 'tool' ? s.currentTool : s.currentNarration}>
           {current.kind === 'tool' ? (
@@ -235,6 +276,47 @@ const s = StyleSheet.create({
     paddingVertical: 5,
     paddingHorizontal: 2,
   },
+  interruptionChannel: {
+    paddingVertical: 9,
+    paddingHorizontal: 10,
+    borderWidth: 1,
+    borderColor: '#8f3d3a',
+    borderRadius: 9,
+    backgroundColor: '#251414',
+  },
+  interruptionIcon: {
+    width: 18,
+    height: 18,
+    borderRadius: 9,
+    overflow: 'hidden',
+    textAlign: 'center',
+    textAlignVertical: 'center',
+    color: '#ff7b72',
+    backgroundColor: '#4a1e1c',
+    fontSize: 12,
+    fontWeight: '800',
+  },
+  interruptionTitle: { color: '#ffd5d2', fontSize: 12, fontWeight: '700', flexShrink: 1 },
+  interruptionAttention: { color: '#ff7b72', fontSize: 10, marginLeft: 'auto' },
+  interruptionDetail: { color: '#f0f3f6', fontSize: 12, lineHeight: 17, marginTop: 6 },
+  interruptionMeta: { color: '#b8a1a0', fontSize: 10, lineHeight: 14, marginTop: 5 },
+  connectionChannel: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: 7,
+    paddingVertical: 8,
+    paddingHorizontal: 10,
+    borderWidth: 1,
+    borderColor: '#315f8f',
+    borderRadius: 9,
+    backgroundColor: '#111a24',
+  },
+  connectionFailed: { borderColor: '#8f3d3a', backgroundColor: '#251414' },
+  connectionRecovered: { borderColor: '#2f6f40', backgroundColor: '#111f16' },
+  connectionIcon: { color: '#79c0ff', fontSize: 17, lineHeight: 18 },
+  connectionIconFailed: { color: '#ff7b72' },
+  connectionLabel: { color: '#f0f3f6', fontSize: 12, fontWeight: '700', flexShrink: 1 },
+  connectionAttention: { color: '#ff7b72', fontSize: 10, marginLeft: 'auto' },
   narrationText: {
     color: '#f0f3f6',
     fontSize: 13,

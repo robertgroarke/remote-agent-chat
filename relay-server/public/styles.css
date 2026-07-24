@@ -2753,6 +2753,89 @@ details.content-block {
   font-size: 11.5px;
 }
 
+.live-native-interruption-row {
+  min-width: 0;
+  margin: 2px 0;
+  padding: 10px 12px;
+  border: 1px solid color-mix(in srgb, var(--border) 58%, #f85149 42%);
+  border-radius: 10px;
+  background: color-mix(in srgb, var(--bg2) 86%, #f85149 14%);
+  color: var(--text);
+}
+
+.live-native-interruption-heading {
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  min-width: 0;
+}
+
+.live-native-interruption-icon {
+  display: inline-grid;
+  place-items: center;
+  flex: 0 0 18px;
+  width: 18px;
+  height: 18px;
+  border-radius: 50%;
+  background: color-mix(in srgb, #f85149 24%, transparent);
+  color: var(--danger, #f85149);
+  font: 800 12px/1 system-ui, sans-serif;
+}
+
+.live-native-interruption-heading .live-status-meta {
+  margin-left: auto;
+  color: var(--danger, #f85149);
+}
+
+.live-native-interruption-detail {
+  margin-top: 6px;
+  overflow-wrap: anywhere;
+  color: var(--text);
+  font-size: 11.5px;
+  line-height: 1.45;
+}
+
+.live-native-interruption-meta {
+  margin-top: 5px;
+  color: var(--text2);
+  font-size: 10.5px;
+  line-height: 1.35;
+}
+
+.live-native-connection-row {
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  min-width: 0;
+  margin: 2px 0;
+  padding: 8px 12px;
+  border: 1px solid color-mix(in srgb, var(--border) 74%, #58a6ff 26%);
+  border-radius: 10px;
+  background: color-mix(in srgb, var(--bg2) 91%, #58a6ff 9%);
+  color: var(--text);
+}
+
+.live-native-connection-row.reconnected {
+  border-color: color-mix(in srgb, var(--border) 72%, #3fb950 28%);
+  background: color-mix(in srgb, var(--bg2) 92%, #3fb950 8%);
+}
+
+.live-native-connection-row.failed {
+  border-color: color-mix(in srgb, var(--border) 62%, #f85149 38%);
+  background: color-mix(in srgb, var(--bg2) 88%, #f85149 12%);
+}
+
+.live-native-connection-icon {
+  flex: 0 0 auto;
+  color: #58a6ff;
+  font-size: 17px;
+  line-height: 1;
+}
+
+.live-native-connection-row.failed .live-native-connection-icon { color: #f85149; }
+.live-native-connection-row .live-status-label { min-width: 0; }
+.live-native-connection-row .live-status-meta { margin-left: auto; color: var(--danger, #f85149); }
+
 .live-step-wrap {
   display: flex;
   justify-content: center;

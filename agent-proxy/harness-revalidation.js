@@ -25,6 +25,7 @@ const AGENT_TYPE_TO_HARNESS = Object.freeze({
 });
 
 const WRITE_CAPABILITY_KEYS = Object.freeze([
+  'send', 'send_message', 'message_send',
   'interrupt', 'goal_pause_resume', 'set_model', 'set_mode', 'permission_mode_change',
   'auto_approve_permissions_toggle', 'permission_dialogs', 'question_prompts',
   'set_codex_config', 'codex_model_change', 'codex_effort_change', 'codex_access_change',
@@ -34,8 +35,13 @@ const WRITE_CAPABILITY_KEYS = Object.freeze([
   'create_branch', 'open_panel',
 ]);
 
+const WRITE_COMMAND_ALIASES = Object.freeze({
+  send: 'send_message',
+  message_send: 'send_message',
+});
+
 const WRITE_COMMANDS = new Set([
-  'send_message', 'send', 'steer', 'discard_queued', 'edit_queued',
+  'send_message', 'send', 'message_send', 'steer', 'discard_queued', 'edit_queued',
   'agent_interrupt', 'agent_goal_control', 'permission_response', 'question_response',
   'error_prompt_action', 'agent_set_model', 'agent_set_effort', 'agent_set_mode',
   'agent_set_permission_mode', 'agent_set_auto_approve_permissions', 'set_codex_config', 'new_thread',
@@ -132,7 +138,32 @@ function programCoverage(program, versions = {}, root = ROOT) {
   return { ok: matrix.every(row => row.issues.length === 0), matrix };
 }
 
-function validationGateForHarness(harness, state = loadState()) {
+function exactFixtureWriteContract(harness, installedVersion, command, options = {}) {
+  const canonicalCommand = WRITE_COMMAND_ALIASES[String(command || '')] || String(command || '');
+  if (!harness || !installedVersion || !canonicalCommand) return null;
+  try {
+    const program = options.program || loadProgram(options.programPath || DEFAULT_PROGRAM_PATH);
+    const definition = program?.harnesses?.[harness];
+    if (!definition?.fixture) return null;
+    const fixtureRoot = options.root || ROOT;
+    const fixture = readJson(path.resolve(fixtureRoot, definition.fixture));
+    if (fixture?.harness !== harness || String(fixture?.installed_version || '') !== String(installedVersion)) {
+      return null;
+    }
+    const contract = fixture?.write_contracts?.[canonicalCommand];
+    const commands = Array.isArray(contract?.commands) ? contract.commands.map(String) : [canonicalCommand];
+    if (contract?.status !== 'read_only_compatible'
+        || contract?.does_not_claim_live_delivery !== true
+        || (!commands.includes(canonicalCommand) && !commands.includes(String(command)))) {
+      return null;
+    }
+    return { ...contract, command: canonicalCommand };
+  } catch {
+    return null;
+  }
+}
+
+function validationGateForHarness(harness, state = loadState(), command = null, options = {}) {
   if (!harness) return { gated: false, reason: null, harness: null };
   const installedVersion = state?.versions?.[harness] != null ? String(state.versions[harness]) : null;
   const record = state?.revalidation_program?.harnesses?.[harness] || null;
@@ -144,6 +175,27 @@ function validationGateForHarness(harness, state = loadState()) {
     && recordVersion
     && (!installedVersion || recordVersion === installedVersion);
   if (passed) return { gated: false, reason: null, harness, installed_version: recordVersion, ...record };
+  // A newly installed app is initially failed at fixture coverage before any
+  // native action is attempted. Once a current-version fixture has been
+  // captured, permit only the explicitly scoped, read-only-compatible command
+  // contract while the broader revalidation remains red. This prevents an
+  // unrelated transcript/fidelity gate from disabling a separately grounded
+  // current-thread send path, without enabling any other write capability.
+  const partialContract = record.failure_stage === 'fixture_coverage'
+    ? exactFixtureWriteContract(harness, recordVersion || installedVersion, command, options)
+    : null;
+  if (partialContract) {
+    return {
+      gated: false,
+      partial: true,
+      reason: null,
+      harness,
+      installed_version: recordVersion || installedVersion,
+      status: record.status || 'fail',
+      validated_command: partialContract.command,
+      write_contract: partialContract,
+    };
+  }
   return {
     gated: true,
     harness,
@@ -154,19 +206,31 @@ function validationGateForHarness(harness, state = loadState()) {
   };
 }
 
-function validationGateForAgentType(agentType, state = loadState()) {
-  return validationGateForHarness(harnessForAgentType(agentType), state);
+function validationGateForAgentType(agentType, state = loadState(), command = null, options = {}) {
+  return validationGateForHarness(harnessForAgentType(agentType), state, command, options);
 }
 
-function applyWriteCapabilityGate(capabilities, agentType, state = loadState()) {
+function applyWriteCapabilityGate(capabilities, agentType, state = loadState(), options = {}) {
   const gate = validationGateForAgentType(agentType, state);
   if (!gate.gated) return capabilities;
+  const sendGate = validationGateForAgentType(agentType, state, 'send_message', options);
   const result = { ...capabilities };
   for (const key of WRITE_CAPABILITY_KEYS) {
     if (result[key] === true) result[key] = false;
   }
-  result.read_only_due_to_revalidation = true;
-  result.write_capability_gate = gate.reason;
+  if (sendGate.gated) {
+    result.send = false;
+    result.send_message = false;
+    result.message_send = false;
+    result.read_only_due_to_revalidation = true;
+    result.write_capability_gate = gate.reason;
+  } else {
+    result.send = true;
+    result.send_message = true;
+    result.message_send = true;
+    result.write_restricted_due_to_revalidation = true;
+    result.revalidation_validated_commands = ['send', 'send_message', 'message_send'];
+  }
   result.revalidation_harness = gate.harness;
   result.revalidation_version = gate.installed_version;
   result.revalidation_status = gate.status;
@@ -185,6 +249,7 @@ module.exports = {
   WRITE_COMMANDS,
   applyWriteCapabilityGate,
   coverageMatrix,
+  exactFixtureWriteContract,
   harnessForAgentType,
   isWriteCommand,
   loadProgram,
