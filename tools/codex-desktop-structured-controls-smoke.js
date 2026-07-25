@@ -45,14 +45,13 @@ async function main() {
     );
     const originalThread = initialThreads.find(thread => thread && thread.active) || null;
     const originalThreadId = String(originalThread?.id || '');
-    assert(originalThreadId, 'current native thread was not detected');
 
     // The currently selected thread may intentionally contain no commands or
     // edits. Choose a listed thread whose exact local archive has both
     // structures, but never switch the native UI: aggregate validation must
     // remain a passive read of the operator's current selection.
     const orderedThreads = [
-      originalThread,
+      ...(originalThread ? [originalThread] : []),
       ...initialThreads.filter(thread => thread && thread.id !== originalThreadId),
     ];
     let validationThread = null;

@@ -1,0 +1,50 @@
+{
+  "schema_version": 1,
+  "harness": "codex-desktop",
+  "installed_version": "26.721.4979.0",
+  "captured_contract": "Desktop idle transcript, composer, thread inventory, question, goal, native stop and persisted user-turn receipt selectors",
+  "source": "installed protected-surface read-only idle probe plus deterministic active-thread and write-receipt regressions",
+  "reader_contract": {
+    "conversation_selector": "[data-thread-find-target=\"conversation\"]",
+    "unit_selector": "[data-content-search-unit-key]",
+    "role_source": "terminal data-content-search-unit-key segment",
+    "turn_identity_source": "UUIDv7 data-content-search-unit-key prefix",
+    "observed_units": 0,
+    "observed_conversations": 0,
+    "observed_roles": {},
+    "active_thread_required": false,
+    "idle_surface_valid": true
+  },
+  "thread_list_contract": {
+    "row_selector": "[data-app-action-sidebar-thread-row]",
+    "observed_rows": 39,
+    "stable_ids": 39,
+    "visible_titles": 39,
+    "active_rows": 0,
+    "active_cardinality": "zero_or_one"
+  },
+  "composer_contract": {
+    "input_selector": ".ProseMirror[data-codex-composer=\"true\"]",
+    "root_selector": ".composer-surface-chrome",
+    "visible_inputs": 1,
+    "visible_roots": 1,
+    "visible_buttons": 5,
+    "submit_candidates": 2,
+    "submit_present": true,
+    "empty_at_probe": true
+  },
+  "write_contracts": {
+    "send_message": {
+      "status": "read_only_compatible",
+      "commands": [
+        "send",
+        "send_message",
+        "message_send"
+      ],
+      "scope": "current_visible_thread",
+      "evidence": "Exact-version visible composer/root/submit selectors plus synthetic receipt and duplicate-suppression regressions",
+      "does_not_claim_live_delivery": true
+    }
+  },
+  "content_safe_evidence_sha256": "291fccb254cdb8d47211e1feb0b1ac8f1eca3568df258ba4f63f3ced86604d85"
+}

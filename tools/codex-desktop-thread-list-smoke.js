@@ -71,12 +71,16 @@ async function main() {
 
     const nativeActive = nativeRows.filter(row => row.active);
     const selectedActive = threads.filter(thread => thread.active);
-    assert.equal(nativeActive.length, 1, 'native sidebar must expose exactly one active thread');
-    assert.equal(selectedActive.length, 1, 'selector must expose exactly one active thread');
-    assert.equal(selectedActive[0].id, nativeActive[0].id,
-      'selector active thread must match the native active row');
+    assert(nativeActive.length <= 1, 'native sidebar must expose at most one active thread');
+    assert(selectedActive.length <= 1, 'selector must expose at most one active thread');
+    assert.equal(selectedActive.length, nativeActive.length,
+      'selector active-thread count must match the native sidebar');
+    if (nativeActive.length === 1) {
+      assert.equal(selectedActive[0].id, nativeActive[0].id,
+        'selector active thread must match the native active row');
+    }
 
-    console.log(`Codex Desktop thread list smoke: PASS (${threads.length} threads, active=${selectedActive[0].id})`);
+    console.log(`Codex Desktop thread list smoke: PASS (${threads.length} threads, active=${selectedActive[0]?.id || 'none'})`);
   } finally {
     await client.close();
   }
