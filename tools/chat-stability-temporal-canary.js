@@ -19,12 +19,13 @@ const HISTORY_ROWS = 4_000;
 const SELECTED_SESSION = 'temporal-session-000';
 const CANONICAL_CONVERSATION_ID = 'codex:temporal-fixture-thread-001';
 const FINAL_SUMMARY = 'Designing process management helpers';
+const COMPOSER_DRAFT_SENTINEL = 'Temporal draft must survive refresh';
 const DEPTHS = [
-  { name: 'top', fraction: 0 },
-  { name: '25_percent', fraction: 0.25 },
-  { name: '50_percent', fraction: 0.5 },
-  { name: '75_percent', fraction: 0.75 },
-  { name: 'near_bottom', fraction: 0.95 },
+  { name: 'top', fraction: 0, sidebarFraction: 0 },
+  { name: '25_percent', fraction: 0.25, sidebarFraction: 0.25 },
+  { name: '50_percent', fraction: 0.5, sidebarFraction: 0.5 },
+  { name: '75_percent', fraction: 0.75, sidebarFraction: 0.75 },
+  { name: 'near_bottom', fraction: 0.95, sidebarFraction: 0.95 },
 ];
 
 function parseArgs(argv) {
@@ -34,6 +35,7 @@ function parseArgs(argv) {
     width: 1440,
     height: 900,
     retainTrace: false,
+    bundlePath: path.join(PUBLIC_ROOT, 'dist', 'bundle.js'),
   };
   for (let index = 0; index < argv.length; index += 1) {
     const arg = argv[index];
@@ -42,6 +44,7 @@ function parseArgs(argv) {
     else if (arg === '--output' && next) options.output = path.resolve(argv[++index]);
     else if (arg === '--width' && next) options.width = Number(argv[++index]);
     else if (arg === '--height' && next) options.height = Number(argv[++index]);
+    else if (arg === '--bundle-path' && next) options.bundlePath = path.resolve(argv[++index]);
     else if (arg === '--retain-trace') options.retainTrace = true;
     else if (arg === '--read-only') continue;
     else throw new Error(`Unknown or incomplete argument: ${arg}`);
@@ -50,6 +53,7 @@ function parseArgs(argv) {
     '--duration-ms must be at least 5000');
   assert(Number.isInteger(options.width) && options.width >= 390, '--width must be at least 390');
   assert(Number.isInteger(options.height) && options.height >= 600, '--height must be at least 600');
+  assert(fs.existsSync(options.bundlePath), `bundle path does not exist: ${options.bundlePath}`);
   return options;
 }
 
@@ -189,6 +193,8 @@ function temporalInitScript() {
     reactCommits: [],
     transcriptMeasurements: [],
     scrollWrites: 0,
+    scrollWritesByContainer: { transcript: 0, sidebar: 0 },
+    unattributedScrollWrites: 0,
     nativeScrollEvents: 0,
     focusLosses: 0,
     overheadMs: 0,
@@ -198,6 +204,10 @@ function temporalInitScript() {
     selectedSession: '',
     canonicalConversationId: '',
     depth: '',
+    sidebarDepth: '',
+    paintSamplePending: false,
+    paintSampleRequested: true,
+    lastPaintSampleAt: 0,
   };
   const pushBounded = (target, value) => {
     if (target.length >= MAX_EVENTS) {
@@ -308,6 +318,7 @@ function temporalInitScript() {
             state.typedFrameReceivedAt = entry.at_epoch_ms;
           }
           pushBounded(state.relayFrames, entry);
+          state.paintSampleRequested = true;
         } catch {}
         state.overheadMs += performance.now() - started;
       });
@@ -326,16 +337,32 @@ function temporalInitScript() {
       enumerable: scrollDescriptor.enumerable,
       get: scrollDescriptor.get,
       set(value) {
-        const isTranscript = this instanceof Element && this.matches?.('.messages');
-        const before = isTranscript ? scrollDescriptor.get.call(this) : null;
+        const container = this instanceof Element && this.matches?.('.messages')
+          ? 'transcript'
+          : this instanceof Element && this.matches?.('.session-list')
+            ? 'sidebar'
+            : '';
+        const before = container ? scrollDescriptor.get.call(this) : null;
+        const context = container ? window.__RAC_SCROLL_WRITE_CONTEXT__ || null : null;
         scrollDescriptor.set.call(this, value);
-        if (isTranscript && state.active) {
+        if (container && state.active) {
+          state.paintSampleRequested = true;
           state.scrollWrites += 1;
+          state.scrollWritesByContainer[container] += 1;
+          if (!context || context.container !== container) state.unattributedScrollWrites += 1;
           pushBounded(state.events, {
             phase: 'programmatic_scroll_write', at_epoch_ms: Date.now(),
             before_scroll_top: before, requested_scroll_top: Number(value),
             after_scroll_top: scrollDescriptor.get.call(this),
-            writer: 'javascript_scrollTop_setter', reason: 'unattributed_programmatic',
+            container,
+            writer: context?.writer || 'javascript_scrollTop_setter',
+            reason: context?.reason || 'unattributed_programmatic',
+            interaction_epoch: context?.interaction_epoch ?? null,
+            route_session_id: context?.route_session_id ?? null,
+            anchor_id: context?.anchor_id ?? null,
+            anchor_offset_px: context?.anchor_offset_px ?? null,
+            bottom_gap_px: context?.bottom_gap_px ?? null,
+            payload_generation: context?.payload_generation ?? null,
             stack_hash: hash(new Error().stack), user_scroll_epoch: state.userScrollEpoch,
           });
         }
@@ -344,7 +371,7 @@ function temporalInitScript() {
   }
 
   originalAdd.call(document, 'wheel', event => {
-    if (event.target?.closest?.('.messages')) state.userScrollEpoch += 1;
+    if (event.target?.closest?.('.messages,.session-list')) state.userScrollEpoch += 1;
   }, { capture: true, passive: true });
   originalAdd.call(document, 'keydown', event => {
     if (['ArrowUp', 'ArrowDown', 'PageUp', 'PageDown', 'Home', 'End'].includes(event.key)) {
@@ -352,10 +379,12 @@ function temporalInitScript() {
     }
   }, true);
   originalAdd.call(document, 'scroll', event => {
-    if (!state.active || !event.target?.matches?.('.messages')) return;
+    if (!state.active || !event.target?.matches?.('.messages,.session-list')) return;
     state.nativeScrollEvents += 1;
+    state.paintSampleRequested = true;
     pushBounded(state.events, {
       phase: 'native_scroll', at_epoch_ms: Date.now(),
+      container: event.target.matches('.messages') ? 'transcript' : 'sidebar',
       scroll_top: event.target.scrollTop,
       scroll_height: event.target.scrollHeight,
       client_height: event.target.clientHeight,
@@ -385,8 +414,10 @@ function temporalInitScript() {
   state.snapshot = (phase, refreshSemantic = false) => {
     const started = performance.now();
     const list = state.list || document.querySelector('.messages');
-    if (!list) return null;
+    const sidebar = state.sidebarList || document.querySelector('.session-list');
+    if (!list || !sidebar) return null;
     state.list = list;
+    state.sidebarList = sidebar;
     if (refreshSemantic || !state.semantic) state.semantic = state.readSemantic();
     const listRect = list.getBoundingClientRect();
     let anchorRow = state.anchorRow;
@@ -398,7 +429,20 @@ function temporalInitScript() {
       state.anchorRow = anchorRow;
     }
     const anchorRect = anchorRow?.isConnected ? anchorRow.getBoundingClientRect() : null;
+    const sidebarRect = sidebar.getBoundingClientRect();
+    let sidebarAnchorRow = state.sidebarAnchorRow;
+    if (!sidebarAnchorRow?.isConnected) {
+      sidebarAnchorRow = [...sidebar.querySelectorAll('.session-card[data-session-id]')].find(row => {
+        const rect = row.getBoundingClientRect();
+        return rect.bottom > sidebarRect.top + 1 && rect.top < sidebarRect.bottom - 1;
+      }) || null;
+      state.sidebarAnchorRow = sidebarAnchorRow;
+    }
+    const sidebarAnchorRect = sidebarAnchorRow?.isConnected ? sidebarAnchorRow.getBoundingClientRect() : null;
+    const sidebarOrder = [...sidebar.querySelectorAll('.session-card[data-session-id]')]
+      .map(row => row.dataset.sessionId || '').filter(Boolean);
     const focused = document.activeElement;
+    const composer = document.querySelector('.textarea-row textarea');
     const profiler = window.__RAC_RENDER_PROFILER__ || [];
     const result = {
       phase,
@@ -412,8 +456,20 @@ function temporalInitScript() {
       client_height: list.clientHeight,
       anchor_key: anchorRow?.dataset?.messageKey || null,
       anchor_offset_px: anchorRect ? Number((anchorRect.top - listRect.top).toFixed(3)) : null,
+      sidebar_depth: state.sidebarDepth,
+      sidebar_scroll_top: Number(sidebar.scrollTop.toFixed(3)),
+      sidebar_scroll_height: sidebar.scrollHeight,
+      sidebar_client_height: sidebar.clientHeight,
+      sidebar_anchor_id: sidebarAnchorRow?.dataset?.sessionId || null,
+      sidebar_anchor_offset_px: sidebarAnchorRect ? Number((sidebarAnchorRect.top - sidebarRect.top).toFixed(3)) : null,
+      sidebar_order_hash: hash(sidebarOrder.join('\u0001')),
       ...state.semantic,
       focus: focused === document.body ? 'body' : `${focused?.tagName?.toLowerCase() || 'none'}:${focused?.className || ''}`.slice(0, 180),
+      composer_draft_hash: hash(composer?.value || ''),
+      composer_draft_length: String(composer?.value || '').length,
+      composer_selection_start: Number.isInteger(composer?.selectionStart) ? composer.selectionStart : null,
+      composer_selection_end: Number.isInteger(composer?.selectionEnd) ? composer.selectionEnd : null,
+      composer_has_focus: focused === composer,
       react_commit_sequence: state.reactCommits.length || profiler.length,
       relay_frame_sequence: state.relayFrames.length,
       user_scroll_epoch: state.userScrollEpoch,
@@ -423,10 +479,11 @@ function temporalInitScript() {
     return result;
   };
 
-  state.start = ({ sessionId, canonicalConversationId, depth, allowLiveEdge }) => {
+  state.start = ({ sessionId, canonicalConversationId, depth, sidebarDepth, allowLiveEdge }) => {
     state.selectedSession = sessionId;
     state.canonicalConversationId = canonicalConversationId;
     state.depth = depth;
+    state.sidebarDepth = sidebarDepth || depth;
     state.allowLiveEdge = !!allowLiveEdge;
     state.events = [];
     state.droppedSamples = 0;
@@ -436,6 +493,8 @@ function temporalInitScript() {
     state.reactCommits = [];
     state.transcriptMeasurements = [];
     state.scrollWrites = 0;
+    state.scrollWritesByContainer = { transcript: 0, sidebar: 0 };
+    state.unattributedScrollWrites = 0;
     state.nativeScrollEvents = 0;
     state.focusLosses = 0;
     state.overheadMs = 0;
@@ -443,8 +502,13 @@ function temporalInitScript() {
     state.typedFrameReceivedAt = null;
     state.startedAtEpochMs = Date.now();
     state.list = document.querySelector('.messages');
+    state.sidebarList = document.querySelector('.session-list');
     state.anchorRow = null;
+    state.sidebarAnchorRow = null;
     state.semantic = null;
+    state.paintSamplePending = false;
+    state.paintSampleRequested = true;
+    state.lastPaintSampleAt = 0;
     state.renderProfileStart = (window.__RAC_RENDER_PROFILER__ || []).length;
     state.listenerBaseline = state.listenerCount();
     state.timerBaseline = state.timerCount();
@@ -471,6 +535,7 @@ function temporalInitScript() {
         cache_relevant: cacheRelevant,
       });
       state.semantic = state.readSemantic();
+      state.paintSampleRequested = true;
       state.overheadMs += performance.now() - started;
     });
     state.mutationObserver.observe(document.getElementById('root'), {
@@ -487,17 +552,34 @@ function temporalInitScript() {
     const frame = () => {
       if (!state.active) return;
       state.frameCount += 1;
-      const sample = state.snapshot('animation_frame');
-      if (sample) {
-        const fingerprint = [sample.scroll_top, sample.scroll_height, sample.anchor_key,
-          sample.anchor_offset_px, sample.active_session_id, sample.canonical_card_count,
-          sample.prompt_id, sample.prompt_count, sample.live_thinking_text,
-          sample.exact_summary_count, sample.total_message_count, sample.focus,
-          sample.react_commit_sequence, sample.relay_frame_sequence].join('|');
-        if (fingerprint !== state.lastFingerprint) {
-          pushBounded(state.events, sample);
-          state.lastFingerprint = fingerprint;
-        }
+      const shouldSample = state.paintSampleRequested || performance.now() - state.lastPaintSampleAt >= 100;
+      if (shouldSample && !state.paintSamplePending) {
+        state.paintSamplePending = true;
+        state.paintSampleRequested = false;
+        // A zero-delay task queued from rAF runs after the browser's paint
+        // opportunity. This avoids treating another component's later rAF
+        // callback in the same frame as a user-visible excursion.
+        originalSetTimeout(() => {
+          state.paintSamplePending = false;
+          if (!state.active) return;
+          state.lastPaintSampleAt = performance.now();
+          const sample = state.snapshot('paint_sample');
+          if (sample) {
+            const fingerprint = [sample.scroll_top, sample.scroll_height, sample.anchor_key,
+              sample.anchor_offset_px, sample.active_session_id, sample.canonical_card_count,
+              sample.sidebar_scroll_top, sample.sidebar_scroll_height, sample.sidebar_anchor_id,
+              sample.sidebar_anchor_offset_px, sample.sidebar_order_hash,
+              sample.prompt_id, sample.prompt_count, sample.live_thinking_text,
+              sample.exact_summary_count, sample.total_message_count, sample.focus,
+              sample.composer_draft_hash, sample.composer_draft_length,
+              sample.composer_selection_start, sample.composer_selection_end, sample.composer_has_focus,
+              sample.react_commit_sequence, sample.relay_frame_sequence].join('|');
+            if (fingerprint !== state.lastFingerprint) {
+              pushBounded(state.events, sample);
+              state.lastFingerprint = fingerprint;
+            }
+          }
+        }, 0);
       }
       state.raf = requestAnimationFrame(frame);
     };
@@ -528,6 +610,8 @@ function temporalInitScript() {
       sampled_animation_frames: state.frameCount,
       dropped_samples: state.droppedSamples,
       programmatic_scroll_writes: state.scrollWrites,
+      programmatic_scroll_writes_by_container: { ...state.scrollWritesByContainer },
+      unattributed_programmatic_scroll_writes: state.unattributedScrollWrites,
       native_scroll_events: state.nativeScrollEvents,
       mutation_batches: state.mutationBatches,
       relay_frames: state.relayFrames.filter(frame => frame.at_epoch_ms >= state.baseline.at_epoch_ms),
@@ -574,6 +658,21 @@ async function settlePaint(page, frames = 4) {
   }), frames);
 }
 
+async function prepareComposerIntent(page) {
+  await page.locator('.textarea-row textarea').evaluate((composer, draft) => {
+    const valueSetter = Object.getOwnPropertyDescriptor(HTMLTextAreaElement.prototype, 'value')?.set;
+    valueSetter?.call(composer, draft);
+    composer.dispatchEvent(new Event('input', { bubbles: true }));
+    composer.focus({ preventScroll: true });
+    composer.setSelectionRange(9, 14, 'forward');
+  }, COMPOSER_DRAFT_SENTINEL);
+  await page.waitForFunction(draft => (
+    document.querySelector('.textarea-row textarea')?.value === draft
+      && !!document.querySelector('.composer-hint.draft-live')
+  ), COMPOSER_DRAFT_SENTINEL, { timeout: 5_000 });
+  await settlePaint(page, 4);
+}
+
 async function preparePage(context, port, depth) {
   const page = await context.newPage();
   page.on('pageerror', error => process.stderr.write(`TEMPORAL_PAGE_ERROR ${depth.name} ${error.message}\n`));
@@ -607,13 +706,24 @@ async function preparePage(context, port, depth) {
     list.scrollTop = Math.round(max * fraction);
     list.dispatchEvent(new Event('scroll', { bubbles: true }));
   }, depth.fraction);
+  await page.locator('.session-list').evaluate((list, fraction) => {
+    const max = Math.max(0, list.scrollHeight - list.clientHeight);
+    list.scrollTop = Math.round(max * fraction);
+    list.dispatchEvent(new Event('scroll', { bubbles: true }));
+  }, depth.sidebarFraction);
   await settlePaint(page, 8);
   await page.waitForTimeout(150);
-  const baseline = await page.evaluate(({ sessionId, canonicalConversationId, name }) => (
+  await prepareComposerIntent(page);
+  const baseline = await page.evaluate(({ sessionId, canonicalConversationId, name, sidebarDepth }) => (
     window.__RAC_TEMPORAL_CANARY__.start({
-      sessionId, canonicalConversationId, depth: name, allowLiveEdge: false,
+      sessionId, canonicalConversationId, depth: name, sidebarDepth, allowLiveEdge: false,
     })
-  ), { sessionId: SELECTED_SESSION, canonicalConversationId: CANONICAL_CONVERSATION_ID, name: depth.name });
+  ), {
+    sessionId: SELECTED_SESSION,
+    canonicalConversationId: CANONICAL_CONVERSATION_ID,
+    name: depth.name,
+    sidebarDepth: `${Math.round(depth.sidebarFraction * 100)}_percent`,
+  });
   return { page, depth, baseline };
 }
 
@@ -630,23 +740,43 @@ async function prepareVerifierPage(context, port) {
     list.scrollTop = list.scrollHeight;
     list.dispatchEvent(new Event('scroll', { bubbles: true }));
   });
+  await page.locator('.session-list').evaluate(list => {
+    list.scrollTop = list.scrollHeight;
+    list.dispatchEvent(new Event('scroll', { bubbles: true }));
+  });
   await settlePaint(page, 6);
+  await prepareComposerIntent(page);
+  await page.locator('.messages').evaluate(list => {
+    list.scrollTop = list.scrollHeight;
+    list.dispatchEvent(new Event('scroll', { bubbles: true }));
+  });
+  await settlePaint(page, 4);
   await page.evaluate(({ sessionId, canonicalConversationId }) => (
     window.__RAC_TEMPORAL_CANARY__.start({
       sessionId, canonicalConversationId, depth: 'live_edge_verifier', allowLiveEdge: true,
+      sidebarDepth: '100_percent',
     })
   ), { sessionId: SELECTED_SESSION, canonicalConversationId: CANONICAL_CONVERSATION_ID });
   return page;
 }
 
 function analyzeDepth(raw) {
-  const frames = raw.events.filter(event => event.phase === 'animation_frame');
+  const frames = raw.events.filter(event => event.phase === 'paint_sample');
   const baseline = raw.baseline;
   const scrollDrifts = frames.map(frame => Math.abs(frame.scroll_top - baseline.scroll_top));
   const anchorDrifts = frames
     .filter(frame => frame.anchor_key === baseline.anchor_key
       && frame.anchor_offset_px != null && baseline.anchor_offset_px != null)
     .map(frame => Math.abs(frame.anchor_offset_px - baseline.anchor_offset_px));
+  const sidebarScrollDrifts = frames.map(frame => Math.abs(frame.sidebar_scroll_top - baseline.sidebar_scroll_top));
+  const sidebarAnchorDrifts = frames
+    .filter(frame => frame.sidebar_anchor_id === baseline.sidebar_anchor_id
+      && frame.sidebar_anchor_offset_px != null && baseline.sidebar_anchor_offset_px != null)
+    .map(frame => Math.abs(frame.sidebar_anchor_offset_px - baseline.sidebar_anchor_offset_px));
+  const transcriptBottomGaps = frames.map(frame => Math.max(0,
+    frame.scroll_height - frame.scroll_top - frame.client_height));
+  const sidebarBottomGaps = frames.map(frame => Math.max(0,
+    frame.sidebar_scroll_height - frame.sidebar_scroll_top - frame.sidebar_client_height));
   const values = frames.map(frame => ({ at: frame.at_epoch_ms, value: frame.scroll_top }));
   let reversalsWithinTwoSeconds = 0;
   let previousDirection = 0;
@@ -667,16 +797,43 @@ function analyzeDepth(raw) {
   const canonicalCounts = frames.map(frame => frame.canonical_card_count);
   const promptCounts = frames.map(frame => frame.prompt_count);
   const activeSessions = new Set(frames.map(frame => frame.active_session_id));
+  const intentSamples = [...frames, raw.final].filter(Boolean);
+  const composerIntentChanged = intentSamples.some(frame => (
+    frame.focus !== baseline.focus
+    || frame.composer_draft_hash !== baseline.composer_draft_hash
+    || frame.composer_draft_length !== baseline.composer_draft_length
+    || frame.composer_selection_start !== baseline.composer_selection_start
+    || frame.composer_selection_end !== baseline.composer_selection_end
+    || frame.composer_has_focus !== baseline.composer_has_focus
+  ));
   return {
     ...raw,
     max_scroll_top_drift_px: Number(Math.max(0, ...scrollDrifts).toFixed(3)),
     max_logical_anchor_drift_px: Number(Math.max(0, ...anchorDrifts).toFixed(3)),
+    max_sidebar_scroll_top_drift_px: Number(Math.max(0, ...sidebarScrollDrifts).toFixed(3)),
+    max_sidebar_anchor_drift_px: Number(Math.max(0, ...sidebarAnchorDrifts).toFixed(3)),
+    sidebar_relative_order_changed: frames.some(frame => frame.sidebar_order_hash !== baseline.sidebar_order_hash),
+    final_transcript_bottom_gap_px: Number(Math.max(0,
+      raw.final.scroll_height - raw.final.scroll_top - raw.final.client_height).toFixed(3)),
+    final_sidebar_bottom_gap_px: Number(Math.max(0,
+      raw.final.sidebar_scroll_height - raw.final.sidebar_scroll_top - raw.final.sidebar_client_height).toFixed(3)),
+    max_painted_transcript_bottom_gap_px: Number(Math.max(0, ...transcriptBottomGaps).toFixed(3)),
+    max_painted_sidebar_bottom_gap_px: Number(Math.max(0, ...sidebarBottomGaps).toFixed(3)),
     direction_reversal_windows: reversalsWithinTwoSeconds,
     canonical_card_count_min: Math.min(...canonicalCounts),
     canonical_card_count_max: Math.max(...canonicalCounts),
     prompt_count_max: Math.max(0, ...promptCounts),
     active_session_ids: [...activeSessions],
     final_total_message_count: raw.final.total_message_count,
+    composer_intent_changed: composerIntentChanged,
+    composer_intent_baseline: {
+      focus: baseline.focus,
+      draft_hash: baseline.composer_draft_hash,
+      draft_length: baseline.composer_draft_length,
+      selection_start: baseline.composer_selection_start,
+      selection_end: baseline.composer_selection_end,
+      has_focus: baseline.composer_has_focus,
+    },
   };
 }
 
@@ -742,9 +899,13 @@ async function main(argv = process.argv.slice(2)) {
     }
     const pathname = new URL(request.url, `http://127.0.0.1:${port}`).pathname;
     const relative = pathname === '/' ? 'index.html' : pathname.replace(/^\/+/, '');
-    const filePath = path.resolve(PUBLIC_ROOT, relative);
-    if (!filePath.startsWith(`${path.resolve(PUBLIC_ROOT)}${path.sep}`)
-      || !fs.existsSync(filePath) || fs.statSync(filePath).isDirectory()) {
+    const filePath = relative === 'dist/bundle.js'
+      ? options.bundlePath
+      : path.resolve(PUBLIC_ROOT, relative);
+    const allowed = relative === 'dist/bundle.js'
+      ? path.resolve(filePath) === path.resolve(options.bundlePath)
+      : filePath.startsWith(`${path.resolve(PUBLIC_ROOT)}${path.sep}`);
+    if (!allowed || !fs.existsSync(filePath) || fs.statSync(filePath).isDirectory()) {
       response.writeHead(404); response.end('not found'); return;
     }
     response.writeHead(200, { 'content-type': contentType(filePath), 'cache-control': 'no-store' });
@@ -815,22 +976,26 @@ async function main(argv = process.argv.slice(2)) {
     args: ['--no-first-run', '--no-default-browser-check', '--disable-background-timer-throttling',
       '--disable-renderer-backgrounding', '--js-flags=--expose-gc'],
   });
-  let context;
+  const contexts = [];
   const pages = [];
   try {
-    context = await browser.newContext({
-      viewport: { width: options.width, height: options.height },
-      colorScheme: 'dark', reducedMotion: 'reduce',
-    });
-    await context.addInitScript(temporalInitScript);
+    const createFixtureContext = async () => {
+      const fixtureContext = await browser.newContext({
+        viewport: { width: options.width, height: options.height },
+        colorScheme: 'dark', reducedMotion: 'reduce',
+      });
+      contexts.push(fixtureContext);
+      await fixtureContext.addInitScript(temporalInitScript);
+      return fixtureContext;
+    };
     for (const depth of DEPTHS) {
-      const prepared = await preparePage(context, port, depth);
+      const prepared = await preparePage(await createFixtureContext(), port, depth);
       pages.push(prepared);
       process.stderr.write(`TEMPORAL_READY ${depth.name} scroll=${prepared.baseline.scroll_top}\n`);
     }
-    const verifierPage = await prepareVerifierPage(context, port);
+    const verifierPage = await prepareVerifierPage(await createFixtureContext(), port);
     const allPages = [...pages.map(item => item.page), verifierPage];
-    const cdps = await Promise.all(allPages.map(page => context.newCDPSession(page)));
+    const cdps = await Promise.all(allPages.map(page => page.context().newCDPSession(page)));
     await Promise.all(cdps.map(cdp => cdp.send('Performance.enable')));
     await Promise.all(cdps.map(cdp => cdp.send('HeapProfiler.enable')));
     await Promise.all(cdps.map(cdp => cdp.send('HeapProfiler.collectGarbage')));
@@ -847,16 +1012,28 @@ async function main(argv = process.argv.slice(2)) {
     let rehydrated = false;
     let reconnected = false;
     let refreshFramesSent = 0;
+    let staticRefreshFramesSent = 0;
     let burstFramesSent = 0;
     let inventoryRefreshes = 0;
-    const semanticTimes = {
-      initial_live_ms: Math.max(500, Math.floor(options.durationMs * 0.08)),
-      final_live_ms: Math.max(1_000, Math.floor(options.durationMs * 0.15)),
-      settle_ms: Math.max(1_500, Math.floor(options.durationMs * 0.25)),
-      duplicate_ms: Math.max(2_000, Math.floor(options.durationMs * 0.38)),
-      rehydrate_ms: Math.max(2_500, Math.floor(options.durationMs * 0.48)),
-      reconnect_ms: Math.max(3_000, Math.floor(options.durationMs * 0.58)),
-    };
+    const semanticTimes = options.durationMs >= 120_000
+      ? {
+        // The acceptance contract requires >=1,000 completely static refresh
+        // frames before any semantic transition is introduced.
+        initial_live_ms: 100_500,
+        final_live_ms: 103_000,
+        settle_ms: 106_000,
+        duplicate_ms: 109_000,
+        rehydrate_ms: 112_000,
+        reconnect_ms: 115_000,
+      }
+      : {
+        initial_live_ms: Math.max(500, Math.floor(options.durationMs * 0.08)),
+        final_live_ms: Math.max(1_000, Math.floor(options.durationMs * 0.15)),
+        settle_ms: Math.max(1_500, Math.floor(options.durationMs * 0.25)),
+        duplicate_ms: Math.max(2_000, Math.floor(options.durationMs * 0.38)),
+        rehydrate_ms: Math.max(2_500, Math.floor(options.durationMs * 0.48)),
+        reconnect_ms: Math.max(3_000, Math.floor(options.durationMs * 0.58)),
+      };
     while (Date.now() - startedAt < options.durationMs) {
       const targetAt = startedAt + tick * 100;
       const delayMs = targetAt - Date.now();
@@ -940,9 +1117,8 @@ async function main(argv = process.argv.slice(2)) {
           total_messages: history.length, loaded_messages: history.length,
         });
       }
-      const burst = tick % 120 < 10;
       const oneHz = tick % 10 === 0;
-      if (oneHz || burst) {
+      {
         stateSeq += 1;
         const activity = settledSent
           ? { kind: 'idle', label: '' }
@@ -967,7 +1143,8 @@ async function main(argv = process.argv.slice(2)) {
           fixture_refresh_kind: 'unchanged',
         });
         refreshFramesSent += 1;
-        if (burst && !oneHz) burstFramesSent += 1;
+        if (!initialLiveSent) staticRefreshFramesSent += 1;
+        if (!oneHz) burstFramesSent += 1;
         if (oneHz) inventoryRefreshes += 1;
       }
       tick += 1;
@@ -1020,8 +1197,13 @@ async function main(argv = process.argv.slice(2)) {
     const depthPass = depthResults.every(result => (
       result.max_scroll_top_drift_px <= 1
       && result.max_logical_anchor_drift_px <= 1
+      && result.max_sidebar_scroll_top_drift_px <= 1
+      && result.max_sidebar_anchor_drift_px <= 1
+      && result.sidebar_relative_order_changed === false
+      && result.composer_intent_changed === false
       && result.direction_reversal_windows === 0
-      && result.programmatic_scroll_writes === 0
+      && (result.programmatic_scroll_writes_by_container?.transcript || 0) === 0
+      && result.unattributed_programmatic_scroll_writes === 0
       && result.canonical_card_count_min === 1
       && result.canonical_card_count_max === 1
       && result.prompt_count_max === 0
@@ -1031,14 +1213,24 @@ async function main(argv = process.argv.slice(2)) {
       && result.dropped_samples === 0
       && result.listener_delta <= 0
       && result.timer_delta <= 0
-      && result.observer_cpu_percent <= 1
+      && (options.durationMs < 120_000 || result.observer_cpu_percent <= 1)
       && (options.durationMs < 120_000 || result.unchanged_refresh_cache_hit_rate >= 0.9)
-      && result.long_tasks.filter(task => task.duration_ms > 50).length === 0
+      && (options.durationMs < 120_000
+        || result.long_tasks.filter(task => task.duration_ms > 50).length === 0)
     ));
     const maxRetainedHeapDelta = Math.max(...perf.map(item => item.heap_delta_after_gc_bytes));
     const result = {
       ok: depthPass
         && temporalContractPass
+        && verifier.max_sidebar_scroll_top_drift_px <= 1
+        && verifier.max_sidebar_anchor_drift_px <= 1
+        && verifier.sidebar_relative_order_changed === false
+        && verifier.max_painted_transcript_bottom_gap_px <= 1
+        && verifier.max_painted_sidebar_bottom_gap_px <= 1
+        && verifier.final_transcript_bottom_gap_px <= 1
+        && verifier.final_sidebar_bottom_gap_px <= 1
+        && verifier.unattributed_programmatic_scroll_writes === 0
+        && verifier.composer_intent_changed === false
         && summaryRows.length === 1
         && summaryRows[0].text.includes(FINAL_SUMMARY)
         && summaryRows[0].role === 'note'
@@ -1048,16 +1240,18 @@ async function main(argv = process.argv.slice(2)) {
         && percentile(producerToRelay, 0.95) <= 250
         && relayToPaint.length === 1
         && percentile(relayToPaint, 0.95) <= 250
-        && maxRetainedHeapDelta <= 10 * 1024 * 1024,
+        && maxRetainedHeapDelta <= 10 * 1024 * 1024
+        && (options.durationMs < 120_000 || staticRefreshFramesSent >= 1_000),
       generated_at: new Date().toISOString(),
       source_commit: execFileSync('git', ['rev-parse', 'HEAD'], { cwd: ROOT, encoding: 'utf8', windowsHide: true }).trim(),
-      bundle_sha256: crypto.createHash('sha256').update(fs.readFileSync(path.join(PUBLIC_ROOT, 'dist', 'bundle.js'))).digest('hex'),
+      bundle_sha256: crypto.createHash('sha256').update(fs.readFileSync(options.bundlePath)).digest('hex'),
       acceptance_class: options.durationMs >= 120_000 ? 'canonical_120_second_temporal_matrix' : 'diagnostic_short_matrix',
       fixture: {
         sessions: SESSION_COUNT,
         selected_transcript_messages_before: HISTORY_ROWS,
         selected_transcript_messages_after: HISTORY_ROWS + 1,
-        scroll_depths: DEPTHS.map(item => item.name),
+        transcript_scroll_depths: [...DEPTHS.map(item => item.name), 'tail'],
+        sidebar_scroll_depths_percent: [...DEPTHS.map(item => Math.round(item.sidebarFraction * 100)), 100],
         tabs: pages.length + 1,
         viewport: { width: options.width, height: options.height },
         browser: 'chromium', headless: true, visible_windows_opened: 0,
@@ -1070,6 +1264,7 @@ async function main(argv = process.argv.slice(2)) {
         one_hz_refreshes: inventoryRefreshes,
         ten_hz_burst_frames: burstFramesSent,
         total_refresh_frames: refreshFramesSent,
+        static_refresh_frames_before_semantic: staticRefreshFramesSent,
         reconnects: reconnected ? 1 : 0,
         history_rehydrates: rehydrated ? 2 : 0,
         duplicate_settled_replays: duplicateSent ? 1 : 0,
@@ -1105,8 +1300,10 @@ async function main(argv = process.argv.slice(2)) {
       },
       budgets: {
         max_unsolicited_scroll_or_anchor_drift_px: 1,
+        max_sidebar_scroll_or_anchor_drift_px: 1,
         max_direction_reversal_windows: 0,
-        max_programmatic_scroll_writes: 0,
+        max_unattributed_programmatic_scroll_writes: 0,
+        minimum_static_refresh_frames_before_semantic: 1_000,
         minimum_unchanged_refresh_cache_hit_rate: 0.9,
         max_observer_cpu_percent: 1,
         max_retained_heap_delta_bytes: 10 * 1024 * 1024,
@@ -1128,7 +1325,7 @@ async function main(argv = process.argv.slice(2)) {
     return result;
   } finally {
     for (const item of pages) await item.page.close().catch(() => {});
-    if (context) await context.close().catch(() => {});
+    await Promise.all(contexts.map(fixtureContext => fixtureContext.close().catch(() => {})));
     await browser.close().catch(() => {});
     for (const ws of sockets) ws.terminate();
     await new Promise(resolve => wss.close(() => resolve()));

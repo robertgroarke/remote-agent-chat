@@ -4,6 +4,7 @@
 import { getLang, isTextFile, sessionLabel } from './file-utils.js';
 import { MarkdownContent } from './markdown.js';
 import { shouldRefreshNativeCliPlaceholder, useRelay } from './hooks.jsx';
+import { codexDesktopThreadControlPolicy } from './codex-desktop-thread-policy.js';
 import {
   resolveSessionChatTitle,
   resolveSessionChatTitleProjection,
@@ -100,6 +101,19 @@ import {
   recordSemanticNotificationStage,
   semanticNotificationAllowed,
 } from './semantic-notifications.js';
+import {
+  PANE_CLOSED,
+  PANE_MINIMIZED,
+  PANE_OPEN,
+  createPaneLifecycleLedger,
+  paneDefinition,
+  paneIsMounted,
+  paneIsOpen,
+  paneRecord,
+  paneRestoreRail,
+  synchronizeAuthoritativePane,
+  transitionPaneLifecycle,
+} from './pane-lifecycle.js';
 import fleetWorkContextPolicy from '../relay-server/fleet-work-context.js';
 
 const {
@@ -110,8 +124,136 @@ const {
 
 const { useState, useRef, useEffect, useLayoutEffect } = React;
 
+function compactPaneViewport() {
+  if (typeof window === 'undefined') return false;
+  const width = Number(window.visualViewport?.width || window.innerWidth || 0);
+  return width > 0 && width <= 700;
+}
+
+function useCompactPaneLayout() {
+  const [compact, setCompact] = React.useState(compactPaneViewport);
+  React.useEffect(() => {
+    if (typeof window === 'undefined') return undefined;
+    const refresh = () => setCompact(compactPaneViewport());
+    const media = window.matchMedia?.('(max-width: 700px)');
+    media?.addEventListener?.('change', refresh);
+    window.visualViewport?.addEventListener?.('resize', refresh);
+    window.addEventListener('resize', refresh);
+    return () => {
+      media?.removeEventListener?.('change', refresh);
+      window.visualViewport?.removeEventListener?.('resize', refresh);
+      window.removeEventListener('resize', refresh);
+    };
+  }, []);
+  return compact;
+}
+
+function usePaneBoolean(ledger, setLedger, sessionId, paneId, compact, openerByPaneRef) {
+  const open = paneIsOpen(ledger, sessionId, paneId);
+  const mounted = paneIsMounted(ledger, sessionId, paneId);
+  const record = paneRecord(ledger, sessionId, paneId);
+  const setOpen = React.useCallback(nextValue => {
+    setLedger(previous => {
+      const wasOpen = paneIsOpen(previous, sessionId, paneId);
+      const nextOpen = typeof nextValue === 'function' ? !!nextValue(wasOpen) : !!nextValue;
+      if (nextOpen && typeof document !== 'undefined' && document.activeElement instanceof HTMLElement) {
+        openerByPaneRef.current[paneId] = document.activeElement;
+      }
+      return transitionPaneLifecycle(previous, {
+        session_id: sessionId,
+        pane_id: paneId,
+        action: nextOpen ? (wasOpen ? 'open' : 'restore') : 'close',
+        compact,
+      });
+    });
+  }, [compact, openerByPaneRef, paneId, sessionId, setLedger]);
+  const minimize = React.useCallback(() => {
+    setLedger(previous => transitionPaneLifecycle(previous, {
+      session_id: sessionId,
+      pane_id: paneId,
+      action: 'minimize',
+    }));
+    const opener = openerByPaneRef.current[paneId];
+    if (opener?.isConnected) {
+      requestAnimationFrame(() => opener.focus({ preventScroll: true }));
+    }
+  }, [openerByPaneRef, paneId, sessionId, setLedger]);
+  return { open, mounted, record, setOpen, minimize };
+}
+
+function PaneLifecycleBoundary({ paneId, state, onMinimize, children, blocking = false }) {
+  const open = state === PANE_OPEN;
+  return (
+    <div
+      id={`pane-${paneId}`}
+      className="pane-lifecycle-boundary"
+      data-pane-id={paneId}
+      data-pane-state={state}
+      hidden={!open}
+      style={{ display: open ? 'contents' : 'none' }}
+      onKeyDown={event => {
+        if (blocking || event.key !== 'Escape' || event.defaultPrevented) return;
+        if (event.target?.matches?.('input, textarea, select, [contenteditable="true"]')) return;
+        event.preventDefault();
+        event.stopPropagation();
+        onMinimize?.();
+      }}
+    >
+      {children}
+    </div>
+  );
+}
+
+function PaneMinimizeButton({ paneId, onMinimize }) {
+  const definition = paneDefinition(paneId);
+  return (
+    <button
+      type="button"
+      className="pane-minimize-btn"
+      onClick={onMinimize}
+      title={`Minimize ${definition?.label || paneId}`}
+      aria-label={`Minimize ${definition?.label || paneId}`}
+      aria-controls={`pane-${paneId}`}
+      aria-expanded="true"
+    >
+      <span aria-hidden="true">—</span>
+      <span className="pane-minimize-label">Minimize</span>
+    </button>
+  );
+}
+
+function PaneRestoreRail({ records, onRestore }) {
+  if (!records.length) return null;
+  return (
+    <nav className="pane-restore-rail" aria-label="Minimized chat panes" data-testid="pane-restore-rail">
+      {records.map(record => {
+        const definition = paneDefinition(record.pane_id);
+        const attention = record.attention_count > 0;
+        return (
+          <button
+            type="button"
+            className={`pane-restore-chip${attention ? ' attention' : ''}`}
+            key={record.pane_id}
+            data-pane-restore={record.pane_id}
+            aria-controls={`pane-${record.pane_id}`}
+            aria-expanded="false"
+            onClick={event => onRestore(record.pane_id, event.currentTarget)}
+          >
+            <span>{definition?.label || record.pane_id}</span>
+            {attention && <span className="pane-attention-count" aria-label={`${record.attention_count} pending`}>{record.attention_count}</span>}
+          </button>
+        );
+      })}
+    </nav>
+  );
+}
+
 const DRAFT_STORAGE_KEY = 'remote-agent-chat:drafts:v1';
 const SHOW_TEST_SESSIONS_STORAGE_KEY = 'remote-agent-chat:show-test-sessions:v1';
+const MOBILE_SYSTEM_BANNER_STORAGE_KEY = 'remote-agent-chat:mobile-system-banner-expanded:v1';
+const MOBILE_HEADER_STORAGE_KEY = 'remote-agent-chat:mobile-header-expanded:v1';
+const MOBILE_LIVE_STATUS_STORAGE_KEY = 'remote-agent-chat:mobile-live-status-expanded:v1';
+const MOBILE_SYSTEM_FINGERPRINT_STORAGE_KEY = 'remote-agent-chat:mobile-system-fingerprint:v1';
 const DEFAULT_INITIAL_HISTORY_LIMIT = 120;
 const CODEX_INITIAL_HISTORY_LIMIT = 500;
 const CODEX_CLI_INITIAL_HISTORY_LIMIT = 160;
@@ -218,6 +360,7 @@ function stableContentHash(value) {
 function messageIdentityKey(msg, fallbackIndex = 0) {
   if (!msg || typeof msg !== 'object') return `empty:${fallbackIndex}`;
   if (msg._cid) return `cid:${msg._cid}`;
+  if (msg.client_message_id) return `cid:${msg.client_message_id}`;
   if (msg.source_message_id) return `source:${msg.source_message_id}`;
   if (msg.native_source_id) return `native:${msg.native_source_id}`;
   if (msg.id != null) return `id:${msg.id}`;
@@ -232,6 +375,10 @@ function messageIdentityKey(msg, fallbackIndex = 0) {
     msg.ts || '',
     stableContentHash(`${content}\n${blocks}`),
   ].join(':');
+}
+
+function messageClientMessageId(msg) {
+  return String(msg?._cid || msg?.client_message_id || msg?.client_msg_id || '');
 }
 
 function messageContentIdentityHash(msg) {
@@ -1538,6 +1685,32 @@ function deliveryFailureText(value) {
   return raw.length > 80 ? `${raw.slice(0, 77)}…` : raw;
 }
 
+function DeliveryFailureActions({ msg, onRetry }) {
+  const retrySafetyKnown = msg.failure_retryable != null || msg.failure_native_attempted != null;
+  const canRetry = Boolean(onRetry) && (
+    (msg.failure_retryable === true && msg.failure_native_attempted === false)
+    || (msg._optimistic && !retrySafetyKnown)
+  );
+  const copyMessage = (event) => {
+    event.stopPropagation();
+    if (navigator.clipboard?.writeText) {
+      navigator.clipboard.writeText(String(msg.content || '')).catch(() => {});
+    }
+  };
+  return (
+    <span className="delivery-failure-actions">
+      {canRetry && (
+        <button type="button" className="delivery-retry" onClick={(event) => { event.stopPropagation(); onRetry(msg); }}>
+          Retry
+        </button>
+      )}
+      <button type="button" className="delivery-copy" onClick={copyMessage} aria-label="Copy failed message">
+        Copy
+      </button>
+    </span>
+  );
+}
+
 function DeliveryStatus({ msg, deliveryStates, onSteer, onRetry }) {
   if (msg._optimistic) {
     const status = deliveryStates[msg._cid] || 'queued';
@@ -1561,11 +1734,7 @@ function DeliveryStatus({ msg, deliveryStates, onSteer, onRetry }) {
         <span className="delivery failed" title={failureDetail} aria-label={`Send failed: ${failureText}`}>
           <span aria-hidden="true">✕</span>
           <span className="delivery-failure-reason">{failureText}</span>
-          {onRetry && (
-            <button type="button" className="delivery-retry" onClick={(event) => { event.stopPropagation(); onRetry(msg); }}>
-              Retry
-            </button>
-          )}
+          <DeliveryFailureActions msg={msg} onRetry={onRetry} />
         </span>
       );
     }
@@ -1573,9 +1742,15 @@ function DeliveryStatus({ msg, deliveryStates, onSteer, onRetry }) {
   if (msg._agentStarted || msg.status === 'agent_started') return <span className="delivery agent-started" title="Agent started working" aria-label="Agent started working">▶</span>;
   if (msg._delivered || msg.status === 'delivered') return <span className="delivery delivered" title="Native user turn observed" aria-label="Native user turn delivered">✓✓</span>;
   if (msg.status === 'failed') {
-    const failureDetail = msg.failure_code || msg._sendError || 'Send failed';
+    const failureDetail = msg.failure_reason || msg.failure_code || msg._sendError || 'Send failed';
     const failureText = deliveryFailureText(failureDetail);
-    return <span className="delivery failed" title={failureDetail} aria-label={`Send failed: ${failureText}`}><span aria-hidden="true">✕</span><span className="delivery-failure-reason">{failureText}</span></span>;
+    return (
+      <span className="delivery failed" title={failureDetail} aria-label={`Send failed: ${failureText}`}>
+        <span aria-hidden="true">✕</span>
+        <span className="delivery-failure-reason">{failureText}</span>
+        <DeliveryFailureActions msg={msg} onRetry={onRetry} />
+      </span>
+    );
   }
   if (msg._launchAcceptedAt || msg.launch_accepted_at) return <span className="delivery launch-accepted" title="Native launch accepted; user-turn receipt pending" aria-label="Native launch accepted; user-turn receipt pending">↗</span>;
   if (msg.status === 'accepted') return <span className="delivery accepted" title="Received by relay; native receipt pending" aria-label="Relay accepted; native receipt pending">✓</span>;
@@ -1704,17 +1879,20 @@ function TranscriptMessage({
   const sourceIdentity = msg.source_message_id || msg.native_source_id || '';
   const contentIdentityHash = messageContentIdentityHash(msg);
   const blockType = topLevelMessageBlockType(msg);
+  const deliveryCid = messageClientMessageId(msg);
   if (msg.role === 'user') {
-    const deliveryStatesForMessage = msg._cid ? { [msg._cid]: deliveryState } : {};
+    const deliveryStatesForMessage = deliveryCid ? { [deliveryCid]: deliveryState } : {};
     return (
       <div
-        className={`message user transcript-virtual-row${msg._optimistic && deliveryState === 'failed' ? ' failed' : ''}${searchMatch ? ' search-match' : ''}`}
+        className={`message user transcript-virtual-row${(msg.status === 'failed' || (msg._optimistic && deliveryState === 'failed')) ? ' failed' : ''}${searchMatch ? ' search-match' : ''}`}
         data-message-key={messageKey}
         data-message-id={msg.id || undefined}
         data-message-role="user"
         data-message-block-type={blockType}
         data-message-content-hash={contentIdentityHash}
         data-message-source-id={sourceIdentity || undefined}
+        data-client-message-id={deliveryCid || undefined}
+        data-delivery-attempt={msg.delivery_attempt || msg._deliveryAttempt || undefined}
         data-message-timestamp={instant?.iso || 'unknown'}
       >
         <div className="user-gutter">
@@ -2670,7 +2848,15 @@ function formatGoalElapsed(goal, nowMs, goalRun = null) {
   return formatClockDuration(fleetGoalElapsedSeconds(goal, goalRun, nowMs), { includeSeconds: true });
 }
 
-function ActivityRow({ activity, thinkingText, agentType, pinned = false }) {
+function ActivityRow({
+  activity,
+  thinkingText,
+  agentType,
+  pinned = false,
+  mobileExpanded = false,
+  onMobileExpandedChange = null,
+  mobileDisclosureId = 'mobile-live-status-details',
+}) {
   const kind = activity?.kind || 'working';
   const meta = ACTIVITY_META[kind] || ACTIVITY_META.working;
   const goal = activity?.goal || null;
@@ -2715,9 +2901,38 @@ function ActivityRow({ activity, thinkingText, agentType, pinned = false }) {
   const thinkingElapsed = thinking ? formatActivityElapsed(thinkingTimerSource, nowMs) : '';
   const currentElapsed = current ? formatActivityElapsed(currentTimerSource, nowMs) : '';
   if (!goal && !thinking && !current && !connection && !interruption && !step && !usage) return null;
+  const mobileNeedsAttention = !!interruption?.blocking || connection?.state === 'failed' || !!usage;
+  const mobileDetailCount = [interruption, connection, current, thinking, step, goal, usage].filter(Boolean).length;
+  const mobileSummaryLabel = interruption?.title
+    || (connection?.state === 'failed' ? connection.label : '')
+    || usage?.title
+    || current?.label
+    || thinking?.label
+    || goal?.label
+    || activity?.label
+    || 'Working';
 
   return (
-    <div className={`live-status-stack${pinned ? ' pinned' : ''}`} data-testid="live-status-stack">
+    <div
+      className={`live-status-stack${pinned ? ' pinned' : ''}${mobileExpanded ? ' mobile-live-status-expanded' : ' mobile-live-status-collapsed'}${mobileNeedsAttention ? ' needs-attention' : ''}`}
+      data-testid="live-status-stack"
+    >
+      <button
+        type="button"
+        className="mobile-live-status-summary"
+        aria-expanded={mobileExpanded}
+        aria-controls={mobileDisclosureId}
+        aria-label={`${mobileExpanded ? 'Hide' : 'Show'} current agent activity details`}
+        onClick={() => onMobileExpandedChange?.(!mobileExpanded)}
+      >
+        <span className="mobile-live-status-icon" aria-hidden="true">{mobileNeedsAttention ? '!' : '●'}</span>
+        <span className="mobile-live-status-label">{mobileSummaryLabel}</span>
+        <span className="mobile-live-status-meta">
+          {mobileNeedsAttention ? 'Needs attention' : `${mobileDetailCount} active`}
+        </span>
+        <span className="mobile-disclosure-chevron" aria-hidden="true">{mobileExpanded ? '⌃' : '⌄'}</span>
+      </button>
+      <div className="live-status-details" id={mobileDisclosureId}>
       {interruption && (
         <div
           className={`live-native-interruption-row ${interruption.severity || 'error'}`}
@@ -2812,6 +3027,7 @@ function ActivityRow({ activity, thinkingText, agentType, pinned = false }) {
           <div className="live-usage-detail">{usage.detail || (usage.resets_at ? `Your rate limit resets at ${usage.resets_at}.` : 'Usage is currently exhausted.')}</div>
         </div>
       )}
+      </div>
     </div>
   );
 }
@@ -2940,7 +3156,7 @@ function questionDeadlineCopy(prompt, msLeft) {
   return `${prefix} ${formatPromptCountdown(msLeft)}`;
 }
 
-function PermissionOverlay({ prompt, sessionId, agentType, onRespond, onDismissFocus }) {
+function PermissionOverlay({ prompt, sessionId, agentType, onRespond, onDismissFocus, onMinimize, interactive = true }) {
   const [now, setNow] = React.useState(Date.now());
   const [questionSelections, setQuestionSelections] = React.useState({});
   const [questionOtherText, setQuestionOtherText] = React.useState({});
@@ -3040,6 +3256,7 @@ function PermissionOverlay({ prompt, sessionId, agentType, onRespond, onDismissF
   };
 
   React.useEffect(() => {
+    if (!interactive) return undefined;
     const handlePromptKey = event => {
       const promptShortcutTarget = event.target?.closest?.('.permission-card');
       const composerTarget = event.target?.matches?.('.input-area textarea');
@@ -3128,6 +3345,7 @@ function PermissionOverlay({ prompt, sessionId, agentType, onRespond, onDismissF
     structuredKeyboardChoices,
     structuredQuestion,
     submittingChoiceId,
+    interactive,
   ]);
 
   return (
@@ -3139,6 +3357,7 @@ function PermissionOverlay({ prompt, sessionId, agentType, onRespond, onDismissF
         aria-label={claudeActionPrompt ? 'Claude Code permission prompt' : 'Permission or question prompt'}
         onPointerDown={() => setKeyboardDismissed(false)}
       >
+        <PaneMinimizeButton paneId="native-action" onMinimize={onMinimize} />
         {claudeActionPrompt ? (
           <>
             <div className="permission-title permission-title-claude">{claudeTitle}</div>
@@ -3313,7 +3532,7 @@ function isBlockingErrorPrompt(prompt) {
   return !!prompt && prompt.blocking !== false && prompt.display_mode !== 'inline';
 }
 
-function ErrorPromptOverlay({ prompt, sessionId, onRespond }) {
+function ErrorPromptOverlay({ prompt, sessionId, onRespond, onMinimize }) {
   const block = typedPromptBlock(prompt, ['error', 'notice']);
   const actions = Array.isArray(prompt?.actions) ? prompt.actions : (block?.actions || []);
   const submittingActionId = prompt?.submitting_action_id || null;
@@ -3322,6 +3541,7 @@ function ErrorPromptOverlay({ prompt, sessionId, onRespond }) {
   return (
     <div className="permission-overlay">
       <div className="permission-card error-prompt-card">
+        <PaneMinimizeButton paneId="native-action" onMinimize={onMinimize} />
         <div className="permission-eyebrow error-prompt-eyebrow">Action Required</div>
         <div className="permission-title">{safeString(block?.label || prompt?.title, 'Error handling model response')}</div>
         <div className="permission-body">{safeString(block?.content || prompt?.message, 'There was an error handling the model response.')}</div>
@@ -3393,7 +3613,7 @@ function ErrorPromptInline({ prompt, sessionId, onRespond }) {
 // Slide-in panel in the sidebar for launching a new agent session or resuming
 // a previous session from conversation history.
 
-function NewSessionPanel({ launchStates, onLaunch, onResume, onClose, workspaces, showTestSessions = false }) {
+function NewSessionPanel({ launchStates, onLaunch, onResume, onClose, onMinimize, workspaces, showTestSessions = false }) {
   const [mode,        setMode]        = React.useState('new');   // 'new' | 'resume'
   const [agentType,   setAgentType]   = React.useState('claude');
   const [wsMode,      setWsMode]      = React.useState('');
@@ -3471,6 +3691,7 @@ function NewSessionPanel({ launchStates, onLaunch, onResume, onClose, workspaces
     <div className="new-session-panel">
       <div className="new-session-header">
         <span>{mode === 'new' ? 'New Session' : 'Resume Session'}</span>
+        <PaneMinimizeButton paneId="new-session" onMinimize={onMinimize} />
         <button className="new-session-close" onClick={onClose} title="Cancel">✕</button>
       </div>
 
@@ -3872,7 +4093,7 @@ function attentionEventIsUnfocused(sessionId, activeSessionId) {
   return document.visibilityState !== 'visible' || !document.hasFocus();
 }
 
-function NotificationSettingsPanel({ onClose, onPreferencesChange }) {
+function NotificationSettingsPanel({ onClose, onMinimize, onPreferencesChange }) {
   const defaults = NOTIFICATION_PREFERENCE_DEFAULTS;
   const [preferences, setPreferences] = useState(defaults);
   const [loading, setLoading] = useState(true);
@@ -4012,6 +4233,7 @@ function NotificationSettingsPanel({ onClose, onPreferencesChange }) {
     <div className="settings-panel notification-settings-panel">
       <div className="settings-panel-header">
         <span>Notifications</span>
+        <PaneMinimizeButton paneId="notification-settings" onMinimize={onMinimize} />
         <button className="settings-panel-close" onClick={onClose} title="Close">✕</button>
       </div>
       <div className="settings-panel-body">
@@ -4129,7 +4351,7 @@ function NotificationSettingsPanel({ onClose, onPreferencesChange }) {
   );
 }
 
-function SessionManagementPanel({ sessions, preferences, initialSessionId, onSave, onExport, onClose }) {
+function SessionManagementPanel({ sessions, preferences, initialSessionId, onSave, onExport, onClose, onMinimize }) {
   const firstId = initialSessionId || sessionIdOf(sessions[0]) || '';
   const [selectedId, setSelectedId] = useState(firstId);
   const [displayName, setDisplayName] = useState('');
@@ -4177,6 +4399,7 @@ function SessionManagementPanel({ sessions, preferences, initialSessionId, onSav
     <div className="settings-panel session-management-panel">
       <div className="settings-panel-header">
         <span>Manage sessions</span>
+        <PaneMinimizeButton paneId="session-management" onMinimize={onMinimize} />
         <button className="settings-panel-close" onClick={onClose} title="Close">✕</button>
       </div>
       <div className="settings-panel-body">
@@ -4241,7 +4464,7 @@ function SessionManagementPanel({ sessions, preferences, initialSessionId, onSav
   );
 }
 
-function ScheduledSendPanel({ sessionId, initialContent, jobs, onSchedule, onCancel, onCreated, onClose }) {
+function ScheduledSendPanel({ sessionId, initialContent, jobs, onSchedule, onCancel, onCreated, onClose, onMinimize }) {
   const [content, setContent] = useState(initialContent || '');
   const [triggerKind, setTriggerKind] = useState('idle');
   const [deliverAt, setDeliverAt] = useState(() => {
@@ -4263,7 +4486,7 @@ function ScheduledSendPanel({ sessionId, initialContent, jobs, onSchedule, onCan
     try { await onCancel(id); } catch (err) { setError(err.message); }
   }
   return <div className="settings-panel scheduled-send-panel" data-testid="scheduled-send-panel">
-    <div className="settings-panel-header"><span>Schedule message</span><button className="settings-panel-close" onClick={onClose} title="Close">×</button></div>
+    <div className="settings-panel-header"><span>Schedule message</span><PaneMinimizeButton paneId="scheduled-send" onMinimize={onMinimize} /><button className="settings-panel-close" onClick={onClose} title="Close">×</button></div>
     <form className="settings-panel-body" onSubmit={createJob}>
       <label className="settings-row session-management-field"><span className="settings-label">Message</span><textarea value={content} maxLength={524288} onChange={event => setContent(event.target.value)} /></label>
       <label className="settings-row session-management-field"><span className="settings-label">Deliver</span><select value={triggerKind} onChange={event => setTriggerKind(event.target.value)}><option value="idle">When session is next idle</option><option value="at">At a specific time</option></select></label>
@@ -4275,7 +4498,7 @@ function ScheduledSendPanel({ sessionId, initialContent, jobs, onSchedule, onCan
   </div>;
 }
 
-function AgentSettingsPanel({ session, config, configControlStates, onRequestRefresh, onSetModel, onSetEffort, onSetPermissionMode, onSetAutoApprovePermissions, onSetMode, onSetCodexConfig, onSwitchWorkspace, onClose }) {
+function AgentSettingsPanel({ session, config, configControlStates, onRequestRefresh, onSetModel, onSetEffort, onSetPermissionMode, onSetAutoApprovePermissions, onSetMode, onSetCodexConfig, onSwitchWorkspace, onClose, onMinimize }) {
   const [showBypassConfirmation, setShowBypassConfirmation] = React.useState(false);
   const [localBypassRestoreProfile, setLocalBypassRestoreProfile] = React.useState(null);
   const sessionId    = sessionIdOf(session);
@@ -4406,6 +4629,7 @@ function AgentSettingsPanel({ session, config, configControlStates, onRequestRef
     <div className="settings-panel">
       <div className="settings-panel-header">
         <span>Session Settings</span>
+        <PaneMinimizeButton paneId="agent-settings" onMinimize={onMinimize} />
         <button className="settings-panel-close" onClick={onClose} title="Close">✕</button>
       </div>
       <div className="settings-panel-body">
@@ -4854,12 +5078,13 @@ function AgentSettingsPanel({ session, config, configControlStates, onRequestRef
 
 // ─── Chat list panel (Epic 9) ─────────────────────────────────────────────────
 // Collapsible panel showing Codex conversations with switch/new actions.
-function ChatListPanel({ chats, sessionId, onSwitch, onNew, onClose }) {
+function ChatListPanel({ chats, sessionId, onSwitch, onNew, onClose, onMinimize }) {
   return (
     <div className="chat-list-panel">
       <div className="chat-list-header">
         <span className="chat-list-title">Conversations</span>
         <button className="chat-list-new-btn" onClick={onNew} title="New conversation">+</button>
+        <PaneMinimizeButton paneId="chat-list" onMinimize={onMinimize} />
         <button className="chat-list-close-btn" onClick={onClose} title="Close">✕</button>
       </div>
       <div className="chat-list-body">
@@ -5028,39 +5253,112 @@ function AntigravityV2NavPanel({ items, onNavigate, onNew, onClose, embedded = f
   );
 }
 
-function ThreadHistoryPanel({ threads, sessionId, onSwitch, onNew, onClose, newLabel = 'New thread' }) {
+function desktopThreadPollabilityLabel(thread) {
+  if (thread?.active || thread?.view_state === 'native_active') return 'Live';
+  if (thread?.view_state === 'archive') return 'Read-only archive';
+  if (thread?.view_state === 'unavailable') return 'Open once in Desktop';
+  return thread?.pollability?.pollable === false ? 'Not pollable' : '';
+}
+
+function desktopThreadPollabilityTitle(thread) {
+  const label = desktopThreadPollabilityLabel(thread);
+  const reason = thread?.pollability?.required_action || thread?.pollability?.reason || '';
+  return [thread?.title || 'Untitled', label, reason].filter(Boolean).join(' · ');
+}
+
+function ThreadHistoryPanel({
+  threads,
+  selectedThreadId,
+  sessionId,
+  onSwitch,
+  onNew,
+  onClose,
+  onMinimize,
+  controlPolicy,
+  canCreateThread = true,
+  newLabel = 'New thread',
+}) {
+  const policy = controlPolicy || {};
+  const selectionMode = policy.selectionMode || 'native';
   return (
     <div className="chat-list-panel">
       <div className="chat-list-header">
         <span className="chat-list-title">Threads</span>
-        <button className="chat-list-new-btn" onClick={onNew} title={newLabel}>+</button>
+        <button
+          className="chat-list-new-btn"
+          onClick={onNew}
+          title={canCreateThread ? newLabel : (policy.reason || 'Native thread creation is unavailable')}
+          disabled={!canCreateThread}
+          aria-disabled={!canCreateThread}
+        >+</button>
+        <PaneMinimizeButton paneId="thread-list" onMinimize={onMinimize} />
         <button className="chat-list-close-btn" onClick={onClose} title="Close">✕</button>
       </div>
       <div className="chat-list-body">
+        {!!policy.notice && (
+          <div className={`thread-control-notice mode-${selectionMode}`} role="status">
+            <strong>{policy.nativeSwitchEnabled ? 'Native thread control' : 'RAC archive viewer'}</strong>
+            <span>{policy.notice}</span>
+          </div>
+        )}
         {(!threads || threads.length === 0) ? (
           <div className="chat-list-empty">No threads found</div>
         ) : (
-          threads.map((thread, i) => (
-            <button
-              key={thread.cache_key || thread.id || i}
-              className={`chat-list-item${thread.active ? ' active' : ''}`}
-              onClick={() => onSwitch(thread.id)}
-              title={thread.title}
-            >
-              <span className="chat-list-item-title">{thread.title}</span>
-              {thread.age && <span className="chat-list-item-age">{thread.age}</span>}
-              {thread.active && <span className="chat-list-item-active">●</span>}
-            </button>
-          ))
+          threads.map((thread, i) => {
+            const isSelected = selectedThreadId
+              ? (String(thread.id || '') === String(selectedThreadId)
+                || String(thread.cache_key || '') === String(selectedThreadId))
+              : !!thread.active;
+            const stateLabel = desktopThreadPollabilityLabel(thread);
+            const actionLabel = policy.nativeSwitchEnabled
+              ? `Switch Codex Desktop to ${thread.title || 'Untitled chat'}`
+              : thread.active
+                ? `Show native-active chat ${thread.title || 'Untitled chat'} in RAC`
+                : `View ${thread.title || 'Untitled chat'} in RAC only; does not switch Codex Desktop`;
+            return (
+              <button
+                key={thread.cache_key || thread.id || i}
+                className={`chat-list-item${isSelected ? ' active' : ''}`}
+                onClick={() => onSwitch(thread.id, selectionMode)}
+                title={`${actionLabel} Â· ${desktopThreadPollabilityTitle(thread)}`}
+                aria-label={actionLabel}
+                data-selection-mode={selectionMode}
+              >
+                <span className="chat-list-item-copy">
+                  <span className="chat-list-item-title">{thread.title}</span>
+                  {stateLabel && <span className={`chat-list-item-state state-${thread.view_state || 'unknown'}`}>{stateLabel}</span>}
+                </span>
+                {thread.age && <span className="chat-list-item-age">{thread.age}</span>}
+                {isSelected && <span className="chat-list-item-active">●</span>}
+              </button>
+            );
+          })
         )}
       </div>
     </div>
   );
 }
 
-function ThreadTabsBar({ threads, activeThreadId, onSwitch, onNew, onOpenHistory, showDraftTab = false, newLabel = 'New chat' }) {
+function ThreadTabsBar({
+  threads,
+  activeThreadId,
+  onSwitch,
+  onNew,
+  onOpenHistory,
+  controlPolicy,
+  canCreateThread = true,
+  showDraftTab = false,
+  newLabel = 'New chat',
+}) {
+  const policy = controlPolicy || {};
+  const selectionMode = policy.selectionMode || 'native';
   return (
-    <div className="thread-tabs-bar">
+    <div className="thread-tabs-bar" data-selection-mode={selectionMode}>
+      {!!policy.notice && (
+        <span className={`thread-tabs-scope mode-${selectionMode}`} role="status" title={policy.notice}>
+          {policy.nativeSwitchEnabled ? 'Native tabs' : 'RAC-only archive view'}
+        </span>
+      )}
       <div className="thread-tabs-scroll">
         {showDraftTab && (
           <button className="thread-tab active draft" type="button" title={newLabel}>
@@ -5068,14 +5366,24 @@ function ThreadTabsBar({ threads, activeThreadId, onSwitch, onNew, onOpenHistory
           </button>
         )}
         {(threads || []).map((thread, i) => {
-          const isActive = activeThreadId ? thread.id === activeThreadId : !!thread.active;
+          const isActive = activeThreadId
+            ? (String(thread.id || '') === String(activeThreadId)
+              || String(thread.cache_key || '') === String(activeThreadId))
+            : !!thread.active;
+          const actionLabel = policy.nativeSwitchEnabled
+            ? `Switch Codex Desktop to ${thread.title || 'Untitled chat'}`
+            : thread.active
+              ? `Show native-active chat ${thread.title || 'Untitled chat'} in RAC`
+              : `View ${thread.title || 'Untitled chat'} in RAC only; does not switch Codex Desktop`;
           return (
             <button
               key={thread.cache_key || thread.id || i}
               className={`thread-tab${isActive ? ' active' : ''}`}
               type="button"
-              title={thread.title || 'Untitled'}
-              onClick={() => onSwitch(thread.id)}
+              title={`${actionLabel} Â· ${desktopThreadPollabilityTitle(thread)}`}
+              aria-label={actionLabel}
+              data-selection-mode={selectionMode}
+              onClick={() => onSwitch(thread.id, selectionMode)}
             >
               <span className="thread-tab-title">{thread.title || 'Untitled'}</span>
               {thread.age && <span className="thread-tab-age">{thread.age}</span>}
@@ -5085,7 +5393,14 @@ function ThreadTabsBar({ threads, activeThreadId, onSwitch, onNew, onOpenHistory
       </div>
       <div className="thread-tabs-actions">
         <button className="thread-tabs-btn" type="button" onClick={onOpenHistory} title="Show all threads">All</button>
-        <button className="thread-tabs-btn accent" type="button" onClick={onNew} title={newLabel}>+</button>
+        <button
+          className="thread-tabs-btn accent"
+          type="button"
+          onClick={onNew}
+          title={canCreateThread ? newLabel : (policy.reason || 'Native thread creation is unavailable')}
+          disabled={!canCreateThread}
+          aria-disabled={!canCreateThread}
+        >+</button>
       </div>
     </div>
   );
@@ -5093,7 +5408,7 @@ function ThreadTabsBar({ threads, activeThreadId, onSwitch, onNew, onOpenHistory
 
 // ─── Branch selector panel ─────────────────────────────────────────────────────
 // Dropdown showing git branches with search, current indicator, and create-new.
-function BranchSelectorPanel({ branchData, sessionId, currentBranch, onSwitch, onCreate, onClose }) {
+function BranchSelectorPanel({ branchData, sessionId, currentBranch, onSwitch, onCreate, onClose, onMinimize }) {
   const [search, setSearch] = React.useState('');
   const [creating, setCreating] = React.useState(false);
   const [newName, setNewName] = React.useState('');
@@ -5107,6 +5422,7 @@ function BranchSelectorPanel({ branchData, sessionId, currentBranch, onSwitch, o
     <div className="branch-selector-panel">
       <div className="branch-selector-header">
         <span className="branch-selector-title">Branches</span>
+        <PaneMinimizeButton paneId="branch-selector" onMinimize={onMinimize} />
         <button className="chat-list-close-btn" onClick={onClose} title="Close">✕</button>
       </div>
       <div className="branch-selector-search">
@@ -5164,7 +5480,7 @@ function BranchSelectorPanel({ branchData, sessionId, currentBranch, onSwitch, o
 
 // ─── Terminal viewer (Epic 4) ──────────────────────────────────────────────────
 // Collapsible panel showing terminal/command output from Codex sessions.
-function TerminalViewer({ entries, canRead, canInput, onClose, onRefresh, onSend, controlResults }) {
+function TerminalViewer({ entries, canRead, canInput, onClose, onRefresh, onSend, controlResults, onMinimize }) {
   const [command, setCommand] = useState('');
   const [requestId, setRequestId] = useState(null);
   const controlResult = requestId ? controlResults?.[requestId] : null;
@@ -5182,6 +5498,7 @@ function TerminalViewer({ entries, canRead, canInput, onClose, onRefresh, onSend
       <div className="terminal-viewer-header">
         <span className="terminal-viewer-title">Terminal</span>
         {canRead && <button className="terminal-viewer-refresh" onClick={onRefresh} title="Refresh">↻</button>}
+        <PaneMinimizeButton paneId="terminal" onMinimize={onMinimize} />
         <button className="terminal-viewer-close" onClick={onClose} title="Close">✕</button>
       </div>
       {canRead ? (
@@ -5228,7 +5545,7 @@ function TerminalViewer({ entries, canRead, canInput, onClose, onRefresh, onSend
   );
 }
 
-function DiffViewer({ entries, onClose, onRefresh, onAccept, onReject }) {
+function DiffViewer({ entries, onClose, onRefresh, onAccept, onReject, onMinimize }) {
   const summaryChips = (summary) => {
     const text = String(summary || '').trim();
     if (!text) return [];
@@ -5242,6 +5559,7 @@ function DiffViewer({ entries, onClose, onRefresh, onAccept, onReject }) {
       <div className="diff-viewer-header">
         <span className="diff-viewer-title">File Changes</span>
         <button className="diff-viewer-refresh" onClick={onRefresh} title="Refresh">↻</button>
+        <PaneMinimizeButton paneId="diff-viewer" onMinimize={onMinimize} />
         <button className="diff-viewer-close" onClick={onClose} title="Close">✕</button>
       </div>
       <div className="diff-viewer-body">
@@ -5333,7 +5651,7 @@ function isMarkdownFile(name) {
   return name.toLowerCase().endsWith('.md');
 }
 
-function MarkdownViewer({ path: filePath, content, truncated, onBack }) {
+function MarkdownViewer({ path: filePath, content, truncated, onBack, onMinimize }) {
   const rendered = React.useMemo(() => {
     if (!content) return '';
     try {
@@ -5362,13 +5680,14 @@ function MarkdownViewer({ path: filePath, content, truncated, onBack }) {
         <button className="file-viewer-back" onClick={onBack} title="Back to files">←</button>
         <span className="file-viewer-title" title={filePath}>{fileName}</span>
         {truncated && <span className="file-viewer-truncated">truncated</span>}
+        {onMinimize && <PaneMinimizeButton paneId="file-browser" onMinimize={onMinimize} />}
       </div>
       <div className="file-viewer-body markdown-body" ref={bodyRef} dangerouslySetInnerHTML={{ __html: rendered }} />
     </div>
   );
 }
 
-function PlainFileViewer({ path: filePath, content, truncated, onBack }) {
+function PlainFileViewer({ path: filePath, content, truncated, onBack, onMinimize }) {
   const fileName = filePath ? filePath.split('/').pop().split('\\').pop() : 'File';
   const ext = fileName.split('.').pop().toLowerCase();
 
@@ -5390,6 +5709,7 @@ function PlainFileViewer({ path: filePath, content, truncated, onBack }) {
         <button className="file-viewer-back" onClick={onBack} title="Back to files">←</button>
         <span className="file-viewer-title" title={filePath}>{fileName}</span>
         {truncated && <span className="file-viewer-truncated">truncated</span>}
+        {onMinimize && <PaneMinimizeButton paneId="file-browser" onMinimize={onMinimize} />}
       </div>
       <div className="file-viewer-body">
         <pre className="file-viewer-code"><code dangerouslySetInnerHTML={{ __html: highlighted }} /></pre>
@@ -5457,7 +5777,7 @@ function TranscriptInlineFilePreview({ sessionId, filePath, fileContents, onClos
   );
 }
 
-function FileBrowser({ sessionId, listing, fileContents, onNavigate, onOpenFile, onClose, onRefresh, viewingFile, onBackToListing }) {
+function FileBrowser({ sessionId, listing, fileContents, onNavigate, onOpenFile, onClose, onRefresh, viewingFile, onBackToListing, onMinimize }) {
   // If viewing a file, show the appropriate viewer
   if (viewingFile) {
     const key = `${sessionId}:${viewingFile}`;
@@ -5466,9 +5786,9 @@ function FileBrowser({ sessionId, listing, fileContents, onNavigate, onOpenFile,
     const truncated = fileData?.truncated || false;
 
     if (isMarkdownFile(viewingFile)) {
-      return <MarkdownViewer path={viewingFile} content={content} truncated={truncated} onBack={onBackToListing} />;
+      return <MarkdownViewer path={viewingFile} content={content} truncated={truncated} onBack={onBackToListing} onMinimize={onMinimize} />;
     }
-    return <PlainFileViewer path={viewingFile} content={content} truncated={truncated} onBack={onBackToListing} />;
+    return <PlainFileViewer path={viewingFile} content={content} truncated={truncated} onBack={onBackToListing} onMinimize={onMinimize} />;
   }
 
   // Directory listing view
@@ -5481,6 +5801,7 @@ function FileBrowser({ sessionId, listing, fileContents, onNavigate, onOpenFile,
       <div className="file-browser-header">
         <span className="file-browser-title">Files</span>
         <button className="file-browser-refresh" onClick={onRefresh} title="Refresh">↻</button>
+        <PaneMinimizeButton paneId="file-browser" onMinimize={onMinimize} />
         <button className="file-browser-close" onClick={onClose} title="Close">✕</button>
       </div>
       <div className="file-browser-breadcrumbs">
@@ -5826,9 +6147,9 @@ function AutomationsView({ sessions, onBack }) {
   }
 
   return (
-    <div className="automations-view">
+    <div className="automations-view" data-pane-id="route-automations">
       <div className="automations-header">
-        <button className="automations-back" onClick={onBack} title="Back to sessions">←</button>
+        <button className="automations-back" data-route-return="chat" onClick={onBack} title="Back to chat">← Back to chat</button>
         <div className="automations-header-text">
           <h2>Automations</h2>
           <p>Automate work by sending scheduled prompts to your agents.</p>
@@ -5883,7 +6204,7 @@ function AutomationsView({ sessions, onBack }) {
 
 // ─── Skills View ────────────────────────────────────────────────────────────
 // Displays installed and recommended skills read from Codex Desktop via CDP.
-function CodexAutomationPane({ view, onShow }) {
+function CodexAutomationPane({ view, onShow, onMinimize }) {
   if (!view?.visible) return null;
   const statusRows = Array.isArray(view.status_rows) ? view.status_rows : [];
   const detailRows = Array.isArray(view.detail_rows) ? view.detail_rows : [];
@@ -5893,6 +6214,7 @@ function CodexAutomationPane({ view, onShow }) {
       <div className="codex-automation-pane-header">
         <div className="codex-automation-pane-icon">o</div>
         <div className="codex-automation-pane-title">{view.title || 'Automation'}</div>
+        <PaneMinimizeButton paneId="automation-context" onMinimize={onMinimize} />
       </div>
       {view.description && (
         <div className="codex-automation-pane-desc">{view.description}</div>
@@ -6112,6 +6434,35 @@ function UsageDashboard({ usage, refreshReceipt, resetReceipt, costDetail, onBac
     fresh: 'Fresh', refreshing: 'Refreshing', stale: 'Stale', auth_required: 'Sign in required',
     rate_limited: 'Refresh limited', unavailable: 'Unavailable',
   })[status] || 'Unavailable';
+  const sourceStatusLabel = (lifecycle, unavailableLabel = 'Unavailable') => ({
+    loading: 'Loading',
+    fresh: 'Fresh',
+    stale: 'Stale',
+    auth_required: 'Sign in required',
+    unavailable: unavailableLabel,
+    error: 'Needs attention',
+  })[lifecycle?.status] || unavailableLabel;
+  const sourceAgeLabel = lifecycle => {
+    const timestamp = lifecycle?.capturedAt || lifecycle?.lastGoodAt || lifecycle?.attemptedAt;
+    if (!timestamp) return 'Not yet observed';
+    const prefix = lifecycle?.status === 'stale' ? 'Last good' : lifecycle?.capturedAt ? 'Observed' : 'Last attempt';
+    return `${prefix} ${formatProviderUsageAge(timestamp, nowMs).replace(/^Updated /, '').toLowerCase()}`;
+  };
+  const sourceCountLabel = value => value == null ? 'Unknown' : value;
+  const cloudDiagnosticLabel = lifecycle => {
+    const diagnostic = lifecycle?.diagnostic;
+    if (!diagnostic) return '';
+    const ports = diagnostic.effectivePorts || [];
+    const attempts = diagnostic.attempts || [];
+    const reachable = attempts.filter(attempt => attempt.reachable).length;
+    if (ports.length === 0) return 'No owned browser endpoint configured';
+    return `Owned browser ${ports.join(', ')} · ${reachable}/${ports.length} reachable`;
+  };
+  const cloudRecoveryLabel = lifecycle => ({
+    start_owned_cloud_source: 'Start owned browser',
+    sign_in_owned_cloud_source: 'Retry after sign-in',
+    configure_owned_cloud_source: 'Retry cloud',
+  })[lifecycle?.nextAction] || 'Retry cloud';
   const resetAttention = normalized.entries.find(entry => (
     entry.providerId === 'openai-codex'
     && Number(entry.resetCredits?.available_count) > 0
@@ -6120,9 +6471,9 @@ function UsageDashboard({ usage, refreshReceipt, resetReceipt, costDetail, onBac
   const resetPending = ['requested', 'accepted'].includes(resetReceipt?.status);
 
   return (
-    <div className="usage-dashboard" data-testid="usage-dashboard">
+    <div className="usage-dashboard" data-testid="usage-dashboard" data-pane-id="route-usage">
       <div className="automations-header usage-dashboard-header">
-        <button className="automations-back" onClick={onBack} title="Back to sessions">←</button>
+        <button className="automations-back" data-route-return="chat" onClick={onBack} title="Back to chat">← Back to chat</button>
         <div className="automations-header-text">
           <h2>Usage & limits</h2>
           <p>Provider-account quotas shared by connected harnesses. Warnings start at 75% used.</p>
@@ -6179,6 +6530,9 @@ function UsageDashboard({ usage, refreshReceipt, resetReceipt, costDetail, onBac
             : '';
           const cardRefreshReceipt = refreshReceipt?.provider_id === entry.providerId ? refreshReceipt : null;
           const cardRefreshPending = ['requested', 'accepted', 'coalesced'].includes(cardRefreshReceipt?.status);
+          const localLifecycle = entry.localRuntime?.lifecycle;
+          const cloudLifecycle = entry.cloudUsage?.lifecycle;
+          const cloudRecovery = cloudRecoveryLabel(cloudLifecycle);
           return (
             <details
               open
@@ -6274,23 +6628,93 @@ function UsageDashboard({ usage, refreshReceipt, resetReceipt, costDetail, onBac
                 ) : !entry.localRuntime && !entry.cloudUsage ? (
                   <div className="usage-dashboard-unavailable">{entry.error?.message || 'This provider did not report quota windows.'}</div>
                 ) : null}
+                {entry.localRuntime && (
+                  <div
+                    className={`usage-dashboard-credit-row usage-dashboard-source-state ${localLifecycle?.status || 'unavailable'}`}
+                    data-testid="ollama-local-runtime"
+                    data-source-status={localLifecycle?.status || 'unavailable'}
+                  >
+                    <span>
+                      <strong>Local runtime</strong>
+                      {sourceCountLabel(entry.localRuntime.loadedModelsCount)} loaded / {sourceCountLabel(entry.localRuntime.installedModelsCount)} installed
+                      <small>
+                        {sourceStatusLabel(localLifecycle)} · {sourceAgeLabel(localLifecycle)}
+                        {localLifecycle?.reason?.message ? ` · ${localLifecycle.reason.message}` : ''}
+                      </small>
+                    </span>
+                    <span><strong>Request telemetry</strong>{entry.localRuntime.telemetryStatus.replace(/_/g, ' ')}<small>{entry.localRuntime.telemetryReason}</small></span>
+                    <button
+                      type="button"
+                      className="usage-card-refresh"
+                      onClick={() => onRefresh(true, entry.providerId)}
+                      disabled={cardRefreshPending}
+                      aria-label="Refresh Ollama local runtime"
+                    >{cardRefreshPending ? 'Refreshing...' : 'Refresh local'}</button>
+                  </div>
+                )}
                 {entry.cloudUsage && entry.providerId === 'ollama-local' && (
                   entry.cloudUsage.subscriptionState === 'active' ? (
-                    <div className="usage-dashboard-credit-row" data-testid="ollama-cloud-usage">
-                      <span><strong>Ollama Cloud</strong>{entry.windows.length} quota window{entry.windows.length === 1 ? '' : 's'}<small>{formatProviderUsageAge(entry.cloudUsage.capturedAt, nowMs)}</small></span>
+                    <div
+                      className={`usage-dashboard-credit-row usage-dashboard-source-state ${cloudLifecycle?.status || 'fresh'}`}
+                      data-testid="ollama-cloud-usage"
+                      data-source-status={cloudLifecycle?.status || 'fresh'}
+                    >
+                      <span>
+                        <strong>Ollama Cloud</strong>
+                        {entry.windows.length} quota window{entry.windows.length === 1 ? '' : 's'}
+                        <small>{sourceStatusLabel(cloudLifecycle)} · {sourceAgeLabel(cloudLifecycle)}</small>
+                      </span>
                       <span><strong>Auto-reload</strong>{entry.cloudUsage.autoReloadEnabled == null ? 'Not reported' : entry.cloudUsage.autoReloadEnabled ? 'On' : 'Off'}<small>Extra usage balance is separate from plan quota</small></span>
+                      <button
+                        type="button"
+                        className="usage-card-refresh"
+                        onClick={() => onRefresh(true, entry.providerId)}
+                        disabled={cardRefreshPending}
+                        aria-label="Refresh Ollama Cloud usage"
+                      >{cardRefreshPending ? 'Refreshing...' : 'Refresh cloud'}</button>
                     </div>
                   ) : entry.cloudUsage.subscriptionState === 'none' ? (
-                    <div className="usage-dashboard-unavailable" data-testid="ollama-cloud-no-subscription"><strong>No cloud subscription</strong> - local models remain unlimited</div>
+                    <div
+                      className="usage-dashboard-credit-row usage-dashboard-source-state fresh"
+                      data-testid="ollama-cloud-no-subscription"
+                      data-source-status="fresh"
+                    >
+                      <span><strong>Ollama Cloud</strong>No cloud subscription<small>Fresh · local models remain available</small></span>
+                      <button
+                        type="button"
+                        className="usage-card-refresh"
+                        onClick={() => onRefresh(true, entry.providerId)}
+                        disabled={cardRefreshPending}
+                        aria-label="Refresh Ollama Cloud subscription"
+                      >{cardRefreshPending ? 'Refreshing...' : 'Refresh cloud'}</button>
+                    </div>
                   ) : (
-                    <div className="usage-dashboard-unavailable" data-testid="ollama-cloud-unavailable"><strong>Cloud usage unavailable</strong> - {entry.cloudUsage.error?.message || 'Open the signed-in Ollama Usage page to expose account quota.'}</div>
+                    <div
+                      className={`usage-dashboard-credit-row usage-dashboard-source-state ${cloudLifecycle?.status || 'unavailable'}`}
+                      data-testid="ollama-cloud-unavailable"
+                      data-source-status={cloudLifecycle?.status || 'unavailable'}
+                    >
+                      <span>
+                        <strong>Ollama Cloud</strong>
+                        {sourceStatusLabel(cloudLifecycle, 'Not connected')}
+                        <small>
+                          {entry.cloudUsage.error?.message || cloudLifecycle?.reason?.message || 'Ollama Cloud monitoring is not connected.'}
+                          {cloudDiagnosticLabel(cloudLifecycle) ? ` · ${cloudDiagnosticLabel(cloudLifecycle)}` : ''}
+                          {` · ${sourceAgeLabel(cloudLifecycle)}`}
+                        </small>
+                      </span>
+                      <button
+                        type="button"
+                        className="usage-card-refresh"
+                        onClick={() => onRefresh(true, entry.providerId)}
+                        disabled={cardRefreshPending}
+                        aria-label={`${cloudRecovery} for Ollama Cloud`}
+                      >{cardRefreshPending
+                          ? cloudRecovery === 'Start owned browser' ? 'Starting...' : 'Refreshing...'
+                          : cloudRecovery}</button>
+                      {entry.dashboardUrl && <a href={entry.dashboardUrl} target="_blank" rel="noreferrer">Open Ollama Cloud</a>}
+                    </div>
                   )
-                )}
-                {entry.localRuntime && (
-                  <div className="usage-dashboard-credit-row" data-testid="ollama-local-runtime">
-                    <span><strong>Local runtime</strong>{entry.localRuntime.loadedModelsCount} loaded / {entry.localRuntime.installedModelsCount} installed<small>{entry.localRuntime.endpointScope.replace(/_/g, ' ')}</small></span>
-                    <span><strong>Request telemetry</strong>{entry.localRuntime.telemetryStatus.replace(/_/g, ' ')}<small>{entry.localRuntime.telemetryReason}</small></span>
-                  </div>
                 )}
                 {entry.localRuntime?.latestRequest && (
                   <div className="usage-dashboard-credit-row" data-testid="ollama-owned-request-metrics">
@@ -6880,9 +7304,9 @@ function HostResourceDashboard({
     ] : []),
   ];
   return (
-    <div className="host-resource-dashboard" data-testid="host-resource-dashboard">
+    <div className="host-resource-dashboard" data-testid="host-resource-dashboard" data-pane-id="route-host-resources">
       <div className="automations-header host-resource-header">
-        <button className="automations-back" onClick={onBack} title="Back to sessions">&larr;</button>
+        <button className="automations-back" data-route-return="chat" onClick={onBack} title="Back to chat">&larr; Back to chat</button>
         <div className="automations-header-text">
           <h2>Host resources</h2>
           <p>Live, ephemeral Windows metrics. Process commands and executable paths never leave the proxy.</p>
@@ -7185,9 +7609,9 @@ function FleetView({ sessions, activities, thinking, permissionPrompts, errorPro
   }
 
   return (
-    <div className="fleet-view" data-testid="fleet-view">
+    <div className="fleet-view" data-testid="fleet-view" data-pane-id="route-fleet">
       <div className="automations-header fleet-view-header">
-        <button className="automations-back" onClick={onBack} title="Back to sessions">{'\u2190'}</button>
+        <button className="automations-back" data-route-return="chat" onClick={onBack} title="Back to chat">{'\u2190'} Back to chat</button>
         <div className="automations-header-text">
           <h2>Fleet view</h2>
           <p>Live monitoring across every active harness session.</p>
@@ -7352,9 +7776,9 @@ function TranscriptSearchView({ onBack, onOpenResult }) {
   }
 
   return (
-    <div className="transcript-search-view" data-testid="transcript-search-view">
+    <div className="transcript-search-view" data-testid="transcript-search-view" data-pane-id="route-search">
       <div className="automations-header transcript-search-header">
-        <button className="skills-back" onClick={onBack} title="Back to sessions">←</button>
+        <button className="skills-back" data-route-return="chat" onClick={onBack} title="Back to chat">← Back to chat</button>
         <div><h2>Transcript search</h2><p>Search every relay-backed message.</p></div>
       </div>
       <form className="transcript-search-form" onSubmit={runSearch}>
@@ -7390,9 +7814,9 @@ function SkillsView({ skills, onRefresh, onBack }) {
   const loading = installed.length === 0 && recommended.length === 0;
 
   return (
-    <div className="skills-view">
+    <div className="skills-view" data-pane-id="route-skills">
       <div className="skills-header">
-        <button className="skills-back" onClick={onBack} title="Back to sessions">←</button>
+        <button className="skills-back" data-route-return="chat" onClick={onBack} title="Back to chat">← Back to chat</button>
         <div className="skills-header-text">
           <h2>Skills</h2>
           <p className="skills-subtitle">Give Codex superpowers.</p>
@@ -7525,8 +7949,86 @@ function App() {
       temporalObserver.droppedSamples = Number(temporalObserver.droppedSamples || 0) + 1;
     }
   });
-  const { sessions, messages, provisionalStreams, historyMeta, historyLoading, connected, connectionHealth, unread, setUnread, thinking, thinkingContent, activities, health, deliveryStates, launchStates, justLaunched, setJustLaunched, permissionPrompts, respondToPrompt, errorPrompts, respondToErrorPrompt, interruptSession, controlGoal, agentConfigs, configControlStates, requestAgentConfig, setAgentModel, setAgentEffort, setAgentPermissionMode, setAutoApprovePermissions, setAntigravityMode, setCodexConfig, newThread, openPanel, openNativeWindow, requestChatList, switchChat, newChat, chatLists, requestThreadList, switchThread, threadLists, switchWorkspace, requestTerminalOutput, sendTerminalInput, terminalOutputs, requestFileChanges, respondToFileChange, fileChanges, sendAttachment, send, sendToSession, steerMessage, discardQueuedMessage, editQueuedMessage, queuedMessages, scheduledSends, scheduleSend, cancelScheduledSend, launchSession, resumeSession, closeSession, activeSessionRef, restoreCachedTranscript, setSessionSubscriptions, workspaces, branchLists, requestBranchList, switchBranch, createBranch, skillLists, requestSkillList, automationViews, showCodexAutomation, controlResults, directoryListings, requestDirectoryListing, fileContents, requestFileContent, requestHistory, requestHistoryChunk, duplicateProxyAlarms, nightlyValidationFailures, latestAppUpdateValidation, revalidationProgramHealth, operatorDogfoodHealth, providerUsage, providerUsageRefreshReceipt, requestProviderUsageRefresh, setProviderUsageWatching, providerUsageResetReceipt, consumeProviderUsageResetCredit, providerUsageCostDetail, requestProviderUsageCostDetail, hostResources, hostResourceError, hostResourceHistory, hostResourceDetails, hostResourceSubscription, subscribeHostResources, unsubscribeHostResources, requestHostResourceRefresh, semanticNotifications, sessionAliases } = useRelay();
+  const { sessions, messages, provisionalStreams, historyMeta, historyLoading, connected, connectionHealth, unread, setUnread, thinking, thinkingContent, activities, health, deliveryStates, launchStates, justLaunched, setJustLaunched, permissionPrompts, respondToPrompt, errorPrompts, respondToErrorPrompt, interruptSession, controlGoal, agentConfigs, configControlStates, requestAgentConfig, setAgentModel, setAgentEffort, setAgentPermissionMode, setAutoApprovePermissions, setAntigravityMode, setCodexConfig, newThread, openPanel, openNativeWindow, requestChatList, switchChat, newChat, chatLists, requestThreadList, switchThread, threadLists, threadViews, switchWorkspace, requestTerminalOutput, sendTerminalInput, terminalOutputs, requestFileChanges, respondToFileChange, fileChanges, sendAttachment, send, sendToSession, steerMessage, discardQueuedMessage, editQueuedMessage, queuedMessages, scheduledSends, scheduleSend, cancelScheduledSend, launchSession, resumeSession, closeSession, activeSessionRef, restoreCachedTranscript, setSessionSubscriptions, workspaces, branchLists, requestBranchList, switchBranch, createBranch, skillLists, requestSkillList, automationViews, showCodexAutomation, controlResults, directoryListings, requestDirectoryListing, fileContents, requestFileContent, requestHistory, requestHistoryChunk, duplicateProxyAlarms, nightlyValidationFailures, latestAppUpdateValidation, revalidationProgramHealth, operatorDogfoodHealth, providerUsage, providerUsageRefreshReceipt, requestProviderUsageRefresh, setProviderUsageWatching, providerUsageResetReceipt, consumeProviderUsageResetCredit, providerUsageCostDetail, requestProviderUsageCostDetail, hostResources, hostResourceError, hostResourceHistory, hostResourceDetails, hostResourceSubscription, subscribeHostResources, unsubscribeHostResources, requestHostResourceRefresh, semanticNotifications, sessionAliases } = useRelay();
   const [activeSession, setActiveSession] = useState(null);
+  const [paneLifecycle, setPaneLifecycle] = useState(() => createPaneLifecycleLedger());
+  const compactPaneLayout = useCompactPaneLayout();
+  const paneOpenerByIdRef = useRef({});
+  const sidebarPane = usePaneBoolean(paneLifecycle, setPaneLifecycle, activeSession, 'sidebar', compactPaneLayout, paneOpenerByIdRef);
+  const newSessionPane = usePaneBoolean(paneLifecycle, setPaneLifecycle, activeSession, 'new-session', compactPaneLayout, paneOpenerByIdRef);
+  const notificationSettingsPane = usePaneBoolean(paneLifecycle, setPaneLifecycle, activeSession, 'notification-settings', compactPaneLayout, paneOpenerByIdRef);
+  const sessionManagementPane = usePaneBoolean(paneLifecycle, setPaneLifecycle, activeSession, 'session-management', compactPaneLayout, paneOpenerByIdRef);
+  const scheduledSendPane = usePaneBoolean(paneLifecycle, setPaneLifecycle, activeSession, 'scheduled-send', compactPaneLayout, paneOpenerByIdRef);
+  const agentSettingsPane = usePaneBoolean(paneLifecycle, setPaneLifecycle, activeSession, 'agent-settings', compactPaneLayout, paneOpenerByIdRef);
+  const composerSettingsPane = usePaneBoolean(paneLifecycle, setPaneLifecycle, activeSession, 'composer-settings', compactPaneLayout, paneOpenerByIdRef);
+  const chatListPane = usePaneBoolean(paneLifecycle, setPaneLifecycle, activeSession, 'chat-list', compactPaneLayout, paneOpenerByIdRef);
+  const threadListPane = usePaneBoolean(paneLifecycle, setPaneLifecycle, activeSession, 'thread-list', compactPaneLayout, paneOpenerByIdRef);
+  const terminalPane = usePaneBoolean(paneLifecycle, setPaneLifecycle, activeSession, 'terminal', compactPaneLayout, paneOpenerByIdRef);
+  const diffViewerPane = usePaneBoolean(paneLifecycle, setPaneLifecycle, activeSession, 'diff-viewer', compactPaneLayout, paneOpenerByIdRef);
+  const branchSelectorPane = usePaneBoolean(paneLifecycle, setPaneLifecycle, activeSession, 'branch-selector', compactPaneLayout, paneOpenerByIdRef);
+  const fileBrowserPane = usePaneBoolean(paneLifecycle, setPaneLifecycle, activeSession, 'file-browser', compactPaneLayout, paneOpenerByIdRef);
+  const antigravityNavigatorPane = usePaneBoolean(paneLifecycle, setPaneLifecycle, activeSession, 'antigravity-navigator', compactPaneLayout, paneOpenerByIdRef);
+  const nativeActionPane = usePaneBoolean(paneLifecycle, setPaneLifecycle, activeSession, 'native-action', compactPaneLayout, paneOpenerByIdRef);
+  const rateLimitPane = usePaneBoolean(paneLifecycle, setPaneLifecycle, activeSession, 'rate-limit', compactPaneLayout, paneOpenerByIdRef);
+  const liveActivityPane = usePaneBoolean(paneLifecycle, setPaneLifecycle, activeSession, 'live-activity', compactPaneLayout, paneOpenerByIdRef);
+  const taskListPane = usePaneBoolean(paneLifecycle, setPaneLifecycle, activeSession, 'task-list', compactPaneLayout, paneOpenerByIdRef);
+  const automationContextPane = usePaneBoolean(paneLifecycle, setPaneLifecycle, activeSession, 'automation-context', compactPaneLayout, paneOpenerByIdRef);
+  const quickSwitcherPane = usePaneBoolean(paneLifecycle, setPaneLifecycle, activeSession, 'quick-switcher', compactPaneLayout, paneOpenerByIdRef);
+  const shortcutHelpPane = usePaneBoolean(paneLifecycle, setPaneLifecycle, activeSession, 'shortcut-help', compactPaneLayout, paneOpenerByIdRef);
+  const revalidationLedgerPane = usePaneBoolean(paneLifecycle, setPaneLifecycle, activeSession, 'revalidation-ledger', compactPaneLayout, paneOpenerByIdRef);
+  const minimizedPaneRecords = paneRestoreRail(paneLifecycle, activeSession);
+  const restorePane = React.useCallback((paneId, opener) => {
+    if (opener) paneOpenerByIdRef.current[paneId] = opener;
+    setPaneLifecycle(previous => transitionPaneLifecycle(previous, {
+      session_id: activeSession,
+      pane_id: paneId,
+      action: 'restore',
+      compact: compactPaneLayout,
+    }));
+  }, [activeSession, compactPaneLayout]);
+  const sidebarOpen = sidebarPane.open;
+  const setSidebarOpen = sidebarPane.setOpen;
+  const showNewSession = newSessionPane.open;
+  const setShowNewSession = newSessionPane.setOpen;
+  const showNotificationSettings = notificationSettingsPane.open;
+  const setShowNotificationSettings = notificationSettingsPane.setOpen;
+  const showSessionManagement = sessionManagementPane.open;
+  const setShowSessionManagement = sessionManagementPane.setOpen;
+  const showScheduledSend = scheduledSendPane.open;
+  const setShowScheduledSend = scheduledSendPane.setOpen;
+  const showSettings = agentSettingsPane.open;
+  const setShowSettings = agentSettingsPane.setOpen;
+  const showComposerSettings = composerSettingsPane.open;
+  const setShowComposerSettings = composerSettingsPane.setOpen;
+  const showChatList = chatListPane.open;
+  const setShowChatList = chatListPane.setOpen;
+  const showThreadList = threadListPane.open;
+  const setShowThreadList = threadListPane.setOpen;
+  const showTerminal = terminalPane.open;
+  const setShowTerminal = terminalPane.setOpen;
+  const showDiffViewer = diffViewerPane.open;
+  const setShowDiffViewer = diffViewerPane.setOpen;
+  const showBranchSelector = branchSelectorPane.open;
+  const setShowBranchSelector = branchSelectorPane.setOpen;
+  const showFileBrowser = fileBrowserPane.open;
+  const setShowFileBrowser = fileBrowserPane.setOpen;
+  const agv2NavigatorOpen = antigravityNavigatorPane.open;
+  const setAgv2NavigatorOpen = antigravityNavigatorPane.setOpen;
+  const quickSwitcherOpen = quickSwitcherPane.open;
+  const setQuickSwitcherOpen = quickSwitcherPane.setOpen;
+  const shortcutHelpOpen = shortcutHelpPane.open;
+  const setShortcutHelpOpen = shortcutHelpPane.setOpen;
+  const revalidationLedgerOpen = revalidationLedgerPane.open;
+  const setRevalidationLedgerOpen = revalidationLedgerPane.setOpen;
+  useEffect(() => {
+    if (compactPaneLayout || paneLifecycle?.sessions?.[activeSession || '__global__']?.panes?.sidebar) return;
+    setPaneLifecycle(previous => transitionPaneLifecycle(previous, {
+      session_id: activeSession,
+      pane_id: 'sidebar',
+      action: 'open',
+      compact: false,
+    }));
+  }, [activeSession, compactPaneLayout, paneLifecycle]);
   const subscribeActiveTranscript = React.useCallback(
     listener => subscribeCachedTranscript(activeSession, listener),
     [activeSession],
@@ -7542,7 +8044,6 @@ function App() {
   );
   const [drafts, setDrafts]             = useState({});
   const [draftFiles, setDraftFiles]     = useState({});
-  const [sidebarOpen, setSidebarOpen]   = useState(false);
   const [sidebarSearchQuery, setSidebarSearchQuery] = useState('');
   const [toast, setToast]               = useState('');
   const [attentionToast, setAttentionToast] = useState(null);
@@ -7554,21 +8055,12 @@ function App() {
   const promptSoundReadyRef = useRef(false);
   const [uploading, setUploading]       = useState(false);
   const [showSlashMenu, setShowSlashMenu] = useState(false);
-  const [showNewSession, setShowNewSession] = useState(false);
-  const [showNotificationSettings, setShowNotificationSettings] = useState(false);
-  const [showSessionManagement, setShowSessionManagement] = useState(false);
-  const [showScheduledSend, setShowScheduledSend] = useState(false);
   const [managedSessionId, setManagedSessionId] = useState('');
   const [sessionPreferences, setSessionPreferences] = useState({});
   const [sessionPreferencesLoaded, setSessionPreferencesLoaded] = useState(false);
   const [openSidebarMenuId, setOpenSidebarMenuId] = useState('');
-  const [showSettings, setShowSettings]     = useState(false);
-  const [showComposerSettings, setShowComposerSettings] = useState(false);
-  const [quickSwitcherOpen, setQuickSwitcherOpen] = useState(false);
   const [quickSwitcherQuery, setQuickSwitcherQuery] = useState('');
   const [quickSwitcherIndex, setQuickSwitcherIndex] = useState(0);
-  const [shortcutHelpOpen, setShortcutHelpOpen] = useState(false);
-  const [revalidationLedgerOpen, setRevalidationLedgerOpen] = useState(false);
   const [stopPending, setStopPending]       = useState({});
   const [goalControlPending, setGoalControlPending] = useState({});
   const [goalCommandNotices, setGoalCommandNotices] = useState({});
@@ -7578,16 +8070,10 @@ function App() {
   const interruptConfirmTimerRef = useRef(null);
   const [showJumpButton, setShowJumpButton] = useState(false);
   const [newMessagesBelow, setNewMessagesBelow] = useState(0);
-  const [showChatList, setShowChatList]     = useState(false);
-  const [agv2NavigatorOpen, setAgv2NavigatorOpen] = useState(true);
   const [optimisticV2ChatFocus, setOptimisticV2ChatFocus] = useState({});
-  const [showThreadList, setShowThreadList] = useState(false);
   const [pendingDraftThreads, setPendingDraftThreads] = useState({});
   const [optimisticThreadFocus, setOptimisticThreadFocus] = useState({});
   const [draftMessageBaselines, setDraftMessageBaselines] = useState({});
-  const [showTerminal, setShowTerminal]   = useState(false);
-  const [showDiffViewer, setShowDiffViewer] = useState(false);
-  const [showBranchSelector, setShowBranchSelector] = useState(false);
   const [showAutomations, setShowAutomations]       = useState(false);
   const [showSkills, setShowSkills]                 = useState(false);
   const [showUsageDashboard, setShowUsageDashboard] = useState(false);
@@ -7595,12 +8081,21 @@ function App() {
   const [showFleetView, setShowFleetView]           = useState(false);
   const [showTranscriptSearch, setShowTranscriptSearch] = useState(false);
   const [transcriptSearchTarget, setTranscriptSearchTarget] = useState(null);
-  const [showFileBrowser, setShowFileBrowser]       = useState(false);
   const [fileBrowserPath, setFileBrowserPath]       = useState('.');
   const [viewingFile, setViewingFile]               = useState(null); // { path, content } when viewing a file
   const [transcriptPreview, setTranscriptPreview]   = useState(null);
   const systemBannerRef = useRef(null);
   const [systemBannerHeight, setSystemBannerHeight] = useState(0);
+  const [mobileSystemBannerExpanded, setMobileSystemBannerExpanded] = useState(() => {
+    try { return localStorage.getItem(MOBILE_SYSTEM_BANNER_STORAGE_KEY) === '1'; } catch { return false; }
+  });
+  const [mobileHeaderExpanded, setMobileHeaderExpanded] = useState(() => {
+    try { return localStorage.getItem(MOBILE_HEADER_STORAGE_KEY) === '1'; } catch { return false; }
+  });
+  const [mobileLiveStatusExpanded, setMobileLiveStatusExpanded] = useState(() => {
+    try { return localStorage.getItem(MOBILE_LIVE_STATUS_STORAGE_KEY) === '1'; } catch { return false; }
+  });
+  const [mobileSystemAlertNew, setMobileSystemAlertNew] = useState(false);
   const quickSwitcherInputRef = useRef(null);
   const [theme, setTheme]                           = useState(() => {
     try { return localStorage.getItem('remote-agent-chat-theme') || 'dark'; } catch { return 'dark'; }
@@ -7619,6 +8114,39 @@ function App() {
   useEffect(() => {
     try { localStorage.setItem(SHOW_TEST_SESSIONS_STORAGE_KEY, showTestSessions ? '1' : '0'); } catch {}
   }, [showTestSessions]);
+  useEffect(() => {
+    try {
+      localStorage.setItem(MOBILE_SYSTEM_BANNER_STORAGE_KEY, mobileSystemBannerExpanded ? '1' : '0');
+    } catch {}
+  }, [mobileSystemBannerExpanded]);
+  useEffect(() => {
+    try { localStorage.setItem(MOBILE_HEADER_STORAGE_KEY, mobileHeaderExpanded ? '1' : '0'); } catch {}
+  }, [mobileHeaderExpanded]);
+  useEffect(() => {
+    try { localStorage.setItem(MOBILE_LIVE_STATUS_STORAGE_KEY, mobileLiveStatusExpanded ? '1' : '0'); } catch {}
+  }, [mobileLiveStatusExpanded]);
+  useEffect(() => {
+    const viewport = window.visualViewport;
+    const updateMobileViewportBudget = () => {
+      const width = Math.max(1, Math.round(viewport?.width || window.innerWidth || 1));
+      const height = Math.max(1, Math.round(viewport?.height || window.innerHeight || 1));
+      const offsetTop = Math.max(0, Math.round(viewport?.offsetTop || 0));
+      document.documentElement.style.setProperty('--rac-visual-viewport-width', `${width}px`);
+      document.documentElement.style.setProperty('--rac-visual-viewport-height', `${height}px`);
+      document.documentElement.style.setProperty('--rac-visual-viewport-offset-top', `${offsetTop}px`);
+    };
+    updateMobileViewportBudget();
+    viewport?.addEventListener('resize', updateMobileViewportBudget);
+    viewport?.addEventListener('scroll', updateMobileViewportBudget);
+    window.addEventListener('resize', updateMobileViewportBudget);
+    window.addEventListener('orientationchange', updateMobileViewportBudget);
+    return () => {
+      viewport?.removeEventListener('resize', updateMobileViewportBudget);
+      viewport?.removeEventListener('scroll', updateMobileViewportBudget);
+      window.removeEventListener('resize', updateMobileViewportBudget);
+      window.removeEventListener('orientationchange', updateMobileViewportBudget);
+    };
+  }, []);
   const [sessionGroupAliases] = useState(() => {
     try {
       const stored = JSON.parse(localStorage.getItem(GROUP_ALIAS_STORAGE_KEY) || '{}');
@@ -7721,8 +8249,9 @@ function App() {
   const sendToSessionRef = useRef(sendToSession);
   useEffect(() => { sendToSessionRef.current = sendToSession; }, [sendToSession]);
   const handleTranscriptRetry = React.useCallback((message) => {
-    if (!activeSession || !message?._cid) return;
-    sendToSessionRef.current(activeSession, message.content, message._cid);
+    const clientMessageId = messageClientMessageId(message);
+    if (!activeSession || !clientMessageId) return;
+    sendToSessionRef.current(activeSession, message.content, clientMessageId);
   }, [activeSession]);
   const requestFileContentRef = useRef(requestFileContent);
   useEffect(() => { requestFileContentRef.current = requestFileContent; }, [requestFileContent]);
@@ -8424,6 +8953,15 @@ function App() {
     () => orderedSessions.find(s => sessionIdOf(s) === activeSession),
     [orderedSessions, activeSession],
   );
+  const activeCodexDesktopThreadView = activeSessionMeta?.agent_type === 'codex-desktop' && activeSession
+    ? (threadViews[activeSession] || null)
+    : null;
+  const activeCodexDesktopThreadDetached = !!(
+    activeCodexDesktopThreadView?.view_state
+    && activeCodexDesktopThreadView.view_state !== 'native_active'
+  );
+  const activeCodexDesktopArchiveView = activeCodexDesktopThreadView?.view_state === 'archive';
+  const activeCodexDesktopThreadLoading = activeCodexDesktopThreadView?.view_state === 'loading';
   const hasNativeDraftThread = !!activeSessionMeta?.is_new_chat_draft;
   const chatRouteActive = !showAutomations
     && !showSkills
@@ -8432,19 +8970,21 @@ function App() {
     && !showFleetView
     && !showTranscriptSearch;
   const activeTranscriptRenderKey = React.useMemo(() => {
-    const focusedThreadId = optimisticThreadFocus[activeSession];
+    const focusedThreadId = activeCodexDesktopThreadView?.thread_id || optimisticThreadFocus[activeSession];
     const activeThread = (threadLists[activeSession] || []).find(thread => thread?.active);
     const activeThreadId = activeThread?.cache_key || activeThread?.id;
     const draftKey = (pendingDraftThreads[activeSession] || hasNativeDraftThread) ? 'draft' : '';
-    return `${activeSession || 'none'}:${draftKey || focusedThreadId || activeThreadId || 'default'}`;
-  }, [activeSession, threadLists, optimisticThreadFocus, pendingDraftThreads, hasNativeDraftThread]);
+    return `${activeSession || 'none'}:${activeCodexDesktopThreadView?.view_state || 'native'}:${draftKey || focusedThreadId || activeThreadId || 'default'}`;
+  }, [activeSession, activeCodexDesktopThreadView?.thread_id, activeCodexDesktopThreadView?.view_state, threadLists, optimisticThreadFocus, pendingDraftThreads, hasNativeDraftThread]);
   const activeMessagesForScroll = activeSession ? activeTranscriptMessages : EMPTY_MESSAGES;
-  const activeProvisionalStream = activeSession ? (provisionalStreams[activeSession] || null) : null;
+  const activeProvisionalStream = activeSession && !activeCodexDesktopThreadDetached
+    ? (provisionalStreams[activeSession] || null)
+    : null;
   const activeNativeCliPlaceholder = shouldRefreshNativeCliPlaceholder(activeSessionMeta, activeMessagesForScroll);
-  const activeActivityForScroll = activeSession ? activities[activeSession] : null;
-  const activeThinkingForScroll = activeSession ? (thinkingContent[activeSession] || '') : '';
-  const activePermissionPromptForScroll = activeSession ? permissionPrompts[activeSession] || null : null;
-  const activeErrorPromptForScroll = activeSession ? errorPrompts[activeSession] || null : null;
+  const activeActivityForScroll = activeSession && !activeCodexDesktopThreadDetached ? activities[activeSession] : null;
+  const activeThinkingForScroll = activeSession && !activeCodexDesktopThreadDetached ? (thinkingContent[activeSession] || '') : '';
+  const activePermissionPromptForScroll = activeSession && !activeCodexDesktopThreadDetached ? permissionPrompts[activeSession] || null : null;
+  const activeErrorPromptForScroll = activeSession && !activeCodexDesktopThreadDetached ? errorPrompts[activeSession] || null : null;
   const activeTranscriptSemanticGeometryVersion = [
     activeSession || '',
     activeProvisionalStream?.messageId || '',
@@ -9349,8 +9889,6 @@ async function uploadBinaryDraft(sessionId, base64, mimeType, filename) {
     if (attentionToast?.sessionId === id) clearAttentionToast();
     setSidebarOpen(false);
     setShowSlashMenu(false);
-    setShowChatList(false);
-    setShowThreadList(false);
     setShowTranscriptSearch(false);
     // A changed activeSession reconciles in the effect below. Re-selecting the
     // current card still needs an explicit refresh because React will not rerun it.
@@ -9472,7 +10010,7 @@ async function uploadBinaryDraft(sessionId, base64, mimeType, filename) {
   // ── Send ─────────────────────────────────────────────────────────────────
 
   function sendMessage() {
-    if (activeBlockingPrompt) return;
+    if (activeBlockingPrompt || activeCodexDesktopThreadDetached) return;
     const currentInput = activeSession ? (drafts[activeSession] || '') : '';
     const attachedFiles = activeSession ? (draftFiles[activeSession] || []) : [];
     const text = currentInput.trim();
@@ -9717,7 +10255,7 @@ async function uploadBinaryDraft(sessionId, base64, mimeType, filename) {
 
   // ── Derived state ─────────────────────────────────────────────────────────
 
-  const isActiveThinking = activeSession ? !!thinking[activeSession] : false;
+  const isActiveThinking = activeSession && !activeCodexDesktopThreadDetached ? !!thinking[activeSession] : false;
   const isStopPending    = activeSession ? !!stopPending[activeSession] : false;
   const currentInput    = activeSession ? (drafts[activeSession] || '') : '';
   const attachedFiles   = activeSession ? (draftFiles[activeSession] || []) : [];
@@ -9810,8 +10348,12 @@ async function uploadBinaryDraft(sessionId, base64, mimeType, filename) {
       }
     };
   }, [renderedMessages, transcriptWindow.scrollToIndex]);
-  const activePrompt    = activeSession ? permissionPrompts[activeSession] || null : null;
-  const activeErrorPrompt = activeSession ? errorPrompts[activeSession] || null : null;
+  const activePrompt = activeSession && !activeCodexDesktopThreadDetached
+    ? permissionPrompts[activeSession] || null
+    : null;
+  const activeErrorPrompt = activeSession && !activeCodexDesktopThreadDetached
+    ? errorPrompts[activeSession] || null
+    : null;
   const activeBlockingErrorPrompt = isBlockingErrorPrompt(activeErrorPrompt) ? activeErrorPrompt : null;
   const activeInlineErrorPrompt = activeErrorPrompt && !isBlockingErrorPrompt(activeErrorPrompt) ? activeErrorPrompt : null;
   const activeBlockingPrompt = activePrompt || activeBlockingErrorPrompt;
@@ -9824,6 +10366,31 @@ async function uploadBinaryDraft(sessionId, base64, mimeType, filename) {
     : activeBlockingErrorPrompt
       ? safeString(activeBlockingErrorPrompt.title, 'Action required')
       : null;
+  const nativeActionSourceKey = activePrompt
+    ? (activePromptContinuityKey || [
+        activeSession,
+        activePrompt.type || 'prompt',
+        activePrompt.prompt_id || activePrompt.request_id || activePrompt.id || 'unknown',
+        activePrompt.generation || activeSessionMeta?.turn_generation || 'legacy',
+      ].join('\u0000'))
+    : activeBlockingErrorPrompt
+      ? [
+          activeSession,
+          'error',
+          activeBlockingErrorPrompt.prompt_id || activeBlockingErrorPrompt.request_id || activeBlockingErrorPrompt.id || 'unknown',
+          activeBlockingErrorPrompt.generation || activeSessionMeta?.turn_generation || 'legacy',
+        ].join('\u0000')
+      : '';
+  useLayoutEffect(() => {
+    setPaneLifecycle(previous => synchronizeAuthoritativePane(previous, {
+      session_id: activeSession,
+      pane_id: 'native-action',
+      source_key: nativeActionSourceKey,
+      attention_count: nativeActionSourceKey ? 1 : 0,
+      compact: compactPaneLayout,
+      payload: nativeActionSourceKey ? { label: activeBlockingPromptLabel } : null,
+    }));
+  }, [activeSession, activeBlockingPromptLabel, compactPaneLayout, nativeActionSourceKey]);
   useLayoutEffect(() => {
     const list = messagesListRef.current;
     if (!list) return;
@@ -9874,7 +10441,12 @@ async function uploadBinaryDraft(sessionId, base64, mimeType, filename) {
   const activeWriteGate = activeSession
     ? agentConfigs[activeSession]?.capabilities?.write_capability_gate || null
     : null;
-  const canSend         = !!(currentInput.trim() || attachedFiles.length > 0) && !!activeSession && !uploading && !activeBlockingPrompt && !activeWriteGate;
+  const canSend = !!(currentInput.trim() || attachedFiles.length > 0)
+    && !!activeSession
+    && !uploading
+    && !activeBlockingPrompt
+    && !activeWriteGate
+    && !activeCodexDesktopThreadDetached;
   const relayHealthState = connected ? (connectionHealth?.state || 'connecting') : 'offline';
   const relayRttText = connectionHealth?.rttMs != null ? ` · ${connectionHealth.rttMs} ms` : '';
   const unreadTotal     = Object.entries(unread).reduce((total, [sessionId, count]) => (
@@ -9904,6 +10476,51 @@ async function uploadBinaryDraft(sessionId, base64, mimeType, filename) {
   const dogfoodUnhealthy = dogfoodStatus !== 'PASS' || dogfoodOpenFingerprints.length > 0;
   const hasSystemBanner = duplicateProxyAlarms.length > 0 || visibleNightlyValidationFailures.length > 0
     || !!recentAppUpdateValidation || !!activeWriteGate || dogfoodUnhealthy;
+  const systemAlertCount = (duplicateProxyAlarms.length > 0 ? 1 : 0)
+    + visibleNightlyValidationFailures.length
+    + (recentAppUpdateValidation ? 1 : 0)
+    + (activeWriteGate ? 1 : 0)
+    + (dogfoodUnhealthy ? 1 : 0);
+  const systemBannerSeverity = activeWriteGate
+    || duplicateProxyAlarms.length > 0
+    || recentAppUpdateValidation?.status === 'fail'
+    || dogfoodStatus === 'FAIL'
+    || dogfoodOpenFingerprints.length > 0
+    ? 'critical'
+    : visibleNightlyValidationFailures.length > 0 || dogfoodUnhealthy
+      ? 'warning'
+      : 'status';
+  const systemBannerFingerprint = JSON.stringify({
+    duplicate: duplicateProxyAlarms.map(item => item.session_id || item.session || '').sort(),
+    nightly: visibleNightlyValidationFailures.map(item => item.run_id || `${item.harness}:${item.app_version}`).sort(),
+    app_update: recentAppUpdateValidation
+      ? `${recentAppUpdateValidation.run_id || ''}:${recentAppUpdateValidation.status || ''}`
+      : '',
+    write_gate: !!activeWriteGate,
+    dogfood: `${dogfoodStatus}:${dogfoodOpenFingerprints.slice().sort().join(',')}`,
+  });
+  useEffect(() => {
+    if (!hasSystemBanner) {
+      setMobileSystemAlertNew(false);
+      return;
+    }
+    const severityRank = systemBannerSeverity === 'critical' ? 2 : systemBannerSeverity === 'warning' ? 1 : 0;
+    try {
+      const previous = JSON.parse(localStorage.getItem(MOBILE_SYSTEM_FINGERPRINT_STORAGE_KEY) || 'null');
+      const isNewHigherSeverity = severityRank > 0 && (
+        !previous
+        || severityRank > Number(previous.severity_rank || 0)
+        || (severityRank === 2 && previous.fingerprint !== systemBannerFingerprint)
+      );
+      setMobileSystemAlertNew(isNewHigherSeverity);
+      localStorage.setItem(MOBILE_SYSTEM_FINGERPRINT_STORAGE_KEY, JSON.stringify({
+        fingerprint: systemBannerFingerprint,
+        severity_rank: severityRank,
+      }));
+    } catch {
+      setMobileSystemAlertNew(severityRank > 0);
+    }
+  }, [hasSystemBanner, systemBannerFingerprint, systemBannerSeverity]);
   const slashQuery      = currentInput.startsWith('/') ? currentInput.slice(1).trim().toLowerCase() : '';
   const filteredSlashCommands = currentInput.startsWith('/')
     ? SLASH_COMMANDS.filter(item => item.command.slice(1).includes(slashQuery))
@@ -9931,6 +10548,14 @@ async function uploadBinaryDraft(sessionId, base64, mimeType, filename) {
   const activeFailedConfigControl = activeConfigControls.find(control => control.status === 'failed') || null;
   const activeHistoryMeta = activeSession ? (historyMeta[activeSession] || null) : null;
   const activeHistoryLoading = activeSession ? (historyLoading[activeSession] || null) : null;
+  const activeHistorySource = activeCodexDesktopArchiveView
+    ? 'codex_desktop_jsonl'
+    : ((activeSessionMeta?.agent_type === 'codex_cli' || activeSessionMeta?.agent_type === 'cursor_cli')
+        ? 'native'
+        : 'relay_sqlite');
+  const activeHistoryThreadId = activeCodexDesktopArchiveView
+    ? activeCodexDesktopThreadView?.thread_id || null
+    : null;
 
   // Transcript history is loaded newest-first for the selected session only.
   // Relay-backed sessions page through SQLite chunks; Codex CLI pages through
@@ -9938,20 +10563,35 @@ async function uploadBinaryDraft(sessionId, base64, mimeType, filename) {
   useEffect(() => {
     if (!activeSession || !connected) return;
     if (transcriptSearchTarget?.sessionId === activeSession) return;
+    if (activeCodexDesktopThreadDetached && !activeCodexDesktopArchiveView) return;
     const existing = messages[activeSession] || [];
     const lastSequence = existing.reduce((maximum, message) => (
       Math.max(maximum, Number(message?.sequence || 0))
     ), 0);
-    if (lastSequence > 0) {
+    if (lastSequence > 0 && !activeCodexDesktopArchiveView) {
       requestHistory(activeSession, { afterSequence: lastSequence });
       return;
     }
     const tailOptions = historyRequestOptionsFor(activeSessionMeta);
-    const chunkSource = (activeSessionMeta?.agent_type === 'codex_cli' || activeSessionMeta?.agent_type === 'cursor_cli') ? 'native' : 'relay_sqlite';
-    requestHistoryChunk(activeSession, { ...tailOptions, mode: 'tail', source: chunkSource });
-  }, [activeSession, connected, activeSessionMeta?.agent_type, transcriptSearchTarget?.sessionId]);
+    requestHistoryChunk(activeSession, {
+      ...tailOptions,
+      mode: 'tail',
+      source: activeHistorySource,
+      threadId: activeHistoryThreadId,
+    });
+  }, [
+    activeSession,
+    connected,
+    activeSessionMeta?.agent_type,
+    activeCodexDesktopArchiveView,
+    activeCodexDesktopThreadDetached,
+    activeHistorySource,
+    activeHistoryThreadId,
+    transcriptSearchTarget?.sessionId,
+  ]);
   useEffect(() => {
     if (!connected || !transcriptSearchTarget || activeSession !== transcriptSearchTarget.sessionId) return;
+    if (activeCodexDesktopThreadDetached) return;
     const targetAlreadyLoaded = (messages[activeSession] || []).some(message => (
       String(message?.id) === String(transcriptSearchTarget.messageId)
     ));
@@ -9967,7 +10607,7 @@ async function uploadBinaryDraft(sessionId, base64, mimeType, filename) {
     requestAroundMatch();
     const retryTimer = setTimeout(requestAroundMatch, 600);
     return () => clearTimeout(retryTimer);
-  }, [connected, activeSession, transcriptSearchTarget?.sessionId, transcriptSearchTarget?.messageId, messages[activeSession]]);
+  }, [connected, activeSession, activeCodexDesktopThreadDetached, transcriptSearchTarget?.sessionId, transcriptSearchTarget?.messageId, messages[activeSession]]);
   useEffect(() => {
     if (!transcriptSearchTarget || activeSession !== transcriptSearchTarget.sessionId) return undefined;
     const selector = `[data-message-id="${transcriptSearchTarget.messageId}"]`;
@@ -10011,6 +10651,17 @@ async function uploadBinaryDraft(sessionId, base64, mimeType, filename) {
     requestHistoryChunk(activeSession, { ...tailOptions, mode: 'tail', source: 'native' });
   }, [activeSession, connected, activeNativeCliPlaceholder]);
   const isAntigravityV2 = activeSessionMeta?.agent_type === 'antigravity-v2';
+  React.useEffect(() => {
+    if (!activeSession || !isAntigravityV2) return;
+    const existing = paneLifecycle?.sessions?.[activeSession]?.panes?.['antigravity-navigator'];
+    if (existing) return;
+    setPaneLifecycle(previous => transitionPaneLifecycle(previous, {
+      session_id: activeSession,
+      pane_id: 'antigravity-navigator',
+      action: 'open',
+      compact: compactPaneLayout,
+    }));
+  }, [activeSession, compactPaneLayout, isAntigravityV2, paneLifecycle]);
   const rawActiveChatList = activeSession ? (chatLists[activeSession] || []) : [];
   const optimisticV2Focus = activeSession ? optimisticV2ChatFocus[activeSession] : null;
   const activeChatList = React.useMemo(() => {
@@ -10026,7 +10677,7 @@ async function uploadBinaryDraft(sessionId, base64, mimeType, filename) {
     && Object.prototype.hasOwnProperty.call(chatLists, activeSession)
   );
   const activeV2ConversationCount = activeChatList.filter(item => !item?.kind || item.kind === 'chat').length;
-  const showAntigravityV2Navigator = !!(activeSession && isAntigravityV2 && !showFileBrowser);
+  const showAntigravityV2Navigator = !!(activeSession && isAntigravityV2);
   const autoExpandLongCodeBlocks = activeSessionMeta?.agent_type === 'antigravity' || activeSessionMeta?.agent_type === 'antigravity_panel' || activeSessionMeta?.agent_type === 'antigravity-v2';
   const visiblePaneSession = activeSessionMeta ? findVisiblePaneSession(orderedSessions, activeSessionMeta) : null;
   const codexWorkbenchPaneSummary = activeSessionMeta?.agent_type === 'codex' && activeSessionMeta?.visible_pane_visible
@@ -10095,8 +10746,10 @@ async function uploadBinaryDraft(sessionId, base64, mimeType, filename) {
     activeTitleProjectionCacheRef.current.set(activeSession, retained);
     return retained;
   }, [activeSession, activeTitleSession, activeMessagesForScroll]);
-  const activeChatTitle = activeChatTitleProjection.title;
-  const activeAutomationView = activeSession ? automationViews[activeSession] : null;
+  const activeChatTitle = activeCodexDesktopThreadView?.title || activeChatTitleProjection.title;
+  const activeAutomationView = activeSession && !activeCodexDesktopThreadDetached
+    ? automationViews[activeSession]
+    : null;
   const activeLooksLikeCodex = activeAgent?.name === 'Codex';
   const showVisiblePaneBanner = !!(
     activeLooksLikeCodex
@@ -10169,7 +10822,7 @@ async function uploadBinaryDraft(sessionId, base64, mimeType, filename) {
   // when no status event has arrived yet for this session (undefined), not when it
   // was explicitly cleared to false by the idle timeout — that would resurrect a
   // stale "generating" indicator after the agent has already finished.
-  const activeActivity = activeSession
+  const activeActivity = activeSession && !activeCodexDesktopThreadDetached
     ? (activities[activeSession] !== undefined
         ? activities[activeSession]
         : (activeSessionMeta && typeof activeSessionMeta === 'object' ? activeSessionMeta.activity : null))
@@ -10251,6 +10904,73 @@ async function uploadBinaryDraft(sessionId, base64, mimeType, filename) {
       || hasSubstantiveLiveText(liveThinkingText || activeActivity.thinkingContent || '')
     )
   );
+  const activeRateLimitVisible = !!(
+    activeSession
+    && (activeSessionMeta?.rate_limit_active
+      || (activeSessionMeta?.percent_used != null && activeSessionMeta.percent_used >= 75))
+  );
+  const activitySourceKey = activeSession && showTranscriptFooterActivity
+    ? [
+        activeSession,
+        'activity',
+        activeSessionMeta?.turn_generation
+          || activeActivity?.turn_id
+          || activeActivity?.started_at
+          || activeActivity?.goal?.fingerprint
+          || 'current',
+      ].join('\u0000')
+    : '';
+  const taskListSourceKey = activeSession && activeActivity?.task_list && !activeActivity?.step
+    ? `${activitySourceKey || activeSession}\u0000tasks`
+    : '';
+  const automationContextSourceKey = activeSession && activeAutomationView?.visible
+    ? [activeSession, 'automation', activeAutomationView.id || activeAutomationView.title || 'visible'].join('\u0000')
+    : '';
+  const rateLimitSourceKey = activeRateLimitVisible
+    ? [activeSession, activeSessionMeta?.rate_limit_active ? 'rate-limit' : 'usage-warning'].join('\u0000')
+    : '';
+  useLayoutEffect(() => {
+    setPaneLifecycle(previous => {
+      let next = previous;
+      next = synchronizeAuthoritativePane(next, {
+        session_id: activeSession,
+        pane_id: 'rate-limit',
+        source_key: rateLimitSourceKey,
+        attention_count: activeSessionMeta?.rate_limit_active ? 1 : 0,
+        payload: rateLimitSourceKey ? { percent_used: activeSessionMeta?.percent_used ?? null } : null,
+      });
+      next = synchronizeAuthoritativePane(next, {
+        session_id: activeSession,
+        pane_id: 'live-activity',
+        source_key: activitySourceKey,
+        payload: activitySourceKey ? { kind: activeActivity?.kind || 'activity' } : null,
+      });
+      next = synchronizeAuthoritativePane(next, {
+        session_id: activeSession,
+        pane_id: 'task-list',
+        source_key: taskListSourceKey,
+        payload: taskListSourceKey ? { present: true } : null,
+      });
+      return synchronizeAuthoritativePane(next, {
+        session_id: activeSession,
+        pane_id: 'automation-context',
+        source_key: automationContextSourceKey,
+        payload: automationContextSourceKey ? { title: activeAutomationView?.title || 'Automation' } : null,
+      });
+    });
+  }, [
+    activeActivity?.kind,
+    activeAutomationView?.title,
+    activeAutomationView?.visible,
+    activeRateLimitVisible,
+    activeSession,
+    activeSessionMeta?.percent_used,
+    activeSessionMeta?.rate_limit_active,
+    activitySourceKey,
+    automationContextSourceKey,
+    rateLimitSourceKey,
+    taskListSourceKey,
+  ]);
   const activeHistoryHasOlderCursor = !!(
     activeHistoryMeta?.cursor
     && (
@@ -10284,10 +11004,10 @@ async function uploadBinaryDraft(sessionId, base64, mimeType, filename) {
         viewportTop: anchorRow.getBoundingClientRect().top,
       } : null;
     }
-    const chunkSource = (activeSessionMeta?.agent_type === 'codex_cli' || activeSessionMeta?.agent_type === 'cursor_cli') ? 'native' : 'relay_sqlite';
     requestHistoryChunk(activeSession, {
       mode: activeHistoryMeta?.cursor ? 'older' : 'tail',
-      source: chunkSource,
+      source: activeHistorySource,
+      threadId: activeHistoryThreadId,
       userInitiated: true,
       beforeOffset: activeHistoryMeta?.cursor?.next_before_offset,
       beforeId: activeHistoryMeta?.cursor?.next_before_id,
@@ -10304,6 +11024,8 @@ async function uploadBinaryDraft(sessionId, base64, mimeType, filename) {
   }, [
     activeSession,
     activeSessionMeta?.agent_type,
+    activeHistorySource,
+    activeHistoryThreadId,
     activeHistoryLoading,
     showPartialHistoryBanner,
     activeHistoryMeta?.cursor?.next_before_offset,
@@ -10311,11 +11033,11 @@ async function uploadBinaryDraft(sessionId, base64, mimeType, filename) {
   ]);
   function retryActiveHistory() {
     if (!activeSession) return;
-    const chunkSource = (activeSessionMeta?.agent_type === 'codex_cli' || activeSessionMeta?.agent_type === 'cursor_cli') ? 'native' : 'relay_sqlite';
     requestHistoryChunk(activeSession, {
       ...historyRequestOptionsFor(activeSessionMeta),
       mode: 'tail',
-      source: chunkSource,
+      source: activeHistorySource,
+      threadId: activeHistoryThreadId,
       userInitiated: true,
     });
   }
@@ -10354,7 +11076,7 @@ async function uploadBinaryDraft(sessionId, base64, mimeType, filename) {
           preview={preview}
           fileContents={fileContents}
           onClosePreview={closeTranscriptPreview}
-          deliveryState={msg._cid ? deliveryStates[msg._cid] : null}
+          deliveryState={messageClientMessageId(msg) ? deliveryStates[messageClientMessageId(msg)] : null}
           onSteer={handleTranscriptSteer}
           onRetry={handleTranscriptRetry}
           richContentEager={richContentEager}
@@ -10395,25 +11117,38 @@ async function uploadBinaryDraft(sessionId, base64, mimeType, filename) {
   ]);
   // Auto-fetch thread list for desktop sessions with no messages (e.g. Codex Desktop showing chat picker)
   const hasThreadCap = activeConfig?.capabilities?.thread_list;
+  const activeDesktopThreadPolicy = React.useMemo(
+    () => codexDesktopThreadControlPolicy({
+      agentType: activeSessionMeta?.agent_type,
+      capabilities: activeConfig?.capabilities,
+      session: activeSessionMeta,
+    }),
+    [activeConfig?.capabilities, activeSessionMeta],
+  );
+  const canCreateDesktopThread = activeConfig?.capabilities?.new_thread === true
+    && (activeSessionMeta?.agent_type !== 'codex-desktop'
+      || activeDesktopThreadPolicy.nativeSwitchEnabled);
   const showDesktopThreadTabs = !!(
     activeSession
     && (activeSessionMeta?.agent_type === 'codex-desktop' || activeSessionMeta?.agent_type === 'cursor')
     && hasThreadCap
     && (threadLists[activeSession]?.length > 0 || pendingDraftThreads[activeSession] || hasNativeDraftThread)
-    && !showFileBrowser
   );
   const desktopThreadTabs = React.useMemo(() => {
     const list = [...(threadLists[activeSession] || [])];
     if (list.length === 0) return list;
-    const focusId = optimisticThreadFocus[activeSession];
-    const focusIndex = focusId ? list.findIndex(thread => thread.id === focusId) : -1;
+    const focusId = activeCodexDesktopThreadView?.thread_id || optimisticThreadFocus[activeSession];
+    const focusIndex = focusId ? list.findIndex(thread => (
+      String(thread.id || '') === String(focusId)
+      || String(thread.cache_key || '') === String(focusId)
+    )) : -1;
     const activeIndex = focusIndex >= 0 ? focusIndex : list.findIndex(thread => thread.active);
     if (activeIndex > 0) {
       const [activeThread] = list.splice(activeIndex, 1);
       list.unshift(activeThread);
     }
     return list;
-  }, [activeSession, threadLists, optimisticThreadFocus]);
+  }, [activeSession, activeCodexDesktopThreadView?.thread_id, threadLists, optimisticThreadFocus]);
   React.useLayoutEffect(() => {
     if (!chatRouteActive || typeof ResizeObserver === 'undefined') return undefined;
     const list = messagesListRef.current;
@@ -10524,16 +11259,21 @@ async function uploadBinaryDraft(sessionId, base64, mimeType, filename) {
     const liveThreads = threadLists[activeSession] || [];
     const focusedThreadId = optimisticThreadFocus[activeSession];
     if (!focusedThreadId) return;
-    if (liveThreads.some(thread => thread.id === focusedThreadId && thread.active)) {
+    const resolvedThreadId = threadViews[activeSession]?.thread_id;
+    if (
+      String(resolvedThreadId || '') === String(focusedThreadId)
+      || liveThreads.some(thread => thread.id === focusedThreadId && thread.active)
+    ) {
       setOptimisticThreadFocus(prev => {
         const next = { ...prev };
         delete next[activeSession];
         return next;
       });
     }
-  }, [activeSession, threadLists, optimisticThreadFocus]);
+  }, [activeSession, threadLists, threadViews, optimisticThreadFocus]);
   function handleNewThread(sessionId = activeSession) {
     if (!sessionId) return;
+    if (sessionId === activeSession && !canCreateDesktopThread) return;
     setPendingDraftThreads(prev => ({ ...prev, [sessionId]: true }));
     setOptimisticThreadFocus(prev => {
       const next = { ...prev };
@@ -10548,12 +11288,12 @@ async function uploadBinaryDraft(sessionId, base64, mimeType, filename) {
     newThread(sessionId);
   }
 
-  function handleSwitchThread(sessionId, threadId) {
+  function handleSwitchThread(sessionId, threadId, selectionMode = 'native') {
     if (!(sessionId && threadId)) return;
     setPendingDraftThreads(prev => ({ ...prev, [sessionId]: false }));
     setOptimisticThreadFocus(prev => ({ ...prev, [sessionId]: threadId }));
     setDraftMessageBaselines(prev => ({ ...prev, [sessionId]: 0 }));
-    switchThread(sessionId, threadId);
+    switchThread(sessionId, threadId, { selectionMode });
   }
 
   function handleAntigravityV2New(sessionId = activeSession) {
@@ -10657,8 +11397,6 @@ async function uploadBinaryDraft(sessionId, base64, mimeType, filename) {
         onManage={() => {
           setManagedSessionId(id);
           setShowSessionManagement(true);
-          setShowNotificationSettings(false);
-          setShowNewSession(false);
         }}
         onClose={() => {
           const isDisconnected = health[id] === 'disconnected' || !health[id];
@@ -10695,8 +11433,9 @@ async function uploadBinaryDraft(sessionId, base64, mimeType, filename) {
       className={`app${hasSystemBanner ? ' has-system-banner' : ''}`}
       style={hasSystemBanner ? { '--system-banner-height': `${systemBannerHeight}px` } : undefined}
     >
-      {quickSwitcherOpen && (
-        <div
+      {quickSwitcherPane.mounted && (
+        <PaneLifecycleBoundary paneId="quick-switcher" state={quickSwitcherPane.record.state} onMinimize={quickSwitcherPane.minimize}>
+          <div
           className="quick-switcher-overlay"
           onMouseDown={event => {
             if (event.target !== event.currentTarget) return;
@@ -10709,6 +11448,7 @@ async function uploadBinaryDraft(sessionId, base64, mimeType, filename) {
           <div className="quick-switcher" role="dialog" aria-modal="true" aria-label="Switch session">
             <div className="quick-switcher-input-wrap">
               <span aria-hidden="true">⌕</span>
+              <PaneMinimizeButton paneId="quick-switcher" onMinimize={quickSwitcherPane.minimize} />
               <input
                 ref={quickSwitcherInputRef}
                 className="quick-switcher-input"
@@ -10762,10 +11502,12 @@ async function uploadBinaryDraft(sessionId, base64, mimeType, filename) {
               <span>{quickSwitcherResults.length} of {quickSwitcherItems.length}</span>
             </div>
           </div>
-        </div>
+          </div>
+        </PaneLifecycleBoundary>
       )}
-      {shortcutHelpOpen && (
-        <div
+      {shortcutHelpPane.mounted && (
+        <PaneLifecycleBoundary paneId="shortcut-help" state={shortcutHelpPane.record.state} onMinimize={shortcutHelpPane.minimize}>
+          <div
           className="shortcut-help-overlay"
           onMouseDown={event => {
             if (event.target === event.currentTarget) setShortcutHelpOpen(false);
@@ -10774,6 +11516,7 @@ async function uploadBinaryDraft(sessionId, base64, mimeType, filename) {
           <div className="shortcut-help" role="dialog" aria-modal="true" aria-label="Keyboard shortcuts">
             <div className="shortcut-help-header">
               <strong>Keyboard shortcuts</strong>
+              <PaneMinimizeButton paneId="shortcut-help" onMinimize={shortcutHelpPane.minimize} />
               <button type="button" onClick={() => setShortcutHelpOpen(false)} aria-label="Close keyboard shortcuts">×</button>
             </div>
             <div className="shortcut-help-list">
@@ -10785,10 +11528,12 @@ async function uploadBinaryDraft(sessionId, base64, mimeType, filename) {
             </div>
             <div className="shortcut-help-note">Shortcuts never switch or submit while you are typing unless they include Ctrl/Cmd or Alt.</div>
           </div>
-        </div>
+          </div>
+        </PaneLifecycleBoundary>
       )}
-      {revalidationLedgerOpen && (
-        <div
+      {revalidationLedgerPane.mounted && (
+        <PaneLifecycleBoundary paneId="revalidation-ledger" state={revalidationLedgerPane.record.state} onMinimize={revalidationLedgerPane.minimize}>
+          <div
           className="shortcut-help-overlay revalidation-ledger-backdrop"
           role="presentation"
           onMouseDown={event => {
@@ -10798,6 +11543,7 @@ async function uploadBinaryDraft(sessionId, base64, mimeType, filename) {
           <div className="revalidation-ledger" role="dialog" aria-modal="true" aria-label="Harness revalidation program health">
             <div className="shortcut-help-header">
               <strong>Harness revalidation program</strong>
+              <PaneMinimizeButton paneId="revalidation-ledger" onMinimize={revalidationLedgerPane.minimize} />
               <button type="button" onClick={() => setRevalidationLedgerOpen(false)} aria-label="Close validation health">{'\u00d7'}</button>
             </div>
             <p className="revalidation-ledger-summary">
@@ -10843,10 +11589,35 @@ async function uploadBinaryDraft(sessionId, base64, mimeType, filename) {
             )}
           </div>
         </div>
+        </PaneLifecycleBoundary>
       )}
       <div className={`overlay ${sidebarOpen ? 'open' : ''}`} onClick={() => setSidebarOpen(false)} />
       {hasSystemBanner && (
-        <div className={`duplicate-proxy-banner${recentAppUpdateValidation?.status === 'pass' && duplicateProxyAlarms.length === 0 && visibleNightlyValidationFailures.length === 0 && !activeWriteGate && !dogfoodUnhealthy ? ' app-update-pass' : ''}`} role={recentAppUpdateValidation?.status === 'pass' && duplicateProxyAlarms.length === 0 && visibleNightlyValidationFailures.length === 0 && !activeWriteGate && !dogfoodUnhealthy ? 'status' : 'alert'} ref={systemBannerRef}>
+        <div
+          className={`duplicate-proxy-banner mobile-system-${mobileSystemBannerExpanded ? 'expanded' : 'collapsed'} severity-${systemBannerSeverity}${recentAppUpdateValidation?.status === 'pass' && duplicateProxyAlarms.length === 0 && visibleNightlyValidationFailures.length === 0 && !activeWriteGate && !dogfoodUnhealthy ? ' app-update-pass' : ''}`}
+          role={recentAppUpdateValidation?.status === 'pass' && duplicateProxyAlarms.length === 0 && visibleNightlyValidationFailures.length === 0 && !activeWriteGate && !dogfoodUnhealthy ? 'status' : 'alert'}
+          ref={systemBannerRef}
+        >
+          <div className="system-banner-mobile-summary">
+            <span className="system-banner-severity" aria-hidden="true">!</span>
+            <span className="system-banner-summary-label">
+              {systemAlertCount} system alert{systemAlertCount === 1 ? '' : 's'} · {systemBannerSeverity}
+            </span>
+            {mobileSystemAlertNew && <span className="system-banner-new">New</span>}
+            <button
+              type="button"
+              className="system-banner-disclosure"
+              aria-expanded={mobileSystemBannerExpanded}
+              aria-controls="system-banner-mobile-details"
+              onClick={() => {
+                setMobileSystemBannerExpanded(expanded => !expanded);
+                setMobileSystemAlertNew(false);
+              }}
+            >
+              {mobileSystemBannerExpanded ? 'Hide' : 'Details'}
+            </button>
+          </div>
+          <div className="system-banner-details" id="system-banner-mobile-details">
           {duplicateProxyAlarms.length > 0 && <>
             <strong>Duplicate proxy detected.</strong>
             <span>{duplicateProxyAlarms.length} session{duplicateProxyAlarms.length === 1 ? '' : 's'} claimed by multiple proxies. Stop the extra proxy to prevent conflicting controls.</span>
@@ -10870,22 +11641,35 @@ async function uploadBinaryDraft(sessionId, base64, mimeType, filename) {
               : 'The required 30-minute canary is missing, expired, skipped, or running against a different served asset.'}</span>
           </>}
           {(revalidationProgramHealth || operatorDogfoodHealth || dogfoodUnhealthy) && <button type="button" className="validation-health-link" onClick={() => setRevalidationLedgerOpen(true)}>View program health</button>}
+          </div>
         </div>
       )}
 
       {/* Sidebar */}
-      <div className={`sidebar ${sidebarOpen ? 'open' : ''}`}>
+      <div
+        id="pane-sidebar"
+        className={`sidebar ${sidebarOpen ? 'open' : ''}${sidebarPane.record.state === PANE_MINIMIZED ? ' pane-minimized' : ''}`}
+        data-pane-id="sidebar"
+        data-pane-state={sidebarPane.record.state === PANE_CLOSED && !compactPaneLayout ? PANE_OPEN : sidebarPane.record.state}
+      >
         <div className="sidebar-header">
           <span className="logo">⌬</span>
           <span style={{ flex: 1 }}>Agent Sessions</span>
+          <PaneMinimizeButton paneId="sidebar" onMinimize={sidebarPane.minimize} />
           <button
             className={`new-session-btn notification-settings-btn${revalidationLedgerOpen ? ' active' : ''}`}
+            data-pane-toggle="revalidation-ledger"
+            aria-expanded={revalidationLedgerOpen}
+            aria-controls="pane-revalidation-ledger"
             title="Harness validation health"
             aria-label="Harness validation health"
             onClick={() => setRevalidationLedgerOpen(true)}
           >V</button>
           <button
             className={`new-session-btn notification-settings-btn${shortcutHelpOpen ? ' active' : ''}`}
+            data-pane-toggle="shortcut-help"
+            aria-expanded={shortcutHelpOpen}
+            aria-controls="pane-shortcut-help"
             title="Keyboard shortcuts (?)"
             aria-label="Keyboard shortcuts"
             onClick={() => {
@@ -10895,18 +11679,22 @@ async function uploadBinaryDraft(sessionId, base64, mimeType, filename) {
           >?</button>
           <button
             className={`new-session-btn notification-settings-btn${showNotificationSettings ? ' active' : ''}`}
+            data-pane-toggle="notification-settings"
             title="Notification settings"
             aria-label="Notification settings"
+            aria-expanded={showNotificationSettings}
+            aria-controls="pane-notification-settings"
             onClick={() => {
               setShowNotificationSettings(open => !open);
-              setShowNewSession(false);
-              setShowSessionManagement(false);
             }}
           >♢</button>
           <button
             className={`new-session-btn notification-settings-btn${showSessionManagement ? ' active' : ''}`}
+            data-pane-toggle="session-management"
             title="Manage sessions"
             aria-label="Manage sessions"
+            aria-expanded={showSessionManagement}
+            aria-controls="pane-session-management"
             onClick={() => {
               setManagedSessionId(
                 activeSession && (showTestSessions || !testSessionIds.has(activeSession))
@@ -10914,17 +11702,16 @@ async function uploadBinaryDraft(sessionId, base64, mimeType, filename) {
                   : sessionIdOf(sidebarManagedSessions[0]) || '',
               );
               setShowSessionManagement(open => !open);
-              setShowNewSession(false);
-              setShowNotificationSettings(false);
             }}
           >⋯</button>
           <button
             className={`new-session-btn${showNewSession ? ' active' : ''}`}
+            data-pane-toggle="new-session"
             title="New session"
+            aria-expanded={showNewSession}
+            aria-controls="pane-new-session"
             onClick={() => {
               setShowNewSession(o => !o);
-              setShowNotificationSettings(false);
-              setShowSessionManagement(false);
             }}
           >+</button>
         </div>
@@ -10960,34 +11747,43 @@ async function uploadBinaryDraft(sessionId, base64, mimeType, filename) {
             tabIndex={sidebarOrderChanged ? 0 : -1}
           >Sort now</button>
         </div>
-        {showNotificationSettings && (
-          <NotificationSettingsPanel
-            onClose={() => setShowNotificationSettings(false)}
-            onPreferencesChange={next => {
-              setAttentionFeedbackPreferences({ ...next, turn_ready: false });
-              setNotificationPreferencesLoaded(true);
-            }}
-          />
+        {notificationSettingsPane.mounted && (
+          <PaneLifecycleBoundary paneId="notification-settings" state={notificationSettingsPane.record.state} onMinimize={notificationSettingsPane.minimize}>
+            <NotificationSettingsPanel
+              onClose={() => setShowNotificationSettings(false)}
+              onMinimize={notificationSettingsPane.minimize}
+              onPreferencesChange={next => {
+                setAttentionFeedbackPreferences({ ...next, turn_ready: false });
+                setNotificationPreferencesLoaded(true);
+              }}
+            />
+          </PaneLifecycleBoundary>
         )}
-        {showSessionManagement && (
-          <SessionManagementPanel
-            sessions={sidebarManagedSessions}
-            preferences={sessionPreferences}
-            initialSessionId={managedSessionId}
-            onSave={saveSessionPreference}
-            onExport={downloadSessionExport}
-            onClose={() => setShowSessionManagement(false)}
-          />
+        {sessionManagementPane.mounted && (
+          <PaneLifecycleBoundary paneId="session-management" state={sessionManagementPane.record.state} onMinimize={sessionManagementPane.minimize}>
+            <SessionManagementPanel
+              sessions={sidebarManagedSessions}
+              preferences={sessionPreferences}
+              initialSessionId={managedSessionId}
+              onSave={saveSessionPreference}
+              onExport={downloadSessionExport}
+              onClose={() => setShowSessionManagement(false)}
+              onMinimize={sessionManagementPane.minimize}
+            />
+          </PaneLifecycleBoundary>
         )}
-        {showNewSession && (
-          <NewSessionPanel
-            launchStates={launchStates}
-            onLaunch={(agentType, workspacePath, options) => launchSession(agentType, workspacePath, options)}
-            onResume={(sourceSession, agentType, workspacePath, options) => resumeSession(sourceSession, agentType, workspacePath, options)}
-            onClose={() => setShowNewSession(false)}
-            workspaces={workspaces}
-            showTestSessions={showTestSessions}
-          />
+        {newSessionPane.mounted && (
+          <PaneLifecycleBoundary paneId="new-session" state={newSessionPane.record.state} onMinimize={newSessionPane.minimize}>
+            <NewSessionPanel
+              launchStates={launchStates}
+              onLaunch={(agentType, workspacePath, options) => launchSession(agentType, workspacePath, options)}
+              onResume={(sourceSession, agentType, workspacePath, options) => resumeSession(sourceSession, agentType, workspacePath, options)}
+              onClose={() => setShowNewSession(false)}
+              onMinimize={newSessionPane.minimize}
+              workspaces={workspaces}
+              showTestSessions={showTestSessions}
+            />
+          </PaneLifecycleBoundary>
         )}
         <SidebarScrollCoordinator
           structureKey={sidebarStructureKey}
@@ -11209,9 +12005,6 @@ async function uploadBinaryDraft(sessionId, base64, mimeType, filename) {
               setShowHostResourceDashboard(false);
               setShowAutomations(false);
               setShowSkills(false);
-              setShowNewSession(false);
-              setShowNotificationSettings(false);
-              setShowSessionManagement(false);
               setShowFleetView(false);
               setShowTranscriptSearch(false);
               setSidebarOpen(false);
@@ -11229,9 +12022,6 @@ async function uploadBinaryDraft(sessionId, base64, mimeType, filename) {
               setShowFleetView(false);
               setShowAutomations(false);
               setShowSkills(false);
-              setShowNewSession(false);
-              setShowNotificationSettings(false);
-              setShowSessionManagement(false);
               setShowTranscriptSearch(false);
               setSidebarOpen(false);
             }}
@@ -11248,9 +12038,6 @@ async function uploadBinaryDraft(sessionId, base64, mimeType, filename) {
               setShowHostResourceDashboard(false);
               setShowAutomations(false);
               setShowSkills(false);
-              setShowNewSession(false);
-              setShowNotificationSettings(false);
-              setShowSessionManagement(false);
               setShowTranscriptSearch(false);
               setSidebarOpen(false);
             }}
@@ -11268,9 +12055,6 @@ async function uploadBinaryDraft(sessionId, base64, mimeType, filename) {
               setShowHostResourceDashboard(false);
               setShowAutomations(false);
               setShowSkills(false);
-              setShowNewSession(false);
-              setShowNotificationSettings(false);
-              setShowSessionManagement(false);
               setSidebarOpen(false);
             }}
           >⌕</button>
@@ -11295,9 +12079,6 @@ async function uploadBinaryDraft(sessionId, base64, mimeType, filename) {
             setShowFleetView(false);
             setShowAutomations(false);
             setShowSkills(false);
-            setShowNewSession(false);
-            setShowNotificationSettings(false);
-            setShowSessionManagement(false);
             setShowTranscriptSearch(false);
             setSidebarOpen(false);
           }}
@@ -11315,16 +12096,19 @@ async function uploadBinaryDraft(sessionId, base64, mimeType, filename) {
             onBack={() => setShowSkills(false)}
           />
         )}
-        {showScheduledSend && activeSession && (
-          <ScheduledSendPanel
-            sessionId={activeSession}
-            initialContent={currentInput}
-            jobs={scheduledSends.filter(job => job.session_id === activeSession)}
-            onSchedule={scheduleSend}
-            onCancel={cancelScheduledSend}
-            onCreated={() => setDraftForSession(activeSession, '')}
-            onClose={() => setShowScheduledSend(false)}
-          />
+        {scheduledSendPane.mounted && activeSession && !activeCodexDesktopThreadDetached && (
+          <PaneLifecycleBoundary paneId="scheduled-send" state={scheduledSendPane.record.state} onMinimize={scheduledSendPane.minimize}>
+            <ScheduledSendPanel
+              sessionId={activeSession}
+              initialContent={currentInput}
+              jobs={scheduledSends.filter(job => job.session_id === activeSession)}
+              onSchedule={scheduleSend}
+              onCancel={cancelScheduledSend}
+              onCreated={() => setDraftForSession(activeSession, '')}
+              onClose={() => setShowScheduledSend(false)}
+              onMinimize={scheduledSendPane.minimize}
+            />
+          </PaneLifecycleBoundary>
         )}
         {showUsageDashboard && (
           <UsageDashboard
@@ -11384,8 +12168,14 @@ async function uploadBinaryDraft(sessionId, base64, mimeType, filename) {
           />
         )}
       {!showAutomations && !showSkills && !showUsageDashboard && !showHostResourceDashboard && !showFleetView && !showTranscriptSearch && (<>
-        <div className="topbar">
-          <button className="hamburger" onClick={() => setSidebarOpen(o => !o)}>
+        <div className={`topbar${mobileHeaderExpanded ? ' mobile-header-expanded' : ' mobile-header-collapsed'}`}>
+          <button
+            className="hamburger"
+            data-pane-toggle="sidebar"
+            aria-expanded={sidebarOpen}
+            aria-controls="pane-sidebar"
+            onClick={() => setSidebarOpen(o => !o)}
+          >
             ☰
             {unreadTotal > 0 && <span className="hamburger-badge">{unreadTotal}</span>}
             {attentionTotal > 0 && (
@@ -11433,6 +12223,9 @@ async function uploadBinaryDraft(sessionId, base64, mimeType, filename) {
                       {activeConfig?.branch && activeConfig.branch !== 'unknown' && (
                         <button
                           className={`topbar-branch-btn${showBranchSelector ? ' active' : ''}`}
+                          data-pane-toggle="branch-selector"
+                          aria-expanded={showBranchSelector}
+                          aria-controls="pane-branch-selector"
                           title={`Branch: ${activeConfig.branch}`}
                           onClick={() => {
                             const next = !showBranchSelector;
@@ -11447,7 +12240,28 @@ async function uploadBinaryDraft(sessionId, base64, mimeType, filename) {
                     </div>
                   </div>
                 </div>
-                <div className="topbar-meta">
+                <div className="mobile-topbar-controls">
+                  <span
+                    className={`mobile-topbar-connection ${connected && activeHealth === 'healthy' ? 'ok' : 'warn'}`}
+                    role="status"
+                    aria-label={`${connected ? 'Relay connected' : 'Relay reconnecting'}; proxy ${activeHealth || 'connecting'}`}
+                    title={`${connected ? 'Relay connected' : 'Relay reconnecting'}; proxy ${activeHealth || 'connecting'}`}
+                  >
+                    <span className="mobile-topbar-connection-dot" aria-hidden="true" />
+                    {connected && activeHealth === 'healthy' ? 'Live' : connected ? 'Degraded' : 'Offline'}
+                  </span>
+                  <button
+                    type="button"
+                    className="mobile-header-disclosure"
+                    aria-expanded={mobileHeaderExpanded}
+                    aria-controls="mobile-session-header-details"
+                    onClick={() => setMobileHeaderExpanded(expanded => !expanded)}
+                  >
+                    <span className="mobile-header-disclosure-label">Details</span>
+                    <span aria-hidden="true">{mobileHeaderExpanded ? '⌃' : '⌄'}</span>
+                  </button>
+                </div>
+                <div className="topbar-meta" id="mobile-session-header-details">
                   <button className="theme-toggle-btn" onClick={() => setTheme(t => t === 'light' ? 'dark' : 'light')} title="Toggle Light/Dark Mode">
                     {theme === 'light' ? '🌙' : '☀️'}
                   </button>
@@ -11530,10 +12344,14 @@ async function uploadBinaryDraft(sessionId, base64, mimeType, filename) {
                   {(activeConfig?.capabilities?.chat_list || isAntigravityV2) && (
                     <button
                       className={`context-pill chat-list-toggle${(isAntigravityV2 ? agv2NavigatorOpen : showChatList) ? ' active' : ''}`}
+                      data-pane-toggle={isAntigravityV2 ? 'antigravity-navigator' : 'chat-list'}
+                      aria-expanded={isAntigravityV2 ? agv2NavigatorOpen : showChatList}
+                      aria-controls={`pane-${isAntigravityV2 ? 'antigravity-navigator' : 'chat-list'}`}
                       title={isAntigravityV2 ? `${agv2NavigatorOpen ? 'Hide' : 'Show'} Agent Manager projects and conversations` : 'View conversations'}
                       onClick={() => {
                         if (isAntigravityV2) {
-                          setAgv2NavigatorOpen(open => !open);
+                          if (agv2NavigatorOpen) antigravityNavigatorPane.minimize();
+                          else setAgv2NavigatorOpen(true);
                           setShowChatList(false);
                           requestChatList(activeSession);
                           return;
@@ -11549,6 +12367,9 @@ async function uploadBinaryDraft(sessionId, base64, mimeType, filename) {
                   {activeConfig?.capabilities?.thread_list && (
                     <button
                       className={`context-pill chat-list-toggle${showThreadList ? ' active' : ''}`}
+                      data-pane-toggle="thread-list"
+                      aria-expanded={showThreadList}
+                      aria-controls="pane-thread-list"
                       title="View threads"
                       onClick={() => {
                         const next = !showThreadList;
@@ -11562,6 +12383,9 @@ async function uploadBinaryDraft(sessionId, base64, mimeType, filename) {
                   {(activeConfig?.capabilities?.terminal_output || activeConfig?.capabilities?.terminal_input) && (
                     <button
                       className={`context-pill terminal-toggle${showTerminal ? ' active' : ''}`}
+                      data-pane-toggle="terminal"
+                      aria-expanded={showTerminal}
+                      aria-controls="pane-terminal"
                       title="Open terminal controls"
                       onClick={() => {
                         const next = !showTerminal;
@@ -11575,6 +12399,9 @@ async function uploadBinaryDraft(sessionId, base64, mimeType, filename) {
                   {activeConfig?.capabilities?.file_changes && (
                     <button
                       className={`context-pill diff-toggle${showDiffViewer ? ' active' : ''}`}
+                      data-pane-toggle="diff-viewer"
+                      aria-expanded={showDiffViewer}
+                      aria-controls="pane-diff-viewer"
                       title="View file changes"
                       onClick={() => {
                         const next = !showDiffViewer;
@@ -11593,6 +12420,9 @@ async function uploadBinaryDraft(sessionId, base64, mimeType, filename) {
                   {activeConfig?.capabilities?.file_browser && (
                     <button
                       className={`context-pill files-toggle${showFileBrowser ? ' active' : ''}`}
+                      data-pane-toggle="file-browser"
+                      aria-expanded={showFileBrowser}
+                      aria-controls="pane-file-browser"
                       title="Browse workspace files"
                       onClick={() => {
                         const next = !showFileBrowser;
@@ -11650,60 +12480,99 @@ async function uploadBinaryDraft(sessionId, base64, mimeType, filename) {
           </div>
         )}
 
-        {showBranchSelector && activeSession && activeConfig?.capabilities?.branch_list && (
-          <BranchSelectorPanel
-            branchData={branchLists[activeSession] || null}
-            sessionId={activeSession}
-            currentBranch={activeConfig?.branch}
-            onSwitch={(branchName) => { switchBranch(activeSession, branchName); setShowBranchSelector(false); }}
-            onCreate={(branchName) => { createBranch(activeSession, branchName); setShowBranchSelector(false); }}
-            onClose={() => setShowBranchSelector(false)}
-          />
+        {branchSelectorPane.mounted && activeSession && activeConfig?.capabilities?.branch_list && (
+          <PaneLifecycleBoundary paneId="branch-selector" state={branchSelectorPane.record.state} onMinimize={branchSelectorPane.minimize}>
+            <BranchSelectorPanel
+              branchData={branchLists[activeSession] || null}
+              sessionId={activeSession}
+              currentBranch={activeConfig?.branch}
+              onSwitch={(branchName) => { switchBranch(activeSession, branchName); setShowBranchSelector(false); }}
+              onCreate={(branchName) => { createBranch(activeSession, branchName); setShowBranchSelector(false); }}
+              onClose={() => setShowBranchSelector(false)}
+              onMinimize={branchSelectorPane.minimize}
+            />
+          </PaneLifecycleBoundary>
         )}
 
-        {showFileBrowser && activeSession && activeConfig?.capabilities?.file_browser && (
-          <FileBrowser
-            sessionId={activeSession}
-            listing={directoryListings[activeSession]}
-            fileContents={fileContents}
-            viewingFile={viewingFile}
-            onNavigate={(dirPath) => {
-              setFileBrowserPath(dirPath);
-              setViewingFile(null);
-              requestDirectoryListing(activeSession, dirPath);
-            }}
-            onOpenFile={(filePath) => {
-              setViewingFile(filePath);
-              requestFileContent(activeSession, filePath);
-            }}
-            onBackToListing={() => setViewingFile(null)}
-            onRefresh={() => {
-              if (viewingFile) {
-                requestFileContent(activeSession, viewingFile);
-              } else {
-                requestDirectoryListing(activeSession, fileBrowserPath);
-              }
-            }}
-            onClose={() => {
-              setShowFileBrowser(false);
-              setViewingFile(null);
-            }}
-          />
+        {fileBrowserPane.mounted && activeSession && activeConfig?.capabilities?.file_browser && (
+          <PaneLifecycleBoundary paneId="file-browser" state={fileBrowserPane.record.state} onMinimize={fileBrowserPane.minimize}>
+            <FileBrowser
+              sessionId={activeSession}
+              listing={directoryListings[activeSession]}
+              fileContents={fileContents}
+              viewingFile={viewingFile}
+              onNavigate={(dirPath) => {
+                setFileBrowserPath(dirPath);
+                setViewingFile(null);
+                requestDirectoryListing(activeSession, dirPath);
+              }}
+              onOpenFile={(filePath) => {
+                setViewingFile(filePath);
+                requestFileContent(activeSession, filePath);
+              }}
+              onBackToListing={() => setViewingFile(null)}
+              onRefresh={() => {
+                if (viewingFile) {
+                  requestFileContent(activeSession, viewingFile);
+                } else {
+                  requestDirectoryListing(activeSession, fileBrowserPath);
+                }
+              }}
+              onClose={() => {
+                setShowFileBrowser(false);
+                setViewingFile(null);
+              }}
+              onMinimize={fileBrowserPane.minimize}
+            />
+          </PaneLifecycleBoundary>
         )}
-        <div className={`messages-wrap${activeAutomationView?.visible ? ' has-automation-pane' : ''}`} style={showFileBrowser ? { display: 'none' } : undefined}>
+        <PaneRestoreRail records={minimizedPaneRecords} onRestore={restorePane} />
+        <div className={`messages-wrap${activeAutomationView?.visible ? ' has-automation-pane' : ''}`}>
         {showDesktopThreadTabs && (
           <ThreadTabsBar
             threads={desktopThreadTabs}
-            activeThreadId={optimisticThreadFocus[activeSession] || null}
+            activeThreadId={activeCodexDesktopThreadView?.thread_id || optimisticThreadFocus[activeSession] || null}
             showDraftTab={!!pendingDraftThreads[activeSession] || hasNativeDraftThread}
             newLabel={newThreadLabel}
-            onSwitch={(threadId) => handleSwitchThread(activeSession, threadId)}
+            controlPolicy={activeDesktopThreadPolicy}
+            canCreateThread={canCreateDesktopThread}
+            onSwitch={(threadId, selectionMode) => handleSwitchThread(activeSession, threadId, selectionMode)}
             onNew={() => handleNewThread(activeSession)}
             onOpenHistory={() => {
               requestThreadList(activeSession);
               setShowThreadList(true);
             }}
           />
+        )}
+        {activeCodexDesktopThreadDetached && (
+          <div
+            className={`thread-view-banner state-${activeCodexDesktopThreadView.view_state}`}
+            data-testid="codex-desktop-thread-view"
+            data-thread-id={activeCodexDesktopThreadView.thread_id || ''}
+            role={['error', 'unavailable'].includes(activeCodexDesktopThreadView.view_state) ? 'alert' : 'status'}
+          >
+            <span className="thread-view-banner-copy">
+              <strong>
+                {activeCodexDesktopThreadLoading
+                  ? 'Checking chat'
+                  : activeCodexDesktopArchiveView
+                    ? 'Read-only native archive'
+                    : activeCodexDesktopThreadView.view_state === 'unavailable'
+                      ? 'Chat needs one native open'
+                      : 'Chat could not be loaded'}
+              </strong>
+              <span>{activeCodexDesktopThreadView.message}</span>
+            </span>
+            {activeCodexDesktopThreadView.retryable && activeCodexDesktopThreadView.thread_id && (
+              <button
+                type="button"
+                onClick={() => handleSwitchThread(activeSession, activeCodexDesktopThreadView.thread_id)}
+                disabled={!connected || activeCodexDesktopThreadLoading}
+              >
+                Retry
+              </button>
+            )}
+          </div>
         )}
         {showLastUserBanner && (
           <div className="last-user-banner" title={lastUserText}>
@@ -11727,35 +12596,25 @@ async function uploadBinaryDraft(sessionId, base64, mimeType, filename) {
           </div>
         )}
         {showAntigravityV2Navigator && (
-          <div className={`agv2-session-nav${agv2NavigatorOpen ? '' : ' collapsed'}`}>
-            <div className="agv2-session-nav-header">
-              <div className="agv2-session-nav-copy">
-                <span className="agv2-session-nav-title">Agent Manager</span>
-                <span className="agv2-session-nav-meta">
-                  {activeV2ConversationCount} conversation{activeV2ConversationCount === 1 ? '' : 's'}
-                </span>
+          <PaneLifecycleBoundary paneId="antigravity-navigator" state={antigravityNavigatorPane.record.state} onMinimize={antigravityNavigatorPane.minimize}>
+            <div className="agv2-session-nav">
+              <div className="agv2-session-nav-header">
+                <div className="agv2-session-nav-copy">
+                  <span className="agv2-session-nav-title">Agent Manager</span>
+                  <span className="agv2-session-nav-meta">
+                    {activeV2ConversationCount} conversation{activeV2ConversationCount === 1 ? '' : 's'}
+                  </span>
+                </div>
+                <button
+                  className="agv2-session-nav-btn"
+                  type="button"
+                  onClick={() => requestChatList(activeSession)}
+                  title="Refresh Agent Manager conversations"
+                >
+                  Refresh
+                </button>
+                <PaneMinimizeButton paneId="antigravity-navigator" onMinimize={antigravityNavigatorPane.minimize} />
               </div>
-              <button
-                className="agv2-session-nav-btn"
-                type="button"
-                onClick={() => requestChatList(activeSession)}
-                title="Refresh Agent Manager conversations"
-              >
-                Refresh
-              </button>
-              <button
-                className="agv2-session-nav-btn"
-                type="button"
-                onClick={() => {
-                  setAgv2NavigatorOpen(open => !open);
-                  requestChatList(activeSession);
-                }}
-                title={agv2NavigatorOpen ? 'Hide Agent Manager conversations' : 'Show Agent Manager conversations'}
-              >
-                {agv2NavigatorOpen ? 'Hide' : 'Show'}
-              </button>
-            </div>
-            {agv2NavigatorOpen && (
               <AntigravityV2NavPanel
                 items={activeChatList}
                 embedded
@@ -11763,8 +12622,8 @@ async function uploadBinaryDraft(sessionId, base64, mimeType, filename) {
                 onNavigate={(itemId) => handleAntigravityV2Navigate(itemId)}
                 onNew={() => handleAntigravityV2New(activeSession)}
               />
-            )}
-          </div>
+            </div>
+          </PaneLifecycleBoundary>
         )}
         {showJumpButton && !activeBlockingPrompt && (
           <button
@@ -11785,31 +12644,41 @@ async function uploadBinaryDraft(sessionId, base64, mimeType, filename) {
         >
           {shouldBottomAlignMessages && <div className="messages-flex-spacer" />}
           {activePrompt && (
-            <PermissionOverlay
-              prompt={activePrompt}
-              sessionId={activeSession}
-              agentType={activeSessionMeta?.agent_type}
-              onRespond={respondToPrompt}
-              onDismissFocus={() => textareaRef.current?.focus()}
-            />
+            <PaneLifecycleBoundary paneId="native-action" state={nativeActionPane.record.state} onMinimize={nativeActionPane.minimize} blocking>
+              <PermissionOverlay
+                prompt={activePrompt}
+                sessionId={activeSession}
+                agentType={activeSessionMeta?.agent_type}
+                onRespond={respondToPrompt}
+                onDismissFocus={() => textareaRef.current?.focus()}
+                onMinimize={nativeActionPane.minimize}
+                interactive={nativeActionPane.open}
+              />
+            </PaneLifecycleBoundary>
           )}
           {activeBlockingErrorPrompt && !activePrompt && (
-            <ErrorPromptOverlay
-              prompt={activeBlockingErrorPrompt}
-              sessionId={activeSession}
-              onRespond={respondToErrorPrompt}
-            />
+            <PaneLifecycleBoundary paneId="native-action" state={nativeActionPane.record.state} onMinimize={nativeActionPane.minimize} blocking>
+              <ErrorPromptOverlay
+                prompt={activeBlockingErrorPrompt}
+                sessionId={activeSession}
+                onRespond={respondToErrorPrompt}
+                onMinimize={nativeActionPane.minimize}
+              />
+            </PaneLifecycleBoundary>
           )}
-          {(activeSessionMeta?.rate_limit_active || (activeSessionMeta?.percent_used != null && activeSessionMeta.percent_used >= 75)) && (
-            <div className={`rate-limit-overlay${activeSessionMeta?.rate_limit_active ? ' critical' : activeSessionMeta?.percent_used >= 90 ? ' critical' : activeSessionMeta?.percent_used >= 75 ? ' warning' : ''}`}>
-              <span className="rate-limit-icon">{activeSessionMeta?.rate_limit_active ? '⏳' : '📊'}</span>
-              <span className="rate-limit-text">
-                {activeSessionMeta?.rate_limit_active
-                  ? <>Rate limited{activeSessionMeta.rate_limited_until && activeSessionMeta.rate_limited_until !== 'unknown' ? <> — resets <strong>{formatUsageResetLabel(activeSessionMeta.rate_limited_until)}</strong></> : null}</>
-                  : <>Used <strong>{activeSessionMeta.percent_used}%</strong> of session limit{activeSessionMeta.rate_limited_until && activeSessionMeta.rate_limited_until !== 'unknown' ? <> · resets <strong>{formatUsageResetLabel(activeSessionMeta.rate_limited_until)}</strong></> : null}</>
-                }
-              </span>
-            </div>
+          {activeRateLimitVisible && (
+            <PaneLifecycleBoundary paneId="rate-limit" state={rateLimitPane.record.state} onMinimize={rateLimitPane.minimize}>
+              <div className={`rate-limit-overlay${activeSessionMeta?.rate_limit_active ? ' critical' : activeSessionMeta?.percent_used >= 90 ? ' critical' : activeSessionMeta?.percent_used >= 75 ? ' warning' : ''}`}>
+                <span className="rate-limit-icon">{activeSessionMeta?.rate_limit_active ? '⏳' : '📊'}</span>
+                <span className="rate-limit-text">
+                  {activeSessionMeta?.rate_limit_active
+                    ? <>Rate limited{activeSessionMeta.rate_limited_until && activeSessionMeta.rate_limited_until !== 'unknown' ? <> — resets <strong>{formatUsageResetLabel(activeSessionMeta.rate_limited_until)}</strong></> : null}</>
+                    : <>Used <strong>{activeSessionMeta.percent_used}%</strong> of session limit{activeSessionMeta.rate_limited_until && activeSessionMeta.rate_limited_until !== 'unknown' ? <> · resets <strong>{formatUsageResetLabel(activeSessionMeta.rate_limited_until)}</strong></> : null}</>
+                  }
+                </span>
+                <PaneMinimizeButton paneId="rate-limit" onMinimize={rateLimitPane.minimize} />
+              </div>
+            </PaneLifecycleBoundary>
           )}
           {showPartialHistoryBanner && (
             <div className="history-tail-banner">
@@ -11836,14 +12705,18 @@ async function uploadBinaryDraft(sessionId, base64, mimeType, filename) {
           )}
           {!activeSession ? (
             <div className="empty-state"><div className="icon">🤖</div><div>Select an agent session</div></div>
-          ) : currentMessages.length === 0 && !activeProvisionalStream && hasThreadCap && activeSessionMeta?.is_list_view && (threadLists[activeSession]?.length > 0) && !pendingDraftThreads[activeSession] && !hasNativeDraftThread ? (
+          ) : currentMessages.length === 0 && !activeProvisionalStream && !activeCodexDesktopThreadView && hasThreadCap && activeSessionMeta?.is_list_view && (threadLists[activeSession]?.length > 0) && !pendingDraftThreads[activeSession] && !hasNativeDraftThread ? (
             <div className="thread-picker-empty">
               <div className="thread-picker-header">Select a chat</div>
               <div className="thread-picker-list">
                 {threadLists[activeSession].map((thread, i) => (
                   <button
                     key={thread.cache_key || thread.id || i}
-                    className={`thread-picker-item${thread.active ? ' active' : ''}`}
+                    className={`thread-picker-item${(
+                      String(activeCodexDesktopThreadView?.thread_id || '') === String(thread.id || '')
+                      || String(activeCodexDesktopThreadView?.thread_id || '') === String(thread.cache_key || '')
+                      || (!activeCodexDesktopThreadView && thread.active)
+                    ) ? ' active' : ''}`}
                     onClick={() => {
                       handleSwitchThread(activeSession, thread.id);
                     }}
@@ -11968,47 +12841,64 @@ async function uploadBinaryDraft(sessionId, base64, mimeType, filename) {
           )}
           <div ref={messagesEndRef} />
         </div>
-        <CodexAutomationPane
-          view={activeAutomationView}
-          onShow={() => activeSession && showCodexAutomation(activeSession)}
-        />
+        {activeAutomationView?.visible && (
+          <PaneLifecycleBoundary paneId="automation-context" state={automationContextPane.record.state} onMinimize={automationContextPane.minimize}>
+            <CodexAutomationPane
+              view={activeAutomationView}
+              onShow={() => activeSession && showCodexAutomation(activeSession)}
+              onMinimize={automationContextPane.minimize}
+            />
+          </PaneLifecycleBoundary>
+        )}
         </div>
 
-        {(activeActivity?.task_list || showTranscriptFooterActivity) && !showFileBrowser && (
+        {(activeActivity?.task_list || showTranscriptFooterActivity) && (
           <div className="transcript-live-footer" data-testid="transcript-live-footer">
             {activeActivity?.task_list && !activeActivity?.step && (
-              <div className="session-tasklist-strip">
-                <TaskList taskList={activeActivity.task_list} sessionId={activeSession} />
-              </div>
+              <PaneLifecycleBoundary paneId="task-list" state={taskListPane.record.state} onMinimize={taskListPane.minimize}>
+                <div className="session-tasklist-strip">
+                  <PaneMinimizeButton paneId="task-list" onMinimize={taskListPane.minimize} />
+                  <TaskList taskList={activeActivity.task_list} sessionId={activeSession} />
+                </div>
+              </PaneLifecycleBoundary>
             )}
             {showTranscriptFooterActivity && (
-              <div className="composer-live-status-strip">
-                <ActivityRow
-                  activity={activeActivity}
-                  thinkingText={activeSession ? (thinkingContent[activeSession] || '') : ''}
-                  agentType={activeSessionMeta?.agent_type}
-                  pinned
-                />
-              </div>
+              <PaneLifecycleBoundary paneId="live-activity" state={liveActivityPane.record.state} onMinimize={liveActivityPane.minimize}>
+                <div className="composer-live-status-strip">
+                  <PaneMinimizeButton paneId="live-activity" onMinimize={liveActivityPane.minimize} />
+                  <ActivityRow
+                    activity={activeActivity}
+                    thinkingText={activeSession ? (thinkingContent[activeSession] || '') : ''}
+                    agentType={activeSessionMeta?.agent_type}
+                    pinned
+                    mobileExpanded={mobileLiveStatusExpanded}
+                    onMobileExpandedChange={setMobileLiveStatusExpanded}
+                    mobileDisclosureId="mobile-live-status-details"
+                  />
+                </div>
+              </PaneLifecycleBoundary>
             )}
           </div>
         )}
 
-        {showSettings && activeSession && (
-          <AgentSettingsPanel
-            session={activeSessionMeta || activeSession}
-            config={activeConfig}
-            configControlStates={configControlStates}
-            onRequestRefresh={requestAgentConfig}
-            onSetModel={(sid, modelId) => setAgentModel(sid, modelId)}
-            onSetEffort={(sid, effort) => setAgentEffort(sid, effort)}
-            onSetPermissionMode={(sid, mode) => setAgentPermissionMode(sid, mode)}
-            onSetAutoApprovePermissions={(sid, enabled) => setAutoApprovePermissions(sid, enabled)}
-            onSetMode={(sid, mode) => setAntigravityMode && setAntigravityMode(sid, mode)}
-            onSetCodexConfig={(updates) => setCodexConfig(activeSession, updates)}
-            onSwitchWorkspace={(sid, folderPath) => switchWorkspace(sid, folderPath)}
-            onClose={() => setShowSettings(false)}
-          />
+        {agentSettingsPane.mounted && activeSession && (
+          <PaneLifecycleBoundary paneId="agent-settings" state={agentSettingsPane.record.state} onMinimize={agentSettingsPane.minimize}>
+            <AgentSettingsPanel
+              session={activeSessionMeta || activeSession}
+              config={activeConfig}
+              configControlStates={configControlStates}
+              onRequestRefresh={requestAgentConfig}
+              onSetModel={(sid, modelId) => setAgentModel(sid, modelId)}
+              onSetEffort={(sid, effort) => setAgentEffort(sid, effort)}
+              onSetPermissionMode={(sid, mode) => setAgentPermissionMode(sid, mode)}
+              onSetAutoApprovePermissions={(sid, enabled) => setAutoApprovePermissions(sid, enabled)}
+              onSetMode={(sid, mode) => setAntigravityMode && setAntigravityMode(sid, mode)}
+              onSetCodexConfig={(updates) => setCodexConfig(activeSession, updates)}
+              onSwitchWorkspace={(sid, folderPath) => switchWorkspace(sid, folderPath)}
+              onClose={() => setShowSettings(false)}
+              onMinimize={agentSettingsPane.minimize}
+            />
+          </PaneLifecycleBoundary>
         )}
 
         {false && transcriptPreview && (
@@ -12020,65 +12910,79 @@ async function uploadBinaryDraft(sessionId, base64, mimeType, filename) {
           />
         )}
 
-        {showChatList && activeSession && activeConfig?.capabilities?.chat_list && !isAntigravityV2 && (
-            <ChatListPanel
-              chats={chatLists[activeSession] || []}
+        {chatListPane.mounted && activeSession && activeConfig?.capabilities?.chat_list && !isAntigravityV2 && (
+          <PaneLifecycleBoundary paneId="chat-list" state={chatListPane.record.state} onMinimize={chatListPane.minimize}>
+              <ChatListPanel
+                chats={chatLists[activeSession] || []}
+                sessionId={activeSession}
+                onSwitch={(chatId) => {
+                  switchChat(activeSession, chatId);
+                  setShowChatList(false);
+                }}
+                onNew={() => {
+                  newChat(activeSession);
+                  setShowChatList(false);
+                }}
+                onClose={() => setShowChatList(false)}
+                onMinimize={chatListPane.minimize}
+              />
+          </PaneLifecycleBoundary>
+        )}
+
+        {threadListPane.mounted && activeSession && activeConfig?.capabilities?.thread_list && (
+          <PaneLifecycleBoundary paneId="thread-list" state={threadListPane.record.state} onMinimize={threadListPane.minimize}>
+            <ThreadHistoryPanel
+              threads={threadLists[activeSession] || []}
+              selectedThreadId={activeCodexDesktopThreadView?.thread_id || optimisticThreadFocus[activeSession] || null}
               sessionId={activeSession}
-              onSwitch={(chatId) => {
-                switchChat(activeSession, chatId);
-                setShowChatList(false);
+              newLabel={newThreadLabel}
+              controlPolicy={activeDesktopThreadPolicy}
+              canCreateThread={canCreateDesktopThread}
+              onSwitch={(threadId, selectionMode) => {
+                handleSwitchThread(activeSession, threadId, selectionMode);
+                setShowThreadList(false);
               }}
               onNew={() => {
-                newChat(activeSession);
-                setShowChatList(false);
+                handleNewThread(activeSession);
+                setShowThreadList(false);
               }}
-              onClose={() => setShowChatList(false)}
+              onClose={() => setShowThreadList(false)}
+              onMinimize={threadListPane.minimize}
             />
+          </PaneLifecycleBoundary>
         )}
 
-        {showThreadList && activeSession && activeConfig?.capabilities?.thread_list && (
-          <ThreadHistoryPanel
-            threads={threadLists[activeSession] || []}
-            sessionId={activeSession}
-            newLabel={newThreadLabel}
-            onSwitch={(threadId) => {
-              handleSwitchThread(activeSession, threadId);
-              setShowThreadList(false);
-            }}
-            onNew={() => {
-              handleNewThread(activeSession);
-              setShowThreadList(false);
-            }}
-            onClose={() => setShowThreadList(false)}
-          />
+        {terminalPane.mounted && activeSession && (activeConfig?.capabilities?.terminal_output || activeConfig?.capabilities?.terminal_input) && (
+          <PaneLifecycleBoundary paneId="terminal" state={terminalPane.record.state} onMinimize={terminalPane.minimize}>
+            <TerminalViewer
+              entries={terminalOutputs[activeSession] || []}
+              canRead={!!activeConfig?.capabilities?.terminal_output}
+              canInput={!!activeConfig?.capabilities?.terminal_input}
+              onRefresh={() => requestTerminalOutput(activeSession)}
+              onSend={text => sendTerminalInput(activeSession, text)}
+              controlResults={controlResults}
+              onClose={() => setShowTerminal(false)}
+              onMinimize={terminalPane.minimize}
+            />
+          </PaneLifecycleBoundary>
         )}
 
-        {!showFileBrowser && showTerminal && activeSession && (activeConfig?.capabilities?.terminal_output || activeConfig?.capabilities?.terminal_input) && (
-          <TerminalViewer
-            entries={terminalOutputs[activeSession] || []}
-            canRead={!!activeConfig?.capabilities?.terminal_output}
-            canInput={!!activeConfig?.capabilities?.terminal_input}
-            onRefresh={() => requestTerminalOutput(activeSession)}
-            onSend={text => sendTerminalInput(activeSession, text)}
-            controlResults={controlResults}
-            onClose={() => setShowTerminal(false)}
-          />
-        )}
-
-        {!showFileBrowser && showDiffViewer && activeSession && activeConfig?.capabilities?.file_changes && (
-          <DiffViewer
-            entries={fileChanges[activeSession] || []}
-            onRefresh={() => requestFileChanges(activeSession)}
-            onAccept={(changeId) => respondToFileChange(activeSession, changeId, 'accept')}
-            onReject={(changeId) => respondToFileChange(activeSession, changeId, 'reject')}
-            onClose={() => setShowDiffViewer(false)}
-          />
+        {diffViewerPane.mounted && activeSession && activeConfig?.capabilities?.file_changes && (
+          <PaneLifecycleBoundary paneId="diff-viewer" state={diffViewerPane.record.state} onMinimize={diffViewerPane.minimize}>
+            <DiffViewer
+              entries={fileChanges[activeSession] || []}
+              onRefresh={() => requestFileChanges(activeSession)}
+              onAccept={(changeId) => respondToFileChange(activeSession, changeId, 'accept')}
+              onReject={(changeId) => respondToFileChange(activeSession, changeId, 'reject')}
+              onClose={() => setShowDiffViewer(false)}
+              onMinimize={diffViewerPane.minimize}
+            />
+          </PaneLifecycleBoundary>
         )}
 
         <div
           className={`input-area composer-skin-${composerSkinForAgentType(activeSessionMeta?.agent_type)}`}
           data-composer-skin={composerSkinForAgentType(activeSessionMeta?.agent_type)}
-          style={showFileBrowser ? { display: 'none' } : undefined}
         >
           <label className={`attach-btn ${!activeSession || !connected || !!activeBlockingPrompt ? 'disabled' : ''}`} title="Attach file">
             <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
@@ -12121,7 +13025,7 @@ async function uploadBinaryDraft(sessionId, base64, mimeType, filename) {
               </div>
             )}
             {/* Queued messages bar — shown above input when agent is busy */}
-            {activeSession && goalCommandNotices[activeSession] && (
+            {activeSession && !activeCodexDesktopThreadDetached && goalCommandNotices[activeSession] && (
               <div
                 className={`goal-command-notice ${goalCommandNotices[activeSession].status}`}
                 role={goalCommandNotices[activeSession].status === 'failed' ? 'alert' : 'status'}
@@ -12131,7 +13035,7 @@ async function uploadBinaryDraft(sessionId, base64, mimeType, filename) {
                 <span>{goalCommandNotices[activeSession].text}</span>
               </div>
             )}
-            {activeSession && (queuedMessages[activeSession] || []).length > 0 && (
+            {activeSession && !activeCodexDesktopThreadDetached && (queuedMessages[activeSession] || []).length > 0 && (
               <div className="queued-bar">
                 {(queuedMessages[activeSession] || []).map(qm => (
                   <QueuedItem
@@ -12151,18 +13055,27 @@ async function uploadBinaryDraft(sessionId, base64, mimeType, filename) {
                 onChange={e => updateInput(e.target.value)}
                 onKeyDown={onKeyDown}
                 onPaste={handlePaste}
-                placeholder={activeBlockingPrompt
+                placeholder={activeCodexDesktopThreadDetached
+                  ? (activeCodexDesktopThreadLoading
+                      ? 'Checking Codex Desktop chat availability…'
+                      : activeCodexDesktopArchiveView
+                        ? 'Read-only Codex Desktop archive'
+                        : 'This Codex Desktop chat is unavailable')
+                  : activeBlockingPrompt
                   ? `Resolve the ${activePrompt?.type === 'question_prompt' ? 'question' : (activePrompt ? 'permission prompt' : 'error prompt')} above to continue`
                   : activeSession
                     ? (window.innerWidth < 600 ? 'Enter message…' : 'Message… (/ for commands)')
                     : 'Select a session'}
-                disabled={!activeSession}
+                disabled={!activeSession || !!activeBlockingPrompt || activeCodexDesktopThreadDetached}
                 rows={1}
               />
               <div className="textarea-btns">
-                {activeSession && (
+                {activeSession && !activeCodexDesktopThreadDetached && (
                   <button
                     className={`composer-gear-btn schedule-send-btn${showScheduledSend ? ' active' : ''}`}
+                    data-pane-toggle="scheduled-send"
+                    aria-expanded={showScheduledSend}
+                    aria-controls="pane-scheduled-send"
                     onClick={() => setShowScheduledSend(open => !open)}
                     title="Schedule this message"
                     aria-label="Schedule message"
@@ -12171,6 +13084,9 @@ async function uploadBinaryDraft(sessionId, base64, mimeType, filename) {
                 {activeSession && (
                   <button
                     className={`composer-gear-btn${showComposerSettings ? ' active' : ''}`}
+                    data-pane-toggle="composer-settings"
+                    aria-expanded={showComposerSettings}
+                    aria-controls="pane-composer-settings"
                     onClick={() => setShowComposerSettings(s => !s)}
                     title="Toggle settings"
                   >⚙</button>
@@ -12185,9 +13101,13 @@ async function uploadBinaryDraft(sessionId, base64, mimeType, filename) {
                 {(activeConfig?.capabilities?.chat_list || isAntigravityV2) && (
                   <button
                     className={`composer-gear-btn mobile-hide${(isAntigravityV2 ? agv2NavigatorOpen : showChatList) ? ' active' : ''}`}
+                    data-pane-toggle={isAntigravityV2 ? 'antigravity-navigator' : 'chat-list'}
+                    aria-expanded={isAntigravityV2 ? agv2NavigatorOpen : showChatList}
+                    aria-controls={`pane-${isAntigravityV2 ? 'antigravity-navigator' : 'chat-list'}`}
                     onClick={() => {
                       if (isAntigravityV2) {
-                        setAgv2NavigatorOpen(open => !open);
+                        if (agv2NavigatorOpen) antigravityNavigatorPane.minimize();
+                        else setAgv2NavigatorOpen(true);
                         setShowChatList(false);
                         requestChatList(activeSession);
                         return;
@@ -12202,6 +13122,9 @@ async function uploadBinaryDraft(sessionId, base64, mimeType, filename) {
                 {activeConfig?.capabilities?.thread_list && (
                   <button
                     className={`composer-gear-btn mobile-hide${showThreadList ? ' active' : ''}`}
+                    data-pane-toggle="thread-list"
+                    aria-expanded={showThreadList}
+                    aria-controls="pane-thread-list"
                     onClick={() => {
                       const willShow = !showThreadList;
                       setShowThreadList(willShow);
@@ -12287,7 +13210,18 @@ async function uploadBinaryDraft(sessionId, base64, mimeType, filename) {
               {activeSession && currentInput && <span className="composer-hint draft-live">draft saved</span>}
             </div>
             {activeSession && (
-              <div className={`composer-settings${showComposerSettings ? ' is-open' : ''}`}>
+              <div
+                id="pane-composer-settings"
+                className={`composer-settings${showComposerSettings ? ' is-open' : ''}${composerSettingsPane.record.state === PANE_MINIMIZED ? ' is-minimized' : ''}`}
+                data-pane-id="composer-settings"
+                data-pane-state={composerSettingsPane.record.state}
+              >
+                {showComposerSettings && (
+                  <div className="composer-settings-header">
+                    <span>Composer settings</span>
+                    <PaneMinimizeButton paneId="composer-settings" onMinimize={composerSettingsPane.minimize} />
+                  </div>
+                )}
                 {(activePendingConfigControl || activeFailedConfigControl) && (
                   <div className={`composer-control-state ${activeFailedConfigControl ? 'failed' : 'pending'}`} role="status">
                     {activeFailedConfigControl
@@ -12487,7 +13421,10 @@ async function uploadBinaryDraft(sessionId, base64, mimeType, filename) {
                     {activeConfig?.capabilities?.codex_bypass_permissions && <button
                       type="button"
                       className="composer-desktop-action composer-bypass-action"
-                      onClick={() => { setShowSettings(true); setShowComposerSettings(false); }}
+                      data-pane-toggle="agent-settings"
+                      aria-expanded={showSettings}
+                      aria-controls="pane-agent-settings"
+                      onClick={() => { setShowSettings(true); composerSettingsPane.minimize(); }}
                       title="Review and confirm Full access in Session Settings"
                     >{activeConfig.bypass_permissions_active ? 'Bypass active' : 'Bypass…'}</button>}
                     {activeConfig?.capabilities?.codex_speed_change && <label className="composer-setting-label" data-control="speed">
@@ -12543,18 +13480,29 @@ async function uploadBinaryDraft(sessionId, base64, mimeType, filename) {
                 )}
                 <button
                   className="composer-desktop-action"
-                  onClick={() => { setShowSettings(true); setShowComposerSettings(false); }}
+                  data-pane-toggle="agent-settings"
+                  aria-expanded={showSettings}
+                  aria-controls="pane-agent-settings"
+                  onClick={() => { setShowSettings(true); composerSettingsPane.minimize(); }}
                 >⚙ Session details</button>
                 <div className="composer-mobile-actions">
                   <button
                     className="composer-mobile-action"
-                    onClick={() => { setShowSettings(true); setShowComposerSettings(false); }}
+                    data-pane-toggle="agent-settings"
+                    aria-expanded={showSettings}
+                    aria-controls="pane-agent-settings"
+                    onClick={() => { setShowSettings(true); composerSettingsPane.minimize(); }}
                   >⚙ Session details</button>
                   {canLaunchNewThread && (
                     <button className="composer-mobile-action" onClick={() => newThread(activeSession)}>✎ New thread</button>
                   )}
                   {(activeConfig?.capabilities?.chat_list || isAntigravityV2) && (
-                    <button className="composer-mobile-action" onClick={() => {
+                    <button
+                      className="composer-mobile-action"
+                      data-pane-toggle={isAntigravityV2 ? 'antigravity-navigator' : 'chat-list'}
+                      aria-expanded={isAntigravityV2 ? agv2NavigatorOpen : showChatList}
+                      aria-controls={`pane-${isAntigravityV2 ? 'antigravity-navigator' : 'chat-list'}`}
+                      onClick={() => {
                       requestChatList(activeSession);
                       if (isAntigravityV2) {
                         setAgv2NavigatorOpen(true);
@@ -12562,11 +13510,16 @@ async function uploadBinaryDraft(sessionId, base64, mimeType, filename) {
                       } else {
                         setShowChatList(true);
                       }
-                      setShowComposerSettings(false);
                     }}>☰ {isAntigravityV2 ? 'Projects' : 'Chat history'}</button>
                   )}
                   {activeConfig?.capabilities?.thread_list && (
-                    <button className="composer-mobile-action" onClick={() => { requestThreadList(activeSession); setShowThreadList(true); setShowComposerSettings(false); }}>⊟ Threads</button>
+                    <button
+                      className="composer-mobile-action"
+                      data-pane-toggle="thread-list"
+                      aria-expanded={showThreadList}
+                      aria-controls="pane-thread-list"
+                      onClick={() => { requestThreadList(activeSession); setShowThreadList(true); }}
+                    >⊟ Threads</button>
                   )}
                   {activeConfig?.capabilities?.open_panel && (
                     <button className="composer-mobile-action" onClick={() => openPanel(activeSession)}>⊞ Open panel</button>

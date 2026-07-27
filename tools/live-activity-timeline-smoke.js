@@ -101,8 +101,18 @@ check('Android preserves relay streaming activity text', /msg\.thinking_content[
 check('Android elapsed ticker updates once per second', /setInterval\(\(\) => setNowMs\(Date\.now\(\)\), 1_000\)/.test(row));
 check('Android elapsed ticker uses the stable started_at anchor', /activity\?\.started_at/.test(row));
 check('Android renders the native Codex stack in canonical order', /current \?[\s\S]+thinking \?[\s\S]+step \?[\s\S]+goal \?[\s\S]+usage \?/.test(row));
-check('Android bounds reasoning independently', /thinking\.text[\s\S]{0,140}numberOfLines=\{4\}/.test(row));
-check('Android bounds current output independently', /current\.partial[\s\S]{0,180}numberOfLines=\{4\}/.test(row));
+check('Android defaults live activity to one bounded disclosure row',
+  /detailsExpanded[\s\S]+compactSummary[\s\S]+accessibilityState=\{\{ expanded: detailsExpanded \}\}/.test(row)
+  && /compactSummary:\s*\{[\s\S]{0,180}minHeight:\s*44[\s\S]{0,80}maxHeight:\s*52/.test(row));
+check('Android derives the expanded detail budget from the visible window',
+  /useWindowDimensions\(\)/.test(row)
+  && /Math\.max\(112,\s*Math\.min\(240,\s*Math\.round\(windowHeight \* 0\.32\)\)\)/.test(row)
+  && /nestedScrollEnabled/.test(row));
+check('Android exposes full reasoning and current output only inside the disclosure',
+  /detailsExpanded && hasDisclosureContent[\s\S]+thinking\.text[\s\S]{0,140}<Text style=\{s\.thinkingText\} selectable>/.test(row)
+  && /current\.partial[\s\S]{0,180}<Text style=\{current\.kind === 'tool' \? s\.currentOutput : s\.narrationText\} selectable>/.test(row));
+check('Android keeps interruption, connection failure, and usage prominent',
+  /interruption \?[\s\S]+connectionFailed \? <ConnectionStatusRow[\s\S]+detailsExpanded && hasDisclosureContent[\s\S]+usage \?/.test(row));
 check('Web renders the native Codex stack in canonical order', /data-live-channel="current"[\s\S]+data-live-channel="thinking"[\s\S]+data-live-channel="step"[\s\S]+data-live-channel="goal"[\s\S]+data-live-channel="usage"/.test(app));
 check('protocol defines relay started_at continuity', /stable `activity\.started_at`[\s\S]{0,240}tool\/kind\/label changes/.test(protocol));
 check('protocol forbids client-side channel guessing', /clients must not infer reasoning from a[\s\S]{0,100}tool label/.test(protocol));

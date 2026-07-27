@@ -75,12 +75,18 @@ function syncProviderAssets(sourceRoot, destinationRoot) {
   const { files } = assertProviderAssetHashes(sourceRoot);
   fs.mkdirSync(destinationRoot, { recursive: true });
   const names = ['manifest.json', ...files];
+  const writtenFiles = [];
   for (const file of names) {
     const source = path.join(sourceRoot, file);
     const destination = path.join(destinationRoot, file);
-    fs.writeFileSync(destination, canonicalAssetBytes(source));
+    const sourceBytes = canonicalAssetBytes(source);
+    const destinationMatches = fs.existsSync(destination)
+      && canonicalAssetBytes(destination).equals(sourceBytes);
+    if (destinationMatches) continue;
+    fs.writeFileSync(destination, sourceBytes);
+    writtenFiles.push(file);
   }
-  return { destinationRoot, files: names };
+  return { destinationRoot, files: names, written_files: writtenFiles };
 }
 
 function assertProviderAssetMirror(sourceRoot, destinationRoot) {

@@ -20,9 +20,10 @@ const { createReadyOwnerRegistry } = require('./codex-owner-test-fixture');
 const { resolveLineageOwner } = require('../shared/codex-live-owner-registry');
 
 class FakeTurn extends EventEmitter {
-  constructor({ fail = false } = {}) {
+  constructor({ fail = false, pendingCompletion = null } = {}) {
     super();
     this.fail = fail;
+    this.pendingCompletion = pendingCompletion;
     this.startCalls = [];
     this.answerCalls = [];
     this.stopCalls = 0;
@@ -63,6 +64,14 @@ class FakeTurn extends EventEmitter {
 
   async interrupt() { return { ok: true }; }
   async stop() { this.stopCalls += 1; }
+
+  flushPendingTurnCompletion() {
+    if (!this.pendingCompletion) return false;
+    const completion = this.pendingCompletion;
+    this.pendingCompletion = null;
+    this.emit('turn_completed', completion);
+    return true;
+  }
 }
 
 function createHarness(fakeTurn) {
@@ -76,8 +85,23 @@ function createHarness(fakeTurn) {
   engine._codexCliAppServerTurnFactory = () => fakeTurn;
   engine._codexOwnerRegistryPath = createReadyOwnerRegistry(tempRoot);
   engine._findCodexCliSummaryByCliId = () => null;
+  engine._validationGateForAgentType = () => ({ gated: false, reason: null });
   engine._sendToRelay = message => { engine.sent.push(message); return true; };
   engine._publishCodexCliConfig = () => {};
+  engine.nativeCompletionConfigPublishes = [];
+  engine._publishCodexCliNativeCompletionConfig = async (sessionId, session, turn) => {
+    engine.nativeCompletionConfigPublishes.push({
+      session_id: sessionId,
+      turn_id: turn.turnId,
+      activity_kind: session.activity?.kind || null,
+    });
+    return { published: true };
+  };
+  engine.terminalizedTraces = [];
+  engine._terminalizeSendLatencyTrace = (clientMessageId, reason) => {
+    engine.terminalizedTraces.push({ client_message_id: clientMessageId, reason });
+    return true;
+  };
   engine._broadcastSessionSnapshot = () => { engine.broadcasts += 1; };
   engine._processMessageQueue = async () => {};
   engine._log = (level, message) => engine.logs.push({ level, message });
@@ -101,8 +125,13 @@ function prompt(sessionId) {
   });
 }
 
-function settle() {
-  return new Promise(resolve => setImmediate(resolve));
+async function waitFor(predicate, label, timeoutMs = 5_000) {
+  const deadline = Date.now() + timeoutMs;
+  do {
+    if (predicate()) return;
+    await new Promise(resolve => setTimeout(resolve, 5));
+  } while (Date.now() < deadline);
+  assert.fail(`Timed out waiting for ${label}`);
 }
 
 (async () => {
@@ -166,7 +195,7 @@ function settle() {
     kind: 'idle', label: '', updated_at: new Date().toISOString(),
   });
   assert.strictEqual(session.activity.kind, 'waiting_for_user', 'stale JSONL idle must not hide an owned question');
-  engine._handleRelayMessage({
+  await engine._handleRelayMessage({
     type: 'question_response',
     request_id: 'response-request',
     session_id: sessionId,
@@ -178,12 +207,11 @@ function settle() {
       choice_ids: [opened.questions[0].choices[0].choice_id],
     }],
   });
-  await settle();
-  await settle();
   assert.strictEqual(fakeTurn.answerCalls.length, 1);
   const answerReceipt = engine.sent.find(message => message.command === 'question_response');
   assert.strictEqual(answerReceipt.result, 'ok');
   assert.strictEqual(answerReceipt.native_acknowledged, true);
+  await waitFor(() => session.activity.kind === 'generating', 'post-answer generating status');
   assert.strictEqual(session.activity.kind, 'generating');
 
   assert.strictEqual(engine._observeCodexCliOwnedTurnCompletion(sessionId, session, {
@@ -203,8 +231,7 @@ function settle() {
   }), true, 'the exact terminal JSONL turn must release via live turn-object identity');
   assert.strictEqual(idleStatusCount(), liveTerminalStatuses + 1,
     'exact terminal JSONL must publish idle status before asynchronous turn cleanup');
-  await settle();
-  await settle();
+  await waitFor(() => session._codexAppServerTurn === null, 'owned app-server cleanup');
   assert.strictEqual(session._codexAppServerTurn, null);
   assert.strictEqual(session.waitingForAssistant, false);
   assert.strictEqual(session.activity.kind, 'idle');
@@ -221,6 +248,8 @@ function settle() {
   assert.strictEqual(resolveLineageOwner(nativeThreadId, {
     registryPath: engine._codexOwnerRegistryPath,
   }).state, 'none');
+  assert.strictEqual(engine.nativeCompletionConfigPublishes.length, 1,
+    'native completion config must publish before the owned turn is released');
 
   session.activity = { kind: 'generating', label: 'stale', updated_at: new Date().toISOString() };
   session._codexCliPendingReceipt = null;
@@ -249,6 +278,120 @@ function settle() {
   }), true, 'a detached exact terminal must reconcile even when activity is already idle');
   assert.strictEqual(idleStatusCount(), detachedNoopStatuses + 1,
     'a first detached terminal must publish status when the idle update is a semantic no-op');
+
+  const fastFailedTurn = new FakeTurn({
+    pendingCompletion: {
+      thread_id: nativeThreadId,
+      turn_id: 'native-turn',
+      status: 'failed',
+      error: {
+        code: 'provider_quota',
+        message: 'The fixture has no remaining usage.',
+      },
+    },
+  });
+  const fastFailedEngine = createHarness(fastFailedTurn);
+  const fastFailedSession = {
+    ...session,
+    session_id: 'fast-failed-session',
+    cliSessionId: null,
+    _codexAppServerTurn: null,
+    _codexAppServerTurnCompleted: false,
+    _codexAppServerLastTurnIdentity: null,
+    _codexCliPendingReceipt: null,
+    activity: { kind: 'idle', label: '', updated_at: new Date().toISOString() },
+  };
+  fastFailedEngine.sessions.set(fastFailedSession.session_id, fastFailedSession);
+  const fastFailed = await fastFailedEngine._sendCodexCliMessage(
+    fastFailedSession,
+    'Complete before startTurn returns.',
+    fastFailedSession.session_id,
+    { clientMessageId: 'fast-failed-message' },
+  );
+  assert.strictEqual(fastFailed.ok, true);
+  await waitFor(
+    () => fastFailedSession._codexAppServerTurn === null,
+    'fast failed completion cleanup',
+  );
+  assert.strictEqual(fastFailedSession.activity.kind, 'failed');
+  assert.strictEqual(fastFailedTurn.stopCalls, 1);
+  assert.deepStrictEqual(fastFailedEngine.terminalizedTraces, [{
+    client_message_id: 'fast-failed-message',
+    reason: 'native_turn_failed',
+  }]);
+  assert.strictEqual(fastFailedEngine.nativeCompletionConfigPublishes.length, 1);
+
+  const jsonlFailedTurn = new FakeTurn();
+  const jsonlFailedEngine = createHarness(jsonlFailedTurn);
+  let jsonlFailureReplayCalls = 0;
+  jsonlFailedEngine._replayCanonicalAssistantForPendingLatency = () => {
+    jsonlFailureReplayCalls += 1;
+    return true;
+  };
+  const jsonlFailedSession = {
+    session_id: 'jsonl-failed-session',
+    agentType: 'codex_cli',
+    status: 'healthy',
+    workspace_path: tempRoot,
+    permission_mode: 'read-only',
+    observedModelId: 'gpt-test',
+    observedEffort: 'medium',
+    activity: { kind: 'idle', label: '', updated_at: new Date().toISOString() },
+    messageQueue: [],
+  };
+  jsonlFailedEngine.sessions.set(jsonlFailedSession.session_id, jsonlFailedSession);
+  const jsonlFailed = await jsonlFailedEngine._sendCodexCliMessage(
+    jsonlFailedSession,
+    'Fail with a native diagnostic.',
+    jsonlFailedSession.session_id,
+    { clientMessageId: 'jsonl-failed-message' },
+  );
+  assert.strictEqual(jsonlFailed.ok, true);
+  const quotaInterruption = {
+    code: 'provider_quota',
+    category: 'quota',
+    title: 'Provider usage limit reached',
+    safe_display_text: 'The fixture has no remaining usage.',
+    blocking: true,
+    resolution_state: 'unresolved',
+  };
+  assert.strictEqual(jsonlFailedEngine._observeCodexCliOwnedTurnCompletion(
+    jsonlFailedSession.session_id,
+    jsonlFailedSession,
+    {
+      cliSessionId: nativeThreadId,
+      taskCompletedTurnId: 'native-turn',
+      taskCompletedAt: new Date().toISOString(),
+      activity: {
+        kind: 'failed',
+        label: quotaInterruption.title,
+        interruption: quotaInterruption,
+      },
+      interruption: quotaInterruption,
+      messages: [
+        { role: 'user', content: 'Fail with a native diagnostic.', native_turn_id: 'native-turn' },
+        {
+          role: 'assistant',
+          content: `[Error]\n\n${quotaInterruption.safe_display_text}`,
+          native_turn_id: 'native-turn',
+          native_interruption: quotaInterruption,
+        },
+      ],
+    },
+  ), true);
+  assert.strictEqual(jsonlFailureReplayCalls, 0,
+    'native failure diagnostic was replayed as a successful latency response');
+  assert.deepStrictEqual(jsonlFailedEngine.terminalizedTraces, [{
+    client_message_id: 'jsonl-failed-message',
+    reason: 'native_turn_failed',
+  }]);
+  await waitFor(
+    () => jsonlFailedSession._codexAppServerTurn === null,
+    'JSONL failed completion cleanup',
+  );
+  assert.strictEqual(jsonlFailedSession.activity.kind, 'failed');
+  assert.strictEqual(jsonlFailedTurn.stopCalls, 1);
+  assert.strictEqual(jsonlFailedEngine.nativeCompletionConfigPublishes.length, 1);
 
   const failedTurn = new FakeTurn({ fail: true });
   const failedEngine = createHarness(failedTurn);
@@ -284,6 +427,12 @@ function settle() {
     stale_post_terminal_activity_rejected: true,
     terminal_activity_idle: true,
     completion_released_owner: true,
+    fast_failed_completion_flushed: true,
+    native_failure_trace_terminalized: true,
+    native_failure_activity_preserved: true,
+    jsonl_failure_diagnostic_not_replayed_as_output: true,
+    jsonl_failure_trace_terminalized_before_cleanup: true,
+    native_completion_config_before_release: true,
     launch_failure_no_fallback: true,
     permission_path_untouched: engine.activePermissionPrompts.size === 0,
   }, null, 2));

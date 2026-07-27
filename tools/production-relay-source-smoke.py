@@ -6,6 +6,7 @@ import hashlib
 import json
 import os
 import shlex
+import subprocess
 from pathlib import Path
 
 import paramiko
@@ -47,6 +48,7 @@ def main() -> None:
 
     expected = {
         "/app/index.js": sha256(source_root / "relay-server" / "index.js"),
+        "/app/activity-timeline.js": sha256(source_root / "relay-server" / "activity-timeline.js"),
         "/app/usage-resume.js": sha256(source_root / "relay-server" / "usage-resume.js"),
         "/app/usage-thresholds.js": sha256(source_root / "relay-server" / "usage-thresholds.js"),
         "/app/proxy-outage-monitor.js": sha256(source_root / "relay-server" / "proxy-outage-monitor.js"),
@@ -58,7 +60,23 @@ def main() -> None:
         "/app/fleet-summary-loader.js": sha256(source_root / "relay-server" / "fleet-summary-loader.js"),
         "/app/shared/question-prompt-contract.js": sha256(source_root / "shared" / "question-prompt-contract.js"),
         "/app/shared/fleet-summary.js": sha256(source_root / "shared" / "fleet-summary.js"),
+        "/app/shared/native-interruption.js": sha256(source_root / "shared" / "native-interruption.js"),
+        "/app/shared/provider-connection-lifecycle.js": sha256(
+            source_root / "shared" / "provider-connection-lifecycle.js"
+        ),
+        "/app/public/app.jsx": sha256(source_root / "relay-server" / "public" / "app.jsx"),
+        "/app/public/hooks.jsx": sha256(source_root / "relay-server" / "public" / "hooks.jsx"),
+        "/app/public/styles.css": sha256(source_root / "relay-server" / "public" / "styles.css"),
+        "/app/public/dist/bundle.js": sha256(
+            source_root / "relay-server" / "public" / "dist" / "bundle.js"
+        ),
+        "/app/public/sw.js": sha256(source_root / "relay-server" / "public" / "sw.js"),
     }
+    source_commit = subprocess.check_output(
+        ["git", "rev-parse", "HEAD"],
+        cwd=source_root,
+        text=True,
+    ).strip()
     ssh = paramiko.SSHClient()
     ssh.set_missing_host_key_policy(paramiko.AutoAddPolicy())
     try:
@@ -74,6 +92,15 @@ def main() -> None:
         exit_code = stdout.channel.recv_exit_status()
         if exit_code != 0:
             raise RuntimeError(f"remote sha256sum failed ({exit_code}): {error}")
+        _, stdout, stderr = ssh.exec_command(
+            "docker inspect agent-relay "
+            "--format '{{.Id}}|{{.Image}}|{{.State.Status}}|{{.State.StartedAt}}'"
+        )
+        inspect_output = stdout.read().decode("utf-8", errors="replace").strip()
+        inspect_error = stderr.read().decode("utf-8", errors="replace").strip()
+        inspect_exit = stdout.channel.recv_exit_status()
+        if inspect_exit != 0:
+            raise RuntimeError(f"production relay inspect failed ({inspect_exit}): {inspect_error}")
         schema_script = (
             "const Database=require('better-sqlite3');"
             "const db=new Database('/data/messages.db',{readonly:true});"
@@ -128,6 +155,7 @@ def main() -> None:
         raise AssertionError(f"production usage_resume_jobs schema mismatch: {schema.get('columns')}")
 
     scheduled_schema = json.loads(scheduled_schema_output)
+    container_id, image_id, container_status, started_at = inspect_output.split("|", 3)
     required_scheduled_columns = {
         "id", "owner_email", "session_id", "content", "trigger_kind", "deliver_at",
         "state", "client_msg_id", "last_error", "created_at", "updated_at",
@@ -149,7 +177,12 @@ def main() -> None:
     result = {
         "ok": True,
         "container": "agent-relay",
+        "container_id": container_id,
+        "image_id": image_id,
+        "container_status": container_status,
+        "container_started_at": started_at,
         "source_root": str(source_root),
+        "source_commit": source_commit,
         "files": {path: {"sha256": digest, "match": True} for path, digest in expected.items()},
         "usage_resume_jobs": {
             "schema_complete": True,

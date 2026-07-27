@@ -15,7 +15,7 @@ for (const marker of [
   "normalizedProviderUsage.summaryAuthoritative ? normalizedProviderUsage.summary.providers",
   "normalizedProviderUsage.summaryAuthoritative ? normalizedProviderUsage.summary.accounts",
   'provider-usage-card-${entry.providerId}',
-  '<ProviderMark providerId={entry.providerId} providerName={entry.providerName} colorScheme="dark" />',
+  '<ProviderMark providerId={entry.providerId} providerName={entry.providerName}',
   'accessibilityState={{ expanded: !collapsed }}',
   'requestProviderUsageRefresh(true)',
   "case 'provider_usage_refresh_receipt':",
@@ -35,9 +35,19 @@ for (const marker of [
   'window.pace.category',
   'window.thresholds.warningPercent',
   'accessibilityLabel="Ollama owned request metrics"',
+  'accessibilityLabel="Ollama local runtime"',
   'accessibilityLabel="Ollama Cloud usage"',
   'accessibilityLabel="Ollama Cloud usage unavailable"',
   'accessibilityLabel="Ollama Cloud no subscription"',
+  'accessibilityLabel="Refresh Ollama local runtime"',
+  'function providerCloudRecoveryLabel(lifecycle)',
+  "start_owned_cloud_source: 'Start owned browser'",
+  'accessibilityLabel={`${cloudRecovery} for Ollama Cloud`}',
+  'accessibilityLabel="Open Ollama Cloud"',
+  "providerSourceStatusLabel(cloudLifecycle, 'Not connected')",
+  'providerSourceAgeLabel(localLifecycle, providerUsageNowMs)',
+  'providerCloudDiagnosticLabel(cloudLifecycle)',
+  'providerSourceCount(entry.localRuntime.loadedModelsCount)',
   'formatOllamaTokenRate(entry.localRuntime.latestRequest.tokensPerSecond)',
   'formatOllamaDuration(entry.localRuntime.latestRequest.promptEvalDurationNs)',
   'usagePaceBudgets',
@@ -47,11 +57,15 @@ for (const marker of [
 assert(!source.includes('function collectUsageByHarness'), 'legacy Android harness aggregation must be removed');
 assert(!source.includes("navigation.navigate('Chat', { sessionId: entry.sessionId"), 'usage cards must not jump to an arbitrary session');
 assert(!source.includes('entry.providerName.slice(0, 2).toUpperCase()'), 'synthetic provider initials must not be primary marks');
+assert(!source.includes('No readable, already-open signed-in Ollama usage page was found.'),
+  'Android must not blame the operator for the passive cloud source configuration');
 for (const marker of [
   'accessibilityRole="image"',
   'provider mark${failed || !mark',
   "require('../assets/providers/openai-light.png')",
   "require('../assets/providers/ollama-light.png')",
+  'const systemColorScheme = useColorScheme();',
+  "const scheme = colorScheme === 'light' || colorScheme === 'dark'",
 ]) assert(marks.includes(marker), `missing Android provider mark marker: ${marker}`);
 
 const result = {
@@ -77,6 +91,10 @@ const result = {
   provider_mark_text_fallback: true,
   ollama_owned_request_metrics: true,
   ollama_cloud_usage_states: true,
+  ollama_independent_source_lifecycle: true,
+  ollama_nullable_local_counts: true,
+  ollama_scoped_source_retries: true,
+  ollama_truthful_not_connected_action: true,
 };
 const outputIndex = process.argv.indexOf('--output');
 if (outputIndex >= 0 && process.argv[outputIndex + 1]) {

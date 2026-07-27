@@ -34,6 +34,47 @@ class CodexCliAppServerTurn extends EventEmitter {
     this.turnId = null;
     this.started = false;
     this.stopping = false;
+    this.pendingTurnCompletions = new Map();
+    this.completedTurnId = null;
+  }
+
+  _emitTurnCompletion(message) {
+    const nativeThreadId = String(message?.params?.threadId || '').trim();
+    const nativeTurn = message?.params?.turn;
+    const nativeTurnId = String(nativeTurn?.id || '').trim();
+    if (!nativeThreadId || nativeThreadId !== this.threadId || !nativeTurnId) return false;
+    if (!this.turnId) {
+      this.pendingTurnCompletions.delete(nativeTurnId);
+      this.pendingTurnCompletions.set(nativeTurnId, message);
+      while (this.pendingTurnCompletions.size > 8) {
+        this.pendingTurnCompletions.delete(this.pendingTurnCompletions.keys().next().value);
+      }
+      return false;
+    }
+    if (nativeTurnId !== this.turnId || this.completedTurnId === nativeTurnId) return false;
+    this.completedTurnId = nativeTurnId;
+    const nativeError = nativeTurn?.error && typeof nativeTurn.error === 'object'
+      ? nativeTurn.error
+      : null;
+    this.emit('turn_completed', {
+      thread_id: this.threadId,
+      turn_id: this.turnId,
+      status: nativeTurn?.status || null,
+      ...(nativeError ? {
+        error: {
+          code: String(nativeError.code || nativeError.type || '').slice(0, 120) || null,
+          message: String(nativeError.message || nativeError.text || '').slice(0, 500) || null,
+        },
+      } : {}),
+    });
+    return true;
+  }
+
+  flushPendingTurnCompletion() {
+    if (!this.turnId) return false;
+    const pendingCompletion = this.pendingTurnCompletions.get(this.turnId);
+    this.pendingTurnCompletions.clear();
+    return pendingCompletion ? this._emitTurnCompletion(pendingCompletion) : false;
   }
 
   async start({
@@ -67,12 +108,7 @@ class CodexCliAppServerTurn extends EventEmitter {
     connection.on('notification', message => {
       this.emit('notification', message);
       if (message?.method !== 'turn/completed') return;
-      if (message.params?.threadId !== this.threadId || message.params?.turn?.id !== this.turnId) return;
-      this.emit('turn_completed', {
-        thread_id: this.threadId,
-        turn_id: this.turnId,
-        status: message.params.turn.status || null,
-      });
+      this._emitTurnCompletion(message);
     });
     connection.on('disconnect', details => {
       this.started = false;
@@ -133,6 +169,7 @@ class CodexCliAppServerTurn extends EventEmitter {
       try { await connection.stop(); } catch {}
       this.connection = null;
       this.started = false;
+      this.pendingTurnCompletions.clear();
       throw error;
     }
   }
@@ -160,6 +197,7 @@ class CodexCliAppServerTurn extends EventEmitter {
     this.connection = null;
     this.stopping = true;
     this.started = false;
+    this.pendingTurnCompletions.clear();
     await connection.stop();
   }
 }

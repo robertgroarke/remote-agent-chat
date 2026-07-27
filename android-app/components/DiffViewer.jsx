@@ -8,13 +8,15 @@ import {
 // Bottom sheet showing file changes / diff output from Codex sessions.
 // Color-coded lines: green for additions, red for deletions, blue for hunks.
 
-export default function DiffViewer({ visible, entries, onRefresh, onClose, loading, onAccept, onReject }) {
+export default function DiffViewer({
+  visible, entries, onRefresh, onClose, onMinimize, loading, onAccept, onReject,
+}) {
   return (
     <Modal
       visible={visible}
       transparent
       animationType="slide"
-      onRequestClose={onClose}
+      onRequestClose={onMinimize || onClose}
     >
       <TouchableWithoutFeedback onPress={onClose}>
         <View style={s.backdrop} />
@@ -25,6 +27,17 @@ export default function DiffViewer({ visible, entries, onRefresh, onClose, loadi
           <Text style={s.title}>File Changes</Text>
           <TouchableOpacity onPress={onRefresh} style={s.refreshBtn} activeOpacity={0.7}>
             <Text style={s.refreshBtnText}>↻</Text>
+          </TouchableOpacity>
+          <TouchableOpacity
+            onPress={onMinimize || onClose}
+            style={s.minimizeBtn}
+            activeOpacity={0.7}
+            accessibilityRole="button"
+            accessibilityLabel="Minimize File changes"
+            accessibilityState={{ expanded: true }}
+            testID="pane-minimize-diff-viewer"
+          >
+            <Text style={s.minimizeBtnText}>Minimize</Text>
           </TouchableOpacity>
           <TouchableOpacity onPress={onClose} style={s.closeBtn} activeOpacity={0.7}>
             <Text style={s.closeBtnText}>✕</Text>
@@ -97,14 +110,14 @@ const s = StyleSheet.create({
     backgroundColor: '#0d1117',
     borderTopLeftRadius: 16,
     borderTopRightRadius: 16,
-    maxHeight: '65%',
+    maxHeight: '45%',
     paddingBottom: 20,
   },
   header: {
     flexDirection: 'row',
     alignItems: 'center',
-    paddingHorizontal: 16,
-    paddingVertical: 12,
+    minHeight: 52,
+    paddingHorizontal: 8,
     borderBottomWidth: 1,
     borderBottomColor: '#21262d',
   },
@@ -117,17 +130,33 @@ const s = StyleSheet.create({
     textTransform: 'uppercase',
   },
   refreshBtn: {
-    paddingHorizontal: 10,
-    paddingVertical: 4,
-    marginRight: 8,
+    minWidth: 44,
+    minHeight: 44,
+    marginRight: 4,
+    alignItems: 'center',
+    justifyContent: 'center',
   },
   refreshBtnText: {
     color: '#d2a8ff',
     fontSize: 16,
   },
-  closeBtn: {
+  minimizeBtn: {
+    minWidth: 44,
+    minHeight: 44,
     paddingHorizontal: 8,
-    paddingVertical: 4,
+    borderWidth: 1,
+    borderColor: '#484f58',
+    borderRadius: 7,
+    marginRight: 4,
+    alignItems: 'center',
+    justifyContent: 'center',
+  },
+  minimizeBtnText: { color: '#f0f6fc', fontSize: 10, fontWeight: '700' },
+  closeBtn: {
+    minWidth: 44,
+    minHeight: 44,
+    alignItems: 'center',
+    justifyContent: 'center',
   },
   closeBtnText: {
     color: '#888',

@@ -38,9 +38,20 @@ for (const marker of [
   'window.pace.category',
   'window.thresholds.warningPercent',
   'data-testid="ollama-owned-request-metrics"',
+  'data-testid="ollama-local-runtime"',
   'data-testid="ollama-cloud-usage"',
   'data-testid="ollama-cloud-unavailable"',
   'data-testid="ollama-cloud-no-subscription"',
+  'data-source-status={localLifecycle?.status || \'unavailable\'}',
+  'aria-label="Refresh Ollama local runtime"',
+  'const cloudRecoveryLabel = lifecycle => ({',
+  "start_owned_cloud_source: 'Start owned browser'",
+  'aria-label={`${cloudRecovery} for Ollama Cloud`}',
+  '>Open Ollama Cloud</a>',
+  "sourceStatusLabel(cloudLifecycle, 'Not connected')",
+  'sourceAgeLabel(localLifecycle)',
+  'sourceCountLabel(entry.localRuntime.loadedModelsCount)',
+  'cloudDiagnosticLabel(cloudLifecycle)',
   'formatOllamaTokenRate(entry.localRuntime.latestRequest.tokensPerSecond)',
   'formatOllamaDuration(entry.localRuntime.latestRequest.promptEvalDurationNs)',
   'usage-pace-budgets',
@@ -93,6 +104,8 @@ for (const marker of [
   '.usage-cost-table',
   '.usage-cost-detail-pager',
   '.usage-refresh-receipt',
+  '.usage-dashboard-source-state',
+  '.usage-dashboard-source-state.unavailable',
   '.usage-pace-chart',
   '.usage-pace-budgets',
   '.session-usage-mini.tone-critical',
@@ -107,6 +120,8 @@ for (const marker of [
   'usage-dashboard-provider-mark-fallback',
 ]) assert(marks.includes(marker), `missing provider mark marker: ${marker}`);
 assert(!app.includes('entry.providerName.slice(0, 2).toUpperCase()'), 'synthetic provider initials must not be primary marks');
+assert(!app.includes('No readable, already-open signed-in Ollama usage page was found.'),
+  'Web must not blame the operator for the passive cloud source configuration');
 
 const result = {
   ok: true,
@@ -138,6 +153,10 @@ const result = {
   provider_mark_text_fallback: true,
   ollama_owned_request_metrics: true,
   ollama_cloud_usage_states: true,
+  ollama_independent_source_lifecycle: true,
+  ollama_nullable_local_counts: true,
+  ollama_scoped_source_retries: true,
+  ollama_truthful_not_connected_action: true,
 };
 const outputIndex = process.argv.indexOf('--output');
 if (outputIndex >= 0 && process.argv[outputIndex + 1]) {

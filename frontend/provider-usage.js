@@ -17,6 +17,69 @@ function finiteNumber(value) {
   return Number.isFinite(numeric) ? numeric : null;
 }
 
+function nullableCount(value) {
+  if (value == null || value === '') return null;
+  const numeric = Number(value);
+  return Number.isFinite(numeric) ? Math.max(0, Math.floor(numeric)) : null;
+}
+
+function normalizeSourceLifecycle(value) {
+  if (!value || typeof value !== 'object') return null;
+  const status = ['loading', 'fresh', 'stale', 'auth_required', 'unavailable', 'error']
+    .includes(value.status) ? value.status : 'unavailable';
+  const diagnostic = value.diagnostic && typeof value.diagnostic === 'object'
+    ? {
+      configuredPorts: (Array.isArray(value.diagnostic.configured_ports)
+        ? value.diagnostic.configured_ports : []).map(Number).filter(Number.isInteger),
+      fallbackPorts: (Array.isArray(value.diagnostic.fallback_ports)
+        ? value.diagnostic.fallback_ports : []).map(Number).filter(Number.isInteger),
+      effectivePorts: (Array.isArray(value.diagnostic.effective_ports)
+        ? value.diagnostic.effective_ports : []).map(Number).filter(Number.isInteger),
+      fallbackPolicy: String(value.diagnostic.fallback_policy || ''),
+      extractionSignature: String(value.diagnostic.extraction_signature || ''),
+      attempts: (Array.isArray(value.diagnostic.attempts) ? value.diagnostic.attempts : []).map(attempt => ({
+        port: nullableCount(attempt?.port),
+        status: String(attempt?.status || ''),
+        code: String(attempt?.code || ''),
+        reachable: attempt?.reachable === true,
+        elapsedMs: Math.max(0, Number(attempt?.elapsed_ms) || 0),
+        ollamaOriginTargets: Math.max(0, Number(attempt?.ollama_origin_targets) || 0),
+        usageTargets: Math.max(0, Number(attempt?.usage_targets) || 0),
+      })),
+      supervision: value.diagnostic.supervision && typeof value.diagnostic.supervision === 'object'
+        ? {
+          status: String(value.diagnostic.supervision.status || ''),
+          code: String(value.diagnostic.supervision.code || ''),
+          port: nullableCount(value.diagnostic.supervision.port),
+          elapsedMs: Math.max(0, Number(value.diagnostic.supervision.elapsed_ms) || 0),
+          visibleWindowsOpened: Math.max(
+            0,
+            Number(value.diagnostic.supervision.visible_windows_opened) || 0,
+          ),
+          protectedExistingTargetsMutated: Math.max(
+            0,
+            Number(value.diagnostic.supervision.protected_existing_targets_mutated) || 0,
+          ),
+        }
+        : null,
+      elapsedMs: Math.max(0, Number(value.diagnostic.elapsed_ms) || 0),
+    }
+    : null;
+  return {
+    status,
+    capturedAt: String(value.captured_at || ''),
+    lastGoodAt: String(value.last_good_at || ''),
+    attemptedAt: String(value.attempted_at || ''),
+    attemptId: String(value.attempt_id || ''),
+    reason: value.reason && typeof value.reason === 'object' ? {
+      code: String(value.reason.code || ''),
+      message: String(value.reason.message || ''),
+    } : null,
+    nextAction: String(value.next_action || ''),
+    diagnostic,
+  };
+}
+
 function normalizedMoney(value) {
   if (!value || typeof value !== 'object') return null;
   if (value.amount == null || value.amount === '') return null;
@@ -81,8 +144,8 @@ function normalizeLocalRuntime(value) {
   return {
     status: String(value.status || ''),
     endpointScope: String(value.endpoint_scope || ''),
-    installedModelsCount: Math.max(0, Number(value.installed_models_count) || 0),
-    loadedModelsCount: Math.max(0, Number(value.loaded_models_count) || 0),
+    installedModelsCount: nullableCount(value.installed_models_count),
+    loadedModelsCount: nullableCount(value.loaded_models_count),
     loadedModels: (Array.isArray(value.loaded_models) ? value.loaded_models : []).map(model => ({
       name: String(model?.name || 'Unnamed local model'),
       sizeBytes: Math.max(0, Number(model?.size_bytes) || 0),
@@ -102,6 +165,12 @@ function normalizeLocalRuntime(value) {
     latestRequest: requestReceipts.at(-1) || null,
     telemetryStatus: String(value.telemetry_status || ''),
     telemetryReason: String(value.telemetry_reason || ''),
+    lifecycle: normalizeSourceLifecycle(value.lifecycle),
+    observations: value.observations && typeof value.observations === 'object' ? {
+      apiPs: normalizeSourceLifecycle(value.observations.api_ps),
+      apiTags: normalizeSourceLifecycle(value.observations.api_tags),
+      ownedReceipts: normalizeSourceLifecycle(value.observations.owned_receipts),
+    } : null,
   };
 }
 
@@ -120,6 +189,7 @@ function normalizeCloudUsage(value) {
     } : null,
     sourceReceipt: value.source_receipt && typeof value.source_receipt === 'object'
       ? { ...value.source_receipt } : null,
+    lifecycle: normalizeSourceLifecycle(value.lifecycle),
   };
 }
 

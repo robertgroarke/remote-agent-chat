@@ -28,6 +28,7 @@ const {
   beginRevalidation,
   coverageForVersions,
   finalizeRevalidation,
+  runCommandValidations,
   runTier2Definition,
   seedProgramState,
 } = require('./harness-revalidation-program');
@@ -38,6 +39,7 @@ const DEFAULT_LEDGER = path.join(root, 'data', 'app-update-drift-ledger.jsonl');
 const DEFAULT_LOCK = path.join(root, 'data', 'app-update-drift-sentinel.lock');
 const DEFAULT_BACKLOG = path.join(root, 'HARNESS_MATURITY_PHASE2_BACKLOG.md');
 const DEFAULT_UNAVAILABLE_GRACE_MS = 90_000;
+const PROTECTED_REVALIDATION_CDP_PORTS = new Set([9223, 9225, 9240]);
 
 function parseArgs(argv) {
   const options = {
@@ -102,6 +104,68 @@ function acquireLock(lockPath) {
 function collectVersions(options) {
   if (!options.versionsJson) return collectAppVersions();
   return JSON.parse(fs.readFileSync(options.versionsJson, 'utf8'));
+}
+
+function stageOwnedCommandRevalidation({
+  options,
+  priorState,
+  programState,
+  change,
+  context,
+  nowMs = Date.now(),
+}) {
+  const target = context?.target;
+  const sessionId = String(target?.session_id || '').trim();
+  const cdpPort = Number(target?.cdp_port);
+  if (!target || target.disposable !== true || !sessionId) return null;
+  if (!Number.isInteger(cdpPort) || cdpPort <= 0 || cdpPort > 65535) return null;
+  if (PROTECTED_REVALIDATION_CDP_PORTS.has(cdpPort)) {
+    throw new Error(`Refusing owned command revalidation on protected CDP port ${cdpPort}`);
+  }
+  const record = programState?.harnesses?.[change.harness];
+  if (!record || record.status !== 'pending') {
+    throw new Error(`Cannot stage owned command revalidation outside pending ${change.harness}`);
+  }
+  const command = String(context.command || '').trim();
+  if (!command || context.tier1Status !== 'pass') {
+    throw new Error('Owned command revalidation requires a passing command-scoped tier 1');
+  }
+  const installedVersion = String(context.installedVersion || '');
+  if (!installedVersion || installedVersion !== String(change.app_version)) {
+    throw new Error('Owned command revalidation version does not match the pending app version');
+  }
+  const expiresAt = new Date(
+    nowMs + Math.min(11 * 60_000, Math.max(60_000, Number(context.timeoutMs) + 30_000)),
+  ).toISOString();
+  const scope = {
+    command,
+    installed_version: installedVersion,
+    tier1_status: 'pass',
+    disposable: true,
+    session_id: sessionId,
+    cdp_port: cdpPort,
+    staged_at: new Date(nowMs).toISOString(),
+    expires_at: expiresAt,
+  };
+  record.command_revalidation_targets = {
+    ...(record.command_revalidation_targets || {}),
+    [command]: scope,
+  };
+  const savePending = () => saveSentinelState(options.state, {
+    ...priorState,
+    versions: { ...(priorState.versions || {}), [change.harness]: change.app_version },
+    observed_at: new Date().toISOString(),
+    revalidation_program: programState,
+  });
+  savePending();
+
+  return () => {
+    const targets = record.command_revalidation_targets || {};
+    delete targets[command];
+    if (Object.keys(targets).length === 0) delete record.command_revalidation_targets;
+    else record.command_revalidation_targets = targets;
+    savePending();
+  };
 }
 
 function revalidationPreviousVersion(options, priorState, harness, appVersion) {
@@ -307,15 +371,35 @@ async function scanForUpdates(options, dependencies = {}) {
         }
       }
     }
+    const commandStates = definition && coverageRow?.issues?.length === 0
+      ? (dependencies.runCommandValidations
+          ? dependencies.runCommandValidations(change.harness, definition, change.app_version, change)
+          : runCommandValidations(change.harness, definition, change.app_version, {
+              timeoutMs: options.timeoutMs,
+              beforeTier2: context => stageOwnedCommandRevalidation({
+                options,
+                priorState,
+                programState,
+                change,
+                context,
+                nowMs: dependencies.now ? dependencies.now() : Date.now(),
+              }),
+            }))
+      : {};
     const entry = {
       ...result,
+      command_states: commandStates,
       kind: 'app_update_validation',
       previous_app_version: change.previous_version,
       change_detected_at: new Date().toISOString(),
       revalidation: change.revalidation === true,
       repair_playbook: REPAIR_PLAYBOOK,
     };
+    entry.tier1_status = entry.failure_stage === 'fixture_coverage' ? 'not_run'
+      : entry.failure_stage === 'tier-1' ? 'failed'
+        : 'pass';
     if (!entry.tier2_status) entry.tier2_status = 'not_run';
+    if (entry.tier2_status === 'gated') entry.tier2_status = 'unavailable';
     if (entry.status === 'pass' && entry.tier2_status === 'pass') {
       entry.validation_transition = `validated ${change.harness} ${change.previous_version} -> ${change.app_version}`;
       entry.detail = `${entry.validation_transition}. ${entry.detail || ''}`.trim();
@@ -495,5 +579,6 @@ module.exports = {
   parseArgs,
   revalidationPreviousVersion,
   scanForUpdates,
+  stageOwnedCommandRevalidation,
   settleUnavailableChanges,
 };

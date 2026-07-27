@@ -9,13 +9,13 @@ import {
 // Shared between Codex (iframe) and Codex Desktop, and reusable for
 // Antigravity Panel (Epic 10).
 
-export default function ChatListSheet({ visible, chats, onSwitch, onNew, onClose, loading }) {
+export default function ChatListSheet({ visible, chats, onSwitch, onNew, onClose, onMinimize, loading }) {
   return (
     <Modal
       visible={visible}
       transparent
       animationType="slide"
-      onRequestClose={onClose}
+      onRequestClose={onMinimize || onClose}
     >
       <TouchableWithoutFeedback onPress={onClose}>
         <View style={s.backdrop} />
@@ -26,6 +26,17 @@ export default function ChatListSheet({ visible, chats, onSwitch, onNew, onClose
           <Text style={s.title}>Conversations</Text>
           <TouchableOpacity onPress={onNew} style={s.newBtn} activeOpacity={0.7}>
             <Text style={s.newBtnText}>+ New</Text>
+          </TouchableOpacity>
+          <TouchableOpacity
+            onPress={onMinimize || onClose}
+            style={s.minimizeBtn}
+            activeOpacity={0.7}
+            accessibilityRole="button"
+            accessibilityLabel="Minimize Conversations"
+            accessibilityState={{ expanded: true }}
+            testID="pane-minimize-chat-list"
+          >
+            <Text style={s.minimizeBtnText}>Minimize</Text>
           </TouchableOpacity>
           <TouchableOpacity onPress={onClose} style={s.closeBtn} activeOpacity={0.7}>
             <Text style={s.closeBtnText}>✕</Text>
@@ -70,14 +81,14 @@ const s = StyleSheet.create({
     backgroundColor: '#1a1a2e',
     borderTopLeftRadius: 16,
     borderTopRightRadius: 16,
-    maxHeight: '60%',
+    maxHeight: '45%',
     paddingBottom: 20,
   },
   header: {
     flexDirection: 'row',
     alignItems: 'center',
-    paddingHorizontal: 16,
-    paddingVertical: 12,
+    minHeight: 52,
+    paddingHorizontal: 8,
     borderBottomWidth: 1,
     borderBottomColor: '#333',
   },
@@ -90,20 +101,36 @@ const s = StyleSheet.create({
     textTransform: 'uppercase',
   },
   newBtn: {
+    minHeight: 44,
     paddingHorizontal: 12,
-    paddingVertical: 6,
     backgroundColor: '#10a37f22',
     borderRadius: 6,
-    marginRight: 8,
+    marginRight: 4,
+    alignItems: 'center',
+    justifyContent: 'center',
   },
   newBtnText: {
     color: '#10a37f',
     fontSize: 13,
     fontWeight: '600',
   },
-  closeBtn: {
+  minimizeBtn: {
+    minWidth: 44,
+    minHeight: 44,
     paddingHorizontal: 8,
-    paddingVertical: 4,
+    borderWidth: 1,
+    borderColor: '#484f58',
+    borderRadius: 7,
+    marginRight: 4,
+    alignItems: 'center',
+    justifyContent: 'center',
+  },
+  minimizeBtnText: { color: '#f0f6fc', fontSize: 10, fontWeight: '700' },
+  closeBtn: {
+    minWidth: 44,
+    minHeight: 44,
+    alignItems: 'center',
+    justifyContent: 'center',
   },
   closeBtnText: {
     color: '#888',

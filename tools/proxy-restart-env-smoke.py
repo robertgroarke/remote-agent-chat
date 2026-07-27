@@ -45,6 +45,7 @@ def main() -> None:
 
     previous_node_path = os.environ.pop("NODE_PATH", None)
     previous_store_path = os.environ.pop("SESSION_STORE_PATH", None)
+    previous_drift_state_path = os.environ.pop("RAC_APP_UPDATE_DRIFT_STATE_PATH", None)
     try:
         with tempfile.TemporaryDirectory(prefix="rac-proxy-clean-source-") as temp:
             clean_root = Path(temp)
@@ -61,6 +62,9 @@ def main() -> None:
             canonical_store = str(CONFIG_ROOT / "agent-proxy" / "session-store.json")
             if os.environ.get("SESSION_STORE_PATH") != canonical_store:
                 raise AssertionError("clean source restart did not retain the canonical session store")
+            canonical_drift_state = str(CONFIG_ROOT / "data" / "app-update-drift-state.json")
+            if os.environ.get("RAC_APP_UPDATE_DRIFT_STATE_PATH") != canonical_drift_state:
+                raise AssertionError("clean source restart did not retain canonical app-validation state")
             resolved = subprocess.run(
                 ["node", "-p", "require.resolve('dotenv')"],
                 cwd=clean_proxy,
@@ -71,6 +75,23 @@ def main() -> None:
             ).stdout.strip()
             if not resolved.endswith(str(Path("dotenv") / "lib" / "main.js")):
                 raise AssertionError(f"clean source resolved unexpected dotenv module: {resolved}")
+            resolved_state = subprocess.run(
+                [
+                    "node",
+                    "-p",
+                    "require('./agent-proxy/harness-revalidation').DEFAULT_STATE_PATH",
+                ],
+                cwd=ROOT,
+                env=os.environ.copy(),
+                capture_output=True,
+                text=True,
+                check=True,
+            ).stdout.strip()
+            if resolved_state != canonical_drift_state:
+                raise AssertionError(
+                    f"proxy adapter resolved unexpected validation state: "
+                    f"{resolved_state!r} != {canonical_drift_state!r}"
+                )
     finally:
         if previous_node_path is None:
             os.environ.pop("NODE_PATH", None)
@@ -80,6 +101,10 @@ def main() -> None:
             os.environ.pop("SESSION_STORE_PATH", None)
         else:
             os.environ["SESSION_STORE_PATH"] = previous_store_path
+        if previous_drift_state_path is None:
+            os.environ.pop("RAC_APP_UPDATE_DRIFT_STATE_PATH", None)
+        else:
+            os.environ["RAC_APP_UPDATE_DRIFT_STATE_PATH"] = previous_drift_state_path
 
     print("PASS proxy restart environment and clean-source dependency/state fallback")
 

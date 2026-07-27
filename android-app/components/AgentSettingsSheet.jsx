@@ -75,7 +75,7 @@ function SettingRow({ label, options, value, onChange, disabled = false }) {
 // ── Main sheet ──────────────────────────────────────────────────────────────
 
 export default function AgentSettingsSheet({
-  visible, onClose, agentType, config, relay, sessionId, session, controlResults, onExport,
+  visible, onClose, onMinimize, agentType, config, relay, sessionId, session, controlResults, onExport,
 }) {
   const [controlStates, setControlStates] = useState({});
   const [bypassConfirmation, setBypassConfirmation] = useState(false);
@@ -271,13 +271,25 @@ export default function AgentSettingsSheet({
   if (!hasConfig) return null;
 
   return (
-    <Modal visible={visible} transparent animationType="slide" onRequestClose={onClose}>
+    <Modal visible={visible} transparent animationType="slide" onRequestClose={onMinimize || onClose}>
       <TouchableWithoutFeedback onPress={onClose}>
         <View style={s.overlay} />
       </TouchableWithoutFeedback>
       <View style={s.sheet}>
         <View style={s.handle} />
-        <Text style={s.sheetTitle}>Agent Settings</Text>
+        <View style={s.sheetHeader}>
+          <Text style={s.sheetTitle}>Agent Settings</Text>
+          <TouchableOpacity
+            style={s.minimizeButton}
+            onPress={onMinimize || onClose}
+            accessibilityRole="button"
+            accessibilityLabel="Minimize Agent settings"
+            accessibilityState={{ expanded: true }}
+            testID="pane-minimize-agent-settings"
+          >
+            <Text style={s.minimizeButtonText}>Minimize</Text>
+          </TouchableOpacity>
+        </View>
 
         <ScrollView style={s.sheetBody} bounces={false}>
           {agentType === 'codex_cli' && (
@@ -517,7 +529,7 @@ const s = StyleSheet.create({
     borderTopLeftRadius:  16,
     borderTopRightRadius: 16,
     paddingBottom:   34,
-    maxHeight:       '60%',
+    maxHeight:       '45%',
   },
   handle: {
     width:           36,
@@ -528,15 +540,31 @@ const s = StyleSheet.create({
     marginTop:       10,
     marginBottom:    8,
   },
-  sheetTitle: {
-    color:             '#cdd9e5',
-    fontSize:          16,
-    fontWeight:        '600',
-    textAlign:         'center',
-    paddingBottom:     12,
+  sheetHeader: {
+    minHeight: 52,
+    flexDirection: 'row',
+    alignItems: 'center',
+    paddingHorizontal: 12,
     borderBottomWidth: 1,
     borderBottomColor: '#30363d',
   },
+  sheetTitle: {
+    flex:              1,
+    color:             '#cdd9e5',
+    fontSize:          16,
+    fontWeight:        '600',
+  },
+  minimizeButton: {
+    minWidth: 44,
+    minHeight: 44,
+    paddingHorizontal: 10,
+    borderWidth: 1,
+    borderColor: '#484f58',
+    borderRadius: 7,
+    alignItems: 'center',
+    justifyContent: 'center',
+  },
+  minimizeButtonText: { color: '#f0f6fc', fontSize: 11, fontWeight: '700' },
   sheetBody: {
     paddingHorizontal: 16,
     paddingTop:        12,

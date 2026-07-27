@@ -28,6 +28,10 @@ const { ProxyOutageMonitor } = require('./proxy-outage-monitor');
 const { historyRowsMatch, buildIncrementalHistoryPlan } = require('./history-sync-policy');
 const { normalizeTranscriptCursor, evaluateTranscriptCursor } = require('./transcript-cursor-policy');
 const { SendLifecycleTracker } = require('./send-lifecycle');
+const {
+  backfillRetrySafeLegacyFailures,
+  restoreRetrySafeFailedMessages,
+} = require('./send-attempt-migration');
 const { normalizeActivityTimeline } = require('./activity-timeline');
 const {
   boundedDisplayText: boundedFleetDisplayText,
@@ -69,6 +73,7 @@ const {
 const { ProviderUsageAuthority, matchingSessionIds } = require('./provider-usage-authority');
 const { ScheduledSendStore } = require('./scheduled-sends');
 const { pruneDirectory } = require('./storage-retention');
+const { LatencyTraceLedger } = require('./latency-trace-ledger');
 const { GoalNotificationCoordinator } = require('./goal-notifications');
 const { SessionAliasReconciler } = require('./session-alias-reconciler');
 const {
@@ -106,6 +111,14 @@ const {
   validateWebPushSubscription,
   validateWorkspaceControlMessage,
 } = require('./request-security');
+const {
+  advanceLatencyTrace,
+  normalizeLatencyTrace,
+  normalizeLatencyTraceTerminal,
+} = loadSharedRuntimeContract('latency-trace.js');
+const {
+  relayClockStageObservation,
+} = loadSharedRuntimeContract('latency-clock.js');
 
 // ── Config ────────────────────────────────────────────────────────────────────
 
@@ -162,6 +175,10 @@ const RELAY_STATE_EPOCH = crypto.randomBytes(6).toString('hex');
 let relayStateSeq = 0;
 const RUNTIME_MAP_MAX_ENTRIES = 2048;
 const RUNTIME_REQUEST_TTL_MS = 2 * 60 * 1000;
+const LATENCY_TRACE_ACTIVE_TTL_MS = Math.max(
+  1_000,
+  parseInt(process.env.LATENCY_TRACE_ACTIVE_TTL_MS || String(6 * 60 * 1000), 10),
+);
 
 function setBoundedMap(map, key, value, limit = RUNTIME_MAP_MAX_ENTRIES) {
   if (map.has(key)) map.delete(key);
@@ -184,6 +201,213 @@ const UPLOAD_DIR = path.join(DATA_DIR, 'uploads');
 if (!fs.existsSync(UPLOAD_DIR)) fs.mkdirSync(UPLOAD_DIR, { recursive: true });
 const HISTORY_DB_PATH = path.join(DATA_DIR, 'messages.db');
 const HISTORY_BACKUP_DIR = path.join(DATA_DIR, 'backups');
+const LATENCY_TRACE_LEDGER_PATH = path.join(DATA_DIR, 'latency-trace-ledger.jsonl');
+const latencyTraceLedger = new LatencyTraceLedger(LATENCY_TRACE_LEDGER_PATH, { log });
+const activeLatencyTraces = new Map();
+const latencyTraceIdByClientMessageId = new Map();
+
+function dropActiveLatencyTrace(traceId) {
+  const entry = activeLatencyTraces.get(traceId);
+  if (!entry) return false;
+  activeLatencyTraces.delete(traceId);
+  if (entry.client_message_id
+      && latencyTraceIdByClientMessageId.get(entry.client_message_id) === traceId) {
+    latencyTraceIdByClientMessageId.delete(entry.client_message_id);
+  }
+  return true;
+}
+
+function retainActiveLatencyTrace(trace) {
+  const traceId = trace.trace_id;
+  const clientMessageId = trace.client_message_id || null;
+  activeLatencyTraces.set(traceId, trace);
+  if (clientMessageId) latencyTraceIdByClientMessageId.set(clientMessageId, traceId);
+  while (activeLatencyTraces.size > RUNTIME_MAP_MAX_ENTRIES) {
+    terminalizeActiveLatencyTrace(
+      activeLatencyTraces.keys().next().value,
+      'capacity_evicted',
+    );
+  }
+  return trace;
+}
+
+function latencyTracePrefixMatches(current, incoming) {
+  if (!current || !incoming || current.trace_id !== incoming.trace_id) return false;
+  for (const [stage, atMs] of Object.entries(current.stages || {})) {
+    if (incoming.stages?.[stage] !== atMs) return false;
+  }
+  return true;
+}
+
+function registerBrowserLatencyTrace(raw, sessionId, clientMessageId, receivedAtMs) {
+  if (!raw || !clientMessageId) return null;
+  const agentType = sessionMeta.get(sessionId)?.agent_type || raw.agent_type || 'unknown';
+  const clock = relayClockStageObservation(receivedAtMs, 'relay');
+  const advanced = advanceLatencyTrace({
+    ...raw,
+    client_message_id: clientMessageId,
+    agent_type: agentType,
+  }, 'relay_recv', receivedAtMs, { source: 'relay_client_ws', ...clock.source });
+  if (!advanced.ok) {
+    log('warn', 'latency-trace', 'Rejected browser send trace', {
+      trace_id: raw.trace_id || null,
+      code: advanced.code,
+    });
+    return null;
+  }
+  return retainActiveLatencyTrace(advanced.trace);
+}
+
+function acceptProxyLatencyTrace(raw) {
+  if (!raw) return null;
+  const normalized = normalizeLatencyTrace(raw);
+  if (!normalized.ok) {
+    log('warn', 'latency-trace', 'Rejected proxy trace', {
+      trace_id: raw.trace_id || null,
+      code: normalized.code,
+    });
+    return null;
+  }
+  const incoming = normalized.trace;
+  const currentTraceId = incoming.client_message_id
+    ? latencyTraceIdByClientMessageId.get(incoming.client_message_id)
+    : incoming.trace_id;
+  const current = activeLatencyTraces.get(currentTraceId || incoming.trace_id);
+  if (current && !latencyTracePrefixMatches(current, incoming)) {
+    log('warn', 'latency-trace', 'Rejected proxy trace prefix rewrite', {
+      trace_id: incoming.trace_id,
+    });
+    return null;
+  }
+  return retainActiveLatencyTrace(incoming);
+}
+
+function latencyTraceForRelayBroadcast(raw, broadcastAtMs, source) {
+  const accepted = acceptProxyLatencyTrace(raw);
+  if (!accepted?.stages?.agent_first_output) return null;
+  const clock = relayClockStageObservation(broadcastAtMs, 'relay');
+  const advanced = advanceLatencyTrace(
+    accepted,
+    'relay_broadcast',
+    broadcastAtMs,
+    { ...(source || {}), ...clock.source },
+  );
+  if (!advanced.ok) {
+    log('warn', 'latency-trace', 'Rejected relay broadcast trace', {
+      trace_id: accepted.trace_id,
+      code: advanced.code,
+    });
+    return null;
+  }
+  return retainActiveLatencyTrace(advanced.trace);
+}
+
+function completeBrowserLatencyTrace(raw) {
+  const normalized = normalizeLatencyTrace(raw, { requireComplete: true });
+  if (!normalized.ok) return normalized;
+  const trace = normalized.trace;
+  const current = activeLatencyTraces.get(trace.trace_id);
+  if (!current) {
+    return latencyTraceLedger.completedTraceIds.has(trace.trace_id)
+      ? { ok: true, appended: false, duplicate: true, trace_id: trace.trace_id }
+      : { ok: false, code: 'trace_not_active' };
+  }
+  if (!latencyTracePrefixMatches(current, trace)) {
+    return { ok: false, code: 'trace_prefix_rewritten' };
+  }
+  const result = latencyTraceLedger.append(trace);
+  if (result.ok) dropActiveLatencyTrace(trace.trace_id);
+  return result;
+}
+
+function terminalizeProxyLatencyTrace(raw) {
+  const normalized = normalizeLatencyTraceTerminal(raw);
+  if (!normalized.ok) return normalized;
+  const terminal = normalized.terminal;
+  const currentTraceId = terminal.client_message_id
+    ? latencyTraceIdByClientMessageId.get(terminal.client_message_id)
+    : terminal.trace_id;
+  const current = activeLatencyTraces.get(currentTraceId || terminal.trace_id);
+  if (!current) {
+    if (latencyTraceLedger.completedTraceIds.has(terminal.trace_id)) {
+      return { ok: true, appended: false, duplicate: true, trace_id: terminal.trace_id };
+    }
+    const durableReceipt = terminal.client_message_id
+      ? (stmtGetSendReceipt.get(terminal.client_message_id)
+        || stmtGetByClientId.get(terminal.client_message_id))
+      : null;
+    if (!durableReceipt) return { ok: false, code: 'trace_not_active' };
+    const durableAgentType = sessionMeta.get(durableReceipt.session)?.agent_type || null;
+    if (durableAgentType && terminal.agent_type !== 'unknown'
+        && terminal.agent_type !== durableAgentType) {
+      return { ok: false, code: 'terminal_identity_mismatch' };
+    }
+    return latencyTraceLedger.appendTerminal(terminal);
+  }
+  if (current.trace_id !== terminal.trace_id
+      || (current.client_message_id && terminal.client_message_id
+        && current.client_message_id !== terminal.client_message_id)
+      || (current.agent_type && terminal.agent_type
+        && current.agent_type !== terminal.agent_type)) {
+    return { ok: false, code: 'terminal_identity_mismatch' };
+  }
+  const result = latencyTraceLedger.appendTerminal(terminal);
+  if (result.ok) dropActiveLatencyTrace(terminal.trace_id);
+  return result;
+}
+
+function terminalizeActiveLatencyTrace(traceId, reason, terminalAtMs = Date.now()) {
+  const trace = activeLatencyTraces.get(traceId);
+  if (!trace) return { ok: false, code: 'trace_not_active' };
+  const normalized = normalizeLatencyTraceTerminal({
+    trace_id: trace.trace_id,
+    client_message_id: trace.client_message_id,
+    agent_type: trace.agent_type,
+    surface_class: trace.surface_class,
+    reason,
+    terminal_at_ms: terminalAtMs,
+    stages_completed: Object.keys(trace.stages || {}),
+  });
+  if (!normalized.ok) return normalized;
+  const result = latencyTraceLedger.appendTerminal(normalized.terminal);
+  if (result.ok) dropActiveLatencyTrace(trace.trace_id);
+  if (result.appended) {
+    broadcastToBrowsers({
+      type: 'latency_trace_terminal',
+      protocol_version: PROTOCOL_VERSION,
+      latency_trace_terminal: normalized.terminal,
+    });
+  }
+  log(result.ok ? 'info' : 'warn', 'latency-trace', 'Terminalized active send trace', {
+    trace_id: trace.trace_id,
+    reason,
+    appended: result.appended === true,
+    code: result.ok ? null : result.code,
+  });
+  return result;
+}
+
+function expireActiveLatencyTraces(now = Date.now()) {
+  let expired = 0;
+  for (const [traceId, trace] of [...activeLatencyTraces.entries()]) {
+    const relayReceivedAt = Number(trace.stages?.relay_recv || 0);
+    if (!(relayReceivedAt > 0) || now - relayReceivedAt <= LATENCY_TRACE_ACTIVE_TTL_MS) continue;
+    const reason = trace.stages?.harness_delivered
+      ? 'expired_no_output'
+      : 'expired_before_delivery';
+    if (terminalizeActiveLatencyTrace(traceId, reason, now).ok) expired += 1;
+  }
+  return expired;
+}
+
+const latencyTraceCleanupTimer = setInterval(() => {
+  try {
+    expireActiveLatencyTraces();
+  } catch (error) {
+    log('warn', 'latency-trace', 'Active trace cleanup failed', { error: error.message });
+  }
+}, Math.min(30_000, Math.max(1_000, Math.floor(LATENCY_TRACE_ACTIVE_TTL_MS / 10))));
+latencyTraceCleanupTimer.unref?.();
 
 let lastUploadMaintenanceAt = 0;
 let uploadInventory = { retained: 0, retainedBytes: 0 };
@@ -252,7 +476,11 @@ db.exec(`
     agent_started_at TEXT,
     native_receipt TEXT,
     process_epoch  TEXT,
-    failure_code   TEXT
+    failure_code   TEXT,
+    failure_reason TEXT,
+    failure_native_attempted INTEGER,
+    failure_retryable INTEGER,
+    delivery_attempt INTEGER NOT NULL DEFAULT 1
   );
   CREATE INDEX IF NOT EXISTS idx_session ON messages(session, id);
   CREATE TABLE IF NOT EXISTS send_receipts (
@@ -269,9 +497,36 @@ db.exec(`
     native_receipt TEXT,
     process_epoch TEXT,
     failure_code  TEXT,
+    failure_reason TEXT,
+    failure_native_attempted INTEGER,
+    failure_retryable INTEGER,
+    content       TEXT,
+    delivery_attempt INTEGER NOT NULL DEFAULT 1,
     updated_at    TEXT NOT NULL
   );
   CREATE INDEX IF NOT EXISTS idx_send_receipts_session ON send_receipts(session, updated_at);
+  CREATE INDEX IF NOT EXISTS idx_send_receipts_server_message
+    ON send_receipts(server_message_id) WHERE server_message_id IS NOT NULL;
+  CREATE TABLE IF NOT EXISTS send_attempts (
+    client_msg_id TEXT NOT NULL,
+    delivery_attempt INTEGER NOT NULL,
+    session TEXT NOT NULL,
+    status TEXT NOT NULL DEFAULT 'accepted',
+    accepted_at TEXT,
+    launch_accepted_at TEXT,
+    delivered_at TEXT,
+    agent_started_at TEXT,
+    native_receipt TEXT,
+    process_epoch TEXT,
+    failure_code TEXT,
+    failure_reason TEXT,
+    failure_native_attempted INTEGER,
+    failure_retryable INTEGER,
+    updated_at TEXT NOT NULL,
+    PRIMARY KEY (client_msg_id, delivery_attempt)
+  );
+  CREATE INDEX IF NOT EXISTS idx_send_attempts_session
+    ON send_attempts(session, client_msg_id, delivery_attempt);
   CREATE TABLE IF NOT EXISTS transcript_source_cursors (
     session           TEXT NOT NULL,
     source            TEXT NOT NULL,
@@ -960,6 +1215,38 @@ if (!existingCols.has('process_epoch'))
   db.exec(`ALTER TABLE messages ADD COLUMN process_epoch TEXT`);
 if (!existingCols.has('failure_code'))
   db.exec(`ALTER TABLE messages ADD COLUMN failure_code TEXT`);
+if (!existingCols.has('failure_reason'))
+  db.exec(`ALTER TABLE messages ADD COLUMN failure_reason TEXT`);
+if (!existingCols.has('failure_native_attempted'))
+  db.exec(`ALTER TABLE messages ADD COLUMN failure_native_attempted INTEGER`);
+if (!existingCols.has('failure_retryable'))
+  db.exec(`ALTER TABLE messages ADD COLUMN failure_retryable INTEGER`);
+if (!existingCols.has('delivery_attempt'))
+  db.exec(`ALTER TABLE messages ADD COLUMN delivery_attempt INTEGER NOT NULL DEFAULT 1`);
+const existingSendReceiptCols = new Set(db.pragma('table_info(send_receipts)').map(r => r.name));
+if (!existingSendReceiptCols.has('failure_reason'))
+  db.exec(`ALTER TABLE send_receipts ADD COLUMN failure_reason TEXT`);
+if (!existingSendReceiptCols.has('failure_native_attempted'))
+  db.exec(`ALTER TABLE send_receipts ADD COLUMN failure_native_attempted INTEGER`);
+if (!existingSendReceiptCols.has('failure_retryable'))
+  db.exec(`ALTER TABLE send_receipts ADD COLUMN failure_retryable INTEGER`);
+if (!existingSendReceiptCols.has('content'))
+  db.exec(`ALTER TABLE send_receipts ADD COLUMN content TEXT`);
+if (!existingSendReceiptCols.has('delivery_attempt'))
+  db.exec(`ALTER TABLE send_receipts ADD COLUMN delivery_attempt INTEGER NOT NULL DEFAULT 1`);
+// The revalidation gate is evaluated before any native adapter is entered.
+// Make that one legacy failure class explicitly retry-safe; every other
+// historical failure remains fail-closed unless it carried exact safety flags.
+// This migration is receipt-led and primary-key bounded so relay startup never
+// scans the multi-gigabyte transcript table for a handful of durable sends.
+const legacySendAttemptMigration = backfillRetrySafeLegacyFailures(db);
+if (legacySendAttemptMigration.receipt_content_rows_changed
+  || legacySendAttemptMigration.receipt_rows_changed
+  || legacySendAttemptMigration.message_rows_changed
+  || legacySendAttemptMigration.message_rows_restored
+  || legacySendAttemptMigration.attempt_rows_inserted) {
+  log('info', 'db', 'Backfilled retry-safe send attempt state', legacySendAttemptMigration);
+}
 
 // Indexes that reference migrated columns — safe to create now
 try { db.exec(`CREATE INDEX IF NOT EXISTS idx_sequence ON messages(session, sequence)`); } catch {}
@@ -1167,18 +1454,18 @@ function nextSeq(sessionId) {
 function getIncrementalHistoryPlan(sessionId, incomingRows, existingCount, tailLimit = 50) {
   if (!Array.isArray(incomingRows) || incomingRows.length < existingCount) return null;
   const tailSize = Math.min(Math.max(0, existingCount), Math.max(1, tailLimit));
-  const existingTail = tailSize > 0 ? getHistoryRowsTail(sessionId, tailSize) : [];
+  const existingTail = tailSize > 0 ? getReconciliationHistoryRowsTail(sessionId, tailSize) : [];
   return buildIncrementalHistoryPlan(existingCount, existingTail, incomingRows);
 }
 
 function historiesTailLikelyMatch(sessionId, incomingRows, tailLimit = 50) {
-  const existingCount = getHistoryCount(sessionId);
+  const existingCount = getReconciliationHistoryCount(sessionId);
   if (existingCount !== incomingRows.length) {
     return { match: false, existingCount };
   }
   const limit = Math.min(Math.max(1, tailLimit), incomingRows.length);
   if (limit <= 0) return { match: true, existingCount };
-  const existingTail = getHistoryRowsTail(sessionId, limit);
+  const existingTail = getReconciliationHistoryRowsTail(sessionId, limit);
   const incomingTail = incomingRows.slice(-limit);
   return { match: historyRowsMatch(existingTail, incomingTail), existingCount };
 }
@@ -1317,6 +1604,13 @@ function hydrateMessageRow(row) {
     }
   }
   if (!hydrated.native_receipt) delete hydrated.native_receipt;
+  if (hydrated.failure_native_attempted != null) {
+    hydrated.failure_native_attempted = Number(hydrated.failure_native_attempted) === 1;
+  }
+  if (hydrated.failure_retryable != null) {
+    hydrated.failure_retryable = Number(hydrated.failure_retryable) === 1;
+  }
+  hydrated.delivery_attempt = Math.max(1, Number(hydrated.delivery_attempt) || 1);
   return hydrated;
 }
 
@@ -1581,6 +1875,13 @@ function flushProxyMessageWrites() {
       content_sha256: crypto.createHash('sha256').update(String(entry.content || ''), 'utf8').digest('hex'),
       content_bytes: Buffer.byteLength(String(entry.content || ''), 'utf8'),
     });
+    const latencyTrace = entry.latencyTrace
+      ? latencyTraceForRelayBroadcast(
+          entry.latencyTrace,
+          Date.now(),
+          { source: 'relay_persisted_message' },
+        )
+      : null;
     broadcastToBrowsers({
       type: 'message',
       session: entry.id,
@@ -1595,6 +1896,7 @@ function flushProxyMessageWrites() {
       ...(entry.sourceMessageId ? { source_message_id: entry.sourceMessageId } : {}),
       ...(entry.sourceCursor ? { source_cursor: entry.sourceCursor } : {}),
       ...(entry.source ? { source: entry.source } : {}),
+      ...(latencyTrace ? { latency_trace: latencyTrace } : {}),
     });
   }
 }
@@ -1611,8 +1913,23 @@ function queueProxyMessageWrite(entry) {
   proxyMessageFlushScheduled = true;
   queueMicrotask(flushProxyMessageWrites);
 }
-const stmtDeleteSession  = db.prepare('DELETE FROM messages WHERE session = ?');
-const stmtDeleteSessionSuffix = db.prepare('DELETE FROM messages WHERE session = ? AND id >= ?');
+const DELIVERY_RECEIPT_OVERLAY_SQL = `
+  EXISTS (
+    SELECT 1 FROM send_receipts receipt_overlay
+    WHERE receipt_overlay.server_message_id = messages.id
+      AND receipt_overlay.status = 'failed'
+      AND receipt_overlay.failure_native_attempted = 0
+      AND receipt_overlay.failure_retryable = 1
+  )
+`;
+const stmtDeleteSession = db.prepare(`
+  DELETE FROM messages
+  WHERE session = ? AND NOT (${DELIVERY_RECEIPT_OVERLAY_SQL})
+`);
+const stmtDeleteSessionSuffix = db.prepare(`
+  DELETE FROM messages
+  WHERE session = ? AND id >= ? AND NOT (${DELIVERY_RECEIPT_OVERLAY_SQL})
+`);
 
 // ── Session history queries ─────────────────────────────────────────────────
 // Returns distinct sessions with their first user message, message count, and timestamps.
@@ -1702,18 +2019,18 @@ const persistSessionMetaBatch = db.transaction((sessions) => {
   return changed;
 });
 const stmtGetHistory     = db.prepare(
-  'SELECT id, role, content, content_blocks, status, sequence, ts, client_msg_id, source_message_id, source_cursor, source, accepted_at, launch_accepted_at, delivered_at, agent_started_at, native_receipt, process_epoch, failure_code FROM messages WHERE session = ? ORDER BY id ASC'
+  'SELECT id, role, content, content_blocks, status, sequence, ts, client_msg_id, source_message_id, source_cursor, source, accepted_at, launch_accepted_at, delivered_at, agent_started_at, native_receipt, process_epoch, failure_code, failure_reason, failure_native_attempted, failure_retryable, delivery_attempt FROM messages WHERE session = ? ORDER BY id ASC'
 );
 const stmtGetExportHistory = db.prepare(
-  'SELECT id, role, content, content_blocks, status, sequence, ts, client_msg_id, source_message_id, source_cursor, source, accepted_at, launch_accepted_at, delivered_at, agent_started_at, native_receipt, process_epoch, failure_code FROM messages WHERE session = ? ORDER BY id ASC'
+  'SELECT id, role, content, content_blocks, status, sequence, ts, client_msg_id, source_message_id, source_cursor, source, accepted_at, launch_accepted_at, delivered_at, agent_started_at, native_receipt, process_epoch, failure_code, failure_reason, failure_native_attempted, failure_retryable, delivery_attempt FROM messages WHERE session = ? ORDER BY id ASC'
 );
 const stmtGetHistoryCount = db.prepare(
   'SELECT COUNT(*) AS count FROM messages WHERE session = ?'
 );
 const stmtGetHistoryTail = db.prepare(
-  `SELECT id, role, content, content_blocks, status, sequence, ts, client_msg_id, source_message_id, source_cursor, source, accepted_at, launch_accepted_at, delivered_at, agent_started_at, native_receipt, process_epoch, failure_code
+  `SELECT id, role, content, content_blocks, status, sequence, ts, client_msg_id, source_message_id, source_cursor, source, accepted_at, launch_accepted_at, delivered_at, agent_started_at, native_receipt, process_epoch, failure_code, failure_reason, failure_native_attempted, failure_retryable, delivery_attempt
    FROM (
-     SELECT id, role, content, content_blocks, status, sequence, ts, client_msg_id, source_message_id, source_cursor, source, accepted_at, launch_accepted_at, delivered_at, agent_started_at, native_receipt, process_epoch, failure_code
+     SELECT id, role, content, content_blocks, status, sequence, ts, client_msg_id, source_message_id, source_cursor, source, accepted_at, launch_accepted_at, delivered_at, agent_started_at, native_receipt, process_epoch, failure_code, failure_reason, failure_native_attempted, failure_retryable, delivery_attempt
      FROM messages
      WHERE session = ?
      ORDER BY id DESC
@@ -1722,9 +2039,9 @@ const stmtGetHistoryTail = db.prepare(
    ORDER BY id ASC`
 );
 const stmtGetHistoryBeforeId = db.prepare(
-  `SELECT id, role, content, content_blocks, status, sequence, ts, client_msg_id, source_message_id, source_cursor, source, accepted_at, launch_accepted_at, delivered_at, agent_started_at, native_receipt, process_epoch, failure_code
+  `SELECT id, role, content, content_blocks, status, sequence, ts, client_msg_id, source_message_id, source_cursor, source, accepted_at, launch_accepted_at, delivered_at, agent_started_at, native_receipt, process_epoch, failure_code, failure_reason, failure_native_attempted, failure_retryable, delivery_attempt
    FROM (
-     SELECT id, role, content, content_blocks, status, sequence, ts, client_msg_id, source_message_id, source_cursor, source, accepted_at, launch_accepted_at, delivered_at, agent_started_at, native_receipt, process_epoch, failure_code
+     SELECT id, role, content, content_blocks, status, sequence, ts, client_msg_id, source_message_id, source_cursor, source, accepted_at, launch_accepted_at, delivered_at, agent_started_at, native_receipt, process_epoch, failure_code, failure_reason, failure_native_attempted, failure_retryable, delivery_attempt
      FROM messages
      WHERE session = ? AND id < ?
      ORDER BY id DESC
@@ -1736,14 +2053,14 @@ const stmtUpdateHistorySourceMetadata = db.prepare(
   'UPDATE messages SET ts = ?, source_message_id = ?, source = ? WHERE session = ? AND id = ?'
 );
 const stmtGetHistoryAtOrBeforeId = db.prepare(
-  `SELECT id, role, content, content_blocks, status, sequence, ts, client_msg_id, source_message_id, source_cursor, source, accepted_at, launch_accepted_at, delivered_at, agent_started_at, native_receipt, process_epoch, failure_code
+  `SELECT id, role, content, content_blocks, status, sequence, ts, client_msg_id, source_message_id, source_cursor, source, accepted_at, launch_accepted_at, delivered_at, agent_started_at, native_receipt, process_epoch, failure_code, failure_reason, failure_native_attempted, failure_retryable, delivery_attempt
    FROM messages
    WHERE session = ? AND id <= ?
    ORDER BY id DESC
    LIMIT ?`
 );
 const stmtGetHistoryAfterId = db.prepare(
-  `SELECT id, role, content, content_blocks, status, sequence, ts, client_msg_id, source_message_id, source_cursor, source, accepted_at, launch_accepted_at, delivered_at, agent_started_at, native_receipt, process_epoch, failure_code
+  `SELECT id, role, content, content_blocks, status, sequence, ts, client_msg_id, source_message_id, source_cursor, source, accepted_at, launch_accepted_at, delivered_at, agent_started_at, native_receipt, process_epoch, failure_code, failure_reason, failure_native_attempted, failure_retryable, delivery_attempt
    FROM messages
    WHERE session = ? AND id > ?
    ORDER BY id ASC
@@ -1753,8 +2070,30 @@ const stmtGetHistoryCountBeforeId = db.prepare(
   'SELECT COUNT(*) AS count FROM messages WHERE session = ? AND id < ?'
 );
 const stmtGetHistoryFrom = db.prepare(
-  `SELECT id, role, content, content_blocks, status, sequence, ts, client_msg_id, source_message_id, source_cursor, source, accepted_at, launch_accepted_at, delivered_at, agent_started_at, native_receipt, process_epoch, failure_code
+  `SELECT id, role, content, content_blocks, status, sequence, ts, client_msg_id, source_message_id, source_cursor, source, accepted_at, launch_accepted_at, delivered_at, agent_started_at, native_receipt, process_epoch, failure_code, failure_reason, failure_native_attempted, failure_retryable, delivery_attempt
    FROM messages WHERE session = ? AND sequence > ? ORDER BY id ASC`
+);
+const stmtGetReconciliationHistory = db.prepare(
+  `SELECT id, role, content, content_blocks, status, sequence, ts, client_msg_id, source_message_id, source_cursor, source, accepted_at, launch_accepted_at, delivered_at, agent_started_at, native_receipt, process_epoch, failure_code, failure_reason, failure_native_attempted, failure_retryable, delivery_attempt
+   FROM messages
+   WHERE session = ? AND NOT (${DELIVERY_RECEIPT_OVERLAY_SQL})
+   ORDER BY id ASC`
+);
+const stmtGetReconciliationHistoryCount = db.prepare(
+  `SELECT COUNT(*) AS count
+   FROM messages
+   WHERE session = ? AND NOT (${DELIVERY_RECEIPT_OVERLAY_SQL})`
+);
+const stmtGetReconciliationHistoryTail = db.prepare(
+  `SELECT id, role, content, content_blocks, status, sequence, ts, client_msg_id, source_message_id, source_cursor, source, accepted_at, launch_accepted_at, delivered_at, agent_started_at, native_receipt, process_epoch, failure_code, failure_reason, failure_native_attempted, failure_retryable, delivery_attempt
+   FROM (
+     SELECT id, role, content, content_blocks, status, sequence, ts, client_msg_id, source_message_id, source_cursor, source, accepted_at, launch_accepted_at, delivered_at, agent_started_at, native_receipt, process_epoch, failure_code, failure_reason, failure_native_attempted, failure_retryable, delivery_attempt
+     FROM messages
+     WHERE session = ? AND NOT (${DELIVERY_RECEIPT_OVERLAY_SQL})
+     ORDER BY id DESC
+     LIMIT ?
+   )
+   ORDER BY id ASC`
 );
 
 function getHistoryRows(sessionId) {
@@ -1768,6 +2107,19 @@ function getHistoryCount(sessionId) {
 function getHistoryRowsTail(sessionId, limit) {
   const safeLimit = Math.max(1, Math.min(1000, Math.floor(Number(limit) || 0)));
   return stmtGetHistoryTail.all(sessionId, safeLimit).map(hydrateMessageRow);
+}
+
+function getReconciliationHistoryRows(sessionId) {
+  return stmtGetReconciliationHistory.all(sessionId).map(hydrateMessageRow);
+}
+
+function getReconciliationHistoryCount(sessionId) {
+  return Number(stmtGetReconciliationHistoryCount.get(sessionId)?.count || 0);
+}
+
+function getReconciliationHistoryRowsTail(sessionId, limit) {
+  const safeLimit = Math.max(1, Math.min(1000, Math.floor(Number(limit) || 0)));
+  return stmtGetReconciliationHistoryTail.all(sessionId, safeLimit).map(hydrateMessageRow);
 }
 
 function historyChunkLimit(limit) {
@@ -1786,7 +2138,7 @@ function reconcileHistoryTailSourceMetadata(sessionId, incomingRows, source) {
   if (incoming.length === 0 || incoming.length > 1000) {
     return { applied: false, code: 'invalid_reconciliation_window', rows: 0 };
   }
-  const existing = getHistoryRowsTail(sessionId, incoming.length);
+  const existing = getReconciliationHistoryRowsTail(sessionId, incoming.length);
   if (existing.length !== incoming.length) {
     return { applied: false, code: 'history_length_mismatch', rows: 0 };
   }
@@ -1833,7 +2185,7 @@ function reconcileHistoryTailSourceMetadata(sessionId, incomingRows, source) {
     });
     return { applied: false, code: 'source_identity_conflict', rows: 0 };
   }
-  rebuildTranscriptSourceCursors(sessionId, getHistoryRowsTail(sessionId, incoming.length));
+  rebuildTranscriptSourceCursors(sessionId, getReconciliationHistoryRowsTail(sessionId, incoming.length));
   log('info', 'history', 'Reconciled native source metadata for persisted tail', {
     session: sessionId,
     rows: incoming.length,
@@ -1889,43 +2241,71 @@ const stmtFindRelatedHistoryByName = db.prepare(`
   LIMIT 1
 `);
 const stmtGetByClientId = db.prepare(
-  'SELECT id, session, sequence, ts, status, accepted_at, launch_accepted_at, delivered_at, agent_started_at, native_receipt, process_epoch, failure_code FROM messages WHERE client_msg_id = ?'
+  `SELECT id, client_msg_id, session, content, sequence, ts, status, accepted_at,
+          launch_accepted_at, delivered_at, agent_started_at, native_receipt,
+          process_epoch, failure_code, failure_reason, failure_native_attempted,
+          failure_retryable, delivery_attempt
+   FROM messages WHERE client_msg_id = ?`
 );
 const stmtGetSendReceipt = db.prepare(
-  'SELECT client_msg_id, session, server_message_id AS id, sequence, ts, status, accepted_at, launch_accepted_at, delivered_at, agent_started_at, native_receipt, process_epoch, failure_code FROM send_receipts WHERE client_msg_id = ?'
+  `SELECT sr.client_msg_id, sr.session, sr.server_message_id AS id, sr.sequence,
+          sr.ts, sr.status, sr.accepted_at, sr.launch_accepted_at,
+          sr.delivered_at, sr.agent_started_at, sr.native_receipt,
+          sr.process_epoch, sr.failure_code, sr.failure_reason,
+          sr.failure_native_attempted, sr.failure_retryable,
+          sr.delivery_attempt, COALESCE(sr.content, m.content) AS content
+   FROM send_receipts sr
+   LEFT JOIN messages m ON m.id = sr.server_message_id
+   WHERE sr.client_msg_id = ?`
 );
 const stmtInsertSendReceipt = db.prepare(
   `INSERT OR IGNORE INTO send_receipts
-     (client_msg_id, session, server_message_id, sequence, ts, status, accepted_at, updated_at)
-   VALUES (?, ?, ?, ?, ?, 'accepted', ?, ?)`
+     (client_msg_id, session, server_message_id, sequence, ts, status,
+      accepted_at, content, delivery_attempt, updated_at)
+   VALUES (?, ?, ?, ?, ?, 'accepted', ?, ?, 1, ?)`
+);
+const stmtInsertSendAttempt = db.prepare(
+  `INSERT OR IGNORE INTO send_attempts
+     (client_msg_id, delivery_attempt, session, status, accepted_at, updated_at)
+   VALUES (?, ?, ?, 'accepted', ?, ?)`
 );
 const stmtMarkReceiptLaunchAccepted = db.prepare(
   `UPDATE send_receipts
    SET status = CASE WHEN status IN ('delivered', 'agent_started', 'failed') THEN status ELSE 'accepted' END,
-       launch_accepted_at = COALESCE(launch_accepted_at, ?),
+       launch_accepted_at = CASE
+         WHEN status IN ('delivered', 'agent_started', 'failed') THEN launch_accepted_at
+         ELSE COALESCE(launch_accepted_at, ?)
+       END,
        process_epoch = COALESCE(?, process_epoch), updated_at = ?
-   WHERE session = ? AND client_msg_id = ?`
+   WHERE session = ? AND client_msg_id = ? AND delivery_attempt = ?`
 );
 const stmtMarkReceiptDelivered = db.prepare(
   `UPDATE send_receipts
    SET status = CASE WHEN status = 'agent_started' THEN status ELSE 'delivered' END,
        delivered_at = COALESCE(delivered_at, ?), native_receipt = COALESCE(?, native_receipt),
-       process_epoch = COALESCE(?, process_epoch), failure_code = NULL, updated_at = ?
-   WHERE session = ? AND client_msg_id = ?`
+       process_epoch = COALESCE(?, process_epoch), failure_code = NULL,
+       failure_reason = NULL, failure_native_attempted = NULL,
+       failure_retryable = NULL, updated_at = ?
+   WHERE session = ? AND client_msg_id = ? AND delivery_attempt = ?`
 );
 const stmtMarkReceiptAgentStarted = db.prepare(
   `UPDATE send_receipts
    SET status = 'agent_started', delivered_at = COALESCE(delivered_at, ?),
        agent_started_at = COALESCE(agent_started_at, ?), native_receipt = COALESCE(?, native_receipt),
-       process_epoch = COALESCE(?, process_epoch), failure_code = NULL, updated_at = ?
-   WHERE session = ? AND client_msg_id = ?`
+       process_epoch = COALESCE(?, process_epoch), failure_code = NULL,
+       failure_reason = NULL, failure_native_attempted = NULL,
+       failure_retryable = NULL, updated_at = ?
+   WHERE session = ? AND client_msg_id = ? AND delivery_attempt = ?`
 );
 const stmtMarkReceiptFailed = db.prepare(
   `UPDATE send_receipts
    SET status = CASE WHEN status IN ('delivered', 'agent_started') THEN status ELSE 'failed' END,
        failure_code = CASE WHEN status IN ('delivered', 'agent_started') THEN failure_code ELSE ? END,
+       failure_reason = CASE WHEN status IN ('delivered', 'agent_started') THEN failure_reason ELSE ? END,
+       failure_native_attempted = CASE WHEN status IN ('delivered', 'agent_started') THEN failure_native_attempted ELSE ? END,
+       failure_retryable = CASE WHEN status IN ('delivered', 'agent_started') THEN failure_retryable ELSE ? END,
        process_epoch = COALESCE(?, process_epoch), updated_at = ?
-   WHERE session = ? AND client_msg_id = ?`
+   WHERE session = ? AND client_msg_id = ? AND delivery_attempt = ?`
 );
 const stmtMarkMessageAccepted = db.prepare(
   `UPDATE messages
@@ -1936,9 +2316,12 @@ const stmtMarkMessageAccepted = db.prepare(
 const stmtMarkMessageLaunchAccepted = db.prepare(
   `UPDATE messages
    SET status = CASE WHEN status IN ('delivered', 'agent_started', 'failed') THEN status ELSE 'accepted' END,
-       launch_accepted_at = COALESCE(launch_accepted_at, ?),
+       launch_accepted_at = CASE
+         WHEN status IN ('delivered', 'agent_started', 'failed') THEN launch_accepted_at
+         ELSE COALESCE(launch_accepted_at, ?)
+       END,
        process_epoch = COALESCE(?, process_epoch)
-   WHERE session = ? AND client_msg_id = ?`
+   WHERE session = ? AND client_msg_id = ? AND delivery_attempt = ?`
 );
 const stmtMarkMessageDelivered = db.prepare(
   `UPDATE messages
@@ -1946,8 +2329,9 @@ const stmtMarkMessageDelivered = db.prepare(
        delivered_at = COALESCE(delivered_at, ?),
        native_receipt = COALESCE(?, native_receipt),
        process_epoch = COALESCE(?, process_epoch),
-       failure_code = NULL
-   WHERE session = ? AND client_msg_id = ?`
+       failure_code = NULL, failure_reason = NULL,
+       failure_native_attempted = NULL, failure_retryable = NULL
+   WHERE session = ? AND client_msg_id = ? AND delivery_attempt = ?`
 );
 const stmtMarkMessageAgentStarted = db.prepare(
   `UPDATE messages
@@ -1956,15 +2340,81 @@ const stmtMarkMessageAgentStarted = db.prepare(
        agent_started_at = COALESCE(agent_started_at, ?),
        native_receipt = COALESCE(?, native_receipt),
        process_epoch = COALESCE(?, process_epoch),
-       failure_code = NULL
-   WHERE session = ? AND client_msg_id = ?`
+       failure_code = NULL, failure_reason = NULL,
+       failure_native_attempted = NULL, failure_retryable = NULL
+   WHERE session = ? AND client_msg_id = ? AND delivery_attempt = ?`
 );
 const stmtMarkMessageFailed = db.prepare(
   `UPDATE messages
    SET status = CASE WHEN status IN ('delivered', 'agent_started') THEN status ELSE 'failed' END,
        failure_code = CASE WHEN status IN ('delivered', 'agent_started') THEN failure_code ELSE ? END,
+       failure_reason = CASE WHEN status IN ('delivered', 'agent_started') THEN failure_reason ELSE ? END,
+       failure_native_attempted = CASE WHEN status IN ('delivered', 'agent_started') THEN failure_native_attempted ELSE ? END,
+       failure_retryable = CASE WHEN status IN ('delivered', 'agent_started') THEN failure_retryable ELSE ? END,
        process_epoch = COALESCE(?, process_epoch)
-   WHERE session = ? AND client_msg_id = ?`
+   WHERE session = ? AND client_msg_id = ? AND delivery_attempt = ?`
+);
+const stmtMarkAttemptLaunchAccepted = db.prepare(
+  `UPDATE send_attempts
+   SET status = CASE WHEN status IN ('delivered', 'agent_started', 'failed') THEN status ELSE 'accepted' END,
+       launch_accepted_at = CASE
+         WHEN status IN ('delivered', 'agent_started', 'failed') THEN launch_accepted_at
+         ELSE COALESCE(launch_accepted_at, ?)
+       END,
+       process_epoch = COALESCE(?, process_epoch), updated_at = ?
+   WHERE session = ? AND client_msg_id = ? AND delivery_attempt = ?`
+);
+const stmtMarkAttemptDelivered = db.prepare(
+  `UPDATE send_attempts
+   SET status = CASE WHEN status = 'agent_started' THEN status ELSE 'delivered' END,
+       delivered_at = COALESCE(delivered_at, ?),
+       native_receipt = COALESCE(?, native_receipt),
+       process_epoch = COALESCE(?, process_epoch), failure_code = NULL,
+       failure_reason = NULL, failure_native_attempted = NULL,
+       failure_retryable = NULL, updated_at = ?
+   WHERE session = ? AND client_msg_id = ? AND delivery_attempt = ?`
+);
+const stmtMarkAttemptAgentStarted = db.prepare(
+  `UPDATE send_attempts
+   SET status = 'agent_started', delivered_at = COALESCE(delivered_at, ?),
+       agent_started_at = COALESCE(agent_started_at, ?),
+       native_receipt = COALESCE(?, native_receipt),
+       process_epoch = COALESCE(?, process_epoch), failure_code = NULL,
+       failure_reason = NULL, failure_native_attempted = NULL,
+       failure_retryable = NULL, updated_at = ?
+   WHERE session = ? AND client_msg_id = ? AND delivery_attempt = ?`
+);
+const stmtMarkAttemptFailed = db.prepare(
+  `UPDATE send_attempts
+   SET status = CASE WHEN status IN ('delivered', 'agent_started') THEN status ELSE 'failed' END,
+       failure_code = CASE WHEN status IN ('delivered', 'agent_started') THEN failure_code ELSE ? END,
+       failure_reason = CASE WHEN status IN ('delivered', 'agent_started') THEN failure_reason ELSE ? END,
+       failure_native_attempted = CASE WHEN status IN ('delivered', 'agent_started') THEN failure_native_attempted ELSE ? END,
+       failure_retryable = CASE WHEN status IN ('delivered', 'agent_started') THEN failure_retryable ELSE ? END,
+       process_epoch = COALESCE(?, process_epoch), updated_at = ?
+   WHERE session = ? AND client_msg_id = ? AND delivery_attempt = ?`
+);
+const stmtResetMessageForRetry = db.prepare(
+  `UPDATE messages
+   SET status = 'accepted', accepted_at = ?, launch_accepted_at = NULL,
+       delivered_at = NULL, agent_started_at = NULL, native_receipt = NULL,
+       process_epoch = NULL, failure_code = NULL, failure_reason = NULL,
+       failure_native_attempted = NULL, failure_retryable = NULL,
+       delivery_attempt = ?
+   WHERE session = ? AND client_msg_id = ? AND delivery_attempt = ?
+     AND status = 'failed' AND failure_native_attempted = 0
+     AND failure_retryable = 1`
+);
+const stmtResetReceiptForRetry = db.prepare(
+  `UPDATE send_receipts
+   SET status = 'accepted', accepted_at = ?, launch_accepted_at = NULL,
+       delivered_at = NULL, agent_started_at = NULL, native_receipt = NULL,
+       process_epoch = NULL, failure_code = NULL, failure_reason = NULL,
+       failure_native_attempted = NULL, failure_retryable = NULL,
+       delivery_attempt = ?, updated_at = ?
+   WHERE session = ? AND client_msg_id = ? AND delivery_attempt = ?
+     AND status = 'failed' AND failure_native_attempted = 0
+     AND failure_retryable = 1`
 );
 
 function serializeNativeReceipt(receipt) {
@@ -1983,6 +2433,74 @@ function deserializeNativeReceipt(receipt) {
   try { return JSON.parse(receipt); } catch { return null; }
 }
 
+function isSafeFailedSendRetry(row) {
+  return row?.status === 'failed'
+    && Number(row.failure_native_attempted) === 0
+    && Number(row.failure_retryable) === 1
+    && !row.launch_accepted_at
+    && !row.delivered_at
+    && !row.agent_started_at
+    && !row.native_receipt;
+}
+
+const beginSafeSendRetry = db.transaction((clientMessageId, sessionId, acceptedAt) => {
+  const before = stmtGetSendReceipt.get(clientMessageId) || stmtGetByClientId.get(clientMessageId) || null;
+  if (!before || before.session !== sessionId) {
+    return { ok: false, code: 'retry_identity_mismatch', row: before };
+  }
+  if (!isSafeFailedSendRetry(before)) {
+    return { ok: false, code: 'retry_not_proven_safe', row: before };
+  }
+  const priorAttempt = Math.max(1, Number(before.delivery_attempt) || 1);
+  const deliveryAttempt = priorAttempt + 1;
+  const messageUpdate = stmtResetMessageForRetry.run(
+    acceptedAt,
+    deliveryAttempt,
+    sessionId,
+    clientMessageId,
+    priorAttempt,
+  );
+  const receiptUpdate = stmtResetReceiptForRetry.run(
+    acceptedAt,
+    deliveryAttempt,
+    acceptedAt,
+    sessionId,
+    clientMessageId,
+    priorAttempt,
+  );
+  if (messageUpdate.changes !== 1 || receiptUpdate.changes !== 1) {
+    const error = new Error('safe retry compare-and-swap failed');
+    error.code = 'retry_compare_and_swap_failed';
+    throw error;
+  }
+  stmtInsertSendAttempt.run(clientMessageId, deliveryAttempt, sessionId, acceptedAt, acceptedAt);
+  return {
+    ok: true,
+    code: 'retry_attempt_started',
+    prior_attempt: priorAttempt,
+    delivery_attempt: deliveryAttempt,
+    row: stmtGetSendReceipt.get(clientMessageId) || stmtGetByClientId.get(clientMessageId),
+  };
+});
+
+function validateSendAttempt(message, row) {
+  const currentAttempt = Math.max(1, Number(row?.delivery_attempt) || 1);
+  const rawAttempt = Number(message?.delivery_attempt);
+  if (!Number.isInteger(rawAttempt) || rawAttempt < 1) {
+    return currentAttempt === 1
+      ? { ok: true, delivery_attempt: 1, legacy: true }
+      : { ok: false, code: 'missing_delivery_attempt', delivery_attempt: currentAttempt };
+  }
+  if (rawAttempt !== currentAttempt) {
+    return {
+      ok: false,
+      code: rawAttempt < currentAttempt ? 'stale_delivery_attempt' : 'future_delivery_attempt',
+      delivery_attempt: currentAttempt,
+    };
+  }
+  return { ok: true, delivery_attempt: currentAttempt, legacy: false };
+}
+
 function persistSendLifecycle(message = {}) {
   const sessionId = message.session_id || message.session;
   const clientMessageId = message.client_message_id;
@@ -1992,6 +2510,11 @@ function persistSendLifecycle(message = {}) {
   if (before.session !== sessionId) {
     return { applied: false, advanced: false, code: 'client_message_id_session_mismatch', row: before };
   }
+  const attemptValidation = validateSendAttempt(message, before);
+  if (!attemptValidation.ok) {
+    return { applied: false, advanced: false, code: attemptValidation.code, row: before };
+  }
+  const deliveryAttempt = attemptValidation.delivery_attempt;
   const receiptJson = serializeNativeReceipt(message.native_receipt);
   const processEpoch = message.process_epoch || message.native_receipt?.process_epoch || null;
   const updatedAt = new Date().toISOString();
@@ -2007,8 +2530,28 @@ function persistSendLifecycle(message = {}) {
       processEpoch,
       sessionId,
       clientMessageId,
+      deliveryAttempt,
     );
-    stmtMarkReceiptAgentStarted.run(deliveredAt, startedAt, receiptJson, processEpoch, updatedAt, sessionId, clientMessageId);
+    stmtMarkReceiptAgentStarted.run(
+      deliveredAt,
+      startedAt,
+      receiptJson,
+      processEpoch,
+      updatedAt,
+      sessionId,
+      clientMessageId,
+      deliveryAttempt,
+    );
+    stmtMarkAttemptAgentStarted.run(
+      deliveredAt,
+      startedAt,
+      receiptJson,
+      processEpoch,
+      updatedAt,
+      sessionId,
+      clientMessageId,
+      deliveryAttempt,
+    );
   } else if (message.result === 'launch_accepted') {
     stage = 'launch_accepted';
     const acceptedAt = message.accepted_at || updatedAt;
@@ -2017,8 +2560,24 @@ function persistSendLifecycle(message = {}) {
       processEpoch,
       sessionId,
       clientMessageId,
+      deliveryAttempt,
     );
-    stmtMarkReceiptLaunchAccepted.run(acceptedAt, processEpoch, updatedAt, sessionId, clientMessageId);
+    stmtMarkReceiptLaunchAccepted.run(
+      acceptedAt,
+      processEpoch,
+      updatedAt,
+      sessionId,
+      clientMessageId,
+      deliveryAttempt,
+    );
+    stmtMarkAttemptLaunchAccepted.run(
+      acceptedAt,
+      processEpoch,
+      updatedAt,
+      sessionId,
+      clientMessageId,
+      deliveryAttempt,
+    );
   } else if (message.result === 'delivered') {
     stage = 'delivered';
     const deliveredAt = message.delivered_at || message.native_receipt?.observed_at || updatedAt;
@@ -2028,18 +2587,75 @@ function persistSendLifecycle(message = {}) {
       processEpoch,
       sessionId,
       clientMessageId,
+      deliveryAttempt,
     );
-    stmtMarkReceiptDelivered.run(deliveredAt, receiptJson, processEpoch, updatedAt, sessionId, clientMessageId);
+    stmtMarkReceiptDelivered.run(
+      deliveredAt,
+      receiptJson,
+      processEpoch,
+      updatedAt,
+      sessionId,
+      clientMessageId,
+      deliveryAttempt,
+    );
+    stmtMarkAttemptDelivered.run(
+      deliveredAt,
+      receiptJson,
+      processEpoch,
+      updatedAt,
+      sessionId,
+      clientMessageId,
+      deliveryAttempt,
+    );
   } else if (message.result === 'failed') {
     stage = 'failed';
     const failureCode = message.error?.code || 'send_failed';
+    const failureReason = String(message.error?.message || message.reason || 'Send failed').slice(0, 1000);
+    const nativeAttempted = message.error?.native_attempted === false || message.native_attempted === false ? 0 : 1;
+    const retryable = nativeAttempted === 0
+      && (message.error?.retryable === true || message.retryable === true)
+      ? 1
+      : 0;
     stmtMarkMessageFailed.run(
       failureCode,
+      failureReason,
+      nativeAttempted,
+      retryable,
       processEpoch,
       sessionId,
       clientMessageId,
+      deliveryAttempt,
     );
-    stmtMarkReceiptFailed.run(failureCode, processEpoch, updatedAt, sessionId, clientMessageId);
+    stmtMarkReceiptFailed.run(
+      failureCode,
+      failureReason,
+      nativeAttempted,
+      retryable,
+      processEpoch,
+      updatedAt,
+      sessionId,
+      clientMessageId,
+      deliveryAttempt,
+    );
+    const restored = restoreRetrySafeFailedMessages(db, clientMessageId);
+    if (restored.changes > 0) {
+      recomputeLatestVisibleMessage(sessionId);
+      log('info', 'send', 'Restored retry-safe failed send after native history replacement', {
+        session: sessionId,
+        cid: clientMessageId,
+      });
+    }
+    stmtMarkAttemptFailed.run(
+      failureCode,
+      failureReason,
+      nativeAttempted,
+      retryable,
+      processEpoch,
+      updatedAt,
+      sessionId,
+      clientMessageId,
+      deliveryAttempt,
+    );
   }
   if (!stage) return { applied: false, advanced: false, code: 'unknown_lifecycle_stage', row: before };
   const after = stmtGetSendReceipt.get(clientMessageId) || stmtGetByClientId.get(clientMessageId) || null;
@@ -2049,8 +2665,18 @@ function persistSendLifecycle(message = {}) {
       ? (!before.delivered_at && Boolean(after?.delivered_at)) || before.status !== after?.status
       : stage === 'agent_started'
         ? (!before.agent_started_at && Boolean(after?.agent_started_at)) || before.status !== after?.status
-        : before.status !== after?.status || before.failure_code !== after?.failure_code;
-  return { applied: true, advanced, code: advanced ? 'lifecycle_advanced' : 'lifecycle_duplicate', row: after };
+        : before.status !== after?.status
+          || before.failure_code !== after?.failure_code
+          || before.failure_reason !== after?.failure_reason
+          || Number(before.failure_native_attempted) !== Number(after?.failure_native_attempted)
+          || Number(before.failure_retryable) !== Number(after?.failure_retryable);
+  return {
+    applied: true,
+    advanced,
+    code: advanced ? 'lifecycle_advanced' : 'lifecycle_duplicate',
+    delivery_attempt: deliveryAttempt,
+    row: after,
+  };
 }
 const stmtRecentBrowserUserMessages = db.prepare(
   `SELECT id, content, ts FROM messages
@@ -2636,7 +3262,7 @@ app.put('/api/maintenance/validation', requireAnyAuth, (req, res) => {
   try {
     const requested = req.body?.validation || req.body || {};
     const validation = saveNightlyValidationStatus(requested);
-    const revalidationHealth = ['harness_revalidation_tier2', 'harness_revalidation_program'].includes(requested.kind)
+    const revalidationHealth = ['app_update_validation', 'harness_revalidation_tier2', 'harness_revalidation_program'].includes(requested.kind)
       ? saveHarnessRevalidationHealth(requested.program_health) : null;
     const dogfoodHealth = requested.kind === 'operator_dogfood'
       ? saveOperatorDogfoodHealth(requested.program_health) : null;
@@ -5098,6 +5724,7 @@ function validateFileBackedTranscriptResync(msg, sessionId) {
 
 function throttleNativeHistoryChunkRequest(sessionId, msg) {
   const mode = msg.mode === 'older' ? 'older' : 'tail';
+  const threadId = String(msg.thread_id || msg.threadId || '');
   if (mode === 'older' && !msg.user_initiated) {
     return {
       code: 'history_older_requires_user_action',
@@ -5106,7 +5733,7 @@ function throttleNativeHistoryChunkRequest(sessionId, msg) {
     };
   }
   const now = Date.now();
-  const key = `${sessionId}:${mode}`;
+  const key = `${sessionId}:${threadId || 'session'}:${mode}`;
   const minInterval = mode === 'older'
     ? NATIVE_HISTORY_OLDER_MIN_INTERVAL_MS
     : NATIVE_HISTORY_TAIL_MIN_INTERVAL_MS;
@@ -5131,6 +5758,7 @@ function throttleNativeHistoryChunkRequest(sessionId, msg) {
 
 function nativeHistoryRequestSignature(sessionId, msg, requestedSource) {
   const mode = msg.mode === 'older' ? 'older' : 'tail';
+  const threadId = String(msg.thread_id || msg.threadId || '');
   const beforeOffset = mode === 'older'
     ? (msg.before_offset ?? msg.beforeOffset ?? msg.cursor?.next_before_offset ?? '')
     : '';
@@ -5142,6 +5770,7 @@ function nativeHistoryRequestSignature(sessionId, msg, requestedSource) {
   return JSON.stringify([
     sessionId,
     requestedSource || 'native',
+    threadId,
     mode,
     beforeOffset,
     beforeId,
@@ -6097,6 +6726,26 @@ function startHeartbeat(ws, label) {
   ws.on('close', () => clearInterval(ws._hbTimer));
 }
 
+function applicationHeartbeatAck(message, relayReceivedAtMs) {
+  const relaySentAtMs = Date.now();
+  const numericClientSentAtMs = Number(message?.client_sent_at_ms);
+  const parsedClientSentAtMs = Number.isFinite(numericClientSentAtMs) && numericClientSentAtMs > 0
+    ? numericClientSentAtMs
+    : Date.parse(String(message?.client_ts || ''));
+  return {
+    type: 'heartbeat_ack',
+    protocol_version: PROTOCOL_VERSION,
+    request_id: message?.request_id,
+    server_ts: new Date(relaySentAtMs).toISOString(),
+    relay_clock_sample_version: 1,
+    ...(Number.isFinite(parsedClientSentAtMs) && parsedClientSentAtMs > 0
+      ? { client_sent_at_ms: parsedClientSentAtMs }
+      : {}),
+    relay_received_at_ms: relayReceivedAtMs,
+    relay_sent_at_ms: relaySentAtMs,
+  };
+}
+
 // ── Message validation (A8-01) ────────────────────────────────────────────────
 
 const MAX_PAYLOAD_BYTES = 128 * 1024 * 1024; // 128 MB transport-level limit
@@ -6114,7 +6763,7 @@ const KNOWN_PROXY_TYPES = new Set([
   'session_list', 'proxy_session_snapshot',
   'status', 'proxy_status',
   'message', 'proxy_message', 'message_delta',
-  'session_launch_ack', 'session_launch_failed', 'session_closed', 'session_meta_backfill',
+  'session_launch_ack', 'session_launch_failed', 'session_closed', 'session_close_failed', 'session_meta_backfill',
   'session_alias_reconciled', 'session_alias_released',
   'permission_prompt', 'permission_prompt_expired', 'question_prompt', 'question_prompt_state',
   'session_error_prompt', 'session_error_prompt_cleared', 'agent_config', 'agent_control_result',
@@ -6124,6 +6773,7 @@ const KNOWN_PROXY_TYPES = new Set([
   'branch_list', 'skill_list', 'codex_automation_view',
   'directory_listing', 'file_content',
   'message_queued', 'queue_delivered', 'steer_result', 'proxy_send_result', 'agent_started',
+  'latency_trace_terminal',
   'native_queue',
   'provider_usage_snapshot',
   'provider_usage_refresh_receipt',
@@ -6155,6 +6805,7 @@ const KNOWN_CLIENT_TYPES = new Set([
   'provider_usage_cost_detail_request',
   'host_resource_refresh', 'host_resource_subscribe', 'host_resource_unsubscribe',
   'host_resource_history_request',
+  'latency_trace_complete',
 ]);
 
 // Rate limiting for browser sends (A8-03): 30 sends per 10 s window
@@ -6396,12 +7047,7 @@ function handleProxyConnection(ws, req) {
 
     // ── Application heartbeat (in addition to native ping/pong) ───────────
     } else if (t === 'heartbeat') {
-      ws.send(JSON.stringify({
-        type:             'heartbeat_ack',
-        protocol_version: PROTOCOL_VERSION,
-        request_id:       msg.request_id,
-        server_ts:        new Date().toISOString(),
-      }));
+      ws.send(JSON.stringify(applicationHeartbeatAck(msg, proxyMessageReceivedAtMs)));
 
     // ── Session registration (old: session_list, new: proxy_session_snapshot)
     } else if (t === 'session_alias_reconciled') {
@@ -6966,6 +7612,30 @@ function handleProxyConnection(ws, req) {
       }
 
     // ── Thinking / activity status ─────────────────────────────────────────
+    } else if (t === 'latency_trace_terminal') {
+      const terminal = normalizeLatencyTraceTerminal(msg.latency_trace_terminal);
+      const result = terminalizeProxyLatencyTrace(msg.latency_trace_terminal);
+      if (!result.ok) {
+        log('warn', 'latency-trace', 'Rejected proxy trace terminal', {
+          trace_id: msg.latency_trace_terminal?.trace_id || null,
+          code: result.code,
+        });
+        return;
+      }
+      if (terminal.ok && result.appended) {
+        broadcastToBrowsers({
+          type: 'latency_trace_terminal',
+          protocol_version: PROTOCOL_VERSION,
+          latency_trace_terminal: terminal.terminal,
+        });
+      }
+      log('info', 'latency-trace', 'Persisted terminal send trace', {
+        trace_id: result.trace_id,
+        appended: result.appended,
+        duplicate: result.duplicate,
+        reason: terminal.ok ? terminal.terminal.reason : null,
+      });
+
     } else if (t === 'message_delta') {
       // Ephemeral fast path: validate and forward without waiting on SQLite.
       // Settled proxy_message/history events remain the reconnect authority.
@@ -6985,6 +7655,18 @@ function handleProxyConnection(ws, req) {
       accepted.message.relay_forwarded_at_ms = relayForwardedAtMs;
       if (accepted.message.stream_trace) {
         accepted.message.stream_trace.relay_forwarded_at_ms = relayForwardedAtMs;
+      }
+      if (msg.latency_trace) {
+        const latencyTrace = latencyTraceForRelayBroadcast(
+          msg.latency_trace,
+          relayForwardedAtMs,
+          {
+            source: 'relay_message_delta',
+            relay_received_at_ms: proxyMessageReceivedAtMs,
+            relay_forwarded_at_ms: relayForwardedAtMs,
+          },
+        );
+        if (latencyTrace) accepted.message.latency_trace = latencyTrace;
       }
       broadcastToBrowsers(accepted.message);
 
@@ -7160,6 +7842,33 @@ function handleProxyConnection(ws, req) {
       // This prevents double-inserts after a relay reconnect where the proxy
       // re-sends its pendingLast message that's already persisted in SQLite.
       if (isDuplicateProxyMessage(id, role, content, sourceMessageId)) {
+        if (msg.latency_trace) {
+          const relayForwardedAtMs = Date.now();
+          const latencyTrace = latencyTraceForRelayBroadcast(
+            msg.latency_trace,
+            relayForwardedAtMs,
+            {
+              source: 'relay_duplicate_canonical_replay',
+              relay_received_at_ms: proxyMessageReceivedAtMs,
+              relay_forwarded_at_ms: relayForwardedAtMs,
+            },
+          );
+          if (latencyTrace) {
+            // An authoritative startup snapshot can persist the first assistant
+            // row before its semantic replay arrives. Forward that replay only
+            // for its pending trace so the browser can acknowledge real paint;
+            // keep the duplicate out of SQLite.
+            broadcastToBrowsers({
+              ...msg,
+              type: 'proxy_message',
+              session: id,
+              session_id: id,
+              role,
+              content,
+              latency_trace: latencyTrace,
+            });
+          }
+        }
         log('info', 'dedup', `Skipping duplicate proxy_message (${sourceMessageId ? 'source id' : 'tail match'})`, {
           session: id,
           role,
@@ -7213,6 +7922,7 @@ function handleProxyConnection(ws, req) {
         sourceMessageId,
         sourceCursor,
         source,
+        latencyTrace: msg.latency_trace || null,
       });
 
     // ── Session launch ack (A2-08) ────────────────────────────────────────
@@ -7230,6 +7940,12 @@ function handleProxyConnection(ws, req) {
           agent_type:       msg.agent_type || pending.agent_type,
           server_ts:        new Date().toISOString(),
           ...(msg.fire_and_forget ? { fire_and_forget: true, message: msg.message } : {}),
+          ...(msg.owned_disposable?.armed === true ? {
+            owned_disposable: {
+              armed: true,
+              scope: msg.owned_disposable.scope,
+            },
+          } : {}),
         };
         if (pending.browser_ws?.readyState === WebSocket.OPEN) {
           pending.browser_ws.send(JSON.stringify(ackMsg));
@@ -7284,6 +8000,23 @@ function handleProxyConnection(ws, req) {
         msg.reason    || 'Launch failed'
       );
 
+    // ── Session close failed without removing the retry target ────────────
+    } else if (t === 'session_close_failed') {
+      broadcastToBrowsers({
+        type:             'session_close_failed',
+        protocol_version: PROTOCOL_VERSION,
+        session_id:       msg.session_id || msg.session,
+        request_id:       msg.request_id,
+        reason:           msg.reason || 'session_close_failed',
+        owned_disposable_cleanup: {
+          destroyed: false,
+          reason: msg.owned_disposable_cleanup?.reason || msg.reason || 'session_close_failed',
+          removed_session_count: 0,
+          native_rollout_removed: msg.owned_disposable_cleanup?.native_rollout_removed === true,
+        },
+        server_ts:        new Date().toISOString(),
+      });
+
     // ── Session closed (A2-08) ────────────────────────────────────────────
     } else if (t === 'session_closed') {
       const id = msg.session_id || msg.session;
@@ -7311,6 +8044,14 @@ function handleProxyConnection(ws, req) {
         request_id:       msg.request_id,
         reason:           msg.reason || 'user_requested',
         server_ts:        new Date().toISOString(),
+        ...(msg.owned_disposable_cleanup ? {
+          owned_disposable_cleanup: {
+            destroyed: msg.owned_disposable_cleanup.destroyed === true,
+            reason: msg.owned_disposable_cleanup.reason || null,
+            removed_session_count: Number(msg.owned_disposable_cleanup.removed_session_count || 0),
+            native_rollout_removed: msg.owned_disposable_cleanup.native_rollout_removed === true,
+          },
+        } : {}),
       });
       queueSessionListBroadcast();
 
@@ -7729,13 +8470,13 @@ function handleProxyConnection(ws, req) {
       let existingLength = 0;
       let alreadyMatches = false;
       if (forceFullReplace) {
-        existingLength = getHistoryCount(id);
+        existingLength = getReconciliationHistoryCount(id);
       } else if (messages.length > 0 && isLargeHistory) {
         const quick = historiesTailLikelyMatch(id, messages);
         existingLength = quick.existingCount;
         alreadyMatches = quick.match;
       } else {
-        existing = getHistoryRows(id);
+        existing = getReconciliationHistoryRows(id);
         existingLength = existing.length;
         alreadyMatches = historyRowsMatch(existing, messages);
       }
@@ -7781,7 +8522,7 @@ function handleProxyConnection(ws, req) {
           broadcastToBrowsers(buildSessionSummary(msg, id));
         }
       } else if (!alreadyMatches) {
-        if (!existing) existing = getHistoryRows(id);
+        if (!existing) existing = getReconciliationHistoryRows(id);
         const resync = db.transaction((msgs) => {
           stmtDeleteSession.run(id);
           sessionSeq.delete(id);
@@ -7937,10 +8678,42 @@ function handleProxyConnection(ws, req) {
         lifecyclePersistence = persistSendLifecycle(msg);
       } else if (t === 'agent_started') {
         lifecyclePersistence = persistSendLifecycle(msg);
+      } else if ((t === 'message_queued' || t === 'queue_delivered') && msg.client_message_id) {
+        const row = stmtGetSendReceipt.get(msg.client_message_id)
+          || stmtGetByClientId.get(msg.client_message_id)
+          || null;
+        let attemptValidation = row && row.session === (msg.session_id || msg.session)
+          ? validateSendAttempt(msg, row)
+          : { ok: false, code: row ? 'client_message_id_session_mismatch' : 'unknown_client_message_id' };
+        if (attemptValidation.ok && row.status !== 'accepted') {
+          attemptValidation = {
+            ok: false,
+            code: 'lifecycle_regression',
+            delivery_attempt: attemptValidation.delivery_attempt,
+          };
+        }
+        lifecyclePersistence = {
+          applied: attemptValidation.ok === true,
+          advanced: attemptValidation.ok === true,
+          code: attemptValidation.ok ? 'attempt_matched' : attemptValidation.code,
+          row,
+        };
       }
-      const keyedLifecycleEvent = (t === 'agent_started' || t === 'proxy_send_result') && Boolean(msg.client_message_id);
+      const keyedLifecycleEvent = (
+        t === 'agent_started'
+        || t === 'proxy_send_result'
+        || t === 'message_queued'
+        || t === 'queue_delivered'
+      ) && Boolean(msg.client_message_id);
       const lifecycleAccepted = !keyedLifecycleEvent
         || (lifecyclePersistence?.applied === true && lifecyclePersistence?.advanced === true);
+      if (t === 'proxy_send_result' && lifecycleAccepted) {
+        if (msg.latency_trace) acceptProxyLatencyTrace(msg.latency_trace);
+        if (msg.result === 'failed' && msg.client_message_id) {
+          const failedTraceId = latencyTraceIdByClientMessageId.get(msg.client_message_id);
+          if (failedTraceId) terminalizeActiveLatencyTrace(failedTraceId, 'send_failed');
+        }
+      }
       if (t === 'proxy_send_result' && lifecycleAccepted && (msg.result === 'delivered' || msg.result === 'failed')) {
         settleUsageResumeFromProxy(msg);
         settleScheduledSendFromProxy(msg);
@@ -7961,7 +8734,11 @@ function handleProxyConnection(ws, req) {
           log('info', 'send', 'agent_started', { session: agentStarted.session_id, cid: agentStarted.client_message_id });
         }
       }
-      log('info', 'send', `${t}`, { session: msg.session_id, cid: msg.client_message_id });
+      log('info', 'send', `${t}`, {
+        session: msg.session_id,
+        cid: msg.client_message_id,
+        delivery_attempt: msg.delivery_attempt || lifecyclePersistence?.delivery_attempt || null,
+      });
 
     // ── Native queue (Codex side-panel queue items) ─────────────────────────
     } else if (t === 'native_queue') {
@@ -8078,21 +8855,7 @@ function handleProxyConnection(ws, req) {
 
 // ── Browser client handler (A2-01, A2-02, A2-03, A2-04) ──────────────────────
 
-function handleClientConnection(ws, req) {
-  log('info', 'client-ws', 'Browser connected');
-  browserClients.add(ws);
-  startHeartbeat(ws, 'browser');
-  const clientPrincipal = authenticatedWebSocketPrincipal(ws, req);
-  ws._authenticatedEmail = authenticatedWebSocketEmail(ws, req);
-  ws._controlConnectionId = crypto.randomUUID();
-  ws._providerUsageWatching = false;
-  // Full transcript traffic is opt-in. Until the client subscribes, it receives
-  // session summaries only; this prevents a reconnect race from replaying every
-  // active transcript before the selected-session subscription arrives.
-  ws._sessionSubscriptions = new Set();
-  ws._transcriptGaps = new Map();
-
-  // Send ack with current session state + any in-flight launches + cached control state
+function buildClientConnectionAck(ws) {
   const pendingLaunchList = Array.from(pendingLaunches.entries()).map(([rid, p]) => ({
     request_id:  rid,
     agent_type:  p.agent_type,
@@ -8118,7 +8881,7 @@ function handleClientConnection(ws, req) {
     suppression_reason: alias.suppression_reason,
     generation: alias.generation_clock,
   }));
-  ws.send(JSON.stringify({
+  return {
     type:                 'connection_ack',
     protocol_version:     PROTOCOL_VERSION,
     heartbeat_interval_ms: HEARTBEAT_INTERVAL_MS,
@@ -8145,7 +8908,26 @@ function handleClientConnection(ws, req) {
     ...(recentSemanticNotifications.length > 0
       ? { semantic_notifications: recentSemanticNotifications } : {}),
     ts:                   Date.now(),
-  }));
+  };
+}
+
+function handleClientConnection(ws, req) {
+  log('info', 'client-ws', 'Browser connected');
+  browserClients.add(ws);
+  startHeartbeat(ws, 'browser');
+  const clientPrincipal = authenticatedWebSocketPrincipal(ws, req);
+  ws._authenticatedEmail = authenticatedWebSocketEmail(ws, req);
+  ws._controlConnectionId = crypto.randomUUID();
+  ws._providerUsageWatching = false;
+  // Full transcript traffic is opt-in. Until the client subscribes, it receives
+  // session summaries only; this prevents a reconnect race from replaying every
+  // active transcript before the selected-session subscription arrives.
+  ws._sessionSubscriptions = new Set();
+  ws._transcriptGaps = new Map();
+
+  // Keep the eager ack for existing Web clients. Native clients may request one
+  // replay after their event handlers are attached.
+  ws.send(JSON.stringify(buildClientConnectionAck(ws)));
   for (const [sessionId, chatList] of cachedChatLists) {
     if (proxySockets.has(sessionId)) ws.send(JSON.stringify(chatList));
   }
@@ -8153,6 +8935,7 @@ function handleClientConnection(ws, req) {
   ws.on('message', (data) => {
     let msg;
     try { msg = JSON.parse(data.toString()); } catch { return; }
+    const clientMessageReceivedAtMs = Date.now();
     const t = msg.type;
     msg = canonicalizeSessionMessage(msg);
 
@@ -8175,16 +8958,26 @@ function handleClientConnection(ws, req) {
     // ── Handshake ──────────────────────────────────────────────────────────
     if (t === 'connection_hello' || t === 'hello') {
       log('info', 'client-ws', 'Browser hello received', { last_seq: msg.last_sequence });
-      // ack already sent on connect
+      if (msg.request_connection_ack === true) {
+        ws.send(JSON.stringify(buildClientConnectionAck(ws)));
+      }
 
     // ── Application heartbeat ──────────────────────────────────────────────
     } else if (t === 'heartbeat') {
-      ws.send(JSON.stringify({
-        type:             'heartbeat_ack',
-        protocol_version: PROTOCOL_VERSION,
-        request_id:       msg.request_id,
-        server_ts:        new Date().toISOString(),
-      }));
+      ws.send(JSON.stringify(applicationHeartbeatAck(msg, clientMessageReceivedAtMs)));
+
+    } else if (t === 'latency_trace_complete') {
+      const completion = completeBrowserLatencyTrace(msg.latency_trace);
+      if (!completion.ok) {
+        log('warn', 'latency-trace', 'Rejected browser render completion', {
+          trace_id: msg.latency_trace?.trace_id || null,
+          code: completion.code,
+        });
+      } else if (completion.appended) {
+        log('info', 'latency-trace', 'Persisted completed send trace', {
+          trace_id: completion.trace_id,
+        });
+      }
 
     // ── Selective session subscription ────────────────────────────────────
     } else if (t === 'provider_usage_watch') {
@@ -8758,12 +9551,12 @@ function handleClientConnection(ws, req) {
         return;
       }
 
-      // A client-generated cid is the durable idempotency key. Reconnects and
-      // retries receive the already-persisted lifecycle state and are never
-      // forwarded to the native harness a second time. This journal check must
-      // precede proxy availability so an offline reconnect can still recover
-      // the authoritative prior state.
+      // A client-generated cid is the durable message identity. Ordinary
+      // reconnect/replay is read-only. An explicit retry may start a new
+      // delivery attempt only after the durable terminal receipt proves that
+      // the prior attempt was retryable and never reached native.
       const existingSend = clientMsgId ? (stmtGetSendReceipt.get(clientMsgId) || stmtGetByClientId.get(clientMsgId)) : null;
+      let retryCandidate = null;
       if (existingSend) {
         if (existingSend.session !== id) {
           ws.send(JSON.stringify({
@@ -8775,7 +9568,21 @@ function handleClientConnection(ws, req) {
           }));
           return;
         }
-        ws.send(JSON.stringify({
+        if (existingSend.content !== content) {
+          ws.send(JSON.stringify({
+            type: 'message_failed',
+            session: id,
+            client_message_id: clientMsgId,
+            reason: 'client_message_id content does not match the durable message',
+            error: { code: 'client_message_id_content_mismatch' },
+          }));
+          return;
+        }
+        const explicitRetry = msg.retry_failed === true || msg.retry_delivery === true;
+        if (explicitRetry && isSafeFailedSendRetry(existingSend)) {
+          retryCandidate = existingSend;
+        } else {
+          ws.send(JSON.stringify({
           type: 'message_accepted',
           session: id,
           client_message_id: clientMsgId,
@@ -8791,15 +9598,26 @@ function handleClientConnection(ws, req) {
           native_receipt: deserializeNativeReceipt(existingSend.native_receipt),
           process_epoch: existingSend.process_epoch || null,
           failure_code: existingSend.failure_code || null,
+          failure_reason: existingSend.failure_reason || null,
+          failure_native_attempted: existingSend.failure_native_attempted == null
+            ? null
+            : Number(existingSend.failure_native_attempted) === 1,
+          failure_retryable: existingSend.failure_retryable == null
+            ? null
+            : Number(existingSend.failure_retryable) === 1,
+          delivery_attempt: Math.max(1, Number(existingSend.delivery_attempt) || 1),
           ...latestVisibleMessageProjection(id),
           replayed: true,
+          retry_rejected: explicitRetry ? 'retry_not_proven_safe' : null,
         }));
-        log('info', 'send', 'Idempotent client retry acknowledged without native redispatch', {
-          session: id,
-          cid: clientMsgId,
-          status: existingSend.status,
-        });
-        return;
+          log('info', 'send', 'Idempotent client replay acknowledged without native redispatch', {
+            session: id,
+            cid: clientMsgId,
+            status: existingSend.status,
+            explicit_retry: explicitRetry,
+          });
+          return;
+        }
       }
 
       const proxyWs = proxySockets.get(id);
@@ -8816,9 +9634,27 @@ function handleClientConnection(ws, req) {
 
       // Attach file data if the message references an uploaded file
       const clientMessageTs = proxyMessageTimestampSeconds(msg);
-      let messageTs = clientMessageTs > 0 ? clientMessageTs : Date.now() / 1000;
+      let messageTs = retryCandidate?.ts
+        || (clientMessageTs > 0 ? clientMessageTs : Date.now() / 1000);
       let createdAt = new Date(messageTs * 1000).toISOString();
-      const proxyMsg = { ...msg, type: 'send', session: id, created_at: createdAt, ts: messageTs };
+      let deliveryAttempt = retryCandidate
+        ? Math.max(1, Number(retryCandidate.delivery_attempt) || 1) + 1
+        : 1;
+      const relayLatencyTrace = registerBrowserLatencyTrace(
+        msg.latency_trace,
+        id,
+        clientMsgId,
+        clientMessageReceivedAtMs,
+      );
+      const proxyMsg = {
+        ...msg,
+        type: 'send',
+        session: id,
+        created_at: createdAt,
+        ts: messageTs,
+        ...(clientMsgId ? { delivery_attempt: deliveryAttempt } : {}),
+        ...(relayLatencyTrace ? { latency_trace: relayLatencyTrace } : {}),
+      };
       const fileMatch = content && (
         content.match(/\[File: ([^\]]+)\]\(\/uploads\/([^)]+)\)/)
         || content.match(/!\[([^\]]*)\]\(\/uploads\/([^)]+)\)/)
@@ -8828,6 +9664,9 @@ function handleClientConnection(ws, req) {
         const originalName = originalNameRaw || storedName;
         const uploadReference = resolveUploadReference(UPLOAD_DIR, storedName);
         if (!uploadReference.ok) {
+          if (relayLatencyTrace) {
+            terminalizeActiveLatencyTrace(relayLatencyTrace.trace_id, 'send_failed');
+          }
           ws.send(JSON.stringify({
             type: 'message_failed',
             session: id,
@@ -8849,10 +9688,29 @@ function handleClientConnection(ws, req) {
       }
 
       // Persist user message — idempotent when client_message_id provided (A2-03)
-      const seq = nextSeq(id);
+      const seq = retryCandidate ? Number(retryCandidate.sequence || 0) : nextSeq(id);
       let serverId, finalSeq = seq;
       try {
-        if (clientMsgId) {
+        if (retryCandidate) {
+          const acceptedAt = new Date().toISOString();
+          const retryStarted = beginSafeSendRetry(clientMsgId, id, acceptedAt);
+          if (!retryStarted.ok) {
+            ws.send(JSON.stringify({
+              type: 'message_failed',
+              session: id,
+              client_message_id: clientMsgId,
+              reason: 'The prior delivery attempt is not proven safe to retry',
+              error: { code: retryStarted.code },
+            }));
+            return;
+          }
+          const row = retryStarted.row;
+          deliveryAttempt = retryStarted.delivery_attempt;
+          proxyMsg.delivery_attempt = deliveryAttempt;
+          serverId = row.id;
+          finalSeq = row.sequence;
+          if (row.ts) messageTs = row.ts;
+        } else if (clientMsgId) {
           insertMessageIdempotent(id, 'user', content, clientMsgId, 'accepted', seq, messageTs);
           const acceptedAt = new Date().toISOString();
           stmtMarkMessageAccepted.run(acceptedAt, clientMsgId);
@@ -8862,12 +9720,16 @@ function handleClientConnection(ws, req) {
             finalSeq = row.sequence;
             if (row.ts) messageTs = row.ts;
           }
-          stmtInsertSendReceipt.run(clientMsgId, id, serverId, finalSeq, messageTs, acceptedAt, acceptedAt);
+          stmtInsertSendReceipt.run(clientMsgId, id, serverId, finalSeq, messageTs, acceptedAt, content, acceptedAt);
+          stmtInsertSendAttempt.run(clientMsgId, 1, id, acceptedAt, acceptedAt);
         } else {
           const info = insertMessage(id, 'user', content, null, 'recorded', seq, messageTs);
           serverId = info.lastInsertRowid;
         }
       } catch (e) {
+        if (relayLatencyTrace) {
+          terminalizeActiveLatencyTrace(relayLatencyTrace.trace_id, 'send_failed');
+        }
         log('error', 'db', 'User message insert failed', { session: id, err: e.message });
         ws.send(JSON.stringify({
           type: 'message_failed',
@@ -8883,13 +9745,22 @@ function handleClientConnection(ws, req) {
       try {
         proxyWs.send(JSON.stringify(proxyMsg));
       } catch (error) {
+        if (relayLatencyTrace) {
+          terminalizeActiveLatencyTrace(relayLatencyTrace.trace_id, 'send_failed');
+        }
         if (clientMsgId) {
           persistSendLifecycle({
             type: 'proxy_send_result',
             session_id: id,
             client_message_id: clientMsgId,
+            delivery_attempt: deliveryAttempt,
             result: 'failed',
-            error: { code: 'relay_proxy_forward_failed' },
+            error: {
+              code: 'relay_proxy_forward_failed',
+              message: 'Relay could not forward the accepted message to the proxy',
+              retryable: true,
+              native_attempted: false,
+            },
           });
         }
         ws.send(JSON.stringify({
@@ -8897,7 +9768,12 @@ function handleClientConnection(ws, req) {
           session: id,
           client_message_id: clientMsgId,
           reason: 'Relay could not forward the accepted message to the proxy',
-          error: { code: 'relay_proxy_forward_failed' },
+          delivery_attempt: deliveryAttempt,
+          error: {
+            code: 'relay_proxy_forward_failed',
+            retryable: true,
+            native_attempted: false,
+          },
         }));
         return;
       }
@@ -8908,7 +9784,10 @@ function handleClientConnection(ws, req) {
       setTimeout(() => recentBrowserSends.delete(key), BROWSER_ECHO_DEDUP_WINDOW_SEC * 1000);
 
       // Ack to the sending browser
-      ws.send(JSON.stringify({
+      const acceptedState = clientMsgId
+        ? (stmtGetSendReceipt.get(clientMsgId) || stmtGetByClientId.get(clientMsgId))
+        : null;
+      const acceptedFrame = {
         type:              'message_accepted',
         session:           id,
         client_message_id: clientMsgId,
@@ -8917,23 +9796,32 @@ function handleClientConnection(ws, req) {
         ts:                messageTs,
         created_at:        createdAt,
         status:            clientMsgId ? 'accepted' : 'recorded',
+        accepted_at:       acceptedState?.accepted_at || null,
+        delivery_attempt:  clientMsgId ? deliveryAttempt : null,
+        retry_restarted:   Boolean(retryCandidate),
         ...latestVisibleMessageProjection(id),
-      }));
+      };
+      ws.send(JSON.stringify(acceptedFrame));
 
       // Broadcast to all browsers (including other tabs)
-      broadcastToBrowsers({
-        type:              'message',
-        session:           id,
-        role:              'user',
-        content,
-        client_message_id: clientMsgId,
-        status:            clientMsgId ? 'accepted' : 'recorded',
-        sequence:          finalSeq,
-        server_message_id: serverId,
-        ts:                messageTs,
-        created_at:        createdAt,
-        ...latestVisibleMessageProjection(id),
-      });
+      if (retryCandidate) {
+        broadcastToBrowsers(acceptedFrame);
+      } else {
+        broadcastToBrowsers({
+          type:              'message',
+          session:           id,
+          role:              'user',
+          content,
+          client_message_id: clientMsgId,
+          status:            clientMsgId ? 'accepted' : 'recorded',
+          delivery_attempt:  clientMsgId ? deliveryAttempt : null,
+          sequence:          finalSeq,
+          server_message_id: serverId,
+          ts:                messageTs,
+          created_at:        createdAt,
+          ...latestVisibleMessageProjection(id),
+        });
+      }
 
     // ── Steer (inject text into Codex input without sending) ───────────────
     } else if (t === 'steer') {
@@ -8961,6 +9849,7 @@ function handleClientConnection(ws, req) {
     } else if (t === 'launch_session') {
       const requestId = msg.request_id;
       const agentType = msg.agent_type;
+      const ownedDisposable = msg.owned_disposable;
 
       if (!requestId || !agentType) {
         ws.send(JSON.stringify({
@@ -8968,6 +9857,24 @@ function handleClientConnection(ws, req) {
           protocol_version: PROTOCOL_VERSION,
           code:             'invalid_message',
           message:          'launch_session requires request_id and agent_type',
+        }));
+        return;
+      }
+      if (ownedDisposable != null && (
+        agentType !== 'codex_cli'
+        || ownedDisposable.scope !== 'latency_trace_sampler_v1'
+        || !/^[a-f0-9]{64}$/i.test(String(ownedDisposable.token || ''))
+        || String(msg.workspace_path || '').replace(/\//g, '\\').toLowerCase()
+          !== 'c:\\temp\\remote-agent-vscode-test'
+      )) {
+        ws.send(JSON.stringify({
+          type:             'session_launch_failed',
+          protocol_version: PROTOCOL_VERSION,
+          request_id:       requestId,
+          agent_type:       agentType,
+          error_code:       'invalid_owned_disposable_capability',
+          reason:           'Owned-disposable launch capability is invalid',
+          server_ts:        new Date().toISOString(),
         }));
         return;
       }
@@ -9016,6 +9923,12 @@ function handleClientConnection(ws, req) {
         ...(msg.effort         ? { effort:         msg.effort         } : {}),
         ...(msg.cli_session_id ? { cli_session_id: msg.cli_session_id } : {}),
         ...(msg.collaboration_mode ? { collaboration_mode: msg.collaboration_mode } : {}),
+        ...(ownedDisposable ? {
+          owned_disposable: {
+            scope: ownedDisposable.scope,
+            token: String(ownedDisposable.token).toLowerCase(),
+          },
+        } : {}),
       }));
 
       // Intermediate ack to the requesting browser
@@ -9110,8 +10023,22 @@ function handleClientConnection(ws, req) {
     } else if (t === 'close_session') {
       const sessionId = msg.session_id || msg.session;
       const requestId = msg.request_id;
+      const destroyOwnedDisposable = msg.destroy_owned_disposable;
 
       if (!sessionId) return;
+      if (destroyOwnedDisposable != null && (
+        destroyOwnedDisposable.scope !== 'latency_trace_sampler_v1'
+        || !/^[a-f0-9]{64}$/i.test(String(destroyOwnedDisposable.token || ''))
+      )) {
+        ws.send(JSON.stringify({
+          type:             'connection_error',
+          protocol_version: PROTOCOL_VERSION,
+          code:             'invalid_owned_disposable_capability',
+          message:          'Owned-disposable cleanup capability is invalid',
+          request_id:       requestId,
+        }));
+        return;
+      }
 
       const proxyWs = proxySockets.get(sessionId);
       if (!proxyWs || proxyWs.readyState !== WebSocket.OPEN) {
@@ -9129,6 +10056,12 @@ function handleClientConnection(ws, req) {
         protocol_version: PROTOCOL_VERSION,
         session_id:       sessionId,
         request_id:       requestId,
+        ...(destroyOwnedDisposable ? {
+          destroy_owned_disposable: {
+            scope: destroyOwnedDisposable.scope,
+            token: String(destroyOwnedDisposable.token).toLowerCase(),
+          },
+        } : {}),
       }));
       log('info', 'close', 'Session close requested', { session: sessionId, request_id: requestId });
 

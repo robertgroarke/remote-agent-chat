@@ -161,6 +161,96 @@ function assertProjection(api, groupsApi, fixture) {
   }
   assert.strictEqual(replayMoves, 0);
 
+  const retainedRecentIds = recentIds.slice(0, 3);
+  const metadataMissing = fixture.sessions.map(session => retainedRecentIds.includes(idOf(session))
+    ? {
+        ...session,
+        latest_visible_message: null,
+        last_message_id: null,
+        last_message_at: null,
+        last_message_kind: null,
+        last_message_source: null,
+      }
+    : session);
+  const retainedProjection = api.projectRecentChatOwnership(metadataMissing, {
+    workingSessionIds: fixture.workingSessionIds,
+    pinnedSessionIds: fixture.pinnedSessionIds,
+    excludedSessionIds: fixture.excludedSessionIds,
+    recentSessionIds: retainedRecentIds,
+    limit: 5,
+  });
+  assert.deepStrictEqual(retainedProjection.recent.map(idOf), retainedRecentIds);
+  const retainedHierarchy = [
+    ...retainedProjection.working.map(idOf),
+    ...retainedProjection.recent.map(idOf),
+    ...retainedProjection.pinned.map(idOf),
+    ...retainedProjection.remaining.map(idOf),
+  ];
+  assert.strictEqual(new Set(retainedHierarchy).size, retainedHierarchy.length);
+
+  const recentInventory = [
+    ...projected.recent,
+    ...projected.pinned,
+    ...projected.remaining,
+  ];
+  let recentLedger = api.createRecentChatMembershipLedger(recentInventory, { limit: 5 });
+  const stableRecentOrder = recentLedger.sessionOrder.join('|');
+  let metadataGapMoves = 0;
+  for (let replay = 0; replay < 600; replay += 1) {
+    const gapInventory = recentInventory.map((session, index) => (
+      (index + replay) % 3 === 0
+        ? {
+            ...session,
+            latest_visible_message: null,
+            last_message_id: null,
+            last_message_at: null,
+            last_message_kind: null,
+            last_message_source: null,
+          }
+        : { ...session }
+    ));
+    const next = api.reconcileRecentChatMembershipLedger(recentLedger, gapInventory, { limit: 5 });
+    recentLedger = next.ledger;
+    if (recentLedger.sessionOrder.join('|') !== stableRecentOrder) metadataGapMoves += 1;
+  }
+  assert.strictEqual(metadataGapMoves, 0);
+
+  const promotedSession = projected.remaining.find(session => !!api.normalizeLatestVisibleMessage(session));
+  const promotedId = idOf(promotedSession);
+  assert.ok(promotedId && !recentLedger.sessionOrder.includes(promotedId));
+  const semanticAt = '2031-02-03T04:05:06.000Z';
+  const semanticInventory = recentInventory.map(session => idOf(session) === promotedId
+    ? {
+        ...session,
+        latest_visible_message: {
+          id: 'semantic-message-promote', at: semanticAt, kind: 'assistant', source: 'relay',
+        },
+        last_message_id: 'semantic-message-promote',
+        last_message_at: semanticAt,
+        last_message_kind: 'assistant',
+        last_message_source: 'relay',
+      }
+    : session);
+  const deferredSemantic = api.reconcileRecentChatMembershipLedger(recentLedger, semanticInventory, {
+    limit: 5,
+    freezeStructure: true,
+  });
+  assert.strictEqual(deferredSemantic.deferred, true);
+  assert.deepStrictEqual(deferredSemantic.ledger.sessionOrder, recentLedger.sessionOrder);
+  const semantic = api.reconcileRecentChatMembershipLedger(recentLedger, semanticInventory, { limit: 5 });
+  assert.strictEqual(semantic.structuralChanged, true);
+  assert.strictEqual(semantic.ledger.sessionOrder[0], promotedId);
+  const durableReplacement = semanticInventory.map(session => idOf(session) === promotedId
+    ? {
+        ...session,
+        latest_visible_message: { ...session.latest_visible_message, id: 'semantic-message-durable' },
+        last_message_id: 'semantic-message-durable',
+      }
+    : session);
+  const settled = api.reconcileRecentChatMembershipLedger(semantic.ledger, durableReplacement, { limit: 5 });
+  assert.strictEqual(settled.structuralChanged, false);
+  assert.deepStrictEqual(settled.ledger.sessionOrder, semantic.ledger.sessionOrder);
+
   return {
     fixture_sessions: fixture.sessions.length,
     harness_types: new Set(fixture.sessions.map(session => session.agent_type)).size,
@@ -170,6 +260,12 @@ function assertProjection(api, groupsApi, fixture) {
     duplicate_or_missing_visible_sessions: hierarchy.length - new Set(hierarchy).size,
     replay_snapshots: 600,
     replay_moves: replayMoves,
+    explicit_recent_membership_survives_missing_metadata: true,
+    metadata_gap_replays: 600,
+    metadata_gap_moves: metadataGapMoves,
+    semantic_message_promotions: 1,
+    interaction_locked_promotions_deferred: 1,
+    provisional_durable_reorders: 0,
     recent_ids: recentIds,
     hierarchy_sha256: crypto.createHash('sha256').update(initialOrder).digest('hex'),
   };

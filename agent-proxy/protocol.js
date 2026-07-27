@@ -32,13 +32,18 @@ function hello(machineLabel, proxyId, proxySecret) {
 
 // ─── Heartbeat ────────────────────────────────────────────────────────────────
 
-function heartbeat(connectionId, requestId) {
+function heartbeat(connectionId, requestId, clientSentAtMs = Date.now()) {
+  const sentAtMs = Number(clientSentAtMs);
+  if (!Number.isFinite(sentAtMs) || sentAtMs <= 0) {
+    throw new TypeError('heartbeat clientSentAtMs must be a positive epoch timestamp');
+  }
   return {
     type: 'heartbeat',
     protocol_version: PROTOCOL_VERSION,
     request_id: requestId,
     connection_id: connectionId,
-    client_ts: new Date().toISOString(),
+    client_sent_at_ms: sentAtMs,
+    client_ts: new Date(sentAtMs).toISOString(),
   };
 }
 
@@ -200,6 +205,10 @@ function proxySendResult(sessionId, clientMessageId, result, extra) {
     client_message_id: clientMessageId,
     result,
   };
+  const deliveryAttempt = Number(extra?.delivery_attempt);
+  if (Number.isInteger(deliveryAttempt) && deliveryAttempt > 0) {
+    msg.delivery_attempt = deliveryAttempt;
+  }
   if (result === 'launch_accepted') {
     msg.accepted_at = extra?.accepted_at || new Date().toISOString();
   } else if (result === 'delivered') {
@@ -214,8 +223,8 @@ function proxySendResult(sessionId, clientMessageId, result, extra) {
   return msg;
 }
 
-function agentStarted(sessionId, clientMessageId, nativeReceipt, nativeStart) {
-  return {
+function agentStarted(sessionId, clientMessageId, nativeReceipt, nativeStart, deliveryAttempt = null) {
+  const msg = {
     type: 'agent_started',
     protocol_version: PROTOCOL_VERSION,
     session_id: sessionId,
@@ -224,6 +233,28 @@ function agentStarted(sessionId, clientMessageId, nativeReceipt, nativeStart) {
     started_at: nativeStart?.native_event_at || nativeStart?.observed_at || new Date().toISOString(),
     native_receipt: nativeReceipt || null,
     native_start: nativeStart || null,
+  };
+  const normalizedAttempt = Number(deliveryAttempt);
+  if (Number.isInteger(normalizedAttempt) && normalizedAttempt > 0) {
+    msg.delivery_attempt = normalizedAttempt;
+  }
+  return msg;
+}
+
+function latencyTraceTerminal(trace, reason, terminalAtMs = Date.now()) {
+  return {
+    type: 'latency_trace_terminal',
+    protocol_version: PROTOCOL_VERSION,
+    latency_trace_terminal: {
+      schema_version: trace?.schema_version || 1,
+      trace_id: trace?.trace_id,
+      client_message_id: trace?.client_message_id,
+      agent_type: trace?.agent_type || 'unknown',
+      surface_class: trace?.surface_class,
+      reason,
+      terminal_at_ms: terminalAtMs,
+      stages_completed: Object.keys(trace?.stages || {}),
+    },
   };
 }
 
@@ -282,6 +313,9 @@ function historyChunk(sessionId, options = {}) {
     complete = !partial,
     source = 'native',
     replace = false,
+    threadId = null,
+    viewState = null,
+    pollability = null,
     error = null,
   } = options;
   const cursor = {
@@ -304,6 +338,9 @@ function historyChunk(sessionId, options = {}) {
     complete: !!complete,
     cursor,
   };
+  if (threadId) msg.thread_id = String(threadId);
+  if (viewState) msg.view_state = String(viewState);
+  if (pollability && typeof pollability === 'object') msg.pollability = pollability;
   if (error) msg.error = error;
   return msg;
 }
@@ -595,8 +632,8 @@ function queuedMessageBlock(content, clientMessageId, status = 'queued') {
   };
 }
 
-function messageQueued(sessionId, clientMessageId, content) {
-  return {
+function messageQueued(sessionId, clientMessageId, content, deliveryAttempt = null) {
+  const msg = {
     type:              'message_queued',
     protocol_version:  PROTOCOL_VERSION,
     session_id:        sessionId,
@@ -605,17 +642,27 @@ function messageQueued(sessionId, clientMessageId, content) {
     content_blocks:    [queuedMessageBlock(content, clientMessageId)],
     queued_at:         new Date().toISOString(),
   };
+  const normalizedAttempt = Number(deliveryAttempt);
+  if (Number.isInteger(normalizedAttempt) && normalizedAttempt > 0) {
+    msg.delivery_attempt = normalizedAttempt;
+  }
+  return msg;
 }
 
 // Sent when a queued message has been successfully delivered to the agent.
-function queueDelivered(sessionId, clientMessageId) {
-  return {
+function queueDelivered(sessionId, clientMessageId, deliveryAttempt = null) {
+  const msg = {
     type:              'queue_delivered',
     protocol_version:  PROTOCOL_VERSION,
     session_id:        sessionId,
     client_message_id: clientMessageId,
     delivered_at:      new Date().toISOString(),
   };
+  const normalizedAttempt = Number(deliveryAttempt);
+  if (Number.isInteger(normalizedAttempt) && normalizedAttempt > 0) {
+    msg.delivery_attempt = normalizedAttempt;
+  }
+  return msg;
 }
 
 // Sent with the result of a steer (mid-conversation injection) attempt.
@@ -662,6 +709,7 @@ module.exports = {
   hostResourceSnapshot,
   proxySendResult,
   agentStarted,
+  latencyTraceTerminal,
   historySnapshot,
   historyChunk,
   agentControlResult,

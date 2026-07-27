@@ -268,6 +268,8 @@ async function main() {
 
     await page.getByText(reconciledMarker, { exact: true }).waitFor({ state: 'visible', timeout: 2500 });
     await refreshBanner.waitFor({ state: 'hidden', timeout: 2500 });
+    const loadOlderButton = page.getByRole('button', { name: 'Load older messages' });
+    await loadOlderButton.waitFor({ state: 'visible', timeout: 2500 });
     const afterReconcile = await page.evaluate(({ live, reconciled }) => ({
       live_rows: [...document.querySelectorAll('.messages .message')]
         .filter(node => String(node.textContent || '').includes(live)).length,
@@ -277,6 +279,7 @@ async function main() {
       refresh_status: String(document.body?.innerText || '').includes('Refreshing latest messages...'),
       visible_throttle_errors: String(document.body?.innerText || '').includes('Native history chunk request throttled'),
       inline_error: !!document.querySelector('.history-error-inline, .history-error-state'),
+      partial_without_total_actionable: !!document.querySelector('.history-tail-banner button:not(:disabled)'),
     }), { live: liveMarker, reconciled: reconciledMarker });
     assert.equal(afterReconcile.live_rows, 1);
     assert.equal(afterReconcile.reconciled_rows, 1);
@@ -284,6 +287,8 @@ async function main() {
     assert.equal(afterReconcile.refresh_status, false);
     assert.equal(afterReconcile.visible_throttle_errors, false);
     assert.equal(afterReconcile.inline_error, false);
+    assert.equal(afterReconcile.partial_without_total_actionable, true,
+      'native partial history with an older cursor hid its continuation action');
     assert.deepEqual(pageErrors, [], `page errors: ${pageErrors.join('\n')}`);
 
     console.log(JSON.stringify({

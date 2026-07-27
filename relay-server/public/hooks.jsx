@@ -7,6 +7,7 @@
 
 import { createProvisionalStream, reduceMessageDeltaStream, shouldClearEmptyProvisionalOnTerminal } from './message-delta.js';
 import { messageInstant, normalizeMessageTimestamp } from './message-time.js';
+import { mergeProvisionalFlushItem } from './provisional-flush.js';
 import { createStateSequenceGate } from './state-sequence.js';
 import {
   createSessionRegistry,
@@ -33,6 +34,10 @@ import {
   mergeOrderedHostResourceFrames,
 } from './host-resources.js';
 import { retainNewerProviderUsage } from './provider-usage.js';
+import {
+  estimateRelayClockOffset,
+  relayClockStageObservation,
+} from './latency-clock.js';
 
 const { useState, useEffect, useRef, useCallback } = React;
 
@@ -47,6 +52,7 @@ function migrateSessionKeyedObject(previous, aliasId, canonicalId, merge = (cano
 }
 const CODEX_CLI_HISTORY_CHUNK_BYTES = 1024 * 1024;
 const HISTORY_CHUNK_TIMEOUT_MS = 15000;
+const THREAD_VIEW_SELECTION_TIMEOUT_MS = 10000;
 const MAX_HISTORY_CHUNK_RETRIES = 3;
 const RECOVERABLE_HISTORY_CHUNK_CODES = new Set([
   'history_chunk_throttled',
@@ -65,6 +71,17 @@ export const DELIVERY_STAGE_TIMEOUT_MS = Object.freeze({
 });
 export const RELAY_RECONNECT_DELAYS_MS = [250, 500, 1000, 2000, 3000];
 export const CLIENT_RUNTIME_RECORD_LIMIT = 512;
+const DELIVERY_STATE_RANK = Object.freeze({
+  offline_queued: 0,
+  queued: 0,
+  busy_queued: 3,
+  accepted: 2,
+  steered: 3,
+  launch_accepted: 3,
+  failed: 4,
+  delivered: 5,
+  agent_started: 6,
+});
 const STARTUP_DEFERRED_RELAY_TYPES = new Set([
   'history',
   'history_snapshot',
@@ -72,6 +89,66 @@ const STARTUP_DEFERRED_RELAY_TYPES = new Set([
   'transcript_resync_required',
   'chat_list',
 ]);
+
+export function createWebuiLatencyTrace(
+  clientMessageId,
+  agentType = 'unknown',
+  atMs = Date.now(),
+  traceId = '',
+  relayClockEstimate = null,
+) {
+  const randomSuffix = traceId || (
+    globalThis.crypto?.randomUUID?.()
+    || `${atMs}-${Math.random().toString(36).slice(2, 12)}`
+  );
+  const observed = relayClockStageObservation(atMs, 'browser', relayClockEstimate, { nowMs: atMs });
+  return {
+    schema_version: 2,
+    trace_id: traceId || `latency-${randomSuffix}`,
+    client_message_id: clientMessageId,
+    agent_type: agentType || 'unknown',
+    stages: { webui_send: observed.adjustedAtMs },
+    raw_stages: { webui_send: atMs },
+    stage_sources: {
+      webui_send: { source: 'webui_client_ws', ...observed.source },
+    },
+  };
+}
+
+export function completeWebuiLatencyTrace(
+  trace,
+  renderAtMs,
+  browserReceivedAtMs,
+  relayClockEstimate = null,
+) {
+  if (!trace?.trace_id || !trace?.stages?.relay_broadcast) return null;
+  if (trace.stages.webui_render) return trace;
+  const observedAtMs = Number(renderAtMs);
+  if (!Number.isFinite(observedAtMs) || observedAtMs <= 0) return null;
+  const observed = relayClockStageObservation(
+    observedAtMs,
+    'browser',
+    relayClockEstimate,
+    { nowMs: observedAtMs },
+  );
+  return {
+    ...trace,
+    schema_version: 2,
+    stages: { ...trace.stages, webui_render: observed.adjustedAtMs },
+    raw_stages: { ...(trace.raw_stages || {}), webui_render: observedAtMs },
+    stage_sources: {
+      ...(trace.stage_sources || {}),
+      webui_render: {
+        source: 'react_post_paint',
+        ...observed.source,
+        ...(Number.isFinite(Number(browserReceivedAtMs))
+          ? { browser_received_at_ms: Number(browserReceivedAtMs) }
+          : {}),
+        browser_paint_at_ms: observedAtMs,
+      },
+    },
+  };
+}
 
 export function boundedRecordWith(previous, key, value, limit = CLIENT_RUNTIME_RECORD_LIMIT) {
   const next = { ...(previous || {}) };
@@ -233,7 +310,10 @@ export function preserveOptimisticMessagesAcrossHistory(authoritativeMessages, p
         _agentStarted: optimistic._agentStarted || authoritative[matchIndex]._agentStarted
           || authoritativeStatus === 'agent_started',
         _sendError: authoritativeStatus === 'failed'
-          ? (authoritative[matchIndex].failure_code || optimistic._sendError || 'Send failed')
+          ? (authoritative[matchIndex].failure_reason
+            || authoritative[matchIndex].failure_code
+            || optimistic._sendError
+            || 'Send failed')
           : (optimistic._sendError || null),
       };
     } else {
@@ -434,6 +514,7 @@ export function useRelay() {
     const [workspaces,        setWorkspaces]        = useState([]);   // [{title, path}] — open Antigravity windows for the launch dropdown
     const [chatLists,         setChatLists]         = useState({});   // sessionId -> [{ id, title, active }] — Codex chat/conversation lists
     const [threadLists,       setThreadLists]       = useState({});   // sessionId -> [{ id, title, active }] — Codex Desktop thread lists
+    const [threadViews,       setThreadViews]       = useState({});   // sessionId -> requester-local Codex Desktop thread view
     const [terminalOutputs,   setTerminalOutputs]   = useState({});   // sessionId -> [{ command?, output, turnId? }] — Codex terminal output
     const [fileChanges,       setFileChanges]       = useState({});   // sessionId -> [{ file?, content, type }] — Codex file changes/diff
     const [branchLists,       setBranchLists]       = useState({});   // sessionId -> { branches: string[], current: string }
@@ -468,6 +549,7 @@ export function useRelay() {
     const deliveryTimers   = useRef({});
     const deliveryStatesRef = useRef({});
     const deliverySessionsRef = useRef({});
+    const deliveryAttemptsRef = useRef({});
     const permissionPromptsRef = useRef({});
     const questionPromptTombstonesRef = useRef(new Map());
     const configControlStatesRef = useRef({});
@@ -482,6 +564,7 @@ export function useRelay() {
     const heartbeatTimer = useRef(null);
     const heartbeatTimeoutTimer = useRef(null);
     const heartbeatPending = useRef(null);
+    const relayClockEstimateRef = useRef(null);
     const heartbeatSequence = useRef(0);
     const heartbeatIntervalMs = useRef(10000);
     const heartbeatTimeoutMs = useRef(30000);
@@ -496,6 +579,9 @@ export function useRelay() {
     const latestHistoryChunkRequest = useRef({});
     const historyChunkTimers = useRef({});
     const historyChunkState = useRef({});
+    const threadViewsRef = useRef({});
+    const threadSwitchRequests = useRef({});
+    const threadSwitchTimers = useRef({});
     const activeCursorThreadIdentity = useRef({});
     const pendingCursorThreadHistoryReset = useRef({});
     const startupReady = useRef(false);
@@ -504,6 +590,7 @@ export function useRelay() {
     const provisionalStreamsRef = useRef({});
     const provisionalFlushHandle = useRef(null);
     const provisionalPendingFlush = useRef(new Map());
+    const completedLatencyTraceIds = useRef(new Set());
     // Host resource resume tokens are requester-scoped and deliberately kept
     // only in memory. They are never written to storage, logs, or transcripts.
     const hostResourceConsumersRef = useRef(new Map());
@@ -517,6 +604,42 @@ export function useRelay() {
     const hostResourceHistoryRequestRef = useRef({ system: '', detail: '' });
     const hostResourceHistoryCursorRef = useRef({ system: 0, detail: 0 });
     const hostResourceLastLiveSequenceRef = useRef({ system: 0, detail: 0 });
+
+    function setThreadView(sessionId, nextView) {
+      if (!sessionId) return;
+      const previous = threadViewsRef.current[sessionId] || null;
+      const resolved = typeof nextView === 'function' ? nextView(previous) : nextView;
+      if (!resolved) {
+        if (!previous) return;
+        const next = { ...threadViewsRef.current };
+        delete next[sessionId];
+        threadViewsRef.current = next;
+        setThreadViews(next);
+        return;
+      }
+      if (previous && sessionRegistryValueEqual(previous, resolved)) return;
+      const next = { ...threadViewsRef.current, [sessionId]: resolved };
+      threadViewsRef.current = next;
+      setThreadViews(next);
+    }
+
+    function isDetachedCodexDesktopThreadView(sessionId) {
+      const viewState = threadViewsRef.current[sessionId]?.view_state;
+      return !!viewState && viewState !== 'native_active';
+    }
+
+    function clearThreadSwitchTimer(sessionId) {
+      const timer = threadSwitchTimers.current[sessionId];
+      if (timer) clearTimeout(timer);
+      delete threadSwitchTimers.current[sessionId];
+    }
+
+    function cancelHistoryChunkRequest(sessionId) {
+      clearTimeout(historyChunkTimers.current[sessionId]);
+      delete historyChunkTimers.current[sessionId];
+      const current = historyChunkState.current[sessionId];
+      if (current) historyChunkState.current[sessionId] = { ...current, inFlight: false };
+    }
 
     function reconcileSessionAlias(event) {
       const aliasId = typeof event?.alias_session_id === 'string' ? event.alias_session_id.trim() : '';
@@ -569,6 +692,10 @@ export function useRelay() {
         (canonical, alias) => ({ ...(alias || {}), ...(canonical || {}), session_id: canonicalId, session: canonicalId })));
       setChatLists(previous => migrateSessionKeyedObject(previous, aliasId, canonicalId, preferCanonical));
       setThreadLists(previous => migrateSessionKeyedObject(previous, aliasId, canonicalId, preferCanonical));
+      threadViewsRef.current = migrateSessionKeyedObject(
+        threadViewsRef.current, aliasId, canonicalId, preferCanonical,
+      );
+      setThreadViews(threadViewsRef.current);
       setTerminalOutputs(previous => migrateSessionKeyedObject(previous, aliasId, canonicalId, mergeArrays));
       setFileChanges(previous => migrateSessionKeyedObject(previous, aliasId, canonicalId, mergeArrays));
       setBranchLists(previous => migrateSessionKeyedObject(previous, aliasId, canonicalId, preferCanonical));
@@ -607,6 +734,25 @@ export function useRelay() {
         pendingCursorThreadHistoryReset]) {
         ref.current = migrateSessionKeyedObject(ref.current, aliasId, canonicalId, preferCanonical);
       }
+      let aliasedThreadSwitchInterrupted = false;
+      if (threadSwitchTimers.current[aliasId]) {
+        clearThreadSwitchTimer(aliasId);
+        aliasedThreadSwitchInterrupted = true;
+      }
+      Object.entries(threadSwitchRequests.current).forEach(([requestId, request]) => {
+        if (request?.sessionId !== aliasId) return;
+        delete threadSwitchRequests.current[requestId];
+        aliasedThreadSwitchInterrupted = true;
+      });
+      if (aliasedThreadSwitchInterrupted) {
+        setThreadView(canonicalId, previous => ({
+          ...(previous || {}),
+          view_state: 'error',
+          retryable: true,
+          completed_at: Date.now(),
+          message: 'The session identity changed while selecting this chat. Retry without changing the native app.',
+        }));
+      }
       return true;
     }
 
@@ -616,9 +762,23 @@ export function useRelay() {
       return true;
     }
 
-    function publishProvisionalStream(sessionId, stream, streamTrace = null) {
+    function publishProvisionalStream(
+      sessionId,
+      stream,
+      streamTrace = null,
+      latencyTrace = null,
+      receivedAtMs = null,
+    ) {
       provisionalStreamsRef.current = { ...provisionalStreamsRef.current, [sessionId]: stream };
-      provisionalPendingFlush.current.set(sessionId, { stream, streamTrace });
+      provisionalPendingFlush.current.set(sessionId, mergeProvisionalFlushItem(
+        provisionalPendingFlush.current.get(sessionId),
+        {
+          stream,
+          streamTrace,
+          latencyTrace,
+          receivedAtMs,
+        },
+      ));
       if (provisionalFlushHandle.current != null) return;
       const raf = typeof requestAnimationFrame === 'function'
         ? requestAnimationFrame
@@ -635,6 +795,10 @@ export function useRelay() {
         });
         pending.forEach(([id, item]) => {
           if (item.streamTrace) recordStreamTraceAfterPaint({ stream_trace: item.streamTrace }, id);
+          if (item.latencyTrace) recordLatencyTraceAfterPaint({
+            latency_trace: item.latencyTrace,
+            _latency_browser_received_at_ms: item.receivedAtMs,
+          }, id);
         });
       });
     }
@@ -912,6 +1076,7 @@ export function useRelay() {
       heartbeatTimer.current = null;
       heartbeatTimeoutTimer.current = null;
       heartbeatPending.current = null;
+      relayClockEstimateRef.current = null;
     }
 
     function sendRelayHeartbeat(ws = wsRef.current) {
@@ -921,6 +1086,7 @@ export function useRelay() {
       heartbeatPending.current = { requestId, sentAt };
       ws.send(JSON.stringify({
         type: 'heartbeat', protocol_version: 1, request_id: requestId,
+        client_sent_at_ms: sentAt,
         client_ts: new Date(sentAt).toISOString(),
       }));
       heartbeatTimeoutTimer.current = setTimeout(() => {
@@ -949,9 +1115,24 @@ export function useRelay() {
       if (heartbeatTimeoutTimer.current) clearTimeout(heartbeatTimeoutTimer.current);
       heartbeatTimeoutTimer.current = null;
       heartbeatPending.current = null;
-      const rttMs = Math.max(0, Date.now() - pending.sentAt);
+      const receivedAtMs = Date.now();
+      const estimated = estimateRelayClockOffset({
+        clientSentAtMs: pending.sentAt,
+        relayReceivedAtMs: msg.relay_received_at_ms,
+        relaySentAtMs: msg.relay_sent_at_ms,
+        clientReceivedAtMs: receivedAtMs,
+      });
+      relayClockEstimateRef.current = estimated.ok ? estimated.estimate : null;
+      const rttMs = Math.max(0, receivedAtMs - pending.sentAt);
       const state = rttMs <= 500 ? 'healthy' : rttMs <= 2000 ? 'slow' : 'poor';
-      setConnectionHealth({ state, rttMs, lastAckAt: Date.now() });
+      setConnectionHealth({
+        state,
+        rttMs,
+        lastAckAt: receivedAtMs,
+        clockStatus: estimated.ok ? estimated.estimate.status : estimated.code,
+        clockOffsetMs: estimated.ok ? estimated.estimate.offset_ms : null,
+        clockUncertaintyMs: estimated.ok ? estimated.estimate.uncertainty_ms : null,
+      });
     }
 
     function clearDeliveryTimeout(clientMessageId) {
@@ -960,16 +1141,45 @@ export function useRelay() {
       delete deliveryTimers.current[clientMessageId];
     }
 
-    function setTrackedDeliveryState(clientMessageId, state) {
-      if (!clientMessageId) return;
+    function setTrackedDeliveryState(clientMessageId, state, { force = false } = {}) {
+      if (!clientMessageId) return false;
+      const current = deliveryStatesRef.current[clientMessageId];
+      const currentRank = DELIVERY_STATE_RANK[current] ?? -1;
+      const nextRank = DELIVERY_STATE_RANK[state] ?? -1;
+      if (!force && current && nextRank < currentRank) return false;
       if (!Object.prototype.hasOwnProperty.call(deliveryStatesRef.current, clientMessageId)
         && Object.keys(deliveryStatesRef.current).length >= CLIENT_RUNTIME_RECORD_LIMIT) {
         const oldest = Object.keys(deliveryStatesRef.current)[0];
         clearDeliveryTimeout(oldest);
         delete deliverySessionsRef.current[oldest];
+        delete deliveryAttemptsRef.current[oldest];
       }
       deliveryStatesRef.current = boundedRecordWith(deliveryStatesRef.current, clientMessageId, state);
       setDeliveryStates(prev => boundedRecordWith(prev, clientMessageId, state));
+      return true;
+    }
+
+    function acceptDeliveryAttempt(clientMessageId, rawAttempt, { allowMissingCurrent = false } = {}) {
+      if (!clientMessageId) return { accepted: false, advanced: false, attempt: 0 };
+      const current = Math.max(0, Number(deliveryAttemptsRef.current[clientMessageId]) || 0);
+      const incoming = Number(rawAttempt);
+      if (!Number.isInteger(incoming) || incoming < 1) {
+        return current <= 1 || allowMissingCurrent
+          ? { accepted: true, advanced: false, attempt: current || 1, legacy: true }
+          : { accepted: false, advanced: false, attempt: current, legacy: true };
+      }
+      if (incoming < current) {
+        return { accepted: false, advanced: false, attempt: current, legacy: false };
+      }
+      const advanced = incoming > current;
+      if (advanced) {
+        deliveryAttemptsRef.current = boundedRecordWith(
+          deliveryAttemptsRef.current,
+          clientMessageId,
+          incoming,
+        );
+      }
+      return { accepted: true, advanced, attempt: incoming, legacy: false };
     }
 
     function trackDeliverySession(clientMessageId, sessionId) {
@@ -995,13 +1205,22 @@ export function useRelay() {
       });
     }
 
-    function markDeliveryFailed(clientMessageId, reason, sessionId = '') {
+    function markDeliveryFailed(clientMessageId, reason, sessionId = '', metadata = {}) {
       if (!clientMessageId) return;
-      if (deliveryStatesRef.current[clientMessageId] === 'agent_started') return;
+      const attempt = acceptDeliveryAttempt(clientMessageId, metadata.delivery_attempt, {
+        allowMissingCurrent: metadata.network !== true,
+      });
+      if (!attempt.accepted) return;
+      if (!setTrackedDeliveryState(clientMessageId, 'failed', { force: attempt.advanced })) return;
       clearDeliveryTimeout(clientMessageId);
-      setTrackedDeliveryState(clientMessageId, 'failed');
       updateTrackedDeliveryMessage(clientMessageId, sessionId, message => ({
         ...message,
+        status: 'failed',
+        failure_code: metadata.failure_code || message.failure_code || null,
+        failure_reason: reason || metadata.failure_reason || 'Send failed',
+        failure_native_attempted: metadata.failure_native_attempted ?? message.failure_native_attempted ?? null,
+        failure_retryable: metadata.failure_retryable ?? message.failure_retryable ?? null,
+        _deliveryAttempt: attempt.attempt,
         _sendError: reason || 'Send failed',
       }));
     }
@@ -1143,8 +1362,12 @@ export function useRelay() {
       ws.onmessage = (e) => {
         let msg;
         try { msg = JSON.parse(e.data); } catch { return; }
+        const browserReceivedAtMs = Date.now();
         if (msg.stream_trace && typeof msg.stream_trace === 'object') {
           msg.stream_trace = { ...msg.stream_trace, browser_received_at_ms: Date.now() };
+        }
+        if (msg.latency_trace && typeof msg.latency_trace === 'object') {
+          msg._latency_browser_received_at_ms = browserReceivedAtMs;
         }
         handleRelayMessageRef.current(msg);
       };
@@ -1212,6 +1435,22 @@ export function useRelay() {
         Object.keys(ref.current).forEach(id => {
           if (!liveIds.has(id)) delete ref.current[id];
         });
+      });
+      let threadViewsChanged = false;
+      const nextThreadViews = { ...threadViewsRef.current };
+      Object.keys(nextThreadViews).forEach(id => {
+        if (liveIds.has(id)) return;
+        delete nextThreadViews[id];
+        clearThreadSwitchTimer(id);
+        threadViewsChanged = true;
+      });
+      if (threadViewsChanged) {
+        threadViewsRef.current = nextThreadViews;
+        setThreadViews(nextThreadViews);
+      }
+      Object.entries(threadSwitchRequests.current).forEach(([requestId, request]) => {
+        if (liveIds.has(request?.sessionId)) return;
+        delete threadSwitchRequests.current[requestId];
       });
       Object.keys(provisionalStreamsRef.current).forEach(id => {
         if (!liveIds.has(id)) delete provisionalStreamsRef.current[id];
@@ -1345,7 +1584,8 @@ export function useRelay() {
       const beforeOffset = options.beforeOffset ?? options.before_offset ?? null;
       const beforeId = options.beforeId ?? options.before_id ?? null;
       const aroundId = options.aroundId ?? options.around_id ?? null;
-      const requestCursorSig = `${mode}\u0001${source}\u0001${beforeOffset ?? ''}\u0001${beforeId ?? ''}\u0001${aroundId ?? ''}`;
+      const threadId = String(options.threadId ?? options.thread_id ?? '').trim() || null;
+      const requestCursorSig = `${mode}\u0001${source}\u0001${threadId || ''}\u0001${beforeOffset ?? ''}\u0001${beforeId ?? ''}\u0001${aroundId ?? ''}`;
       const currentChunkState = historyChunkState.current[id] || {};
       const nowMs = Date.now();
       // An explicit search deep-link must supersede an automatic tail hydration;
@@ -1379,6 +1619,7 @@ export function useRelay() {
           beforeOffset,
           beforeId,
           aroundId,
+          threadId,
           userInitiated: options.userInitiated === true || options.user_initiated === true,
           retryAttempt: Number(options.retryAttempt || 0),
           lastRequestSig: requestCursorSig,
@@ -1388,7 +1629,7 @@ export function useRelay() {
         historyChunkState.current[id] = {
           ...(historyChunkState.current[id] || {}), source, chunkBytes,
           limit: options.limit || historyChunkState.current[id]?.limit || null,
-          inFlight: true, mode, beforeOffset, beforeId, aroundId,
+          inFlight: true, mode, beforeOffset, beforeId, aroundId, threadId,
           userInitiated: options.userInitiated === true || options.user_initiated === true,
           retryAttempt: Number(options.retryAttempt || 0),
           lastRequestSig: requestCursorSig, lastRequestAt: nowMs,
@@ -1415,6 +1656,7 @@ export function useRelay() {
         replace,
         chunk_bytes: chunkBytes,
       };
+      if (threadId) payload.thread_id = threadId;
       const limit = Number(options.limit || options.tailLimit || 0);
       if (Number.isFinite(limit) && limit > 0) payload.limit = Math.floor(limit);
       if (options.userInitiated || options.user_initiated) payload.user_initiated = true;
@@ -1449,6 +1691,7 @@ export function useRelay() {
             source,
             beforeOffset,
             beforeId,
+            threadId,
             chunkBytes,
             retryAttempt: retryAttempt + 1,
           });
@@ -1564,10 +1807,12 @@ export function useRelay() {
       return ['codex', 'codex-desktop', 'cursor', 'codex_cli', 'cursor_cli', 'roo_code', 'cline'].includes(session.agent_type);
     }
 
-    function clearSessionTranscript(sessionId) {
+    function clearSessionTranscript(sessionId, options = {}) {
       if (!sessionId) return;
       setMessages(prev => ({ ...prev, [sessionId]: [] }));
-      setQueuedMessages(prev => ({ ...prev, [sessionId]: [] }));
+      if (options.preserveQueued !== true) {
+        setQueuedMessages(prev => ({ ...prev, [sessionId]: [] }));
+      }
       setThinking(prev => ({ ...prev, [sessionId]: false }));
       setThinkingContent(prev => ({ ...prev, [sessionId]: '' }));
       setActivities(prev => ({ ...prev, [sessionId]: false }));
@@ -1721,6 +1966,17 @@ export function useRelay() {
 
     function newThread(sessionId) {
       const requestId = `new-thread-${Date.now()}-${Math.random().toString(36).slice(2, 7)}`;
+      const session = sessions.find(candidate => (
+        (typeof candidate === 'object' ? candidate?.session_id : candidate) === sessionId
+      ));
+      if (session?.agent_type === 'codex-desktop') {
+        clearThreadSwitchTimer(sessionId);
+        Object.entries(threadSwitchRequests.current).forEach(([pendingRequestId, request]) => {
+          if (request?.sessionId === sessionId) delete threadSwitchRequests.current[pendingRequestId];
+        });
+        cancelHistoryChunkRequest(sessionId);
+        setThreadView(sessionId, null);
+      }
       clearSessionTranscript(sessionId);
       send({ type: 'new_thread', session_id: sessionId, request_id: requestId });
       return requestId;
@@ -1767,7 +2023,70 @@ export function useRelay() {
 
     function switchThread(sessionId, threadId) {
       const requestId = `swthread-${Date.now()}-${Math.random().toString(36).slice(2, 7)}`;
-      clearSessionTranscript(sessionId);
+      const session = sessions.find(candidate => (
+        (typeof candidate === 'object' ? candidate?.session_id : candidate) === sessionId
+      ));
+      if (session?.agent_type !== 'codex-desktop') {
+        clearSessionTranscript(sessionId);
+        send({ type: 'switch_thread', session_id: sessionId, thread_id: threadId, request_id: requestId });
+        return requestId;
+      }
+      const selectedThread = (threadLists[sessionId] || []).find(thread => (
+        String(thread?.id || '') === String(threadId)
+        || String(thread?.cache_key || '') === String(threadId)
+      ));
+      const startedAt = Date.now();
+      clearThreadSwitchTimer(sessionId);
+      Object.entries(threadSwitchRequests.current).forEach(([pendingRequestId, request]) => {
+        if (request?.sessionId === sessionId) delete threadSwitchRequests.current[pendingRequestId];
+      });
+      cancelHistoryChunkRequest(sessionId);
+      clearSessionTranscript(sessionId, { preserveQueued: true });
+      const pending = {
+        sessionId,
+        threadId: String(threadId || ''),
+        requestId,
+        startedAt,
+      };
+      threadSwitchRequests.current[requestId] = pending;
+      setThreadView(sessionId, {
+        thread_id: pending.threadId,
+        title: selectedThread?.title || 'Codex Desktop chat',
+        view_state: 'loading',
+        selection_mode: 'client_local_readonly',
+        selection_budget_ms: THREAD_VIEW_SELECTION_TIMEOUT_MS,
+        started_at: startedAt,
+        deadline_at: startedAt + THREAD_VIEW_SELECTION_TIMEOUT_MS,
+        read_only: true,
+        retryable: false,
+        message: 'Checking this Codex Desktop chat without changing the native app.',
+      });
+      if (wsRef.current?.readyState !== WebSocket.OPEN) {
+        delete threadSwitchRequests.current[requestId];
+        setThreadView(sessionId, previous => ({
+          ...(previous || {}),
+          view_state: 'error',
+          retryable: true,
+          completed_at: Date.now(),
+          message: 'The relay is offline. Reconnect, then retry this chat.',
+        }));
+        return requestId;
+      }
+      threadSwitchTimers.current[sessionId] = setTimeout(() => {
+        delete threadSwitchTimers.current[sessionId];
+        if (!threadSwitchRequests.current[requestId]) return;
+        delete threadSwitchRequests.current[requestId];
+        setThreadView(sessionId, previous => {
+          if (previous?.thread_id !== pending.threadId || previous?.view_state !== 'loading') return previous;
+          return {
+            ...previous,
+            view_state: 'error',
+            retryable: true,
+            completed_at: Date.now(),
+            message: 'Codex Desktop chat availability timed out. Retry without changing the native app.',
+          };
+        });
+      }, THREAD_VIEW_SELECTION_TIMEOUT_MS);
       send({ type: 'switch_thread', session_id: sessionId, thread_id: threadId, request_id: requestId });
       return requestId;
     }
@@ -1905,17 +2224,41 @@ export function useRelay() {
       const cid = retryClientMessageId || `cmsg-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
       trackDeliverySession(cid, session);
       const retryMessage = retryClientMessageId
-        ? (transcriptStoreView[session] || []).find(message => message._cid === cid)
+        ? (transcriptStoreView[session] || []).find(message => (
+            message._cid === cid
+            || message.client_message_id === cid
+            || message.client_msg_id === cid
+          ))
         : null;
       const createdAt = messageInstant(retryMessage)?.iso || new Date().toISOString();
       setMessages(prev => {
         const existing = prev[session] || [];
-        const hasRetryTarget = retryClientMessageId && existing.some(message => message._cid === cid);
+        const hasRetryTarget = retryClientMessageId && existing.some(message => (
+          message._cid === cid
+          || message.client_message_id === cid
+          || message.client_msg_id === cid
+        ));
         return {
           ...prev,
           [session]: hasRetryTarget
-            ? existing.map(message => message._cid === cid
-              ? { ...message, content, _optimistic: true, _delivered: false, _agentStarted: false, _sendError: null }
+            ? existing.map(message => (
+              message._cid === cid
+              || message.client_message_id === cid
+              || message.client_msg_id === cid
+            )
+              ? {
+                  ...message,
+                  content,
+                  _cid: cid,
+                  _optimistic: true,
+                  _delivered: false,
+                  _agentStarted: false,
+                  _sendError: null,
+                  failure_code: null,
+                  failure_reason: null,
+                  failure_native_attempted: null,
+                  failure_retryable: null,
+                }
               : message)
             : [...existing, normalizeMessageTimestamp({
                 role: 'user', content, _cid: cid, _optimistic: true, created_at: createdAt,
@@ -1923,13 +2266,39 @@ export function useRelay() {
         };
       });
       if (wsRef.current?.readyState === WebSocket.OPEN) {
-        setTrackedDeliveryState(cid, 'queued');
+        setTrackedDeliveryState(cid, 'queued', { force: Boolean(retryClientMessageId) });
         armDeliveryTimeout(cid, 'queued', 'Timed out waiting for relay acceptance.');
-        send({ type: 'send', session, content, client_message_id: cid, created_at: createdAt });
+        const sessionEntry = sessions.find(candidate => (
+          (typeof candidate === 'string' ? candidate : candidate?.session_id) === session
+        ));
+        const agentType = (typeof sessionEntry === 'object' ? sessionEntry?.agent_type : null)
+          || agentConfigsRef.current[session]?.agent_type
+          || 'unknown';
+        send({
+          type: 'send',
+          session,
+          content,
+          client_message_id: cid,
+          created_at: createdAt,
+          ...(retryClientMessageId ? { retry_failed: true } : {}),
+          latency_trace: createWebuiLatencyTrace(
+            cid,
+            agentType,
+            Date.now(),
+            '',
+            relayClockEstimateRef.current,
+          ),
+        });
       } else if (offlineSendQueue.current.length < 20) {
         offlineSendQueue.current = [
           ...offlineSendQueue.current.filter(item => item.cid !== cid),
-          { session, content, cid, created_at: createdAt },
+          {
+            session,
+            content,
+            cid,
+            created_at: createdAt,
+            retry_failed: Boolean(retryClientMessageId),
+          },
         ];
         clearDeliveryTimeout(cid);
         setTrackedDeliveryState(cid, 'offline_queued');
@@ -1947,11 +2316,25 @@ export function useRelay() {
       offlineSendQueue.current = [];
       queued.forEach(item => {
         trackDeliverySession(item.cid, item.session);
-        setTrackedDeliveryState(item.cid, 'queued');
+        setTrackedDeliveryState(item.cid, 'queued', { force: item.retry_failed === true });
         armDeliveryTimeout(item.cid, 'queued', 'Timed out waiting for relay acceptance after reconnect.');
+        const sessionEntry = sessions.find(candidate => (
+          (typeof candidate === 'string' ? candidate : candidate?.session_id) === item.session
+        ));
+        const agentType = (typeof sessionEntry === 'object' ? sessionEntry?.agent_type : null)
+          || agentConfigsRef.current[item.session]?.agent_type
+          || 'unknown';
         ws.send(JSON.stringify({
           type: 'send', session: item.session, content: item.content, client_message_id: item.cid,
           created_at: item.created_at,
+          ...(item.retry_failed ? { retry_failed: true } : {}),
+          latency_trace: createWebuiLatencyTrace(
+            item.cid,
+            agentType,
+            Date.now(),
+            '',
+            relayClockEstimateRef.current,
+          ),
         }));
       });
     }
@@ -1970,6 +2353,7 @@ export function useRelay() {
       clearDeliveryTimeout(clientMessageId);
       delete deliveryStatesRef.current[clientMessageId];
       delete deliverySessionsRef.current[clientMessageId];
+      delete deliveryAttemptsRef.current[clientMessageId];
       send({ type: 'discard_queued', session_id: sessionId, client_message_id: clientMessageId });
       setQueuedMessages(prev => ({ ...prev, [sessionId]: (prev[sessionId] || []).filter(m => m.cid !== clientMessageId) }));
       setDeliveryStates(prev => { const next = { ...prev }; delete next[clientMessageId]; return next; });
@@ -2051,6 +2435,38 @@ export function useRelay() {
         rows.push({ ...trace, browser_paint_at_ms: Date.now() });
         if (rows.length > 500) rows.splice(0, rows.length - 500);
         window.__RAC_STREAM_TRACES__ = rows;
+      }));
+    }
+
+    function recordLatencyTraceAfterPaint(msg, sessionId) {
+      const trace = msg?.latency_trace;
+      if (!trace?.trace_id || !trace?.stages?.relay_broadcast || typeof window === 'undefined') return;
+      if (completedLatencyTraceIds.current.has(trace.trace_id)) return;
+      completedLatencyTraceIds.current.add(trace.trace_id);
+      while (completedLatencyTraceIds.current.size > CLIENT_RUNTIME_RECORD_LIMIT) {
+        completedLatencyTraceIds.current.delete(completedLatencyTraceIds.current.values().next().value);
+      }
+      const browserReceivedAtMs = Number(msg._latency_browser_received_at_ms) || Date.now();
+      const raf = window.requestAnimationFrame || (callback => window.setTimeout(callback, 16));
+      raf(() => raf(() => {
+        const completed = completeWebuiLatencyTrace(
+          trace,
+          Date.now(),
+          browserReceivedAtMs,
+          relayClockEstimateRef.current,
+        );
+        if (!completed) return;
+        const rows = Array.isArray(window.__RAC_LATENCY_TRACES__) ? window.__RAC_LATENCY_TRACES__ : [];
+        rows.push({ ...completed, session_id: sessionId || msg.session || msg.session_id || '' });
+        if (rows.length > CLIENT_RUNTIME_RECORD_LIMIT) {
+          rows.splice(0, rows.length - CLIENT_RUNTIME_RECORD_LIMIT);
+        }
+        window.__RAC_LATENCY_TRACES__ = rows;
+        send({
+          type: 'latency_trace_complete',
+          protocol_version: 1,
+          latency_trace: completed,
+        });
       }));
     }
 
@@ -2484,15 +2900,23 @@ export function useRelay() {
       if (t === 'message_delta') {
         const id = msg.session_id || msg.session;
         if (!id) return;
+        if (isDetachedCodexDesktopThreadView(id)) return;
         const reduced = reduceMessageDeltaStream(provisionalStreamsRef.current[id] || null, msg);
         if (!reduced.accepted) return;
-        publishProvisionalStream(id, reduced.stream, msg.stream_trace || null);
+        publishProvisionalStream(
+          id,
+          reduced.stream,
+          msg.stream_trace || null,
+          msg.latency_trace || null,
+          msg._latency_browser_received_at_ms || null,
+        );
         return;
       }
 
       if (t === 'transcript_resync_required') {
         const id = msg.session_id || msg.session;
         if (!id || id !== activeSessionRef.current) return;
+        if (isDetachedCodexDesktopThreadView(id)) return;
         const currentChunkState = historyChunkState.current[id] || {};
         historyChunkState.current[id] = { ...currentChunkState, inFlight: false };
         clearTimeout(historyChunkTimers.current[id]);
@@ -2509,6 +2933,7 @@ export function useRelay() {
       if (t === 'history' || t === 'history_snapshot') {
         const id = msg.session || msg.session_id;
         if (!id) return;
+        if (isDetachedCodexDesktopThreadView(id)) return;
         if (
           msg.request_id
           && latestHistoryRequest.current[id]
@@ -2581,11 +3006,26 @@ export function useRelay() {
       if (t === 'history_chunk') {
         const id = msg.session || msg.session_id;
         if (!id) return;
+        const responseSource = msg.source || 'relay_sqlite';
+        const responseThreadId = String(msg.thread_id || '');
+        const selectedView = threadViewsRef.current[id] || null;
+        if (responseSource === 'codex_desktop_jsonl') {
+          if (
+            selectedView?.view_state !== 'archive'
+            || !responseThreadId
+            || responseThreadId !== String(selectedView.thread_id || '')
+          ) {
+            return;
+          }
+        } else if (isDetachedCodexDesktopThreadView(id)) {
+          return;
+        }
         const currentChunkState = historyChunkState.current[id] || {};
         const isCompatibleTailResponse = (
           msg.mode !== 'older'
           && currentChunkState.mode === 'tail'
-          && (msg.source || 'relay_sqlite') === (currentChunkState.source || 'relay_sqlite')
+          && responseSource === (currentChunkState.source || 'relay_sqlite')
+          && responseThreadId === String(currentChunkState.threadId || '')
         );
         if (
           msg.request_id
@@ -2623,6 +3063,7 @@ export function useRelay() {
                 beforeOffset: currentChunkState.beforeOffset,
                 beforeId: currentChunkState.beforeId,
                 aroundId: currentChunkState.aroundId,
+                threadId: currentChunkState.threadId,
                 userInitiated: currentChunkState.userInitiated,
                 limit: currentChunkState.limit,
                 chunkBytes: currentChunkState.chunkBytes,
@@ -2643,6 +3084,17 @@ export function useRelay() {
           };
           clearTimeout(historyChunkTimers.current[id]);
           delete historyChunkTimers.current[id];
+          if (responseSource === 'codex_desktop_jsonl' && msg.view_state === 'unavailable') {
+            setThreadView(id, previous => ({
+              ...(previous || {}),
+              view_state: 'unavailable',
+              read_only: true,
+              retryable: true,
+              completed_at: Date.now(),
+              pollability: msg.pollability || previous?.pollability || null,
+              message: String(msg.error?.message || msg.error || 'Open this chat in Codex Desktop once, then retry.'),
+            }));
+          }
           setHistoryMeta(prev => ({
             ...prev,
             [id]: {
@@ -2685,6 +3137,9 @@ export function useRelay() {
             limit: null,
             mode: 'chunked',
             source: msg.source || 'native',
+            thread_id: responseThreadId || null,
+            view_state: msg.view_state || selectedView?.view_state || null,
+            pollability: msg.pollability || selectedView?.pollability || null,
             cursor,
             bytes_total: cursor.total_bytes || 0,
             refreshing: false,
@@ -2713,6 +3168,7 @@ export function useRelay() {
       if (t === 'history_delta') {
         const id      = msg.session || msg.session_id;
         if (!id) return;
+        if (isDetachedCodexDesktopThreadView(id)) return;
         if (
           msg.request_id
           && latestHistoryRequest.current[id]
@@ -2946,12 +3402,86 @@ export function useRelay() {
           const activeThread = threads.find(thread => thread?.active);
           const cursorIdentity = String(activeThread?.cache_key || '');
           const previousIdentity = activeCursorThreadIdentity.current[sid] || '';
-          if (cursorIdentity && previousIdentity && cursorIdentity !== previousIdentity) {
+          const localView = threadViewsRef.current[sid] || null;
+          if (
+            (!localView || localView.view_state === 'native_active')
+            && cursorIdentity
+            && previousIdentity
+            && cursorIdentity !== previousIdentity
+          ) {
             pendingCursorThreadHistoryReset.current[sid] = cursorIdentity;
             clearSessionTranscript(sid);
           }
           if (cursorIdentity) activeCursorThreadIdentity.current[sid] = cursorIdentity;
           setThreadLists(prev => ({ ...prev, [sid]: threads }));
+          if (localView && localView.view_state !== 'loading') {
+            const selectedThread = threads.find(thread => (
+              String(thread?.id || '') === String(localView.thread_id || '')
+              || String(thread?.cache_key || '') === String(localView.thread_id || '')
+            ));
+            if (!selectedThread) {
+              setThreadView(sid, {
+                ...localView,
+                view_state: 'unavailable',
+                read_only: true,
+                retryable: true,
+                completed_at: Date.now(),
+                message: 'This chat is no longer in the current Codex Desktop inventory. Refresh the list and retry.',
+              });
+            } else if (selectedThread.active && localView.view_state !== 'native_active') {
+              cancelHistoryChunkRequest(sid);
+              clearSessionTranscript(sid, { preserveQueued: true });
+              setThreadView(sid, {
+                ...localView,
+                thread_id: String(selectedThread.id || localView.thread_id),
+                title: selectedThread.title || localView.title,
+                view_state: 'native_active',
+                history_source: 'relay_sqlite',
+                read_only: false,
+                retryable: false,
+                pollability: selectedThread.pollability || localView.pollability,
+                completed_at: Date.now(),
+                message: 'Showing the natively active Codex Desktop chat.',
+              });
+              requestHistoryChunk(sid, {
+                mode: 'tail',
+                source: 'relay_sqlite',
+                replace: true,
+              });
+            } else if (!selectedThread.active && selectedThread.view_state !== localView.view_state) {
+              const nextViewState = selectedThread.view_state === 'archive' ? 'archive' : 'unavailable';
+              cancelHistoryChunkRequest(sid);
+              clearSessionTranscript(sid, { preserveQueued: true });
+              setThreadView(sid, {
+                ...localView,
+                thread_id: String(selectedThread.id || localView.thread_id),
+                title: selectedThread.title || localView.title,
+                view_state: nextViewState,
+                history_source: nextViewState === 'archive' ? 'codex_desktop_jsonl' : null,
+                read_only: true,
+                retryable: nextViewState === 'unavailable',
+                pollability: selectedThread.pollability || localView.pollability,
+                completed_at: Date.now(),
+                message: nextViewState === 'archive'
+                  ? 'Showing the immutable native archive. This chat is read-only until it is active in Codex Desktop.'
+                  : (selectedThread.pollability?.required_action || 'Open this chat in Codex Desktop once, then retry.'),
+              });
+              if (nextViewState === 'archive') {
+                requestHistoryChunk(sid, {
+                  mode: 'tail',
+                  source: 'codex_desktop_jsonl',
+                  threadId: String(selectedThread.id || localView.thread_id),
+                  replace: true,
+                });
+              }
+            } else {
+              setThreadView(sid, {
+                ...localView,
+                title: selectedThread.title || localView.title,
+                pollability: selectedThread.pollability || localView.pollability,
+              });
+            }
+          }
         }
         return;
       }
@@ -3051,6 +3581,65 @@ export function useRelay() {
         const sid = msg.session_id || msg.session;
         if (msg.request_id) {
           setControlResults(prev => boundedRecordWith(prev, msg.request_id, { ...msg, received_at: Date.now() }));
+          const pendingThreadView = msg.command === 'switch_thread'
+            ? threadSwitchRequests.current[msg.request_id]
+            : null;
+          if (pendingThreadView) {
+            const viewSessionId = sid || pendingThreadView.sessionId;
+            clearThreadSwitchTimer(pendingThreadView.sessionId);
+            delete threadSwitchRequests.current[msg.request_id];
+            if (msg.result === 'ok') {
+              const details = msg.details || {};
+              const resolvedThreadId = String(details.thread_id || '');
+              if (!resolvedThreadId || resolvedThreadId !== pendingThreadView.threadId) {
+                setThreadView(viewSessionId, previous => ({
+                  ...(previous || {}),
+                  view_state: 'error',
+                  retryable: true,
+                  completed_at: Date.now(),
+                  error_code: 'thread_identity_mismatch',
+                  message: 'Codex Desktop returned a different chat identity. Retry without changing the native app.',
+                }));
+              } else {
+                const resolvedView = {
+                  ...details,
+                  thread_id: resolvedThreadId,
+                  view_state: details.view_state || 'unavailable',
+                  selection_mode: 'client_local_readonly',
+                  started_at: pendingThreadView.startedAt,
+                  completed_at: Date.now(),
+                };
+                setThreadView(viewSessionId, resolvedView);
+                cancelHistoryChunkRequest(viewSessionId);
+                clearSessionTranscript(viewSessionId, { preserveQueued: true });
+                if (resolvedView.view_state === 'archive') {
+                  requestHistoryChunk(viewSessionId, {
+                    mode: 'tail',
+                    source: 'codex_desktop_jsonl',
+                    threadId: resolvedThreadId,
+                    replace: true,
+                  });
+                } else if (resolvedView.view_state === 'native_active') {
+                  requestHistoryChunk(viewSessionId, {
+                    mode: 'tail',
+                    source: 'relay_sqlite',
+                    replace: true,
+                  });
+                }
+              }
+            } else {
+              const error = typeof msg.error === 'object' && msg.error ? msg.error : {};
+              setThreadView(viewSessionId, previous => ({
+                ...(previous || {}),
+                view_state: 'error',
+                retryable: msg.retryable !== false && error.retryable !== false,
+                completed_at: Date.now(),
+                error_code: error.code || 'thread_view_failed',
+                native_mutated: false,
+                message: error.message || String(msg.error || 'Codex Desktop chat availability could not be resolved.'),
+              }));
+            }
+          }
           const pendingEntry = Object.entries(configControlStatesRef.current)
             .find(([, transaction]) => transaction.requestId === msg.request_id
               && transaction.sessionId === sid
@@ -3106,6 +3695,8 @@ export function useRelay() {
         const cid = msg.client_message_id;
         const sid = msg.session_id || msg.session;
         if (cid && sid) trackDeliverySession(cid, sid);
+        const attempt = acceptDeliveryAttempt(cid, msg.delivery_attempt);
+        if (cid && !attempt.accepted) return;
         const storedStatus = ['accepted', 'delivered', 'agent_started', 'failed'].includes(msg.status)
           ? msg.status
           : 'accepted';
@@ -3113,13 +3704,26 @@ export function useRelay() {
           ? 'launch_accepted'
           : storedStatus;
         if (cid && persistedStatus === 'failed') {
-          markDeliveryFailed(cid, msg.failure_code || 'Send failed', sid);
+          markDeliveryFailed(
+            cid,
+            msg.failure_reason || msg.failure_code || 'Send failed',
+            sid,
+            {
+              network: true,
+              delivery_attempt: msg.delivery_attempt,
+              failure_code: msg.failure_code,
+              failure_reason: msg.failure_reason,
+              failure_native_attempted: msg.failure_native_attempted,
+              failure_retryable: msg.failure_retryable,
+            },
+          );
           return;
         }
         // Don't overwrite busy_queued or steered — those are higher-priority states
-        const current = cid ? deliveryStatesRef.current[cid] : null;
-        if (cid && !['busy_queued', 'steered', 'launch_accepted', 'delivered', 'agent_started'].includes(current)) {
-          setTrackedDeliveryState(cid, persistedStatus);
+        if (cid) {
+          if (!setTrackedDeliveryState(cid, persistedStatus, {
+            force: attempt.advanced || msg.retry_restarted === true,
+          })) return;
           if (persistedStatus === 'accepted') {
             armDeliveryTimeout(cid, 'accepted', 'Relay accepted the message, but native delivery timed out.');
           } else if (persistedStatus === 'launch_accepted') {
@@ -3137,8 +3741,15 @@ export function useRelay() {
             ...(msg.timestamp != null ? { timestamp: msg.timestamp } : {}),
             ...(msg.ts != null ? { ts: msg.ts } : {}),
             ...(msg.launch_accepted_at != null ? { _launchAcceptedAt: msg.launch_accepted_at } : {}),
+            status: persistedStatus === 'launch_accepted' ? 'accepted' : persistedStatus,
+            _cid: cid,
+            _deliveryAttempt: attempt.attempt,
             _delivered: persistedStatus === 'delivered' || persistedStatus === 'agent_started',
             _agentStarted: persistedStatus === 'agent_started',
+            failure_code: null,
+            failure_reason: null,
+            failure_native_attempted: null,
+            failure_retryable: null,
             _sendError: null,
           }));
         }
@@ -3149,11 +3760,15 @@ export function useRelay() {
         const cid = msg.client_message_id;
         const sid = msg.session_id || msg.session;
         if (cid && sid) trackDeliverySession(cid, sid);
-        if (cid && !['delivered', 'agent_started'].includes(deliveryStatesRef.current[cid])) {
-          setTrackedDeliveryState(cid, 'launch_accepted');
+        const attempt = acceptDeliveryAttempt(cid, msg.delivery_attempt);
+        if (cid && !attempt.accepted) return;
+        if (cid && setTrackedDeliveryState(cid, 'launch_accepted', { force: attempt.advanced })) {
           armDeliveryTimeout(cid, 'launch_accepted', 'The native launch was accepted, but no native user turn was observed.');
           updateTrackedDeliveryMessage(cid, sid, message => ({
             ...message,
+            status: 'accepted',
+            _cid: cid,
+            _deliveryAttempt: attempt.attempt,
             _launchAcceptedAt: msg.accepted_at || new Date().toISOString(),
             _sendError: null,
           }));
@@ -3165,14 +3780,22 @@ export function useRelay() {
         const cid = msg.client_message_id;
         const sid = msg.session_id || msg.session;
         if (cid && sid) trackDeliverySession(cid, sid);
-        if (cid && deliveryStatesRef.current[cid] !== 'agent_started') {
-          setTrackedDeliveryState(cid, 'delivered');
+        const attempt = acceptDeliveryAttempt(cid, msg.delivery_attempt);
+        if (cid && !attempt.accepted) return;
+        if (cid && setTrackedDeliveryState(cid, 'delivered', { force: attempt.advanced })) {
           armDeliveryTimeout(cid, 'delivered', 'Message reached the agent, but agent activity did not start in time.');
         }
         if (cid) {
           updateTrackedDeliveryMessage(cid, sid, message => ({
             ...message,
+            status: 'delivered',
+            _cid: cid,
+            _deliveryAttempt: attempt.attempt,
             _delivered: true,
+            failure_code: null,
+            failure_reason: null,
+            failure_native_attempted: null,
+            failure_retryable: null,
             _sendError: null,
           }));
         }
@@ -3183,16 +3806,25 @@ export function useRelay() {
         const cid = msg.client_message_id;
         const sid = msg.session_id || msg.session;
         if (cid && sid) trackDeliverySession(cid, sid);
+        const attempt = acceptDeliveryAttempt(cid, msg.delivery_attempt);
+        if (cid && !attempt.accepted) return;
         if (cid) {
           clearDeliveryTimeout(cid);
-          setTrackedDeliveryState(cid, 'agent_started');
+          setTrackedDeliveryState(cid, 'agent_started', { force: attempt.advanced });
         }
         if (sid) openProvisionalStream(sid, cid || null);
         if (cid) {
           updateTrackedDeliveryMessage(cid, sid, message => ({
             ...message,
+            status: 'agent_started',
+            _cid: cid,
+            _deliveryAttempt: attempt.attempt,
             _delivered: true,
             _agentStarted: true,
+            failure_code: null,
+            failure_reason: null,
+            failure_native_attempted: null,
+            failure_retryable: null,
             _sendError: null,
           }));
         }
@@ -3202,10 +3834,19 @@ export function useRelay() {
       if (t === 'message_failed' || (t === 'proxy_send_result' && msg.result === 'failed')) {
         const cid = msg.client_message_id;
         const sid = msg.session_id || msg.session;
+        const attempt = acceptDeliveryAttempt(cid, msg.delivery_attempt);
+        if (cid && !attempt.accepted) return;
         if (sid) clearProvisionalStream(sid);
         if (cid) {
           const failureReason = msg.reason || msg.message || msg.error?.message || 'Send failed';
-          markDeliveryFailed(cid, failureReason, sid);
+          markDeliveryFailed(cid, failureReason, sid, {
+            network: true,
+            delivery_attempt: msg.delivery_attempt,
+            failure_code: msg.failure_code || msg.error?.code,
+            failure_reason: failureReason,
+            failure_native_attempted: msg.failure_native_attempted ?? msg.error?.native_attempted,
+            failure_retryable: msg.failure_retryable ?? msg.error?.retryable,
+          });
         }
         return;
       }
@@ -3215,18 +3856,21 @@ export function useRelay() {
         const cid = msg.client_message_id;
         const sid = msg.session_id || msg.session;
         if (cid) {
+          const attempt = acceptDeliveryAttempt(cid, msg.delivery_attempt);
+          if (!attempt.accepted) return;
           const contentBlocks = Array.isArray(msg.content_blocks) ? msg.content_blocks : [];
           const queuedBlock = contentBlocks.find(block => block?.type === 'queued_message');
+          if (!setTrackedDeliveryState(cid, 'busy_queued', { force: attempt.advanced })) return;
           clearDeliveryTimeout(cid);
-          setTrackedDeliveryState(cid, 'busy_queued');
           if (sid) {
             setQueuedMessages(prev => ({
               ...prev,
-              [sid]: [...(prev[sid] || []), {
+              [sid]: [...(prev[sid] || []).filter(item => item.cid !== cid), {
                 cid,
                 content: queuedBlock?.content ?? msg.content,
                 content_blocks: contentBlocks,
                 queuedAt: msg.queued_at,
+                delivery_attempt: attempt.attempt,
               }],
             }));
           }
@@ -3237,7 +3881,9 @@ export function useRelay() {
         const cid = msg.client_message_id;
         const sid = msg.session_id || msg.session;
         if (cid) {
-          setTrackedDeliveryState(cid, 'accepted');
+          const attempt = acceptDeliveryAttempt(cid, msg.delivery_attempt);
+          if (!attempt.accepted) return;
+          if (!setTrackedDeliveryState(cid, 'accepted', { force: true })) return;
           armDeliveryTimeout(cid, 'accepted', 'Queued message left the relay, but native delivery timed out.');
           if (sid) setQueuedMessages(prev => ({ ...prev, [sid]: (prev[sid] || []).filter(m => m.cid !== cid) }));
         }
@@ -3357,8 +4003,19 @@ export function useRelay() {
         const contentBlocks = Array.isArray(msg.content_blocks)
           ? msg.content_blocks
           : (Array.isArray(msg.message?.content_blocks) ? msg.message.content_blocks : null);
-        const clientMessageId = msg.client_message_id || msg.message?.client_message_id || null;
+        const clientMessageId = msg.client_message_id
+          || msg.client_msg_id
+          || msg.message?.client_message_id
+          || msg.message?.client_msg_id
+          || null;
         const deliveryStatus = msg.status || msg.message?.status || null;
+        const deliveryAttempt = msg.delivery_attempt ?? msg.message?.delivery_attempt ?? null;
+        const failureCode = msg.failure_code || msg.message?.failure_code || null;
+        const failureReason = msg.failure_reason || msg.message?.failure_reason || null;
+        const failureNativeAttempted = msg.failure_native_attempted
+          ?? msg.message?.failure_native_attempted
+          ?? null;
+        const failureRetryable = msg.failure_retryable ?? msg.message?.failure_retryable ?? null;
         const sourceMessageId = msg.source_message_id || msg.message?.source_message_id || null;
         const nativeSourceId = msg.native_source_id || msg.message?.native_source_id || null;
         const sourceCursor = msg.source_cursor || msg.message?.source_cursor || null;
@@ -3367,6 +4024,7 @@ export function useRelay() {
         const messageSequence = msg.sequence ?? msg.message?.sequence ?? null;
         const nativeDelivered = deliveryStatus === 'delivered' || deliveryStatus === 'agent_started';
         if (!id || !role || !content) return;
+        if (isDetachedCodexDesktopThreadView(id)) return;
         if (role === 'assistant') clearProvisionalStream(id);
         const incomingMessage = normalizeMessageTimestamp({
           role,
@@ -3379,6 +4037,11 @@ export function useRelay() {
           ...(serverMessageId != null ? { server_message_id: serverMessageId } : {}),
           ...(clientMessageId ? { client_message_id: clientMessageId } : {}),
           ...(deliveryStatus ? { status: deliveryStatus } : {}),
+          ...(deliveryAttempt != null ? { delivery_attempt: deliveryAttempt } : {}),
+          ...(failureCode ? { failure_code: failureCode } : {}),
+          ...(failureReason ? { failure_reason: failureReason } : {}),
+          ...(failureNativeAttempted != null ? { failure_native_attempted: failureNativeAttempted } : {}),
+          ...(failureRetryable != null ? { failure_retryable: failureRetryable } : {}),
           ...(messageSequence != null ? { sequence: messageSequence } : {}),
           ...((msg.created_at ?? msg.message?.created_at) != null ? { created_at: msg.created_at ?? msg.message?.created_at } : {}),
           ...((msg.timestamp ?? msg.message?.timestamp) != null ? { timestamp: msg.timestamp ?? msg.message?.timestamp } : {}),
@@ -3400,24 +4063,15 @@ export function useRelay() {
               const prev_msg = existing[idx];
               updated[idx] = normalizeMessageTimestamp({
                 ...prev_msg,
-                role,
-                content,
-                ...(contentBlocks ? { content_blocks: contentBlocks } : {}),
-                ...(incomingMessage.source_message_id ? { source_message_id: incomingMessage.source_message_id } : {}),
-                ...(incomingMessage.native_source_id ? { native_source_id: incomingMessage.native_source_id } : {}),
-                ...(incomingMessage.source_cursor ? { source_cursor: incomingMessage.source_cursor } : {}),
-                ...(incomingMessage.source ? { source: incomingMessage.source } : {}),
-                ...(incomingMessage.server_message_id != null ? { server_message_id: incomingMessage.server_message_id } : {}),
-                ...(incomingMessage.client_message_id ? { client_message_id: incomingMessage.client_message_id } : {}),
-                ...(incomingMessage.status ? { status: incomingMessage.status } : {}),
-                ...(incomingMessage.sequence != null ? { sequence: incomingMessage.sequence } : {}),
-                ...(incomingMessage.created_at != null ? { created_at: incomingMessage.created_at } : {}),
-                ...(incomingMessage.timestamp != null ? { timestamp: incomingMessage.timestamp } : {}),
-                ...(incomingMessage.ts != null ? { ts: incomingMessage.ts } : {}),
+                ...incomingMessage,
                 _delivered: prev_msg._delivered || nativeDelivered,
                 _agentStarted: prev_msg._agentStarted || deliveryStatus === 'agent_started',
                 _cid: prev_msg._cid,
                 _optimistic: prev_msg._optimistic,
+                _deliveryAttempt: deliveryAttempt ?? prev_msg._deliveryAttempt ?? 1,
+                _sendError: deliveryStatus === 'failed'
+                  ? (failureReason || failureCode || prev_msg._sendError || 'Send failed')
+                  : prev_msg._sendError,
               });
               return { ...prev, [id]: removeSupersededCliTranscriptPlaceholders(updated) };
             }
@@ -3444,6 +4098,10 @@ export function useRelay() {
             {
               ...incomingMessage,
               ...(role === 'user' && clientMessageId ? { _cid: clientMessageId } : {}),
+              ...(role === 'user' && deliveryAttempt != null ? { _deliveryAttempt: deliveryAttempt } : {}),
+              ...(role === 'user' && deliveryStatus === 'failed'
+                ? { _sendError: failureReason || failureCode || 'Send failed' }
+                : {}),
               _delivered: role === 'user' && nativeDelivered,
               _agentStarted: role === 'user' && deliveryStatus === 'agent_started',
             },
@@ -3465,6 +4123,7 @@ export function useRelay() {
               : session
           )));
         }
+        recordLatencyTraceAfterPaint(msg, id);
         return;
       }
     }
@@ -3474,7 +4133,7 @@ export function useRelay() {
     // where `sessions` / `messages` would be frozen at initial render values).
     handleRelayMessageRef.current = handleRelayMessage;
 
-    return { sessions, messages, provisionalStreams, historyMeta, historyLoading, connected, connectionHealth, unread, setUnread, thinking, thinkingContent, activities, health, deliveryStates, launchStates, justLaunched, setJustLaunched, permissionPrompts, respondToPrompt, errorPrompts, respondToErrorPrompt, interruptSession, controlGoal, agentConfigs, configControlStates, requestAgentConfig, setAgentModel, setAgentEffort, setAgentPermissionMode, setAutoApprovePermissions, setAntigravityMode, setCodexConfig, newThread, openPanel, openNativeWindow, requestChatList, switchChat, newChat, chatLists, requestThreadList, switchThread, threadLists, switchWorkspace, requestTerminalOutput, sendTerminalInput, terminalOutputs, requestFileChanges, respondToFileChange, fileChanges, sendAttachment, send, sendToSession, steerMessage, discardQueuedMessage, editQueuedMessage, queuedMessages, scheduledSends, scheduleSend, cancelScheduledSend, refreshScheduledSends, launchSession, resumeSession, closeSession, activeSessionRef, restoreCachedTranscript, setSessionSubscriptions, workspaces, branchLists, requestBranchList, switchBranch, createBranch, skillLists, requestSkillList, automationViews, showCodexAutomation, controlResults, directoryListings, requestDirectoryListing, fileContents, requestFileContent, requestHistory, requestHistoryChunk, duplicateProxyAlarms, nightlyValidationFailures, latestAppUpdateValidation, revalidationProgramHealth, operatorDogfoodHealth, providerUsage, providerUsageRefreshReceipt, requestProviderUsageRefresh, setProviderUsageWatching, providerUsageResetReceipt, consumeProviderUsageResetCredit, providerUsageCostDetail, requestProviderUsageCostDetail, hostResources, hostResourceError, hostResourceHistory, hostResourceDetails, hostResourceSubscription, subscribeHostResources, unsubscribeHostResources, requestHostResourceRefresh, clearHostResources, semanticNotifications, sessionAliases };
+    return { sessions, messages, provisionalStreams, historyMeta, historyLoading, connected, connectionHealth, unread, setUnread, thinking, thinkingContent, activities, health, deliveryStates, launchStates, justLaunched, setJustLaunched, permissionPrompts, respondToPrompt, errorPrompts, respondToErrorPrompt, interruptSession, controlGoal, agentConfigs, configControlStates, requestAgentConfig, setAgentModel, setAgentEffort, setAgentPermissionMode, setAutoApprovePermissions, setAntigravityMode, setCodexConfig, newThread, openPanel, openNativeWindow, requestChatList, switchChat, newChat, chatLists, requestThreadList, switchThread, threadLists, threadViews, switchWorkspace, requestTerminalOutput, sendTerminalInput, terminalOutputs, requestFileChanges, respondToFileChange, fileChanges, sendAttachment, send, sendToSession, steerMessage, discardQueuedMessage, editQueuedMessage, queuedMessages, scheduledSends, scheduleSend, cancelScheduledSend, refreshScheduledSends, launchSession, resumeSession, closeSession, activeSessionRef, restoreCachedTranscript, setSessionSubscriptions, workspaces, branchLists, requestBranchList, switchBranch, createBranch, skillLists, requestSkillList, automationViews, showCodexAutomation, controlResults, directoryListings, requestDirectoryListing, fileContents, requestFileContent, requestHistory, requestHistoryChunk, duplicateProxyAlarms, nightlyValidationFailures, latestAppUpdateValidation, revalidationProgramHealth, operatorDogfoodHealth, providerUsage, providerUsageRefreshReceipt, requestProviderUsageRefresh, setProviderUsageWatching, providerUsageResetReceipt, consumeProviderUsageResetCredit, providerUsageCostDetail, requestProviderUsageCostDetail, hostResources, hostResourceError, hostResourceHistory, hostResourceDetails, hostResourceSubscription, subscribeHostResources, unsubscribeHostResources, requestHostResourceRefresh, clearHostResources, semanticNotifications, sessionAliases };
   }
 
 // (removed window.useRelay — now an ES module export)

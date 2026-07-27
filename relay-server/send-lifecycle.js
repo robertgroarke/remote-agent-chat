@@ -30,6 +30,10 @@ class SendLifecycleTracker {
       }
       this.pending.set(sessionId, {
         clientMessageId,
+        deliveryAttempt: Number.isInteger(Number(message.delivery_attempt))
+          && Number(message.delivery_attempt) > 0
+          ? Number(message.delivery_attempt)
+          : null,
         deliveredAt: message.delivered_at || new Date(this.now()).toISOString(),
         recordedAt: this.now(),
       });
@@ -77,7 +81,7 @@ class SendLifecycleTracker {
     const startedAtMs = Number.isFinite(deliveredAtMs)
       ? Math.max(deliveredAtMs, observedStartedAtMs)
       : observedStartedAtMs;
-    return {
+    const agentStarted = {
       type: 'agent_started',
       protocol_version: 1,
       session_id: sessionId,
@@ -88,6 +92,8 @@ class SendLifecycleTracker {
         ? message.activity
         : { kind: activityKind || 'working' },
     };
+    if (pending.deliveryAttempt) agentStarted.delivery_attempt = pending.deliveryAttempt;
+    return agentStarted;
   }
 
   clearSession(sessionId) {

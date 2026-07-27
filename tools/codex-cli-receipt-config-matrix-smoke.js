@@ -35,6 +35,7 @@ fs.writeFileSync(path.join(codexRoot, 'models_cache.json'), JSON.stringify({
 
 process.env.USERPROFILE = root;
 const codexCli = require('../agent-proxy/codex-cli');
+const { ProxyEngine } = require('../agent-proxy/proxy-engine');
 
 const line = entry => `${JSON.stringify(entry)}\n`;
 const ts = (offset = 0) => new Date(Date.now() + offset).toISOString();
@@ -105,6 +106,56 @@ async function main() {
   assert.strictEqual(installedObservation.effort, 'max');
   assert.strictEqual(installedObservation.model_observation.source, 'turn_context');
   assert.strictEqual(installedObservation.effort_observation.source, 'turn_context');
+
+  const completionId = '05000000-0000-4000-8000-000000000001';
+  const completionFile = sessionPath(completionId);
+  write(completionFile, [
+    { timestamp: ts(-6000), type: 'session_meta', payload: { id: completionId, cwd: root } },
+    {
+      timestamp: ts(-5900),
+      type: 'turn_context',
+      payload: { turn_id: 'completion-turn', model: 'gpt-5.4-mini', effort: 'low' },
+    },
+  ]);
+  const completionTurn = {};
+  const completionSession = {
+    codexCliFilePath: completionFile,
+    _codexAppServerTurn: completionTurn,
+    observedModelId: 'unknown',
+    observedEffort: 'unknown',
+  };
+  const completionEngine = Object.create(ProxyEngine.prototype);
+  completionEngine.sessions = new Map([[completionId, completionSession]]);
+  completionEngine._applyCodexCliSummaryMetadata = (sessionId, session, summary) => {
+    assert.strictEqual(sessionId, completionId);
+    assert.strictEqual(summary.model_id, 'gpt-5.4-mini');
+    assert.strictEqual(summary.effort, 'low');
+    session.observedModelId = summary.model_id;
+    session.observedEffort = summary.effort;
+    return true;
+  };
+  let completionPublished = null;
+  completionEngine._publishCodexCliConfig = (sessionId, session) => {
+    completionPublished = {
+      session_id: sessionId,
+      observed_model_id: session.observedModelId,
+      observed_effort: session.observedEffort,
+    };
+    return completionPublished;
+  };
+  completionEngine._log = () => {};
+  const completionReceipt = await completionEngine._publishCodexCliNativeCompletionConfig(
+    completionId,
+    completionSession,
+    completionTurn,
+    { timeoutMs: 50, pollMs: 5 },
+  );
+  assert(completionReceipt.model_observed && completionReceipt.effort_observed);
+  assert.deepStrictEqual(completionPublished, {
+    session_id: completionId,
+    observed_model_id: 'gpt-5.4-mini',
+    observed_effort: 'low',
+  });
 
   const configId = '10000000-0000-4000-8000-000000000001';
   const configFile = sessionPath(configId);
@@ -272,7 +323,7 @@ async function main() {
     p50_ms: Number(percentile(0.50).toFixed(3)),
     p95_ms: Number(percentile(0.95).toFixed(3)),
     max_ms: Number(sorted[sorted.length - 1].toFixed(3)),
-    config_cases: ['unknown', 'later_turn_change', 'partial_line', 'rotation', 'bounded_tail', 'installed_0.144.6_turn_context', 'catalog_hot_refresh', 'partial_cache_retained'],
+    config_cases: ['unknown', 'later_turn_change', 'partial_line', 'rotation', 'bounded_tail', 'installed_0.144.6_turn_context', 'completion_publish_before_teardown', 'catalog_hot_refresh', 'partial_cache_retained'],
     receipt_cases: ['identical_sequential', 'partial_line', 'wrong_session', 'malformed_tail', 'rotation', 'two_sessions', 'exit_0_no_append', 'nonzero_exit'],
   };
   process.stdout.write(`PASS codex-cli receipt/config matrix ${JSON.stringify(result)}\n`);

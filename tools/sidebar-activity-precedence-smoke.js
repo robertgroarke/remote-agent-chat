@@ -198,6 +198,41 @@ try {
   producerActivity = { ...producerActivity, observed_at: new Date(NOW_MS + 5_000).toISOString() };
   assertProducerState(NOW_MS + 19_999, 'working');
   assertProducerState(NOW_MS + 20_001, 'stale');
+  const semanticMembershipOptions = web.sidebarSemanticMembershipOptions({
+    connected: true,
+    health: 'healthy',
+    nowMs: NOW_MS + 60_000,
+    requireFreshness: true,
+  });
+  assert.strictEqual(semanticMembershipOptions.requireFreshness, false);
+  assert.deepStrictEqual(android.sidebarSemanticMembershipOptions({
+    connected: true,
+    health: 'healthy',
+    nowMs: NOW_MS + 60_000,
+    requireFreshness: true,
+  }), semanticMembershipOptions);
+  assert.strictEqual(web.sidebarSessionState(producerFixture, {
+    activities: { [producerFixture.session_id]: producerActivity },
+    ...semanticMembershipOptions,
+  }), 'working');
+  assert.strictEqual(web.sidebarSessionState(producerFixture, {
+    activities: { [producerFixture.session_id]: producerActivity },
+    ...semanticMembershipOptions,
+    health: { [producerFixture.session_id]: 'disconnected' },
+  }), 'stale');
+  const staleWorkingSnapshot = {
+    session_id: 'live-idle-tombstone-fixture',
+    activity: { kind: 'generating', generating: true, updated_at: FRESH_AT },
+  };
+  const liveIdleTombstoneOptions = {
+    activities: { [staleWorkingSnapshot.session_id]: false },
+    connected: true,
+    health: { [staleWorkingSnapshot.session_id]: 'healthy' },
+    nowMs: NOW_MS,
+    requireFreshness: false,
+  };
+  assert.strictEqual(web.sidebarSessionState(staleWorkingSnapshot, liveIdleTombstoneOptions), 'idle');
+  assert.strictEqual(android.sidebarSessionState(staleWorkingSnapshot, liveIdleTombstoneOptions), 'idle');
 
   const laggedBlockedGoal = {
     kind: 'generating',
@@ -256,6 +291,60 @@ try {
     withEntrant,
   );
 
+  const continuityOptions = { nowMs: NOW_MS, entryConfirmMs: 2_000, exitGraceMs: 10_000 };
+  const pendingEntrant = web.reconcileSidebarWorkingLedger(
+    initialLedger,
+    workingObjects.slice(0, 4),
+    continuityOptions,
+  );
+  assert.strictEqual(pendingEntrant.structuralChanged, false);
+  assert.strictEqual(pendingEntrant.deferred, true);
+  assert.deepStrictEqual(pendingEntrant.sessions.map(idOf), initialLedger.sessionOrder);
+  const confirmedEntrant = web.reconcileSidebarWorkingLedger(
+    pendingEntrant.ledger,
+    workingObjects.slice(0, 4),
+    { ...continuityOptions, nowMs: NOW_MS + 2_000 },
+  );
+  assert.strictEqual(confirmedEntrant.structuralChanged, true);
+  assert.deepStrictEqual(confirmedEntrant.sessions.map(idOf), [...initialLedger.sessionOrder, idOf(workingObjects[3])]);
+  const ambiguousExit = web.reconcileSidebarWorkingLedger(
+    confirmedEntrant.ledger,
+    workingObjects.slice(0, 3),
+    { ...continuityOptions, nowMs: NOW_MS + 3_000 },
+  );
+  assert.strictEqual(ambiguousExit.structuralChanged, false);
+  assert.deepStrictEqual(ambiguousExit.sessions.map(idOf), confirmedEntrant.ledger.sessionOrder);
+  const sustainedExit = web.reconcileSidebarWorkingLedger(
+    ambiguousExit.ledger,
+    workingObjects.slice(0, 3),
+    { ...continuityOptions, nowMs: NOW_MS + 13_000 },
+  );
+  assert.strictEqual(sustainedExit.structuralChanged, true);
+  assert.deepStrictEqual(sustainedExit.sessions.map(idOf), initialLedger.sessionOrder);
+  const immediateExit = web.reconcileSidebarWorkingLedger(
+    confirmedEntrant.ledger,
+    workingObjects.slice(0, 3),
+    {
+      ...continuityOptions,
+      nowMs: NOW_MS + 3_000,
+      immediateExitIds: new Set([idOf(workingObjects[3])]),
+    },
+  );
+  assert.strictEqual(immediateExit.structuralChanged, true);
+  assert.deepStrictEqual(immediateExit.sessions.map(idOf), initialLedger.sessionOrder);
+  assert.deepStrictEqual(
+    android.reconcileSidebarWorkingLedger(
+      android.reconcileSidebarWorkingLedger(
+        android.createSidebarWorkingLedger(workingObjects.slice(0, 3)),
+        workingObjects.slice(0, 4),
+        continuityOptions,
+      ).ledger,
+      workingObjects.slice(0, 4),
+      { ...continuityOptions, nowMs: NOW_MS + 2_000 },
+    ),
+    confirmedEntrant,
+  );
+
   const workingPinned = baselineWeb.working.filter(id => fixture.preferences[id]?.pinned);
   assert.ok(workingPinned.length > 0);
   workingPinned.forEach(id => {
@@ -312,10 +401,12 @@ try {
 
   const appSource = fs.readFileSync(path.join(ROOT, 'frontend', 'app.jsx'), 'utf8');
   const androidSource = fs.readFileSync(path.join(ROOT, 'android-app', 'screens', 'SessionListScreen.jsx'), 'utf8');
-  assert.ok((appSource.match(/requireFreshness:\s*true/g) || []).length >= 2,
-    'Web Fleet and Sidebar must both enforce producer freshness');
-  assert.ok((androidSource.match(/requireFreshness:\s*true/g) || []).length >= 2,
-    'Android Fleet and Sidebar must both enforce producer freshness');
+  assert.ok((appSource.match(/requireFreshness:\s*true/g) || []).length >= 1,
+    'Web Fleet display state must enforce producer freshness');
+  assert.ok((androidSource.match(/requireFreshness:\s*true/g) || []).length >= 1,
+    'Android Fleet display state must enforce producer freshness');
+  assert.match(appSource, /sidebarSemanticMembershipOptions\(sidebarStateOptions\)/);
+  assert.match(androidSource, /sidebarSemanticMembershipOptions\(sidebarStateOptions\)/);
   assert.ok(appSource.indexOf('{workingSessions.length > 0') < appSource.indexOf('{pinnedSessions.length > 0'));
   assert.match(appSource, /\.\.\.workingSessions, \.\.\.recentSessions, \.\.\.pinnedSessions, \.\.\.sessionGroups/);
   assert.match(appSource, /class SidebarScrollCoordinator extends React\.Component/);
@@ -336,10 +427,15 @@ try {
     identical_snapshot_replays: 600,
     identical_snapshot_moves: identicalSnapshotMoves,
     stable_working_ledger: true,
+    working_membership_entry_confirmation_ms: 2_000,
+    ambiguous_working_exit_grace_ms: 10_000,
+    explicit_idle_attention_exit_immediate: true,
     authoritative_edges: edgeEvidence,
     web_android_state_parity: true,
     web_android_hierarchy_parity: true,
     fleet_sidebar_freshness_policy_parity: true,
+    working_membership_ignores_heartbeat_freshness: true,
+    live_idle_tombstone_beats_stale_working_snapshot: true,
     producer_heartbeat_kept_working: true,
     stalled_producer_demoted_together_ms: 15_001,
     lagged_blocked_goal_with_confirmed_execution: 'working_goal',

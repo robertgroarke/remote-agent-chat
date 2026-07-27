@@ -14,12 +14,31 @@ const {
 } = require('./mobile-cold-load-production-e2e');
 
 const ROOT = path.resolve(__dirname, '..');
+const ENV_ROOT = path.resolve(process.env.RAC_CONFIG_ROOT || ROOT);
 const args = process.argv.slice(2);
 const outputIndex = args.indexOf('--output');
 const outputPath = outputIndex >= 0 && args[outputIndex + 1]
   ? path.resolve(args[outputIndex + 1])
   : path.join(ROOT, 'evidence', 'harness-maturity', new Date().toISOString().slice(0, 10),
     'vscode-codex-controls-production-passive.json');
+const sessionIndex = args.indexOf('--session-id');
+const requestedSessionId = sessionIndex >= 0 && args[sessionIndex + 1]
+  ? String(args[sessionIndex + 1])
+  : '';
+const widthIndex = args.indexOf('--width');
+const heightIndex = args.indexOf('--height');
+const themeIndex = args.indexOf('--theme');
+const viewport = {
+  width: widthIndex >= 0 ? Number(args[widthIndex + 1]) : 1440,
+  height: heightIndex >= 0 ? Number(args[heightIndex + 1]) : 900,
+};
+const theme = themeIndex >= 0 ? String(args[themeIndex + 1]) : 'dark';
+const sessionStorePath = path.resolve(
+  process.env.SESSION_STORE_PATH || path.join(ROOT, 'agent-proxy', 'session-store.json'),
+);
+assert(Number.isInteger(viewport.width) && viewport.width >= 320, '--width must be at least 320');
+assert(Number.isInteger(viewport.height) && viewport.height >= 480, '--height must be at least 480');
+assert(['dark', 'light'].includes(theme), '--theme must be dark or light');
 
 const FORBIDDEN_WS_TYPES = new Set([
   'set_codex_config', 'send', 'permission_response', 'error_prompt_action',
@@ -29,14 +48,18 @@ const FORBIDDEN_WS_TYPES = new Set([
 ]);
 
 function protectedSession() {
-  const store = JSON.parse(fs.readFileSync(path.join(ROOT, 'agent-proxy', 'session-store.json'), 'utf8'));
-  const matches = Object.entries(store.sessions || {}).filter(([, session]) => (
+  const store = JSON.parse(fs.readFileSync(sessionStorePath, 'utf8'));
+  const matches = Object.entries(store.sessions || {}).filter(([sessionId, session]) => (
     session?.agent_type === 'codex'
     && Number(session?.cdp_port) === 9223
     && session?.status === 'healthy'
-    && /[\\/]Remote Agent Chat$/i.test(String(session?.workspace_path || ''))
+    && (requestedSessionId
+      ? sessionId === requestedSessionId
+      : /[\\/]Remote Agent Chat$/i.test(String(session?.workspace_path || '')))
   ));
-  assert.equal(matches.length, 1, 'Expected one healthy protected Remote Agent Chat Codex session');
+  assert.equal(matches.length, 1, requestedSessionId
+    ? `Expected one healthy protected Codex session ${requestedSessionId}`
+    : 'Expected one healthy protected Remote Agent Chat Codex session');
   const [sessionId, session] = matches[0];
   assert(session.target_id, 'Protected Codex session omitted target_id');
   return { session_id: sessionId, ...session };
@@ -52,7 +75,11 @@ async function nativeConfig(session) {
     await client.Runtime.enable();
     client.Runtime._webviewId = (String(target.url || '').match(/[?&]id=([0-9a-f-]+)/i) || [])[1] || '';
     await selectors.cacheInnerContextId(client.Runtime);
-    const config = await selectors.readAgentConfig(client.Runtime, 'codex', session.workspace_path || '');
+    const [config, rawMessages] = await Promise.all([
+      selectors.readAgentConfig(client.Runtime, 'codex', session.workspace_path || ''),
+      selectors.readMessages(client.Runtime, 'codex', `vscode-codex-controls-${session.session_id}`),
+    ]);
+    const messages = rawMessages ? JSON.parse(rawMessages) : [];
     return {
       model_id: config.model_id,
       effort: config.effort,
@@ -60,6 +87,7 @@ async function nativeConfig(session) {
       permission_mode: config.permission_mode,
       approval_policy: config.approval_policy,
       conversation_scoped: config.conversation_scoped === true,
+      native_message_count: Array.isArray(messages) ? messages.length : 0,
     };
   } finally {
     await client?.close().catch(() => {});
@@ -67,8 +95,8 @@ async function nativeConfig(session) {
 }
 
 async function main() {
-  const relayEnv = fidelity.loadEnvFile(path.join(ROOT, 'relay-server', '.env'));
-  const proxyEnv = fidelity.loadEnvFile(path.join(ROOT, 'agent-proxy', '.env'));
+  const relayEnv = fidelity.loadEnvFile(path.join(ENV_ROOT, 'relay-server', '.env'));
+  const proxyEnv = fidelity.loadEnvFile(path.join(ENV_ROOT, 'agent-proxy', '.env'));
   const upstreamUrl = fidelity.deriveRelayBaseUrl(null, relayEnv, proxyEnv);
   const publicOrigin = new URL(relayEnv.PUBLIC_URL).origin;
   const token = fidelity.buildBearerToken(relayEnv);
@@ -77,7 +105,6 @@ async function main() {
 
   const session = protectedSession();
   const expected = await nativeConfig(session);
-  assert(expected.conversation_scoped, 'Protected target is not a conversation-scoped Codex session');
   assert(expected.model_id && expected.model_id !== 'unknown', 'Protected native model is unreadable');
   assert(expected.effort && expected.effort !== 'unknown', 'Protected native effort is unreadable');
   assert(expected.permission_profile && expected.permission_profile !== 'unknown',
@@ -90,7 +117,9 @@ async function main() {
     args: ['--disable-gpu', '--no-first-run', '--disable-background-networking'],
   });
   try {
-    const page = await browser.newPage({ viewport: { width: 1440, height: 900 } });
+    const context = await browser.newContext({ viewport });
+    await context.addInitScript(selectedTheme => localStorage.setItem('theme', selectedTheme), theme);
+    const page = await context.newPage();
     const diagnostics = [];
     page.on('console', message => diagnostics.push(`console:${message.type()}:${message.text()}`));
     page.on('pageerror', error => diagnostics.push(`pageerror:${error.message}`));
@@ -157,8 +186,18 @@ async function main() {
       document.querySelector('.session-card.active[data-session-id="' + CSS.escape(sessionId) + '"]')
       && document.querySelector('.messages')?.dataset?.agentType === 'codex'
     ), session.session_id, { timeout: 20000 });
+    await page.waitForFunction(({ sessionId, expectedCount }) => (
+      document.querySelector('.session-card.active[data-session-id="' + CSS.escape(sessionId) + '"]')
+      && Number(document.querySelector('.messages')?.dataset?.totalMessageCount || 0) === expectedCount
+    ), { sessionId: session.session_id, expectedCount: expected.native_message_count }, { timeout: 45000 });
+    if (viewport.width <= 768) {
+      const mobileSettingsToggle = page.locator('button.composer-gear-btn[title="Toggle settings"]');
+      await mobileSettingsToggle.waitFor({ state: 'visible', timeout: 15000 });
+      await mobileSettingsToggle.evaluate(element => element.click());
+      await page.waitForSelector('.composer-settings.is-open', { state: 'visible', timeout: 15000 });
+    }
 
-    const detailsButton = page.locator('button.composer-desktop-action')
+    const detailsButton = page.locator('button.composer-desktop-action:visible, button.composer-mobile-action:visible')
       .filter({ hasText: 'Session details' })
       .first();
     await detailsButton.waitFor({ state: 'visible', timeout: 15000 });
@@ -199,6 +238,11 @@ async function main() {
         permissions: row('Next turn permissions'),
         approval_policy: row('Approval policy'),
         access_sandbox: row('Access / sandbox'),
+        total_message_count: Number(document.querySelector('.messages')?.dataset?.totalMessageCount || 0),
+        session_card_text: document.querySelector('.session-card.active[data-session-id]')?.textContent
+          ?.replace(/\s+/g, ' ').trim() || '',
+        composer_present: !!document.querySelector('.input-area textarea'),
+        composer_disabled: document.querySelector('.input-area textarea')?.disabled === true,
         body_overflow_x: document.body.scrollWidth > window.innerWidth,
         bundle_src: script?.getAttribute('src') || '',
         sent_ws: Array.from(window.__RAC_PASSIVE_WS_SENT__ || []),
@@ -207,6 +251,8 @@ async function main() {
 
     assert.equal(state.selected_session_id, session.session_id, 'Production UI selected the wrong session');
     assert.equal(state.agent_type, 'codex', 'Production UI rendered the wrong harness skin');
+    assert.equal(state.total_message_count, expected.native_message_count,
+      'Rendered transcript count differs from protected native truth');
     assert.equal(state.model?.value, expected.model_id, 'Rendered model differs from protected native truth');
     assert.equal(state.effort?.value, expected.effort, 'Rendered effort differs from protected native truth');
     assert.equal(state.permissions?.value, expected.permission_profile,
@@ -219,15 +265,18 @@ async function main() {
     assert(state.effort.options.some(option => option.value === expected.effort), 'Current effort is absent from picker');
     assert(state.permissions.options.some(option => option.value === 'full-access' && option.text === 'Full access'),
       'Confirmed Full access option is absent from permission picker');
-    assert.equal(state.model.disabled, false, 'Protected model picker is unexpectedly disabled');
-    assert.equal(state.effort.disabled, false, 'Protected effort picker is unexpectedly disabled');
-    assert.equal(state.permissions.disabled, false, 'Protected permissions picker is unexpectedly disabled');
+    assert.equal(state.model.disabled, !expected.conversation_scoped,
+      'Protected model picker availability differs from native conversation scope');
+    assert.equal(state.effort.disabled, !expected.conversation_scoped,
+      'Protected effort picker availability differs from native conversation scope');
+    assert.equal(state.permissions.disabled, !expected.conversation_scoped,
+      'Protected permissions picker availability differs from native conversation scope');
     assert.equal(state.body_overflow_x, false, 'Production settings cause horizontal overflow');
     const forbidden = state.sent_ws.filter(message => FORBIDDEN_WS_TYPES.has(message.type));
     assert.deepStrictEqual(forbidden, [], 'Passive production proof emitted a control/send message');
 
     const screenshotPath = path.join(path.dirname(outputPath),
-      'vscode-codex-controls-production-passive-1440x900.png');
+      `vscode-codex-controls-production-passive-${session.session_id.slice(0, 8)}-${viewport.width}x${viewport.height}-${theme}.png`);
     fs.mkdirSync(path.dirname(screenshotPath), { recursive: true });
     await page.screenshot({ path: screenshotPath, fullPage: true });
     const result = {
@@ -236,6 +285,7 @@ async function main() {
       browser: 'Google Chrome headless (fresh authenticated production loopback)',
       public_origin: publicOrigin,
       production_lan_origin: new URL(upstreamUrl).origin,
+      viewport: { ...viewport, theme },
       protected_session: {
         session_id: session.session_id,
         cdp_port: 9223,
@@ -244,6 +294,12 @@ async function main() {
       native_expected: expected,
       rendered: state,
       forbidden_ws_messages: forbidden.length,
+      delivery_capability: {
+        composer_present: state.composer_present,
+        composer_disabled: state.composer_disabled,
+        protected_send_exercised: false,
+        reason: 'protected port 9223 passive-only contract',
+      },
       production_controls_clicked: 0,
       user_messages_sent: 0,
       focus_actions: 0,

@@ -5,10 +5,15 @@
 // Native's WebSocket implementation does not support custom headers.
 
 import { getStoredJwt, RELAY_URL } from './auth';
+import { estimateRelayClockOffset } from './latency-clock';
+import { DeviceEventEmitter, Platform, unstable_batchedUpdates } from 'react-native';
 
 const RECONNECT_DELAYS_MS = [250, 500, 1_000, 2_000, 3_000];
 const DEFAULT_HEARTBEAT_MS = 10_000;
 const DEFAULT_HEARTBEAT_TIMEOUT_MS = 30_000;
+const SESSION_SUMMARY_FLUSH_MS = 100;
+const CONNECT_OPEN_POLL_MS = 250;
+const CONNECT_OPEN_TIMEOUT_MS = 15_000;
 
 export function classifyRelayRtt(rttMs) {
   if (!Number.isFinite(rttMs) || rttMs < 0) return 'connecting';
@@ -24,11 +29,15 @@ export class RelayClient {
     this.reconnectAttempt = 0;
     this._reconnectTimer = null;
     this._heartbeatTimer = null;
+    this._heartbeatStartTimer = null;
     this._heartbeatIntervalMs = DEFAULT_HEARTBEAT_MS;
     this._heartbeatTimeoutMs = DEFAULT_HEARTBEAT_TIMEOUT_MS;
     this._heartbeatSequence = 0;
     this._heartbeatPending = new Map();
+    this._relayClockEstimate = null;
     this._sessionSubscriptions = [];
+    this._sessionSummaryPending = new Map();
+    this._sessionSummaryTimer = null;
     this._subscriptionSequence = 0;
     this._hostResourceDesired = { active: false, aggregateOnly: false };
     this._hostResourceSubscriptionId = '';
@@ -36,6 +45,9 @@ export class RelayClient {
     this._hostResourceSequence = 0;
     this._controlConnectionId = '';
     this._sessionAliases = new Map();
+    this._connecting     = false;
+    this._connectWatchdogTimer = null;
+    this._nativeSocketSubscriptions = [];
     this.stopped        = false;
   }
 
@@ -108,7 +120,19 @@ export class RelayClient {
 
   async connect() {
     if (this.stopped) return;
-    const jwt = await getStoredJwt();
+    if (this.ws?.readyState === WebSocket.OPEN) {
+      this.requestSessionSnapshot();
+      return;
+    }
+    if (this.ws?.readyState === WebSocket.CONNECTING || this._connecting) return;
+    this._connecting = true;
+    let jwt;
+    try {
+      jwt = await getStoredJwt();
+    } finally {
+      this._connecting = false;
+    }
+    if (this.stopped) return;
     if (!jwt) {
       // Not authenticated — surface as disconnected event and stop
       this.onMessage({ type: '_disconnected', reason: 'unauthenticated' });
@@ -116,15 +140,22 @@ export class RelayClient {
     }
     const wsBase = RELAY_URL.replace(/^http/, 'ws');
     const url    = `${wsBase}/client-ws?token=${encodeURIComponent(jwt)}`;
-    this.ws      = new WebSocket(url);
+    const socket = new WebSocket(url);
+    this.ws      = socket;
+    let openHandled = false;
 
-    this.ws.onopen = () => {
+    const handleOpen = () => {
+      if (openHandled || this.stopped || this.ws !== socket) return;
+      openHandled = true;
+      this._clearConnectWatchdog();
       console.log('[RelayClient] Connected to', wsBase);
       this.reconnectAttempt = 0;
       this.onMessage({ type: '_connected' });
       this.onMessage({ type: '_connection_health', state: 'connecting', rttMs: null, lastAckAt: null });
-      // Ask for current session list and history on connect
-      this._send({ type: 'connection_hello', last_sequence: 0 });
+      // React Native may finish a fast LAN handshake before property handlers
+      // are attached. Request an authoritative replay after every observed open
+      // so an early connection_ack can never strand the session list.
+      this.requestSessionSnapshot();
       this._send({
         type: 'subscribe',
         protocol_version: 1,
@@ -139,7 +170,7 @@ export class RelayClient {
       }
     };
 
-    this.ws.onmessage = (e) => {
+    const handleMessage = (e) => {
       try {
         let msg = JSON.parse(e.data);
         if (msg.type === 'session_alias_reconciled') {
@@ -168,12 +199,17 @@ export class RelayClient {
           this._hostResourceSubscriptionId = msg.subscription_id;
           this._hostResourceSubscribeRequestId = '';
         }
-        // Emit initial activity from session_list metadata so badges appear
-        // immediately on connect (before the first 'status' event arrives)
+        // The inventory already carries activity for every list row. Re-emitting
+        // all of it as individual status callbacks turns a large authoritative
+        // snapshot into N extra React state writes and can starve the heartbeat
+        // acknowledgment. Only the selected transcript subscription needs an
+        // initial status projection before its first live status frame.
         if ((msg.type === 'session_list' || msg.type === 'connection_ack') && Array.isArray(msg.sessions)) {
+          const subscribedSessionIds = new Set(this._sessionSubscriptions);
           this.onMessage(msg);
           for (const s of msg.sessions) {
-            if (s && typeof s === 'object' && s.session_id && s.activity) {
+            if (s && typeof s === 'object' && s.session_id && s.activity
+              && subscribedSessionIds.has(s.session_id)) {
               const kind = s.activity.kind || 'idle';
               this.onMessage({
                 type:     'status',
@@ -186,24 +222,136 @@ export class RelayClient {
           }
           return;
         }
+        if (msg.type === 'session_summary') {
+          this._queueSessionSummary(msg);
+          return;
+        }
         this.onMessage(msg);
-      } catch { /* ignore malformed frames */ }
+      } catch {
+        console.warn('[RelayClient] Dropped malformed relay frame');
+        this.onMessage({
+          type: '_transport_diagnostic',
+          stage: 'message_parse',
+          reason: 'malformed_frame',
+        });
+      }
     };
 
-    this.ws.onerror = (err) => {
+    const handleError = (err) => {
+      if (this.ws !== socket) return;
       console.warn('[RelayClient] WebSocket error', err?.message || err);
     };
 
-    this.ws.onclose = (e) => {
+    const handleClose = (e) => {
+      if (this.ws !== socket) return;
+      this._clearConnectWatchdog();
+      this._clearNativeSocketSubscriptions();
+      this._clearSessionSummaryQueue();
+      this.ws = null;
       console.log('[RelayClient] Disconnected', e?.code, e?.reason);
       this._stopHeartbeat();
       this.onMessage({ type: '_disconnected' });
       this.onMessage({ type: '_connection_health', state: 'offline', rttMs: null, lastAckAt: null });
       if (!this.stopped) this._scheduleReconnect();
     };
+
+    // React Native's release bridge emits socket lifecycle frames on the native
+    // device emitter. Consume that stream by socket id so the EventTarget shim
+    // cannot strand an otherwise-connected socket. Older hosts retain the
+    // property contract, while browsers retain EventTarget.
+    const nativePropertyEvents = Platform?.OS === 'android' || Platform?.OS === 'ios';
+    const nativeSocketId = Number(socket?._socketId);
+    const nativeRawEvents = nativePropertyEvents
+      && Number.isInteger(nativeSocketId)
+      && typeof DeviceEventEmitter?.addListener === 'function';
+    // React Native's WebSocket wrapper is an EventTarget even though its
+    // onopen/onmessage properties are not a reliable release contract. Prefer
+    // that wrapper stream because it is where native websocketMessage frames
+    // are decoded and dispatched. The raw emitter remains a fallback for older
+    // native wrappers that do not expose EventTarget.
+    if (typeof socket.addEventListener === 'function') {
+      socket.addEventListener('message', handleMessage);
+      socket.addEventListener('error', handleError);
+      socket.addEventListener('close', handleClose);
+      socket.addEventListener('open', handleOpen);
+    } else if (nativeRawEvents) {
+      this._clearNativeSocketSubscriptions();
+      const listen = (type, listener) => {
+        const subscription = DeviceEventEmitter.addListener(type, event => {
+          if (Number(event?.id) === nativeSocketId) listener(event);
+        });
+        this._nativeSocketSubscriptions.push(subscription);
+      };
+      listen('websocketOpen', event => {
+        // The raw native event can run before React Native's wrapper listener.
+        // Promote the public wrapper state first so the exactly-once hello,
+        // subscription, and heartbeat writes cannot be discarded as CONNECTING.
+        socket.readyState = WebSocket.OPEN;
+        if (typeof event?.protocol === 'string') socket.protocol = event.protocol;
+        handleOpen();
+      });
+      listen('websocketMessage', event => handleMessage({ data: event?.data }));
+      listen('websocketFailed', event => {
+        handleError({ message: event?.message });
+        handleClose({ code: 1006, reason: event?.message || 'native_websocket_failed' });
+      });
+      listen('websocketClosed', event => handleClose({
+        code: event?.code,
+        reason: event?.reason,
+      }));
+    } else if (nativePropertyEvents) {
+      socket.onmessage = handleMessage;
+      socket.onerror = handleError;
+      socket.onclose = handleClose;
+      socket.onopen = handleOpen;
+    } else {
+      socket.onmessage = handleMessage;
+      socket.onerror = handleError;
+      socket.onclose = handleClose;
+      socket.onopen = handleOpen;
+    }
+    const connectStartedAt = Date.now();
+    this._clearConnectWatchdog();
+    this._connectWatchdogTimer = setInterval(() => {
+      if (this.stopped || this.ws !== socket) {
+        this._clearConnectWatchdog();
+        return;
+      }
+      if (socket.readyState === WebSocket.OPEN) {
+        handleOpen();
+        return;
+      }
+      if (Date.now() - connectStartedAt < CONNECT_OPEN_TIMEOUT_MS) return;
+      this._clearConnectWatchdog();
+      this.ws = null;
+      console.warn('[RelayClient] WebSocket open timed out');
+      this.onMessage({ type: '_disconnected', reason: 'relay_open_timeout' });
+      this.onMessage({
+        type: '_connection_health',
+        state: 'offline',
+        rttMs: null,
+        lastAckAt: null,
+      });
+      try { socket.close(); } catch {}
+      if (!this.stopped) this._scheduleReconnect();
+    }, CONNECT_OPEN_POLL_MS);
+    setTimeout(() => {
+      if (socket.readyState === WebSocket.OPEN) handleOpen();
+    }, 0);
   }
 
   // ── Send helpers ───────────────────────────────────────────────────────────
+
+  requestSessionSnapshot() {
+    this._send({
+      type: 'connection_hello',
+      protocol_version: 1,
+      peer_role: 'android',
+      client_name: 'android-app',
+      last_sequence: 0,
+      request_connection_ack: true,
+    });
+  }
 
   setSessionSubscriptions(sessionIds) {
     const normalized = [...new Set((Array.isArray(sessionIds) ? sessionIds : [])
@@ -221,14 +369,30 @@ export class RelayClient {
     });
   }
 
-  sendMessage(sessionId, content, clientMsgId, createdAt = null) {
+  sendMessage(sessionId, content, clientMsgId, createdAt = null, latencyTrace = null, options = {}) {
     this._send({
       type:              'send',
       session:           sessionId,
       content,
       client_message_id: clientMsgId || `${Date.now()}-${Math.random().toString(36).slice(2)}`,
       ...(createdAt ? { created_at: createdAt } : {}),
+      ...(latencyTrace ? { latency_trace: latencyTrace } : {}),
+      ...(options.retryFailed === true ? { retry_failed: true } : {}),
     });
+  }
+
+  completeLatencyTrace(latencyTrace) {
+    if (!latencyTrace) return false;
+    this._send({
+      type: 'latency_trace_complete',
+      protocol_version: 1,
+      latency_trace: latencyTrace,
+    });
+    return true;
+  }
+
+  getRelayClockEstimate() {
+    return this._relayClockEstimate ? { ...this._relayClockEstimate } : null;
   }
 
   resumeSession(sourceSession, agentType, workspacePath, options = {}) {
@@ -265,6 +429,8 @@ export class RelayClient {
     };
     if (options.userInitiated === true) message.user_initiated = true;
     if (Number(options.chunkBytes) > 0) message.chunk_bytes = Number(options.chunkBytes);
+    if (options.threadId != null) message.thread_id = String(options.threadId);
+    if (mode === 'older' && options.beforeOffset != null) message.before_offset = options.beforeOffset;
     if (mode === 'older' && options.beforeId != null) message.before_id = options.beforeId;
     if (mode === 'around' && options.aroundId != null) message.around_id = options.aroundId;
     this._send(message);
@@ -455,6 +621,12 @@ export class RelayClient {
   }
 
   // ── Panel control (Epic 9) ─────────────────────────────────────────────────
+
+  newThread(sessionId) {
+    const requestId = `new-thread-${Date.now()}-${Math.random().toString(36).slice(2, 7)}`;
+    this._send({ type: 'new_thread', session_id: sessionId, request_id: requestId });
+    return requestId;
+  }
 
   openPanel(sessionId) {
     const requestId = `panel-${Date.now()}-${Math.random().toString(36).slice(2, 7)}`;
@@ -708,12 +880,64 @@ export class RelayClient {
   disconnect() {
     this.stopped = true;
     clearTimeout(this._reconnectTimer);
+    this._clearConnectWatchdog();
     this._stopHeartbeat();
+    this._clearNativeSocketSubscriptions();
+    this._clearSessionSummaryQueue();
     this.ws?.close();
     this.ws = null;
   }
 
   // ── Internals ──────────────────────────────────────────────────────────────
+
+  _clearConnectWatchdog() {
+    clearInterval(this._connectWatchdogTimer);
+    this._connectWatchdogTimer = null;
+  }
+
+  _clearNativeSocketSubscriptions() {
+    for (const subscription of this._nativeSocketSubscriptions) {
+      try { subscription?.remove?.(); } catch {}
+    }
+    this._nativeSocketSubscriptions = [];
+  }
+
+  _queueSessionSummary(message) {
+    const sessionId = message?.session_id || message?.session;
+    if (!sessionId) {
+      this.onMessage(message);
+      return;
+    }
+    const previous = this._sessionSummaryPending.get(sessionId);
+    this._sessionSummaryPending.set(sessionId, previous ? {
+      ...previous,
+      ...message,
+      unread_delta: Number(previous.unread_delta || 0) + Number(message.unread_delta || 0),
+    } : message);
+    if (this._sessionSummaryTimer) return;
+    this._sessionSummaryTimer = setTimeout(
+      () => this._flushSessionSummaries(),
+      SESSION_SUMMARY_FLUSH_MS,
+    );
+  }
+
+  _flushSessionSummaries() {
+    this._sessionSummaryTimer = null;
+    const summaries = [...this._sessionSummaryPending.values()];
+    this._sessionSummaryPending.clear();
+    if (this.stopped || summaries.length === 0) return;
+    const deliver = () => {
+      for (const summary of summaries) this.onMessage(summary);
+    };
+    if (typeof unstable_batchedUpdates === 'function') unstable_batchedUpdates(deliver);
+    else deliver();
+  }
+
+  _clearSessionSummaryQueue() {
+    clearTimeout(this._sessionSummaryTimer);
+    this._sessionSummaryTimer = null;
+    this._sessionSummaryPending.clear();
+  }
 
   _send(msg) {
     if (this.ws?.readyState === WebSocket.OPEN) {
@@ -723,15 +947,26 @@ export class RelayClient {
 
   _startHeartbeat() {
     this._stopHeartbeat();
-    this._sendHeartbeat();
-    this._heartbeatTimer = setInterval(() => this._sendHeartbeat(), this._heartbeatIntervalMs);
+    // A connection acknowledgement can carry a large authoritative inventory.
+    // Yield through its React hydration before timestamping the first RTT
+    // sample, otherwise synchronous row rendering is mislabeled as relay
+    // latency and can keep a fully hydrated client in a false "poor" state.
+    this._heartbeatStartTimer = setTimeout(() => {
+      this._heartbeatStartTimer = null;
+      if (this.stopped || this.ws?.readyState !== WebSocket.OPEN) return;
+      this._sendHeartbeat();
+      this._heartbeatTimer = setInterval(() => this._sendHeartbeat(), this._heartbeatIntervalMs);
+    }, 0);
   }
 
   _stopHeartbeat() {
+    clearTimeout(this._heartbeatStartTimer);
+    this._heartbeatStartTimer = null;
     clearInterval(this._heartbeatTimer);
     this._heartbeatTimer = null;
     for (const pending of this._heartbeatPending.values()) clearTimeout(pending.timeout);
     this._heartbeatPending.clear();
+    this._relayClockEstimate = null;
   }
 
   _sendHeartbeat() {
@@ -747,6 +982,7 @@ export class RelayClient {
     this._heartbeatPending.set(requestId, { sentAt, timeout });
     this._send({
       type: 'heartbeat', protocol_version: 1, request_id: requestId,
+      client_sent_at_ms: sentAt,
       client_ts: new Date(sentAt).toISOString(),
     });
   }
@@ -756,12 +992,23 @@ export class RelayClient {
     if (!pending) return;
     clearTimeout(pending.timeout);
     this._heartbeatPending.delete(message.request_id);
-    const rttMs = Math.max(0, Date.now() - pending.sentAt);
+    const receivedAtMs = Date.now();
+    const estimated = estimateRelayClockOffset({
+      clientSentAtMs: pending.sentAt,
+      relayReceivedAtMs: message.relay_received_at_ms,
+      relaySentAtMs: message.relay_sent_at_ms,
+      clientReceivedAtMs: receivedAtMs,
+    });
+    this._relayClockEstimate = estimated.ok ? estimated.estimate : null;
+    const rttMs = Math.max(0, receivedAtMs - pending.sentAt);
     this.onMessage({
       type: '_connection_health',
       state: classifyRelayRtt(rttMs),
       rttMs,
-      lastAckAt: Date.now(),
+      lastAckAt: receivedAtMs,
+      clockStatus: estimated.ok ? estimated.estimate.status : estimated.code,
+      clockOffsetMs: estimated.ok ? estimated.estimate.offset_ms : null,
+      clockUncertaintyMs: estimated.ok ? estimated.estimate.uncertainty_ms : null,
     });
   }
 

@@ -2,8 +2,10 @@ import React, { useEffect, useState } from 'react';
 import {
   View, Text, TextInput, TouchableOpacity, ScrollView, StyleSheet,
 } from 'react-native';
+import { useThemedStyles } from '../lib/theme';
 
 export default function QueuedMessageBar({ items, onSteer, onDiscard, onEdit }) {
+  const s = useThemedStyles(darkStyles);
   const [editingId, setEditingId] = useState(null);
   const [editText, setEditText] = useState('');
 
@@ -78,6 +80,7 @@ export default function QueuedMessageBar({ items, onSteer, onDiscard, onEdit }) 
 }
 
 function Action({ label, onPress, disabled, secondary, danger }) {
+  const s = useThemedStyles(darkStyles);
   return (
     <TouchableOpacity
       style={[s.action, secondary && s.actionSecondary, danger && s.actionDanger, disabled && s.disabled]}
@@ -91,7 +94,7 @@ function Action({ label, onPress, disabled, secondary, danger }) {
   );
 }
 
-const s = StyleSheet.create({
+const darkStyles = StyleSheet.create({
   container: {
     borderTopWidth: 1,
     borderTopColor: '#30363d',

@@ -16,6 +16,7 @@ lock = restart.ProxyRestartLock(agent="parent-wrapper-smoke")
 
 with (
     patch.object(lock, "_get_proxy_relay_pids", return_value=[101, 202]),
+    patch.object(lock, "_get_proxy_supervisor_pid", return_value=None),
     patch.object(lock, "_parent_pid", side_effect=lambda pid: {101: 301, 202: 302}[pid]),
     patch.object(lock, "_process_name", side_effect=lambda pid: {301: "cmd", 302: "python"}[pid]),
     patch.object(lock, "_kill_proxy_launcher", side_effect=lambda: events.append(("broad-launcher-cleanup", None))),

@@ -53,6 +53,41 @@ const ambiguousTail = history.map(row => ({ ...row }));
 ambiguousTail[ambiguousTail.length - 50].content = 'changed-before-sampled-prefix';
 assert.equal(buildIncrementalHistoryPlan(history.length, tail, ambiguousTail), null);
 
+const citationStableId = 'codex_cli_pair:memory-citation-fixture';
+const citationExisting = [
+  { id: 1, role: 'user', content: 'prefix', source_message_id: 'prefix-source' },
+  {
+    id: 2,
+    role: 'assistant',
+    content: 'One canonical answer.',
+    source_message_id: citationStableId,
+    content_blocks: [{ type: 'markdown', content: 'One canonical answer.' }],
+  },
+];
+const citationIncoming = [
+  { role: 'user', content: 'prefix', source_message_id: 'prefix-source' },
+  {
+    role: 'assistant',
+    content: 'One canonical answer.',
+    source_message_id: citationStableId,
+    content_blocks: [
+      { type: 'markdown', content: 'One canonical answer.' },
+      { type: 'memory_citation', title: 'Sources', content: 'Memory references\n- MEMORY.md:10-11' },
+    ],
+  },
+];
+const citationPlan = buildIncrementalHistoryPlan(2, citationExisting, citationIncoming);
+assert.strictEqual(citationPlan.mode, 'replace_suffix');
+assert.strictEqual(citationPlan.prefix_count, 1);
+assert.strictEqual(citationPlan.delete_from_id, 2);
+assert.strictEqual(citationPlan.rows.length, 1, 'citation enrichment must replace one stable-ID row, not append a duplicate');
+assert.strictEqual(citationPlan.rows[0].content_blocks.filter(block => block.type === 'memory_citation').length, 1);
+assert.strictEqual(
+  historyRowsMatch(citationIncoming, citationExisting),
+  true,
+  'a delayed provisional replay must not regress an already enriched stable-ID row',
+);
+
 const relaySource = fs.readFileSync(path.join(__dirname, '..', 'relay-server', 'index.js'), 'utf8');
 assert(relaySource.includes('getIncrementalHistoryPlan(id, messages, existingLength)'));
 assert(relaySource.includes('incrementalPlan.rows'));

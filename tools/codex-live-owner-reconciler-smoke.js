@@ -9,8 +9,10 @@ const {
   acquireLineageLease,
   defaultRegistryPath,
   loadOwnerRegistry,
+  publishLiveOwner,
   releaseLineageLease,
   resolveLineageOwner,
+  rolloutFileIdentity,
 } = require('../shared/codex-live-owner-registry');
 const { reconcileCodexLiveOwners } = require('./codex-live-owner-reconciler');
 
@@ -97,6 +99,82 @@ assert.equal(resolveLineageOwner(ids.idle, { registryPath, nowMs }).state, 'none
 assert.equal(registry.lineages[ids.rotator].owners[0].turn_id, 'turn-fixture-1');
 assert.equal(registry.lineages[ids.interactive].owners[0].root_pid, 52001);
 assert.equal(registry.lineages[ids.interactive].owners[0].native_pid, 52002);
+
+const identityRegistryPath = path.join(root, 'identity-owners.json');
+const identityNowMs = nowMs + 10;
+const identityStamp = new Date(identityNowMs).toISOString();
+publishLiveOwner({
+  ...registry.lineages[ids.interactive].owners[0],
+  owner_id: 'interactive_tui:52001:heartbeat-epoch',
+  process_epoch: 'heartbeat-epoch',
+  native_pid: null,
+  heartbeat_at: identityStamp,
+  proof: 'launcher_exact_resume_uuid',
+  runtime_generation: 'fixture-generation',
+  model: 'gpt-5.6-sol',
+  effort: 'xhigh',
+}, { registryPath: identityRegistryPath, nowMs: identityNowMs });
+publishLiveOwner({
+  session_id: ids.idle,
+  owner_id: 'interactive_tui:54001:heartbeat-only-epoch',
+  owner_kind: 'interactive_tui',
+  state: 'active',
+  root_pid: 54001,
+  native_pid: null,
+  connection_id: null,
+  rac_session_id: null,
+  thread_id: ids.idle,
+  turn_id: null,
+  process_epoch: 'heartbeat-only-epoch',
+  rollout_path: fs.realpathSync(sessions.idle.rolloutPath),
+  rollout_identity: rolloutFileIdentity(sessions.idle.rolloutPath),
+  logical_name: 'idle',
+  started_at: identityStamp,
+  heartbeat_at: identityStamp,
+  terminal_at: null,
+  proof: 'launcher_exact_resume_uuid',
+  runtime_generation: 'fixture-generation',
+  model: 'gpt-5.6-sol',
+  effort: 'xhigh',
+}, { registryPath: identityRegistryPath, nowMs: identityNowMs });
+publishLiveOwner({
+  ...registry.lineages[ids.rotator].owners[0],
+  owner_id: 'rotator_exec:59901:distinct-root-epoch',
+  root_pid: 59901,
+  native_pid: null,
+  process_epoch: 'distinct-root-epoch',
+  heartbeat_at: identityStamp,
+  proof: 'launcher_exact_resume_uuid',
+  runtime_generation: 'fixture-generation',
+}, { registryPath: identityRegistryPath, nowMs: identityNowMs });
+const identityAlive = new Set([...alive, 54001, 59901]);
+reconcileCodexLiveOwners({
+  manifestPath,
+  registryPath: identityRegistryPath,
+  processes,
+  nowMs: identityNowMs + 1,
+  processIsAlive: pid => identityAlive.has(pid),
+  producerId: 'fixture-identity-reconciler',
+  producerPid: 50000,
+  processEpoch: 'fixture-identity-reconciler-epoch',
+  runtimeGeneration: 'fixture-generation',
+});
+const identityRegistry = loadOwnerRegistry(identityRegistryPath);
+assert.equal(identityRegistry.lineages[ids.interactive].owners.length, 1,
+  'a heartbeat owner and a synthetic scan owner for the same root must collapse');
+assert.equal(identityRegistry.lineages[ids.interactive].owners[0].owner_id,
+  'interactive_tui:52001:heartbeat-epoch', 'the authoritative heartbeat identity must survive reconciliation');
+assert.equal(identityRegistry.lineages[ids.interactive].owners[0].native_pid, 52002,
+  'process discovery must enrich a heartbeat owner without replacing its identity');
+assert.equal(identityRegistry.lineages[ids.idle].owners.length, 1,
+  'a fresh live heartbeat owner must survive an incomplete process snapshot');
+assert.equal(identityRegistry.lineages[ids.idle].owners[0].owner_id,
+  'interactive_tui:54001:heartbeat-only-epoch');
+assert.equal(identityRegistry.lineages[ids.rotator].owners.length, 2,
+  'distinct live roots must remain ambiguous instead of being collapsed');
+assert.equal(resolveLineageOwner(ids.rotator, { registryPath: identityRegistryPath, nowMs: identityNowMs + 1 }).state,
+  'multiple');
+assert.equal(identityRegistry.authority.state, 'ready');
 
 const registryWithStaleSuccessor = JSON.parse(fs.readFileSync(registryPath, 'utf8'));
 registryWithStaleSuccessor.lineages[staleSuccessorId] = { owners: [], lease: null };
@@ -195,6 +273,9 @@ console.log(JSON.stringify({
   scanned_lineages: result.scanned_lineages,
   exact_rotator_owners: 1,
   exact_interactive_owners: 1,
+  same_root_heartbeat_identity_preserved: true,
+  incomplete_snapshot_owner_preserved: true,
+  distinct_roots_failed_closed: true,
   unbound_app_servers_misclassified: 0,
   active_leases_preserved: 1,
   ownerless_removed_lineages_pruned: 1,

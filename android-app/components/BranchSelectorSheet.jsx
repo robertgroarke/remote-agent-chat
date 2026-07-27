@@ -7,7 +7,9 @@ import {
 // ── BranchSelectorSheet ─────────────────────────────────────────────────────
 // Bottom sheet showing git branches with search, current indicator, and create-new.
 
-export default function BranchSelectorSheet({ visible, branches, current, loading, onSwitch, onCreate, onClose }) {
+export default function BranchSelectorSheet({
+  visible, branches, current, loading, onSwitch, onCreate, onClose, onMinimize,
+}) {
   const [search, setSearch]     = useState('');
   const [creating, setCreating] = useState(false);
   const [newName, setNewName]   = useState('');
@@ -30,7 +32,7 @@ export default function BranchSelectorSheet({ visible, branches, current, loadin
       visible={visible}
       transparent
       animationType="slide"
-      onRequestClose={onClose}
+      onRequestClose={onMinimize || onClose}
     >
       <TouchableWithoutFeedback onPress={onClose}>
         <View style={s.backdrop} />
@@ -39,6 +41,17 @@ export default function BranchSelectorSheet({ visible, branches, current, loadin
       <View style={s.sheet}>
         <View style={s.header}>
           <Text style={s.title}>Branches</Text>
+          <TouchableOpacity
+            onPress={onMinimize || onClose}
+            style={s.minimizeBtn}
+            activeOpacity={0.7}
+            accessibilityRole="button"
+            accessibilityLabel="Minimize Branches"
+            accessibilityState={{ expanded: true }}
+            testID="pane-minimize-branch-selector"
+          >
+            <Text style={s.minimizeBtnText}>Minimize</Text>
+          </TouchableOpacity>
           <TouchableOpacity onPress={onClose} style={s.closeBtn} activeOpacity={0.7}>
             <Text style={s.closeBtnText}>✕</Text>
           </TouchableOpacity>
@@ -124,14 +137,14 @@ const s = StyleSheet.create({
     backgroundColor: '#1a1a2e',
     borderTopLeftRadius: 16,
     borderTopRightRadius: 16,
-    maxHeight: '60%',
+    maxHeight: '45%',
     paddingBottom: 20,
   },
   header: {
     flexDirection: 'row',
     alignItems: 'center',
-    paddingHorizontal: 16,
-    paddingVertical: 12,
+    minHeight: 52,
+    paddingHorizontal: 8,
     borderBottomWidth: 1,
     borderBottomColor: '#333',
   },
@@ -143,9 +156,23 @@ const s = StyleSheet.create({
     letterSpacing: 0.5,
     textTransform: 'uppercase',
   },
-  closeBtn: {
+  minimizeBtn: {
+    minWidth: 44,
+    minHeight: 44,
     paddingHorizontal: 8,
-    paddingVertical: 4,
+    borderWidth: 1,
+    borderColor: '#484f58',
+    borderRadius: 7,
+    marginRight: 4,
+    alignItems: 'center',
+    justifyContent: 'center',
+  },
+  minimizeBtnText: { color: '#f0f6fc', fontSize: 10, fontWeight: '700' },
+  closeBtn: {
+    minWidth: 44,
+    minHeight: 44,
+    alignItems: 'center',
+    justifyContent: 'center',
   },
   closeBtnText: {
     color: '#888',

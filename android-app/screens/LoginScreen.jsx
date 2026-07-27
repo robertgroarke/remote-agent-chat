@@ -7,8 +7,10 @@ import {
   signInWithGoogle, statusCodes,
   signInWithCustomTab, storeJwtDirectly,
 } from '../lib/auth';
+import { useThemedStyles } from '../lib/theme';
 
 export default function LoginScreen({ navigation, route }) {
+  const s = useThemedStyles(darkStyles);
   const [loading, setLoading] = useState(false);
   const [error,   setError]   = useState(null);
 
@@ -99,7 +101,7 @@ export default function LoginScreen({ navigation, route }) {
   );
 }
 
-const s = StyleSheet.create({
+const darkStyles = StyleSheet.create({
   container: {
     flex:            1,
     backgroundColor: '#0b0f14',

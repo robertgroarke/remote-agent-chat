@@ -14,6 +14,9 @@ function runtimeFixture(state, prompt) {
       if (expression.includes('__REMOTE_AGENT_CODEX_COMPOSER_VERIFY__')) {
         return { result: { value: JSON.stringify({ ok: true, code: 'ready' }) } };
       }
+      if (expression.includes('__REMOTE_AGENT_CODEX_COMPOSER_CLICK_FALLBACK__')) {
+        return { result: { value: JSON.stringify({ ok: true, code: 'ready', x: 640, y: 720 }) } };
+      }
       if (expression.includes('var _REMOTE_AGENT_RECENT_TURN_LIMIT')) {
         const matchCount = Number(state.existingMatches || 0) + (state.submitted ? 1 : 0);
         const messages = Array.from({ length: matchCount }, () => ({ role: 'user', content: prompt }));
@@ -43,7 +46,7 @@ function replacementRuntimeFixture(state, prompt) {
   };
 }
 
-function clientFixture(state, { persistOnEnter }) {
+function clientFixture(state, { persistOnEnter, persistOnClick = false }) {
   return {
     Input: {
       async insertText({ text }) {
@@ -55,15 +58,21 @@ function clientFixture(state, { persistOnEnter }) {
           state.submitted = true;
         }
       },
+      async dispatchMouseEvent(event) {
+        state.mouse.push(`${event.type}:${event.button || 'none'}`);
+        if (persistOnClick && event.type === 'mouseReleased' && event.button === 'left') {
+          state.submitted = true;
+        }
+      },
     },
   };
 }
 
-async function runCase(name, persistOnEnter, existingMatches = 0) {
+async function runCase(name, persistOnEnter, existingMatches = 0, persistOnClick = false) {
   const prompt = `Codex Desktop receipt fixture ${name}`;
-  const state = { inserted: '', keys: [], submitted: false, existingMatches };
+  const state = { inserted: '', keys: [], mouse: [], submitted: false, existingMatches };
   const result = await selectors.sendCodexDesktopTrustedInput(
-    clientFixture(state, { persistOnEnter }),
+    clientFixture(state, { persistOnEnter, persistOnClick }),
     runtimeFixture(state, prompt),
     prompt,
     `codex-desktop-send-${name}`,
@@ -105,6 +114,38 @@ async function runRotatedClientCase() {
   assert.deepStrictEqual(result, { ok: true, method: 'cdp_input_enter_confirmed' });
 }
 
+async function runRotatedClickClientCase() {
+  const prompt = 'Codex Desktop receipt fixture rotated-click-client';
+  const state = { inserted: '', keys: [], mouse: [], submitted: false, currentClient: null };
+  const originalRuntime = runtimeFixture(state, prompt);
+  const replacementClient = clientFixture(state, { persistOnEnter: false, persistOnClick: true });
+  replacementClient.Runtime = runtimeFixture(state, prompt);
+  const originalClient = clientFixture(state, { persistOnEnter: false });
+  originalClient.Runtime = originalRuntime;
+  const dispatch = originalClient.Input.dispatchKeyEvent;
+  originalClient.Input.dispatchKeyEvent = async event => {
+    await dispatch(event);
+    if (event.type === 'keyDown' && event.key === 'Enter') {
+      state.currentClient = replacementClient;
+    }
+  };
+  state.currentClient = originalClient;
+
+  const result = await selectors.sendCodexDesktopTrustedInput(
+    originalClient,
+    originalRuntime,
+    prompt,
+    'codex-desktop-send-rotated-click-client',
+    {
+      codexConfirmationAttempts: 2,
+      codexConfirmationIntervalMs: 1,
+      codexConfirmationClientProvider: () => state.currentClient,
+    },
+  );
+  assert.deepStrictEqual(result, { ok: true, method: 'cdp_input_click_confirmed' });
+  assert(state.mouse.includes('mouseReleased:left'), 'rotated click must use the replacement target Input domain');
+}
+
 async function runThreadTargetGateCases() {
   const engine = Object.create(ProxyEngine.prototype);
   const session = {
@@ -134,12 +175,17 @@ async function runThreadTargetGateCases() {
   const repeatedContent = await runCase('repeated-content', true, 1);
   assert.deepStrictEqual(repeatedContent, { ok: true, method: 'cdp_input_enter_confirmed' });
 
+  const clickRecovered = await runCase('click-recovered', false, 0, true);
+  assert.deepStrictEqual(clickRecovered, { ok: true, method: 'cdp_input_click_confirmed' });
+
   const ambiguous = await runCase('ambiguous', false);
   assert.strictEqual(ambiguous.ok, false);
   assert.strictEqual(ambiguous.code, 'native_user_turn_not_observed');
   assert.strictEqual(ambiguous.baseline_matches, 0);
+  assert.strictEqual(ambiguous.click_fallback_attempted, true);
 
   await runRotatedClientCase();
+  await runRotatedClickClientCase();
   await runThreadTargetGateCases();
 
   const unsupported = await selectors.sendCodexDesktopTrustedInput(

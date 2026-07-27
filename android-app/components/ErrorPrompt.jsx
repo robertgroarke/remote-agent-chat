@@ -2,8 +2,10 @@ import React from 'react';
 import {
   View, Text, TouchableOpacity, ScrollView, StyleSheet,
 } from 'react-native';
+import { useThemedStyles } from '../lib/theme';
 
 export default function ErrorPrompt({ prompt, blocking, onAction }) {
+  const s = useThemedStyles(darkStyles);
   if (!prompt) return null;
 
   const block = (Array.isArray(prompt.content_blocks) ? prompt.content_blocks : [])
@@ -56,7 +58,7 @@ export default function ErrorPrompt({ prompt, blocking, onAction }) {
   );
 }
 
-const s = StyleSheet.create({
+const darkStyles = StyleSheet.create({
   container: {
     backgroundColor: '#251c1d',
     borderTopWidth: 1,

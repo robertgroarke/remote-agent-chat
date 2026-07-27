@@ -4,6 +4,31 @@ apply plugin: "com.facebook.react"
 
 def projectRoot = rootDir.getAbsoluteFile().getParentFile().getAbsolutePath()
 
+def releaseTaskRequested = gradle.startParameter.taskNames.any { taskName ->
+    taskName.toLowerCase().contains("release")
+}
+if (releaseTaskRequested) {
+    def relayUrl = System.getenv("EXPO_PUBLIC_RELAY_URL")?.trim()
+    def googleClientId = System.getenv("EXPO_PUBLIC_GOOGLE_CLIENT_ID")?.trim()
+    def googleWebClientId = System.getenv("EXPO_PUBLIC_GOOGLE_WEB_CLIENT_ID")?.trim()
+    def nodeEnv = System.getenv("NODE_ENV")?.trim()
+    if (!relayUrl || !relayUrl.startsWith("https://") || relayUrl.contains("yourdomain.com")) {
+        throw new GradleException(
+            "Release build refused: EXPO_PUBLIC_RELAY_URL must be an explicit non-example HTTPS endpoint."
+        )
+    }
+    if (!googleClientId || !googleWebClientId) {
+        throw new GradleException(
+            "Release build refused: both public Google OAuth client IDs must be configured."
+        )
+    }
+    if (nodeEnv != "production") {
+        throw new GradleException(
+            "Release build refused: NODE_ENV must be production so Expo resolves the intended environment."
+        )
+    }
+}
+
 /**
  * This is the configuration block to customize your React Native Android app.
  * By default you don't need to apply any configuration, just uncomment the lines you need.
@@ -91,8 +116,8 @@ android {
         applicationId 'com.agentchat.app'
         minSdkVersion rootProject.ext.minSdkVersion
         targetSdkVersion rootProject.ext.targetSdkVersion
-        versionCode 2
-        versionName "1.0.1"
+        versionCode 3
+        versionName "1.0.2"
     }
     signingConfigs {
         debug {

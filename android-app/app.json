@@ -2,10 +2,10 @@
   "expo": {
     "name": "Agent Chat",
     "slug": "agent-chat",
-    "version": "1.0.1",
+    "version": "1.0.2",
     "orientation": "portrait",
     "scheme": "agentchat",
-    "userInterfaceStyle": "dark",
+    "userInterfaceStyle": "automatic",
     "backgroundColor": "#0b0f14",
     "icon": "./assets/icon.png",
     "android": {
@@ -14,7 +14,7 @@
         "backgroundColor": "#0b0f14"
       },
       "package": "com.agentchat.app",
-      "versionCode": 2
+      "versionCode": 3
     },
     "splash": {
       "image": "./assets/splash.png",

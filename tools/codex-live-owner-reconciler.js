@@ -19,6 +19,7 @@ const {
   defaultRegistryPath,
   normalizeOwner,
   rolloutFileIdentity,
+  sameDirectOwnerProcess,
   updateOwnerRegistry,
 } = require('../shared/codex-live-owner-registry');
 
@@ -112,6 +113,76 @@ function discoverLineageOwner(entry, logicalName, processes, nowIso) {
   return null;
 }
 
+function ownerIsLive(owner, nowMs, isAlive) {
+  return (
+    (owner.state === 'active' || owner.state === 'transferring')
+    && nowMs - Date.parse(owner.heartbeat_at) <= DEFAULT_HEARTBEAT_TTL_MS
+    && (!owner.root_pid || isAlive(owner.root_pid))
+    && (!owner.native_pid || isAlive(owner.native_pid))
+  );
+}
+
+function directOwnerScore(owner) {
+  let score = 0;
+  if (owner.proof === 'launcher_exact_resume_uuid') score += 1_000;
+  if (owner.runtime_generation) score += 100;
+  if (owner.model) score += 10;
+  if (owner.effort) score += 10;
+  if (owner.process_epoch) score += 5;
+  return score;
+}
+
+function preferDirectOwner(left, right) {
+  const scoreDelta = directOwnerScore(left) - directOwnerScore(right);
+  if (scoreDelta !== 0) return scoreDelta > 0 ? left : right;
+  const heartbeatDelta = Date.parse(left.heartbeat_at) - Date.parse(right.heartbeat_at);
+  if (heartbeatDelta !== 0) return heartbeatDelta > 0 ? left : right;
+  return left.owner_id.localeCompare(right.owner_id) <= 0 ? left : right;
+}
+
+function mergeObservedDirectOwner(authoritative, observed, nowIso) {
+  return normalizeOwner({
+    ...observed,
+    ...authoritative,
+    native_pid: authoritative.native_pid || observed.native_pid,
+    thread_id: authoritative.thread_id || observed.thread_id,
+    rollout_path: authoritative.rollout_path || observed.rollout_path,
+    rollout_identity: authoritative.rollout_identity || observed.rollout_identity,
+    logical_name: authoritative.logical_name || observed.logical_name,
+    proof: authoritative.proof || observed.proof,
+    runtime_generation: authoritative.runtime_generation || observed.runtime_generation,
+    model: authoritative.model || observed.model,
+    effort: authoritative.effort || observed.effort,
+    heartbeat_at: nowIso,
+  });
+}
+
+function collapseDirectOwners(owners) {
+  const canonical = [];
+  for (const owner of [...owners].sort((left, right) => left.owner_id.localeCompare(right.owner_id))) {
+    const matchingIndex = canonical.findIndex(item => sameDirectOwnerProcess(item, owner));
+    if (matchingIndex === -1) canonical.push(owner);
+    else canonical[matchingIndex] = preferDirectOwner(canonical[matchingIndex], owner);
+  }
+  return canonical;
+}
+
+function reconcileLineageOwners(lineage, observedOwner, nowMs, nowIso, isAlive) {
+  const liveOwners = lineage.owners.filter(owner => ownerIsLive(owner, nowMs, isAlive));
+  const proxyOwners = liveOwners.filter(owner => owner.owner_kind === 'proxy_app_server');
+  let directOwners = collapseDirectOwners(liveOwners.filter(owner => owner.owner_kind !== 'proxy_app_server'));
+  if (observedOwner) {
+    const matchingIndex = directOwners.findIndex(owner => sameDirectOwnerProcess(owner, observedOwner));
+    if (matchingIndex === -1) directOwners.push(observedOwner);
+    else {
+      const authoritative = preferDirectOwner(directOwners[matchingIndex], observedOwner);
+      directOwners[matchingIndex] = mergeObservedDirectOwner(authoritative, observedOwner, nowIso);
+    }
+    directOwners = collapseDirectOwners(directOwners);
+  }
+  return [...proxyOwners, ...directOwners];
+}
+
 function reconcileCodexLiveOwners(options = {}) {
   const manifestPath = path.resolve(options.manifestPath || DEFAULT_MANIFEST);
   const registryPath = path.resolve(options.registryPath || defaultRegistryPath(options.env));
@@ -153,18 +224,14 @@ function reconcileCodexLiveOwners(options = {}) {
 
   const skippedLeases = [];
   updateOwnerRegistry(registryPath, registry => {
+    const isAlive = options.processIsAlive || processIsAlive;
     const manifestSessionIds = new Set(discovered.keys());
     for (const [sessionId, lineage] of Object.entries(registry.lineages)) {
       if (manifestSessionIds.has(sessionId)) continue;
       const liveLease = lineage.lease && Date.parse(lineage.lease.expires_at) > nowMs
         ? lineage.lease
         : null;
-      const liveOwners = lineage.owners.filter(owner => (
-        (owner.state === 'active' || owner.state === 'transferring')
-        && nowMs - Date.parse(owner.heartbeat_at) <= DEFAULT_HEARTBEAT_TTL_MS
-        && (!owner.root_pid || (options.processIsAlive || processIsAlive)(owner.root_pid))
-        && (!owner.native_pid || (options.processIsAlive || processIsAlive)(owner.native_pid))
-      ));
+      const liveOwners = lineage.owners.filter(owner => ownerIsLive(owner, nowMs, isAlive));
       if (!liveLease && !liveOwners.length) delete registry.lineages[sessionId];
       else registry.lineages[sessionId] = { owners: liveOwners, lease: liveLease };
     }
@@ -174,13 +241,7 @@ function reconcileCodexLiveOwners(options = {}) {
         skippedLeases.push(sessionId);
         continue;
       }
-      const liveProxyOwners = lineage.owners.filter(owner => (
-        owner.owner_kind === 'proxy_app_server'
-        && nowMs - Date.parse(owner.heartbeat_at) <= DEFAULT_HEARTBEAT_TTL_MS
-        && (!owner.root_pid || (options.processIsAlive || processIsAlive)(owner.root_pid))
-        && (!owner.native_pid || (options.processIsAlive || processIsAlive)(owner.native_pid))
-      ));
-      const owners = [...liveProxyOwners, ...(result.owner ? [result.owner] : [])];
+      const owners = reconcileLineageOwners(lineage, result.owner, nowMs, nowIso, isAlive);
       registry.lineages[sessionId] = { owners, lease: null };
     }
     registry.authority = {
@@ -241,5 +302,6 @@ module.exports = {
   ownerFromRotator,
   parseArgs,
   readLatestTurnId,
+  reconcileLineageOwners,
   reconcileCodexLiveOwners,
 };

@@ -19,8 +19,6 @@ const {
 } = require('../shared/question-prompt-contract');
 
 const repoRoot = path.resolve(__dirname, '..');
-const fixturePath = path.join(repoRoot, 'tests', 'fixtures', 'codex-app-server', '0.144.4', 'request-user-input-contract.json');
-const fixture = JSON.parse(fs.readFileSync(fixturePath, 'utf8'));
 
 function codexInvocation() {
   if (process.env.CODEX_CLI_PATH) return { command: process.env.CODEX_CLI_PATH, prefix: [] };
@@ -67,13 +65,25 @@ function expectCode(fn, code) {
 
 const schemaDir = generatedSchemaDir();
 const codexCliVersion = installedCodexVersion();
+const fixturePath = path.join(
+  repoRoot,
+  'tests',
+  'fixtures',
+  'codex-app-server',
+  codexCliVersion,
+  'request-user-input-contract.json',
+);
+assert.ok(
+  fs.existsSync(fixturePath),
+  `unsupported Codex request-user-input contract version ${codexCliVersion}`,
+);
+const fixture = JSON.parse(fs.readFileSync(fixturePath, 'utf8'));
+assert.strictEqual(fixture.codex_cli_version, codexCliVersion);
 const schemaResult = validateGeneratedQuestionSchemas(schemaDir);
 assert.strictEqual(schemaResult.ok, true);
 assert.strictEqual(schemaResult.method, fixture.method);
 for (const [name, expected] of Object.entries(fixture.generated_schema_sha256)) {
-  if (codexCliVersion === fixture.codex_cli_version) {
-    assert.strictEqual(sha256(path.join(schemaDir, name)), expected, `${name} drifted without a version change`);
-  }
+  assert.strictEqual(sha256(path.join(schemaDir, name)), expected, `${name} drifted without a version change`);
 }
 
 const nativeRequest = {

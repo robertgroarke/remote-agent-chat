@@ -43,6 +43,8 @@ const androidHostResources = read('android-app/lib/host-resources.js');
 const androidProviderUsage = read('android-app/lib/provider-usage.js');
 const androidSessionUsage = read('android-app/lib/session-usage.js');
 const androidGoalCommand = read('android-app/lib/goal-command.js');
+const androidLatencyTrace = read('android-app/lib/latency-trace.js');
+const androidLatencyClock = read('android-app/lib/latency-clock.js');
 const webApp = read('frontend/app.jsx');
 const webStyles = read('frontend/styles.css');
 const webHooks = read('frontend/hooks.jsx');
@@ -57,6 +59,7 @@ const webSessionTitle = read('frontend/session-title.js');
 const webSessionPins = read('frontend/session-pins.js');
 const webSessionRegistry = read('frontend/session-registry.js');
 const webGoalCommand = read('frontend/goal-command.js');
+const webLatencyClock = read('frontend/latency-clock.js');
 const proxyNoisePolicy = read('agent-proxy/session-noise-policy.js');
 const proxyProtocol = read('agent-proxy/protocol.js');
 const proxyEngine = read('agent-proxy/proxy-engine.js');
@@ -108,12 +111,35 @@ assert(hasAll(androidChat, [
 ]), 'Android must consume the delivery lifecycle');
 assert(hasAll(androidChat, [
   "case 'message_delta'", 'reduceMessageDeltaStream', 'requestAnimationFrame',
-  'ListFooterComponent={provisionalStream ? <ProvisionalBubble',
+  'ListFooterComponent={visibleProvisionalStream ? <ProvisionalBubble',
   "if (msg.role === 'assistant') clearProvisionalStream()",
   'shouldClearEmptyProvisionalOnTerminal(',
-]), 'Android must match the provisional message-delta stream and settled reconcile contract');
+]), 'Android must match the selected-thread provisional message-delta stream and settled reconcile contract');
 assert(hasAll(webHooks, ["if (t === 'message_delta')", 'provisionalPendingFlush', 'clearProvisionalStream(id)', 'shouldClearEmptyProvisionalOnTerminal(']),
   'Web must consume, rAF-batch, and reconcile provisional message deltas');
+assert(hasAll(androidLatencyTrace, [
+  'createAndroidLatencyTrace', 'completeAndroidLatencyTrace',
+  'android_react_native_post_paint', 'raw_stages', 'relayClockStageObservation',
+  'retainAndroidLatencyTerminal', 'measurement_status',
+]) && hasAll(androidRelay, [
+  'latency_trace: latencyTrace', "type: 'latency_trace_complete'",
+  'client_sent_at_ms', 'estimateRelayClockOffset', 'getRelayClockEstimate',
+]) && hasAll(androidChat, [
+  'scheduleLatencyTraceAfterRender', 'latencyTraceCompletedIdsRef',
+  "case 'proxy_message':", "case 'latency_trace_terminal':", 'getRelayClockEstimate',
+]), 'Android must create, post-render-complete, deduplicate, and terminalize the L0 trace contract');
+assert(hasAll(webHooks, [
+  'createWebuiLatencyTrace', 'completeWebuiLatencyTrace',
+  'recordLatencyTraceAfterPaint', "type: 'latency_trace_complete'",
+  'client_sent_at_ms', 'estimateRelayClockOffset', 'raw_stages',
+]), 'Web must retain the matching L0 trace lifecycle');
+assert(hasAll(androidLatencyClock, [
+  'LATENCY_CLOCK_SKEW_THRESHOLD_MS', 'LATENCY_CLOCK_RTT_THRESHOLD_MS',
+  'estimateRelayClockOffset', 'relayClockStageObservation',
+]) && hasAll(webLatencyClock, [
+  'LATENCY_CLOCK_SKEW_THRESHOLD_MS', 'LATENCY_CLOCK_RTT_THRESHOLD_MS',
+  'estimateRelayClockOffset', 'relayClockStageObservation',
+]), 'Web and Android must estimate relay-clock offset with the same bounded contract');
 assert(hasAll(androidTranscriptCache, [
   'TRANSCRIPT_CACHE_LIMIT = 10', 'getCachedTranscript', 'setCachedTranscript',
   'mergeCachedTranscript', 'isTranscriptActivityLive', 'latestTranscriptSequence',
@@ -248,7 +274,7 @@ assert(hasAll(proxyProtocol, [
 ]), 'Permission, notice, and actionable-error events must carry canonical blocks');
 assert(hasAll(androidErrorPrompt, ["item?.type === 'error'", "item?.type === 'notice'", 'block?.content']),
   'Android must prefer typed error/notice content');
-assert.match(androidChat, /<PermissionPrompt prompt=\{permPrompt\}/);
+assert.match(androidChat, /<PermissionPrompt prompt=\{visiblePermPrompt\}/);
 assert(hasAll(androidRelay, [
   'steerMessage', "type: 'steer'", 'discardQueuedMessage', "type: 'discard_queued'",
   'editQueuedMessage', "type: 'edit_queued'",
@@ -620,6 +646,8 @@ const rows = [
     'Both clients use client_message_id and consume relay acceptance, canonical/raw proxy delivery, correlated agent_started activity, and retryable failure results.'],
   ['Provisional incremental assistant stream', 'PARITY',
     'Both clients open on agent_started, validate the same ordered delta reducer, rAF-batch appends, and atomically reconcile on the settled assistant message.'],
+  ['Causal send-to-render latency trace lifecycle', 'PARITY',
+    'Web and Android create privacy-clean send traces, complete exactly once after rendered streaming or canonical output, preserve raw plus relay-adjusted clock receipts without clamping, and retain terminal unmeasured outcomes.'],
   ['Instant cached selected-session switching', 'PARITY',
     'Both clients share a 10-session transcript LRU, paint revisits from memory, and hydrate/reconcile only when the operator selects a session.'],
   ['Selective selected-session subscription', 'PARITY',

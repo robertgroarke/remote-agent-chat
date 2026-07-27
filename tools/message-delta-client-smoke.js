@@ -8,8 +8,10 @@ const path = require('path');
 const root = path.resolve(__dirname, '..');
 const webModulePath = path.join(root, 'frontend', 'message-delta.js');
 const androidModulePath = path.join(root, 'android-app', 'lib', 'message-delta.js');
+const flushModulePath = path.join(root, 'frontend', 'provisional-flush.js');
 const webSource = fs.readFileSync(webModulePath, 'utf8');
 const androidSource = fs.readFileSync(androidModulePath, 'utf8');
+const flushSource = fs.readFileSync(flushModulePath, 'utf8');
 const normalizeEol = source => source.replace(/\r\n/g, '\n');
 assert.strictEqual(normalizeEol(androidSource), normalizeEol(webSource),
   'web and Android delta reducers must remain source-identical after checkout EOL normalization');
@@ -20,6 +22,9 @@ function loadReducer(source) {
 }
 
 const { createProvisionalStream, reduceMessageDeltaStream, shouldClearEmptyProvisionalOnTerminal } = loadReducer(webSource);
+const mergeProvisionalFlushItem = Function(
+  `${flushSource.replace(/export\s+function\s+/g, 'function ')}\nreturn mergeProvisionalFlushItem;`,
+)();
 let stream = createProvisionalStream('session-1', 'cid-1', 1000);
 assert.strictEqual(shouldClearEmptyProvisionalOnTerminal(stream, { kind: 'idle' }), true);
 assert.strictEqual(shouldClearEmptyProvisionalOnTerminal(stream, { kind: 'completed' }), true);
@@ -50,6 +55,44 @@ result = reduceMessageDeltaStream(stream, {
 assert.strictEqual(result.accepted, true);
 assert.strictEqual(result.stream.open, false);
 
+const firstTrace = { trace_id: 'trace-first-output' };
+const firstStreamTrace = { trace_id: 'stream-first-output' };
+let pendingFlush = mergeProvisionalFlushItem(null, {
+  stream: { ...stream, seq: 2, content: 'Hello world', open: true },
+  streamTrace: firstStreamTrace,
+  latencyTrace: firstTrace,
+  receivedAtMs: 2000,
+});
+pendingFlush = mergeProvisionalFlushItem(pendingFlush, {
+  stream: { ...stream, seq: 3, content: 'Hello world', open: false },
+  streamTrace: null,
+  latencyTrace: null,
+  receivedAtMs: 2001,
+});
+assert.strictEqual(pendingFlush.stream.open, false,
+  'same-frame close must publish the newest stream state');
+assert.strictEqual(pendingFlush.streamTrace, firstStreamTrace,
+  'same-frame untraced close must not erase the first-output stream trace');
+assert.strictEqual(pendingFlush.latencyTrace, firstTrace,
+  'same-frame untraced close must not erase the first-output latency trace');
+assert.strictEqual(pendingFlush.receivedAtMs, 2000,
+  'retained latency trace must keep its matching browser receive timestamp');
+const replacementTrace = { trace_id: 'trace-replacement' };
+pendingFlush = mergeProvisionalFlushItem(pendingFlush, {
+  stream: { ...stream, seq: 4, content: 'Hello world!', open: true },
+  latencyTrace: replacementTrace,
+  receivedAtMs: 2002,
+});
+assert.strictEqual(pendingFlush.latencyTrace, replacementTrace,
+  'a later traced delta must replace earlier pending trace metadata');
+assert.strictEqual(pendingFlush.receivedAtMs, 2002,
+  'replacement trace must carry its own receive timestamp');
+const nextFrame = mergeProvisionalFlushItem(null, {
+  stream: { ...stream, seq: 5, content: 'Hello world!!', open: true },
+});
+assert.strictEqual(nextFrame.latencyTrace, null,
+  'a cleared render batch must not leak a prior response trace');
+
 const hooks = fs.readFileSync(path.join(root, 'frontend', 'hooks.jsx'), 'utf8');
 const app = fs.readFileSync(path.join(root, 'frontend', 'app.jsx'), 'utf8');
 const styles = fs.readFileSync(path.join(root, 'frontend', 'styles.css'), 'utf8');
@@ -66,8 +109,8 @@ assert(app.includes('<ProvisionalStreamingBubble') && styles.includes('.provisio
   'web provisional row and themed caret must render');
 assert(android.includes("case 'message_delta':") && android.includes('requestAnimationFrame'),
   'Android must consume and rAF-batch the same deltas');
-assert(android.includes('ListFooterComponent={provisionalStream ? <ProvisionalBubble'),
-  'Android must render the provisional assistant row in transcript order');
+assert(android.includes('ListFooterComponent={visibleProvisionalStream ? <ProvisionalBubble'),
+  'Android must render only the selected-thread provisional assistant row in transcript order');
 assert(android.includes("if (msg.role === 'assistant') clearProvisionalStream()"),
   'settled Android assistant message must reconcile the provisional row');
 assert(android.includes('shouldClearEmptyProvisionalOnTerminal('),
@@ -83,5 +126,8 @@ console.log(JSON.stringify({
   nonempty_terminal_stream_preserved_until_settle: true,
   web_dom_append: 'O(chunk)',
   raf_batched: true,
+  same_frame_close_trace_retained: true,
+  later_trace_replaced_atomically: true,
+  cleared_batch_trace_isolated: true,
   snapshot_reconcile: true,
 }, null, 2));

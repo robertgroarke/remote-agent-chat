@@ -5,7 +5,10 @@ const path = require('path');
 
 const ROOT = path.resolve(__dirname, '..');
 const DEFAULT_PROGRAM_PATH = path.join(ROOT, 'config', 'harness-revalidation-program.json');
-const DEFAULT_STATE_PATH = path.join(ROOT, 'data', 'app-update-drift-state.json');
+const DEFAULT_STATE_PATH = path.resolve(
+  process.env.RAC_APP_UPDATE_DRIFT_STATE_PATH
+    || path.join(ROOT, 'data', 'app-update-drift-state.json'),
+);
 
 const AGENT_TYPE_TO_HARNESS = Object.freeze({
   'antigravity-v2': 'antigravity-v2',
@@ -163,6 +166,269 @@ function exactFixtureWriteContract(harness, installedVersion, command, options =
   }
 }
 
+function normalizedTierStatus(value) {
+  const status = String(value || '').trim().toLowerCase();
+  if (status === 'gated') return 'unavailable';
+  if (['pass', 'failed', 'fail', 'not_run', 'unavailable', 'stale', 'pending'].includes(status)) {
+    return status === 'fail' ? 'failed' : status;
+  }
+  return null;
+}
+
+const OWNED_REVALIDATION_PROTECTED_CDP_PORTS = new Set([9223, 9225, 9240]);
+
+function ownedCommandRevalidationState(
+  record,
+  effectiveVersion,
+  canonicalCommand,
+  options = {},
+) {
+  const target = record?.command_revalidation_targets?.[canonicalCommand];
+  if (record?.status !== 'pending' || !target || target.disposable !== true) return null;
+  const targetVersion = target.installed_version != null
+    ? String(target.installed_version)
+    : null;
+  if (!effectiveVersion || targetVersion !== String(effectiveVersion)) return null;
+  if (String(target.command || '') !== canonicalCommand) return null;
+  if (normalizedTierStatus(target.tier1_status) !== 'pass') return null;
+
+  const expiresAtMs = Date.parse(String(target.expires_at || ''));
+  const nowMs = Number.isFinite(Number(options.nowMs)) ? Number(options.nowMs) : Date.now();
+  if (!Number.isFinite(expiresAtMs) || expiresAtMs <= nowMs) return null;
+
+  const requestedSessionId = String(options.sessionId || '').trim();
+  const targetSessionId = String(target.session_id || '').trim();
+  const requestedPort = Number(options.cdpPort);
+  const targetPort = Number(target.cdp_port);
+  if (!requestedSessionId || requestedSessionId !== targetSessionId) return null;
+  if (!Number.isInteger(requestedPort) || requestedPort !== targetPort) return null;
+  if (OWNED_REVALIDATION_PROTECTED_CDP_PORTS.has(requestedPort)) return null;
+
+  return {
+    command: canonicalCommand,
+    status: 'pending',
+    executable: true,
+    live_verified: false,
+    basis: 'owned_disposable_tier2_revalidation',
+    installed_version: String(effectiveVersion),
+    tier1_status: 'pass',
+    tier2_status: 'pending',
+    revalidation_owned_target: true,
+    revalidation_expires_at: target.expires_at,
+    reason: 'Owned disposable tier-2 revalidation is in progress',
+  };
+}
+
+function commandValidationForHarness(harness, state = loadState(), command = null, options = {}) {
+  const canonicalCommand = WRITE_COMMAND_ALIASES[String(command || '')] || String(command || '');
+  const installedVersion = state?.versions?.[harness] != null ? String(state.versions[harness]) : null;
+  const record = state?.revalidation_program?.harnesses?.[harness] || null;
+  if (!harness || !canonicalCommand) {
+    return {
+      command: canonicalCommand || null,
+      status: 'not_run',
+      executable: false,
+      live_verified: false,
+      reason: 'command validation requires a harness and command',
+    };
+  }
+  if (!record) {
+    return {
+      command: canonicalCommand,
+      status: 'pass',
+      executable: true,
+      live_verified: true,
+      basis: 'trusted_baseline_without_drift_record',
+      installed_version: installedVersion,
+      reason: null,
+    };
+  }
+  const recordVersion = record.installed_version != null ? String(record.installed_version) : null;
+  const effectiveVersion = recordVersion || installedVersion;
+  if (installedVersion && recordVersion && installedVersion !== recordVersion) {
+    return {
+      command: canonicalCommand,
+      status: 'stale',
+      executable: false,
+      live_verified: false,
+      basis: 'version_mismatch',
+      installed_version: installedVersion,
+      validated_version: recordVersion,
+      reason: `command contract is stale: installed ${installedVersion}, validated ${recordVersion}`,
+    };
+  }
+  const fullPass = record.status === 'pass'
+    && recordVersion
+    && (!installedVersion || recordVersion === installedVersion);
+  if (fullPass) {
+    return {
+      command: canonicalCommand,
+      status: 'pass',
+      executable: true,
+      live_verified: true,
+      basis: 'full_revalidation_pass',
+      installed_version: effectiveVersion,
+      reason: null,
+    };
+  }
+  const contract = exactFixtureWriteContract(
+    harness,
+    effectiveVersion,
+    canonicalCommand,
+    options,
+  );
+  if (!contract) {
+    const status = record.failure_stage === 'fixture_coverage' ? 'stale' : 'not_run';
+    return {
+      command: canonicalCommand,
+      status,
+      executable: false,
+      live_verified: false,
+      basis: 'exact_version_command_contract_missing',
+      installed_version: effectiveVersion,
+      reason: record.reason || `no current ${canonicalCommand} contract for ${effectiveVersion || 'installed version'}`,
+    };
+  }
+
+  const ownedRevalidation = ownedCommandRevalidationState(
+    record,
+    effectiveVersion,
+    canonicalCommand,
+    options,
+  );
+  if (ownedRevalidation) {
+    return {
+      ...ownedRevalidation,
+      write_contract: contract,
+    };
+  }
+  if (record?.status === 'pending'
+    && record?.command_revalidation_targets?.[canonicalCommand]) {
+    return {
+      command: canonicalCommand,
+      status: 'pending',
+      executable: false,
+      live_verified: false,
+      basis: 'owned_disposable_tier2_scope_mismatch',
+      installed_version: effectiveVersion,
+      tier1_status: 'pass',
+      tier2_status: 'pending',
+      write_contract: contract,
+      reason: 'Owned disposable tier-2 revalidation is scoped to a different or expired target',
+    };
+  }
+
+  const recordedCommandState = record?.command_states?.[canonicalCommand];
+  if (recordedCommandState && typeof recordedCommandState === 'object') {
+    const commandVersion = recordedCommandState.installed_version != null
+      ? String(recordedCommandState.installed_version)
+      : effectiveVersion;
+    if (effectiveVersion && commandVersion && commandVersion !== effectiveVersion) {
+      return {
+        command: canonicalCommand,
+        status: 'stale',
+        executable: false,
+        live_verified: false,
+        basis: 'recorded_command_state_version_mismatch',
+        installed_version: effectiveVersion,
+        validated_version: commandVersion,
+        write_contract: contract,
+        reason: `recorded ${canonicalCommand} state is for ${commandVersion}, installed ${effectiveVersion}`,
+      };
+    }
+    const recordedStatus = normalizedTierStatus(recordedCommandState.status) || 'not_run';
+    const executable = recordedStatus === 'pass' || recordedStatus === 'unavailable';
+    const tier1Status = normalizedTierStatus(recordedCommandState.tier1_status);
+    const tier2Status = normalizedTierStatus(recordedCommandState.tier2_status);
+    return {
+      command: canonicalCommand,
+      status: recordedStatus,
+      executable,
+      live_verified: executable
+        && recordedCommandState.live_verified === true
+        && tier2Status === 'pass',
+      basis: 'recorded_command_state',
+      installed_version: effectiveVersion,
+      tier1_status: tier1Status,
+      tier2_status: tier2Status,
+      checked_at: recordedCommandState.checked_at || record.updated_at || null,
+      write_contract: contract,
+      reason: recordedCommandState.reason
+        || recordedCommandState.tier2_detail
+        || recordedCommandState.tier1_detail
+        || null,
+    };
+  }
+
+  // New records publish tier states directly. The legacy inference is narrowly
+  // bounded to records produced by the pre-command-state sentinel: the record
+  // must say tier 1 passed, must have failed only at tier 2, and must identify
+  // tier-2 availability rather than a mutating validation failure.
+  const explicitTier1 = normalizedTierStatus(record.command_tier1_status);
+  const legacyTier1Pass = record.failure_stage === 'tier-2'
+    && /^Tier-1 passed;/i.test(String(record.reason || ''));
+  const tier1Status = explicitTier1 || (
+    record.failure_stage === 'fixture_coverage' ? 'pass'
+      : legacyTier1Pass ? 'pass'
+        : record.failure_stage === 'tier-1' ? 'failed'
+          : 'not_run'
+  );
+  if (tier1Status !== 'pass') {
+    return {
+      command: canonicalCommand,
+      status: tier1Status,
+      executable: false,
+      live_verified: false,
+      basis: 'send_specific_tier1_not_green',
+      installed_version: effectiveVersion,
+      write_contract: contract,
+      reason: record.reason || `${canonicalCommand} tier-1 state is ${tier1Status}`,
+    };
+  }
+
+  const explicitTier2 = normalizedTierStatus(
+    record.command_tier2_status || record.last_tier2_status,
+  );
+  const legacyUnavailable = legacyTier1Pass
+    && /tier-2 (?:gated|unavailable):/i.test(String(record.reason || ''));
+  const tier2Status = explicitTier2 || (
+    record.failure_stage === 'fixture_coverage' ? 'not_run'
+      : legacyUnavailable ? 'unavailable'
+        : record.failure_stage === 'tier-2' ? 'failed'
+          : 'not_run'
+  );
+  if (tier2Status === 'failed' || tier2Status === 'stale') {
+    return {
+      command: canonicalCommand,
+      status: tier2Status,
+      executable: false,
+      live_verified: false,
+      basis: 'send_specific_tier2_failed',
+      installed_version: effectiveVersion,
+      tier1_status: tier1Status,
+      tier2_status: tier2Status,
+      write_contract: contract,
+      reason: record.reason || `${canonicalCommand} tier-2 state is ${tier2Status}`,
+    };
+  }
+  return {
+    command: canonicalCommand,
+    status: tier2Status === 'unavailable' ? 'unavailable' : 'pass',
+    executable: true,
+    live_verified: tier2Status === 'pass',
+    basis: tier2Status === 'unavailable'
+      ? 'current_send_contract_live_target_unavailable'
+      : 'current_exact_version_send_contract',
+    installed_version: effectiveVersion,
+    tier1_status: tier1Status,
+    tier2_status: tier2Status,
+    write_contract: contract,
+    reason: tier2Status === 'unavailable'
+      ? (record.last_tier2_detail || record.tier2_detail || record.reason || 'owned disposable tier-2 target unavailable')
+      : null,
+  };
+}
+
 function validationGateForHarness(harness, state = loadState(), command = null, options = {}) {
   if (!harness) return { gated: false, reason: null, harness: null };
   const installedVersion = state?.versions?.[harness] != null ? String(state.versions[harness]) : null;
@@ -175,25 +441,24 @@ function validationGateForHarness(harness, state = loadState(), command = null, 
     && recordVersion
     && (!installedVersion || recordVersion === installedVersion);
   if (passed) return { gated: false, reason: null, harness, installed_version: recordVersion, ...record };
-  // A newly installed app is initially failed at fixture coverage before any
-  // native action is attempted. Once a current-version fixture has been
-  // captured, permit only the explicitly scoped, read-only-compatible command
-  // contract while the broader revalidation remains red. This prevents an
-  // unrelated transcript/fidelity gate from disabling a separately grounded
-  // current-thread send path, without enabling any other write capability.
-  const partialContract = record.failure_stage === 'fixture_coverage'
-    ? exactFixtureWriteContract(harness, recordVersion || installedVersion, command, options)
+  // Command truth is independent from whole-harness test availability. A
+  // current exact-version command contract may remain executable while its
+  // owned live target is unavailable, but an actual command-contract failure
+  // remains fail-closed.
+  const commandState = command
+    ? commandValidationForHarness(harness, state, command, options)
     : null;
-  if (partialContract) {
+  if (commandState?.executable) {
     return {
       gated: false,
       partial: true,
-      reason: null,
+      reason: commandState.reason,
       harness,
       installed_version: recordVersion || installedVersion,
       status: record.status || 'fail',
-      validated_command: partialContract.command,
-      write_contract: partialContract,
+      validated_command: commandState.command,
+      command_state: commandState,
+      write_contract: commandState.write_contract,
     };
   }
   return {
@@ -230,6 +495,9 @@ function applyWriteCapabilityGate(capabilities, agentType, state = loadState(), 
     result.message_send = true;
     result.write_restricted_due_to_revalidation = true;
     result.revalidation_validated_commands = ['send', 'send_message', 'message_send'];
+    result.revalidation_command_states = {
+      send_message: sendGate.command_state,
+    };
   }
   result.revalidation_harness = gate.harness;
   result.revalidation_version = gate.installed_version;
@@ -248,12 +516,14 @@ module.exports = {
   WRITE_CAPABILITY_KEYS,
   WRITE_COMMANDS,
   applyWriteCapabilityGate,
+  commandValidationForHarness,
   coverageMatrix,
   exactFixtureWriteContract,
   harnessForAgentType,
   isWriteCommand,
   loadProgram,
   loadState,
+  ownedCommandRevalidationState,
   programCoverage,
   validationGateForAgentType,
   validationGateForHarness,

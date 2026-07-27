@@ -88,7 +88,7 @@ def main() -> None:
 
     timeout_lock = ProxyRestartLock(agent="reconnect-timeout-smoke")
     with (
-        patch.object(timeout_lock, "_get_proxy_relay_pids", return_value=[]),
+        patch.object(timeout_lock, "_get_proxy_runtime_pids", return_value=[]),
         patch("proxy_restart_lock.time.monotonic", side_effect=[0, 91]),
         patch("proxy_restart_lock.time.sleep", return_value=None),
     ):
@@ -101,7 +101,7 @@ def main() -> None:
 
     delayed_start_lock = ProxyRestartLock(agent="delayed-authenticated-readiness-smoke")
     with (
-        patch.object(delayed_start_lock, "_get_proxy_relay_pids", side_effect=[[], [], [21]]),
+        patch.object(delayed_start_lock, "_get_proxy_runtime_pids", side_effect=[[], [], [21]]),
         patch.object(delayed_start_lock, "_relay_handshake_ready", return_value=True),
         patch("proxy_restart_lock.time.monotonic", side_effect=[0, 1, 31, 45]),
         patch("proxy_restart_lock.time.sleep", return_value=None),
@@ -111,7 +111,7 @@ def main() -> None:
 
     readiness_lock = ProxyRestartLock(agent="authenticated-readiness-smoke")
     with (
-        patch.object(readiness_lock, "_get_proxy_relay_pids", side_effect=[[21], [21]]),
+        patch.object(readiness_lock, "_get_proxy_runtime_pids", side_effect=[[21], [21]]),
         patch.object(readiness_lock, "_relay_handshake_ready", side_effect=[False, True]) as handshake,
         patch("proxy_restart_lock.time.monotonic", side_effect=[0, 1, 2]),
         patch("proxy_restart_lock.time.sleep", return_value=None),
@@ -134,6 +134,45 @@ def main() -> None:
             log_file.write(b"[relay] Handshake OK. replacement-worker\n")
         assert boundary_lock._relay_handshake_ready() is True
 
+    with TemporaryDirectory() as temp_dir:
+        supervisor_lock = ProxyRestartLock(agent="supervisor-lock-fallback-smoke")
+        supervisor_lock.config_root = Path(temp_dir)
+        supervisor_lock.source_root = Path(temp_dir)
+        lock_path = Path(temp_dir) / "data" / "proxy-supervisor.lock"
+        lock_path.parent.mkdir(parents=True)
+        lock_path.write_text("77\nproxy\n2026-07-21T00:00:00Z\n", encoding="utf-8")
+        with patch.object(supervisor_lock, "_process_name", return_value="node"):
+            assert supervisor_lock._get_proxy_supervisor_pid() == 77
+        lock_path.write_text("77\nusage\n2026-07-21T00:00:00Z\n", encoding="utf-8")
+        with patch.object(supervisor_lock, "_process_name", return_value="node"):
+            assert supervisor_lock._get_proxy_supervisor_pid() is None
+
+    with TemporaryDirectory() as source_dir, TemporaryDirectory() as config_dir:
+        clean_source_lock = ProxyRestartLock(
+            agent="clean-source-supervisor-lock-smoke",
+            source_root=source_dir,
+        )
+        clean_source_lock.config_root = Path(config_dir)
+        source_lock_path = Path(source_dir) / "data" / "proxy-supervisor.lock"
+        source_lock_path.parent.mkdir(parents=True)
+        source_lock_path.write_text("88\nproxy\n2026-07-22T00:00:00Z\n", encoding="utf-8")
+        config_lock_path = Path(config_dir) / "data" / "proxy-supervisor.lock"
+        config_lock_path.parent.mkdir(parents=True)
+        config_lock_path.write_text("77\nproxy\n2026-07-21T00:00:00Z\n", encoding="utf-8")
+        with patch.object(clean_source_lock, "_process_name", return_value="node"):
+            assert clean_source_lock._get_proxy_supervisor_pid() == 88
+        source_lock_path.write_text("88\nusage\n2026-07-22T00:00:00Z\n", encoding="utf-8")
+        with patch.object(clean_source_lock, "_process_name", return_value="node"):
+            assert clean_source_lock._get_proxy_supervisor_pid() == 77
+
+    runtime_lock = ProxyRestartLock(agent="wss-runtime-fallback-smoke")
+    with (
+        patch.object(runtime_lock, "_get_proxy_relay_pids", return_value=[]),
+        patch.object(runtime_lock, "_get_proxy_supervisor_pid", return_value=77),
+        patch.object(runtime_lock, "_direct_node_children", return_value=[78]),
+    ):
+        assert runtime_lock._get_proxy_runtime_pids() == [78]
+
     evidence = {
         "schema_version": 1,
         "ok": True,
@@ -149,8 +188,10 @@ def main() -> None:
             "relay_authentication_required": True,
             "stale_handshake_excluded_at_restart_boundary": True,
             "startup_beyond_30_seconds_tolerated": True,
+            "named_supervisor_lock_fallback": True,
+            "wss_443_runtime_fallback": True,
             "startup_timeout_seconds": 90,
-            "checks": 10,
+            "checks": 12,
         },
     }
 

@@ -93,6 +93,22 @@ const {
   isWriteCommand,
   validationGateForAgentType,
 } = require('./harness-revalidation');
+const {
+  advanceLatencyTrace,
+} = require('../shared/latency-trace');
+const {
+  estimateRelayClockOffset,
+  relayClockStageObservation,
+} = require('../shared/latency-clock');
+const {
+  bindDeliveryReceipt,
+  bindNativeUser,
+  canonicalAssistantForEntry,
+  contentSha256,
+  identityHasStrongAnchor,
+  nativeIdentity,
+  selectCausalEntry,
+} = require('./latency-trace-causality');
 
 const SERIALIZED_NAVIGATION = Symbol('serializedNavigation');
 const PRIORITY_RELAY_CONTROL = Symbol('priorityRelayControl');
@@ -126,8 +142,130 @@ const NAVIGATION_SCOPED_RELAY_TYPES = new Set([
 ]);
 const CODEX_DESKTOP_QUESTION_TOMBSTONE_TTL_MS = 30 * 24 * 60 * 60 * 1000;
 const CODEX_DESKTOP_QUESTION_TOMBSTONE_MAX = 128;
+const SEND_LATENCY_TRACE_RETENTION_MS = 5 * 60 * 1000;
+const OWNED_DISPOSABLE_SCOPE = 'latency_trace_sampler_v1';
+const OWNED_DISPOSABLE_WORKSPACE = 'c:\\temp\\remote-agent-vscode-test';
 
 function sleep(ms) { return new Promise(r => setTimeout(r, ms)); }
+
+function normalizeOwnedDisposableWorkspace(value) {
+  return String(value || '').replace(/\//g, '\\').replace(/\\+$/, '').toLowerCase();
+}
+
+function parseOwnedDisposableCapability(value) {
+  if (!value || typeof value !== 'object') return null;
+  const scope = String(value.scope || '');
+  const token = String(value.token || '').toLowerCase();
+  if (scope !== OWNED_DISPOSABLE_SCOPE || !/^[a-f0-9]{64}$/.test(token)) return null;
+  return {
+    scope,
+    token,
+    tokenHash: crypto.createHash('sha256').update(token).digest('hex'),
+  };
+}
+
+function ownedDisposableTokenHashMatches(actual, expected) {
+  const left = String(actual || '').toLowerCase();
+  const right = String(expected || '').toLowerCase();
+  return /^[a-f0-9]{64}$/.test(left)
+    && /^[a-f0-9]{64}$/.test(right)
+    && crypto.timingSafeEqual(Buffer.from(left, 'hex'), Buffer.from(right, 'hex'));
+}
+
+function ownedDisposableRolloutPath(filePath, cliSessionId) {
+  if (!filePath) return { ok: true, path: null };
+  const cliId = String(cliSessionId || '');
+  if (!/^[0-9a-f-]{36}$/i.test(cliId)) return { ok: false, reason: 'invalid_native_session_id' };
+  const sessionsRoot = path.resolve(
+    process.env.CODEX_SESSIONS_DIR
+      || path.join(process.env.USERPROFILE || process.env.HOME || '', '.codex', 'sessions')
+  );
+  const candidate = path.resolve(filePath);
+  const relative = path.relative(sessionsRoot, candidate);
+  if (!relative || relative.startsWith(`..${path.sep}`) || relative === '..' || path.isAbsolute(relative)) {
+    return { ok: false, reason: 'native_rollout_outside_sessions_root' };
+  }
+  if (!path.basename(candidate).toLowerCase().endsWith(`-${cliId.toLowerCase()}.jsonl`)) {
+    return { ok: false, reason: 'native_rollout_identity_mismatch' };
+  }
+  if (fs.existsSync(candidate)) {
+    const stat = fs.lstatSync(candidate);
+    if (!stat.isFile() || stat.isSymbolicLink()) {
+      return { ok: false, reason: 'native_rollout_not_regular_file' };
+    }
+    const realRoot = fs.realpathSync.native(sessionsRoot);
+    const realCandidate = fs.realpathSync.native(candidate);
+    const realRelative = path.relative(realRoot, realCandidate);
+    if (!realRelative || realRelative.startsWith(`..${path.sep}`)
+        || realRelative === '..' || path.isAbsolute(realRelative)) {
+      return { ok: false, reason: 'native_rollout_realpath_escape' };
+    }
+  }
+  return { ok: true, path: candidate };
+}
+
+function validateOwnedDisposableCodexCliSession(sessionId, session, request) {
+  const capability = parseOwnedDisposableCapability(request);
+  if (!capability) return { ok: false, reason: 'invalid_cleanup_capability' };
+  if (!session || session.agentType !== 'codex_cli') {
+    return { ok: false, reason: 'not_owned_codex_cli' };
+  }
+  if (normalizeOwnedDisposableWorkspace(session.workspace_path) !== OWNED_DISPOSABLE_WORKSPACE
+      || Number(session._cdpPort || session.cdp_port || 0) !== 0
+      || session.targetId) {
+    return { ok: false, reason: 'owned_fixture_boundary_mismatch' };
+  }
+  if (session.ownedDisposableScope !== capability.scope
+      || !ownedDisposableTokenHashMatches(session.ownedDisposableTokenHash, capability.tokenHash)) {
+    return { ok: false, reason: 'owned_fixture_capability_mismatch' };
+  }
+  const stored = sessionStore.getSession(sessionId);
+  if (!stored
+      || stored.owned_disposable_scope !== capability.scope
+      || !ownedDisposableTokenHashMatches(stored.owned_disposable_token_hash, capability.tokenHash)
+      || stored.cli_session_id !== session.cliSessionId
+      || normalizeOwnedDisposableWorkspace(stored.workspace_path) !== OWNED_DISPOSABLE_WORKSPACE) {
+    return { ok: false, reason: 'durable_owned_identity_mismatch' };
+  }
+  const rollout = ownedDisposableRolloutPath(
+    session.codexCliFilePath || session.codex_cli_file_path || stored.codex_cli_file_path,
+    session.cliSessionId,
+  );
+  if (!rollout.ok) return { ok: false, reason: rollout.reason };
+  return { ok: true, capability, stored, rollout };
+}
+
+function destroyOwnedDisposableCodexCliSession(sessionId, session, request, validated = null) {
+  const validation = validated?.ok === true
+    ? validated
+    : validateOwnedDisposableCodexCliSession(sessionId, session, request);
+  if (!validation.ok) return { destroyed: false, reason: validation.reason };
+  const { capability, stored, rollout } = validation;
+  let nativeRolloutRemoved = rollout.path == null || !fs.existsSync(rollout.path);
+  if (rollout.path && fs.existsSync(rollout.path)) {
+    try {
+      fs.unlinkSync(rollout.path);
+      nativeRolloutRemoved = !fs.existsSync(rollout.path);
+    } catch {
+      return { destroyed: false, reason: 'native_rollout_remove_failed' };
+    }
+  }
+  const removed = sessionStore.removeOwnedDisposableSession(sessionId, {
+    scope: capability.scope,
+    tokenHash: capability.tokenHash,
+    cliSessionId: session.cliSessionId,
+    workspacePath: stored.workspace_path,
+  });
+  if (!removed.removed) {
+    return { destroyed: false, reason: removed.reason, native_rollout_removed: nativeRolloutRemoved };
+  }
+  return {
+    destroyed: true,
+    reason: removed.reason,
+    removed_session_count: removed.removed_session_ids.length,
+    native_rollout_removed: nativeRolloutRemoved,
+  };
+}
 
 function codexDesktopQuestionIdentity(sessionId, observed) {
   const nativeThreadId = String(observed?.native_thread_id || '').trim();
@@ -540,9 +678,59 @@ function isDesktopAppPage(target, agentType) {
   const url = String(target.url || '');
   if (!url || url.startsWith('devtools') || url.startsWith('chrome-extension')) return false;
   if (agentType === 'codex-desktop') {
-    return /^app:\/\/-\/index\.html(?:[?#].*)?$/i.test(url);
+    try {
+      const parsed = new URL(url);
+      return parsed.protocol === 'app:'
+        && parsed.hostname === '-'
+        && parsed.pathname === '/index.html'
+        && !parsed.searchParams.has('initialRoute');
+    } catch {
+      return false;
+    }
   }
   return true;
+}
+
+function configuredDesktopPortMap(cdpPorts = [], codexDesktopCdpPorts = null) {
+  const scannedPorts = new Set(
+    (Array.isArray(cdpPorts) ? cdpPorts : [])
+      .map(Number)
+      .filter(port => Number.isInteger(port) && port > 0 && port <= 65535),
+  );
+  const requestedCodexPorts = codexDesktopCdpPorts == null
+    ? (scannedPorts.has(9225) ? [9225] : [])
+    : codexDesktopCdpPorts;
+  if (!Array.isArray(requestedCodexPorts)) {
+    throw new Error('codexDesktopCdpPorts must be an array');
+  }
+  const map = new Map([
+    [9224, 'claude-desktop'],
+    [9227, 'cursor'],
+  ]);
+  for (const rawPort of requestedCodexPorts) {
+    const port = Number(rawPort);
+    if (!Number.isInteger(port) || port <= 0 || port > 65535) {
+      throw new Error(`Invalid Codex Desktop CDP port: ${rawPort}`);
+    }
+    if (!scannedPorts.has(port)) {
+      throw new Error(`Codex Desktop CDP port ${port} is not present in cdpPorts`);
+    }
+    const existing = map.get(port);
+    if (existing && existing !== 'codex-desktop') {
+      throw new Error(`Codex Desktop CDP port ${port} conflicts with ${existing}`);
+    }
+    map.set(port, 'codex-desktop');
+  }
+  return Object.freeze(Object.fromEntries(map));
+}
+
+function desktopSessionSignatureSource(agentType, target) {
+  const url = String(target?.url || '');
+  const port = Number(target?._cdpPort);
+  if (agentType === 'codex-desktop' && Number.isInteger(port) && port !== 9225) {
+    return `${agentType}::port=${port}::${url}`;
+  }
+  return `${agentType}::${url}`;
 }
 
 function isStoredDesktopTargetCanonical(session, target) {
@@ -1076,6 +1264,12 @@ const AUTOMATIC_HISTORY_SNAPSHOT_MAX_BYTES = Math.min(
   envMbBytes('RAC_HISTORY_SNAPSHOT_AUTO_MAX_MB', 4, 1, 64)
 );
 const CODEX_CLI_HISTORY_CHUNK_BYTES = envMbBytes('CODEX_CLI_HISTORY_CHUNK_MB', 1, 1, 16);
+const CODEX_DESKTOP_THREAD_HISTORY_MAX_HYDRATE_BYTES = envMbBytes(
+  'CODEX_DESKTOP_THREAD_HISTORY_MAX_HYDRATE_MB',
+  8,
+  1,
+  32,
+);
 const CODEX_CLI_HISTORY_TAIL_MIN_INTERVAL_MS = 1_500;
 const CODEX_CLI_HISTORY_OLDER_MIN_INTERVAL_MS = 5_000;
 const FILE_TRANSCRIPT_ASYNC_APPEND_THRESHOLD = 20;
@@ -1125,6 +1319,10 @@ class ProxyEngine extends EventEmitter {
     super();
 
     this.CDP_PORTS = config.cdpPorts;
+    this.DESKTOP_PORT_MAP = configuredDesktopPortMap(
+      this.CDP_PORTS,
+      config.codexDesktopCdpPorts,
+    );
     this.RELAY_URL_BASE = config.relayUrl;
     this.PROXY_SECRET = config.proxySecret || null;
     this.RELAY_URL = this.RELAY_URL_BASE; // SEC-02: secret moved to connection_hello message
@@ -1224,6 +1422,10 @@ class ProxyEngine extends EventEmitter {
     this._codexConfigQueues = new Map();
     this._codexConfigPending = new Map();
     this._codexConfigReceipts = new Map();
+    this._latencyTracesByClientMessageId = new Map();
+    this._latencyTraceClientIdsBySession = new Map();
+    this._latencyOutputSequenceBySession = new Map();
+    this._latencyTraceCleanupTimer = null;
     this.openWorkspaces = [];
     this._cdpPortCooldownUntil = new Map();
     this._cdpTargetCooldownUntil = new Map();
@@ -1235,6 +1437,8 @@ class ProxyEngine extends EventEmitter {
     this._relayEpoch = 0;
     this.hbIntervalMs = 10000;
     this.hbTimer = null;
+    this._relayHeartbeatPending = new Map();
+    this._relayClockEstimate = null;
     this.reconnectAttempt = 0;
     this.MAX_RECONNECT_DELAY_MS = 60000;
     this._navigationContext = new AsyncLocalStorage();
@@ -1388,6 +1592,14 @@ class ProxyEngine extends EventEmitter {
       sessionId = session.session_id;
     }
     const startedAt = Date.now();
+    session._lastDomPushLatencySource = {
+      observed_at_ms: Number.isFinite(event?.sourceAt) ? event.sourceAt : startedAt,
+      source: 'cdp_dom_push',
+      source_at: Number.isFinite(event?.sourceAt) ? event.sourceAt : startedAt,
+      ...(Number.isFinite(event?.cdpToQueueMs) ? { cdpToQueueMs: event.cdpToQueueMs } : {}),
+      ...(Number.isFinite(event?.bindingToProxyMs) ? { bindingToProxyMs: event.bindingToProxyMs } : {}),
+      ...(Number.isFinite(event?.queueToDispatchMs) ? { queueToDispatchMs: event.queueToDispatchMs } : {}),
+    };
     const signalMs = Number.isFinite(event?.sourceAt)
       ? Math.max(0, Date.now() - event.sourceAt)
       : null;
@@ -4055,15 +4267,77 @@ class ProxyEngine extends EventEmitter {
       },
     );
     if (!accepted) return { mode: 'canonical_schema_migration_deferred', sent: 0 };
+    const latencyReplaySent = this._replayCanonicalAssistantForPendingLatency(
+      sessionId,
+      recoveredMessages,
+      session,
+    );
     session._codexCliCanonicalMigrationAttempted = true;
     session._lastFileTranscriptResyncAt = Date.now();
     this._log('warn', `[${sessionId}] Sent bounded codex_cli canonical transcript schema migration ${resyncId} (${recoveredMessages.length} rows, ${CODEX_CLI_CANONICAL_TRANSCRIPT_SCHEMA})`);
     return {
       mode: 'canonical_schema_migration',
       sent: recoveredMessages.length,
+      latency_replay_sent: latencyReplaySent,
       resync_id: resyncId,
       schema: CODEX_CLI_CANONICAL_TRANSCRIPT_SCHEMA,
     };
+  }
+
+  _replayCanonicalAssistantForPendingLatency(sessionId, recoveredMessages, session = null) {
+    this._expireSendLatencyTraces(Date.now(), sessionId);
+    const clientMessageIds = this._latencyTraceClientIdsBySession?.get(sessionId) || [];
+    if (clientMessageIds.length === 0) return false;
+    const owner = session || this.sessions?.get(sessionId) || null;
+    const entries = clientMessageIds
+      .map(clientMessageId => this._latencyTracesByClientMessageId?.get(clientMessageId))
+      .filter(Boolean);
+    const deliveredEntries = entries.filter(entry => entry.delivered === true);
+    if (deliveredEntries.length === 0) {
+      if (owner) owner._pendingCanonicalLatencyMessages = recoveredMessages.slice();
+      return false;
+    }
+    const generationMessage = recoveredMessages.find(message => (
+      message?.source_cursor?.generation
+      || message?.native_source_cursor?.generation
+    ));
+    const generation = generationMessage?.source_cursor?.generation
+      || generationMessage?.native_source_cursor?.generation
+      || null;
+    for (const entry of deliveredEntries) {
+      const causal = canonicalAssistantForEntry(entry, recoveredMessages, generation);
+      if (!causal.ok) {
+        if (['canonical_user_ambiguous', 'canonical_no_output_before_next_user'].includes(causal.code)) {
+          entry.causalAmbiguityObserved = true;
+        }
+        continue;
+      }
+      const userEnvelope = proto.proxyMessage(
+        sessionId,
+        causal.user.role,
+        causal.user.content,
+        causal.user,
+      );
+      this._attachFirstOutputLatencyTrace(userEnvelope);
+      const sent = this._sendProxyMessage(sessionId, causal.assistant);
+      if (sent) {
+        if (owner) owner._pendingCanonicalLatencyMessages = null;
+        this._log('info', `[${sessionId}] Replayed causally matched canonical assistant row for pending latency trace`);
+        return true;
+      }
+    }
+    if (owner) owner._pendingCanonicalLatencyMessages = recoveredMessages.slice();
+    return false;
+  }
+
+  _flushPendingCanonicalAssistantForLatency(sessionId, session) {
+    const messages = session?._pendingCanonicalLatencyMessages;
+    if (!Array.isArray(messages) || messages.length === 0) return false;
+    return this._replayCanonicalAssistantForPendingLatency(
+      sessionId,
+      messages,
+      session,
+    );
   }
 
   _flushCodexCliCanonicalMigrations() {
@@ -4746,7 +5020,193 @@ class ProxyEngine extends EventEmitter {
     }
   }
 
-  _applyCodexDesktopThreadList(sessionId, session, threads) {
+  _decorateCodexDesktopThreadViews(sessionId, session, threads) {
+    const rows = Array.isArray(threads) ? threads.filter(Boolean) : [];
+    if (!session || session.agentType !== 'codex-desktop' || rows.length === 0) return rows;
+    const cliIds = rows
+      .map(thread => codexDesktopCliSessionId(thread.cache_key || thread.id || ''))
+      .filter(Boolean);
+    const archives = typeof codexCli.findSessionFilesByCliIds === 'function'
+      ? codexCli.findSessionFilesByCliIds(cliIds)
+      : new Map(cliIds.map(cliId => [cliId, codexCli.findSessionByCliId(cliId, { includeMessages: false })]).filter(([, value]) => value));
+    const viewIndex = new Map();
+    let archived = 0;
+    let unavailable = 0;
+    let activeThreadId = null;
+    const decorated = rows.map(thread => {
+      const threadId = String(thread.id || thread.cache_key || '');
+      const cacheKey = String(thread.cache_key || thread.id || '');
+      const cliSessionId = codexDesktopCliSessionId(cacheKey);
+      const archive = cliSessionId ? archives.get(cliSessionId.toLowerCase()) : null;
+      let viewState;
+      let loadable;
+      let pollability;
+      if (thread.active) {
+        activeThreadId = threadId || cacheKey || null;
+        viewState = 'native_active';
+        loadable = true;
+        pollability = {
+          state: 'live',
+          pollable: true,
+          loadable: true,
+          reason: 'native_active_thread',
+        };
+      } else if (archive?.filePath) {
+        archived += 1;
+        viewState = 'archive';
+        loadable = true;
+        pollability = {
+          state: 'archive',
+          pollable: false,
+          loadable: true,
+          reason: 'immutable_native_archive',
+        };
+      } else {
+        unavailable += 1;
+        viewState = 'unavailable';
+        loadable = false;
+        pollability = {
+          state: 'not_pollable',
+          pollable: false,
+          loadable: false,
+          reason: cliSessionId ? 'native_archive_not_found' : 'thread_identity_unavailable',
+          required_action: 'Open this chat in Codex Desktop once, then retry.',
+        };
+      }
+      const projected = {
+        ...thread,
+        view_state: viewState,
+        loadable,
+        selection_mode: 'client_local_readonly',
+        pollability,
+      };
+      const internal = {
+        ...projected,
+        cli_session_id: cliSessionId || null,
+        archive_file_path: archive?.filePath || null,
+        archive_size_bytes: Number(archive?.sizeBytes || 0),
+        archive_updated_at: archive?.updatedAt || null,
+      };
+      for (const key of [threadId, cacheKey, cliSessionId]) {
+        if (key) viewIndex.set(String(key), internal);
+      }
+      return projected;
+    });
+    session._codexDesktopThreadViewIndex = viewIndex;
+    session._codexDesktopThreadViewRows = decorated;
+    session._codexDesktopThreadViewPollability = {
+      state: 'polled',
+      pollable: true,
+      reason: 'native_active_document',
+      selection_mode: 'client_local_readonly',
+      active_thread_id: activeThreadId,
+      advertised_threads: decorated.length,
+      archived_threads: archived,
+      unavailable_threads: unavailable,
+      observed_at: new Date().toISOString(),
+    };
+    const pollabilitySig = JSON.stringify({
+      activeThreadId,
+      advertised: decorated.length,
+      archived,
+      unavailable,
+    });
+    if (pollabilitySig !== session._codexDesktopThreadViewPollabilitySig) {
+      session._codexDesktopThreadViewPollabilitySig = pollabilitySig;
+      this._lastSessionSnapshotSig = null;
+      this._log(
+        unavailable > 0 ? 'warn' : 'info',
+        `[${sessionId}] Codex Desktop thread view inventory: ${decorated.length} advertised, `
+          + `${archived} archive-backed, ${unavailable} not pollable, active=${activeThreadId || 'none'}`,
+      );
+    }
+    return decorated;
+  }
+
+  async _resolveCodexDesktopThreadView(sessionId, session, requestedThreadId) {
+    const startedAt = Date.now();
+    let threads = Array.isArray(session?._lastThreadList) ? session._lastThreadList : [];
+    const matchesRequested = thread => (
+      String(thread?.id || '') === String(requestedThreadId)
+      || String(thread?.cache_key || '') === String(requestedThreadId)
+    );
+    if (!threads.some(matchesRequested)) {
+      threads = await this._withTimeout(
+        selectors.readCodexThreadList(session.client.Runtime, true),
+        2500,
+        `codex-desktop read-only thread inventory ${sessionId.substring(0, 8)}`,
+      );
+      this._applyCodexDesktopThreadList(sessionId, session, threads);
+      threads = session._lastThreadList || threads;
+    } else {
+      threads = this._decorateCodexDesktopThreadViews(sessionId, session, threads);
+      session._lastThreadList = threads.slice();
+    }
+    const entry = session._codexDesktopThreadViewIndex?.get(String(requestedThreadId))
+      || threads.map(thread => session._codexDesktopThreadViewIndex?.get(String(thread?.id || '')))
+        .find(candidate => candidate && matchesRequested(candidate));
+    if (!entry) {
+      return {
+        ok: false,
+        error: {
+          code: 'thread_not_found',
+          message: 'This Codex Desktop chat is no longer present in the native thread inventory.',
+          retryable: true,
+          native_attempted: false,
+        },
+      };
+    }
+    const resolvedInMs = Math.max(0, Date.now() - startedAt);
+    const common = {
+      thread_id: String(entry.id || requestedThreadId),
+      thread_cache_key: String(entry.cache_key || entry.id || requestedThreadId),
+      title: entry.title || 'Untitled',
+      view_state: entry.view_state,
+      selection_mode: 'client_local_readonly',
+      selection_budget_ms: 10000,
+      resolved_in_ms: resolvedInMs,
+      pollability: entry.pollability,
+      native_mutated: false,
+    };
+    if (entry.view_state === 'native_active') {
+      return {
+        ok: true,
+        details: {
+          ...common,
+          read_only: false,
+          history_source: 'relay_sqlite',
+          message: 'Showing the natively active Codex Desktop chat.',
+        },
+      };
+    }
+    if (entry.view_state === 'archive' && entry.archive_file_path) {
+      return {
+        ok: true,
+        details: {
+          ...common,
+          read_only: true,
+          history_source: 'codex_desktop_jsonl',
+          archive_updated_at: entry.archive_updated_at,
+          archive_size_bytes: entry.archive_size_bytes,
+          message: 'Showing the immutable native archive. This chat is read-only until it is active in Codex Desktop.',
+        },
+      };
+    }
+    return {
+      ok: true,
+      details: {
+        ...common,
+        view_state: 'unavailable',
+        read_only: true,
+        history_source: null,
+        retryable: true,
+        message: entry.pollability?.required_action
+          || 'Open this chat in Codex Desktop once, then retry.',
+      },
+    };
+  }
+
+  _applyCodexDesktopThreadList(sessionId, session, threads, options = {}) {
     if (!session || !['codex-desktop', 'cursor'].includes(session.agentType) || !Array.isArray(threads) || threads.length === 0) return;
 
     if (session.agentType === 'cursor' && session._cursorVirtual) {
@@ -4754,14 +5214,25 @@ class ProxyEngine extends EventEmitter {
       return;
     }
 
-    const threadListSig = JSON.stringify(threads.map(t => `${t.id || ''}:${t.title || ''}:${!!t.active}:${t.age || ''}`));
-    if (threadListSig !== session._lastThreadListSig) {
+    const projectedThreads = session.agentType === 'codex-desktop'
+      ? this._decorateCodexDesktopThreadViews(sessionId, session, threads)
+      : threads;
+    const threadListSig = JSON.stringify(projectedThreads.map(t => [
+      t.id || '',
+      t.title || '',
+      !!t.active,
+      t.age || '',
+      t.view_state || '',
+      t.pollability?.state || '',
+      t.pollability?.reason || '',
+    ]));
+    if (options.forceEmit === true || threadListSig !== session._lastThreadListSig) {
       session._lastThreadListSig = threadListSig;
-      this._sendToRelay(proto.threadList(sessionId, threads));
+      this._sendToRelay(proto.threadList(sessionId, projectedThreads));
     }
-    session._lastThreadList = threads.slice();
+    session._lastThreadList = projectedThreads.slice();
 
-    const activeThread = threads.find(t => t && t.active);
+    const activeThread = projectedThreads.find(t => t && t.active);
     // Stable native IDs are the thread identity. Titles are mutable and the
     // previous presentation-class selector could normalize them differently
     // across builds, causing a false thread change after restart.
@@ -4939,6 +5410,8 @@ class ProxyEngine extends EventEmitter {
         ok: false,
         code: 'codex_desktop_thread_not_open',
         detail: 'Open this thread in Codex Desktop before retrying.',
+        native_attempted: false,
+        retryable: true,
       };
     }
     let activeThreadKey = '';
@@ -4949,6 +5422,8 @@ class ProxyEngine extends EventEmitter {
         ok: false,
         code: 'codex_desktop_thread_not_open',
         detail: `Could not verify the open Codex Desktop thread: ${error.message}`,
+        native_attempted: false,
+        retryable: true,
       };
     }
     if (!activeThreadKey || !codexDesktopThreadKeysMatch(expectedThreadKey, activeThreadKey)) {
@@ -4956,6 +5431,8 @@ class ProxyEngine extends EventEmitter {
         ok: false,
         code: 'codex_desktop_thread_not_open',
         detail: 'Open this thread in Codex Desktop before retrying.',
+        native_attempted: false,
+        retryable: true,
       };
     }
     return { ok: true, active_thread_key: activeThreadKey };
@@ -5452,18 +5929,31 @@ class ProxyEngine extends EventEmitter {
     if (isWriteCommand(type)) {
       const sessionId = msg.session_id || msg.session;
       const session = sessionId ? this.sessions.get(sessionId) : null;
+      const clientLocalReadOnlySelection = type === 'switch_thread'
+        && session?.agentType === 'codex-desktop';
       const gateResolver = this._validationGateForAgentType || validationGateForAgentType;
-      const gate = gateResolver(session?.agentType, undefined, type);
+      const gate = clientLocalReadOnlySelection
+        ? { gated: false }
+        : gateResolver(session?.agentType, undefined, type, {
+          sessionId,
+          cdpPort: session?._cdpPort,
+        });
       if (session && gate.gated) {
         const error = {
           code: 'pending_revalidation',
           message: gate.reason,
           retryable: true,
+          native_attempted: false,
           revalidation_harness: gate.harness,
           revalidation_version: gate.installed_version,
         };
         if ((type === 'send' || type === 'send_message') && msg.client_message_id) {
-          this._sendToRelay(proto.proxySendResult(sessionId, msg.client_message_id, 'failed', { error }));
+          const failureMessage = proto.proxySendResult(sessionId, msg.client_message_id, 'failed', { error });
+          const deliveryAttempt = Number(msg.delivery_attempt);
+          if (Number.isInteger(deliveryAttempt) && deliveryAttempt > 0) {
+            failureMessage.delivery_attempt = deliveryAttempt;
+          }
+          this._sendToRelay(failureMessage);
         } else {
           this._sendToRelay(proto.agentControlResult(
             sessionId,
@@ -5591,7 +6081,12 @@ class ProxyEngine extends EventEmitter {
       for (const [sessionId, session] of this.sessions.entries()) {
         if (session.messageQueue?.length) {
           for (const item of session.messageQueue) {
-            this._sendToRelay(proto.messageQueued(sessionId, item.client_message_id, item.content));
+            this._sendToRelay(proto.messageQueued(
+              sessionId,
+              item.client_message_id,
+              item.content,
+              item.delivery_attempt,
+            ));
           }
           this._log('info', `[relay] Re-broadcast ${session.messageQueue.length} queued messages for ${sessionId}`);
         }
@@ -5605,7 +6100,10 @@ class ProxyEngine extends EventEmitter {
       return;
     }
 
-    if (type === 'heartbeat_ack') return;
+    if (type === 'heartbeat_ack') {
+      this._handleRelayHeartbeatAck(msg);
+      return;
+    }
 
     if (type === 'provider_usage_watch') {
       this._providerUsage.setWatching(msg.active === true).catch(error => {
@@ -5851,6 +6349,7 @@ class ProxyEngine extends EventEmitter {
         content:           msg.content,
         file:              msg.file,
         client_message_id: msg.client_message_id,
+        latency_trace:     msg.latency_trace,
       });
       return;
     }
@@ -6888,7 +7387,11 @@ class ProxyEngine extends EventEmitter {
         : selectors.readCodexThreadList(sessionData.client.Runtime, true);
       threadListPromise
         .then(threads => {
-          this._sendToRelay(proto.threadList(sid, threads));
+          if (agentT === 'codex-desktop' || agentT === 'cursor') {
+            this._applyCodexDesktopThreadList(sid, sessionData, threads, { forceEmit: true });
+          } else {
+            this._sendToRelay(proto.threadList(sid, threads));
+          }
           this._sendToRelay(proto.agentControlResult(sid, requestId, 'thread_list', 'ok'));
         })
         .catch(err => {
@@ -6918,6 +7421,43 @@ class ProxyEngine extends EventEmitter {
           code: 'invalid_message', message: 'switch_thread requires thread_id',
         }));
         return;
+      }
+
+      if (agentT === 'codex-desktop') {
+        return this._resolveCodexDesktopThreadView(sid, sessionData, threadId)
+          .then(resolution => {
+            if (!resolution.ok) {
+              this._sendToRelay(proto.agentControlResult(
+                sid,
+                requestId,
+                'switch_thread',
+                'failed',
+                resolution.error,
+              ));
+              return;
+            }
+            this._log(
+              'info',
+              `[ctrl] Codex Desktop client-local thread view ${sid}: ${threadId} `
+                + `(${resolution.details.view_state}, ${resolution.details.resolved_in_ms}ms, native mutation=false)`,
+            );
+            this._sendToRelay(proto.agentControlResult(
+              sid,
+              requestId,
+              'switch_thread',
+              'ok',
+              resolution.details,
+            ));
+          })
+          .catch(error => {
+            this._log('warn', `[ctrl] Codex Desktop read-only thread selection failed for ${sid}: ${error.message}`);
+            this._sendToRelay(proto.agentControlResult(sid, requestId, 'switch_thread', 'failed', {
+              code: 'thread_view_resolution_failed',
+              message: error.message || 'Codex Desktop chat availability could not be resolved.',
+              retryable: true,
+              native_attempted: false,
+            }));
+          });
       }
 
       if (sessionData._cursorVirtual) {
@@ -8706,6 +9246,19 @@ class ProxyEngine extends EventEmitter {
         const cliSessionId = crypto.randomUUID();
         const workspace = workspacePath || process.cwd();
         const workspaceName = path.basename(workspace) || 'Codex CLI';
+        const ownedDisposable = parseOwnedDisposableCapability(msg.owned_disposable);
+        if (msg.owned_disposable != null && (
+          !ownedDisposable
+          || normalizeOwnedDisposableWorkspace(workspace) !== OWNED_DISPOSABLE_WORKSPACE
+        )) {
+          this._sendToRelay({
+            type: 'session_launch_failed', protocol_version: proto.PROTOCOL_VERSION,
+            request_id: requestId, agent_type: agentType,
+            reason: 'Owned-disposable launch capability is invalid',
+            error_code: 'invalid_owned_disposable_capability',
+          });
+          return;
+        }
         const collaborationMode = msg.collaboration_mode == null
           ? null
           : String(msg.collaboration_mode).trim().toLowerCase();
@@ -8788,12 +9341,19 @@ class ProxyEngine extends EventEmitter {
         session.nextSendEffort = effort;
         session.nextSendEffortStatus = effort ? 'pending' : 'unset';
         session.codexCliCollaborationMode = collaborationMode;
+        session.ownedDisposableScope = ownedDisposable?.scope || null;
+        session.ownedDisposableTokenHash = ownedDisposable?.tokenHash || null;
         sessionStore.updateSession(session.session_id, {
           codex_cli_next_model_id: modelId,
           codex_cli_next_model_status: session.nextSendModelStatus,
           codex_cli_next_effort: effort,
           codex_cli_next_effort_status: session.nextSendEffortStatus,
           codex_cli_collaboration_mode: collaborationMode,
+          ...(ownedDisposable ? {
+            owned_disposable_scope: ownedDisposable.scope,
+            owned_disposable_token_hash: ownedDisposable.tokenHash,
+            owned_disposable_created_at: new Date().toISOString(),
+          } : {}),
         });
         this._publishCodexCliConfig(session.session_id, session);
         try {
@@ -8832,6 +9392,12 @@ class ProxyEngine extends EventEmitter {
           request_id: requestId,
           session_id: session.session_id,
           agent_type: agentType,
+          ...(ownedDisposable ? {
+            owned_disposable: {
+              armed: true,
+              scope: ownedDisposable.scope,
+            },
+          } : {}),
         });
         return;
       }
@@ -9200,9 +9766,41 @@ class ProxyEngine extends EventEmitter {
       const sid = msg.session_id || msg.session;
       this._log('info', `[ctrl] close_session for ${sid}`);
       const sessionData = this.sessions.get(sid);
+      const destroyRequest = msg.destroy_owned_disposable || null;
+      const destroyValidation = destroyRequest
+        ? validateOwnedDisposableCodexCliSession(sid, sessionData, destroyRequest)
+        : null;
+      const sendCleanupFailure = cleanup => {
+        this._sendToRelay({
+          type: 'session_close_failed',
+          protocol_version: proto.PROTOCOL_VERSION,
+          session_id: sid,
+          request_id: msg.request_id,
+          reason: cleanup?.reason || 'owned_disposable_cleanup_failed',
+          owned_disposable_cleanup: cleanup || {
+            destroyed: false,
+            reason: 'owned_disposable_cleanup_failed',
+          },
+        });
+        this._broadcastSessionSnapshot();
+      };
+      if (destroyRequest && destroyValidation?.ok !== true) {
+        this._log('warn', `[ctrl] owned-disposable cleanup rejected for ${sid}: ${destroyValidation?.reason || 'unknown'}`);
+        sendCleanupFailure({ destroyed: false, reason: destroyValidation?.reason || 'unknown' });
+        return;
+      }
 
       const finishClose = () => {
-        sessionStore.markDisconnected(sid);
+        const cleanupReceipt = destroyRequest
+          ? destroyOwnedDisposableCodexCliSession(sid, sessionData, destroyRequest, destroyValidation)
+          : null;
+        if (destroyRequest && cleanupReceipt?.destroyed !== true) {
+          this._log('warn', `[ctrl] owned-disposable cleanup rejected for ${sid}: ${cleanupReceipt?.reason || 'unknown'}`);
+          sendCleanupFailure(cleanupReceipt);
+          return;
+        }
+        this._dropSendLatencyTracesForSession(sid);
+        if (!destroyRequest) sessionStore.markDisconnected(sid);
         this.sessions.delete(sid);
         this.activeQuestionPromptAdapters.delete(sid);
         this.activePermissionPrompts.delete(sid);
@@ -9211,6 +9809,8 @@ class ProxyEngine extends EventEmitter {
           type: 'session_closed',
           protocol_version: proto.PROTOCOL_VERSION,
           session_id: sid,
+          request_id: msg.request_id,
+          ...(cleanupReceipt ? { owned_disposable_cleanup: cleanupReceipt } : {}),
         });
         this._broadcastSessionSnapshot();
       };
@@ -9465,7 +10065,7 @@ class ProxyEngine extends EventEmitter {
   _handleHistoryChunkRequest(msg) {
     const sessionId = msg.session_id || msg.session;
     const requestId = msg.request_id || null;
-    const fail = (code, message, source = 'codex_cli_jsonl', retryAfterMs = 0) => {
+    const fail = (code, message, source = 'codex_cli_jsonl', retryAfterMs = 0, metadata = {}) => {
       if (!sessionId) return;
       this._sendToRelay(proto.historyChunk(sessionId, {
         requestId,
@@ -9475,12 +10075,156 @@ class ProxyEngine extends EventEmitter {
         partial: false,
         complete: true,
         source,
+        threadId: metadata.threadId || null,
+        viewState: metadata.viewState || null,
+        pollability: metadata.pollability || null,
         error: { code, message, ...(retryAfterMs > 0 ? { retry_after_ms: retryAfterMs } : {}) },
       }));
     };
     if (!sessionId) return;
     const session = this.sessions.get(sessionId);
     if (!session) return fail('session_not_found', 'Session not found');
+    const sendCodexArchiveChunk = ({
+      filePath,
+      source,
+      threadId = null,
+      viewState = null,
+      pollability = null,
+      throttleKey = sessionId,
+      maxHydrateBytes = RELAY_MESSAGE_MAX_BYTES,
+    }) => {
+      const metadata = { threadId, viewState, pollability };
+      if (!filePath) return fail('archive_not_found', 'Codex archive path is unavailable', source, 0, metadata);
+      const throttle = this._codexCliHistoryChunkThrottle(throttleKey, msg);
+      if (throttle) return fail(throttle.code, throttle.message, source, throttle.retryAfterMs, metadata);
+      const requestedBytes = Number(msg.chunk_bytes || msg.chunkBytes || 0);
+      const chunkBytes = Number.isFinite(requestedBytes) && requestedBytes > 0
+        ? Math.max(256 * 1024, Math.min(16 * 1024 * 1024, Math.floor(requestedBytes)))
+        : CODEX_CLI_HISTORY_CHUNK_BYTES;
+      const requestedLimit = Math.max(0, Math.min(1000, Math.floor(Number(msg.limit) || 0)));
+      const beforeOffset = msg.mode === 'older'
+        ? (msg.before_offset ?? msg.beforeOffset ?? msg.cursor?.next_before_offset ?? null)
+        : null;
+      try {
+        const chunk = codexCli.readCanonicalHistoryChunk(filePath, {
+          beforeOffset,
+          limit: requestedLimit,
+          maxHydrateBytes,
+        }) || codexCli.parseCodexJsonlChunk(filePath, {
+          beforeOffset,
+          chunkBytes,
+          minimumMessages: requestedLimit,
+        });
+        if (!chunk) return fail('archive_unreadable', 'Codex archive could not be read', source, 0, metadata);
+        const parsedMessages = Array.isArray(chunk.state?.messages) ? chunk.state.messages : [];
+        const firstReturnedIndex = requestedLimit > 0 && parsedMessages.length > requestedLimit
+          ? parsedMessages.length - requestedLimit
+          : 0;
+        const messages = firstReturnedIndex > 0
+          ? parsedMessages.slice(firstReturnedIndex)
+          : parsedMessages;
+        const firstReturnedOffset = Math.max(
+          0,
+          Number(chunk.messageStartOffsets?.[firstReturnedIndex]) || Number(chunk.startOffset) || 0,
+        );
+        const nextBeforeOffset = firstReturnedIndex > 0
+          ? (firstReturnedOffset > 0 ? firstReturnedOffset : null)
+          : (chunk.nextBeforeOffset ?? null);
+        this._sendToRelay(proto.historyChunk(sessionId, {
+          requestId,
+          messages,
+          mode: msg.mode === 'older' ? 'older' : 'tail',
+          replace: msg.mode !== 'older' && msg.replace === true,
+          startOffset: firstReturnedOffset,
+          endOffset: chunk.endOffset,
+          nextBeforeOffset,
+          totalBytes: chunk.stat?.size || 0,
+          partial: !!nextBeforeOffset,
+          complete: !nextBeforeOffset,
+          source,
+          threadId,
+          viewState,
+          pollability,
+        }));
+        this._log(
+          'info',
+          `[${sessionId}] Sent ${source} history chunk`
+            + `${threadId ? ` for ${threadId}` : ''} `
+            + `(${messages.length}/${parsedMessages.length} msgs, scanned ${chunk.bytesRead || 0} bytes, `
+            + `${firstReturnedOffset}-${chunk.endOffset}/${chunk.stat?.size || 0}`
+            + `${chunk.canonical ? ', canonical full-history slice' : ', bounded fallback'})`,
+        );
+      } catch (error) {
+        fail('chunk_read_failed', error.message || 'Codex archive chunk read failed', source, 0, metadata);
+      }
+      return undefined;
+    };
+
+    if (session.agentType === 'codex-desktop') {
+      const threadId = String(msg.thread_id || msg.threadId || '').trim();
+      const source = String(msg.source || '');
+      if (source !== 'codex_desktop_jsonl') {
+        return fail(
+          'unsupported_history_source',
+          'Inactive Codex Desktop chats are served only from their immutable native archive.',
+          source || 'codex_desktop_jsonl',
+          0,
+          { threadId, viewState: 'unavailable' },
+        );
+      }
+      if (!threadId) {
+        return fail(
+          'thread_id_required',
+          'A Codex Desktop thread_id is required for archive history.',
+          source,
+          0,
+          { viewState: 'unavailable' },
+        );
+      }
+      if (Array.isArray(session._lastThreadList) && session._lastThreadList.length > 0) {
+        const decorated = this._decorateCodexDesktopThreadViews(sessionId, session, session._lastThreadList);
+        session._lastThreadList = decorated.slice();
+      }
+      const entry = session._codexDesktopThreadViewIndex?.get(threadId) || null;
+      if (!entry) {
+        return fail(
+          'thread_inventory_required',
+          'Refresh the Codex Desktop thread list, then retry this chat.',
+          source,
+          0,
+          {
+            threadId,
+            viewState: 'unavailable',
+            pollability: {
+              state: 'not_pollable',
+              pollable: false,
+              loadable: false,
+              reason: 'thread_not_in_current_inventory',
+            },
+          },
+        );
+      }
+      if (entry.view_state !== 'archive' || !entry.archive_file_path) {
+        return fail(
+          entry.view_state === 'native_active' ? 'thread_is_native_active' : 'archive_not_found',
+          entry.view_state === 'native_active'
+            ? 'The active Codex Desktop chat is served from the live relay transcript.'
+            : (entry.pollability?.required_action || 'Open this chat in Codex Desktop once, then retry.'),
+          source,
+          0,
+          { threadId, viewState: entry.view_state, pollability: entry.pollability },
+        );
+      }
+      return sendCodexArchiveChunk({
+        filePath: entry.archive_file_path,
+        source,
+        threadId: String(entry.id || threadId),
+        viewState: 'archive',
+        pollability: entry.pollability,
+        throttleKey: `${sessionId}:${entry.cli_session_id || threadId}`,
+        maxHydrateBytes: CODEX_DESKTOP_THREAD_HISTORY_MAX_HYDRATE_BYTES,
+      });
+    }
 
     if (session.agentType === 'cursor_cli') {
       const filePath = session.cursorCliFilePath || session.cursor_cli_file_path;
@@ -9522,60 +10266,11 @@ class ProxyEngine extends EventEmitter {
       return fail('unsupported_agent_type', 'Chunked native history is only available for Codex CLI or Cursor CLI sessions');
     }
     const filePath = session.codexCliFilePath || session.codex_cli_file_path;
-    if (!filePath) return fail('archive_not_found', 'Codex CLI archive path is unavailable');
-    const throttle = this._codexCliHistoryChunkThrottle(sessionId, msg);
-    if (throttle) return fail(throttle.code, throttle.message, 'codex_cli_jsonl', throttle.retryAfterMs);
-
-    const requestedBytes = Number(msg.chunk_bytes || msg.chunkBytes || 0);
-    const chunkBytes = Number.isFinite(requestedBytes) && requestedBytes > 0
-      ? Math.max(256 * 1024, Math.min(16 * 1024 * 1024, Math.floor(requestedBytes)))
-      : CODEX_CLI_HISTORY_CHUNK_BYTES;
-    const requestedLimit = Math.max(0, Math.min(1000, Math.floor(Number(msg.limit) || 0)));
-    const beforeOffset = msg.mode === 'older'
-      ? (msg.before_offset ?? msg.beforeOffset ?? msg.cursor?.next_before_offset ?? null)
-      : null;
-    try {
-      const chunk = codexCli.readCanonicalHistoryChunk(filePath, {
-        beforeOffset,
-        limit: requestedLimit,
-        maxHydrateBytes: RELAY_MESSAGE_MAX_BYTES,
-      }) || codexCli.parseCodexJsonlChunk(filePath, {
-        beforeOffset,
-        chunkBytes,
-        minimumMessages: requestedLimit,
-      });
-      if (!chunk) return fail('archive_unreadable', 'Codex CLI archive could not be read');
-      const parsedMessages = Array.isArray(chunk.state?.messages) ? chunk.state.messages : [];
-      const firstReturnedIndex = requestedLimit > 0 && parsedMessages.length > requestedLimit
-        ? parsedMessages.length - requestedLimit
-        : 0;
-      const messages = firstReturnedIndex > 0
-        ? parsedMessages.slice(firstReturnedIndex)
-        : parsedMessages;
-      const firstReturnedOffset = Math.max(
-        0,
-        Number(chunk.messageStartOffsets?.[firstReturnedIndex]) || Number(chunk.startOffset) || 0,
-      );
-      const nextBeforeOffset = firstReturnedIndex > 0
-        ? (firstReturnedOffset > 0 ? firstReturnedOffset : null)
-        : (chunk.nextBeforeOffset ?? null);
-      this._sendToRelay(proto.historyChunk(sessionId, {
-        requestId,
-        messages,
-        mode: msg.mode === 'older' ? 'older' : 'tail',
-        replace: msg.mode !== 'older' && msg.replace === true,
-        startOffset: firstReturnedOffset,
-        endOffset: chunk.endOffset,
-        nextBeforeOffset,
-        totalBytes: chunk.stat?.size || 0,
-        partial: !!nextBeforeOffset,
-        complete: !nextBeforeOffset,
-        source: 'codex_cli_jsonl',
-      }));
-      this._log('info', `[${sessionId}] Sent Codex CLI history chunk (${messages.length}/${parsedMessages.length} msgs, scanned ${chunk.bytesRead || 0} bytes, ${firstReturnedOffset}-${chunk.endOffset}/${chunk.stat?.size || 0}${chunk.canonical ? ', canonical full-history slice' : ', bounded fallback'})`);
-    } catch (e) {
-      fail('chunk_read_failed', e.message || 'Codex CLI archive chunk read failed');
-    }
+    return sendCodexArchiveChunk({
+      filePath,
+      source: 'codex_cli_jsonl',
+      throttleKey: sessionId,
+    });
   }
 
   _scheduleRelayBulkFlush() {
@@ -9687,6 +10382,7 @@ class ProxyEngine extends EventEmitter {
       'message', 'proxy_message', 'history', 'history_snapshot', 'history_chunk',
     ]);
     if (!canonicalSessionId || !sharedTranscriptTypes.has(msg.type)) return null;
+    this._moveSendLatencyTracesSession(sessionId, canonicalSessionId);
     return {
       ...msg,
       ...(Object.prototype.hasOwnProperty.call(msg, 'session') ? { session: canonicalSessionId } : {}),
@@ -9694,10 +10390,301 @@ class ProxyEngine extends EventEmitter {
     };
   }
 
+  _registerSendLatencyTrace(msg, sessionData) {
+    const clientMessageId = String(msg?.client_message_id || '');
+    const sessionId = String(msg?.session || msg?.session_id || '');
+    if (!clientMessageId || !sessionId || !msg?.latency_trace) return null;
+    const proxyReceivedAtMs = Date.now();
+    const proxyClock = relayClockStageObservation(
+      proxyReceivedAtMs,
+      'proxy',
+      this._relayClockEstimate,
+      { nowMs: proxyReceivedAtMs },
+    );
+    const proxyReceived = advanceLatencyTrace(
+      {
+        ...msg.latency_trace,
+        client_message_id: clientMessageId,
+        agent_type: sessionData?.agentType || msg.latency_trace.agent_type || 'unknown',
+      },
+      'proxy_recv',
+      proxyReceivedAtMs,
+      { source: 'proxy_ws', ...proxyClock.source },
+    );
+    if (!proxyReceived.ok) {
+      this._log('warn', `[latency] Rejected send trace ${msg.latency_trace?.trace_id || 'unknown'} at proxy_recv: ${proxyReceived.code}`);
+      return null;
+    }
+    if (this._latencyTracesByClientMessageId.has(clientMessageId)) {
+      this._terminalizeSendLatencyTrace(clientMessageId, 'trace_replaced');
+    }
+    const entry = {
+      trace: proxyReceived.trace,
+      sessionId,
+      clientMessageId,
+      contentSha256: contentSha256(msg?.content || ''),
+      registeredAtMs: Date.now(),
+      delivered: false,
+      completed: false,
+    };
+    this._latencyTracesByClientMessageId.set(clientMessageId, entry);
+    const sessionClientIds = this._latencyTraceClientIdsBySession.get(sessionId) || [];
+    if (!sessionClientIds.includes(clientMessageId)) sessionClientIds.push(clientMessageId);
+    this._latencyTraceClientIdsBySession.set(sessionId, sessionClientIds);
+    while (this._latencyTracesByClientMessageId.size > 512) {
+      const oldestClientMessageId = this._latencyTracesByClientMessageId.keys().next().value;
+      this._terminalizeSendLatencyTrace(oldestClientMessageId, 'capacity_evicted');
+    }
+    msg.latency_trace = proxyReceived.trace;
+    return entry;
+  }
+
+  _dropSendLatencyTrace(clientMessageId) {
+    const entry = this._latencyTracesByClientMessageId?.get(clientMessageId);
+    if (!entry) return false;
+    this._latencyTracesByClientMessageId.delete(clientMessageId);
+    const sessionClientIds = this._latencyTraceClientIdsBySession?.get(entry.sessionId) || [];
+    const remaining = sessionClientIds.filter(value => value !== clientMessageId);
+    if (remaining.length > 0) this._latencyTraceClientIdsBySession?.set(entry.sessionId, remaining);
+    else this._latencyTraceClientIdsBySession?.delete(entry.sessionId);
+    return true;
+  }
+
+  _latencyTraceTerminalReason(entry) {
+    if (!entry?.delivered) return 'expired_before_delivery';
+    if (entry.causalAmbiguityObserved === true || entry.overlapAmbiguous === true) {
+      return 'causal_identity_ambiguous';
+    }
+    const receiptIdentity = entry.receiptIdentity;
+    if (!entry.nativeUser && !identityHasStrongAnchor(receiptIdentity)) {
+      return 'expired_native_user_unobserved';
+    }
+    return 'expired_no_output';
+  }
+
+  _terminalizeSendLatencyTrace(clientMessageId, reason, terminalAtMs = Date.now()) {
+    const entry = this._latencyTracesByClientMessageId?.get(clientMessageId);
+    if (!entry || entry.completed === true) return false;
+    entry.completed = true;
+    const message = proto.latencyTraceTerminal(entry.trace, reason, terminalAtMs);
+    const emitted = this._sendToRelay(message);
+    this._dropSendLatencyTrace(clientMessageId);
+    this._log(
+      'info',
+      `[latency] Terminal ${entry.trace?.trace_id || clientMessageId} reason=${reason} emitted=${emitted}`,
+    );
+    return true;
+  }
+
+  _expireSendLatencyTraces(now = Date.now(), sessionId = null) {
+    if (!this._latencyTracesByClientMessageId || !this._latencyTraceClientIdsBySession) return 0;
+    const clientMessageIds = sessionId
+      ? [...(this._latencyTraceClientIdsBySession.get(sessionId) || [])]
+      : [...this._latencyTracesByClientMessageId.keys()];
+    let expired = 0;
+    for (const clientMessageId of clientMessageIds) {
+      const entry = this._latencyTracesByClientMessageId.get(clientMessageId);
+      if (!entry) continue;
+      const registeredAtMs = Number(entry.registeredAtMs || 0);
+      if (registeredAtMs > 0 && now - registeredAtMs <= SEND_LATENCY_TRACE_RETENTION_MS) {
+        continue;
+      }
+      if (this._terminalizeSendLatencyTrace(
+        clientMessageId,
+        this._latencyTraceTerminalReason(entry),
+        now,
+      )) {
+        expired += 1;
+      }
+    }
+    return expired;
+  }
+
+  _hasPendingSendLatencyTrace(sessionId, now = Date.now()) {
+    this._expireSendLatencyTraces(now, sessionId);
+    return (this._latencyTraceClientIdsBySession?.get(sessionId) || []).some(clientMessageId => (
+      this._latencyTracesByClientMessageId?.has(clientMessageId)
+    ));
+  }
+
+  _dropSendLatencyTracesForSession(sessionId, reason = 'session_removed') {
+    const clientMessageIds = [...(this._latencyTraceClientIdsBySession?.get(sessionId) || [])];
+    for (const clientMessageId of clientMessageIds) {
+      this._terminalizeSendLatencyTrace(clientMessageId, reason);
+    }
+    return clientMessageIds.length;
+  }
+
+  _moveSendLatencyTracesSession(fromSessionId, toSessionId) {
+    if (!fromSessionId || !toSessionId || fromSessionId === toSessionId) return 0;
+    const moving = [...(this._latencyTraceClientIdsBySession?.get(fromSessionId) || [])];
+    if (moving.length === 0) return 0;
+    const target = this._latencyTraceClientIdsBySession?.get(toSessionId) || [];
+    for (const clientMessageId of moving) {
+      const entry = this._latencyTracesByClientMessageId.get(clientMessageId);
+      if (entry) entry.sessionId = toSessionId;
+      if (!target.includes(clientMessageId)) target.push(clientMessageId);
+    }
+    this._latencyTraceClientIdsBySession.set(toSessionId, target);
+    this._latencyTraceClientIdsBySession.delete(fromSessionId);
+    const priorSequence = this._latencyOutputSequenceBySession?.get(fromSessionId);
+    if (Number.isFinite(priorSequence)) {
+      const current = Number(this._latencyOutputSequenceBySession?.get(toSessionId) || 0);
+      this._latencyOutputSequenceBySession?.set(toSessionId, Math.max(current, priorSequence));
+      this._latencyOutputSequenceBySession?.delete(fromSessionId);
+    }
+    return moving.length;
+  }
+
+  _advanceSendLatencyTrace(clientMessageId, stage, observedAtMs, source, nativeReceipt = null) {
+    this._expireSendLatencyTraces();
+    const entry = this._latencyTracesByClientMessageId.get(clientMessageId);
+    if (!entry) return null;
+    const proxyClock = relayClockStageObservation(
+      observedAtMs,
+      'proxy',
+      this._relayClockEstimate,
+      { nowMs: Date.now() },
+    );
+    const advanced = advanceLatencyTrace(
+      entry.trace,
+      stage,
+      observedAtMs,
+      { ...(source || {}), ...proxyClock.source },
+    );
+    if (!advanced.ok) {
+      this._log('warn', `[latency] Rejected trace ${entry.trace.trace_id} at ${stage}: ${advanced.code}`);
+      return null;
+    }
+    entry.trace = advanced.trace;
+    if (stage === 'harness_delivered') {
+      entry.delivered = true;
+      entry.deliveredAtMs = Number(observedAtMs) || Date.now();
+      bindDeliveryReceipt(entry, nativeReceipt);
+    }
+    return entry.trace;
+  }
+
+  _firstOutputLatencySource(msg, sessionId) {
+    const streamTrace = msg?.stream_trace && typeof msg.stream_trace === 'object'
+      ? msg.stream_trace
+      : null;
+    if (streamTrace) {
+      return {
+        observedAtMs: Number(streamTrace.native_event_at_ms) || Date.now(),
+        source: {
+          source: 'stream_trace',
+          native_event_at_ms: Number(streamTrace.native_event_at_ms) || Date.now(),
+          native_timestamp_source: streamTrace.native_timestamp_source || 'proxy_observed',
+          proxy_read_at_ms: Number(streamTrace.proxy_read_at_ms) || undefined,
+          proxy_normalized_at_ms: Number(streamTrace.proxy_normalized_at_ms) || undefined,
+          proxy_sent_at_ms: Number(streamTrace.proxy_sent_at_ms) || undefined,
+        },
+      };
+    }
+    const nativeMessageAtMs = Date.parse(
+      msg?.created_at
+      || msg?.message?.created_at
+      || '',
+    );
+    if (Number.isFinite(nativeMessageAtMs) && nativeMessageAtMs > 0
+        && nativeMessageAtMs <= Date.now() + 30_000) {
+      return {
+        observedAtMs: nativeMessageAtMs,
+        source: {
+          source: 'native_message_timestamp',
+          native_event_at_ms: nativeMessageAtMs,
+          native_timestamp_source: 'message_created_at',
+        },
+      };
+    }
+    const session = this.sessions.get(sessionId);
+    const domPush = session?._lastDomPushLatencySource;
+    if (domPush && Date.now() - Number(domPush.observed_at_ms || 0) <= 10_000) {
+      return {
+        observedAtMs: Number(domPush.observed_at_ms) || Date.now(),
+        source: domPush,
+      };
+    }
+    return {
+      observedAtMs: Date.now(),
+      source: { source: 'proxy_output_observed' },
+    };
+  }
+
+  _attachFirstOutputLatencyTrace(msg) {
+    const type = msg?.type;
+    const role = msg?.role || msg?.message?.role;
+    const content = msg?.content || msg?.message?.content;
+    const isAssistantDelta = type === 'message_delta'
+      && (role || 'assistant') === 'assistant'
+      && msg.op === 'append'
+      && typeof msg.append === 'string'
+      && msg.append.length > 0;
+    const isAssistantMessage = (type === 'message' || type === 'proxy_message')
+      && role === 'assistant'
+      && typeof content === 'string'
+      && content.length > 0;
+    const isUserMessage = (type === 'message' || type === 'proxy_message')
+      && role === 'user'
+      && typeof content === 'string'
+      && content.length > 0;
+    if (!isUserMessage && !isAssistantDelta && !isAssistantMessage) return msg;
+    const sessionId = String(msg.session_id || msg.session || '');
+    this._expireSendLatencyTraces(Date.now(), sessionId);
+    const clientMessageIds = this._latencyTraceClientIdsBySession?.get(sessionId) || [];
+    const entries = clientMessageIds
+      .map(clientMessageId => this._latencyTracesByClientMessageId.get(clientMessageId))
+      .filter(Boolean);
+    if (entries.length === 0) return msg;
+    if (!this._latencyOutputSequenceBySession) this._latencyOutputSequenceBySession = new Map();
+    const sequence = Number(this._latencyOutputSequenceBySession.get(sessionId) || 0) + 1;
+    this._latencyOutputSequenceBySession.set(sessionId, sequence);
+    if (isUserMessage) {
+      bindNativeUser(entries, msg, sequence);
+      return msg;
+    }
+    const selected = selectCausalEntry(entries, msg, sequence);
+    if (!selected.ok) {
+      if (selected.code.includes('ambiguous')) {
+        for (const entry of entries) entry.causalAmbiguityObserved = true;
+      } else if (selected.code === 'causal_identity_missing'
+          && !identityHasStrongAnchor(nativeIdentity(msg))) {
+        for (const entry of entries) {
+          if (entry.delivered === true && entry.completed !== true) {
+            entry.causalAmbiguityObserved = true;
+            entry.firstOutputUnresolved = true;
+          }
+        }
+      }
+      return msg;
+    }
+    const clientMessageId = selected.entry.clientMessageId;
+    const observed = this._firstOutputLatencySource(msg, sessionId);
+    const trace = this._advanceSendLatencyTrace(
+      clientMessageId,
+      'agent_first_output',
+      observed.observedAtMs,
+      {
+        ...observed.source,
+        causal_match: selected.match,
+      },
+    );
+    if (!trace) return msg;
+    selected.entry.completed = true;
+    this._dropSendLatencyTrace(clientMessageId);
+    return {
+      ...msg,
+      latency_trace: trace,
+      latency_causal_match: selected.match,
+    };
+  }
+
   _sendToRelay(msg, options = {}) {
     msg = this._canonicalizeSuppressedRelayMessage(msg);
     if (!msg) return false;
     msg = this._stampNavigationMessage(msg);
+    msg = this._attachFirstOutputLatencyTrace(msg);
     if (msg?.type === 'rate_limit_active' || msg?.type === 'rate_limit_cleared') {
       this._providerUsage?.refresh({ force: true, reason: msg.type }).catch(() => {});
     }
@@ -9744,12 +10731,14 @@ class ProxyEngine extends EventEmitter {
         boundOldestMap(this._pendingPreReadyHistory, PENDING_PRE_READY_HISTORY_MAX_ENTRIES);
       }
     }
-    if (type === 'proxy_send_result' || type === 'agent_started') {
+    if (type === 'proxy_send_result' || type === 'agent_started' || type === 'latency_trace_terminal') {
       const sid = msg.session_id || msg.session;
-      const clientMessageId = msg.client_message_id;
-      if (sid && clientMessageId) {
+      const clientMessageId = msg.client_message_id
+        || msg.latency_trace_terminal?.client_message_id;
+      const traceId = msg.latency_trace_terminal?.trace_id;
+      if ((sid || traceId) && clientMessageId) {
         if (!this._pendingPreReadyEvents) this._pendingPreReadyEvents = new Map();
-        const key = `${type}:${sid}:${clientMessageId}`;
+        const key = `${type}:${sid || traceId}:${clientMessageId}`;
         this._pendingPreReadyEvents.set(key, encoded);
         // Delivery results are tiny. Bound the queue so a prolonged outage
         // cannot grow memory without limit.
@@ -10705,15 +11694,50 @@ class ProxyEngine extends EventEmitter {
 
   _startHeartbeat() {
     this._stopHeartbeat();
-    this.hbTimer = setInterval(() => {
-      if (!this.relayReady || !this.relayWs || this.relayWs.readyState !== WebSocket.OPEN) return;
-      const requestId = `hb_${Date.now()}`;
-      this.relayWs.send(JSON.stringify(proto.heartbeat(this.connectionId, requestId)));
-    }, this.hbIntervalMs);
+    this._sendRelayHeartbeat();
+    this.hbTimer = setInterval(() => this._sendRelayHeartbeat(), this.hbIntervalMs);
+  }
+
+  _sendRelayHeartbeat() {
+    if (!this.relayReady || !this.relayWs || this.relayWs.readyState !== WebSocket.OPEN) return;
+    if (this._relayHeartbeatPending.size > 0) return;
+    const clientSentAtMs = Date.now();
+    const requestId = `hb_${clientSentAtMs}`;
+    this._relayHeartbeatPending.set(requestId, clientSentAtMs);
+    this.relayWs.send(JSON.stringify(
+      proto.heartbeat(this.connectionId, requestId, clientSentAtMs),
+    ));
+  }
+
+  _handleRelayHeartbeatAck(message) {
+    const clientSentAtMs = this._relayHeartbeatPending.get(message?.request_id);
+    if (!clientSentAtMs) return false;
+    this._relayHeartbeatPending.delete(message.request_id);
+    const estimated = estimateRelayClockOffset({
+      clientSentAtMs,
+      relayReceivedAtMs: message.relay_received_at_ms,
+      relaySentAtMs: message.relay_sent_at_ms,
+      clientReceivedAtMs: Date.now(),
+    });
+    if (!estimated.ok) {
+      this._relayClockEstimate = null;
+      this._log('warn', `[latency] Relay clock sample rejected: ${estimated.code}`);
+      return false;
+    }
+    this._relayClockEstimate = estimated.estimate;
+    if (estimated.estimate.status !== 'synchronized') {
+      this._log(
+        'warn',
+        `[latency] Relay clock ${estimated.estimate.status}: offset=${estimated.estimate.offset_ms}ms rtt=${estimated.estimate.rtt_ms}ms`,
+      );
+    }
+    return true;
   }
 
   _stopHeartbeat() {
     if (this.hbTimer) { clearInterval(this.hbTimer); this.hbTimer = null; }
+    this._relayHeartbeatPending.clear();
+    this._relayClockEstimate = null;
   }
 
   // ─── Session broadcast ───────────────────────────────────────────────
@@ -11040,6 +12064,8 @@ class ProxyEngine extends EventEmitter {
       agent_type:       s.agentType,
       host_type:        s.host_type || null,
       host_label:       s.host_label || null,
+      cdp_port:         Number(s._cdpPort || 0) || null,
+      target_id:        s.targetId || null,
       display_name:     s.display_name,
       window_title:     s.windowTitle,
       workspace_name:   s.workspace_name,
@@ -11058,6 +12084,14 @@ class ProxyEngine extends EventEmitter {
       chat_title_source: s.chat_title_source || null,
       codex_desktop_active_thread_title: s.agentType === 'codex-desktop'
         ? (s._activeThreadTitle || null) : null,
+      codex_desktop_thread_pollability: s.agentType === 'codex-desktop'
+        ? (s._codexDesktopThreadViewPollability || {
+            state: s.status === 'healthy' ? 'polled' : 'not_pollable',
+            pollable: s.status === 'healthy',
+            reason: s.status === 'healthy' ? 'native_active_document' : 'native_document_disconnected',
+            selection_mode: 'client_local_readonly',
+          })
+        : null,
       cursor_agent_title: s.agentType === 'cursor'
         ? (s._activeThreadTitle || s.chat_title || null) : null,
       cursor_agent_id:  s.cursorAgentId || null,
@@ -13406,6 +14440,18 @@ class ProxyEngine extends EventEmitter {
         + `live_turn=${!!turn} match=${exactThread && exactTurn}`,
     );
     if (!exactTurn || !exactThread) return false;
+    const nativeInterruption = summary?.interruption || summary?.activity?.interruption || null;
+    const failed = summary?.activity?.kind === 'failed' || !!nativeInterruption;
+    // Native terminal diagnostics are transcript rows, not successful model
+    // output. Terminalize the open send trace before any canonical replay can
+    // consume an error row as the first assistant response.
+    if (!failed) {
+      this._replayCanonicalAssistantForPendingLatency(
+        sessionId,
+        Array.isArray(summary?.messages) ? summary.messages : [],
+        session,
+      );
+    }
     session._codexAppServerTerminalReconciledTurnId = completedTurnId;
     const completedAtMs = Date.parse(summary.taskCompletedAt || '');
     session._codexAppServerTerminalCompletedAtMs = Number.isFinite(completedAtMs)
@@ -13415,7 +14461,13 @@ class ProxyEngine extends EventEmitter {
       turn.emit('turn_completed', {
         thread_id: ownedThreadId,
         turn_id: ownedTurnId,
-        status: 'completed',
+        status: failed ? 'failed' : 'completed',
+        ...(failed ? {
+          error: {
+            code: nativeInterruption?.code || nativeInterruption?.category || 'native_turn_failed',
+            message: nativeInterruption?.safe_display_text || summary?.activity?.label || 'Codex CLI failed',
+          },
+        } : {}),
         source: 'codex_cli_jsonl',
         completed_at: summary.taskCompletedAt || null,
       });
@@ -13494,6 +14546,42 @@ class ProxyEngine extends EventEmitter {
     return cfg;
   }
 
+  async _publishCodexCliNativeCompletionConfig(
+    sessionId,
+    session,
+    turn,
+    { timeoutMs = 2_000, pollMs = 25 } = {},
+  ) {
+    let nativeSummary = null;
+    const observationDeadline = Date.now() + Math.max(0, Number(timeoutMs) || 0);
+    do {
+      if (session.codexCliFilePath) {
+        try {
+          nativeSummary = codexCli.readSessionSummary(session.codexCliFilePath, {
+            includeMessages: false,
+            maxHydrateBytes: codexCli.CODEX_CLI_ACTIVE_HYDRATE_MAX_BYTES,
+            preferTailBytes: codexCli.CODEX_CLI_ACTIVE_HYDRATE_TAIL_BYTES,
+          });
+        } catch {}
+      }
+      if (nativeSummary?.model_observation && nativeSummary?.effort_observation) break;
+      if (Date.now() >= observationDeadline) break;
+      await sleep(Math.max(1, Number(pollMs) || 25));
+    } while (this.sessions.get(sessionId) === session && session._codexAppServerTurn === turn);
+    if (nativeSummary) this._applyCodexCliSummaryMetadata(sessionId, session, nativeSummary);
+    const published = this._publishCodexCliConfig(sessionId, session);
+    if (!nativeSummary?.model_observation || !nativeSummary?.effort_observation) {
+      this._log('warn', `[codex-cli] native completion config incomplete for ${sessionId}`
+        + ` model=${nativeSummary?.model_observation ? 'observed' : 'missing'}`
+        + ` effort=${nativeSummary?.effort_observation ? 'observed' : 'missing'}`);
+    }
+    return {
+      model_observed: nativeSummary?.model_observation != null,
+      effort_observed: nativeSummary?.effort_observation != null,
+      published,
+    };
+  }
+
   _buildCodexCliSessionFromSummary(sessionMeta, summary, { rehydrateGoalRun = false } = {}) {
     const now = new Date().toISOString();
     const interrupted = sessionMeta.codex_cli_interrupted === true;
@@ -13563,6 +14651,8 @@ class ProxyEngine extends EventEmitter {
       nextSendEffort: sessionMeta.codex_cli_next_effort || legacyNextEffort || null,
       nextSendEffortStatus: sessionMeta.codex_cli_next_effort_status || (legacyNextEffort ? 'pending' : 'unset'),
       nextSendEffortError: sessionMeta.codex_cli_next_effort_error || null,
+      ownedDisposableScope: sessionMeta.owned_disposable_scope || null,
+      ownedDisposableTokenHash: sessionMeta.owned_disposable_token_hash || null,
       permission_mode: sessionMeta.permission_mode || summary.permission_mode || 'workspace-write',
       approval_policy: sessionMeta.approval_policy || summary.approval_policy || null,
       percentUsed: summary.percent_used ?? sessionMeta.percent_used ?? null,
@@ -13800,6 +14890,7 @@ class ProxyEngine extends EventEmitter {
             lifecycle: 'native_user_turn_observed',
             native_receipt: receipt,
             process_epoch: baseline.process_epoch || null,
+            delivery_attempt: pending.delivery_attempt || baseline.delivery_attempt || 1,
           },
         ));
         if (emitted) this._persistCodexCliReceiptState(sessionId, session, {
@@ -13814,6 +14905,7 @@ class ProxyEngine extends EventEmitter {
           baseline.client_message_id,
           receipt,
           inspected.agent_started,
+          pending.delivery_attempt || baseline.delivery_attempt || 1,
         ));
         if (emitted) this._persistCodexCliReceiptState(sessionId, session, {
           native_receipt: receipt,
@@ -13890,7 +14982,7 @@ class ProxyEngine extends EventEmitter {
         ownerState: summary._racCodexCliOwnerConfirmed === true ? 'confirmed' : '',
       });
       this._setCodexCliActivity(sessionId, existing,
-        ownedTurnCompleted && summary.activity?.kind !== 'idle'
+        ownedTurnCompleted && ['generating', 'waiting_for_user', 'working'].includes(summary.activity?.kind)
           ? { ...summary.activity, kind: 'idle', label: '', updated_at: summary.taskCompletedAt || summary.updatedAt || new Date().toISOString() }
           : (summary.activity || { kind: 'idle', label: '', updated_at: summary.updatedAt || new Date().toISOString() }),
         lifecycleContext);
@@ -13981,7 +15073,7 @@ class ProxyEngine extends EventEmitter {
         ownerState: summary._racCodexCliOwnerConfirmed === true ? 'confirmed' : '',
       });
       this._setCodexCliActivity(sessionId, existing,
-        ownedTurnCompleted && summary.activity?.kind !== 'idle'
+        ownedTurnCompleted && ['generating', 'waiting_for_user', 'working'].includes(summary.activity?.kind)
           ? { ...summary.activity, kind: 'idle', label: '', updated_at: summary.taskCompletedAt || summary.updatedAt || new Date().toISOString() }
           : (summary.activity || { kind: 'idle', label: '', updated_at: summary.updatedAt || new Date().toISOString() }),
         lifecycleContext);
@@ -14211,6 +15303,7 @@ class ProxyEngine extends EventEmitter {
           continue;
         }
         if (sess.status === 'healthy' && isArchiveOnly) {
+          if (this._hasPendingSendLatencyTrace(sess.session_id)) continue;
           sessionStore.markDisconnected(sess.session_id);
           changed = true;
         }
@@ -14224,6 +15317,7 @@ class ProxyEngine extends EventEmitter {
         }
         if ((session.codexCliArchiveDiscovered === true && !isExternalActive)
           || (session.codexCliExternalActive === true && !isExternalActive)) {
+          if (this._hasPendingSendLatencyTrace(sessionId)) continue;
           this.sessions.delete(sessionId);
           changed = true;
         }
@@ -14297,6 +15391,7 @@ class ProxyEngine extends EventEmitter {
       if (sess.status !== 'healthy') continue;
       if (sess.codex_cli_archive_discovered !== true) continue;
       if (sess.cli_session_id && visibleCliIds.has(sess.cli_session_id)) continue;
+      if (this._hasPendingSendLatencyTrace(sess.session_id)) continue;
       if (sess.codex_cli_owner_demoted === true && sess.codex_cli_file_path
           && fs.existsSync(sess.codex_cli_file_path)) continue;
       sessionStore.markDisconnected(sess.session_id);
@@ -14306,6 +15401,7 @@ class ProxyEngine extends EventEmitter {
       if (session.agentType !== 'codex_cli') continue;
       if (session.codexCliArchiveDiscovered !== true) continue;
       if (session.cliSessionId && visibleCliIds.has(session.cliSessionId)) continue;
+      if (this._hasPendingSendLatencyTrace(sessionId)) continue;
       if (session.codexCliOwnerDemoted === true && session.codexCliFilePath
           && fs.existsSync(session.codexCliFilePath)) continue;
       this.sessions.delete(sessionId);
@@ -14430,6 +15526,9 @@ class ProxyEngine extends EventEmitter {
     nativeEventAtMs = proxyReadAtMs,
     nativeTimestampSource = 'codex_stream_observed',
     transport = 'codex_app_server',
+    threadId = null,
+    turnId = null,
+    processEpoch = null,
   } = {}) {
     if (typeof append !== 'string' || append.length === 0) return false;
     const nextText = `${session._codexCliLiveText || ''}${append}`;
@@ -14439,6 +15538,22 @@ class ProxyEngine extends EventEmitter {
       trace_id: crypto.randomUUID(),
       agent_type: 'codex_cli',
       session_id: sessionId,
+      thread_id: threadId
+        || session._codexAppServerTurnIdentity?.thread_id
+        || session._codexAppServerLastTurnIdentity?.thread_id
+        || session._codexCliPendingReceipt?.native_receipt?.thread_id
+        || session.cliSessionId
+        || null,
+      turn_id: turnId
+        || session._codexAppServerTurnIdentity?.turn_id
+        || session._codexAppServerLastTurnIdentity?.turn_id
+        || session._codexCliPendingReceipt?.native_receipt?.turn_id
+        || null,
+      process_epoch: processEpoch
+        || session._codexAppServerTurnIdentity?.process_epoch
+        || session._codexAppServerLastTurnIdentity?.process_epoch
+        || session._codexCliPendingReceipt?.native_receipt?.process_epoch
+        || null,
       native_event_at_ms: nativeEventAtMs,
       native_timestamp_source: nativeTimestampSource,
       proxy_read_at_ms: proxyReadAtMs,
@@ -14480,6 +15595,9 @@ class ProxyEngine extends EventEmitter {
         nativeEventAtMs: proxyReadAtMs,
         nativeTimestampSource: 'codex_app_server_notification_observed',
         transport: 'codex_app_server',
+        threadId: params.threadId || turn?.threadId || null,
+        turnId: params.turnId || turn?.turnId || null,
+        processEpoch: session._codexAppServerTurnIdentity?.process_epoch || null,
       });
     }
 
@@ -14617,7 +15735,12 @@ class ProxyEngine extends EventEmitter {
     return this._sendCodexCliAppServerMessage(session, content, sessionId, sendContext);
   }
 
-  async _sendCodexCliAppServerMessage(session, content, sessionId, { clientMessageId = null } = {}) {
+  async _sendCodexCliAppServerMessage(
+    session,
+    content,
+    sessionId,
+    { clientMessageId = null, deliveryAttempt = 1 } = {},
+  ) {
     if (session._codexAppServerTurn || session._codexCliChild) {
       return { ok: false, code: 'agent_busy', detail: 'Codex CLI already has an owned turn running' };
     }
@@ -14672,6 +15795,7 @@ class ProxyEngine extends EventEmitter {
       clientMessageId,
       processEpoch,
     });
+    receiptBaseline.delivery_attempt = deliveryAttempt;
     const turn = this._codexCliAppServerTurnFactory({
       sessionId,
       cwd: workspacePath,
@@ -14704,22 +15828,27 @@ class ProxyEngine extends EventEmitter {
       }
     }
     session._codexAppServerTurn = turn;
+    session._codexAppServerTurnIdentity = {
+      thread_id: intendedThreadId,
+      turn_id: null,
+      process_epoch: processEpoch,
+    };
     session._codexAppServerTurnCompleted = false;
     session._codexAppServerLastTurnIdentity = null;
     session._codexAppServerTerminalReconciledTurnId = null;
     session._codexAppServerTerminalCompletedAtMs = 0;
     this._resetCodexCliLiveStream(session);
-    const releaseTurn = async ({ failed = false, detail = null } = {}) => {
+    const releaseTurn = async ({ failed = false, detail = null, failureCode = null } = {}) => {
       if (session._codexAppServerTurn !== turn) return;
       this._closeCodexCliMessageDelta(session, sessionId);
       session._codexAppServerTurn = null;
       session._codexAppServerTurnIdentity = null;
       session._codexAppServerTurnCompleted = false;
       this._clearQuestionPromptAdapter(sessionId, failed ? 'failed' : 'expired', {
-        error_code: failed ? 'app_server_disconnected' : 'native_turn_completed',
+        error_code: failed ? (failureCode || 'app_server_disconnected') : 'native_turn_completed',
       });
-      if (failed && session._codexCliInterrupted !== true) {
-        const activity = { kind: 'idle', label: detail || 'Codex CLI failed', updated_at: new Date().toISOString() };
+      if (failed && session._codexCliInterrupted !== true && session.activity?.kind !== 'failed') {
+        const activity = { kind: 'failed', label: detail || 'Codex CLI failed', updated_at: new Date().toISOString() };
         session.waitingForAssistant = false;
         this._setCodexCliActivity(sessionId, session, activity);
       }
@@ -14784,6 +15913,9 @@ class ProxyEngine extends EventEmitter {
     });
     turn.on('turn_completed', completion => {
       if (this.sessions.get(sessionId) !== session || session._codexAppServerTurn !== turn) return;
+      if (session._codexAppServerTurnCompleted === true) return;
+      const failed = completion.status === 'failed';
+      const completionDetail = String(completion.error?.message || '').trim().slice(0, 500);
       session._codexAppServerTurnCompleted = true;
       const completedAtMs = Date.parse(completion.completed_at || '');
       session._codexAppServerTerminalCompletedAtMs = Number.isFinite(completedAtMs)
@@ -14792,12 +15924,27 @@ class ProxyEngine extends EventEmitter {
       session.waitingForAssistant = false;
       this._closeCodexCliMessageDelta(session, sessionId);
       this._setCodexCliActivity(sessionId, session, {
-        kind: 'idle',
-        label: completion.status === 'failed' ? 'Codex CLI failed' : '',
+        kind: failed ? 'failed' : 'idle',
+        label: failed ? 'Codex CLI failed' : '',
+        ...(failed && completionDetail ? {
+          current: { kind: 'error', label: completionDetail },
+        } : {}),
         updated_at: new Date().toISOString(),
       });
-      releaseTurn({ failed: completion.status === 'failed' }).catch(error => {
+      if (failed) {
+        const clientMessageId = session._codexCliPendingReceipt?.baseline?.client_message_id;
+        if (clientMessageId) this._terminalizeSendLatencyTrace(clientMessageId, 'native_turn_failed');
+      }
+      (async () => {
+        await this._publishCodexCliNativeCompletionConfig(sessionId, session, turn);
+        await releaseTurn({
+          failed,
+          detail: failed ? 'Codex CLI failed' : null,
+          failureCode: failed ? 'native_turn_failed' : null,
+        });
+      })().catch(error => {
         this._log('warn', `[codex-cli] app-server turn cleanup failed for ${sessionId}: ${error.message}`);
+        releaseTurn({ failed: true, detail: 'Codex app-server completion cleanup failed' }).catch(() => {});
       });
     });
     turn.on('disconnect', details => {
@@ -14814,6 +15961,7 @@ class ProxyEngine extends EventEmitter {
     }));
     session._codexCliPendingReceipt = {
       baseline: receiptBaseline,
+      delivery_attempt: deliveryAttempt,
       state: 'launch_accepted',
       updated_at: new Date().toISOString(),
     };
@@ -14946,7 +16094,14 @@ class ProxyEngine extends EventEmitter {
           lifecycle: 'proxy_launch_accepted',
           process_epoch: processEpoch,
           accepted_at: new Date().toISOString(),
+          delivery_attempt: deliveryAttempt,
         }));
+      }
+      if (typeof turn.flushPendingTurnCompletion === 'function') {
+        setImmediate(() => {
+          if (this.sessions.get(sessionId) !== session || session._codexAppServerTurn !== turn) return;
+          turn.flushPendingTurnCompletion();
+        });
       }
       return {
         ok: true,
@@ -14977,7 +16132,12 @@ class ProxyEngine extends EventEmitter {
     }
   }
 
-  async _sendCodexCliExecMessage(session, content, sessionId, { clientMessageId = null } = {}) {
+  async _sendCodexCliExecMessage(
+    session,
+    content,
+    sessionId,
+    { clientMessageId = null, deliveryAttempt = 1 } = {},
+  ) {
     if (session._codexCliChild) {
       return { ok: false, code: 'agent_busy', detail: 'Codex CLI process is already running' };
     }
@@ -15027,6 +16187,7 @@ class ProxyEngine extends EventEmitter {
       clientMessageId,
       processEpoch,
     });
+    receiptBaseline.delivery_attempt = deliveryAttempt;
     const exitState = { exited: false, code: null, error: null, stderr: '' };
     session._codexCliActiveLaunchConfig = {
       model_id: requestedModel,
@@ -15154,6 +16315,7 @@ class ProxyEngine extends EventEmitter {
     }, 'codex_exec_resume'));
     session._codexCliPendingReceipt = {
       baseline: receiptBaseline,
+      delivery_attempt: deliveryAttempt,
       state: 'launch_accepted',
       updated_at: new Date().toISOString(),
     };
@@ -15179,6 +16341,7 @@ class ProxyEngine extends EventEmitter {
         lifecycle: 'proxy_launch_accepted',
         process_epoch: processEpoch,
         accepted_at: new Date().toISOString(),
+        delivery_attempt: deliveryAttempt,
       }));
     }
     const receiptResult = await codexCli.waitForCodexReceipt(receiptBaseline, {
@@ -16149,7 +17312,8 @@ class ProxyEngine extends EventEmitter {
     const fallbackActivity = session._codexCliChild || session._codexAppServerTurn
       ? this._codexCliHeadlessActivity({ kind: 'generating', label: 'Codex CLI running headlessly', thinkingContent: session._codexCliLiveText || '', updated_at: new Date().toISOString() }, session._codexAppServerTurn ? 'codex_app_server' : 'codex_exec_resume')
       : (session.activity?.kind === 'idle' ? session.activity : { kind: 'idle', label: '', updated_at: new Date().toISOString() });
-    const observedActivity = ownedTurnCompleted && summaryActivity?.kind !== 'idle'
+    const observedActivity = ownedTurnCompleted
+      && ['generating', 'waiting_for_user', 'working'].includes(summaryActivity?.kind)
       ? { ...summaryActivity, kind: 'idle', label: '', updated_at: ownedTurnCompletedAt || new Date().toISOString() }
       : (summaryActivity || fallbackActivity);
     const activityChanged = this._setCodexCliActivity(sessionId, session, observedActivity, lifecycleContext);
@@ -18816,13 +19980,25 @@ class ProxyEngine extends EventEmitter {
 
   async _handleSendRequest(msg) {
     const { session: sessionId, content, file, client_message_id } = msg;
+    const requestedDeliveryAttempt = Number(msg.delivery_attempt);
+    const deliveryAttempt = Number.isInteger(requestedDeliveryAttempt) && requestedDeliveryAttempt > 0
+      ? requestedDeliveryAttempt
+      : 1;
     let sessionData = this.sessions.get(sessionId);
+    this._registerSendLatencyTrace(msg, sessionData);
 
     if (!sessionData) {
       this._log('warn', `[send] Unknown session: ${sessionId}`);
       if (client_message_id) {
+        this._terminalizeSendLatencyTrace(client_message_id, 'send_failed');
         this._sendToRelay(proto.proxySendResult(sessionId, client_message_id, 'failed', {
-          error: { code: 'session_unknown', message: `No active session: ${sessionId}` },
+          error: {
+            code: 'session_unknown',
+            message: `No active session: ${sessionId}`,
+            retryable: true,
+            native_attempted: false,
+          },
+          delivery_attempt: deliveryAttempt,
         }));
       }
       return;
@@ -18885,7 +20061,12 @@ class ProxyEngine extends EventEmitter {
     if (queuesWhenBusy && (activityKind === 'thinking' || activityKind === 'generating') && client_message_id) {
       if (!sessionData.messageQueue) sessionData.messageQueue = [];
       const isFirstInQueue = sessionData.messageQueue.length === 0;
-      sessionData.messageQueue.push({ content: messageContent, client_message_id, queued_at: Date.now() });
+      sessionData.messageQueue.push({
+        content: messageContent,
+        client_message_id,
+        delivery_attempt: deliveryAttempt,
+        queued_at: Date.now(),
+      });
       // Only type the FIRST queued message into ProseMirror (so Codex shows its
       // native Steer button). Subsequent messages stay in proxy queue — typing
       // each one would overwrite the previous in the single ProseMirror input.
@@ -18894,7 +20075,12 @@ class ProxyEngine extends EventEmitter {
         await selectors.steerCodexInput(sessionData.client.Runtime, messageContent, usePageEval);
       }
       this._log('info', `[${sessionId}] Agent is ${activityKind} — queued ${client_message_id} (depth: ${sessionData.messageQueue.length})${isFirstInQueue && isCodexType ? ' + typed into input' : ''}`);
-      this._sendToRelay(proto.messageQueued(sessionId, client_message_id, messageContent));
+      this._sendToRelay(proto.messageQueued(
+        sessionId,
+        client_message_id,
+        messageContent,
+        deliveryAttempt,
+      ));
       return;
     }
 
@@ -18911,6 +20097,8 @@ class ProxyEngine extends EventEmitter {
             ok: false,
             code: 'codex_desktop_cdp_busy',
             detail: `Codex Desktop CDP remained busy for ${this.CODEX_DESKTOP_SEND_LOCK_WAIT_MS}ms`,
+            native_attempted: false,
+            retryable: true,
           };
         } else {
           // Discovery may have replaced a disconnected client while this send
@@ -18948,6 +20136,7 @@ class ProxyEngine extends EventEmitter {
           }
           result = await this._sendSessionMessage(sessionData, messageContent, sessionId, {
             clientMessageId: client_message_id || null,
+            deliveryAttempt,
           });
           if (result.ok) break;
           if (!RETRIABLE_SEND_CODES.has(result.code)) break;
@@ -18984,9 +20173,19 @@ class ProxyEngine extends EventEmitter {
     // Queue message if agent is busy (steer feature)
     if (!result.ok && QUEUE_ON_SEND_CODES.has(result.code) && client_message_id) {
       if (!sessionData.messageQueue) sessionData.messageQueue = [];
-      sessionData.messageQueue.push({ content: messageContent, client_message_id, queued_at: Date.now() });
+      sessionData.messageQueue.push({
+        content: messageContent,
+        client_message_id,
+        delivery_attempt: deliveryAttempt,
+        queued_at: Date.now(),
+      });
       this._log('info', `[${sessionId}] Send deferred (${result.code}) — queued message ${client_message_id} (queue depth: ${sessionData.messageQueue.length})`);
-      this._sendToRelay(proto.messageQueued(sessionId, client_message_id, messageContent));
+      this._sendToRelay(proto.messageQueued(
+        sessionId,
+        client_message_id,
+        messageContent,
+        deliveryAttempt,
+      ));
       return;
     }
 
@@ -19027,11 +20226,32 @@ class ProxyEngine extends EventEmitter {
 
     if (client_message_id) {
       if (result.ok) {
-        const deliveryEmitted = this._sendToRelay(proto.proxySendResult(sessionId, client_message_id, 'delivered', {
+        const receiptObservedAtMs = Date.parse(
+          result.native_receipt?.observed_at
+          || result.native_receipt?.native_event_at
+          || '',
+        );
+        const latencyTrace = this._advanceSendLatencyTrace(
+          client_message_id,
+          'harness_delivered',
+          Number.isFinite(receiptObservedAtMs) ? receiptObservedAtMs : Date.now(),
+          {
+            source: result.native_receipt ? 'native_receipt' : 'proxy_delivery_result',
+            source_at: Number.isFinite(receiptObservedAtMs) ? receiptObservedAtMs : Date.now(),
+          },
+          result.native_receipt || null,
+        );
+        const deliveryMessage = proto.proxySendResult(sessionId, client_message_id, 'delivered', {
           lifecycle: result.delivery_lifecycle || (result.lifecycle_managed ? 'native_user_turn_observed' : 'injection_confirmed'),
           native_receipt: result.native_receipt || null,
           process_epoch: result.process_epoch || null,
-        }));
+          delivery_attempt: deliveryAttempt,
+        });
+        if (latencyTrace) deliveryMessage.latency_trace = latencyTrace;
+        const deliveryEmitted = this._sendToRelay(deliveryMessage);
+        if (deliveryEmitted) {
+          this._flushPendingCanonicalAssistantForLatency(sessionId, sessionData);
+        }
         if (result.lifecycle_managed && deliveryEmitted) {
           this._persistCodexCliReceiptState(sessionId, sessionData, {
             state: 'native_user_turn_observed',
@@ -19047,6 +20267,7 @@ class ProxyEngine extends EventEmitter {
                 client_message_id,
                 result.native_receipt,
                 agentStart.agent_started,
+                deliveryAttempt,
               ));
               if (emitted) this._persistCodexCliReceiptState(sessionId, sessionData, {
                 native_receipt: result.native_receipt,
@@ -19061,11 +20282,16 @@ class ProxyEngine extends EventEmitter {
           });
         }
       } else {
+        this._terminalizeSendLatencyTrace(client_message_id, 'send_failed');
         this._sendToRelay(proto.proxySendResult(sessionId, client_message_id, 'failed', {
           error: {
             code: result.code || 'send_injection_failed',
             message: result.detail || 'Inject failed after all strategies',
+            native_attempted: result.native_attempted === false ? false : true,
+            retryable: result.native_attempted === false && result.retryable === true,
           },
+          process_epoch: result.process_epoch || null,
+          delivery_attempt: deliveryAttempt,
         }));
       }
     }
@@ -19084,6 +20310,7 @@ class ProxyEngine extends EventEmitter {
 
       const result = await this._sendSessionMessage(session, item.content, sessionId, {
         clientMessageId: item.client_message_id || null,
+        deliveryAttempt: item.delivery_attempt || 1,
       });
 
     if (result.ok && !result.lifecycle_managed) {
@@ -19120,12 +20347,37 @@ class ProxyEngine extends EventEmitter {
       );
     }
     if (result.ok) {
-      this._sendToRelay(proto.queueDelivered(sessionId, item.client_message_id));
-      const deliveryEmitted = this._sendToRelay(proto.proxySendResult(sessionId, item.client_message_id, 'delivered', {
+      this._sendToRelay(proto.queueDelivered(
+        sessionId,
+        item.client_message_id,
+        item.delivery_attempt || 1,
+      ));
+      const receiptObservedAtMs = Date.parse(
+        result.native_receipt?.observed_at
+        || result.native_receipt?.native_event_at
+        || '',
+      );
+      const latencyTrace = this._advanceSendLatencyTrace(
+        item.client_message_id,
+        'harness_delivered',
+        Number.isFinite(receiptObservedAtMs) ? receiptObservedAtMs : Date.now(),
+        {
+          source: result.native_receipt ? 'native_receipt' : 'proxy_delivery_result',
+          source_at: Number.isFinite(receiptObservedAtMs) ? receiptObservedAtMs : Date.now(),
+        },
+        result.native_receipt || null,
+      );
+      const deliveryMessage = proto.proxySendResult(sessionId, item.client_message_id, 'delivered', {
         lifecycle: result.delivery_lifecycle || (result.lifecycle_managed ? 'native_user_turn_observed' : 'injection_confirmed'),
         native_receipt: result.native_receipt || null,
         process_epoch: result.process_epoch || null,
-      }));
+        delivery_attempt: item.delivery_attempt || 1,
+      });
+      if (latencyTrace) deliveryMessage.latency_trace = latencyTrace;
+      const deliveryEmitted = this._sendToRelay(deliveryMessage);
+      if (deliveryEmitted) {
+        this._flushPendingCanonicalAssistantForLatency(sessionId, session);
+      }
       if (result.lifecycle_managed && deliveryEmitted) {
         this._persistCodexCliReceiptState(sessionId, session, {
           state: 'native_user_turn_observed',
@@ -19141,6 +20393,7 @@ class ProxyEngine extends EventEmitter {
               item.client_message_id,
               result.native_receipt,
               agentStart.agent_started,
+              item.delivery_attempt || 1,
             ));
             if (emitted) this._persistCodexCliReceiptState(sessionId, session, {
               native_receipt: result.native_receipt,
@@ -19160,8 +20413,16 @@ class ProxyEngine extends EventEmitter {
       // Agent went busy again — re-queue
       session.messageQueue.unshift(item);
     } else {
+      this._terminalizeSendLatencyTrace(item.client_message_id, 'send_failed');
       this._sendToRelay(proto.proxySendResult(sessionId, item.client_message_id, 'failed', {
-        error: { code: result.code, message: result.detail || 'Queued send failed' },
+        error: {
+          code: result.code,
+          message: result.detail || 'Queued send failed',
+          native_attempted: result.native_attempted === false ? false : true,
+          retryable: result.native_attempted === false && result.retryable === true,
+        },
+        process_epoch: result.process_epoch || null,
+        delivery_attempt: item.delivery_attempt || 1,
       }));
       // Type next queued message into ProseMirror even on failure
       await this._typeNextQueuedIntoProseMirror(sessionId);
@@ -19668,7 +20929,7 @@ class ProxyEngine extends EventEmitter {
       return;
     }
 
-    const DESKTOP_PORT_MAP = { 9224: 'claude-desktop', 9225: 'codex-desktop', 9227: 'cursor' };
+    const DESKTOP_PORT_MAP = this.DESKTOP_PORT_MAP;
     const looksLikeAntigravityV2Page = (t) => {
       const url = String(t.url || '');
       const title = String(t.title || '');
@@ -20774,7 +22035,7 @@ class ProxyEngine extends EventEmitter {
             workspaceName: workspaceMatch?.title || wsTitle || target.title || agentType,
             windowTitle: target.title || agentType,
           })
-          : `${agentType}::${target.url}`;
+          : desktopSessionSignatureSource(agentType, target);
         const sessionMeta = sessionStore.resolveSession({
           target: { ...target, id: target.id },
           windowTitle: target.title || agentType,
@@ -21065,6 +22326,14 @@ class ProxyEngine extends EventEmitter {
       LOCAL_UPLOAD_MAINTENANCE_INTERVAL_MS,
     );
     this._localUploadMaintenanceTimer.unref?.();
+    this._latencyTraceCleanupTimer = setInterval(() => {
+      try {
+        this._expireSendLatencyTraces();
+      } catch (error) {
+        this._log('warn', `[latency] Trace cleanup failed: ${error.message}`);
+      }
+    }, Math.min(30_000, Math.max(1_000, Math.floor(SEND_LATENCY_TRACE_RETENTION_MS / 10))));
+    this._latencyTraceCleanupTimer.unref?.();
 
     // Native Codex JSONL receipts are authoritative at request_user_input
     // deadlines. Keep one engine-owned lane independent of CDP renderer
@@ -21495,6 +22764,10 @@ class ProxyEngine extends EventEmitter {
       clearInterval(this._localUploadMaintenanceTimer);
       this._localUploadMaintenanceTimer = null;
     }
+    if (this._latencyTraceCleanupTimer) {
+      clearInterval(this._latencyTraceCleanupTimer);
+      this._latencyTraceCleanupTimer = null;
+    }
     if (this._codexVsCodeQuestionDeadlineSweepTimer) {
       clearInterval(this._codexVsCodeQuestionDeadlineSweepTimer);
       this._codexVsCodeQuestionDeadlineSweepTimer = null;
@@ -21552,6 +22825,12 @@ class ProxyEngine extends EventEmitter {
     this._codexConfigQueues.clear();
     this._codexConfigPending.clear();
     this._codexConfigReceipts.clear();
+    for (const clientMessageId of [...this._latencyTracesByClientMessageId.keys()]) {
+      this._terminalizeSendLatencyTrace(clientMessageId, 'proxy_stopped');
+    }
+    this._latencyTracesByClientMessageId.clear();
+    this._latencyTraceClientIdsBySession.clear();
+    this._latencyOutputSequenceBySession.clear();
     this._pollWindowSessionIndexes.clear();
     this._cdpPortCooldownUntil.clear();
     this._cdpTargetCooldownUntil.clear();
@@ -21595,6 +22874,8 @@ module.exports = {
   codexDesktopThreadKeysMatch,
   resolveCodexDesktopThreadMetadata,
   isDesktopAppPage,
+  configuredDesktopPortMap,
+  desktopSessionSignatureSource,
   isStoredDesktopTargetCanonical,
   classifyStoredCdpOrphan,
   classifyActiveSessionTarget,

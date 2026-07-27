@@ -37,22 +37,45 @@ function formatSize(bytes) {
 
 export default function FileBrowserSheet({
   visible, listing, viewingFile, fileContent, loading, error,
-  onNavigate, onOpenFile, onBack, onRefresh, onClose,
+  onNavigate, onOpenFile, onBack, onRefresh, onClose, onMinimize,
 }) {
   const currentPath = listing?.path || '.';
   const entries = listing?.entries || [];
 
   return (
-    <Modal visible={visible} animationType="slide" presentationStyle="pageSheet" onRequestClose={onClose}>
+    <Modal
+      visible={visible}
+      transparent
+      animationType="slide"
+      presentationStyle="overFullScreen"
+      onRequestClose={onMinimize || onClose}
+    >
+      <View style={s.backdrop}>
       <View style={s.container}>
         <View style={s.header}>
-          <TouchableOpacity onPress={viewingFile ? onBack : onClose} accessibilityRole="button">
+          <TouchableOpacity
+            style={s.headerButton}
+            onPress={viewingFile ? onBack : onClose}
+            accessibilityRole="button"
+          >
             <Text style={s.headerAction}>{viewingFile ? 'Back' : 'Close'}</Text>
           </TouchableOpacity>
           <Text style={s.title} numberOfLines={1}>{viewingFile || 'Workspace Files'}</Text>
-          <TouchableOpacity onPress={onRefresh} accessibilityRole="button" disabled={loading}>
-            <Text style={[s.headerAction, loading && s.disabled]}>Refresh</Text>
-          </TouchableOpacity>
+          <View style={s.headerActions}>
+            <TouchableOpacity
+              style={s.minimizeButton}
+              onPress={onMinimize || onClose}
+              accessibilityRole="button"
+              accessibilityLabel="Minimize Workspace files"
+              accessibilityState={{ expanded: true }}
+              testID="pane-minimize-file-browser"
+            >
+              <Text style={s.minimizeText}>Minimize</Text>
+            </TouchableOpacity>
+            <TouchableOpacity style={s.headerButton} onPress={onRefresh} accessibilityRole="button" disabled={loading}>
+              <Text style={[s.headerAction, loading && s.disabled]}>Refresh</Text>
+            </TouchableOpacity>
+          </View>
         </View>
 
         {!!error && <Text style={s.error} accessibilityRole="alert">{error}</Text>}
@@ -100,6 +123,7 @@ export default function FileBrowserSheet({
           </>
         )}
       </View>
+      </View>
     </Modal>
   );
 }
@@ -123,18 +147,43 @@ function EntryRow({ name, type, size, viewable = true, onPress }) {
 }
 
 const s = StyleSheet.create({
-  container: { flex: 1, backgroundColor: '#0d1117' },
+  backdrop: {
+    flex: 1,
+    justifyContent: 'flex-end',
+    backgroundColor: 'rgba(0,0,0,0.55)',
+  },
+  container: {
+    minHeight: 240,
+    maxHeight: '45%',
+    backgroundColor: '#0d1117',
+    borderTopLeftRadius: 16,
+    borderTopRightRadius: 16,
+    overflow: 'hidden',
+  },
   header: {
     height: 56,
-    paddingHorizontal: 16,
+    paddingHorizontal: 8,
     borderBottomWidth: 1,
     borderBottomColor: '#30363d',
     flexDirection: 'row',
     alignItems: 'center',
     justifyContent: 'space-between',
   },
-  headerAction: { color: '#58a6ff', fontSize: 14, fontWeight: '700', minWidth: 54 },
-  title: { color: '#f0f6fc', fontSize: 15, fontWeight: '700', flex: 1, textAlign: 'center', marginHorizontal: 8 },
+  headerActions: { flexDirection: 'row', alignItems: 'center', gap: 4 },
+  headerButton: { minWidth: 44, minHeight: 44, alignItems: 'center', justifyContent: 'center' },
+  headerAction: { color: '#58a6ff', fontSize: 13, fontWeight: '700' },
+  title: { color: '#f0f6fc', fontSize: 14, fontWeight: '700', flex: 1, textAlign: 'center', marginHorizontal: 4 },
+  minimizeButton: {
+    minWidth: 44,
+    minHeight: 44,
+    paddingHorizontal: 8,
+    borderWidth: 1,
+    borderColor: '#484f58',
+    borderRadius: 7,
+    alignItems: 'center',
+    justifyContent: 'center',
+  },
+  minimizeText: { color: '#f0f6fc', fontSize: 10, fontWeight: '700' },
   disabled: { opacity: 0.45 },
   loading: { marginVertical: 8 },
   error: { color: '#ff7b72', backgroundColor: '#2d1518', padding: 10, fontSize: 12 },

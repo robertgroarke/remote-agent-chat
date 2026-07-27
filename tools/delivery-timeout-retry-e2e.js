@@ -44,6 +44,9 @@ function contentType(filePath) {
 async function main() {
   const port = await freePort();
   const sends = [];
+  let historyRows = [];
+  let historyRequests = 0;
+  let historyPushes = 0;
   let controlAttempts = 0;
   const server = http.createServer((request, response) => {
     if (request.url.startsWith('/api/')) {
@@ -70,6 +73,13 @@ async function main() {
   wss.on('connection', ws => {
     const send = payload => ws.readyState === ws.OPEN && ws.send(JSON.stringify(payload));
     setTimeout(() => send({
+      type: 'connection_ack',
+      protocol_version: 1,
+      connection_id: `fixture-${Date.now()}`,
+      heartbeat_interval_ms: 10_000,
+      heartbeat_timeout_ms: 30_000,
+    }), 5);
+    setTimeout(() => send({
       type: 'session_list',
       sessions: [{
         session_id: fixtureSessionId,
@@ -82,11 +92,37 @@ async function main() {
       }],
       workspaces: [],
     }), 25);
+    setTimeout(() => {
+      if (historyRows.length) {
+        historyPushes += 1;
+        send({ type: 'history', session: fixtureSessionId, messages: historyRows, mode: 'full' });
+      }
+    }, 100);
     ws.on('message', raw => {
       let message;
       try { message = JSON.parse(String(raw)); } catch { return; }
+      if (message.type === 'connection_hello') {
+        send({
+          type: 'connection_ack',
+          protocol_version: 1,
+          connection_id: `fixture-${Date.now()}`,
+          heartbeat_interval_ms: 10_000,
+          heartbeat_timeout_ms: 30_000,
+        });
+        return;
+      }
+      if (message.type === 'subscribe') {
+        send({
+          type: 'subscription_ack',
+          protocol_version: 1,
+          request_id: message.request_id,
+          sessions: message.sessions || [],
+        });
+        return;
+      }
       if (message.type === 'get_history' || message.type === 'history_request') {
-        send({ type: 'history', session: fixtureSessionId, messages: [], mode: 'full' });
+        historyRequests += 1;
+        send({ type: 'history', session: fixtureSessionId, messages: historyRows, mode: 'full' });
       }
       if (message.type === 'agent_config_request') {
         send({
@@ -117,18 +153,72 @@ async function main() {
         }
       }
       if (message.type !== 'send' || message.session !== fixtureSessionId) return;
-      sends.push({ cid: message.client_message_id, content: message.content, at: Date.now() });
+      sends.push({
+        cid: message.client_message_id,
+        content: message.content,
+        retry_failed: message.retry_failed === true,
+        at: Date.now(),
+      });
       if (sends.length === 3) {
+        historyRows = [{
+          id: 3,
+          role: 'user',
+          content: message.content,
+          client_msg_id: message.client_message_id,
+          status: 'failed',
+          delivery_attempt: 1,
+          failure_code: 'pending_revalidation',
+          failure_reason: 'fixture version mismatch: expected current, found prior',
+          failure_native_attempted: false,
+          failure_retryable: true,
+          created_at: new Date().toISOString(),
+        }];
         setTimeout(() => send({
           type: 'proxy_send_result',
           session_id: fixtureSessionId,
           client_message_id: message.client_message_id,
+          delivery_attempt: 1,
           result: 'failed',
           error: {
             code: 'pending_revalidation',
             message: 'fixture version mismatch: expected current, found prior',
+            native_attempted: false,
+            retryable: true,
           },
         }), 25);
+        return;
+      }
+      if (sends.length === 4) {
+        historyRows = historyRows.map(row => ({
+          ...row,
+          status: 'agent_started',
+          delivery_attempt: 2,
+          failure_code: null,
+          failure_reason: null,
+          failure_native_attempted: null,
+          failure_retryable: null,
+        }));
+        setTimeout(() => send({
+          type: 'message_accepted',
+          session: fixtureSessionId,
+          client_message_id: message.client_message_id,
+          status: 'accepted',
+          delivery_attempt: 2,
+          retry_restarted: true,
+          ts: Date.now(),
+        }), 25);
+        setTimeout(() => send({
+          type: 'message_delivered',
+          session_id: fixtureSessionId,
+          client_message_id: message.client_message_id,
+          delivery_attempt: 2,
+        }), 50);
+        setTimeout(() => send({
+          type: 'agent_started',
+          session_id: fixtureSessionId,
+          client_message_id: message.client_message_id,
+          delivery_attempt: 2,
+        }), 75);
         return;
       }
       if (sends.length !== 2) return;
@@ -142,6 +232,7 @@ async function main() {
   let browser;
   let page;
   let originalUrl;
+  const pageErrors = [];
   try {
     if (isolatedHeadless) {
       browser = await chromium.launch({
@@ -150,6 +241,7 @@ async function main() {
         args: ['--disable-gpu', '--no-first-run', '--no-default-browser-check'],
       });
       page = await browser.newPage({ viewport: { width: 1280, height: 900 } });
+      page.on('pageerror', error => pageErrors.push(error.stack || error.message));
       await page.addInitScript(() => {
         localStorage.setItem('remote-agent-chat:show-test-sessions:v1', '1');
       });
@@ -159,6 +251,7 @@ async function main() {
       const pages = browser.contexts().flatMap(context => context.pages());
       assert.strictEqual(pages.length, 1, `expected exactly one persistent verification page, found ${pages.length}`);
       [page] = pages;
+      page.on('pageerror', error => pageErrors.push(error.stack || error.message));
       originalUrl = page.url();
     }
     await page.goto(`http://127.0.0.1:${port}/`, { waitUntil: 'domcontentloaded', timeout: 15000 });
@@ -169,8 +262,9 @@ async function main() {
 
     const retry = page.locator('.delivery.failed .delivery-retry');
     await retry.waitFor({ state: 'visible', timeout: 13000 });
-    const failureTitle = await retry.locator('xpath=..').getAttribute('title');
+    const failureTitle = await page.locator('.delivery.failed').first().getAttribute('title');
     assert.match(failureTitle || '', /relay acceptance/i);
+    assert.strictEqual(await page.locator('.delivery.failed .delivery-copy').count(), 1);
     await retry.click();
     await page.locator('.delivery.agent-started').waitFor({ state: 'visible', timeout: 5000 });
 
@@ -187,6 +281,26 @@ async function main() {
     assert.match(await structuredFailure.getAttribute('title') || '', /fixture version mismatch/);
     assert.strictEqual(sends.length, 3, 'fixture should observe one explicit structured-failure send');
     assert.strictEqual(await page.locator('.message.user').count(), 2, 'structured failure retains one explanatory user bubble');
+    assert.strictEqual(await structuredFailure.locator('.delivery-retry').count(), 1, 'proven pre-native failure exposes Retry');
+    assert.strictEqual(await structuredFailure.locator('.delivery-copy').count(), 1, 'failed bubble exposes Copy');
+
+    await page.reload({ waitUntil: 'domcontentloaded', timeout: 15000 });
+    await page.getByText('Delivery timeout retry fixture', { exact: true }).first().click({ timeout: 5000 });
+    const hydratedFailure = page.locator('.message.user[data-client-message-id] .delivery.failed').first();
+    try {
+      await hydratedFailure.waitFor({ state: 'visible', timeout: 5000 });
+    } catch (error) {
+      throw new Error(`${error.message}; history_requests=${historyRequests}; history_pushes=${historyPushes}; rows=${JSON.stringify(historyRows)}; page_errors=${JSON.stringify(pageErrors)}; body=${(await page.locator('body').innerText()).slice(0, 2000)}`);
+    }
+    assert.match(await hydratedFailure.innerText(), /Update validation pending/i);
+    assert.strictEqual(await hydratedFailure.locator('.delivery-retry').count(), 1, 'Retry survives history hydration');
+    assert.strictEqual(await hydratedFailure.locator('.delivery-copy').count(), 1, 'Copy survives history hydration');
+    await hydratedFailure.locator('.delivery-retry').click();
+    await page.locator('.delivery.agent-started').waitFor({ state: 'visible', timeout: 5000 });
+    assert.strictEqual(sends.length, 4, 'historical failure retry dispatches exactly once');
+    assert.strictEqual(sends[3].cid, sends[2].cid, 'historical retry reuses the durable client_message_id');
+    assert.strictEqual(sends[3].retry_failed, true, 'historical retry carries explicit retry intent');
+    assert.strictEqual(await page.locator('.message.user').count(), 1, 'historical retry preserves one user bubble');
 
     await page.locator('.composer-gear-btn').first().click();
     const modelSelect = page.locator('.composer-setting-label').filter({ hasText: 'Model' }).locator('select').first();
@@ -208,9 +322,17 @@ async function main() {
       pages: 1,
       timeout_stage: 'queued',
       correlation_id_reused: true,
-      user_bubbles: 2,
+      sends_observed: sends.length,
+      user_bubbles: await page.locator('.message.user').count(),
       structured_failure_reason_visible: true,
+      historical_failure_hydrated: true,
+      historical_retry_cid_reused: sends[3].cid === sends[2].cid,
+      historical_retry_explicit: sends[3].retry_failed === true,
+      history_requests: historyRequests,
+      history_pushes: historyPushes,
+      page_errors: pageErrors.length,
       final_state: 'agent_started',
+      final_delivery_attempt: 2,
       optimistic_control: 'new-model',
       rejected_control_rolled_back: 'old-model',
       confirmed_control: 'new-model',

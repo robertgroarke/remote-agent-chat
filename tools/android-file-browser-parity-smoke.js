@@ -31,7 +31,11 @@ for (const marker of [
 ]) assert(chat.includes(marker), `missing Android file-browser marker: ${marker}`);
 
 assert.match(chat, /sid !== sessionId/);
-assert.match(sheet, /presentationStyle="pageSheet"/);
+assert.match(sheet, /presentationStyle="overFullScreen"/);
+assert.match(sheet, /maxHeight:\s*'45%'/);
+assert.match(sheet, /accessibilityLabel="Minimize Workspace files"/);
+assert.match(sheet, /onRequestClose=\{onMinimize \|\| onClose\}/);
+assert.match(sheet, /minimizeButton:\s*\{[\s\S]{0,120}minWidth:\s*44[\s\S]{0,80}minHeight:\s*44/);
 assert.match(sheet, /accessibilityLabel=\{`\$\{directory \? 'Folder' : 'File'\}/);
 assert.match(sheet, /selectable/);
 assert.match(sheet, /Preview truncated by the desktop file-size limit/);
@@ -49,4 +53,7 @@ console.log(JSON.stringify({
   binary_files_disabled: true,
   truncated_preview_notice: true,
   accessible_rows: true,
+  bounded_viewport_ratio: 0.45,
+  minimized_state_retained: true,
+  minimize_target_dp: 44,
 }, null, 2));

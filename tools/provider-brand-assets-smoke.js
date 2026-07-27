@@ -3,12 +3,14 @@
 
 const assert = require('assert');
 const fs = require('fs');
+const os = require('os');
 const path = require('path');
 const {
   assertProviderAssetHashes,
   assertProviderAssetMirror,
   canonicalAssetBytes,
   providerAssetDigest,
+  syncProviderAssets,
 } = require('./provider-brand-assets');
 
 const root = path.join(__dirname, '..');
@@ -82,6 +84,26 @@ for (const file of files) {
 
 const androidMirror = assertProviderAssetMirror(sourceRoot, androidRoot);
 const publicMirror = assertProviderAssetMirror(sourceRoot, publicRoot);
+const idempotenceRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'rac-provider-assets-smoke-'));
+try {
+  const initialSync = syncProviderAssets(sourceRoot, idempotenceRoot);
+  assert.strictEqual(initialSync.written_files.length, initialSync.files.length);
+  const textMirrorPath = path.join(idempotenceRoot, 'claude-color.svg');
+  const crlfMirror = Buffer.from(
+    canonicalAssetBytes(path.join(sourceRoot, 'claude-color.svg'))
+      .toString('utf8')
+      .replace(/\n/g, '\r\n'),
+    'utf8',
+  );
+  assert(crlfMirror.includes(Buffer.from('\r\n')), 'CRLF idempotence fixture is not CRLF');
+  fs.writeFileSync(textMirrorPath, crlfMirror);
+  const repeatedSync = syncProviderAssets(sourceRoot, idempotenceRoot);
+  assert.deepStrictEqual(repeatedSync.written_files, []);
+  assert(fs.readFileSync(textMirrorPath).equals(crlfMirror),
+    'canonical-equivalent text mirror was rewritten');
+} finally {
+  fs.rmSync(idempotenceRoot, { recursive: true, force: true });
+}
 const expectedMirrorFiles = new Set(['manifest.json', ...files]);
 for (const mirrorRoot of [androidRoot, publicRoot]) {
   const actual = fs.readdirSync(mirrorRoot).filter(name => fs.statSync(path.join(mirrorRoot, name)).isFile());
@@ -109,7 +131,9 @@ const androidScreen = fs.readFileSync(path.join(root, 'android-app', 'screens', 
 assert(androidComponent.includes('accessibilityRole="image"'));
 assert(androidComponent.includes('provider mark${failed || !mark'));
 assert(!/https?:\/\//.test(androidComponent), 'Android provider marks must not hotlink');
-assert(androidScreen.includes('<ProviderMark providerId={entry.providerId} providerName={entry.providerName} colorScheme="dark" />'));
+assert(androidScreen.includes('<ProviderMark providerId={entry.providerId} providerName={entry.providerName}'));
+assert(androidComponent.includes('const systemColorScheme = useColorScheme();'));
+assert(androidComponent.includes("const scheme = colorScheme === 'light' || colorScheme === 'dark'"));
 assert(!androidScreen.includes('entry.providerName.slice(0, 2).toUpperCase()'));
 for (const provider of manifest.providers) {
   for (const file of new Set([provider.render.android.light, provider.render.android.dark])) {
@@ -132,6 +156,7 @@ const result = {
   png_files: files.filter(file => file.endsWith('.png')).length,
   android_mirror_files: androidMirror.files,
   public_mirror_files: publicMirror.files,
+  canonical_equivalent_sync_writes: 0,
   digest_sha256: providerAssetDigest(sourceRoot).toString('hex'),
   hotlinks: 0,
   unsafe_svg_findings: 0,

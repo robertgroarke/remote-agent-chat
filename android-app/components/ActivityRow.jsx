@@ -1,5 +1,7 @@
 import React, { useState, useEffect } from 'react';
-import { View, Text, StyleSheet, Pressable } from 'react-native';
+import {
+  View, Text, StyleSheet, Pressable, ScrollView, useWindowDimensions,
+} from 'react-native';
 import { fleetGoalElapsedSeconds } from '../lib/fleet-activity';
 
 const INACTIVE_KINDS = new Set([
@@ -22,7 +24,8 @@ export default function ActivityRow({ activity, agentType }) {
     || activity?.updatedAt
     || null;
   const [nowMs, setNowMs] = useState(Date.now());
-  const [goalExpanded, setGoalExpanded] = useState(false);
+  const [detailsExpanded, setDetailsExpanded] = useState(false);
+  const { height: windowHeight } = useWindowDimensions();
   const hasCanonicalChannels = !!(activity?.thinking || activity?.current);
   const legacyText = String(activity?.thinkingContent || activity?.thinking_content || '').trim();
   const thinking = activity?.thinking || (!hasCanonicalChannels && kind === 'thinking'
@@ -70,6 +73,30 @@ export default function ActivityRow({ activity, agentType }) {
   const nativeGlyph = nativeStatusGlyph(agentType);
   const nativeLabel = thinking?.label || activity?.label || 'Thinking';
   if (!goal && !thinking && !current && !connection && !interruption && !step && !usage && planTasks.length === 0) return null;
+  const connectionFailed = connection?.state === 'failed';
+  const hasDisclosureContent = !!(
+    (connection && !connectionFailed)
+    || current
+    || thinking
+    || planTasks.length
+    || step
+    || goal
+  );
+  const needsAttention = !!(interruption || usage || connectionFailed);
+  const summaryLabel = current?.label
+    || thinking?.label
+    || activity?.label
+    || goal?.label
+    || plan?.label
+    || plan?.title
+    || connection?.label
+    || (step ? `Step ${step.current || 1} of ${step.total || 1}` : '')
+    || 'Working';
+  const summaryMeta = [
+    currentElapsed || thinkingElapsed || goalElapsed,
+    needsAttention ? 'Needs attention' : '',
+  ].filter(Boolean).join(' · ');
+  const disclosureMaxHeight = Math.max(112, Math.min(240, Math.round(windowHeight * 0.32)));
 
   return (
     <View style={s.stack} testID="live-status-stack">
@@ -97,19 +124,32 @@ export default function ActivityRow({ activity, agentType }) {
           </Text>
         </View>
       ) : null}
-      {connection ? (
-        <View
-          style={[s.connectionChannel, connection.state === 'failed' && s.connectionFailed, connection.state === 'reconnected' && s.connectionRecovered]}
-          testID="native-connection-row"
-          accessibilityRole={connection.state === 'failed' ? 'alert' : 'text'}
-          accessibilityLiveRegion={connection.state === 'failed' ? 'assertive' : 'polite'}
-          accessibilityLabel={`Codex native connection. ${connection.label || 'Connection status'}`}
+      {connectionFailed ? <ConnectionStatusRow connection={connection} /> : null}
+      {hasDisclosureContent ? (
+        <Pressable
+          style={[s.compactSummary, needsAttention && s.compactSummaryAttention]}
+          accessibilityRole="button"
+          accessibilityState={{ expanded: detailsExpanded }}
+          accessibilityLabel={`${summaryLabel}. ${summaryMeta || 'Live activity'}. ${detailsExpanded ? 'Collapse' : 'Expand'} live activity details`}
+          onPress={() => setDetailsExpanded(value => !value)}
         >
-          <Text style={[s.connectionIcon, connection.state === 'failed' && s.connectionIconFailed]}>{'⌁'}</Text>
-          <Text style={s.connectionLabel}>{connection.label || 'Native connection status'}</Text>
-          {connection.state === 'failed' ? <Text style={s.connectionAttention}>Needs attention</Text> : null}
-        </View>
+          <Text style={[s.compactSummaryIcon, needsAttention && s.compactSummaryIconAttention]}>
+            {needsAttention ? '!' : nativeGlyph}
+          </Text>
+          <Text style={s.compactSummaryLabel} numberOfLines={1}>{summaryLabel}</Text>
+          {!!summaryMeta && <Text style={[s.compactSummaryMeta, needsAttention && s.compactSummaryMetaAttention]} numberOfLines={1}>{summaryMeta}</Text>}
+          <Text style={s.compactSummaryChevron}>{detailsExpanded ? '⌃' : '⌄'}</Text>
+        </Pressable>
       ) : null}
+      {detailsExpanded && hasDisclosureContent ? (
+        <ScrollView
+          style={[s.detailsViewport, { maxHeight: disclosureMaxHeight }]}
+          contentContainerStyle={s.detailsStack}
+          nestedScrollEnabled
+          keyboardShouldPersistTaps="handled"
+          accessibilityLabel="Expanded live activity details"
+        >
+      {connection && !connectionFailed ? <ConnectionStatusRow connection={connection} /> : null}
       {current ? (
         <View style={current.kind === 'tool' ? s.currentTool : s.currentNarration}>
           {current.kind === 'tool' ? (
@@ -120,7 +160,7 @@ export default function ActivityRow({ activity, agentType }) {
             </View>
           ) : null}
           {current.partial ? (
-            <Text style={current.kind === 'tool' ? s.currentOutput : s.narrationText} selectable numberOfLines={4}>{current.partial}</Text>
+            <Text style={current.kind === 'tool' ? s.currentOutput : s.narrationText} selectable>{current.partial}</Text>
           ) : null}
         </View>
       ) : null}
@@ -131,7 +171,7 @@ export default function ActivityRow({ activity, agentType }) {
             <Text style={s.thinkingLabel}>{nativeLabel}</Text>
             {thinkingElapsed ? <Text style={s.meta}>{thinkingElapsed}</Text> : null}
           </View>
-          {thinking.text ? <Text style={s.thinkingText} selectable numberOfLines={4}>{thinking.text}</Text> : null}
+          {thinking.text ? <Text style={s.thinkingText} selectable>{thinking.text}</Text> : null}
         </View>
       ) : null}
       {planTasks.length > 0 ? (
@@ -167,20 +207,17 @@ export default function ActivityRow({ activity, agentType }) {
         </View>
       ) : null}
       {goal ? (
-        <Pressable
-          accessibilityRole="button"
-          accessibilityState={{ expanded: goalExpanded }}
-          onPress={() => setGoalExpanded(value => !value)}
-          style={[s.channel, s.goalChannel]}
-        >
+        <View style={[s.channel, s.goalChannel]}>
           <View style={s.heading}>
             <Text style={s.goalIcon}>⛳</Text>
             <Text style={s.goalLabel}>{goal.label || 'Pursuing goal'}</Text>
             <Text style={s.goalText} numberOfLines={1}>{goalText || 'Active goal'}</Text>
             <Text style={s.meta}>{goalElapsed || goal.state || goal.status || 'active'}</Text>
           </View>
-          {goalExpanded && goalText ? <Text style={s.goalExpanded} selectable>{goalText}</Text> : null}
-        </Pressable>
+          {goalText ? <Text style={s.goalExpanded} selectable>{goalText}</Text> : null}
+        </View>
+      ) : null}
+        </ScrollView>
       ) : null}
       {usage ? (
         <View style={[s.channel, s.usageChannel]} accessibilityRole="alert">
@@ -188,6 +225,22 @@ export default function ActivityRow({ activity, agentType }) {
           <Text style={s.usageDetail}>{usage.detail || (usage.resets_at ? `Your rate limit resets at ${usage.resets_at}.` : 'Usage is currently exhausted.')}</Text>
         </View>
       ) : null}
+    </View>
+  );
+}
+
+function ConnectionStatusRow({ connection }) {
+  return (
+    <View
+      style={[s.connectionChannel, connection.state === 'failed' && s.connectionFailed, connection.state === 'reconnected' && s.connectionRecovered]}
+      testID="native-connection-row"
+      accessibilityRole={connection.state === 'failed' ? 'alert' : 'text'}
+      accessibilityLiveRegion={connection.state === 'failed' ? 'assertive' : 'polite'}
+      accessibilityLabel={`Codex native connection. ${connection.label || 'Connection status'}`}
+    >
+      <Text style={[s.connectionIcon, connection.state === 'failed' && s.connectionIconFailed]}>{'⌁'}</Text>
+      <Text style={s.connectionLabel}>{connection.label || 'Native connection status'}</Text>
+      {connection.state === 'failed' ? <Text style={s.connectionAttention}>Needs attention</Text> : null}
     </View>
   );
 }
@@ -270,6 +323,54 @@ const s = StyleSheet.create({
   stack: {
     marginHorizontal: 12,
     marginBottom: 6,
+    gap: 5,
+  },
+  compactSummary: {
+    minHeight: 44,
+    maxHeight: 52,
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: 7,
+    paddingHorizontal: 10,
+    borderWidth: 1,
+    borderColor: '#30363d',
+    borderRadius: 9,
+    backgroundColor: '#111820',
+  },
+  compactSummaryAttention: {
+    borderColor: '#8f3d3a',
+    backgroundColor: '#251414',
+  },
+  compactSummaryIcon: {
+    width: 18,
+    color: '#79c0ff',
+    fontSize: 11,
+    textAlign: 'center',
+  },
+  compactSummaryIconAttention: { color: '#ff7b72', fontWeight: '800' },
+  compactSummaryLabel: {
+    flex: 1,
+    minWidth: 0,
+    color: '#f0f3f6',
+    fontSize: 12,
+    fontWeight: '700',
+  },
+  compactSummaryMeta: {
+    maxWidth: '38%',
+    color: '#8b949e',
+    fontFamily: 'monospace',
+    fontSize: 10,
+  },
+  compactSummaryMetaAttention: { color: '#ff7b72' },
+  compactSummaryChevron: { color: '#9da7b3', fontSize: 15 },
+  detailsViewport: {
+    borderWidth: 1,
+    borderColor: '#30363d',
+    borderRadius: 9,
+    backgroundColor: '#0d1117',
+  },
+  detailsStack: {
+    padding: 7,
     gap: 5,
   },
   currentNarration: {

@@ -453,6 +453,15 @@ Rules:
 - the browser must generate `client_message_id` before sending
 - retries from the browser must reuse the same `client_message_id`
 - the relay must treat `client_message_id` as idempotent for browser-originated sends
+- an ordinary reconnect/replay with the same ID returns the durable lifecycle and
+  never redispatches to the proxy
+- an operator retry sets `retry_failed: true`; the relay may create the next
+  `delivery_attempt` only when the durable current attempt is `failed`,
+  `failure_native_attempted` is `false`, `failure_retryable` is `true`, content
+  and canonical session identity match, and no launch/delivery/start receipt
+  exists
+- clients never choose `delivery_attempt`; it is a relay-owned positive integer
+  beginning at 1 and incremented transactionally for an eligible retry
 
 ## Message Delivery State Model
 
@@ -486,8 +495,16 @@ Rules:
 - `agent_started` means a later native event proves the agent began processing that delivered turn
 - `failed` means the relay or proxy has determined the send cannot currently be completed
 - relay persistence, WebSocket acknowledgement, process spawn, stdout, exit code 0, dequeue, and an outbound/optimistic/history echo are never delivery evidence
-- relay lifecycle persistence is monotonic and keyed by `(session_id, client_message_id)`; duplicate or wrong-session lifecycle events must not rebroadcast
+- relay lifecycle persistence is monotonic and keyed by
+  `(session_id, client_message_id, delivery_attempt)`; duplicate, lower-attempt,
+  lower-stage, or wrong-session lifecycle events must not rebroadcast
 - retries reuse the same `client_message_id` and consult the durable receipt journal before proxy availability or redispatch
+- Web and Android retain one canonical user row across history hydration, live
+  tail, reconnect, and retry; they reject lower attempts and lower stages within
+  an attempt, while a higher attempt may restart at `accepted`
+- a failed row always exposes Copy. Retry is exposed only for a proven
+  pre-native retryable failure, or for a local optimistic failure whose safety
+  is still unknown and will therefore be revalidated by the relay
 - historical rows without receipt provenance render as neutral `recorded` / `receipt unknown`
 
 ### Busy and native queue surfaces
@@ -586,6 +603,7 @@ Sent by relay to browser after it durably accepts a browser-originated send.
   "session_id": "sess_123",
   "message_id": "msg_cli_123",
   "client_message_id": "msg_cli_123",
+  "delivery_attempt": 1,
   "status": "accepted",
   "accepted_at": "2026-03-19T10:16:31.000Z"
 }
@@ -607,6 +625,7 @@ Prompt bodies are not stored in receipt evidence.
   "session_id": "sess_123",
   "message_id": "msg_cli_123",
   "client_message_id": "msg_cli_123",
+  "delivery_attempt": 1,
   "result": "delivered",
   "lifecycle": "native_user_turn_observed",
   "delivered_at": "2026-03-19T10:16:32.000Z",
@@ -633,6 +652,7 @@ receipt-managed producers emit it directly.
   "protocol_version": 1,
   "session_id": "sess_123",
   "client_message_id": "msg_cli_123",
+  "delivery_attempt": 1,
   "delivered_at": "2026-03-19T10:16:32.000Z",
   "started_at": "2026-03-19T10:16:33.000Z",
   "native_start": {
@@ -655,11 +675,18 @@ Sent when the relay or proxy determines the send failed.
   "session_id": "sess_123",
   "message_id": "msg_cli_123",
   "client_message_id": "msg_cli_123",
+  "delivery_attempt": 1,
   "status": "failed",
+  "failure_code": "session_not_connected",
+  "failure_reason": "Session is not currently connected",
+  "failure_native_attempted": false,
+  "failure_retryable": true,
   "failed_at": "2026-03-19T10:16:35.000Z",
   "error": {
     "code": "session_not_connected",
-    "message": "Session is not currently connected"
+    "message": "Session is not currently connected",
+    "native_attempted": false,
+    "retryable": true
   }
 }
 ```
@@ -1532,6 +1559,7 @@ Sent by proxy in response to a relay-forwarded send request.
   "protocol_version": 1,
   "session_id": "sess_123",
   "client_message_id": "msg_cli_123",
+  "delivery_attempt": 1,
   "result": "delivered",
   "delivered_at": "2026-03-19T10:16:32.000Z"
 }
@@ -1545,11 +1573,14 @@ Failure example:
   "protocol_version": 1,
   "session_id": "sess_123",
   "client_message_id": "msg_cli_123",
+  "delivery_attempt": 1,
   "result": "failed",
   "failed_at": "2026-03-19T10:16:35.000Z",
   "error": {
     "code": "send_button_not_found",
-    "message": "Could not locate the active send button"
+    "message": "Could not locate the active send button",
+    "native_attempted": false,
+    "retryable": true
   }
 }
 ```
@@ -1568,6 +1599,7 @@ expires unmatched correlations after two minutes.
   "protocol_version": 1,
   "session_id": "sess_123",
   "client_message_id": "msg_cli_123",
+  "delivery_attempt": 1,
   "delivered_at": "2026-03-19T10:16:32.000Z",
   "started_at": "2026-03-19T10:16:32.240Z",
   "activity": {
@@ -1577,8 +1609,10 @@ expires unmatched correlations after two minutes.
 }
 ```
 
-Clients advance the matching optimistic user bubble to `agent_started` and must ignore
-unmatched IDs. A later failure for the same ID still wins and remains retryable.
+Clients advance the matching user bubble to `agent_started` and ignore unmatched IDs.
+A lower-attempt frame or lower-stage frame within the same attempt cannot regress that
+terminal state. A failure can replace it only on a higher relay-issued attempt, and is
+retryable only when its explicit safety fields permit another attempt.
 
 ### `proxy_status`
 
@@ -1818,6 +1852,36 @@ During measured streaming runs, `proxy_status` may also carry an additive
 native timestamp sets `native_event_at_ms` to the first observable proxy read and records
 that limitation in `native_timestamp_source`. Trace metadata is diagnostic only: it must
 not change status deduplication, activity state, or transcript reconciliation.
+
+Every WebUI-originated send may additionally carry a content-free `latency_trace`.
+This is the end-to-end send lifecycle rather than a second receive-path timer. The
+browser creates the trace beside `client_message_id`; each trusted boundary adds exactly
+one monotonic timestamp in this order:
+
+`webui_send -> relay_recv -> proxy_recv -> harness_delivered ->
+agent_first_output -> relay_broadcast -> webui_render`.
+
+The proxy uses the native delivery receipt for `harness_delivered`. For
+`agent_first_output`, it reuses the existing `stream_trace` native timestamp or the
+DOM-push `source_at`, `cdpToQueueMs`, `bindingToProxyMs`, and
+`queueToDispatchMs` telemetry when available. A later hop may clamp a skewed wall-clock
+observation to the prior logical timestamp while retaining the raw observation and
+`clock_adjustment_ms` in `stage_sources`; stage timestamps themselves never regress.
+
+After React commits the first assistant delta or settled assistant message, the browser
+sends one `latency_trace_complete` acknowledgement. The relay accepts it only when its
+prefix matches the active send, then appends one deduplicated
+`real_webui_send` row to `data/latency-trace-ledger.jsonl`. Reconnects, replay, and a
+second browser tab cannot append the same `trace_id` twice, including across relay
+restart. Ledger rows contain trace/client correlation IDs, agent/surface class, stage
+timestamps, bounded stage-source timing metadata, and derived hop durations. They never
+contain session IDs, message content, prompt text, credentials, or local paths.
+
+`tools/latency-trace-ledger-report.js` validates the lifecycle and computes p50/p95 for
+every hop by agent type and by the `codex_cli`, `codex-desktop`, and `webview` surface
+classes. Earlier production scoreboard, question-prompt, VS Code question-push, and
+Continue distributions are retained as hashed stage-source references; they are not
+copied into the end-to-end ledger or misrepresented as complete send traces.
 
 ### `message_delta`
 

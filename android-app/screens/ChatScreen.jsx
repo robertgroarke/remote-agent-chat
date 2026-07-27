@@ -5,6 +5,7 @@ import {
   View, FlatList, TextInput, TouchableOpacity,
   Text, StyleSheet, KeyboardAvoidingView, Platform,
   ActivityIndicator, Keyboard, Image, Alert, Share, Modal, ScrollView,
+  useWindowDimensions,
 } from 'react-native';
 import * as ImagePicker    from 'expo-image-picker';
 import * as DocumentPicker from 'expo-document-picker';
@@ -69,10 +70,41 @@ import {
   classifyGoalCommandIntent,
   satisfiedGoalCommandLabel,
 } from '../lib/goal-command';
+import {
+  completeAndroidLatencyTrace,
+  createAndroidLatencyTrace,
+  retainAndroidLatencyCompletion,
+  retainAndroidLatencyTerminal,
+} from '../lib/latency-trace';
+import { useAppTheme, useThemedStyles } from '../lib/theme';
+import {
+  createPaneLifecycleLedger,
+  paneDefinition,
+  paneIsOpen,
+  paneRestoreRail,
+  synchronizeAuthoritativePane,
+  transitionPaneLifecycle,
+} from '../lib/pane-lifecycle';
+const {
+  acceptDeliveryAttempt,
+  clientMessageIdOf,
+  deliveryStateOf,
+  mergeCanonicalDeliveryMessages,
+  normalizeDeliveryMessage,
+  shouldAdvanceDeliveryState,
+} = require('../lib/delivery-lifecycle');
 
 const DRAFT_STORAGE_PREFIX = 'remote-agent-chat:draft:v1:';
+
+export function reconcileHydratedComposerDraft(liveInput, inputAtHydrationStart, storedDraft) {
+  const live = typeof liveInput === 'string' ? liveInput : '';
+  if (live !== inputAtHydrationStart) return live;
+  return typeof storedDraft === 'string' ? storedDraft : '';
+}
+
 const HISTORY_PAGE_SIZE = 200;
 const MAX_HISTORY_CHUNK_RETRIES = 3;
+const THREAD_VIEW_SELECTION_TIMEOUT_MS = 10000;
 const RECOVERABLE_HISTORY_CHUNK_CODES = new Set([
   'history_chunk_throttled',
   'history_chunk_duplicate_cursor',
@@ -87,6 +119,65 @@ const DELIVERY_STAGE_TIMEOUT_MS = Object.freeze({
   delivered: 30000,
   steered: 30000,
 });
+let retainedPaneLifecycle = createPaneLifecycleLedger();
+
+function useAndroidPane(ledger, setLedger, sessionId, paneId) {
+  const open = paneIsOpen(ledger, sessionId, paneId);
+  const setOpen = useCallback(nextValue => {
+    setLedger(previous => {
+      const wasOpen = paneIsOpen(previous, sessionId, paneId);
+      const nextOpen = typeof nextValue === 'function' ? !!nextValue(wasOpen) : !!nextValue;
+      return transitionPaneLifecycle(previous, {
+        session_id: sessionId,
+        pane_id: paneId,
+        action: nextOpen ? (wasOpen ? 'open' : 'restore') : 'close',
+        compact: true,
+      });
+    });
+  }, [paneId, sessionId, setLedger]);
+  const minimize = useCallback(() => {
+    setLedger(previous => transitionPaneLifecycle(previous, {
+      session_id: sessionId,
+      pane_id: paneId,
+      action: 'minimize',
+    }));
+  }, [paneId, sessionId, setLedger]);
+  return { open, setOpen, minimize };
+}
+
+function PaneRestoreRail({ records, onRestore }) {
+  const s = useThemedStyles(darkStyles);
+  if (!records.length) return null;
+  return (
+    <View style={s.paneRestoreRail} testID="pane-restore-rail" accessibilityLabel="Minimized chat panes">
+      <ScrollView
+        horizontal
+        showsHorizontalScrollIndicator={false}
+        contentContainerStyle={s.paneRestoreRailContent}
+      >
+        {records.map(record => {
+          const definition = paneDefinition(record.pane_id);
+          return (
+            <TouchableOpacity
+              key={record.pane_id}
+              style={[s.paneRestoreChip, record.attention_count > 0 && s.paneRestoreChipAttention]}
+              onPress={() => onRestore(record.pane_id)}
+              accessibilityRole="button"
+              accessibilityState={{ expanded: false }}
+              accessibilityLabel={`Restore ${definition?.label || record.pane_id}${record.attention_count > 0 ? `, ${record.attention_count} pending` : ''}`}
+              testID={`pane-restore-${record.pane_id}`}
+            >
+              <Text style={s.paneRestoreChipText}>{definition?.label || record.pane_id}</Text>
+              {record.attention_count > 0 && (
+                <Text style={s.paneAttentionCount}>{record.attention_count}</Text>
+              )}
+            </TouchableOpacity>
+          );
+        })}
+      </ScrollView>
+    </View>
+  );
+}
 const SLASH_COMMANDS = [
   ...GOAL_CONTROL_SLASH_COMMANDS,
   { command: '/plan', detail: 'Outline the implementation approach and major steps.' },
@@ -103,6 +194,7 @@ function routeTitleProjection(value) {
 }
 
 function ProvisionalBubble({ stream }) {
+  const s = useThemedStyles(darkStyles);
   const instant = parseMessageInstant(stream?.startedAtMs);
   const absoluteTimestamp = instant ? formatAbsoluteMessageTime(instant) : 'time unknown';
   return (
@@ -119,14 +211,78 @@ function ProvisionalBubble({ stream }) {
 }
 
 export default function ChatScreen({ route, navigation }) {
-  const { sessionId, title, agentType, searchMessageId, session: routeSession } = route.params;
+  const theme = useAppTheme();
+  const hr = useThemedStyles(darkHeaderStyles);
+  const s = useThemedStyles(darkStyles);
+  const {
+    sessionId,
+    title,
+    agentType: routeAgentType,
+    searchMessageId,
+    session: routeSession,
+  } = route.params;
+  const { height: windowHeight } = useWindowDimensions();
+  const [paneLifecycle, setPaneLifecycleState] = useState(() => retainedPaneLifecycle);
+  const updatePaneLifecycle = useCallback(updater => {
+    setPaneLifecycleState(previous => {
+      const next = typeof updater === 'function' ? updater(previous) : updater;
+      retainedPaneLifecycle = next;
+      return next;
+    });
+  }, []);
+  const settingsPane = useAndroidPane(paneLifecycle, updatePaneLifecycle, sessionId, 'agent-settings');
+  const usagePane = useAndroidPane(paneLifecycle, updatePaneLifecycle, sessionId, 'session-usage');
+  const schedulePane = useAndroidPane(paneLifecycle, updatePaneLifecycle, sessionId, 'scheduled-send');
+  const chatListPane = useAndroidPane(paneLifecycle, updatePaneLifecycle, sessionId, 'chat-list');
+  const threadListPane = useAndroidPane(paneLifecycle, updatePaneLifecycle, sessionId, 'thread-list');
+  const terminalPane = useAndroidPane(paneLifecycle, updatePaneLifecycle, sessionId, 'terminal');
+  const diffPane = useAndroidPane(paneLifecycle, updatePaneLifecycle, sessionId, 'diff-viewer');
+  const branchPane = useAndroidPane(paneLifecycle, updatePaneLifecycle, sessionId, 'branch-selector');
+  const fileBrowserPane = useAndroidPane(paneLifecycle, updatePaneLifecycle, sessionId, 'file-browser');
+  const nativeActionPane = useAndroidPane(paneLifecycle, updatePaneLifecycle, sessionId, 'native-action');
+  const rateLimitPane = useAndroidPane(paneLifecycle, updatePaneLifecycle, sessionId, 'rate-limit');
+  const liveActivityPane = useAndroidPane(paneLifecycle, updatePaneLifecycle, sessionId, 'live-activity');
+  const settingsOpen = settingsPane.open;
+  const setSettingsOpen = settingsPane.setOpen;
+  const usageDetailsOpen = usagePane.open;
+  const setUsageDetailsOpen = usagePane.setOpen;
+  const scheduleOpen = schedulePane.open;
+  const setScheduleOpen = schedulePane.setOpen;
+  const chatListOpen = chatListPane.open;
+  const setChatListOpen = chatListPane.setOpen;
+  const threadListOpen = threadListPane.open;
+  const setThreadListOpen = threadListPane.setOpen;
+  const terminalOpen = terminalPane.open;
+  const setTerminalOpen = terminalPane.setOpen;
+  const diffOpen = diffPane.open;
+  const setDiffOpen = diffPane.setOpen;
+  const branchOpen = branchPane.open;
+  const setBranchOpen = branchPane.setOpen;
+  const fileBrowserOpen = fileBrowserPane.open;
+  const setFileBrowserOpen = fileBrowserPane.setOpen;
+  const minimizedPaneRecords = paneRestoreRail(paneLifecycle, sessionId);
+  const restorePane = useCallback(paneId => {
+    updatePaneLifecycle(previous => transitionPaneLifecycle(previous, {
+      session_id: sessionId,
+      pane_id: paneId,
+      action: 'restore',
+      compact: true,
+    }));
+  }, [sessionId, updatePaneLifecycle]);
 
   const [messages,  setMessages]  = useState(() => getCachedTranscript(sessionId) || []);
   const [sessionMeta, setSessionMeta] = useState(() => (
     routeSession && typeof routeSession === 'object'
       ? { ...routeSession, session_id: sessionId }
-      : { session_id: sessionId, agent_type: agentType }
+      : { session_id: sessionId, agent_type: routeAgentType }
   ));
+  const agentType = sessionMeta?.agent_type
+    || sessionMeta?.agentType
+    || routeSession?.agent_type
+    || routeSession?.agentType
+    || routeSession?.type
+    || routeAgentType
+    || '';
   const [liveTitleState, setLiveTitleState] = useState(() => ({
     sessionId,
     projection: routeTitleProjection(title),
@@ -139,7 +295,6 @@ export default function ChatScreen({ route, navigation }) {
   const [input,     setInput]     = useState('');
   const [slashMenuDismissed, setSlashMenuDismissed] = useState(false);
   const [sendPending,   setSendPending]   = useState(false);   // waiting for echo
-  const [failedMsg,     setFailedMsg]     = useState(null);    // { sessionId, text, clientMsgId }
   const [deliveryStates, setDeliveryStates] = useState({});    // client message id -> delivery lifecycle
   const [queuedMessages, setQueuedMessages] = useState([]);    // proxy/native queue items for this session
   const [reconnectInfo, setReconnectInfo] = useState(null);  // { attempt, nextRetryMs }
@@ -147,29 +302,21 @@ export default function ChatScreen({ route, navigation }) {
   const [showJumpBtn,   setShowJumpBtn]   = useState(false); // show jump-to-bottom button
   const [agentConfig,   setAgentConfig]   = useState(null);  // per-session config from relay
   const [providerUsage, setProviderUsage] = useState(null);
-  const [usageDetailsOpen, setUsageDetailsOpen] = useState(false);
   const [providerUsageNowMs, setProviderUsageNowMs] = useState(Date.now());
-  const [settingsOpen,  setSettingsOpen]  = useState(false); // agent settings sheet
-  const [scheduleOpen,  setScheduleOpen]  = useState(false); // scheduled message sheet
   const [attachment,    setAttachment]    = useState(null);  // { uri, name, mimeType, isText?, content? }
   const [uploading,     setUploading]     = useState(false); // file upload in progress
-  const [chatListOpen,  setChatListOpen]  = useState(false); // chat list sheet visible
   const [chatList,      setChatList]      = useState([]);    // [{ id, title, active }]
   const [chatListLoading, setChatListLoading] = useState(false);
-  const [threadListOpen, setThreadListOpen] = useState(false);
   const [threadList,     setThreadList]     = useState([]);
   const [threadListLoading, setThreadListLoading] = useState(false);
-  const [terminalOpen,   setTerminalOpen]   = useState(false);
+  const [threadView, setThreadView] = useState(null);
   const [terminalEntries, setTerminalEntries] = useState([]);
   const [terminalLoading, setTerminalLoading] = useState(false);
-  const [diffOpen,       setDiffOpen]       = useState(false);
   const [diffEntries,    setDiffEntries]    = useState([]);
   const [diffLoading,    setDiffLoading]    = useState(false);
-  const [branchOpen,     setBranchOpen]     = useState(false);
   const [branchList,     setBranchList]     = useState([]);
   const [branchCurrent,  setBranchCurrent]  = useState('');
   const [branchLoading,  setBranchLoading]  = useState(false);
-  const [fileBrowserOpen, setFileBrowserOpen] = useState(false);
   const [directoryListing, setDirectoryListing] = useState({ path: '.', entries: [] });
   const [viewingFile, setViewingFile] = useState(null);
   const [fileContent, setFileContent] = useState(null);
@@ -184,14 +331,101 @@ export default function ChatScreen({ route, navigation }) {
   const [goalCommandNotice, setGoalCommandNotice] = useState(null);
   const [interruptPending, setInterruptPending] = useState('');
   const [goalControlPending, setGoalControlPending] = useState('');
+  const [writeGateExpanded, setWriteGateExpanded] = useState(false);
   const [provisionalStream, setProvisionalStream] = useState(null);
   const [highlightedSearchMessageId, setHighlightedSearchMessageId] = useState(
     Number.isSafeInteger(Number(searchMessageId)) ? Number(searchMessageId) : null,
   );
-  const errorPromptIsBlocking = !!errorPrompt
-    && errorPrompt.blocking !== false
-    && errorPrompt.display_mode !== 'inline';
-  const composerBlockedByPrompt = !!permPrompt || errorPromptIsBlocking;
+  const threadViewDetached = agentType === 'codex-desktop'
+    && !!threadView?.view_state
+    && threadView.view_state !== 'native_active';
+  const visiblePermPrompt = threadViewDetached ? null : permPrompt;
+  const visibleErrorPrompt = threadViewDetached ? null : errorPrompt;
+  const visibleActivity = threadViewDetached ? null : activity;
+  const visibleProvisionalStream = threadViewDetached ? null : provisionalStream;
+  const errorPromptIsBlocking = !!visibleErrorPrompt
+    && visibleErrorPrompt.blocking !== false
+    && visibleErrorPrompt.display_mode !== 'inline';
+  const composerBlockedByPrompt = !!visiblePermPrompt || errorPromptIsBlocking;
+  const nativeActionSourceKey = visiblePermPrompt
+    ? [
+        sessionId,
+        visiblePermPrompt.type || 'prompt',
+        visiblePermPrompt.prompt_id || visiblePermPrompt.request_id || visiblePermPrompt.id || 'unknown',
+        visiblePermPrompt.generation || sessionMeta?.turn_generation || 'legacy',
+      ].join('\u0000')
+    : errorPromptIsBlocking
+      ? [
+          sessionId,
+          'error',
+          visibleErrorPrompt.prompt_id || visibleErrorPrompt.request_id || visibleErrorPrompt.id || 'unknown',
+          visibleErrorPrompt.generation || sessionMeta?.turn_generation || 'legacy',
+        ].join('\u0000')
+      : '';
+  const rateLimitVisible = !!visibleActivity?.rate_limited_until;
+  const liveActivityVisible = !rateLimitVisible && !!(
+    visibleActivity
+    && (
+      visibleActivity.kind !== 'idle'
+      || visibleActivity.goal
+      || visibleActivity.connection
+      || visibleActivity.thinking
+      || visibleActivity.current
+      || visibleActivity.step
+      || visibleActivity.task_list
+    )
+  );
+  const liveActivitySourceKey = liveActivityVisible
+    ? [
+        sessionId,
+        'activity',
+        sessionMeta?.turn_generation
+          || visibleActivity.turn_id
+          || visibleActivity.started_at
+          || visibleActivity.goal?.fingerprint
+          || 'current',
+      ].join('\u0000')
+    : '';
+  const rateLimitSourceKey = rateLimitVisible
+    ? [
+        sessionId,
+        'rate-limit',
+        visibleActivity.rate_limited_until,
+      ].join('\u0000')
+    : '';
+  useLayoutEffect(() => {
+    updatePaneLifecycle(previous => {
+      const withPrompt = synchronizeAuthoritativePane(previous, {
+        session_id: sessionId,
+        pane_id: 'native-action',
+        source_key: nativeActionSourceKey,
+        attention_count: nativeActionSourceKey ? 1 : 0,
+        compact: true,
+        payload: nativeActionSourceKey ? { blocking: true } : null,
+      });
+      const withRateLimit = synchronizeAuthoritativePane(withPrompt, {
+        session_id: sessionId,
+        pane_id: 'rate-limit',
+        source_key: rateLimitSourceKey,
+        attention_count: 0,
+        payload: rateLimitSourceKey ? { until: visibleActivity?.rate_limited_until } : null,
+      });
+      return synchronizeAuthoritativePane(withRateLimit, {
+        session_id: sessionId,
+        pane_id: 'live-activity',
+        source_key: liveActivitySourceKey,
+        payload: liveActivitySourceKey ? { kind: visibleActivity?.kind || 'activity' } : null,
+      });
+    });
+  }, [
+    visibleActivity?.kind,
+    visibleActivity?.rate_limited_until,
+    liveActivitySourceKey,
+    nativeActionSourceKey,
+    rateLimitSourceKey,
+    sessionId,
+    updatePaneLifecycle,
+  ]);
   const computedTitleProjection = useMemo(() => resolveSessionChatTitleProjection(
     sessionMeta,
     sessionMeta?.custom_display_name || '',
@@ -201,6 +435,9 @@ export default function ChatScreen({ route, navigation }) {
     ? liveTitleState.projection
     : routeTitleProjection(title);
   const liveChatTitle = liveTitleProjection.title;
+  const displayedChatTitle = threadViewDetached && threadView?.title
+    ? threadView.title
+    : liveChatTitle;
 
   const clientRef       = useRef(null);
   const stateSequenceGateRef = useRef(createStateSequenceGate());
@@ -215,11 +452,11 @@ export default function ChatScreen({ route, navigation }) {
   const deliveryStageTimers = useRef({});
   const deliveryRecords = useRef({});
   const deliveryStatesRef = useRef({});
+  const deliveryAttemptsRef = useRef({});
   const isAtBottom      = useRef(true);
   const seenSequences   = useRef(new Set(messages.map(message => message?.sequence).filter(sequence => sequence != null)));
   const messagesSessionIdRef = useRef(sessionId);
   const pendingMsgId    = useRef(null);   // { _id, _text } of in-flight message
-  const failedMsgRef    = useRef(null);   // mirrors failedMsg state for use in callbacks
   const messageQueue    = useRef([]);     // offline queue: [{ text, clientMsgId }], max 5
   const scrollMetrics   = useRef({ contentHeight: 0, layoutHeight: 0, offsetY: 0 });
   const configRetryRef  = useRef(null);
@@ -229,6 +466,10 @@ export default function ChatScreen({ route, navigation }) {
   const historyRequestTimerRef = useRef(null);
   const historyRetryTimerRef = useRef(null);
   const historyRequestStateRef = useRef(null);
+  const threadViewRef = useRef(threadView);
+  const pendingThreadSwitchRef = useRef(null);
+  const pendingThreadViewRevealRef = useRef(null);
+  const threadSwitchTimerRef = useRef(null);
   const searchMessageIdRef = useRef(Number.isSafeInteger(Number(searchMessageId)) ? Number(searchMessageId) : null);
   const provisionalStreamRef = useRef(null);
   const provisionalFrameRef = useRef(null);
@@ -236,11 +477,15 @@ export default function ChatScreen({ route, navigation }) {
   const interruptPendingRef = useRef('');
   const goalControlPendingRef = useRef('');
   const pendingGoalSlashControlRef = useRef(null);
+  const latencyTraceScheduledIdsRef = useRef(new Set());
+  const latencyTraceCompletedIdsRef = useRef(new Set());
+  const latencyTraceFrameIdsRef = useRef(new Set());
   messagesValueRef.current = messages;
   composerDraftRef.current = input;
   routeParamsRef.current = route.params;
   routeSessionRef.current = routeSession;
   sessionMetaRef.current = sessionMeta;
+  threadViewRef.current = threadView;
 
   function publishProvisionalStream(stream) {
     provisionalStreamRef.current = stream;
@@ -294,44 +539,102 @@ export default function ChatScreen({ route, navigation }) {
     }));
   }, [sessionId, title, computedTitleProjection]);
 
-  // Keep ref in sync with state for use inside memoized callbacks
-  function updateFailedMsg(val) {
-    failedMsgRef.current = val;
-    setFailedMsg(val);
-  }
-
   function clearDeliveryStageTimeout(clientMsgId) {
     const timer = deliveryStageTimers.current[clientMsgId];
     if (timer) clearTimeout(timer);
     delete deliveryStageTimers.current[clientMsgId];
   }
 
-  function setTrackedDeliveryState(clientMsgId, state) {
-    if (!clientMsgId) return;
+  function setTrackedDeliveryState(clientMsgId, state, { force = false } = {}) {
+    if (!clientMsgId) return false;
+    const current = deliveryStatesRef.current[clientMsgId];
+    if (!shouldAdvanceDeliveryState(current, state, force)) return false;
     deliveryStatesRef.current[clientMsgId] = state;
     setDeliveryStates(prev => ({ ...prev, [clientMsgId]: state }));
+    return true;
   }
 
-  function failDelivery(clientMsgId, reason) {
+  function publishThreadView(nextValue) {
+    const next = typeof nextValue === 'function'
+      ? nextValue(threadViewRef.current)
+      : nextValue;
+    threadViewRef.current = next;
+    setThreadView(next);
+    return next;
+  }
+
+  function clearThreadSwitchState() {
+    clearTimeout(threadSwitchTimerRef.current);
+    threadSwitchTimerRef.current = null;
+    pendingThreadSwitchRef.current = null;
+  }
+
+  function cancelHistoryChunkRequest() {
+    clearTimeout(historyRequestTimerRef.current);
+    clearTimeout(historyRetryTimerRef.current);
+    historyRequestTimerRef.current = null;
+    historyRetryTimerRef.current = null;
+    historyRequestStateRef.current = null;
+    historyLoadingRef.current = false;
+    setHistoryLoadingOlder(false);
+    setHistoryRefreshing(false);
+  }
+
+  function failDelivery(clientMsgId, reason, metadata = {}) {
     if (!clientMsgId) return;
-    if (deliveryStatesRef.current[clientMsgId] === 'agent_started') return;
-    const record = deliveryRecords.current[clientMsgId];
+    const attempt = acceptDeliveryAttempt(
+      deliveryAttemptsRef.current,
+      clientMsgId,
+      metadata.delivery_attempt,
+      { allowMissingCurrent: metadata.network !== true },
+    );
+    if (!attempt.accepted) return;
+    if (!setTrackedDeliveryState(clientMsgId, 'failed', { force: attempt.advanced })) return;
     clearDeliveryStageTimeout(clientMsgId);
     delete deliveryRecords.current[clientMsgId];
-    setTrackedDeliveryState(clientMsgId, 'failed');
-    setMessages(prev => prev.map(item => item._cid === clientMsgId
-      ? { ...item, _sendError: reason || 'Send failed' }
+    setMessages(prev => prev.map(item => clientMessageIdOf(item) === clientMsgId
+      ? normalizeDeliveryMessage({
+          ...item,
+          status: 'failed',
+          _cid: clientMsgId,
+          _deliveryAttempt: attempt.attempt,
+          _sendError: reason || 'Send failed',
+          failure_code: metadata.failure_code ?? item.failure_code ?? null,
+          failure_reason: reason || metadata.failure_reason || item.failure_reason || 'Send failed',
+          failure_native_attempted: metadata.failure_native_attempted ?? item.failure_native_attempted ?? null,
+          failure_retryable: metadata.failure_retryable ?? item.failure_retryable ?? null,
+        })
       : item));
-    if (record) updateFailedMsg({
-      sessionId,
-      text: record.text,
-      clientMsgId,
-      reason: reason || 'Send failed',
-    });
     if (pendingMsgId.current?._id === clientMsgId) {
       clearTimeout(sendTimer.current);
       setSendPending(false);
       pendingMsgId.current = null;
+    }
+  }
+
+  function reconcileHistoricalDeliveryStates(rows) {
+    let next = deliveryStatesRef.current;
+    let changed = false;
+    (Array.isArray(rows) ? rows : []).forEach(message => {
+      const clientMsgId = clientMessageIdOf(message);
+      const state = deliveryStateOf(message);
+      if (!clientMsgId || !state) return;
+      const attempt = acceptDeliveryAttempt(
+        deliveryAttemptsRef.current,
+        clientMsgId,
+        message,
+        { allowMissingCurrent: true },
+      );
+      if (!attempt.accepted) return;
+      const current = next[clientMsgId];
+      if (!shouldAdvanceDeliveryState(current, state, attempt.advanced)) return;
+      if (!changed) next = { ...next };
+      next[clientMsgId] = state;
+      changed = true;
+    });
+    if (changed) {
+      deliveryStatesRef.current = next;
+      setDeliveryStates(next);
     }
   }
 
@@ -355,10 +658,10 @@ export default function ChatScreen({ route, navigation }) {
 
   // ── Navigation header ───────────────────────────────────────────────────────
 
-  const activityLabel = activity?.label || (activity?.generating ? 'Generating…' : null);
-  const activityKind = String(activity?.kind || '').toLowerCase();
-  const turnActive = activity?.generating === true || ['thinking', 'generating', 'running_command', 'applying_patch', 'reading_files', 'working'].includes(activityKind);
-  const goal = activity?.goal || null;
+  const activityLabel = visibleActivity?.label || (visibleActivity?.generating ? 'Generating…' : null);
+  const activityKind = String(visibleActivity?.kind || '').toLowerCase();
+  const turnActive = visibleActivity?.generating === true || ['thinking', 'generating', 'running_command', 'applying_patch', 'reading_files', 'working'].includes(activityKind);
+  const goal = visibleActivity?.goal || null;
   const goalState = String(goal?.state || goal?.status || '').toLowerCase();
   const goalBlocked = goalState === 'blocked';
   const blockedResumeSupported = goalBlocked && agentConfig?.capabilities?.goal_blocked_resume === true;
@@ -366,7 +669,7 @@ export default function ChatScreen({ route, navigation }) {
     ? 'pause'
     : (goalState === 'paused' || blockedResumeSupported ? 'resume' : null);
   const goalBlockedReason = goalBlocked
-    ? String(goal?.block_reason || goal?.reason || activity?.label || 'Goal blocked').trim()
+    ? String(goal?.block_reason || goal?.reason || visibleActivity?.label || 'Goal blocked').trim()
     : '';
   const canControlGoal = !!(goalAction && goal?.fingerprint && agentConfig?.capabilities?.goal_pause_resume === true
     && Number(sessionMeta?.control_generation) > 0);
@@ -408,12 +711,12 @@ export default function ChatScreen({ route, navigation }) {
       headerTitle: () => (
         <View style={{ alignItems: 'center', maxWidth: 120 }}>
           <Text
-            style={{ color: '#fff', fontSize: 14, fontWeight: '600' }}
+            style={{ color: theme.text, fontSize: 14, fontWeight: '600' }}
             numberOfLines={1}
-            accessibilityLabel={liveChatTitle}
-          >{liveChatTitle}</Text>
+            accessibilityLabel={displayedChatTitle}
+          >{displayedChatTitle}</Text>
           {activityLabel ? (
-            <Text style={{ color: '#58a6ff', fontSize: 10, fontStyle: 'italic' }} numberOfLines={1}>{activityLabel}</Text>
+            <Text style={{ color: theme.accent, fontSize: 10, fontStyle: 'italic' }} numberOfLines={1}>{activityLabel}</Text>
           ) : null}
         </View>
       ),
@@ -431,7 +734,6 @@ export default function ChatScreen({ route, navigation }) {
                 <ProviderMark
                   providerId={usageProjection.providerMarkId}
                   providerName={usageProjection.billingProviderName}
-                  colorScheme="dark"
                 />
               </View>
               <View style={hr.usageRows}>
@@ -446,7 +748,7 @@ export default function ChatScreen({ route, navigation }) {
               </View>
             </TouchableOpacity>
           )}
-          {hasOpenPanel && (
+          {!threadViewDetached && hasOpenPanel && (
             <TouchableOpacity
               onPress={() => clientRef.current?.openPanel(sessionId)}
               style={hr.btn}
@@ -455,7 +757,7 @@ export default function ChatScreen({ route, navigation }) {
               <Text style={hr.btnText}>Panel</Text>
             </TouchableOpacity>
           )}
-          {hasNativeWindow && (
+          {!threadViewDetached && hasNativeWindow && (
             <TouchableOpacity
               onPress={event => clientRef.current?.openNativeWindow(sessionId, !!event?.nativeEvent)}
               style={hr.btn}
@@ -479,7 +781,7 @@ export default function ChatScreen({ route, navigation }) {
               <Text style={hr.btnText}>Threads</Text>
             </TouchableOpacity>
           )}
-          {hasTerminal && (
+          {!threadViewDetached && hasTerminal && (
             <TouchableOpacity
               onPress={() => {
                 setTerminalOpen(true);
@@ -492,7 +794,7 @@ export default function ChatScreen({ route, navigation }) {
               <Text style={hr.btnText}>Term</Text>
             </TouchableOpacity>
           )}
-          {hasFileChanges && (
+          {!threadViewDetached && hasFileChanges && (
             <TouchableOpacity
               onPress={() => {
                 setDiffOpen(true);
@@ -505,7 +807,7 @@ export default function ChatScreen({ route, navigation }) {
               <Text style={hr.btnText}>Diff</Text>
             </TouchableOpacity>
           )}
-          {hasFileBrowser && (
+          {!threadViewDetached && hasFileBrowser && (
             <TouchableOpacity
               onPress={() => {
                 setFileBrowserOpen(true);
@@ -522,7 +824,7 @@ export default function ChatScreen({ route, navigation }) {
               <Text style={hr.btnText}>Files</Text>
             </TouchableOpacity>
           )}
-          {hasChatList && (
+          {!threadViewDetached && hasChatList && (
             <TouchableOpacity
               onPress={() => {
                 setChatListOpen(true);
@@ -535,7 +837,7 @@ export default function ChatScreen({ route, navigation }) {
               <Text style={hr.btnText}>Chats</Text>
             </TouchableOpacity>
           )}
-          {agentConfig?.capabilities?.branch_list && agentConfig?.branch && agentConfig.branch !== 'unknown' && (
+          {!threadViewDetached && agentConfig?.capabilities?.branch_list && agentConfig?.branch && agentConfig.branch !== 'unknown' && (
             <TouchableOpacity
               onPress={() => {
                 setBranchOpen(true);
@@ -548,18 +850,45 @@ export default function ChatScreen({ route, navigation }) {
               <Text style={hr.btnText}>⑂ {agentConfig.branch.length > 10 ? agentConfig.branch.substring(0, 10) + '…' : agentConfig.branch}</Text>
             </TouchableOpacity>
           )}
-          <TouchableOpacity
+          {!threadViewDetached && <TouchableOpacity
             onPress={() => setSettingsOpen(true)}
             style={hr.btn}
             activeOpacity={0.7}
           >
             <Text style={hr.gearText}>⚙</Text>
-          </TouchableOpacity>
+          </TouchableOpacity>}
         </View>
       ),
     });
-  }, [navigation, sessionId, liveChatTitle, agentType, agentConfig, activityLabel, usageProjection, usageHeaderRows,
-    canControlGoal, canInterrupt, goalAction, goal, sessionMeta, goalControlPending, interruptPending]);
+  }, [navigation, sessionId, displayedChatTitle, agentType, agentConfig, activityLabel, usageProjection, usageHeaderRows,
+    canControlGoal, canInterrupt, goalAction, goal, sessionMeta, goalControlPending, interruptPending, theme, threadViewDetached]);
+
+  const scheduleLatencyTraceAfterRender = useCallback((trace) => {
+    const traceId = String(trace?.trace_id || '');
+    if (!traceId
+        || latencyTraceScheduledIdsRef.current.has(traceId)
+        || latencyTraceCompletedIdsRef.current.has(traceId)) return false;
+    latencyTraceScheduledIdsRef.current.add(traceId);
+    const firstFrame = requestAnimationFrame(() => {
+      latencyTraceFrameIdsRef.current.delete(firstFrame);
+      const secondFrame = requestAnimationFrame(() => {
+        latencyTraceFrameIdsRef.current.delete(secondFrame);
+        latencyTraceScheduledIdsRef.current.delete(traceId);
+        const completed = completeAndroidLatencyTrace(
+          trace,
+          Date.now(),
+          clientRef.current?.getRelayClockEstimate(),
+        );
+        if (!completed || latencyTraceCompletedIdsRef.current.has(traceId)) return;
+        latencyTraceCompletedIdsRef.current.add(traceId);
+        retainAndroidLatencyCompletion(completed);
+        clientRef.current?.completeLatencyTrace(completed);
+      });
+      latencyTraceFrameIdsRef.current.add(secondFrame);
+    });
+    latencyTraceFrameIdsRef.current.add(firstFrame);
+    return true;
+  }, []);
 
   // ── Message handler ─────────────────────────────────────────────────────────
 
@@ -621,20 +950,17 @@ export default function ChatScreen({ route, navigation }) {
           console.log('[ChatScreen] Config retry for', sessionId);
           clientRef.current?.requestAgentConfig(sessionId);
         }, 3000);
-        // Retry failed message
-        if (failedMsgRef.current && failedMsgRef.current.sessionId === sessionId) {
-          const { text, clientMsgId } = failedMsgRef.current;
-          updateFailedMsg(null);
-          doSend(text, clientMsgId);
-        }
         // Flush offline queue
-        if (messageQueue.current.length > 0) {
+        if (
+          !(threadViewRef.current?.view_state && threadViewRef.current.view_state !== 'native_active')
+          && messageQueue.current.length > 0
+        ) {
           const queued = [...messageQueue.current];
           messageQueue.current = [];
           // Remove queued placeholders from messages
           setMessages(prev => prev.filter(m => !m._queued));
           for (const item of queued) {
-            doSend(item.text, item.clientMsgId, item.createdAt);
+            doSend(item.text, item.clientMsgId, item.createdAt, { retryFailed: item.retryFailed === true });
           }
         }
         break;
@@ -651,7 +977,10 @@ export default function ChatScreen({ route, navigation }) {
         // Mark pending send as failed
         if (pendingMsgId.current) {
           const failedPending = pendingMsgId.current;
-          failDelivery(failedPending._id, 'Connection lost before the relay confirmed delivery.');
+          failDelivery(failedPending._id, 'Connection lost before the relay confirmed delivery.', {
+            network: true,
+            delivery_attempt: deliveryAttemptsRef.current[failedPending._id] || undefined,
+          });
         }
         if (msg.reason === 'unauthenticated') {
           signOut().then(() => navigation.replace('Login'));
@@ -695,45 +1024,56 @@ export default function ChatScreen({ route, navigation }) {
       case 'message_delta': {
         const sid = msg.session_id || msg.session;
         if (sid !== sessionId) break;
+        if (threadViewRef.current?.view_state && threadViewRef.current.view_state !== 'native_active') break;
         const reduced = reduceMessageDeltaStream(provisionalStreamRef.current, msg);
         if (reduced.accepted) publishProvisionalStream(reduced.stream);
+        if (msg.latency_trace) scheduleLatencyTraceAfterRender(msg.latency_trace);
         break;
       }
+
+      case 'proxy_message': {
+        const sid = msg.session_id || msg.session;
+        if (threadViewRef.current?.view_state && threadViewRef.current.view_state !== 'native_active') break;
+        if (sid === sessionId && msg.role === 'assistant' && msg.latency_trace) {
+          scheduleLatencyTraceAfterRender(msg.latency_trace);
+        }
+        break;
+      }
+
+      case 'latency_trace_terminal':
+        retainAndroidLatencyTerminal(msg.latency_trace_terminal);
+        break;
 
       case 'transcript_resync_required': {
         const sid = msg.session_id || msg.session;
         if (sid !== sessionId) break;
+        if (threadViewRef.current?.view_state && threadViewRef.current.view_state !== 'native_active') break;
         historyLoadingRef.current = false;
         clearTimeout(historyRequestTimerRef.current);
         clearTimeout(historyRetryTimerRef.current);
         historyRequestStateRef.current = null;
-        requestHistoryChunkWithState({
-          mode: 'tail',
-          limit: HISTORY_PAGE_SIZE,
-          replace: true,
-          source: nativeHistorySource(),
-        });
+        requestHistoryTail({ replace: true });
         break;
       }
 
       case 'history': {
         if (msg.session !== sessionId) break;
-        const msgs = normalizeTranscriptTimestamps((msg.messages || []).filter(m => {
-          if (seenSequences.current.has(m.sequence)) return false;
-          seenSequences.current.add(m.sequence);
-          return true;
-        }));
+        if (threadViewRef.current?.view_state && threadViewRef.current.view_state !== 'native_active') break;
+        const msgs = normalizeTranscriptTimestamps((msg.messages || []).map(normalizeDeliveryMessage));
+        reconcileHistoricalDeliveryStates(msgs);
         setMessages(prev => mergeSorted([...prev, ...msgs]));
+        seenSequences.current = new Set(
+          mergeSorted([...messagesValueRef.current, ...msgs])
+            .map(message => message?.sequence)
+            .filter(sequence => sequence != null),
+        );
         break;
       }
 
       case 'message': {
         if (msg.session !== sessionId) break;
+        if (threadViewRef.current?.view_state && threadViewRef.current.view_state !== 'native_active') break;
         if (msg.role === 'assistant') clearProvisionalStream();
-        if (msg.sequence != null) {
-          if (seenSequences.current.has(msg.sequence)) break;
-          seenSequences.current.add(msg.sequence);
-        }
         const clientMsgId = msg.client_message_id || msg.client_msg_id || null;
         const nativeDelivered = msg.status === 'delivered' || msg.status === 'agent_started';
         const matchesPending = msg.role === 'user' && pendingMsgId.current &&
@@ -745,38 +1085,44 @@ export default function ChatScreen({ route, navigation }) {
           setSendPending(false);
           pendingMsgId.current = null;
         }
-        setMessages(prev => {
-          const withoutOptimisticEcho = msg.role === 'user'
-            ? prev.filter(item => !(item._optimistic && (
-                (matchedClientMsgId && item._cid === matchedClientMsgId) ||
-                (matchesPending && item.content === msg.content)
-              )))
-            : prev;
-          const previousOptimistic = matchesPending
-            ? prev.find(item => item._optimistic && (
-                (matchedClientMsgId && item._cid === matchedClientMsgId)
-                || item.content === msg.content
-              ))
-            : null;
-          return mergeSorted([...withoutOptimisticEcho, normalizeMessageTimestamp({
-            ...previousOptimistic,
+        setMessages(prev => mergeSorted([...prev, normalizeDeliveryMessage(normalizeMessageTimestamp({
             ...msg,
             ...(msg.role === 'user' ? {
-              _delivered: previousOptimistic?._delivered || nativeDelivered,
-              _agentStarted: previousOptimistic?._agentStarted || msg.status === 'agent_started',
+              _delivered: nativeDelivered,
+              _agentStarted: msg.status === 'agent_started',
               ...(matchedClientMsgId ? { _cid: matchedClientMsgId, _optimistic: true } : {}),
             } : {}),
-          })]);
-        });
+          }))]));
+        if (msg.sequence != null) seenSequences.current.add(msg.sequence);
+        if (msg.role === 'assistant' && msg.latency_trace) {
+          scheduleLatencyTraceAfterRender(msg.latency_trace);
+        }
         break;
       }
 
       case 'history_chunk': {
         const sid = msg.session_id || msg.session;
         if (sid !== sessionId) break;
+        const responseSource = msg.source || 'relay_sqlite';
+        const responseThreadId = String(msg.thread_id || '');
+        const selectedView = threadViewRef.current;
+        if (responseSource === 'codex_desktop_jsonl') {
+          if (
+            selectedView?.view_state !== 'archive'
+            || !responseThreadId
+            || responseThreadId !== String(selectedView.thread_id || '')
+          ) break;
+        } else if (selectedView?.view_state && selectedView.view_state !== 'native_active') {
+          break;
+        }
+        const requestState = historyRequestStateRef.current || {};
+        if (
+          msg.request_id
+          && requestState.requestId
+          && msg.request_id !== requestState.requestId
+        ) break;
         if (msg.error && (!msg.messages || msg.messages.length === 0)) {
           const errorCode = String(msg.error?.code || '');
-          const requestState = historyRequestStateRef.current || {};
           const retryAttempt = Number(requestState.retryAttempt || 0);
           clearTimeout(historyRequestTimerRef.current);
           if (RECOVERABLE_HISTORY_CHUNK_CODES.has(errorCode) && retryAttempt < MAX_HISTORY_CHUNK_RETRIES) {
@@ -795,6 +1141,17 @@ export default function ChatScreen({ route, navigation }) {
           setHistoryLoadingOlder(false);
           setHistoryRefreshing(false);
           setHistoryError(msg.error?.message || msg.error || 'Transcript history could not be loaded.');
+          if (responseSource === 'codex_desktop_jsonl' && msg.view_state === 'unavailable') {
+            publishThreadView(previous => ({
+              ...(previous || {}),
+              view_state: 'unavailable',
+              read_only: true,
+              retryable: true,
+              completed_at: Date.now(),
+              pollability: msg.pollability || previous?.pollability || null,
+              message: String(msg.error?.message || msg.error || 'Open this chat in Codex Desktop once, then retry.'),
+            }));
+          }
           break;
         }
         historyLoadingRef.current = false;
@@ -802,17 +1159,19 @@ export default function ChatScreen({ route, navigation }) {
         clearTimeout(historyRetryTimerRef.current);
         setHistoryLoadingOlder(false);
         setHistoryRefreshing(false);
+        historyRequestStateRef.current = null;
         const authoritativeReplace = msg.mode === 'around' || (msg.mode === 'tail' && msg.replace === true);
-        const rawIncoming = normalizeTranscriptTimestamps(Array.isArray(msg.messages) ? msg.messages : []);
-        const incoming = authoritativeReplace ? rawIncoming : rawIncoming.filter(message => {
-          if (message.sequence == null) return true;
-          if (seenSequences.current.has(message.sequence)) return false;
-          seenSequences.current.add(message.sequence);
-          return true;
-        });
+        const rawIncoming = normalizeTranscriptTimestamps(
+          (Array.isArray(msg.messages) ? msg.messages : []).map(normalizeDeliveryMessage),
+        );
+        const incoming = rawIncoming;
+        reconcileHistoricalDeliveryStates(incoming);
         if (authoritativeReplace) {
           setMessages(previous => {
-            const merged = mergeSorted([...incoming, ...previous]);
+            const merged = responseSource === 'codex_desktop_jsonl'
+              ? mergeSorted(incoming)
+              : mergeSorted([...incoming, ...previous]);
+            messagesValueRef.current = merged;
             seenSequences.current = new Set(merged.map(message => message?.sequence).filter(sequence => sequence != null));
             return merged;
           });
@@ -828,11 +1187,18 @@ export default function ChatScreen({ route, navigation }) {
           }
           searchMessageIdRef.current = null;
         } else {
-          setMessages(prev => mergeSorted([...prev, ...incoming]));
+          setMessages(prev => {
+            const merged = mergeSorted([...prev, ...incoming]);
+            messagesValueRef.current = merged;
+            return merged;
+          });
         }
+        const nextBeforeOffset = msg.cursor?.next_before_offset ?? null;
         const nextBeforeId = msg.cursor?.next_before_id ?? null;
-        setHistoryCursor(nextBeforeId);
-        setHasOlderHistory(!!msg.partial && nextBeforeId != null);
+        setHistoryCursor(nextBeforeOffset != null || nextBeforeId != null
+          ? { beforeOffset: nextBeforeOffset, beforeId: nextBeforeId }
+          : null);
+        setHasOlderHistory(!!msg.partial && (nextBeforeOffset != null || nextBeforeId != null));
         setHistoryError(null);
         break;
       }
@@ -877,15 +1243,19 @@ export default function ChatScreen({ route, navigation }) {
       }
 
       case 'permission_prompt': {
-        notePromptForAttentionFeedback(msg, sessionId).catch(() => {});
         if ((msg.session_id || msg.session) !== sessionId) break;
+        if (!(threadViewRef.current?.view_state && threadViewRef.current.view_state !== 'native_active')) {
+          notePromptForAttentionFeedback(msg, sessionId).catch(() => {});
+        }
         setPermPrompt({ ...msg, received_at: Date.now() });
         break;
       }
 
       case 'question_prompt': {
-        notePromptForAttentionFeedback(msg, sessionId).catch(() => {});
         if ((msg.session_id || msg.session) !== sessionId) break;
+        if (!(threadViewRef.current?.view_state && threadViewRef.current.view_state !== 'native_active')) {
+          notePromptForAttentionFeedback(msg, sessionId).catch(() => {});
+        }
         setPermPrompt(prev => {
           const samePrompt = prev?.prompt_id === msg.prompt_id && prev?.generation === msg.generation;
           return {
@@ -1001,7 +1371,10 @@ export default function ChatScreen({ route, navigation }) {
           || (msg.open_prompts || []).find(prompt => (prompt.session_id || prompt.session) === sessionId);
         const openError = (msg.open_error_prompts || [])
           .find(prompt => (prompt.session_id || prompt.session) === sessionId);
-        if (openPermission) rememberPromptForAttentionFeedback(openPermission);
+        if (
+          openPermission
+          && !(threadViewRef.current?.view_state && threadViewRef.current.view_state !== 'native_active')
+        ) rememberPromptForAttentionFeedback(openPermission);
         setPermPrompt(previous => {
           if (openPermission) {
             const samePrompt = previous?.prompt_id === openPermission.prompt_id
@@ -1046,6 +1419,76 @@ export default function ChatScreen({ route, navigation }) {
         if (sid !== sessionId) break;
         if (msg.request_id) {
           setControlResults(prev => ({ ...prev, [msg.request_id]: { ...msg, received_at: Date.now() } }));
+        }
+        const pendingThreadSwitch = msg.command === 'switch_thread'
+          && msg.request_id
+          && pendingThreadSwitchRef.current?.requestId === msg.request_id
+          ? pendingThreadSwitchRef.current
+          : null;
+        if (pendingThreadSwitch) {
+          clearThreadSwitchState();
+          cancelHistoryChunkRequest();
+          clearProvisionalStream();
+          messagesValueRef.current = [];
+          setMessages([]);
+          setHistoryCursor(null);
+          setHasOlderHistory(false);
+          setHistoryError(null);
+          const details = msg.details && typeof msg.details === 'object' ? msg.details : {};
+          const resolvedThreadId = String(details.thread_id || '');
+          if (msg.result === 'ok' && resolvedThreadId === pendingThreadSwitch.threadId) {
+            const resolvedView = publishThreadView({
+              ...details,
+              thread_id: resolvedThreadId,
+              title: details.title || pendingThreadSwitch.title,
+              view_state: details.view_state || 'unavailable',
+              selection_mode: 'client_local_readonly',
+              started_at: pendingThreadSwitch.startedAt,
+              completed_at: Date.now(),
+            });
+            if (resolvedView.view_state === 'archive') {
+              requestHistoryChunkWithState({
+                mode: 'tail',
+                source: 'codex_desktop_jsonl',
+                threadId: resolvedThreadId,
+                replace: true,
+                limit: HISTORY_PAGE_SIZE,
+              });
+            } else if (resolvedView.view_state === 'native_active') {
+              pendingThreadViewRevealRef.current = null;
+              requestHistoryChunkWithState({
+                mode: 'tail',
+                source: 'relay_sqlite',
+                replace: true,
+                limit: HISTORY_PAGE_SIZE,
+              });
+            } else {
+              pendingThreadViewRevealRef.current = null;
+            }
+          } else if (msg.result === 'ok') {
+            pendingThreadViewRevealRef.current = null;
+            publishThreadView(previous => ({
+              ...(previous || {}),
+              view_state: 'error',
+              retryable: true,
+              completed_at: Date.now(),
+              error_code: 'thread_identity_mismatch',
+              message: 'Codex Desktop returned a different chat identity. Retry without changing the native app.',
+            }));
+          } else {
+            pendingThreadViewRevealRef.current = null;
+            const controlError = typeof msg.error === 'object' && msg.error ? msg.error : {};
+            publishThreadView(previous => ({
+              ...(previous || {}),
+              view_state: 'error',
+              retryable: msg.retryable !== false && controlError.retryable !== false,
+              completed_at: Date.now(),
+              error_code: controlError.code || 'thread_view_failed',
+              native_mutated: false,
+              message: controlError.message || String(msg.error || 'Codex Desktop chat availability could not be resolved.'),
+            }));
+          }
+          clientRef.current?.requestThreadList(sessionId);
         }
         if (['permission_response', 'question_response'].includes(msg.command)) {
           if (msg.result === 'ok') {
@@ -1098,6 +1541,7 @@ export default function ChatScreen({ route, navigation }) {
         }
         if (msg.result === 'ok') {
           clientRef.current?.requestAgentConfig(sessionId);
+          if (msg.command === 'new_thread') clientRef.current?.requestThreadList(sessionId);
         } else if (msg.result === 'failed') {
           // Stop any loading spinners on failure
           const cmd = msg.command;
@@ -1120,6 +1564,8 @@ export default function ChatScreen({ route, navigation }) {
 
       case 'message_accepted': {
         const cid = msg.client_message_id;
+        const sid = msg.session_id || msg.session;
+        if (sid && sid !== sessionId) break;
         const storedStatus = ['accepted', 'delivered', 'agent_started', 'failed'].includes(msg.status)
           ? msg.status
           : 'accepted';
@@ -1127,12 +1573,22 @@ export default function ChatScreen({ route, navigation }) {
           ? 'launch_accepted'
           : storedStatus;
         if (cid && persistedStatus === 'failed') {
-          failDelivery(cid, msg.failure_code || 'Send failed.');
+          failDelivery(cid, msg.failure_reason || msg.failure_code || 'Send failed.', {
+            delivery_attempt: msg.delivery_attempt,
+            failure_code: msg.failure_code,
+            failure_reason: msg.failure_reason,
+            failure_native_attempted: msg.failure_native_attempted,
+            failure_retryable: msg.failure_retryable,
+          });
           break;
         }
-        const current = cid ? deliveryStatesRef.current[cid] : null;
-        if (cid && !['busy_queued', 'steered', 'launch_accepted', 'delivered', 'agent_started'].includes(current)) {
-          setTrackedDeliveryState(cid, persistedStatus);
+        const attempt = acceptDeliveryAttempt(deliveryAttemptsRef.current, cid, msg.delivery_attempt);
+        if (cid && !attempt.accepted) break;
+        if (cid) {
+          const advanced = setTrackedDeliveryState(cid, persistedStatus, {
+            force: attempt.advanced || msg.retry_restarted === true,
+          });
+          if (!advanced) break;
           if (persistedStatus === 'accepted') {
             armDeliveryStageTimeout(cid, 'accepted', 'Relay accepted the message, but native delivery timed out.');
           } else if (persistedStatus === 'launch_accepted') {
@@ -1144,16 +1600,24 @@ export default function ChatScreen({ route, navigation }) {
           }
         }
         if (cid) {
-          setMessages(prev => prev.map(item => item._cid === cid
-            ? normalizeMessageTimestamp({
+          setMessages(prev => prev.map(item => clientMessageIdOf(item) === cid
+            ? normalizeDeliveryMessage(normalizeMessageTimestamp({
                 ...item,
                 ...(msg.created_at != null ? { created_at: msg.created_at } : {}),
                 ...(msg.timestamp != null ? { timestamp: msg.timestamp } : {}),
                 ...(msg.ts != null ? { ts: msg.ts } : {}),
                 ...(msg.launch_accepted_at != null ? { _launchAcceptedAt: msg.launch_accepted_at } : {}),
+                status: persistedStatus === 'launch_accepted' ? 'accepted' : persistedStatus,
+                _cid: cid,
+                _deliveryAttempt: attempt.attempt,
                 _delivered: persistedStatus === 'delivered' || persistedStatus === 'agent_started',
                 _agentStarted: persistedStatus === 'agent_started',
-              })
+                failure_code: null,
+                failure_reason: null,
+                failure_native_attempted: null,
+                failure_retryable: null,
+                _sendError: null,
+              }))
             : item));
         }
         break;
@@ -1163,27 +1627,52 @@ export default function ChatScreen({ route, navigation }) {
       case 'proxy_send_result': {
         const cid = msg.client_message_id;
         if (!cid) break;
+        const sid = msg.session_id || msg.session;
+        if (sid && sid !== sessionId) break;
         if (msg.type === 'proxy_send_result' && msg.result === 'failed') {
-          failDelivery(cid, msg.reason || msg.message || msg.error?.message || 'The desktop proxy rejected the message.');
+          failDelivery(cid, msg.reason || msg.message || msg.error?.message || 'The desktop proxy rejected the message.', {
+            delivery_attempt: msg.delivery_attempt,
+            failure_code: msg.failure_code || msg.error?.code,
+            failure_reason: msg.failure_reason || msg.error?.message,
+            failure_native_attempted: msg.failure_native_attempted ?? msg.error?.native_attempted,
+            failure_retryable: msg.failure_retryable ?? msg.error?.retryable,
+          });
           break;
         }
+        const attempt = acceptDeliveryAttempt(deliveryAttemptsRef.current, cid, msg.delivery_attempt);
+        if (!attempt.accepted) break;
         if (msg.type === 'proxy_send_result' && msg.result === 'launch_accepted') {
-          if (!['delivered', 'agent_started'].includes(deliveryStatesRef.current[cid])) {
-            setTrackedDeliveryState(cid, 'launch_accepted');
+          if (setTrackedDeliveryState(cid, 'launch_accepted', { force: attempt.advanced })) {
             armDeliveryStageTimeout(cid, 'launch_accepted', 'The native launch was accepted, but no native user turn was observed.');
-            setMessages(prev => prev.map(item => item._cid === cid
-              ? { ...item, _launchAcceptedAt: msg.accepted_at || new Date().toISOString() }
+            setMessages(prev => prev.map(item => clientMessageIdOf(item) === cid
+              ? normalizeDeliveryMessage({
+                  ...item,
+                  status: 'accepted',
+                  _cid: cid,
+                  _deliveryAttempt: attempt.attempt,
+                  _launchAcceptedAt: msg.accepted_at || new Date().toISOString(),
+                  _sendError: null,
+                })
               : item));
           }
           break;
         }
         if (msg.type === 'proxy_send_result' && msg.result !== 'delivered') break;
-        if (deliveryStatesRef.current[cid] !== 'agent_started') {
-          setTrackedDeliveryState(cid, 'delivered');
-          armDeliveryStageTimeout(cid, 'delivered', 'Message reached the agent, but agent activity did not start in time.');
-        }
-        setMessages(prev => prev.map(item => item._cid === cid
-          ? { ...item, _delivered: true }
+        if (!setTrackedDeliveryState(cid, 'delivered', { force: attempt.advanced })) break;
+        armDeliveryStageTimeout(cid, 'delivered', 'Message reached the agent, but agent activity did not start in time.');
+        setMessages(prev => prev.map(item => clientMessageIdOf(item) === cid
+          ? normalizeDeliveryMessage({
+              ...item,
+              status: 'delivered',
+              _cid: cid,
+              _deliveryAttempt: attempt.attempt,
+              _delivered: true,
+              failure_code: null,
+              failure_reason: null,
+              failure_native_attempted: null,
+              failure_retryable: null,
+              _sendError: null,
+            })
           : item));
         if (pendingMsgId.current?._id === cid) {
           clearTimeout(sendTimer.current);
@@ -1197,13 +1686,28 @@ export default function ChatScreen({ route, navigation }) {
         const cid = msg.client_message_id;
         if (!cid) break;
         const sid = msg.session_id || msg.session;
+        if (sid && sid !== sessionId) break;
+        const attempt = acceptDeliveryAttempt(deliveryAttemptsRef.current, cid, msg.delivery_attempt);
+        if (!attempt.accepted) break;
         if (!sid || sid === sessionId) {
           publishProvisionalStream(createProvisionalStream(sessionId, cid));
         }
         completeDelivery(cid);
-        setTrackedDeliveryState(cid, 'agent_started');
-        setMessages(prev => prev.map(item => item._cid === cid
-          ? { ...item, _delivered: true, _agentStarted: true }
+        setTrackedDeliveryState(cid, 'agent_started', { force: attempt.advanced });
+        setMessages(prev => prev.map(item => clientMessageIdOf(item) === cid
+          ? normalizeDeliveryMessage({
+              ...item,
+              status: 'agent_started',
+              _cid: cid,
+              _deliveryAttempt: attempt.attempt,
+              _delivered: true,
+              _agentStarted: true,
+              failure_code: null,
+              failure_reason: null,
+              failure_native_attempted: null,
+              failure_retryable: null,
+              _sendError: null,
+            })
           : item));
         break;
       }
@@ -1211,8 +1715,16 @@ export default function ChatScreen({ route, navigation }) {
       case 'message_failed': {
         const cid = msg.client_message_id;
         if (!cid) break;
+        const sid = msg.session_id || msg.session;
+        if (sid && sid !== sessionId) break;
         clearProvisionalStream();
-        failDelivery(cid, msg.reason || msg.message || msg.error?.message || 'Send failed.');
+        failDelivery(cid, msg.reason || msg.message || msg.error?.message || 'Send failed.', {
+          delivery_attempt: msg.delivery_attempt,
+          failure_code: msg.failure_code || msg.error?.code,
+          failure_reason: msg.failure_reason || msg.error?.message,
+          failure_native_attempted: msg.failure_native_attempted ?? msg.error?.native_attempted,
+          failure_retryable: msg.failure_retryable ?? msg.error?.retryable,
+        });
         break;
       }
 
@@ -1338,6 +1850,85 @@ export default function ChatScreen({ route, navigation }) {
           const activeThread = threads.find(item => item?.active);
           if (activeThread?.title) mergeSessionMetadata({ native_chat_title: activeThread.title });
           setThreadListLoading(false);
+          const localView = threadViewRef.current;
+          if (localView && localView.view_state !== 'loading') {
+            const selectedThread = threads.find(thread => (
+              String(thread?.id || '') === String(localView.thread_id || '')
+              || String(thread?.cache_key || '') === String(localView.thread_id || '')
+            ));
+            if (!selectedThread) {
+              publishThreadView({
+                ...localView,
+                view_state: 'unavailable',
+                read_only: true,
+                retryable: true,
+                completed_at: Date.now(),
+                message: 'This chat is no longer in the current Codex Desktop inventory. Refresh the list and retry.',
+              });
+            } else if (selectedThread.active && localView.view_state !== 'native_active') {
+              cancelHistoryChunkRequest();
+              clearProvisionalStream();
+              messagesValueRef.current = [];
+              setMessages([]);
+              setHistoryCursor(null);
+              setHasOlderHistory(false);
+              publishThreadView({
+                ...localView,
+                thread_id: String(selectedThread.id || localView.thread_id),
+                title: selectedThread.title || localView.title,
+                view_state: 'native_active',
+                history_source: 'relay_sqlite',
+                read_only: false,
+                retryable: false,
+                pollability: selectedThread.pollability || localView.pollability,
+                completed_at: Date.now(),
+                message: 'Showing the natively active Codex Desktop chat.',
+              });
+              requestHistoryChunkWithState({
+                mode: 'tail',
+                source: 'relay_sqlite',
+                replace: true,
+                limit: HISTORY_PAGE_SIZE,
+              });
+            } else if (!selectedThread.active && selectedThread.view_state !== localView.view_state) {
+              const nextViewState = selectedThread.view_state === 'archive' ? 'archive' : 'unavailable';
+              cancelHistoryChunkRequest();
+              clearProvisionalStream();
+              messagesValueRef.current = [];
+              setMessages([]);
+              setHistoryCursor(null);
+              setHasOlderHistory(false);
+              publishThreadView({
+                ...localView,
+                thread_id: String(selectedThread.id || localView.thread_id),
+                title: selectedThread.title || localView.title,
+                view_state: nextViewState,
+                history_source: nextViewState === 'archive' ? 'codex_desktop_jsonl' : null,
+                read_only: true,
+                retryable: nextViewState === 'unavailable',
+                pollability: selectedThread.pollability || localView.pollability,
+                completed_at: Date.now(),
+                message: nextViewState === 'archive'
+                  ? 'Showing the immutable native archive. This chat is read-only until it is active in Codex Desktop.'
+                  : (selectedThread.pollability?.required_action || 'Open this chat in Codex Desktop once, then retry.'),
+              });
+              if (nextViewState === 'archive') {
+                requestHistoryChunkWithState({
+                  mode: 'tail',
+                  source: 'codex_desktop_jsonl',
+                  threadId: String(selectedThread.id || localView.thread_id),
+                  replace: true,
+                  limit: HISTORY_PAGE_SIZE,
+                });
+              }
+            } else {
+              publishThreadView({
+                ...localView,
+                title: selectedThread.title || localView.title,
+                pollability: selectedThread.pollability || localView.pollability,
+              });
+            }
+          }
         }
         break;
       }
@@ -1373,21 +1964,24 @@ export default function ChatScreen({ route, navigation }) {
       default:
         break;
     }
-  }, [sessionId, navigation, mergeSessionMetadata]);
+  }, [sessionId, agentType, navigation, mergeSessionMetadata, scheduleLatencyTraceAfterRender]);
 
   // ── Connect on mount ────────────────────────────────────────────────────────
 
   useEffect(() => {
+    clearThreadSwitchState();
+    pendingThreadViewRevealRef.current = null;
+    publishThreadView(null);
     clearTimeout(sendTimer.current);
     Object.values(deliveryStageTimers.current).forEach(timer => clearTimeout(timer));
     deliveryStageTimers.current = {};
     deliveryRecords.current = {};
     deliveryStatesRef.current = {};
+    deliveryAttemptsRef.current = {};
     pendingMsgId.current = null;
     setSendPending(false);
     setDeliveryStates({});
     setControlResults({});
-    updateFailedMsg(null);
     clearProvisionalStream();
     const cached = getCachedTranscript(sessionId) || [];
     messagesSessionIdRef.current = sessionId;
@@ -1398,6 +1992,8 @@ export default function ChatScreen({ route, navigation }) {
     setHistoryLoadingOlder(false);
     setHistoryRefreshing(false);
     setHistoryError(null);
+    prevMsgCount.current = 0;
+    historyLoaded.current = false;
     historyLoadingRef.current = false;
     historyUserScrolledRef.current = false;
     searchMessageIdRef.current = Number.isSafeInteger(Number(searchMessageId)) ? Number(searchMessageId) : null;
@@ -1405,10 +2001,13 @@ export default function ChatScreen({ route, navigation }) {
     clearTimeout(historyRequestTimerRef.current);
     clearTimeout(historyRetryTimerRef.current);
     historyRequestStateRef.current = null;
+    latencyTraceScheduledIdsRef.current.clear();
+    latencyTraceCompletedIdsRef.current.clear();
   }, [sessionId, searchMessageId]);
 
   useEffect(() => {
     if (messagesSessionIdRef.current !== sessionId) return;
+    if (threadViewRef.current?.view_state && threadViewRef.current.view_state !== 'native_active') return;
     setCachedTranscript(sessionId, messages);
   }, [sessionId, messages]);
 
@@ -1428,23 +2027,40 @@ export default function ChatScreen({ route, navigation }) {
       clearTimeout(configRetryRef.current);
       clearTimeout(historyRequestTimerRef.current);
       clearTimeout(historyRetryTimerRef.current);
+      clearTimeout(threadSwitchTimerRef.current);
+      threadSwitchTimerRef.current = null;
+      pendingThreadSwitchRef.current = null;
       if (provisionalFrameRef.current != null) cancelAnimationFrame(provisionalFrameRef.current);
       provisionalFrameRef.current = null;
       provisionalPendingRef.current = null;
+      for (const frameId of latencyTraceFrameIdsRef.current) cancelAnimationFrame(frameId);
+      latencyTraceFrameIdsRef.current.clear();
+      latencyTraceScheduledIdsRef.current.clear();
     };
   }, [handleMessage]);
 
   // Restore and persist a separate composer draft for every session.
   useEffect(() => {
     let active = true;
+    const key = `${DRAFT_STORAGE_PREFIX}${sessionId}`;
+    const inputAtHydrationStart = composerDraftRef.current;
     draftLoadedRef.current = false;
     AsyncStorage.getItem(`${DRAFT_STORAGE_PREFIX}${sessionId}`)
       .then(value => {
-        if (active) setInput(value || '');
+        if (!active) return;
+        setInput(current => {
+          const next = reconcileHydratedComposerDraft(current, inputAtHydrationStart, value);
+          composerDraftRef.current = next;
+          return next;
+        });
       })
       .catch(() => {})
       .finally(() => {
-        if (active) draftLoadedRef.current = true;
+        if (!active) return;
+        draftLoadedRef.current = true;
+        const current = composerDraftRef.current;
+        const persist = current ? AsyncStorage.setItem(key, current) : AsyncStorage.removeItem(key);
+        persist.catch(() => {});
       });
     return () => { active = false; };
   }, [sessionId]);
@@ -1471,10 +2087,12 @@ export default function ChatScreen({ route, navigation }) {
     // Don't count initial history load as "new" messages
     if (!historyLoaded.current) {
       historyLoaded.current = true;
+      if (threadViewDetached) return;
       setTimeout(() => flatListRef.current?.scrollToEnd({ animated: false }), 50);
       return;
     }
 
+    if (threadViewDetached) return;
     if (isAtBottom.current) {
       setUnreadCount(0);
       setShowJumpBtn(false);
@@ -1483,24 +2101,38 @@ export default function ChatScreen({ route, navigation }) {
       setUnreadCount(prev => prev + newCount);
       setShowJumpBtn(true);
     }
-  }, [messages]);
+  }, [messages, threadViewDetached]);
 
   // ── Send message ────────────────────────────────────────────────────────────
 
-  function doSend(text, clientMsgId, originalCreatedAt = null) {
+  function doSend(text, clientMsgId, originalCreatedAt = null, options = {}) {
     const id = clientMsgId || `${Date.now()}-${Math.random().toString(36).slice(2)}`;
-    const retryMessage = messages.find(item => item._cid === id);
+    const retryMessage = messagesValueRef.current.find(item => clientMessageIdOf(item) === id);
     const createdAt = parseMessageInstant(originalCreatedAt)?.iso
       || messageInstant(retryMessage)?.iso
       || new Date().toISOString();
     clearDeliveryStageTimeout(id);
-    deliveryRecords.current[id] = { text, stage: 'queued' };
+    deliveryRecords.current[id] = { text, stage: 'queued', retryFailed: options.retryFailed === true };
     pendingMsgId.current = { _id: id, _text: text };
     setSendPending(true);
-    setTrackedDeliveryState(id, 'queued');
-    setMessages(prev => prev.some(item => item._cid === id)
-      ? prev.map(item => item._cid === id
-        ? { ...item, content: text, _optimistic: true, _queued: false, _delivered: false, _agentStarted: false, _sendError: null }
+    setTrackedDeliveryState(id, 'queued', { force: options.retryFailed === true });
+    setMessages(prev => prev.some(item => clientMessageIdOf(item) === id)
+      ? prev.map(item => clientMessageIdOf(item) === id
+        ? normalizeDeliveryMessage({
+            ...item,
+            content: text,
+            _cid: id,
+            _optimistic: true,
+            status: 'local',
+            _queued: false,
+            _delivered: false,
+            _agentStarted: false,
+            _sendError: null,
+            failure_code: null,
+            failure_reason: null,
+            failure_native_attempted: null,
+            failure_retryable: null,
+          })
         : item)
       : [...prev, normalizeMessageTimestamp({
           role: 'user',
@@ -1509,8 +2141,20 @@ export default function ChatScreen({ route, navigation }) {
           _optimistic: true,
           created_at: createdAt,
         })]);
-    updateFailedMsg(null);
-    clientRef.current.sendMessage(sessionId, text, id, createdAt);
+    const latencyTrace = createAndroidLatencyTrace(
+      id,
+      sessionMetaRef.current?.agent_type || agentType,
+      Date.now(),
+      clientRef.current?.getRelayClockEstimate(),
+    );
+    clientRef.current.sendMessage(
+      sessionId,
+      text,
+      id,
+      createdAt,
+      latencyTrace,
+      { retryFailed: options.retryFailed === true },
+    );
     armDeliveryStageTimeout(id, 'queued', 'Timed out waiting for relay acceptance.');
 
     // Bound the composer while the stage-specific lifecycle timer owns the retry state.
@@ -1579,6 +2223,7 @@ export default function ChatScreen({ route, navigation }) {
   }
 
   async function handleSend() {
+    if (threadViewRef.current?.view_state && threadViewRef.current.view_state !== 'native_active') return;
     const text = input.trim();
     if (!text && !attachment) return;
     if (writeCapabilityGate) {
@@ -1724,10 +2369,44 @@ export default function ChatScreen({ route, navigation }) {
     setSlashMenuDismissed(true);
   }
 
-  function handleRetry() {
-    if (!failedMsg || !clientRef.current) return;
-    const { text, clientMsgId } = failedMsg;
-    doSend(text, clientMsgId);
+  function handleMessageRetry(message) {
+    if (threadViewRef.current?.view_state && threadViewRef.current.view_state !== 'native_active') return;
+    if (!message || !clientRef.current) return;
+    const clientMsgId = clientMessageIdOf(message);
+    if (!clientMsgId) return;
+    const retrySafetyKnown = message.failure_retryable != null || message.failure_native_attempted != null;
+    const canRetry = (message.failure_retryable === true && message.failure_native_attempted === false)
+      || (message._optimistic && !retrySafetyKnown);
+    if (!canRetry) return;
+    const text = String(message.content || '');
+    const createdAt = messageInstant(message)?.iso || new Date().toISOString();
+    if (!connected || sendPending) {
+      if (messageQueue.current.length >= 5) {
+        Alert.alert('Retry queue full', 'Reconnect or wait for another pending message to finish.');
+        return;
+      }
+      messageQueue.current = [
+        ...messageQueue.current.filter(item => item.clientMsgId !== clientMsgId),
+        { text, clientMsgId, createdAt, retryFailed: true },
+      ];
+      setTrackedDeliveryState(clientMsgId, connected ? 'busy_queued' : 'offline_queued', { force: true });
+      setMessages(prev => prev.map(item => clientMessageIdOf(item) === clientMsgId
+        ? normalizeDeliveryMessage({
+            ...item,
+            _cid: clientMsgId,
+            _optimistic: true,
+            status: 'local',
+            _queued: true,
+            _sendError: null,
+            failure_code: null,
+            failure_reason: null,
+            failure_native_attempted: null,
+            failure_retryable: null,
+          })
+        : item));
+      return;
+    }
+    doSend(text, clientMsgId, createdAt, { retryFailed: true });
   }
 
   function handlePermChoice(promptId, choiceId, details = {}) {
@@ -1829,11 +2508,15 @@ export default function ChatScreen({ route, navigation }) {
 
   function loadOlderHistory() {
     if (!hasOlderHistory || historyLoadingRef.current || historyCursor == null || !connected) return;
+    const profile = historyProfile();
+    if (!profile) return;
     requestHistoryChunkWithState({
       mode: 'older',
-      beforeId: historyCursor,
+      beforeOffset: historyCursor.beforeOffset,
+      beforeId: historyCursor.beforeId,
       limit: HISTORY_PAGE_SIZE,
-      source: nativeHistorySource(),
+      source: profile.source,
+      threadId: profile.threadId,
       userInitiated: true,
     });
   }
@@ -1843,15 +2526,32 @@ export default function ChatScreen({ route, navigation }) {
     requestHistoryTail();
   }
 
-  function requestHistoryTail() {
+  function requestHistoryTail(overrides = {}) {
+    const profile = historyProfile();
+    if (!profile) return null;
     const aroundId = searchMessageIdRef.current;
-    requestHistoryChunkWithState(aroundId
+    return requestHistoryChunkWithState(aroundId && profile.source !== 'codex_desktop_jsonl'
       ? { mode: 'around', aroundId, limit: HISTORY_PAGE_SIZE, source: 'relay_sqlite' }
-      : { mode: 'tail', limit: HISTORY_PAGE_SIZE, source: nativeHistorySource() });
+      : {
+          mode: 'tail',
+          limit: HISTORY_PAGE_SIZE,
+          source: profile.source,
+          threadId: profile.threadId,
+          ...overrides,
+        });
   }
 
-  function nativeHistorySource() {
-    return agentType === 'codex_cli' || agentType === 'cursor_cli' ? 'native' : 'relay_sqlite';
+  function historyProfile() {
+    const selectedView = threadViewRef.current;
+    if (agentType === 'codex-desktop' && selectedView?.view_state === 'archive') {
+      const threadId = String(selectedView.thread_id || '');
+      return threadId ? { source: 'codex_desktop_jsonl', threadId } : null;
+    }
+    if (selectedView?.view_state && selectedView.view_state !== 'native_active') return null;
+    return {
+      source: agentType === 'codex_cli' || agentType === 'cursor_cli' ? 'native' : 'relay_sqlite',
+      threadId: null,
+    };
   }
 
   function requestHistoryChunkWithState(options, retryAttempt = 0) {
@@ -1864,6 +2564,95 @@ export default function ChatScreen({ route, navigation }) {
     const requestId = clientRef.current.requestHistoryChunk(sessionId, requestOptions);
     historyRequestStateRef.current = { requestId, options: requestOptions, retryAttempt };
     armHistoryTimeout();
+    return requestId;
+  }
+
+  function selectDesktopThread(threadId) {
+    const requestedThreadId = String(threadId || '');
+    if (!requestedThreadId || !clientRef.current) return null;
+    const selectedThread = threadList.find(thread => (
+      String(thread?.id || '') === requestedThreadId
+      || String(thread?.cache_key || '') === requestedThreadId
+    ));
+    if (agentType !== 'codex-desktop') {
+      pendingThreadViewRevealRef.current = null;
+      cancelHistoryChunkRequest();
+      clearProvisionalStream();
+      messagesValueRef.current = [];
+      setMessages([]);
+      setHistoryCursor(null);
+      setHasOlderHistory(false);
+      prevMsgCount.current = 0;
+      historyLoaded.current = false;
+      return clientRef.current.switchThread(sessionId, requestedThreadId);
+    }
+
+    clearThreadSwitchState();
+    cancelHistoryChunkRequest();
+    clearProvisionalStream();
+    messagesValueRef.current = [];
+    setMessages([]);
+    setHistoryCursor(null);
+    setHasOlderHistory(false);
+    setHistoryError(null);
+    prevMsgCount.current = 0;
+    historyLoaded.current = false;
+    const startedAt = Date.now();
+    const localRequestId = `swthread-local-${startedAt}-${Math.random().toString(36).slice(2, 7)}`;
+    pendingThreadViewRevealRef.current = {
+      sessionId,
+      threadId: requestedThreadId,
+      token: localRequestId,
+    };
+    publishThreadView({
+      thread_id: requestedThreadId,
+      title: selectedThread?.title || 'Codex Desktop chat',
+      view_state: 'loading',
+      selection_mode: 'client_local_readonly',
+      selection_budget_ms: THREAD_VIEW_SELECTION_TIMEOUT_MS,
+      started_at: startedAt,
+      deadline_at: startedAt + THREAD_VIEW_SELECTION_TIMEOUT_MS,
+      read_only: true,
+      retryable: false,
+      pollability: selectedThread?.pollability || null,
+      message: 'Checking this Codex Desktop chat without changing the native app.',
+    });
+    if (!connected) {
+      pendingThreadViewRevealRef.current = null;
+      publishThreadView(previous => ({
+        ...(previous || {}),
+        view_state: 'error',
+        retryable: true,
+        completed_at: Date.now(),
+        message: 'The relay is offline. Reconnect, then retry this chat.',
+      }));
+      return localRequestId;
+    }
+    const requestId = clientRef.current.switchThread(sessionId, requestedThreadId);
+    const pending = {
+      sessionId,
+      threadId: requestedThreadId,
+      title: selectedThread?.title || 'Codex Desktop chat',
+      requestId,
+      startedAt,
+    };
+    pendingThreadSwitchRef.current = pending;
+    threadSwitchTimerRef.current = setTimeout(() => {
+      if (pendingThreadSwitchRef.current?.requestId !== requestId) return;
+      pendingThreadSwitchRef.current = null;
+      threadSwitchTimerRef.current = null;
+      pendingThreadViewRevealRef.current = null;
+      publishThreadView(previous => {
+        if (previous?.thread_id !== requestedThreadId || previous?.view_state !== 'loading') return previous;
+        return {
+          ...previous,
+          view_state: 'error',
+          retryable: true,
+          completed_at: Date.now(),
+          message: 'Codex Desktop chat availability timed out. Retry without changing the native app.',
+        };
+      });
+    }, THREAD_VIEW_SELECTION_TIMEOUT_MS);
     return requestId;
   }
 
@@ -1926,7 +2715,7 @@ export default function ChatScreen({ route, navigation }) {
           </Text>
         </View>
       )}
-      {(canControlGoal || goalBlocked || canInterrupt) && (
+      {!threadViewDetached && (canControlGoal || goalBlocked || canInterrupt) && (
         <View style={s.sessionControlBar} accessibilityLabel="Session controls">
           <View style={s.sessionControlCopy}>
             <Text style={s.sessionControlEyebrow}>TURN CONTROLS</Text>
@@ -1993,6 +2782,44 @@ export default function ChatScreen({ route, navigation }) {
         </View>
       )}
 
+      {threadViewDetached && (
+        <View
+          style={[
+            s.threadViewBanner,
+            threadView?.view_state === 'archive' ? s.threadViewBannerArchive : null,
+            ['error', 'unavailable'].includes(threadView?.view_state) ? s.threadViewBannerUnavailable : null,
+          ]}
+          accessibilityRole={['error', 'unavailable'].includes(threadView?.view_state) ? 'alert' : 'summary'}
+          accessibilityLabel={`Codex Desktop chat ${threadView?.view_state || 'loading'}. ${threadView?.message || ''}`}
+        >
+          <View style={s.threadViewCopy}>
+            <Text style={s.threadViewEyebrow}>
+              {threadView?.view_state === 'archive'
+                ? 'READ-ONLY NATIVE ARCHIVE'
+                : threadView?.view_state === 'loading'
+                  ? 'CHECKING CHAT AVAILABILITY'
+                  : 'CHAT UNAVAILABLE'}
+            </Text>
+            <Text style={s.threadViewMessage}>
+              {threadView?.message || 'This Codex Desktop chat is not the natively active chat.'}
+            </Text>
+            {!!threadView?.pollability?.state && (
+              <Text style={s.threadViewPollability}>{`Pollability: ${threadView.pollability.state}`}</Text>
+            )}
+          </View>
+          {threadView?.retryable && (
+            <TouchableOpacity
+              style={s.threadViewRetry}
+              onPress={() => selectDesktopThread(threadView.thread_id)}
+              accessibilityRole="button"
+              accessibilityLabel="Retry Codex Desktop chat"
+            >
+              <Text style={s.threadViewRetryText}>Retry</Text>
+            </TouchableOpacity>
+          )}
+        </View>
+      )}
+
       <FlatList
         ref={flatListRef}
         data={messages}
@@ -2010,7 +2837,8 @@ export default function ChatScreen({ route, navigation }) {
             <MessageBubble
               message={item}
               agentType={agentType}
-              deliveryState={item._cid ? deliveryStates[item._cid] : null}
+              deliveryState={clientMessageIdOf(item) ? deliveryStates[clientMessageIdOf(item)] : null}
+              onRetry={threadViewDetached ? undefined : handleMessageRetry}
             />
           </View>
         )}
@@ -2039,7 +2867,7 @@ export default function ChatScreen({ route, navigation }) {
             )}
           </View>
         ) : null}
-        ListFooterComponent={provisionalStream ? <ProvisionalBubble stream={provisionalStream} /> : null}
+        ListFooterComponent={visibleProvisionalStream ? <ProvisionalBubble stream={visibleProvisionalStream} /> : null}
         onScroll={e => {
           const { contentOffset, contentSize, layoutMeasurement } = e.nativeEvent;
           scrollMetrics.current = {
@@ -2065,6 +2893,34 @@ export default function ChatScreen({ route, navigation }) {
         }}
         scrollEventThrottle={16}
         onContentSizeChange={() => {
+          if (threadViewDetached) {
+            const pendingReveal = pendingThreadViewRevealRef.current;
+            const currentView = threadViewRef.current;
+            if (
+              pendingReveal
+              && pendingReveal.sessionId === sessionId
+              && pendingReveal.threadId === currentView?.thread_id
+              && currentView?.view_state === 'archive'
+              && messagesValueRef.current.length > 0
+              && pendingReveal.scheduled !== true
+            ) {
+              pendingReveal.scheduled = true;
+              requestAnimationFrame(() => {
+                if (
+                  pendingThreadViewRevealRef.current?.token !== pendingReveal.token
+                  || messagesSessionIdRef.current !== pendingReveal.sessionId
+                  || threadViewRef.current?.thread_id !== pendingReveal.threadId
+                  || threadViewRef.current?.view_state !== 'archive'
+                ) return;
+                pendingThreadViewRevealRef.current = null;
+                flatListRef.current?.scrollToEnd({ animated: false });
+                isAtBottom.current = true;
+                setUnreadCount(0);
+                setShowJumpBtn(false);
+              });
+            }
+            return;
+          }
           // Re-evaluate bottom state when content size changes (new messages)
           const { contentHeight, layoutHeight, offsetY } = scrollMetrics.current;
           if (contentHeight > 0) {
@@ -2075,9 +2931,15 @@ export default function ChatScreen({ route, navigation }) {
             }
           }
         }}
-        ListEmptyComponent={provisionalStream ? null : (
+        ListEmptyComponent={visibleProvisionalStream ? null : (
           <View style={s.emptyList}>
-            <Text style={s.emptyText}>No messages yet</Text>
+            <Text style={s.emptyText}>
+              {threadView?.view_state === 'loading'
+                ? 'Checking chat availability…'
+                : threadViewDetached
+                  ? 'No archived messages are available.'
+                  : 'No messages yet'}
+            </Text>
           </View>
         )}
       />
@@ -2100,21 +2962,77 @@ export default function ChatScreen({ route, navigation }) {
         </TouchableOpacity>
       )}
 
-      <ActivityRow activity={activity} agentType={agentType} />
-      <PermissionPrompt prompt={permPrompt} agentType={agentType} onChoice={handlePermChoice} />
-      <ErrorPrompt
-        prompt={permPrompt ? null : errorPrompt}
-        blocking={errorPromptIsBlocking}
-        onAction={handleErrorPromptAction}
-      />
-
-      {failedMsg && (
-        <TouchableOpacity style={s.failedRow} onPress={handleRetry} activeOpacity={0.7}>
-          <Text style={s.failedText}>{failedMsg.reason || 'Send failed'} — tap to retry</Text>
-        </TouchableOpacity>
+      {rateLimitVisible && (
+        <View
+          style={rateLimitPane.open ? s.paneSurface : s.paneHidden}
+          testID="pane-rate-limit"
+          accessibilityElementsHidden={!rateLimitPane.open}
+        >
+          <TouchableOpacity
+            style={s.paneMinimizeButton}
+            onPress={rateLimitPane.minimize}
+            accessibilityRole="button"
+            accessibilityLabel="Minimize Rate limit"
+            accessibilityState={{ expanded: true }}
+            testID="pane-minimize-rate-limit"
+          >
+            <Text style={s.paneMinimizeButtonText}>Minimize</Text>
+          </TouchableOpacity>
+          <ActivityRow activity={visibleActivity} agentType={agentType} />
+        </View>
+      )}
+      {liveActivityVisible && (
+        <View
+          style={liveActivityPane.open ? s.paneSurface : s.paneHidden}
+          testID="pane-live-activity"
+          accessibilityElementsHidden={!liveActivityPane.open}
+        >
+          <TouchableOpacity
+            style={s.paneMinimizeButton}
+            onPress={liveActivityPane.minimize}
+            accessibilityRole="button"
+            accessibilityLabel="Minimize Live activity"
+            accessibilityState={{ expanded: true }}
+            testID="pane-minimize-live-activity"
+          >
+            <Text style={s.paneMinimizeButtonText}>Minimize</Text>
+          </TouchableOpacity>
+          <ActivityRow activity={visibleActivity} agentType={agentType} />
+        </View>
+      )}
+      {(visiblePermPrompt || errorPromptIsBlocking) && (
+        <View
+          style={nativeActionPane.open ? s.paneSurface : s.paneHidden}
+          testID="pane-native-action"
+          accessibilityElementsHidden={!nativeActionPane.open}
+        >
+          <TouchableOpacity
+            style={[s.paneMinimizeButton, s.paneMinimizeAttention]}
+            onPress={nativeActionPane.minimize}
+            accessibilityRole="button"
+            accessibilityLabel="Minimize Action needed"
+            accessibilityState={{ expanded: true }}
+            testID="pane-minimize-native-action"
+          >
+            <Text style={s.paneMinimizeButtonText}>Minimize</Text>
+          </TouchableOpacity>
+          <PermissionPrompt prompt={visiblePermPrompt} agentType={agentType} onChoice={handlePermChoice} />
+          <ErrorPrompt
+            prompt={visiblePermPrompt ? null : visibleErrorPrompt}
+            blocking={errorPromptIsBlocking}
+            onAction={handleErrorPromptAction}
+          />
+        </View>
+      )}
+      {!visiblePermPrompt && visibleErrorPrompt && !errorPromptIsBlocking && (
+        <ErrorPrompt
+          prompt={visibleErrorPrompt}
+          blocking={false}
+          onAction={handleErrorPromptAction}
+        />
       )}
 
-      {goalCommandNotice && (
+      {!threadViewDetached && goalCommandNotice && (
         <View
           style={[s.goalCommandNotice, s[`goalCommandNotice_${goalCommandNotice.status}`]]}
           accessibilityRole={goalCommandNotice.status === 'failed' ? 'alert' : 'text'}
@@ -2125,14 +3043,14 @@ export default function ChatScreen({ route, navigation }) {
         </View>
       )}
 
-      <QueuedMessageBar
+      {!threadViewDetached && <QueuedMessageBar
         items={queuedMessages}
         onSteer={handleSteerQueued}
         onDiscard={handleDiscardQueued}
         onEdit={handleEditQueued}
-      />
+      />}
 
-      {attachment && (
+      {!threadViewDetached && attachment && (
         <View style={s.attachPreview}>
           {attachment.mimeType?.startsWith('image/') ? (
             <Image source={{ uri: attachment.uri }} style={s.attachThumb} />
@@ -2148,7 +3066,7 @@ export default function ChatScreen({ route, navigation }) {
         </View>
       )}
 
-      {filteredSlashCommands.length > 0 && (
+      {!threadViewDetached && filteredSlashCommands.length > 0 && (
         <View style={s.slashMenu} accessibilityRole="menu">
           {filteredSlashCommands.map(item => (
             <TouchableOpacity
@@ -2165,16 +3083,37 @@ export default function ChatScreen({ route, navigation }) {
         </View>
       )}
 
-      {!!writeCapabilityGate && <View style={s.revalidationGate} accessibilityRole="alert">
-        <Text style={s.revalidationGateTitle}>Harness writes paused</Text>
-        <Text style={s.revalidationGateText}>{writeCapabilityGate}. Read-only transcript access remains available.</Text>
-      </View>}
+      {!threadViewDetached && !!writeCapabilityGate && (
+        <View style={s.revalidationGate} accessibilityRole="alert">
+          <TouchableOpacity
+            style={s.revalidationGateSummary}
+            onPress={() => setWriteGateExpanded(value => !value)}
+            accessibilityRole="button"
+            accessibilityState={{ expanded: writeGateExpanded }}
+            accessibilityLabel={`Harness writes paused. ${writeGateExpanded ? 'Collapse' : 'Expand'} safety gate details`}
+          >
+            <Text style={s.revalidationGateIcon}>!</Text>
+            <Text style={s.revalidationGateTitle} numberOfLines={1}>Harness writes paused</Text>
+            <Text style={s.revalidationGateAction}>{writeGateExpanded ? 'Hide' : 'Details'}</Text>
+          </TouchableOpacity>
+          {writeGateExpanded && (
+            <ScrollView
+              style={[s.revalidationGateDetails, { maxHeight: Math.max(88, Math.min(160, Math.round(windowHeight * 0.24))) }]}
+              nestedScrollEnabled
+              accessibilityLabel="Harness write gate details"
+            >
+              <Text style={s.revalidationGateText}>{writeCapabilityGate}. Read-only transcript access remains available.</Text>
+            </ScrollView>
+          )}
+        </View>
+      )}
+      {!threadViewDetached && <PaneRestoreRail records={minimizedPaneRecords} onRestore={restorePane} />}
       <View style={s.inputRow}>
         <TouchableOpacity
           style={s.attachBtn}
           onPress={showAttachmentPicker}
           activeOpacity={0.7}
-          disabled={uploading || !!writeCapabilityGate}
+          disabled={threadViewDetached || uploading || !!writeCapabilityGate}
         >
           <Text style={s.attachBtnText}>📎</Text>
         </TouchableOpacity>
@@ -2186,24 +3125,24 @@ export default function ChatScreen({ route, navigation }) {
             setInput(value);
             setSlashMenuDismissed(false);
           }}
-          placeholder="Message…"
+          placeholder={threadViewDetached ? 'Archived chat is read-only' : 'Message…'}
           placeholderTextColor="#444c56"
           multiline
           maxLength={4000}
           returnKeyType="default"
-          editable={!writeCapabilityGate}
+          editable={!threadViewDetached && !writeCapabilityGate}
         />
         <TouchableOpacity
-          style={[s.attachBtn, (!input.trim() || !!writeCapabilityGate) && s.sendBtnDisabled]}
+          style={[s.attachBtn, (threadViewDetached || !input.trim() || !!writeCapabilityGate) && s.sendBtnDisabled]}
           onPress={() => setScheduleOpen(true)}
-          disabled={!input.trim() || !!writeCapabilityGate}
+          disabled={threadViewDetached || !input.trim() || !!writeCapabilityGate}
           accessibilityRole="button"
           accessibilityLabel="Schedule message"
         ><Text style={s.attachBtnText}>◷</Text></TouchableOpacity>
         <TouchableOpacity
-          style={[s.sendBtn, (!input.trim() && !attachment || sendPending || uploading || composerBlockedByPrompt || !!writeCapabilityGate) && s.sendBtnDisabled]}
+          style={[s.sendBtn, (threadViewDetached || (!input.trim() && !attachment) || sendPending || uploading || composerBlockedByPrompt || !!writeCapabilityGate) && s.sendBtnDisabled]}
           onPress={handleSend}
-          disabled={(!input.trim() && !attachment) || sendPending || uploading || composerBlockedByPrompt || !!writeCapabilityGate}
+          disabled={threadViewDetached || (!input.trim() && !attachment) || sendPending || uploading || composerBlockedByPrompt || !!writeCapabilityGate}
           activeOpacity={0.7}
         >
           {sendPending || uploading ? (
@@ -2215,8 +3154,9 @@ export default function ChatScreen({ route, navigation }) {
       </View>
 
       <AgentSettingsSheet
-        visible={settingsOpen}
+        visible={!threadViewDetached && settingsOpen}
         onClose={() => setSettingsOpen(false)}
+        onMinimize={settingsPane.minimize}
         agentType={agentType}
         config={agentConfig}
         relay={clientRef.current}
@@ -2228,22 +3168,37 @@ export default function ChatScreen({ route, navigation }) {
       <Modal
         visible={usageDetailsOpen}
         animationType="slide"
-        presentationStyle="pageSheet"
-        onRequestClose={() => setUsageDetailsOpen(false)}
+        transparent
+        presentationStyle="overFullScreen"
+        onRequestClose={usagePane.minimize}
       >
-        <View style={s.sessionUsageModal} testID="session-usage-details" accessibilityViewIsModal>
+        <View style={s.paneModalBackdrop}>
+          <View
+            style={[s.sessionUsageModal, { maxHeight: Math.max(240, Math.round(windowHeight * 0.45)) }]}
+            testID="session-usage-details"
+            accessibilityViewIsModal
+          >
           <View style={s.sessionUsageHeader}>
             <View style={s.sessionUsageProviderHeading}>
               <ProviderMark
                 providerId={usageProjection.providerMarkId}
                 providerName={usageProjection.billingProviderName}
-                colorScheme="dark"
               />
               <View style={s.sessionUsageHeadingCopy}>
                 <Text style={s.sessionUsageTitle}>Session usage</Text>
                 <Text style={s.sessionUsageSubtitle}>{usageProjection.billingProviderName}</Text>
               </View>
             </View>
+            <TouchableOpacity
+              style={s.paneMinimizeButton}
+              onPress={usagePane.minimize}
+              accessibilityRole="button"
+              accessibilityLabel="Minimize Session usage"
+              accessibilityState={{ expanded: true }}
+              testID="pane-minimize-session-usage"
+            >
+              <Text style={s.paneMinimizeButtonText}>Minimize</Text>
+            </TouchableOpacity>
             <TouchableOpacity
               onPress={() => setUsageDetailsOpen(false)}
               accessibilityRole="button"
@@ -2316,7 +3271,11 @@ export default function ChatScreen({ route, navigation }) {
               style={s.sessionUsageOpenDashboard}
               onPress={() => {
                 setUsageDetailsOpen(false);
-                navigation.navigate('SessionList', { openUsageNonce: Date.now() });
+                navigation.push('SessionList', {
+                  openUsageNonce: Date.now(),
+                  returnToChat: true,
+                  returnSessionId: sessionId,
+                });
               }}
               accessibilityRole="button"
               accessibilityLabel="Open Usage and limits"
@@ -2324,18 +3283,20 @@ export default function ChatScreen({ route, navigation }) {
               <Text style={s.sessionUsageOpenDashboardText}>Open Usage &amp; limits</Text>
             </TouchableOpacity>
           </ScrollView>
+          </View>
         </View>
       </Modal>
       <ScheduledSendSheet
-        visible={scheduleOpen}
+        visible={!threadViewDetached && scheduleOpen}
         sessionId={sessionId}
         initialContent={input}
         onCreated={() => setInput('')}
         onClose={() => setScheduleOpen(false)}
+        onMinimize={schedulePane.minimize}
       />
 
       <TerminalViewer
-        visible={terminalOpen}
+        visible={!threadViewDetached && terminalOpen}
         entries={terminalEntries}
         loading={terminalLoading}
         onRefresh={() => {
@@ -2343,13 +3304,14 @@ export default function ChatScreen({ route, navigation }) {
           clientRef.current?.requestTerminalOutput(sessionId);
         }}
         onClose={() => setTerminalOpen(false)}
+        onMinimize={terminalPane.minimize}
         onSendInput={(agentType === 'codex-desktop' || agentType === 'cursor') ? (text) => {
           clientRef.current?.sendTerminalInput(sessionId, text);
         } : undefined}
       />
 
       <DiffViewer
-        visible={diffOpen}
+        visible={!threadViewDetached && diffOpen}
         entries={diffEntries}
         loading={diffLoading}
         onRefresh={() => {
@@ -2359,10 +3321,11 @@ export default function ChatScreen({ route, navigation }) {
         onAccept={(changeId) => clientRef.current?.respondToFileChange(sessionId, changeId, 'accept')}
         onReject={(changeId) => clientRef.current?.respondToFileChange(sessionId, changeId, 'reject')}
         onClose={() => setDiffOpen(false)}
+        onMinimize={diffPane.minimize}
       />
 
       <FileBrowserSheet
-        visible={fileBrowserOpen}
+        visible={!threadViewDetached && fileBrowserOpen}
         listing={directoryListing}
         viewingFile={viewingFile}
         fileContent={fileContent}
@@ -2382,25 +3345,43 @@ export default function ChatScreen({ route, navigation }) {
           setFileContent(null);
           setFileBrowserError(null);
         }}
+        onMinimize={fileBrowserPane.minimize}
       />
 
       <ThreadHistorySheet
         visible={threadListOpen}
         threads={threadList}
         loading={threadListLoading}
+        selectedThreadId={threadView?.thread_id || null}
         onSwitch={(threadId) => {
-          clientRef.current?.switchThread(sessionId, threadId);
+          selectDesktopThread(threadId);
           setThreadListOpen(false);
         }}
         onNew={() => {
-          clientRef.current?.newChat(sessionId);
+          if (agentType === 'codex-desktop') {
+            clearThreadSwitchState();
+            pendingThreadViewRevealRef.current = null;
+            cancelHistoryChunkRequest();
+            clearProvisionalStream();
+            publishThreadView(null);
+            messagesValueRef.current = [];
+            setMessages([]);
+            setHistoryCursor(null);
+            setHasOlderHistory(false);
+            prevMsgCount.current = 0;
+            historyLoaded.current = false;
+            clientRef.current?.newThread?.(sessionId);
+          } else {
+            clientRef.current?.newChat(sessionId);
+          }
           setThreadListOpen(false);
         }}
         onClose={() => setThreadListOpen(false)}
+        onMinimize={threadListPane.minimize}
       />
 
       <ChatListSheet
-        visible={chatListOpen}
+        visible={!threadViewDetached && chatListOpen}
         chats={chatList}
         loading={chatListLoading}
         onSwitch={(chatId) => {
@@ -2412,10 +3393,11 @@ export default function ChatScreen({ route, navigation }) {
           setChatListOpen(false);
         }}
         onClose={() => setChatListOpen(false)}
+        onMinimize={chatListPane.minimize}
       />
 
       <BranchSelectorSheet
-        visible={branchOpen}
+        visible={!threadViewDetached && branchOpen}
         branches={branchList}
         current={branchCurrent || agentConfig?.branch || ''}
         loading={branchLoading}
@@ -2428,6 +3410,7 @@ export default function ChatScreen({ route, navigation }) {
           setBranchOpen(false);
         }}
         onClose={() => setBranchOpen(false)}
+        onMinimize={branchPane.minimize}
       />
     </KeyboardAvoidingView>
   );
@@ -2454,36 +3437,12 @@ function getLang(name) {
 }
 
 function mergeSorted(msgs) {
-  const merged = [];
-  const indexes = new Map();
-  msgs.forEach(m => {
-    const key = m.source_message_id ? `source:${m.source_message_id}`
-      : m.native_source_id ? `native:${m.native_source_id}`
-      : m.id != null ? `id:${m.id}`
-      : m.server_message_id != null ? `server:${m.server_message_id}`
-      : m.sequence != null ? `seq:${m.sequence}`
-      : m._cid ? `client:${m._cid}`
-      : `ts:${messageInstant(m)?.iso || 'unknown'}:${m.role}:${String(m.content)}`;
-    if (!indexes.has(key)) {
-      indexes.set(key, merged.length);
-      merged.push(m);
-      return;
-    }
-    const index = indexes.get(key);
-    const current = merged[index];
-    const currentHasCitation = Array.isArray(current?.content_blocks)
-      && current.content_blocks.some(block => block?.type === 'memory_citation');
-    const incomingHasCitation = Array.isArray(m?.content_blocks)
-      && m.content_blocks.some(block => block?.type === 'memory_citation');
-    if (incomingHasCitation && !currentHasCitation) merged[index] = { ...current, ...m };
-  });
-  return merged
-    .sort((a, b) => (a.sequence ?? 0) - (b.sequence ?? 0));
+  return mergeCanonicalDeliveryMessages(msgs);
 }
 
 // ── Styles ────────────────────────────────────────────────────────────────────
 
-const hr = StyleSheet.create({
+const darkHeaderStyles = StyleSheet.create({
   row:      { flexDirection: 'row', alignItems: 'center' },
   btn:      { marginRight: 4, paddingVertical: 6, paddingHorizontal: 2 },
   btnText:  { color: '#f85149', fontSize: 11, fontWeight: '600' },
@@ -2511,7 +3470,7 @@ const hr = StyleSheet.create({
   usage_unavailable: { borderColor: '#484f58' },
 });
 
-const s = StyleSheet.create({
+const darkStyles = StyleSheet.create({
   container: {
     flex:            1,
     backgroundColor: '#0b0f14',
@@ -2543,7 +3502,79 @@ const s = StyleSheet.create({
   sessionInterruptButton: { borderColor: '#d29922', backgroundColor: '#2d210d' },
   sessionControlButtonDisabled: { opacity: 0.55 },
   sessionControlButtonText: { color: '#f0f6fc', fontSize: 11, fontWeight: '700' },
-  sessionUsageModal: { flex: 1, backgroundColor: '#0b0f14' },
+  paneRestoreRail: {
+    minHeight: 48,
+    maxHeight: 48,
+    borderTopWidth: StyleSheet.hairlineWidth,
+    borderTopColor: '#30363d',
+    backgroundColor: '#10161d',
+  },
+  paneRestoreRailContent: {
+    minHeight: 48,
+    alignItems: 'center',
+    paddingHorizontal: 8,
+    gap: 8,
+  },
+  paneRestoreChip: {
+    minWidth: 44,
+    minHeight: 44,
+    paddingHorizontal: 12,
+    borderWidth: 1,
+    borderColor: '#484f58',
+    borderRadius: 8,
+    backgroundColor: '#161b22',
+    flexDirection: 'row',
+    alignItems: 'center',
+    justifyContent: 'center',
+    gap: 6,
+  },
+  paneRestoreChipAttention: {
+    borderColor: '#d29922',
+    backgroundColor: '#2d210d',
+  },
+  paneRestoreChipText: { color: '#f0f6fc', fontSize: 12, fontWeight: '700' },
+  paneAttentionCount: {
+    color: '#0b0f14',
+    backgroundColor: '#d29922',
+    borderRadius: 9,
+    minWidth: 18,
+    minHeight: 18,
+    textAlign: 'center',
+    fontSize: 11,
+    fontWeight: '800',
+  },
+  paneSurface: { display: 'flex' },
+  paneHidden: { display: 'none' },
+  paneMinimizeButton: {
+    minWidth: 44,
+    minHeight: 44,
+    paddingHorizontal: 10,
+    borderWidth: 1,
+    borderColor: '#484f58',
+    borderRadius: 7,
+    backgroundColor: '#161b22',
+    alignItems: 'center',
+    justifyContent: 'center',
+  },
+  paneMinimizeAttention: {
+    borderColor: '#d29922',
+    backgroundColor: '#2d210d',
+  },
+  paneMinimizeButtonText: { color: '#f0f6fc', fontSize: 11, fontWeight: '700' },
+  paneModalBackdrop: {
+    flex: 1,
+    justifyContent: 'flex-end',
+    backgroundColor: 'rgba(0, 0, 0, 0.35)',
+  },
+  sessionUsageModal: {
+    minHeight: 240,
+    backgroundColor: '#0b0f14',
+    borderTopWidth: 1,
+    borderTopColor: '#30363d',
+    borderTopLeftRadius: 12,
+    borderTopRightRadius: 12,
+    overflow: 'hidden',
+  },
   sessionUsageHeader: {
     minHeight: 68,
     paddingHorizontal: 18,
@@ -2615,6 +3646,62 @@ const s = StyleSheet.create({
   connectionHealthText: {
     color: '#8b949e',
     fontSize: 11,
+  },
+  threadViewBanner: {
+    minHeight: 54,
+    paddingHorizontal: 12,
+    paddingVertical: 9,
+    borderBottomWidth: 1,
+    borderBottomColor: '#d29922',
+    backgroundColor: '#2d210d',
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: 10,
+  },
+  threadViewBannerArchive: {
+    borderBottomColor: '#388bfd',
+    backgroundColor: '#0d2138',
+  },
+  threadViewBannerUnavailable: {
+    borderBottomColor: '#f0883e',
+    backgroundColor: '#321d0b',
+  },
+  threadViewCopy: {
+    flex: 1,
+    minWidth: 0,
+  },
+  threadViewEyebrow: {
+    color: '#f0d49a',
+    fontSize: 9,
+    fontWeight: '800',
+    letterSpacing: 0.6,
+  },
+  threadViewMessage: {
+    color: '#f0f6fc',
+    fontSize: 11,
+    lineHeight: 16,
+    marginTop: 2,
+  },
+  threadViewPollability: {
+    color: '#8b949e',
+    fontSize: 10,
+    marginTop: 3,
+  },
+  threadViewRetry: {
+    minWidth: 58,
+    minHeight: 40,
+    paddingHorizontal: 12,
+    borderWidth: 1,
+    borderColor: '#58a6ff',
+    borderRadius: 8,
+    alignItems: 'center',
+    justifyContent: 'center',
+    backgroundColor: '#0d2138',
+  },
+  threadViewRetryText: {
+    color: '#f0f6fc',
+    fontSize: 12,
+    fontWeight: '700',
   },
   messageList: {
     paddingVertical: 12,
@@ -2703,18 +3790,6 @@ const s = StyleSheet.create({
     fontSize:   12,
     fontWeight:  '600',
   },
-  failedRow: {
-    backgroundColor: '#3d1a1a',
-    borderTopWidth:  1,
-    borderTopColor:  '#f85149',
-    paddingVertical: 8,
-    alignItems:      'center',
-  },
-  failedText: {
-    color:    '#f85149',
-    fontSize: 12,
-    fontWeight: '600',
-  },
   goalCommandNotice: {
     marginHorizontal: 10,
     marginVertical: 4,
@@ -2774,11 +3849,36 @@ const s = StyleSheet.create({
     backgroundColor: '#4b2e0b',
     borderTopWidth: 1,
     borderTopColor: '#d29922',
+  },
+  revalidationGateSummary: {
+    minHeight: 44,
+    maxHeight: 44,
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: 8,
+    paddingHorizontal: 12,
+  },
+  revalidationGateIcon: {
+    width: 18,
+    height: 18,
+    borderRadius: 9,
+    overflow: 'hidden',
+    textAlign: 'center',
+    textAlignVertical: 'center',
+    color: '#4b2e0b',
+    backgroundColor: '#f0d49a',
+    fontSize: 12,
+    fontWeight: '800',
+  },
+  revalidationGateTitle: { flex: 1, minWidth: 0, color: '#f0d49a', fontSize: 12, fontWeight: '700' },
+  revalidationGateAction: { color: '#f0d49a', fontSize: 11, fontWeight: '700' },
+  revalidationGateDetails: {
+    borderTopWidth: 1,
+    borderTopColor: '#805d28',
     paddingHorizontal: 12,
     paddingVertical: 8,
   },
-  revalidationGateTitle: { color: '#f0d49a', fontSize: 12, fontWeight: '700' },
-  revalidationGateText: { color: '#f0d49a', fontSize: 11, lineHeight: 16, marginTop: 2 },
+  revalidationGateText: { color: '#f0d49a', fontSize: 11, lineHeight: 16 },
   inputRow: {
     flexDirection:   'row',
     alignItems:      'flex-end',

@@ -3,18 +3,29 @@ import {
   View, Text, Modal, TouchableOpacity, TouchableWithoutFeedback,
   ScrollView, StyleSheet, ActivityIndicator,
 } from 'react-native';
+import { useThemedStyles } from '../lib/theme';
 
 // ── ThreadHistorySheet (Epic 2) ─────────────────────────────────────────────
 // Bottom sheet showing Codex Desktop thread history with switch/new actions.
 // Same visual style as ChatListSheet.
 
-export default function ThreadHistorySheet({ visible, threads, onSwitch, onNew, onClose, loading }) {
+export default function ThreadHistorySheet({
+  visible,
+  threads,
+  selectedThreadId,
+  onSwitch,
+  onNew,
+  onClose,
+  onMinimize,
+  loading,
+}) {
+  const s = useThemedStyles(darkStyles);
   return (
     <Modal
       visible={visible}
       transparent
       animationType="slide"
-      onRequestClose={onClose}
+      onRequestClose={onMinimize || onClose}
     >
       <TouchableWithoutFeedback onPress={onClose}>
         <View style={s.backdrop} />
@@ -22,9 +33,20 @@ export default function ThreadHistorySheet({ visible, threads, onSwitch, onNew, 
 
       <View style={s.sheet}>
         <View style={s.header}>
-          <Text style={s.title}>Threads</Text>
+          <Text style={s.title}>Codex Desktop chats</Text>
           <TouchableOpacity onPress={onNew} style={s.newBtn} activeOpacity={0.7}>
             <Text style={s.newBtnText}>+ New</Text>
+          </TouchableOpacity>
+          <TouchableOpacity
+            onPress={onMinimize || onClose}
+            style={s.minimizeBtn}
+            activeOpacity={0.7}
+            accessibilityRole="button"
+            accessibilityLabel="Minimize Threads"
+            accessibilityState={{ expanded: true }}
+            testID="pane-minimize-thread-list"
+          >
+            <Text style={s.minimizeBtnText}>Minimize</Text>
           </TouchableOpacity>
           <TouchableOpacity onPress={onClose} style={s.closeBtn} activeOpacity={0.7}>
             <Text style={s.closeBtnText}>✕</Text>
@@ -43,25 +65,59 @@ export default function ThreadHistorySheet({ visible, threads, onSwitch, onNew, 
             <Text style={s.emptyText}>No threads found</Text>
           )}
 
-          {(threads || []).map((thread, i) => (
-            <TouchableOpacity
-              key={thread.id || `thread-${i}`}
-              style={[s.threadItem, thread.active && s.threadItemActive]}
-              onPress={() => onSwitch(thread.id)}
-              activeOpacity={0.7}
-            >
-              <Text style={s.threadTitle} numberOfLines={2}>{thread.title}</Text>
-              {thread.age ? <Text style={s.ageLabel}>{thread.age}</Text> : null}
-              {thread.active && <Text style={s.activeDot}>●</Text>}
-            </TouchableOpacity>
-          ))}
+          {(threads || []).map((thread, i) => {
+            const threadId = String(thread.id || thread.cache_key || '');
+            const selected = !!threadId && threadId === String(selectedThreadId || '');
+            const viewState = thread.active
+              ? 'native_active'
+              : (thread.view_state || (thread.loadable ? 'archive' : 'unavailable'));
+            const stateLabel = viewState === 'native_active'
+              ? 'Native active'
+              : viewState === 'archive'
+                ? 'Archive'
+                : 'Unavailable';
+            return (
+              <TouchableOpacity
+                key={threadId || `thread-${i}`}
+                style={[
+                  s.threadItem,
+                  thread.active && s.threadItemActive,
+                  selected && s.threadItemSelected,
+                ]}
+                onPress={() => onSwitch(threadId)}
+                activeOpacity={0.7}
+                accessibilityRole="button"
+                accessibilityState={{ selected }}
+                accessibilityLabel={`${thread.title || 'Untitled chat'}. ${stateLabel}${selected ? '. Selected' : ''}`}
+                testID={`desktop-thread-${threadId || i}`}
+              >
+                <View style={s.threadCopy}>
+                  <Text style={s.threadTitle} numberOfLines={2}>{thread.title || 'Untitled chat'}</Text>
+                  <View style={s.threadMetadata}>
+                    <Text style={[
+                      s.stateLabel,
+                      viewState === 'native_active' && s.stateLabelActive,
+                      viewState === 'archive' && s.stateLabelArchive,
+                      viewState === 'unavailable' && s.stateLabelUnavailable,
+                    ]}>{stateLabel}</Text>
+                    {selected && <Text style={s.selectedLabel}>Selected</Text>}
+                    {!!thread.pollability?.state && (
+                      <Text style={s.pollabilityLabel}>{thread.pollability.state}</Text>
+                    )}
+                  </View>
+                </View>
+                {thread.age ? <Text style={s.ageLabel}>{thread.age}</Text> : null}
+                {thread.active && <Text style={s.activeDot}>●</Text>}
+              </TouchableOpacity>
+            );
+          })}
         </ScrollView>
       </View>
     </Modal>
   );
 }
 
-const s = StyleSheet.create({
+const darkStyles = StyleSheet.create({
   backdrop: {
     flex: 1,
     backgroundColor: 'rgba(0,0,0,0.5)',
@@ -70,16 +126,16 @@ const s = StyleSheet.create({
     backgroundColor: '#1a1a2e',
     borderTopLeftRadius: 16,
     borderTopRightRadius: 16,
-    maxHeight: '60%',
+    maxHeight: '45%',
     paddingBottom: 20,
   },
   header: {
     flexDirection: 'row',
     alignItems: 'center',
-    paddingHorizontal: 16,
-    paddingVertical: 12,
+    minHeight: 52,
+    paddingHorizontal: 8,
     borderBottomWidth: 1,
-    borderBottomColor: '#333',
+    borderBottomColor: '#30363d',
   },
   title: {
     flex: 1,
@@ -90,20 +146,36 @@ const s = StyleSheet.create({
     textTransform: 'uppercase',
   },
   newBtn: {
+    minHeight: 44,
     paddingHorizontal: 12,
-    paddingVertical: 6,
-    backgroundColor: '#10a37f22',
+    backgroundColor: '#123b2a',
     borderRadius: 6,
-    marginRight: 8,
+    marginRight: 4,
+    alignItems: 'center',
+    justifyContent: 'center',
   },
   newBtnText: {
-    color: '#10a37f',
+    color: '#3fb950',
     fontSize: 13,
     fontWeight: '600',
   },
-  closeBtn: {
+  minimizeBtn: {
+    minWidth: 44,
+    minHeight: 44,
     paddingHorizontal: 8,
-    paddingVertical: 4,
+    borderWidth: 1,
+    borderColor: '#484f58',
+    borderRadius: 7,
+    marginRight: 4,
+    alignItems: 'center',
+    justifyContent: 'center',
+  },
+  minimizeBtnText: { color: '#f0f6fc', fontSize: 10, fontWeight: '700' },
+  closeBtn: {
+    minWidth: 44,
+    minHeight: 44,
+    alignItems: 'center',
+    justifyContent: 'center',
   },
   closeBtnText: {
     color: '#888',
@@ -143,7 +215,15 @@ const s = StyleSheet.create({
   },
   threadItemActive: {
     backgroundColor: '#ffffff08',
-    borderLeftColor: '#10a37f',
+    borderLeftColor: '#3fb950',
+  },
+  threadItemSelected: {
+    backgroundColor: '#0d2138',
+    borderLeftColor: '#58a6ff',
+  },
+  threadCopy: {
+    flex: 1,
+    minWidth: 0,
   },
   threadTitle: {
     flex: 1,
@@ -151,13 +231,43 @@ const s = StyleSheet.create({
     fontSize: 14,
   },
   ageLabel: {
-    color: '#666',
+    color: '#8b949e',
     fontSize: 11,
     marginLeft: 8,
   },
   activeDot: {
-    color: '#10a37f',
+    color: '#3fb950',
     fontSize: 10,
     marginLeft: 8,
+  },
+  threadMetadata: {
+    flexDirection: 'row',
+    flexWrap: 'wrap',
+    alignItems: 'center',
+    gap: 6,
+    marginTop: 5,
+  },
+  stateLabel: {
+    color: '#8b949e',
+    fontSize: 10,
+    fontWeight: '700',
+    textTransform: 'uppercase',
+  },
+  stateLabelActive: { color: '#3fb950' },
+  stateLabelArchive: { color: '#58a6ff' },
+  stateLabelUnavailable: { color: '#f0883e' },
+  selectedLabel: {
+    color: '#f0f6fc',
+    backgroundColor: '#1f3b5b',
+    borderRadius: 8,
+    paddingHorizontal: 6,
+    paddingVertical: 1,
+    fontSize: 9,
+    fontWeight: '700',
+    textTransform: 'uppercase',
+  },
+  pollabilityLabel: {
+    color: '#8b949e',
+    fontSize: 10,
   },
 });

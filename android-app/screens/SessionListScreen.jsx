@@ -9,6 +9,11 @@ import Svg, { Circle, Line, Path, Rect } from 'react-native-svg';
 import { useFocusEffect } from '@react-navigation/native';
 import AsyncStorage from '@react-native-async-storage/async-storage';
 import { RelayClient }   from '../lib/relay';
+import {
+  advanceSessionHydration,
+  createSessionHydrationState,
+  sessionHydrationPresentation,
+} from '../lib/session-hydration';
 import { createStateSequenceGate } from '../lib/state-sequence';
 import { mergeGoalProjectedActivity } from '../lib/goal-projection';
 import {
@@ -42,6 +47,7 @@ import { processSemanticNotification } from '../lib/semantic-notifications';
 import { AgentIcon } from '../components/AgentIcons';
 import ProviderMark from '../components/ProviderMark';
 import { useReducedMotion } from '../lib/reduced-motion';
+import { useThemedStyles } from '../lib/theme';
 import SessionHistorySheet from '../components/SessionHistorySheet';
 import LaunchSessionSheet from '../components/LaunchSessionSheet';
 import SessionPreferencesSheet from '../components/SessionPreferencesSheet';
@@ -63,6 +69,7 @@ import {
   MAX_BROADCAST_CONTENT_CHARS,
   MAX_BROADCAST_SESSIONS,
   normalizeBroadcastRequest,
+  retainEligibleBroadcastSelection,
   sessionSupportsBroadcast,
 } from '../lib/broadcast-send-policy';
 import {
@@ -154,6 +161,52 @@ function compactUsageTokens(value) {
   return String(numeric);
 }
 
+function providerSourceStatusLabel(lifecycle, unavailableLabel = 'Unavailable') {
+  return ({
+    loading: 'Loading',
+    fresh: 'Fresh',
+    stale: 'Stale',
+    auth_required: 'Sign in required',
+    unavailable: unavailableLabel,
+    error: 'Needs attention',
+  })[lifecycle?.status] || unavailableLabel;
+}
+
+function providerSourceAgeLabel(lifecycle, nowMs) {
+  const timestamp = lifecycle?.capturedAt || lifecycle?.lastGoodAt || lifecycle?.attemptedAt;
+  if (!timestamp) return 'Not yet observed';
+  const prefix = lifecycle?.status === 'stale' ? 'Last good' : lifecycle?.capturedAt ? 'Observed' : 'Last attempt';
+  return `${prefix} ${formatProviderUsageAge(timestamp, nowMs).replace(/^Updated /, '').toLowerCase()}`;
+}
+
+function providerSourceTone(lifecycle) {
+  return lifecycle?.status === 'fresh' ? '#3fb950'
+    : lifecycle?.status === 'stale' ? '#d29922'
+      : ['auth_required', 'error'].includes(lifecycle?.status) ? '#f85149' : '#58a6ff';
+}
+
+function providerCloudDiagnosticLabel(lifecycle) {
+  const diagnostic = lifecycle?.diagnostic;
+  if (!diagnostic) return '';
+  const ports = diagnostic.effectivePorts || [];
+  const attempts = diagnostic.attempts || [];
+  const reachable = attempts.filter(attempt => attempt.reachable).length;
+  if (ports.length === 0) return 'No owned browser endpoint configured';
+  return `Owned browser ${ports.join(', ')} - ${reachable}/${ports.length} reachable`;
+}
+
+function providerCloudRecoveryLabel(lifecycle) {
+  return ({
+    start_owned_cloud_source: 'Start owned browser',
+    sign_in_owned_cloud_source: 'Retry after sign-in',
+    configure_owned_cloud_source: 'Retry cloud',
+  })[lifecycle?.nextAction] || 'Retry cloud';
+}
+
+function providerSourceCount(value) {
+  return value == null ? 'Unknown' : value;
+}
+
 function clampHostResourceViewport(viewport) {
   const width = Math.max(0.04, Math.min(1, Number(viewport?.end) - Number(viewport?.start) || 1));
   const start = Math.max(0, Math.min(1 - width, Number(viewport?.start) || 0));
@@ -179,6 +232,7 @@ function HostResourceChart({
   crosshairSequence, onCrosshairChange, range = 'live', nowMs = Date.now(), paused = false,
   subscriptionStatus = 'live',
 }) {
+  const s = useThemedStyles(darkStyles);
   const [width, setWidth] = useState(340);
   const [hiddenSeries, setHiddenSeries] = useState({});
   const [scale, setScale] = useState({ mode: 'auto', fixedMax: null });
@@ -499,6 +553,7 @@ function migrateSessionList(previous, aliasId, canonicalId) {
 }
 
 export default function SessionListScreen({ navigation, route }) {
+  const s = useThemedStyles(darkStyles);
   const reducedMotion = useReducedMotion();
   const [sessionRegistry, setSessionRegistry] = useState(() => createSessionRegistry());
   const sessions = sessionRegistry.list;
@@ -512,6 +567,11 @@ export default function SessionListScreen({ navigation, route }) {
   const [connected,   setConnected]   = useState(false);
   const [connectionHealth, setConnectionHealth] = useState({ state: 'connecting', rttMs: null });
   const [loading,     setLoading]     = useState(true);
+  const [sessionHydration, setSessionHydration] = useState(() => createSessionHydrationState());
+  const hydrationPresentation = useMemo(
+    () => sessionHydrationPresentation(sessionHydration),
+    [sessionHydration],
+  );
   const [searchQuery,   setSearchQuery]   = useState('');
   const [reconnectInfo, setReconnectInfo] = useState(null); // { attempt, nextRetryMs }
   const [jwtDaysLeft,   setJwtDaysLeft]   = useState(null); // days until JWT expiry
@@ -545,6 +605,12 @@ export default function SessionListScreen({ navigation, route }) {
   const [estimatedCostProject, setEstimatedCostProject] = useState('');
   const [collapsedProviderUsage, setCollapsedProviderUsage] = useState({});
   const [showUsageDashboard, setShowUsageDashboard] = useState(false);
+  const closeUsageDashboard = useCallback(() => {
+    setShowUsageDashboard(false);
+    if (route?.params?.returnToChat === true && navigation.canGoBack()) {
+      navigation.goBack();
+    }
+  }, [navigation, route?.params?.returnToChat]);
   const [showHostResourceDashboard, setShowHostResourceDashboard] = useState(false);
   const [hostResources, setHostResources] = useState(null);
   const [hostResourceError, setHostResourceError] = useState(null);
@@ -822,12 +888,18 @@ export default function SessionListScreen({ navigation, route }) {
 
       case '_connected':
         setConnected(true);
-        setLoading(false);
+        setSessionHydration(previous => advanceSessionHydration(
+          previous, { type: 'socket_open' }, Date.now(),
+        ));
         setReconnectInfo(null);
         break;
 
       case '_disconnected':
         setConnected(false);
+        setLoading(false);
+        setSessionHydration(previous => advanceSessionHydration(
+          previous, { type: 'disconnect', reason: msg.reason }, Date.now(),
+        ));
         fleetControlPendingRef.current = {};
         setFleetControlPending({});
         if (msg.reason === 'unauthenticated') {
@@ -843,13 +915,19 @@ export default function SessionListScreen({ navigation, route }) {
         setConnectionHealth({ state: msg.state || 'connecting', rttMs: msg.rttMs ?? null });
         break;
 
-      case 'session_list':
-        setSessions(msg.sessions || []);
+      case 'session_list': {
+        const incomingSessions = Array.isArray(msg.sessions) ? msg.sessions : [];
+        setSessions(incomingSessions);
+        setLoading(false);
+        setSessionHydration(previous => advanceSessionHydration(
+          previous, { type: 'inventory', sessionCount: incomingSessions.length }, Date.now(),
+        ));
         setClosingSessions(previous => {
-          const liveIds = new Set((msg.sessions || []).map(item => typeof item === 'string' ? item : (item.session_id || item.id)));
+          const liveIds = new Set(incomingSessions.map(item => typeof item === 'string' ? item : (item.session_id || item.id)));
           return Object.fromEntries(Object.entries(previous).filter(([id]) => liveIds.has(id)));
         });
         break;
+      }
 
       case 'status': {
         const sid = msg.session;
@@ -879,8 +957,12 @@ export default function SessionListScreen({ navigation, route }) {
         if (msg.provider_usage && typeof msg.provider_usage === 'object') {
           setProviderUsage(previous => retainNewerProviderUsage(previous, msg.provider_usage));
         }
-        if (msg.sessions) {
+        if (Array.isArray(msg.sessions)) {
           setSessions(msg.sessions);
+          setLoading(false);
+          setSessionHydration(previous => advanceSessionHydration(
+            previous, { type: 'inventory', sessionCount: msg.sessions.length }, Date.now(),
+          ));
         }
         if (msg.session_health) {
           setHealthMap(msg.session_health);
@@ -1378,6 +1460,28 @@ export default function SessionListScreen({ navigation, route }) {
 
   // ── Helpers ─────────────────────────────────────────────────────────────────
 
+  useEffect(() => {
+    if (!loading || !['connecting', 'awaiting_sessions'].includes(sessionHydration.phase)) return undefined;
+    const delay = Math.max(0, Number(sessionHydration.deadlineAtMs || 0) - Date.now());
+    const timer = setTimeout(() => {
+      const now = Date.now();
+      setSessionHydration(previous => advanceSessionHydration(previous, { type: 'timeout' }, now));
+      setLoading(false);
+    }, delay);
+    return () => clearTimeout(timer);
+  }, [loading, sessionHydration.phase, sessionHydration.deadlineAtMs]);
+
+  const retrySessionHydration = useCallback(() => {
+    clientRef.current?.disconnect();
+    setConnected(false);
+    setLoading(sessions.length === 0);
+    setSessionHydration(previous => advanceSessionHydration(previous, { type: 'retry' }, Date.now()));
+    const client = new RelayClient(handleMessage);
+    client.setSessionSubscriptions([]);
+    clientRef.current = client;
+    client.connect();
+  }, [handleMessage, sessions.length]);
+
   function sessionId(s)   { return typeof s === 'string' ? s : (s.session_id || s.id); }
   function sessionName(s) {
     const sid = sessionId(s);
@@ -1844,9 +1948,10 @@ export default function SessionListScreen({ navigation, route }) {
   const fleetEntryById = useMemo(() => Object.fromEntries(fleetEntries.map(entry => [entry.id, entry])), [fleetEntries]);
   const broadcastExpectedConfirmation = `SEND TO ${broadcastSelectedIds.length} SESSIONS`;
   useEffect(() => {
-    setBroadcastSelectedIds(previous => previous
-      .filter(id => fleetEntryById[id]?.canReceiveBroadcast)
-      .slice(0, MAX_BROADCAST_SESSIONS));
+    setBroadcastSelectedIds(previous => retainEligibleBroadcastSelection(
+      previous,
+      id => fleetEntryById[id]?.canReceiveBroadcast,
+    ));
   }, [fleetEntryById]);
 
   function toggleBroadcastSelection(sessionIdValue) {
@@ -1940,6 +2045,14 @@ export default function SessionListScreen({ navigation, route }) {
   if (loading) {
     return (
       <View style={s.container}>
+        <View
+          style={s.hydrationStatus}
+          accessibilityRole="progressbar"
+          accessibilityLiveRegion="polite"
+        >
+          <Text style={s.hydrationTitle}>{hydrationPresentation.title}</Text>
+          <Text style={s.hydrationDetail}>{hydrationPresentation.detail}</Text>
+        </View>
         <View style={{ padding: 12, gap: 8 }}>
           {[0, 1, 2].map(i => <SkeletonCard key={i} delay={i * 200} />)}
         </View>
@@ -1997,12 +2110,7 @@ export default function SessionListScreen({ navigation, route }) {
         <TouchableOpacity
           style={s.disconnectBanner}
           activeOpacity={0.7}
-          onPress={() => {
-            clientRef.current?.disconnect();
-            const c = new RelayClient(handleMessage);
-            clientRef.current = c;
-            c.connect();
-          }}
+          onPress={retrySessionHydration}
         >
           <Text style={s.disconnectText}>
             {reconnectInfo && reconnectInfo.attempt >= 5
@@ -2136,9 +2244,9 @@ export default function SessionListScreen({ navigation, route }) {
         visible={showUsageDashboard}
         animationType={reducedMotion ? 'none' : 'slide'}
         presentationStyle="pageSheet"
-        onRequestClose={() => setShowUsageDashboard(false)}
+        onRequestClose={closeUsageDashboard}
       >
-        <View style={s.usageModal}>
+        <View style={s.usageModal} testID="route-usage" accessibilityViewIsModal>
           <View style={s.usageHeader}>
             <View style={{ flex: 1 }}>
               <Text style={s.usageTitle}>Usage & limits</Text>
@@ -2158,8 +2266,15 @@ export default function SessionListScreen({ navigation, route }) {
                   {normalizedProviderUsage.inFlight ? 'Refreshing...' : 'Refresh'}
                 </Text>
               </TouchableOpacity>
-              <TouchableOpacity onPress={() => setShowUsageDashboard(false)} accessibilityRole="button" accessibilityLabel="Close usage and limits">
-                <Text style={s.usageClose}>Close</Text>
+              <TouchableOpacity
+                onPress={closeUsageDashboard}
+                accessibilityRole="button"
+                accessibilityLabel={route?.params?.returnToChat === true ? 'Back to chat' : 'Close usage and limits'}
+                testID="route-usage-back-to-chat"
+              >
+                <Text style={s.usageClose}>
+                  {route?.params?.returnToChat === true ? 'Back to chat' : 'Close'}
+                </Text>
               </TouchableOpacity>
             </View>
           </View>
@@ -2344,6 +2459,15 @@ export default function SessionListScreen({ navigation, route }) {
               const cardRefreshReceipt = providerUsageRefreshReceipt?.provider_id === entry.providerId
                 ? providerUsageRefreshReceipt : null;
               const cardRefreshPending = ['requested', 'accepted', 'coalesced'].includes(cardRefreshReceipt?.status);
+              const refreshProviderSource = () => {
+                const requestId = clientRef.current?.requestProviderUsageRefresh(true, entry.providerId);
+                if (requestId) setProviderUsageRefreshReceipt({
+                  requestId, status: 'requested', provider_id: entry.providerId,
+                });
+              };
+              const localLifecycle = entry.localRuntime?.lifecycle;
+              const cloudLifecycle = entry.cloudUsage?.lifecycle;
+              const cloudRecovery = providerCloudRecoveryLabel(cloudLifecycle);
               return (
                 <View
                   key={entry.key}
@@ -2358,7 +2482,7 @@ export default function SessionListScreen({ navigation, route }) {
                     accessibilityState={{ expanded: !collapsed }}
                     onPress={() => setCollapsedProviderUsage(previous => ({ ...previous, [entry.key]: !previous[entry.key] }))}
                   >
-                    <ProviderMark providerId={entry.providerId} providerName={entry.providerName} colorScheme="dark" />
+                    <ProviderMark providerId={entry.providerId} providerName={entry.providerName} />
                     <View style={s.usageProviderIdentity}>
                       <Text style={s.usageCardTitle}>{entry.providerName}</Text>
                       <Text style={s.usageSessions}>{entry.accountLabel}{entry.plan ? ` - ${entry.plan}` : ''}</Text>
@@ -2380,12 +2504,7 @@ export default function SessionListScreen({ navigation, route }) {
                     <TouchableOpacity
                       style={[s.usageCardRefresh, cardRefreshPending ? s.usageRefreshDisabled : null]}
                       disabled={cardRefreshPending}
-                      onPress={() => {
-                        const requestId = clientRef.current?.requestProviderUsageRefresh(true, entry.providerId);
-                        if (requestId) setProviderUsageRefreshReceipt({
-                          requestId, status: 'requested', provider_id: entry.providerId,
-                        });
-                      }}
+                      onPress={refreshProviderSource}
                       accessibilityRole="button"
                       accessibilityLabel={`Refresh ${entry.providerName} usage now`}
                     ><Text style={s.usageCardRefreshText}>{cardRefreshPending ? 'Refreshing...' : 'Refresh now'}</Text></TouchableOpacity>
@@ -2451,34 +2570,89 @@ export default function SessionListScreen({ navigation, route }) {
                   ) : !entry.localRuntime && !entry.cloudUsage ? (
                     <Text style={s.usageUnavailable}>{entry.error?.message || 'This provider did not report quota windows.'}</Text>
                   ) : null}
-                  {!!entry.cloudUsage && entry.providerId === 'ollama-local' && (
-                    entry.cloudUsage.subscriptionState === 'active' ? <View style={s.usageCredits} accessibilityLabel="Ollama Cloud usage">
-                      <View style={s.usageCreditCell}>
-                        <Text style={s.usageCreditLabel}>Ollama Cloud</Text>
-                        <Text style={s.usageCreditValue}>{entry.windows.length} quota window{entry.windows.length === 1 ? '' : 's'}</Text>
-                        <Text style={s.usageSessions}>{formatProviderUsageAge(entry.cloudUsage.capturedAt, providerUsageNowMs)}</Text>
-                      </View>
-                      <View style={s.usageCreditCell}>
-                        <Text style={s.usageCreditLabel}>Auto-reload</Text>
-                        <Text style={s.usageCreditValue}>{entry.cloudUsage.autoReloadEnabled == null ? 'Not reported' : entry.cloudUsage.autoReloadEnabled ? 'On' : 'Off'}</Text>
-                        <Text style={s.usageSessions}>Extra usage balance is separate from plan quota</Text>
-                      </View>
-                    </View> : entry.cloudUsage.subscriptionState === 'none'
-                      ? <Text style={s.usageUnavailable} accessibilityLabel="Ollama Cloud no subscription">No cloud subscription - local models remain unlimited</Text>
-                      : <Text style={s.usageUnavailable} accessibilityLabel="Ollama Cloud usage unavailable">Cloud usage unavailable - {entry.cloudUsage.error?.message || 'Open the signed-in Ollama Usage page to expose account quota.'}</Text>
-                  )}
                   {!!entry.localRuntime && <View style={s.usageCredits} accessibilityLabel="Ollama local runtime">
-                    <View style={s.usageCreditCell}>
+                    <View style={[s.usageCreditCell, { borderLeftColor: providerSourceTone(localLifecycle), borderLeftWidth: 3 }]}>
                       <Text style={s.usageCreditLabel}>Local runtime</Text>
-                      <Text style={s.usageCreditValue}>{entry.localRuntime.loadedModelsCount} loaded / {entry.localRuntime.installedModelsCount} installed</Text>
-                      <Text style={s.usageSessions}>{entry.localRuntime.endpointScope.replace(/_/g, ' ')}</Text>
+                      <Text style={s.usageCreditValue}>{providerSourceCount(entry.localRuntime.loadedModelsCount)} loaded / {providerSourceCount(entry.localRuntime.installedModelsCount)} installed</Text>
+                      <Text style={s.usageSessions}>
+                        {providerSourceStatusLabel(localLifecycle)} - {providerSourceAgeLabel(localLifecycle, providerUsageNowMs)}
+                        {localLifecycle?.reason?.message ? ` - ${localLifecycle.reason.message}` : ''}
+                      </Text>
                     </View>
                     <View style={s.usageCreditCell}>
                       <Text style={s.usageCreditLabel}>Request telemetry</Text>
                       <Text style={s.usageCreditValue}>{entry.localRuntime.telemetryStatus.replace(/_/g, ' ')}</Text>
                       <Text style={s.usageSessions}>{entry.localRuntime.telemetryReason}</Text>
                     </View>
+                    <TouchableOpacity
+                      style={[s.usageCardRefresh, { alignSelf: 'center' }, cardRefreshPending ? s.usageRefreshDisabled : null]}
+                      disabled={cardRefreshPending}
+                      onPress={refreshProviderSource}
+                      accessibilityRole="button"
+                      accessibilityLabel="Refresh Ollama local runtime"
+                    ><Text style={s.usageCardRefreshText}>{cardRefreshPending ? 'Refreshing...' : 'Refresh local'}</Text></TouchableOpacity>
                   </View>}
+                  {!!entry.cloudUsage && entry.providerId === 'ollama-local' && (
+                    entry.cloudUsage.subscriptionState === 'active' ? <View style={s.usageCredits} accessibilityLabel="Ollama Cloud usage">
+                      <View style={[s.usageCreditCell, { borderLeftColor: providerSourceTone(cloudLifecycle), borderLeftWidth: 3 }]}>
+                        <Text style={s.usageCreditLabel}>Ollama Cloud</Text>
+                        <Text style={s.usageCreditValue}>{entry.windows.length} quota window{entry.windows.length === 1 ? '' : 's'}</Text>
+                        <Text style={s.usageSessions}>{providerSourceStatusLabel(cloudLifecycle)} - {providerSourceAgeLabel(cloudLifecycle, providerUsageNowMs)}</Text>
+                      </View>
+                      <View style={s.usageCreditCell}>
+                        <Text style={s.usageCreditLabel}>Auto-reload</Text>
+                        <Text style={s.usageCreditValue}>{entry.cloudUsage.autoReloadEnabled == null ? 'Not reported' : entry.cloudUsage.autoReloadEnabled ? 'On' : 'Off'}</Text>
+                        <Text style={s.usageSessions}>Extra usage balance is separate from plan quota</Text>
+                      </View>
+                      <TouchableOpacity
+                        style={[s.usageCardRefresh, { alignSelf: 'center' }, cardRefreshPending ? s.usageRefreshDisabled : null]}
+                        disabled={cardRefreshPending}
+                        onPress={refreshProviderSource}
+                        accessibilityRole="button"
+                        accessibilityLabel="Refresh Ollama Cloud usage"
+                      ><Text style={s.usageCardRefreshText}>{cardRefreshPending ? 'Refreshing...' : 'Refresh cloud'}</Text></TouchableOpacity>
+                    </View> : entry.cloudUsage.subscriptionState === 'none'
+                      ? <View style={s.usageCredits} accessibilityLabel="Ollama Cloud no subscription">
+                        <View style={[s.usageCreditCell, { borderLeftColor: '#3fb950', borderLeftWidth: 3 }]}>
+                          <Text style={s.usageCreditLabel}>Ollama Cloud</Text>
+                          <Text style={s.usageCreditValue}>No cloud subscription</Text>
+                          <Text style={s.usageSessions}>Fresh - local models remain available</Text>
+                        </View>
+                        <TouchableOpacity
+                          style={[s.usageCardRefresh, { alignSelf: 'center' }, cardRefreshPending ? s.usageRefreshDisabled : null]}
+                          disabled={cardRefreshPending}
+                          onPress={refreshProviderSource}
+                          accessibilityRole="button"
+                          accessibilityLabel="Refresh Ollama Cloud subscription"
+                        ><Text style={s.usageCardRefreshText}>{cardRefreshPending ? 'Refreshing...' : 'Refresh cloud'}</Text></TouchableOpacity>
+                      </View>
+                      : <View style={s.usageCredits} accessibilityLabel="Ollama Cloud usage unavailable">
+                        <View style={[s.usageCreditCell, { borderLeftColor: providerSourceTone(cloudLifecycle), borderLeftWidth: 3 }]}>
+                          <Text style={s.usageCreditLabel}>Ollama Cloud</Text>
+                          <Text style={s.usageCreditValue}>{providerSourceStatusLabel(cloudLifecycle, 'Not connected')}</Text>
+                          <Text style={s.usageSessions}>
+                            {entry.cloudUsage.error?.message || cloudLifecycle?.reason?.message || 'Ollama Cloud monitoring is not connected.'}
+                            {providerCloudDiagnosticLabel(cloudLifecycle) ? ` - ${providerCloudDiagnosticLabel(cloudLifecycle)}` : ''}
+                            {` - ${providerSourceAgeLabel(cloudLifecycle, providerUsageNowMs)}`}
+                          </Text>
+                        </View>
+                        <TouchableOpacity
+                          style={[s.usageCardRefresh, { alignSelf: 'center' }, cardRefreshPending ? s.usageRefreshDisabled : null]}
+                          disabled={cardRefreshPending}
+                          onPress={refreshProviderSource}
+                          accessibilityRole="button"
+                          accessibilityLabel={`${cloudRecovery} for Ollama Cloud`}
+                        ><Text style={s.usageCardRefreshText}>{cardRefreshPending
+                            ? cloudRecovery === 'Start owned browser' ? 'Starting...' : 'Refreshing...'
+                            : cloudRecovery}</Text></TouchableOpacity>
+                        {!!entry.dashboardUrl && <TouchableOpacity
+                          style={[s.usageCardRefresh, { alignSelf: 'center' }]}
+                          onPress={() => Linking.openURL(entry.dashboardUrl)}
+                          accessibilityRole="link"
+                          accessibilityLabel="Open Ollama Cloud"
+                        ><Text style={s.usageCardRefreshText}>Open Ollama Cloud</Text></TouchableOpacity>}
+                      </View>
+                  )}
                   {!!entry.localRuntime?.latestRequest && <View style={s.usageCredits} accessibilityLabel="Ollama owned request metrics">
                     <View style={s.usageCreditCell}>
                       <Text style={s.usageCreditLabel}>Latest owned request</Text>
@@ -3134,10 +3308,24 @@ export default function SessionListScreen({ navigation, route }) {
         }
         ListEmptyComponent={
           <View style={s.empty}>
-            <Text style={s.emptyTitle}>No active sessions</Text>
-            <Text style={s.emptyHint}>
-              Start an agent in Antigravity IDE to see sessions here.
+            <Text style={s.emptyTitle}>
+              {hydrationPresentation.retryable ? hydrationPresentation.title : 'No active sessions'}
             </Text>
+            <Text style={s.emptyHint}>
+              {hydrationPresentation.retryable
+                ? hydrationPresentation.detail
+                : 'Start an agent in Antigravity IDE to see sessions here.'}
+            </Text>
+            {hydrationPresentation.retryable && (
+              <TouchableOpacity
+                style={s.hydrationRetryButton}
+                onPress={retrySessionHydration}
+                accessibilityRole="button"
+                accessibilityLabel="Retry session list"
+              >
+                <Text style={s.hydrationRetryText}>Retry</Text>
+              </TouchableOpacity>
+            )}
           </View>
         }
         renderSectionHeader={({ section }) => (
@@ -3407,6 +3595,7 @@ export default function SessionListScreen({ navigation, route }) {
 // ── Skeleton shimmer card ────────────────────────────────────────────────────
 
 function SkeletonCard({ delay = 0 }) {
+  const s = useThemedStyles(darkStyles);
   const reducedMotion = useReducedMotion();
   const opacity = useRef(new Animated.Value(0.3)).current;
   useEffect(() => {
@@ -3445,7 +3634,7 @@ SessionListScreen.navigationOptions = ({ navigation }) => ({
   ),
 });
 
-const s = StyleSheet.create({
+const darkStyles = StyleSheet.create({
   container: {
     flex:            1,
     backgroundColor: '#0b0f14',
@@ -4007,6 +4196,36 @@ const s = StyleSheet.create({
     color:     '#768390',
     fontSize:  14,
     textAlign: 'center',
+  },
+  hydrationStatus: {
+    paddingHorizontal: 16,
+    paddingTop:        16,
+    paddingBottom:     4,
+  },
+  hydrationTitle: {
+    color:      '#cdd9e5',
+    fontSize:   14,
+    fontWeight: '600',
+    textAlign:  'center',
+  },
+  hydrationDetail: {
+    color:      '#768390',
+    fontSize:   12,
+    lineHeight: 17,
+    marginTop:  4,
+    textAlign:  'center',
+  },
+  hydrationRetryButton: {
+    backgroundColor:   '#238636',
+    borderRadius:      7,
+    marginTop:         14,
+    paddingHorizontal: 18,
+    paddingVertical:   9,
+  },
+  hydrationRetryText: {
+    color:      '#ffffff',
+    fontSize:   14,
+    fontWeight: '600',
   },
   card: {
     backgroundColor: '#161b22',

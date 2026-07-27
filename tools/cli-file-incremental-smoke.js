@@ -2,6 +2,7 @@
 'use strict';
 
 const assert = require('assert');
+const crypto = require('crypto');
 const fs = require('fs');
 const os = require('os');
 const path = require('path');
@@ -246,6 +247,140 @@ try {
   assert.strictEqual(migrationFrames.length, 3);
   assert.strictEqual(migrationFrames[2].messages.length, 2);
   assert.strictEqual(migrationFrames[2].test_direct_transport, true);
+  const latencyMigrationSessionId = 'canonical-latency-session';
+  const latencyMigrationMessages = [
+    { role: 'user', content: 'Measured request.', source_message_id: 'codex_cli:fixture-latency-user' },
+    { role: 'assistant', content: 'Measured first output.', source_message_id: 'codex_cli:fixture-latency-assistant' },
+  ];
+  const latencyMigrationState = migrationEngine._fileTranscriptState(
+    'codex_cli',
+    codexPath,
+    latencyMigrationMessages,
+    { mode: 'full', start_offset: 0, end_offset: 2300, file_size: 2300, partial: false },
+  );
+  migrationEngine._latencyTraceClientIdsBySession = new Map([
+    [latencyMigrationSessionId, ['fixture-latency-cid']],
+  ]);
+  migrationEngine._latencyTracesByClientMessageId = new Map([
+    ['fixture-latency-cid', {
+      delivered: false,
+      completed: false,
+      sessionId: latencyMigrationSessionId,
+      clientMessageId: 'fixture-latency-cid',
+      contentSha256: crypto.createHash('sha256').update('Measured request.').digest('hex'),
+      registeredAtMs: Date.now(),
+    }],
+  ]);
+  migrationEngine._latencyOutputSequenceBySession = new Map();
+  const canonicalLatencyReplays = [];
+  migrationEngine._sendProxyMessage = (sessionId, message) => {
+    canonicalLatencyReplays.push({ sessionId, message });
+    return true;
+  };
+  const latencyMigrationSession = {};
+  const latencyMigrationResult = migrationEngine._migrateCodexCliCanonicalTranscript(
+    latencyMigrationSessionId,
+    latencyMigrationSession,
+    latencyMigrationState,
+    'latency fixture',
+  );
+  assert.strictEqual(latencyMigrationResult.mode, 'canonical_schema_migration');
+  assert.strictEqual(latencyMigrationResult.latency_replay_sent, false);
+  assert.strictEqual(canonicalLatencyReplays.length, 0,
+    'a canonical assistant observed before delivery must remain deferred');
+  assert.deepStrictEqual(
+    latencyMigrationSession._pendingCanonicalLatencyMessages?.map(message => message.content),
+    ['Measured request.', 'Measured first output.'],
+  );
+  migrationEngine._latencyTracesByClientMessageId.get('fixture-latency-cid').delivered = true;
+  assert.strictEqual(
+    migrationEngine._flushPendingCanonicalAssistantForLatency(
+      latencyMigrationSessionId,
+      latencyMigrationSession,
+    ),
+    true,
+  );
+  assert.strictEqual(canonicalLatencyReplays.length, 1,
+    'the delivery receipt must replay exactly one deferred canonical assistant row');
+  assert.strictEqual(canonicalLatencyReplays[0].sessionId, latencyMigrationSessionId);
+  assert.strictEqual(canonicalLatencyReplays[0].message.role, 'assistant');
+  assert.strictEqual(canonicalLatencyReplays[0].message.content, 'Measured first output.');
+  assert.strictEqual(
+    migrationEngine._flushPendingCanonicalAssistantForLatency(
+      latencyMigrationSessionId,
+      latencyMigrationSession,
+    ),
+    false,
+    'a deferred canonical assistant must flush exactly once',
+  );
+  assert.strictEqual(canonicalLatencyReplays.length, 1);
+  const terminalLatencyEngine = Object.create(ProxyEngine.prototype);
+  const terminalLatencySessionId = 'terminal-latency-session';
+  const terminalLatencyTurn = {
+    threadId: 'terminal-latency-thread',
+    turnId: 'terminal-latency-turn',
+    emit: () => {},
+  };
+  const terminalLatencySession = {
+    _codexAppServerTurn: terminalLatencyTurn,
+    _codexAppServerTurnIdentity: {
+      thread_id: terminalLatencyTurn.threadId,
+      turn_id: terminalLatencyTurn.turnId,
+    },
+  };
+  terminalLatencyEngine.sessions = new Map([
+    [terminalLatencySessionId, terminalLatencySession],
+  ]);
+  terminalLatencyEngine._latencyTraceClientIdsBySession = new Map([
+    [terminalLatencySessionId, ['terminal-latency-cid']],
+  ]);
+  terminalLatencyEngine._latencyTracesByClientMessageId = new Map([
+    ['terminal-latency-cid', {
+      delivered: true,
+      completed: false,
+      sessionId: terminalLatencySessionId,
+      clientMessageId: 'terminal-latency-cid',
+      contentSha256: crypto.createHash('sha256').update('Measured request.').digest('hex'),
+      registeredAtMs: Date.now(),
+      receiptIdentity: {
+        native_session_id: terminalLatencyTurn.threadId,
+        native_turn_id: terminalLatencyTurn.turnId,
+        process_epoch: null,
+        cursor: null,
+      },
+    }],
+  ]);
+  terminalLatencyEngine._latencyOutputSequenceBySession = new Map();
+  terminalLatencyEngine._log = () => {};
+  const terminalLatencyReplays = [];
+  terminalLatencyEngine._sendProxyMessage = (sessionId, message) => {
+    terminalLatencyReplays.push({ sessionId, message });
+    return true;
+  };
+  const terminalAssistantAt = '2026-07-25T21:07:26.423Z';
+  assert.strictEqual(terminalLatencyEngine._observeCodexCliOwnedTurnCompletion(
+    terminalLatencySessionId,
+    terminalLatencySession,
+    {
+      cliSessionId: terminalLatencyTurn.threadId,
+      taskCompletedTurnId: terminalLatencyTurn.turnId,
+      taskCompletedAt: '2026-07-25T21:07:26.446Z',
+      messages: [
+        { role: 'user', content: 'Measured request.', native_turn_id: terminalLatencyTurn.turnId },
+        { role: 'assistant', content: 'Settled fallback.', native_turn_id: terminalLatencyTurn.turnId, created_at: terminalAssistantAt },
+      ],
+    },
+  ), true);
+  assert.strictEqual(terminalLatencyReplays.length, 1,
+    'an exact terminal turn with no streamed delta must replay one settled assistant row');
+  assert.strictEqual(terminalLatencyReplays[0].message.content, 'Settled fallback.');
+  const terminalLatencySource = terminalLatencyEngine._firstOutputLatencySource(
+    { created_at: terminalAssistantAt },
+    terminalLatencySessionId,
+  );
+  assert.strictEqual(terminalLatencySource.observedAtMs, Date.parse(terminalAssistantAt));
+  assert.strictEqual(terminalLatencySource.source.source, 'native_message_timestamp');
+  assert.strictEqual(terminalLatencySource.source.native_timestamp_source, 'message_created_at');
 
   const orderingEngine = Object.create(ProxyEngine.prototype);
   const orderedFrames = [];
@@ -704,6 +839,8 @@ try {
       source: migrationFrames[0].source,
       replace_all: migrationFrames[0].replace_all === true,
       legacy_history_omitted: !Object.prototype.hasOwnProperty.call(migrationFrames[0], 'history'),
+      pending_latency_replay_rows: canonicalLatencyReplays.length,
+      terminal_latency_fallback_rows: terminalLatencyReplays.length,
     },
     authoritative_ordering: {
       stale_bulk_cancelled: true,

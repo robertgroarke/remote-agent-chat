@@ -54,7 +54,6 @@ function normalizedCommandLine(value) {
 function isHeadlessCodexExecCommand(commandLine) {
   const command = normalizedCommandLine(commandLine);
   return /(?:^| )exec(?: |$)/.test(command)
-    && /(?:^| )--json(?: |$)/.test(command)
     && (command.includes('codex') || command.includes('@openai'));
 }
 
@@ -254,6 +253,11 @@ async function takeOverOwnedHeadlessWorker(entry, options = {}) {
   const findWorker = options.findWorker || (value => findOwnedHeadlessWorker(value, options));
   const worker = findWorker(entry);
   if (!worker) return { status: 'not_running', worker: null, forced: false };
+  if (options.pauseAcknowledged !== true) {
+    const error = new Error(`Refusing to stop owned headless worker ${worker.rootPid} before the native goal is durably paused`);
+    error.code = 'CODEX_OWNER_PAUSE_REQUIRED';
+    throw error;
+  }
   const terminate = options.terminateProcessTree || terminateProcessTree;
   const waitForExit = options.waitForProcessesToExit
     || ((pids, timeoutMs) => waitForProcessesToExit(pids, timeoutMs, options));

@@ -111,6 +111,17 @@ function validation(harness, status, previous, current, runId) {
     duration_ms: 17, exit_code: status === 'pass' ? 0 : 1,
     detail: status === 'pass' ? 'isolated pass' : 'isolated failure',
     completed_at: new Date().toISOString(), change_detected_at: new Date().toISOString(),
+    program_health: {
+      schema_version: 1,
+      updated_at: new Date().toISOString(),
+      harnesses: {
+        [harness]: {
+          status,
+          installed_version: current,
+          reason: status === 'pass' ? null : 'isolated failure',
+        },
+      },
+    },
   };
 }
 
@@ -163,18 +174,26 @@ async function main() {
       item.type === 'app_update_validation_status' && item.validation?.run_id === passEntry.run_id
     ));
     assert.equal(passEvent.validation.status, 'pass');
+    const passHealthEvent = await waitForMessage(firstClient.messages, item => (
+      item.type === 'harness_revalidation_status'
+      && item.program_health?.harnesses?.cursor?.installed_version === '3.5.33'
+    ));
+    assert.deepStrictEqual(passHealthEvent.program_health, passEntry.program_health);
+    await page.getByRole('button', { name: 'Details' }).click();
     await page.getByText('App update validated.', { exact: true }).waitFor();
-    assert((await page.locator('.duplicate-proxy-banner.app-update-pass').count()) === 1);
+    assert((await page.locator('.duplicate-proxy-banner').count()) === 1);
     assert((await page.locator('body').innerText()).includes('cursor 3.5.32 -> 3.5.33'));
 
     const readback = await requestJson(port, 'GET', '/api/maintenance/validation');
     assert.equal(readback.status, 200);
     assert.equal(readback.json.latest_app_update_validation.run_id, passEntry.run_id);
+    assert.deepStrictEqual(readback.json.revalidation_program_health, passEntry.program_health);
 
     await closeSocket(firstClient.ws);
     firstClient = null;
     restoredClient = await connectClient(port);
     assert.equal(restoredClient.ack.latest_app_update_validation.run_id, passEntry.run_id);
+    assert.deepStrictEqual(restoredClient.ack.revalidation_program_health, passEntry.program_health);
 
     const failEntry = validation('codex', 'fail', '26.706.1', '26.707.1', 'app-update-fail-e2e');
     const failResponse = await requestJson(port, 'PUT', '/api/maintenance/validation', { validation: failEntry });
@@ -183,6 +202,11 @@ async function main() {
     await waitForMessage(restoredClient.messages, item => (
       item.type === 'app_update_validation_status' && item.validation?.run_id === failEntry.run_id
     ));
+    const failHealthEvent = await waitForMessage(restoredClient.messages, item => (
+      item.type === 'harness_revalidation_status'
+      && item.program_health?.harnesses?.codex?.installed_version === '26.707.1'
+    ));
+    assert.deepStrictEqual(failHealthEvent.program_health, failEntry.program_health);
     const nightlyFailure = await waitForMessage(restoredClient.messages, item => (
       item.type === 'nightly_validation_status'
       && item.failures?.some(failure => failure.harness === 'codex')
@@ -193,8 +217,8 @@ async function main() {
     assert(mobileBody.includes('codex 26.706.1 -> 26.707.1'));
     assert(!mobileBody.includes('Nightly validation failed.'), 'same-run generic warning must be suppressed');
 
-    const genericCodex = { ...failEntry, kind: 'nightly_validation' };
-    const genericRejected = await requestJson(port, 'PUT', '/api/maintenance/validation', { validation: genericCodex });
+    const genericAppOnly = { ...failEntry, harness: 'gemini', kind: 'nightly_validation' };
+    const genericRejected = await requestJson(port, 'PUT', '/api/maintenance/validation', { validation: genericAppOnly });
     assert.equal(genericRejected.status, 400, 'extra app surfaces must remain scoped to app-update validation');
     const unknownRejected = await requestJson(port, 'PUT', '/api/maintenance/validation', {
       validation: { ...passEntry, harness: 'unknown-harness', run_id: 'unknown' },
@@ -214,6 +238,7 @@ async function main() {
       baseline_ack_empty: true,
       live_pass_banner_event: true,
       reconnect_restoration: true,
+      app_update_program_health_converged: true,
       live_failure_banner_event: true,
       nightly_failure_projection: true,
       push_routes: { pass: 'agent_ready', fail: 'agent_error' },

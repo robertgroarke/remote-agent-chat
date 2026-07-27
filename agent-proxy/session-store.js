@@ -704,6 +704,47 @@ function markDisconnected(session_id) {
   });
 }
 
+function removeOwnedDisposableSession(session_id, expected = {}) {
+  const session = _store.sessions[session_id];
+  const scope = String(expected.scope || '');
+  const tokenHash = String(expected.tokenHash || '').toLowerCase();
+  const cliSessionId = String(expected.cliSessionId || '');
+  const workspacePath = expected.workspacePath ? path.resolve(expected.workspacePath) : '';
+  if (!session) return { removed: false, reason: 'session_not_found', removed_session_ids: [] };
+  if (!scope || !/^[a-f0-9]{64}$/.test(tokenHash) || !cliSessionId || !workspacePath) {
+    return { removed: false, reason: 'invalid_expected_identity', removed_session_ids: [] };
+  }
+  const storedHash = String(session.owned_disposable_token_hash || '').toLowerCase();
+  const hashMatches = /^[a-f0-9]{64}$/.test(storedHash)
+    && crypto.timingSafeEqual(Buffer.from(storedHash, 'hex'), Buffer.from(tokenHash, 'hex'));
+  if (session.owned_disposable_scope !== scope
+      || !hashMatches
+      || session.cli_session_id !== cliSessionId
+      || path.resolve(session.workspace_path || '') !== workspacePath) {
+    return { removed: false, reason: 'owned_identity_mismatch', removed_session_ids: [] };
+  }
+
+  const removedSessionIds = [];
+  for (const [sid, candidate] of Object.entries(_store.sessions)) {
+    if (candidate.owned_disposable_scope !== scope) continue;
+    if (String(candidate.owned_disposable_token_hash || '').toLowerCase() !== tokenHash) continue;
+    if (candidate.cli_session_id !== cliSessionId) continue;
+    if (path.resolve(candidate.workspace_path || '') !== workspacePath) continue;
+    _persistedLastSeen.delete(candidate);
+    delete _store.sessions[sid];
+    removedSessionIds.push(sid);
+  }
+  if (removedSessionIds.length === 0) {
+    return { removed: false, reason: 'owned_aliases_not_found', removed_session_ids: [] };
+  }
+  _saveStore();
+  return {
+    removed: true,
+    reason: 'owned_disposable_removed',
+    removed_session_ids: removedSessionIds,
+  };
+}
+
 function updatePreference(preference_key, updates) {
   if (!preference_key) return;
   const existing = _store.preferences[preference_key] || { preference_key };
@@ -790,6 +831,7 @@ module.exports = {
   updateSession,
   migrateVirtualSession,
   markDisconnected,
+  removeOwnedDisposableSession,
   updatePreference,
   getPreference,
   replacePreference,

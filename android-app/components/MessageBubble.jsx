@@ -24,7 +24,7 @@ const {
 // Props:
 //   message — { role, content, sequence, timestamp }
 //   content may be a string or an array of content blocks (Claude format)
-export default function MessageBubble({ message, agentType, deliveryState }) {
+export default function MessageBubble({ message, agentType, deliveryState, onRetry }) {
   const isUser = message.role === 'user';
   const blocks = normalizeMessageBlocks(message);
   const isLight = useColorScheme() === 'light';
@@ -35,8 +35,9 @@ export default function MessageBubble({ message, agentType, deliveryState }) {
   const absoluteTimestamp = instant ? formatAbsoluteMessageTime(instant) : 'time unknown';
   const visibleTimestamp = instant ? formatVisibleMessageTime(instant) : 'Time unknown';
   const deliveryText = isUser ? deliveryLabel(message, deliveryState) : '';
+  const deliveryFailure = isUser ? deliveryFailureForMessage(message, deliveryState, onRetry) : null;
 
-  const handleLongPress = useCallback(() => {
+  const copyMessage = useCallback(() => {
     const plain = blocksToPlainText(blocks);
     if (!plain) return;
     Clipboard.setStringAsync(plain);
@@ -47,7 +48,7 @@ export default function MessageBubble({ message, agentType, deliveryState }) {
   const bubble = (
     <Pressable
       style={nativeLayout === 'codex-terminal' ? s.terminalContent : null}
-      onLongPress={handleLongPress}
+      onLongPress={copyMessage}
       delayLongPress={400}
     >
       <View style={[
@@ -92,12 +93,37 @@ export default function MessageBubble({ message, agentType, deliveryState }) {
             {visibleTimestamp}
           </Text>
           {isUser && (
-            <Text
-              style={[s.delivery, deliveryState === 'failed' && s.deliveryFailed]}
-              accessibilityLabel={deliveryText.replace(/^[✓✕▶↗·\s]+/u, '') || deliveryText}
-            >
-              {deliveryText}
-            </Text>
+            <>
+              <Text
+                style={[s.delivery, deliveryFailure && s.deliveryFailed]}
+                accessibilityLabel={deliveryText.replace(/^[✓✕▶↗·\s]+/u, '') || deliveryText}
+              >
+                {deliveryText}
+              </Text>
+              {deliveryFailure && (
+                <View style={s.deliveryActions}>
+                  {deliveryFailure.canRetry && (
+                    <Pressable
+                      style={[s.deliveryAction, isLight && s.deliveryActionLight]}
+                      onPress={() => onRetry(message)}
+                      accessibilityRole="button"
+                      accessibilityLabel="Retry failed message"
+                      accessibilityHint={deliveryFailure.detail}
+                    >
+                      <Text style={[s.deliveryActionText, isLight && s.deliveryActionTextLight]}>Retry</Text>
+                    </Pressable>
+                  )}
+                  <Pressable
+                    style={[s.deliveryAction, isLight && s.deliveryActionLight]}
+                    onPress={copyMessage}
+                    accessibilityRole="button"
+                    accessibilityLabel="Copy failed message"
+                  >
+                    <Text style={[s.deliveryActionText, isLight && s.deliveryActionTextLight]}>Copy</Text>
+                  </Pressable>
+                </View>
+              )}
+            </>
           )}
       </View>
     </View>
@@ -743,17 +769,29 @@ function deliveryFailureText(value) {
   return raw.length > 80 ? `${raw.slice(0, 77)}…` : raw;
 }
 
+function deliveryFailureForMessage(message, deliveryState, onRetry) {
+  if (deliveryState && deliveryState !== 'failed') return null;
+  if (deliveryState !== 'failed' && message.status !== 'failed') return null;
+  const detail = message.failure_reason || message._sendError || message.failure_code || 'Send failed';
+  const retrySafetyKnown = message.failure_retryable != null || message.failure_native_attempted != null;
+  const canRetry = typeof onRetry === 'function' && (
+    (message.failure_retryable === true && message.failure_native_attempted === false)
+    || (message._optimistic && !retrySafetyKnown)
+  );
+  return { detail, canRetry };
+}
+
 function deliveryLabel(message, deliveryState) {
   if (deliveryState === 'offline_queued') return 'Queued offline';
   if (deliveryState === 'queued') return 'Sending…';
   if (deliveryState === 'busy_queued' || message._queued) return 'Queued';
   if (deliveryState === 'steered') return 'Steered';
-  if (deliveryState === 'failed') return `✕ ${deliveryFailureText(message._sendError || message.failure_code)}`;
+  if (deliveryState === 'failed') return `✕ ${deliveryFailureText(message.failure_reason || message._sendError || message.failure_code)}`;
   if (deliveryState === 'launch_accepted') return '↗ Native launch accepted · receipt pending';
   if (deliveryState === 'delivered') return '✓✓ Delivered';
   if (deliveryState === 'agent_started' || message._agentStarted) return '▶ Agent started';
   if (message._delivered) return '✓✓ Delivered';
-  if (message.status === 'failed') return `✕ ${deliveryFailureText(message.failure_code || message._sendError)}`;
+  if (message.status === 'failed') return `✕ ${deliveryFailureText(message.failure_reason || message.failure_code || message._sendError)}`;
   if (message._launchAcceptedAt || message.launch_accepted_at) return '↗ Native launch accepted · receipt pending';
   if (message.status === 'accepted') return '✓ Relay accepted';
   return 'Recorded · receipt unknown';
@@ -1384,6 +1422,33 @@ const s = StyleSheet.create({
   },
   deliveryFailed: {
     color: '#f85149',
+  },
+  deliveryActions: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: 6,
+    marginTop: 3,
+  },
+  deliveryAction: {
+    minWidth: 52,
+    minHeight: 44,
+    justifyContent: 'center',
+    borderWidth: StyleSheet.hairlineWidth,
+    borderColor: '#58a6ff',
+    borderRadius: 999,
+    paddingHorizontal: 9,
+    paddingVertical: 3,
+  },
+  deliveryActionLight: {
+    borderColor: '#0969da',
+  },
+  deliveryActionText: {
+    color: '#58a6ff',
+    fontSize: 11,
+    fontWeight: '600',
+  },
+  deliveryActionTextLight: {
+    color: '#0969da',
   },
   copiedToast: {
     position:        'absolute',

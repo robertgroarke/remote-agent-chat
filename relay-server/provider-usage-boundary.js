@@ -16,6 +16,10 @@ const ARRAY_LIMITS = new Map([
   ['$.snapshots[].windows', 64],
   ['$.snapshots[].local_runtime.loaded_models', 64],
   ['$.snapshots[].local_runtime.request_receipts', 32],
+  ['$.snapshots[].cloud_usage.lifecycle.diagnostic.configured_ports', 8],
+  ['$.snapshots[].cloud_usage.lifecycle.diagnostic.fallback_ports', 8],
+  ['$.snapshots[].cloud_usage.lifecycle.diagnostic.effective_ports', 8],
+  ['$.snapshots[].cloud_usage.lifecycle.diagnostic.attempts', 8],
   ['$.snapshots[].reset_credits.details', 10],
   ['$.estimated_cost.by_provider', 32],
   ['$.estimated_cost.by_model', 512],
@@ -74,6 +78,12 @@ const ALLOWED_KEYS = new Set([
   'ready_state', 'visibility_state', 'active_element_tag', 'page_path', 'page_state_unchanged',
   'dom_mutation_records', 'navigation_actions', 'click_actions', 'focus_actions',
   'existing_target_id_preserved', 'target_inventory_stable', 'targets_created',
+  'lifecycle', 'attempted_at', 'last_good_at', 'attempt_id', 'reason', 'next_action',
+  'diagnostic', 'configured_ports', 'fallback_ports', 'effective_ports', 'fallback_policy',
+  'extraction_signature', 'attempts', 'supervision', 'port', 'reachable', 'elapsed_ms',
+  'visible_windows_opened', 'protected_existing_targets_mutated',
+  'ollama_origin_targets', 'usage_targets', 'observations', 'api_ps', 'api_tags',
+  'owned_receipts',
 ]);
 
 const DETAIL_ALLOWED_KEYS = new Set([

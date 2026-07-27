@@ -101,18 +101,41 @@ function sendTail(client, requestId, limit = 200) {
   }));
 }
 
+function sendOlder(client, requestId, beforeOffset, limit = 200) {
+  client.ws.send(JSON.stringify({
+    type: 'history_chunk_request',
+    protocol_version: 1,
+    session_id: sessionId,
+    session: sessionId,
+    request_id: requestId,
+    mode: 'older',
+    source: 'native',
+    replace: false,
+    user_initiated: true,
+    before_offset: beforeOffset,
+    limit,
+    chunk_bytes: 1024 * 1024,
+  }));
+}
+
 function nativeSuccess(request, marker) {
+  const mode = request.mode === 'older' ? 'older' : 'tail';
   return {
     type: 'history_chunk', protocol_version: 1,
     session_id: sessionId, session: sessionId,
     request_id: request.request_id,
-    mode: 'tail', source: 'codex_cli_jsonl', replace: true,
+    mode, source: 'codex_cli_jsonl', replace: mode !== 'older',
     messages: [
       { source_message_id: `${marker}-user`, role: 'user', content: `question-${marker}`, sequence: 1, ts: 1784600000 },
       { source_message_id: `${marker}-assistant`, role: 'assistant', content: `answer-${marker}`, sequence: 2, ts: 1784600001 },
     ],
-    partial: true, complete: false,
-    cursor: { start_offset: 1024, end_offset: 4096, next_before_offset: 1024, total_bytes: 31_471_461 },
+    partial: mode !== 'older', complete: mode === 'older',
+    cursor: {
+      start_offset: mode === 'older' ? 0 : 1024,
+      end_offset: mode === 'older' ? 1024 : 4096,
+      next_before_offset: mode === 'older' ? null : 1024,
+      total_bytes: 31_471_461,
+    },
   };
 }
 
@@ -191,6 +214,33 @@ async function main() {
     assert(recovered.history_delivery.retry_count >= 2);
     assert.equal(clients[0].messages.filter(message => message.request_id === 'recoverable-retry').length, 1);
 
+    const firstOlderStart = proxy.messages.length;
+    sendOlder(clients[0], 'older-first-tab', 1024);
+    const firstOlderRequest = await waitFor(() => proxy.messages.slice(firstOlderStart)
+      .find(message => message.type === 'history_chunk_request' && message.mode === 'older'),
+    2500, 'first older-history request');
+    proxy.ws.send(JSON.stringify(nativeSuccess(firstOlderRequest, 'older-first')));
+    const firstOlderResponse = await waitFor(() => clients[0].messages.find(message => (
+      message.type === 'history_chunk' && message.request_id === 'older-first-tab'
+    )), 2500, 'first older-history response');
+    assert.equal(firstOlderResponse.error, undefined);
+
+    // Let only the five-second rate interval expire. The former global cursor
+    // tombstone remained for sixty seconds and stranded this independent tab
+    // behind the relay flight timeout.
+    await sleep(5100);
+    const repeatedOlderStart = proxy.messages.length;
+    sendOlder(clients[1], 'older-second-tab', 1024);
+    const repeatedOlderRequest = await waitFor(() => proxy.messages.slice(repeatedOlderStart)
+      .find(message => message.type === 'history_chunk_request' && message.mode === 'older'),
+    2500, 'same-cursor older-history request from a second tab');
+    proxy.ws.send(JSON.stringify(nativeSuccess(repeatedOlderRequest, 'older-second')));
+    const repeatedOlderResponse = await waitFor(() => clients[1].messages.find(message => (
+      message.type === 'history_chunk' && message.request_id === 'older-second-tab'
+    )), 2500, 'same-cursor older-history response to a second tab');
+    assert.equal(repeatedOlderResponse.error, undefined);
+    assert.equal(repeatedOlderResponse.messages[1].content, 'answer-older-second');
+
     console.log(JSON.stringify({
       result: 'PASS',
       authenticated_clients: 10,
@@ -203,6 +253,8 @@ async function main() {
       retry_delay_ms: Date.now() - retryRequestedAt,
       recoverable_throttle_visible_to_clients: 0,
       automatic_retry_terminal_receipts: 1,
+      repeated_completed_cursor_tabs: 2,
+      repeated_cursor_terminal_timeouts: 0,
       duplicate_rows: 0,
       visible_windows_opened: 0,
       focus_actions: 0,

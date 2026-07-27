@@ -76,6 +76,20 @@ const fixtureCapturedAt = new Date().toISOString();
 const fixtureStaleAfter = new Date(Date.now() + 10 * 60 * 1000).toISOString();
 let currentProviderUsage = null;
 
+function sourceLifecycle(status, id, options = {}) {
+  const capturedAt = options.capturedAt || fixtureCapturedAt;
+  return {
+    status,
+    captured_at: status === 'fresh' || status === 'stale' ? capturedAt : null,
+    last_good_at: options.lastGoodAt || (status === 'fresh' || status === 'stale' ? capturedAt : null),
+    attempted_at: options.attemptedAt || capturedAt,
+    attempt_id: id,
+    reason: options.reason || null,
+    next_action: options.nextAction || 'refresh_source',
+    diagnostic: options.diagnostic || null,
+  };
+}
+
 function providerUsageFixture() {
   const capturedAt = fixtureCapturedAt;
   const staleAfter = fixtureStaleAfter;
@@ -165,23 +179,30 @@ function providerUsageFixture() {
         source: 'existing_signed_in_ollama_usage_surface',
         dashboardUrl: 'https://ollama.com/settings/usage',
         accountLabel: 'Cloud account + loopback runtime',
-        cloudUsage: {
-          subscription_state: 'active', source: 'existing_signed_in_ollama_usage_surface', captured_at: capturedAt,
-          auto_reload_enabled: false, error: null,
-          source_receipt: { page_state_unchanged: true, dom_mutation_records: 0, navigation_actions: 0, click_actions: 0, focus_actions: 0, targets_created: 0 },
-        },
         financials: {
           semantics_version: 1, source: 'existing_signed_in_ollama_usage_surface', observed_at: capturedAt,
           account_scope: 'Pro', extra_usage_enabled: true,
           prepaid_balance: { amount: 0, currency: 'USD', source_field: 'balance_remaining', semantics: 'prepaid_balance', directly_reported: true },
           disclaimer: 'Ollama Cloud quota and local runtime telemetry are separate truth domains.',
         },
-        localRuntime: {
-          status: 'running', endpoint_scope: 'loopback_only', installed_models_count: 13,
-          loaded_models_count: 0, loaded_models: [], observed_request_count: 0, request_receipts: [],
-          telemetry_status: 'not_observed', telemetry_reason: 'Only explicit owned terminal response receipts are counted.',
-        },
-      }),
+         localRuntime: {
+           status: 'running', endpoint_scope: 'loopback_only', installed_models_count: 13,
+           loaded_models_count: 0, loaded_models: [], observed_request_count: 0, request_receipts: [],
+           telemetry_status: 'not_observed', telemetry_reason: 'Only explicit owned terminal response receipts are counted.',
+           lifecycle: sourceLifecycle('fresh', 'fixture-local-fresh'),
+           observations: {
+             api_ps: sourceLifecycle('fresh', 'fixture-api-ps-fresh'),
+             api_tags: sourceLifecycle('fresh', 'fixture-api-tags-fresh'),
+             owned_receipts: sourceLifecycle('fresh', 'fixture-receipts-fresh'),
+           },
+         },
+         cloudUsage: {
+           subscription_state: 'active', source: 'existing_signed_in_ollama_usage_surface', captured_at: capturedAt,
+           auto_reload_enabled: false, error: null,
+           lifecycle: sourceLifecycle('fresh', 'fixture-cloud-fresh'),
+           source_receipt: { page_state_unchanged: true, dom_mutation_records: 0, navigation_actions: 0, click_actions: 0, focus_actions: 0, targets_created: 0 },
+         },
+       }),
     ],
     estimated_cost: {
       schema_version: 1,
@@ -419,6 +440,8 @@ async function main() {
   const warmRouteActivationSamples = [];
   const browserErrors = [];
   let sessionHeaderStorm = null;
+  let ollamaLifecycleProof = null;
+  let ollamaUnavailableFixture = null;
   try {
     if (browserMode === 'headless-fixture') {
       browser = await chromium.launch({ channel: 'chrome', headless: true });
@@ -445,7 +468,15 @@ async function main() {
         waitUntil: 'domcontentloaded', timeout: 15000,
       });
       await page.locator('.session-card').first().waitFor({ state: 'visible', timeout: 5000 });
-      if (viewport.width <= 600) await page.locator('.hamburger').click();
+      if (viewport.width <= 600) {
+        await page.waitForFunction(() => {
+          const sidebar = document.querySelector('.sidebar');
+          return !sidebar || sidebar.classList.contains('open') || sidebar.getBoundingClientRect().right <= 1;
+        });
+        await page.locator('.hamburger').focus();
+        await page.keyboard.press('Enter');
+        await page.waitForFunction(() => document.querySelector('.sidebar')?.classList.contains('open'));
+      }
       const activationStartedAt = Date.now();
       await page.getByRole('button', { name: 'Usage and limits' }).click();
       await page.locator('[data-testid="usage-dashboard"]').waitFor({ state: 'visible', timeout: 5000 });
@@ -506,15 +537,19 @@ async function main() {
       await antigravity.getByText(/^Source: in app api/).waitFor();
       await antigravity.getByText(/^Updated /).waitFor();
       await antigravity.getByText(/^Next refresh /).waitFor();
-      const ollama = page.locator('[data-provider-id="ollama-local"]');
-      await ollama.getByText('Session', { exact: true }).waitFor();
-      await ollama.getByText('Weekly', { exact: true }).waitFor();
+       const ollama = page.locator('[data-provider-id="ollama-local"]');
+       await ollama.getByText('Session', { exact: true }).waitFor();
+       await ollama.getByText('Weekly', { exact: true }).waitFor();
       await ollama.getByText('1.9% used', { exact: true }).waitFor();
       await ollama.getByText('48.3% used', { exact: true }).waitFor();
       await ollama.getByText(/Available prepaid balance\$0\.00/).waitFor();
-      await ollama.getByText(/Auto-reloadOff/).waitFor();
-      await ollama.getByText(/Local runtime0 loaded \/ 13 installed/).waitFor();
-    });
+       await ollama.getByText(/Auto-reloadOff/).waitFor();
+       await ollama.getByText(/Local runtime0 loaded \/ 13 installed/).waitFor();
+       assert.strictEqual(await ollama.locator('[data-testid="ollama-local-runtime"]').getAttribute('data-source-status'), 'fresh');
+       assert.strictEqual(await ollama.locator('[data-testid="ollama-cloud-usage"]').getAttribute('data-source-status'), 'fresh');
+       await ollama.getByRole('button', { name: 'Refresh Ollama local runtime' }).waitFor();
+       await ollama.getByRole('button', { name: 'Refresh Ollama Cloud usage' }).waitFor();
+     });
     providerRefreshRequests = 0;
     const forcedStale = providerUsageFixture();
     forcedStale.generation = 8;
@@ -970,6 +1005,7 @@ async function main() {
       await page.screenshot({ path: path.join(screenshotDir, 'usage-dashboard-mobile-390.png'), fullPage: true });
     }
     await page.locator('[data-testid="usage-dashboard"] .automations-back').click();
+    await page.locator('.mobile-header-disclosure').click();
     const mobileMini = page.locator('[data-testid="session-usage-mini"]');
     await mobileMini.waitFor({ state: 'visible' });
     const mobileMiniGeometry = await mobileMini.evaluate(node => {
@@ -1002,8 +1038,142 @@ async function main() {
     }
     await page.keyboard.press('Escape');
 
+    if (browserMode === 'headless-fixture') {
+    await loadFixture({ width: 390, height: 844 });
+    const secondContext = await browser.newContext({ viewport: { width: 1280, height: 900 } });
+    const secondPage = await secondContext.newPage();
+    await secondPage.goto(`http://127.0.0.1:${port}/?session=usage-codex-primary`, {
+      waitUntil: 'domcontentloaded', timeout: 15000,
+    });
+    await secondPage.locator('.session-card').first().waitFor({ state: 'visible', timeout: 5000 });
+    await secondPage.getByRole('button', { name: 'Usage and limits' }).click();
+    await secondPage.locator('[data-testid="usage-dashboard"]').waitFor({ state: 'visible', timeout: 5000 });
+    assert(providerUsageWatchStates.filter(Boolean).length >= 2,
+      `expected two active usage watchers, saw ${JSON.stringify(providerUsageWatchStates)}`);
+    for (const targetPage of [page, secondPage]) {
+      const ollamaCard = targetPage.locator('[data-provider-id="ollama-local"]');
+      if (await ollamaCard.getAttribute('open') == null) await ollamaCard.locator('summary').click();
+    }
+
+    const staleOllamaUsage = providerUsageFixture();
+    staleOllamaUsage.generation = 1000;
+    staleOllamaUsage.generated_at = new Date().toISOString();
+    const staleOllama = staleOllamaUsage.snapshots.find(account => account.provider_id === 'ollama-local');
+    staleOllama.cloud_usage.lifecycle = sourceLifecycle('stale', 'fixture-cloud-stale', {
+      capturedAt: new Date(Date.now() - 2 * 60_000).toISOString(),
+      lastGoodAt: fixtureCapturedAt,
+      reason: { code: 'cdp_endpoint_unavailable', message: 'Configured Ollama source endpoint is unavailable.' },
+      nextAction: 'retry_cloud_source',
+    });
+    broadcastProviderUsage(staleOllamaUsage);
+    for (const targetPage of [page, secondPage]) {
+      const card = targetPage.locator('[data-provider-id="ollama-local"]');
+      await card.locator('[data-testid="ollama-cloud-usage"][data-source-status="stale"]').waitFor();
+      await card.getByText(/Local runtime0 loaded \/ 13 installed/).waitFor();
+    }
+
+    const disconnectedOllamaUsage = providerUsageFixture();
+    disconnectedOllamaUsage.generation = 1001;
+    disconnectedOllamaUsage.generated_at = new Date().toISOString();
+    const disconnectedOllama = disconnectedOllamaUsage.snapshots.find(account => account.provider_id === 'ollama-local');
+    disconnectedOllama.windows = [];
+    disconnectedOllama.financials = null;
+    disconnectedOllama.cloud_usage = {
+      subscription_state: 'unavailable',
+      source: 'passive_ollama_cloud_surface',
+      captured_at: null,
+      auto_reload_enabled: null,
+      error: {
+        code: 'cdp_endpoint_unavailable',
+        message: 'Configured Ollama source endpoint is unavailable.',
+      },
+      lifecycle: sourceLifecycle('unavailable', 'fixture-cloud-unavailable', {
+        reason: { code: 'cdp_endpoint_unavailable', message: 'Configured Ollama source endpoint is unavailable.' },
+        nextAction: 'start_owned_cloud_source',
+        diagnostic: {
+          configured_ports: [9240],
+          fallback_ports: [],
+          effective_ports: [9240],
+          fallback_policy: 'configured_only',
+          extraction_signature: 'ollama-settings-usage-dom-v2',
+          attempts: [{ port: 9240, status: 'unavailable', code: 'cdp_endpoint_unavailable', reachable: false, elapsed_ms: 5, ollama_origin_targets: 0, usage_targets: 0 }],
+          elapsed_ms: 5,
+        },
+      }),
+      source_receipt: null,
+    };
+    ollamaUnavailableFixture = disconnectedOllamaUsage;
+    broadcastProviderUsage(disconnectedOllamaUsage);
+    for (const targetPage of [page, secondPage]) {
+      const card = targetPage.locator('[data-provider-id="ollama-local"]');
+      const unavailableRow = card.locator('[data-testid="ollama-cloud-unavailable"][data-source-status="unavailable"]');
+      await unavailableRow.waitFor();
+      assert.match(await unavailableRow.innerText(), /Not connected/);
+      await card.getByText(/Local runtime0 loaded \/ 13 installed/).waitFor();
+      await card.getByRole('button', { name: 'Start owned browser' }).waitFor();
+      await card.getByRole('link', { name: 'Open Ollama Cloud' }).waitFor();
+    }
+    if (screenshotDir) {
+      await secondPage.locator('[data-provider-id="ollama-local"]')
+        .screenshot({ path: path.join(screenshotDir, 'ollama-independent-sources-dark-desktop.png') });
+      await page.locator('[data-provider-id="ollama-local"]')
+        .screenshot({ path: path.join(screenshotDir, 'ollama-independent-sources-dark-mobile-390.png') });
+    }
+
+    const oldReplay = providerUsageFixture();
+    oldReplay.generation = 1000;
+    oldReplay.generated_at = new Date(Date.now() + 1000).toISOString();
+    broadcastProviderUsage(oldReplay, { cache: false });
+    await page.waitForTimeout(100);
+    for (const targetPage of [page, secondPage]) {
+      assert.strictEqual(
+        await targetPage.locator('[data-provider-id="ollama-local"] [data-testid="ollama-cloud-unavailable"]').count(),
+        1,
+        'older replay must not replace the newer settled cloud source state',
+      );
+    }
+
+    await secondPage.reload({ waitUntil: 'domcontentloaded', timeout: 15000 });
+    await secondPage.locator('.session-card').first().waitFor({ state: 'visible', timeout: 5000 });
+    await secondPage.getByRole('button', { name: 'Usage and limits' }).click();
+    await secondPage.locator('[data-provider-id="ollama-local"] [data-testid="ollama-cloud-unavailable"]')
+      .waitFor({ state: 'visible', timeout: 5000 });
+    assert(providerUsageWatchStates.filter(Boolean).length >= 3,
+      'reconnected second watcher must subscribe without regressing source state');
+
+    const recoveredOllamaUsage = providerUsageFixture();
+    recoveredOllamaUsage.generation = 1002;
+    recoveredOllamaUsage.generated_at = new Date().toISOString();
+    broadcastProviderUsage(recoveredOllamaUsage);
+    for (const targetPage of [page, secondPage]) {
+      const card = targetPage.locator('[data-provider-id="ollama-local"]');
+      await card.locator('[data-testid="ollama-cloud-usage"][data-source-status="fresh"]').waitFor();
+      await card.getByText('Session', { exact: true }).waitFor();
+      await card.getByText('Weekly', { exact: true }).waitFor();
+    }
+    ollamaLifecycleProof = {
+      states: ['fresh', 'stale', 'unavailable', 'recovered'],
+      two_browser_watchers: true,
+      reconnect_preserved_state: true,
+      old_replay_rejected: true,
+      source_actions_passive: true,
+    };
+    await secondContext.close();
+    }
+
     await page.evaluate(() => localStorage.setItem('remote-agent-chat-theme', 'light'));
     await loadFixture({ width: 1280, height: 900 });
+    if (ollamaUnavailableFixture) {
+      const lightDisconnected = structuredClone(ollamaUnavailableFixture);
+      lightDisconnected.generation = 1003;
+      lightDisconnected.generated_at = new Date().toISOString();
+      broadcastProviderUsage(lightDisconnected);
+      const lightDesktopOllama = page.locator('[data-provider-id="ollama-local"]');
+      if (await lightDesktopOllama.getAttribute('open') == null) await lightDesktopOllama.locator('summary').click();
+      await lightDesktopOllama.locator('[data-testid="ollama-cloud-unavailable"][data-source-status="unavailable"]').waitFor();
+      if (screenshotDir) await lightDesktopOllama
+        .screenshot({ path: path.join(screenshotDir, 'ollama-independent-sources-light-desktop.png') });
+    }
     const lightDesktopOverflow = await page.locator('.usage-dashboard').evaluate(node => node.scrollWidth - node.clientWidth);
     assert(lightDesktopOverflow <= 1, `light desktop dashboard overflowed by ${lightDesktopOverflow}px`);
     assert.match(await page.locator('.usage-dashboard').evaluate(node => getComputedStyle(node).backgroundColor), /rgb/i);
@@ -1011,6 +1181,14 @@ async function main() {
       await page.screenshot({ path: path.join(screenshotDir, 'usage-dashboard-light-desktop.png'), fullPage: true });
     }
     await loadFixture({ width: 390, height: 844 });
+    if (ollamaUnavailableFixture) {
+      const lightMobileOllama = page.locator('[data-provider-id="ollama-local"]');
+      if (await lightMobileOllama.getAttribute('open') == null) await lightMobileOllama.locator('summary').click();
+      await lightMobileOllama.locator('[data-testid="ollama-cloud-unavailable"][data-source-status="unavailable"]').waitFor();
+      if (screenshotDir) await lightMobileOllama
+        .screenshot({ path: path.join(screenshotDir, 'ollama-independent-sources-light-mobile-390.png') });
+      ollamaLifecycleProof.light_dark_desktop_mobile = true;
+    }
     const lightMobileOverflow = await page.locator('.usage-dashboard').evaluate(node => node.scrollWidth - node.clientWidth);
     assert(lightMobileOverflow <= 1, `light mobile dashboard overflowed by ${lightMobileOverflow}px`);
     if (screenshotDir) {
@@ -1056,6 +1234,12 @@ async function main() {
       session_header_formal_storm: sessionHeaderStorm,
       schema_version: 5,
       ollama_cloud_and_local: true,
+      ollama_independent_source_lifecycle: ollamaLifecycleProof?.states || null,
+      ollama_two_browser_watchers: ollamaLifecycleProof?.two_browser_watchers ?? null,
+      ollama_reconnect_preserved_state: ollamaLifecycleProof?.reconnect_preserved_state ?? null,
+      ollama_old_replay_rejected: ollamaLifecycleProof?.old_replay_rejected ?? null,
+      ollama_source_actions_passive: ollamaLifecycleProof?.source_actions_passive ?? null,
+      ollama_light_dark_desktop_mobile: ollamaLifecycleProof?.light_dark_desktop_mobile ?? null,
       ollama_zero_balance_exact: true,
       predictive_pace_windows: await page.locator('.usage-pace').count(),
       safe_budget_groups: await page.locator('.usage-pace-budgets').count(),

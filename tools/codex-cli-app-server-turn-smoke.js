@@ -48,6 +48,27 @@ class FakeConnection extends EventEmitter {
   }
 }
 
+class FastCompletionConnection extends FakeConnection {
+  async startTurn(threadId, content, params) {
+    const result = await super.startTurn(threadId, content, params);
+    this.emit('notification', {
+      method: 'turn/completed',
+      params: {
+        threadId,
+        turn: {
+          id: result.turn.id,
+          status: 'failed',
+          error: {
+            code: 'provider_quota',
+            message: 'The fixture has no remaining usage.',
+          },
+        },
+      },
+    });
+    return result;
+  }
+}
+
 (async () => {
   const connection = new FakeConnection();
   const turn = new CodexCliAppServerTurn({
@@ -115,6 +136,29 @@ class FakeConnection extends EventEmitter {
   }]);
   await newTurn.stop();
 
+  const fastConnection = new FastCompletionConnection();
+  const fastTurn = new CodexCliAppServerTurn({
+    sessionId: 'rac-fast', cwd: 'C:\\workspace', connectionFactory: () => fastConnection,
+  });
+  const fastCompletions = [];
+  fastTurn.on('turn_completed', completion => fastCompletions.push(completion));
+  await fastTurn.start({ content: 'Fast terminal fixture' });
+  assert.strictEqual(fastCompletions.length, 0,
+    'completion received before startTurn returns must wait for owner setup');
+  assert.strictEqual(fastTurn.flushPendingTurnCompletion(), true);
+  assert.strictEqual(fastTurn.flushPendingTurnCompletion(), false,
+    'the buffered completion must emit exactly once');
+  assert.deepStrictEqual(fastCompletions, [{
+    thread_id: 'thread-new',
+    turn_id: 'turn-owned',
+    status: 'failed',
+    error: {
+      code: 'provider_quota',
+      message: 'The fixture has no remaining usage.',
+    },
+  }]);
+  await fastTurn.stop();
+
   console.log(JSON.stringify({
     result: 'PASS',
     resume_owned: true,
@@ -124,6 +168,9 @@ class FakeConnection extends EventEmitter {
     question_channel_preserved: true,
     exact_interrupt: true,
     expected_disconnect_classified: true,
+    fast_completion_buffered: true,
+    fast_completion_exactly_once: true,
+    terminal_error_retained: true,
   }, null, 2));
 })().catch(error => {
   console.error(error.stack || error.message);

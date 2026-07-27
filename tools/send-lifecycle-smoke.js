@@ -11,7 +11,8 @@ const tracker = new SendLifecycleTracker({ now: () => now, maxPendingMs: 120000 
 
 tracker.markProxyResult({
   type: 'proxy_send_result', session_id: 'sess-a', client_message_id: 'cid-a',
-  result: 'delivered', delivered_at: '2026-07-11T20:00:00.000Z',
+  result: 'delivered', delivery_attempt: 2,
+  delivered_at: '2026-07-11T20:00:00.000Z',
 });
 assert.equal(tracker.consumeActivity({ session_id: 'sess-a', activity: { kind: 'idle' } }), null);
 now += 82;
@@ -24,6 +25,7 @@ assert.deepEqual(started, {
   protocol_version: 1,
   session_id: 'sess-a',
   client_message_id: 'cid-a',
+  delivery_attempt: 2,
   delivered_at: '2026-07-11T20:00:00.000Z',
   started_at: '2026-07-11T20:00:00.082Z',
   activity: { kind: 'thinking', label: 'Thinking', started_at: '2026-07-11T20:00:00.082Z' },
@@ -41,6 +43,19 @@ const raced = tracker.markProxyResult({
 });
 assert.equal(raced.client_message_id, 'cid-race');
 assert.equal(raced.activity.kind, 'generating');
+
+now += 1000;
+assert.equal(tracker.consumeActivity({
+  session_id: 'sess-stale',
+  activity: { kind: 'generating', started_at: '2026-07-11T19:59:00.000Z' },
+}), null);
+now += 25;
+const stale = tracker.markProxyResult({
+  session_id: 'sess-stale', client_message_id: 'cid-stale', result: 'delivered',
+  delivered_at: new Date(now).toISOString(),
+});
+assert.equal(stale.started_at, new Date(now).toISOString(), 'stale pre-send activity clock must be clamped to delivery');
+assert(Date.parse(stale.started_at) >= Date.parse(stale.delivered_at), 'terminal receipt must not predate delivery');
 
 tracker.markProxyResult({ session_id: 'sess-b', client_message_id: 'cid-b', result: 'delivered' });
 tracker.markProxyResult({ session_id: 'sess-b', client_message_id: 'cid-b', result: 'failed' });
@@ -79,4 +94,4 @@ assert(android.includes("case 'agent_started':"));
 assert(androidBubble.includes("deliveryState === 'agent_started'"));
 assert(protocol.includes('### `agent_started`'));
 
-console.log('send lifecycle smoke: PASS (legacy relay derivation plus native-receipt-managed agent_started gating)');
+console.log('send lifecycle smoke: PASS (truthful legacy chronology plus native-receipt-managed agent_started gating)');

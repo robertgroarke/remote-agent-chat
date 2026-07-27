@@ -3,10 +3,12 @@ import {
   View, Text, TouchableOpacity, ScrollView, StyleSheet, TextInput, useColorScheme,
 } from 'react-native';
 import PROMPT_THEMES from './permission-prompt-theme.json';
+import { useThemedStyles } from '../lib/theme';
 
 const idFor = (choice, index) => choice.choice_id || choice.id || choice.value || `choice-${index}`;
 
 export default function PermissionPrompt({ prompt, agentType, onChoice, colorScheme = null }) {
+  const s = useThemedStyles(darkStyles);
   const systemColorScheme = useColorScheme();
   const [now, setNow] = useState(Date.now());
   const [selections, setSelections] = useState({});
@@ -202,14 +204,14 @@ export default function PermissionPrompt({ prompt, agentType, onChoice, colorSch
           return (
             <TouchableOpacity
               key={id}
-              style={[s.choiceBtn, choiceStyle(choice.style), claudeAction && s.claudeChoice, selected && s.claudeChoiceSelected, pending && s.choicePending]}
+              style={[s.choiceBtn, choiceStyle(choice.style, s), claudeAction && s.claudeChoice, selected && s.claudeChoiceSelected, pending && s.choicePending]}
               activeOpacity={0.75}
               disabled={!!submittingChoiceId}
               onPress={() => onChoice(prompt.prompt_id, id)}
               accessibilityState={{ disabled: !!submittingChoiceId, busy: pending, selected }}
             >
               {claudeAction && <Text style={[s.choiceShortcut, selected && s.claudeChoiceSelectedText]}>{choice.shortcut || index + 1}</Text>}
-              <Text style={[s.choiceText, choiceTextStyle(choice.style), selected && s.claudeChoiceSelectedText]}>
+              <Text style={[s.choiceText, choiceTextStyle(choice.style, s), selected && s.claudeChoiceSelectedText]}>
                 {labelPrefix}
                 {!!destination && <Text style={s.choiceDestination}>{destination}</Text>}
                 {pending ? ' · Sending…' : ''}
@@ -278,11 +280,11 @@ export default function PermissionPrompt({ prompt, agentType, onChoice, colorSch
   );
 }
 
-function choiceStyle(style) {
+function choiceStyle(style, styles) {
   switch (style) {
-    case 'primary': return s.choicePrimary;
-    case 'danger': return s.choiceDanger;
-    default: return s.choiceDefault;
+    case 'primary': return styles.choicePrimary;
+    case 'danger': return styles.choiceDanger;
+    default: return styles.choiceDefault;
   }
 }
 
@@ -292,15 +294,15 @@ function formatCountdown(msLeft) {
   return `${minutes}:${String(totalSeconds % 60).padStart(2, '0')}`;
 }
 
-function choiceTextStyle(style) {
+function choiceTextStyle(style, styles) {
   switch (style) {
-    case 'primary': return s.choiceTextPrimary;
-    case 'danger': return s.choiceTextDanger;
-    default: return s.choiceTextDefault;
+    case 'primary': return styles.choiceTextPrimary;
+    case 'danger': return styles.choiceTextDanger;
+    default: return styles.choiceTextDefault;
   }
 }
 
-const s = StyleSheet.create({
+const darkStyles = StyleSheet.create({
   container: { backgroundColor: '#1c2128', borderTopWidth: 1, borderTopColor: '#f0883e', padding: 16 },
   claudeContainer: { marginHorizontal: 8, marginBottom: 8, padding: 10, borderWidth: 1, borderColor: '#484848', borderRadius: 8, backgroundColor: '#30302f' },
   header: { flexDirection: 'row', alignItems: 'center', marginBottom: 8, gap: 8 },

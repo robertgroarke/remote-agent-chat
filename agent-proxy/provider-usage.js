@@ -1510,8 +1510,47 @@ async function collectCursor(fingerprintKey, options = {}) {
 }
 
 function normalizeOllamaCloudUsage(value, capturedAt = Date.now()) {
-  const source = safeText(value?.source, 60) || 'existing_signed_in_ollama_usage_surface';
+  const source = safeText(value?.source, 60) || 'owned_ollama_usage_surface';
+  const attemptedIso = isoTimestamp(value?.attempted_at) || new Date(capturedAt).toISOString();
+  const attemptId = safeText(value?.attempt_id, 100)
+    || `ollama-cloud-${Date.parse(attemptedIso) || capturedAt}`;
+  const lifecycleStatus = ['fresh', 'stale', 'auth_required', 'unavailable', 'error']
+    .includes(value?.lifecycle_status)
+    ? value.lifecycle_status
+    : (value?.ok ? 'fresh' : 'unavailable');
+  const attempts = (Array.isArray(value?.attempts) ? value.attempts : []).slice(-8).map(attempt => ({
+    port: Math.max(0, Number(attempt?.port) || 0),
+    status: ['fresh', 'auth_required', 'unavailable', 'error'].includes(attempt?.status)
+      ? attempt.status : 'error',
+    code: safeText(attempt?.code, 80),
+    reachable: attempt?.reachable === true,
+    elapsed_ms: Math.max(0, Number(attempt?.elapsed_ms) || 0),
+    ollama_origin_targets: Math.max(0, Number(attempt?.ollama_origin_targets) || 0),
+    usage_targets: Math.max(0, Number(attempt?.usage_targets) || 0),
+  }));
+  const diagnostic = {
+    configured_ports: (Array.isArray(value?.configured_ports) ? value.configured_ports : [])
+      .map(Number).filter(port => Number.isInteger(port) && port >= 1024 && port <= 65535).slice(0, 8),
+    fallback_ports: (Array.isArray(value?.fallback_ports) ? value.fallback_ports : [])
+      .map(Number).filter(port => Number.isInteger(port) && port >= 1024 && port <= 65535).slice(0, 8),
+    effective_ports: (Array.isArray(value?.effective_ports) ? value.effective_ports : [])
+      .map(Number).filter(port => Number.isInteger(port) && port >= 1024 && port <= 65535).slice(0, 8),
+    fallback_policy: safeText(value?.fallback_policy, 40) || 'none',
+    extraction_signature: safeText(value?.extraction_signature, 80),
+    attempts,
+    supervision: value?.supervision && typeof value.supervision === 'object' ? {
+      status: safeText(value.supervision.status, 40) || 'unknown',
+      code: safeText(value.supervision.code, 80),
+      port: Math.max(0, Number(value.supervision.port) || 0),
+      elapsed_ms: Math.max(0, Number(value.supervision.elapsed_ms) || 0),
+      visible_windows_opened: 0,
+      protected_existing_targets_mutated: 0,
+    } : null,
+  };
   if (!value?.ok) {
+    const code = safeText(value?.code, 60) || 'cloud_source_unavailable';
+    const message = safeText(value?.message, 180)
+      || 'Ollama Cloud monitoring is not connected.';
     return {
       windows: [],
       financials: null,
@@ -1521,11 +1560,20 @@ function normalizeOllamaCloudUsage(value, capturedAt = Date.now()) {
         captured_at: null,
         auto_reload_enabled: null,
         error: {
-          code: safeText(value?.code, 60) || 'existing_usage_surface_unavailable',
-          message: safeText(value?.message, 180)
-            || 'Cloud usage unavailable: no readable, already-open signed-in Ollama usage page was found.',
+          code,
+          message,
         },
         source_receipt: null,
+        lifecycle: {
+          status: lifecycleStatus,
+          captured_at: null,
+          last_good_at: null,
+          attempted_at: attemptedIso,
+          attempt_id: attemptId,
+          reason: { code, message },
+          next_action: safeText(value?.next_action, 80) || 'connect_owned_cloud_source',
+          diagnostic,
+        },
       },
     };
   }
@@ -1588,6 +1636,7 @@ function normalizeOllamaCloudUsage(value, capturedAt = Date.now()) {
       existing_target_id_preserved: value.source_receipt.existing_target_id_preserved === true,
       target_inventory_stable: value.source_receipt.target_inventory_stable === true,
       targets_created: Math.max(0, Number(value.source_receipt.targets_created) || 0),
+      extraction_signature: safeText(value.source_receipt.extraction_signature, 80),
     }
     : null;
   return {
@@ -1600,6 +1649,160 @@ function normalizeOllamaCloudUsage(value, capturedAt = Date.now()) {
       auto_reload_enabled: typeof value.auto_reload_enabled === 'boolean' ? value.auto_reload_enabled : null,
       error: null,
       source_receipt: receipt,
+      lifecycle: {
+        status: 'fresh',
+        captured_at: capturedIso,
+        last_good_at: capturedIso,
+        attempted_at: attemptedIso,
+        attempt_id: attemptId,
+        reason: null,
+        next_action: 'none',
+        diagnostic,
+      },
+    },
+  };
+}
+
+function ollamaObservationError(error, fallbackCode = 'unavailable') {
+  const rawCode = safeText(error?.code, 60) || fallbackCode;
+  const code = /ECONNREFUSED|ECONNRESET|EHOSTUNREACH|ENOTFOUND/i.test(rawCode)
+    ? 'service_unreachable' : rawCode;
+  const status = code === 'timeout' ? 'error'
+    : ['malformed_payload', 'response_too_large', 'endpoint_rejected'].includes(code) ? 'error'
+      : 'unavailable';
+  const messages = {
+    service_unreachable: 'The Ollama loopback service is not reachable.',
+    not_running: 'The Ollama loopback service is not reachable.',
+    timeout: 'The Ollama loopback observation timed out.',
+    malformed_payload: 'The Ollama loopback response schema was not recognized.',
+    response_too_large: 'The Ollama loopback response exceeded the safe size limit.',
+    endpoint_rejected: 'The Ollama endpoint is not an approved loopback address.',
+  };
+  return {
+    status,
+    code,
+    message: safeText(messages[code] || error?.message, 180) || 'The Ollama loopback observation is unavailable.',
+    next_action: ['service_unreachable', 'not_running'].includes(code)
+      ? 'start_local_runtime' : 'retry_local_runtime',
+  };
+}
+
+function ollamaSourceLifecycle({
+  status,
+  capturedAt = null,
+  attemptedAt,
+  attemptId,
+  reason = null,
+  nextAction = 'none',
+  diagnostic = null,
+}) {
+  const capturedIso = isoTimestamp(capturedAt);
+  return {
+    status,
+    captured_at: capturedIso,
+    last_good_at: capturedIso,
+    attempted_at: isoTimestamp(attemptedAt),
+    attempt_id: safeText(attemptId, 100),
+    reason: reason ? {
+      code: safeText(reason.code, 60) || 'unavailable',
+      message: safeText(reason.message, 180) || 'The source is unavailable.',
+    } : null,
+    next_action: safeText(nextAction, 80) || 'none',
+    ...(diagnostic ? { diagnostic } : {}),
+  };
+}
+
+function retainedOllamaLifecycle(previous, current) {
+  const lastGoodAt = isoTimestamp(previous?.last_good_at || previous?.captured_at);
+  if (!lastGoodAt) return current;
+  return {
+    ...previous,
+    status: 'stale',
+    captured_at: isoTimestamp(previous?.captured_at) || lastGoodAt,
+    last_good_at: lastGoodAt,
+    attempted_at: isoTimestamp(current?.attempted_at),
+    attempt_id: safeText(current?.attempt_id, 100),
+    reason: current?.reason || null,
+    next_action: safeText(current?.next_action, 80) || 'retry_source',
+    ...(current?.diagnostic ? { diagnostic: current.diagnostic } : {}),
+  };
+}
+
+function mergeOllamaLastGood(current, previous) {
+  if (!previous || current?.provider_id !== 'ollama-local') return current;
+  let merged = current;
+  const currentCloud = current.cloud_usage;
+  const previousCloud = previous.cloud_usage;
+  if (currentCloud?.lifecycle?.status !== 'fresh'
+      && ['active', 'none'].includes(previousCloud?.subscription_state)
+      && (previousCloud?.lifecycle?.captured_at || previousCloud?.captured_at)) {
+    merged = {
+      ...merged,
+      windows: (previous.windows || []).map(window => ({
+        ...window,
+        freshness_status: 'stale',
+      })),
+      financials: previous.financials || null,
+      cloud_usage: {
+        ...previousCloud,
+        error: currentCloud?.error || null,
+        lifecycle: retainedOllamaLifecycle(previousCloud.lifecycle || {
+          status: 'fresh',
+          captured_at: previousCloud.captured_at,
+          last_good_at: previousCloud.captured_at,
+        }, currentCloud?.lifecycle),
+      },
+    };
+  }
+  const currentLocal = merged.local_runtime;
+  const previousLocal = previous.local_runtime;
+  if (!currentLocal || !previousLocal) return merged;
+  const observations = { ...(currentLocal.observations || {}) };
+  let loadedModelsCount = currentLocal.loaded_models_count;
+  let loadedModels = currentLocal.loaded_models;
+  let installedModelsCount = currentLocal.installed_models_count;
+  let retained = false;
+  const priorPs = previousLocal.observations?.api_ps || {
+    status: previousLocal.loaded_models_count == null ? 'unavailable' : 'fresh',
+    captured_at: previous.captured_at,
+    last_good_at: previous.captured_at,
+  };
+  if (observations.api_ps?.status !== 'fresh'
+      && previousLocal.loaded_models_count != null
+      && ['fresh', 'stale'].includes(priorPs.status)) {
+    loadedModelsCount = previousLocal.loaded_models_count;
+    loadedModels = previousLocal.loaded_models || [];
+    observations.api_ps = retainedOllamaLifecycle(priorPs, observations.api_ps);
+    retained = true;
+  }
+  const priorTags = previousLocal.observations?.api_tags || {
+    status: previousLocal.installed_models_count == null ? 'unavailable' : 'fresh',
+    captured_at: previous.captured_at,
+    last_good_at: previous.captured_at,
+  };
+  if (observations.api_tags?.status !== 'fresh'
+      && previousLocal.installed_models_count != null
+      && ['fresh', 'stale'].includes(priorTags.status)) {
+    installedModelsCount = previousLocal.installed_models_count;
+    observations.api_tags = retainedOllamaLifecycle(priorTags, observations.api_tags);
+    retained = true;
+  }
+  if (!retained) return merged;
+  return {
+    ...merged,
+    status: merged.status === 'unavailable' ? 'stale' : merged.status,
+    local_runtime: {
+      ...currentLocal,
+      status: 'partial',
+      installed_models_count: installedModelsCount,
+      loaded_models_count: loadedModelsCount,
+      loaded_models: loadedModels,
+      observations,
+      lifecycle: retainedOllamaLifecycle(previousLocal.lifecycle || {
+        status: 'fresh',
+        captured_at: previous.captured_at,
+        last_good_at: previous.captured_at,
+      }, currentLocal.lifecycle),
     },
   };
 }
@@ -1608,27 +1811,64 @@ async function collectOllama(fingerprintKey, options = {}) {
   const requester = options.requester || requestLoopbackJson;
   const receiptReader = options.receiptReader || readOllamaRequestReceipts;
   const cloudReader = options.cloudReader || readOllamaCloudUsageFromExistingChrome;
-  const [runningResult, installedResult, requestReceiptsResult, cloudResult] = await Promise.allSettled([
-    requester('/api/ps', options),
-    requester('/api/tags', options),
-    Promise.resolve(receiptReader(options)),
-    Promise.resolve(cloudReader(options.cloudOptions || {})),
+  const attemptedAtMs = Date.now();
+  const attemptedAt = new Date(attemptedAtMs).toISOString();
+  const attemptId = safeText(options.attemptId, 100)
+    || `ollama-local-${attemptedAtMs}-${crypto.randomBytes(5).toString('hex')}`;
+  const observeEndpoint = async pathname => {
+    const startedAt = Date.now();
+    try {
+      const value = await requester(pathname, options);
+      if (!value || !Array.isArray(value.models)) {
+        throw new ProviderUsageError('Ollama returned an unrecognized models payload.', {
+          code: 'malformed_payload',
+        });
+      }
+      return { ok: true, value, latency_ms: Date.now() - startedAt };
+    } catch (error) {
+      return { ok: false, error, latency_ms: Date.now() - startedAt };
+    }
+  };
+  const observeReceipts = async () => {
+    const startedAt = Date.now();
+    try {
+      return { ok: true, value: await Promise.resolve(receiptReader(options)), latency_ms: Date.now() - startedAt };
+    } catch (error) {
+      return { ok: false, error, latency_ms: Date.now() - startedAt };
+    }
+  };
+  const observeCloud = async () => {
+    try {
+      return { ok: true, value: await Promise.resolve(cloudReader(options.cloudOptions || {})) };
+    } catch (error) {
+      return {
+        ok: false,
+        error,
+        value: {
+          ok: false,
+          lifecycle_status: 'error',
+          code: safeText(error?.code, 60) || 'cloud_source_failed',
+          message: 'The passive Ollama cloud usage source failed.',
+          attempted_at: attemptedAt,
+          attempt_id: `ollama-cloud-${attemptId}`,
+          next_action: 'retry_cloud_source',
+        },
+      };
+    }
+  };
+  const [runningObservation, installedObservation, receiptsObservation, cloudObservation] = await Promise.all([
+    observeEndpoint('/api/ps'),
+    observeEndpoint('/api/tags'),
+    observeReceipts(),
+    observeCloud(),
   ]);
-  const running = runningResult.status === 'fulfilled' ? runningResult.value : null;
-  const installed = installedResult.status === 'fulfilled' ? installedResult.value : null;
-  const requestReceiptsValue = requestReceiptsResult.status === 'fulfilled' ? requestReceiptsResult.value : [];
-  const cloudRaw = cloudResult.status === 'fulfilled'
-    ? cloudResult.value
-    : { ok: false, code: 'existing_usage_surface_failed', message: 'The passive Ollama cloud usage source failed.' };
+  const capturedAt = new Date().toISOString();
+  const running = runningObservation.ok ? runningObservation.value : null;
+  const installed = installedObservation.ok ? installedObservation.value : null;
+  const requestReceiptsValue = receiptsObservation.ok ? receiptsObservation.value : [];
+  const cloudRaw = cloudObservation.value;
   const cloud = normalizeOllamaCloudUsage(cloudRaw);
-  const localAvailable = runningResult.status === 'fulfilled' || installedResult.status === 'fulfilled';
-  if (!localAvailable && cloud.cloud_usage.subscription_state === 'unavailable') {
-    const localError = runningResult.reason || installedResult.reason;
-    throw new ProviderUsageError(
-      safeText(localError?.message, 180) || 'Ollama local runtime and cloud usage are unavailable.',
-      { code: safeText(localError?.code, 60) || 'not_running' },
-    );
-  }
+  const localAvailable = runningObservation.ok || installedObservation.ok;
   const runningModels = (Array.isArray(running?.models) ? running.models : []).slice(0, 64).map(model => ({
     name: safeText(model?.name || model?.model, 160) || 'Unnamed local model',
     size_bytes: Math.max(0, safeNumber(model?.size) || 0),
@@ -1636,28 +1876,53 @@ async function collectOllama(fingerprintKey, options = {}) {
     context_length: Math.max(0, safeNumber(model?.context_length) || 0),
     expires_at: isoTimestamp(model?.expires_at),
   }));
-  const installedCount = Array.isArray(installed?.models) ? installed.models.length : 0;
+  const installedCount = installedObservation.ok ? installed.models.length : null;
   const requestReceipts = (Array.isArray(requestReceiptsValue) ? requestReceiptsValue : [])
     .map(normalizePersistedOllamaReceipt)
     .filter(Boolean)
     .slice(-MAX_OLLAMA_REQUEST_RECEIPTS);
   const latestReceipt = requestReceipts.at(-1) || null;
   const cloudAvailable = cloud.cloud_usage.subscription_state !== 'unavailable';
+  const runningFailure = runningObservation.ok ? null : ollamaObservationError(runningObservation.error);
+  const installedFailure = installedObservation.ok ? null : ollamaObservationError(installedObservation.error);
+  const receiptsFailure = receiptsObservation.ok ? null : ollamaObservationError(
+    receiptsObservation.error, 'receipt_scan_failed');
+  const localReason = !runningObservation.ok ? {
+    code: `api_ps_${runningFailure.code}`,
+    message: installedObservation.ok
+      ? `Loaded-model observation unavailable; installed-model observation remains fresh. ${runningFailure.message}`
+      : runningFailure.message,
+  } : !installedObservation.ok ? {
+    code: `api_tags_${installedFailure.code}`,
+    message: `Installed-model observation unavailable; loaded-model observation remains fresh. ${installedFailure.message}`,
+  } : null;
+  const localLifecycleStatus = runningObservation.ok && installedObservation.ok ? 'fresh'
+    : localAvailable ? 'error'
+      : [runningFailure?.status, installedFailure?.status].includes('error') ? 'error' : 'unavailable';
+  const observationLifecycle = (observation, failure) => ollamaSourceLifecycle({
+    status: observation.ok ? 'fresh' : failure.status,
+    capturedAt: observation.ok ? capturedAt : null,
+    attemptedAt,
+    attemptId,
+    reason: observation.ok ? null : failure,
+    nextAction: observation.ok ? 'none' : failure.next_action,
+    diagnostic: { elapsed_ms: Math.max(0, Number(observation.latency_ms) || 0) },
+  });
   const plan = cloudAvailable
     ? (cloud.cloud_usage.subscription_state === 'none' ? 'No cloud subscription' : safeText(cloudRaw.plan, 80) || 'Ollama Cloud')
     : 'Local models';
   return {
-    account_fingerprint: accountFingerprint(cloudAvailable ? `ollama-cloud:${plan}` : 'ollama-loopback-runtime', fingerprintKey),
+    account_fingerprint: accountFingerprint('ollama-cloud-and-loopback-runtime', fingerprintKey),
     account_label: cloudAvailable && localAvailable ? 'Cloud account + loopback runtime'
       : cloudAvailable ? 'Cloud account' : 'Loopback runtime',
     plan,
     source: cloud.cloud_usage.subscription_state === 'active' ? cloud.cloud_usage.source : 'loopback_api',
     source_history: [
-      sourceAttempt('ollama_api_ps', runningResult.status === 'fulfilled' ? 'ok' : 'failed', {
-        code: runningResult.status === 'fulfilled' ? null : safeText(runningResult.reason?.code, 60) || 'not_running',
+      sourceAttempt('ollama_api_ps', runningObservation.ok ? 'ok' : 'failed', {
+        code: runningObservation.ok ? null : runningFailure.code,
       }),
-      sourceAttempt('ollama_api_tags', installedResult.status === 'fulfilled' ? 'ok' : 'failed', {
-        code: installedResult.status === 'fulfilled' ? null : safeText(installedResult.reason?.code, 60) || 'not_running',
+      sourceAttempt('ollama_api_tags', installedObservation.ok ? 'ok' : 'failed', {
+        code: installedObservation.ok ? null : installedFailure.code,
       }),
       ...(latestReceipt ? [sourceAttempt('ollama_owned_request_receipt', 'ok')] : []),
       sourceAttempt('ollama_cloud_existing_surface', cloud.cloud_usage.subscription_state === 'unavailable' ? 'failed' : 'ok', {
@@ -1668,11 +1933,12 @@ async function collectOllama(fingerprintKey, options = {}) {
     credits: null,
     financials: cloud.financials,
     cloud_usage: cloud.cloud_usage,
-    local_runtime: localAvailable ? {
-      status: runningResult.status === 'fulfilled' && installedResult.status === 'fulfilled' ? 'running' : 'partial',
+    local_runtime: {
+      status: runningObservation.ok && installedObservation.ok ? 'running'
+        : localAvailable ? 'partial' : 'unavailable',
       endpoint_scope: 'loopback_only',
       installed_models_count: installedCount,
-      loaded_models_count: runningModels.length,
+      loaded_models_count: runningObservation.ok ? runningModels.length : null,
       loaded_models: runningModels,
       prompt_tokens: latestReceipt?.prompt_tokens ?? null,
       response_tokens: latestReceipt?.response_tokens ?? null,
@@ -1687,7 +1953,23 @@ async function collectOllama(fingerprintKey, options = {}) {
       telemetry_reason: latestReceipt
         ? 'Only explicit owned terminal response receipts are counted; Ollama exposes no historical request totals.'
         : 'Ollama exposes no historical request totals; only explicit owned terminal response receipts are counted.',
-    } : null,
+      lifecycle: ollamaSourceLifecycle({
+        status: localLifecycleStatus,
+        capturedAt: localAvailable ? capturedAt : null,
+        attemptedAt,
+        attemptId,
+        reason: localReason,
+        nextAction: localReason
+          ? (runningFailure?.next_action || installedFailure?.next_action || 'retry_local_runtime')
+          : 'none',
+      }),
+      observations: {
+        api_ps: observationLifecycle(runningObservation, runningFailure),
+        api_tags: observationLifecycle(installedObservation, installedFailure),
+        owned_receipts: observationLifecycle(receiptsObservation, receiptsFailure),
+      },
+    },
+    provider_status: localAvailable || cloudAvailable ? 'fresh' : 'unavailable',
     reset_credits: null,
     request_count: 3,
   };
@@ -1962,7 +2244,8 @@ class ProviderUsageRegistry {
           stale_reason: staleReason,
           status: statusOverride === 'refreshing'
             ? 'refreshing'
-            : (staleReason ? 'stale' : 'fresh'),
+            : staleReason ? 'stale'
+              : (['stale', 'unavailable'].includes(good.status) ? good.status : 'fresh'),
           ...(failure && staleReason
             ? { error: failure.error, last_good_captured_at: good.captured_at }
             : { error: null }),
@@ -2139,7 +2422,10 @@ class ProviderUsageRegistry {
               this.refreshIntervalFor(entry.key) * 2,
               Number(result.stale_after_ms) || this.staleAfterMs,
             );
-            this.lastGood.set(identityKey, {
+            const providerStatus = entry.key === 'ollama'
+              && ['fresh', 'stale', 'unavailable'].includes(result.provider_status)
+              ? result.provider_status : 'fresh';
+            const candidate = {
               schema_version: SCHEMA_VERSION,
               provider_id: entry.provider.provider_id,
               provider_name: entry.provider.provider_name,
@@ -2151,7 +2437,7 @@ class ProviderUsageRegistry {
               account_metadata: result.account_metadata || null,
               source: safeText(result.source, 60),
               source_history: Array.isArray(result.source_history) ? result.source_history.slice(-8) : [],
-              status: 'fresh',
+              status: providerStatus,
               captured_at: new Date(parsedCapturedAt).toISOString(),
               stale_after: new Date(parsedCapturedAt + resultStaleAfterMs).toISOString(),
               next_refresh_at: null,
@@ -2165,7 +2451,10 @@ class ProviderUsageRegistry {
               request_count: Math.max(0, Number(result.request_count) || 0),
               latency_ms: this.now() - startedAt,
               ...entry.mapped,
-            });
+            };
+            this.lastGood.set(identityKey, entry.key === 'ollama'
+              ? mergeOllamaLastGood(candidate, this.lastGood.get(identityKey))
+              : candidate);
           }
           const previousIdentities = this.identitiesByProvider.get(entry.key) || new Set();
           for (const identityKey of previousIdentities) {

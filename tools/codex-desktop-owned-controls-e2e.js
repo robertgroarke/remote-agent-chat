@@ -16,8 +16,8 @@ const {
 const { freshEvidencePath } = require('./evidence-path');
 
 const ROOT = path.resolve(__dirname, '..');
-
-const PORT = Number(process.env.CODEX_DESKTOP_CDP_PORT || 9225);
+const DEFAULT_PORT = Number(process.env.CODEX_DESKTOP_CDP_PORT || 9225);
+const PROTECTED_CDP_PORTS = new Set([9223, 9225, 9240]);
 
 function parseArgs(argv) {
   const options = {
@@ -42,15 +42,62 @@ function parseArgs(argv) {
 }
 
 function isCanonicalTarget(target) {
-  return target?.type === 'page' && /^app:\/\/-\/index\.html(?:[?#]|$)/i.test(String(target.url || ''));
+  return target?.type === 'page' && String(target.url || '') === 'app://-/index.html';
 }
 
-async function openNative() {
-  const targets = (await listCdpTargets(CDP, { port: PORT })).filter(isCanonicalTarget);
+function parseOwnedTarget(env = process.env) {
+  const raw = String(env.RAC_TIER2_OWNED_SESSION || '').trim();
+  assert(raw, 'RAC_TIER2_OWNED_SESSION must name the owned disposable Codex Desktop target');
+  let configured;
+  try {
+    configured = JSON.parse(raw);
+  } catch {
+    configured = raw;
+  }
+  const target = typeof configured === 'string'
+    ? { session_id: configured }
+    : configured;
+  assert(target && typeof target === 'object' && !Array.isArray(target),
+    'RAC_TIER2_OWNED_SESSION must be a session id or JSON object');
+  const sessionId = String(target.session_id || '').trim();
+  assert(sessionId, 'Owned Codex Desktop target is missing session_id');
+  const targetPort = target.cdp_port ?? target.port;
+  const environmentPort = env.CODEX_DESKTOP_CDP_PORT;
+  const cdpPort = Number(targetPort ?? environmentPort);
+  assert(Number.isInteger(cdpPort) && cdpPort > 0 && cdpPort <= 65535,
+    'Owned Codex Desktop target must provide a valid cdp_port');
+  if (targetPort != null && environmentPort != null) {
+    assert.strictEqual(Number(environmentPort), cdpPort,
+      'CODEX_DESKTOP_CDP_PORT disagrees with the owned target cdp_port');
+  }
+  assert(!PROTECTED_CDP_PORTS.has(cdpPort),
+    `Refusing owned Codex Desktop mutation on protected CDP port ${cdpPort}`);
+  return { sessionId, cdpPort };
+}
+
+function selectOwnedRelaySession(sessions, ownedTarget, { allowMissing = false } = {}) {
+  assert(Array.isArray(sessions), 'Relay session inventory must be an array');
+  const exact = sessions.filter(session =>
+    session?.session_id === ownedTarget.sessionId
+    && session?.agent_type === 'codex-desktop'
+    && session?.status !== 'disconnected');
+  if (exact.length === 0 && allowMissing) return null;
+  assert.strictEqual(exact.length, 1,
+    `expected one connected owned Codex Desktop relay session ${ownedTarget.sessionId}, found ${exact.length}`);
+  const session = exact[0];
+  assert.strictEqual(Number(session.cdp_port), ownedTarget.cdpPort,
+    `owned Codex Desktop relay session ${ownedTarget.sessionId} uses CDP port ${session.cdp_port}, expected ${ownedTarget.cdpPort}`);
+  assert(!PROTECTED_CDP_PORTS.has(Number(session.cdp_port)),
+    `Refusing relay mutation for protected CDP port ${session.cdp_port}`);
+  return session;
+}
+
+async function openNative(port = DEFAULT_PORT) {
+  const targets = (await listCdpTargets(CDP, { port })).filter(isCanonicalTarget);
   assert.strictEqual(targets.length, 1, `expected one canonical Codex Desktop target, found ${targets.length}`);
   const target = targets[0];
   const client = await connectCdpTarget(CDP, {
-    port: PORT,
+    port,
     host: target._cdpHost,
     target: target.id,
   });
@@ -193,12 +240,14 @@ async function restoreOriginal(native, relay, sessionId, originalThreadId) {
 
 async function main(argv = process.argv.slice(2)) {
   const options = parseArgs(argv);
+  const ownedTarget = parseOwnedTarget();
   const runId = Date.now().toString(36);
   const result = {
     ok: false,
     generated_at: new Date().toISOString(),
     run_id: runId,
-    cdp_port: PORT,
+    cdp_port: ownedTarget.cdpPort,
+    requested_session_id: ownedTarget.sessionId,
     focus_actions: 0,
     visible_windows_opened: 0,
     app_restarted: false,
@@ -221,13 +270,16 @@ async function main(argv = process.argv.slice(2)) {
     result.operation_lock = OPERATION_LOCK_PATH;
     result.stages.push('operation_lock');
 
-    native = await openNative();
+    native = await openNative(ownedTarget.cdpPort);
     relay = await production.openRelay();
     const session = await production.waitFor(
-      () => production.latestSessions(relay.messages).find(item =>
-        item.agent_type === 'codex-desktop' && item.status !== 'disconnected'),
+      () => selectOwnedRelaySession(
+        production.latestSessions(relay.messages),
+        ownedTarget,
+        { allowMissing: true },
+      ),
       30000,
-      'connected Codex Desktop relay session',
+      `connected owned Codex Desktop relay session ${ownedTarget.sessionId}`,
     );
     sessionId = session.session_id;
     result.session_id = sessionId;
@@ -393,7 +445,9 @@ module.exports = {
   nativeSurfaceState,
   openNative,
   parseArgs,
+  parseOwnedTarget,
   requestConfig,
   restoreOriginal,
+  selectOwnedRelaySession,
   send,
 };

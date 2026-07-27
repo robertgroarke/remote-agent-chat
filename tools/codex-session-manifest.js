@@ -4,6 +4,7 @@
 const fs = require('fs');
 const os = require('os');
 const path = require('path');
+const { atomicReplaceText } = require('../shared/codex-live-owner-registry');
 
 const ROOT = path.resolve(__dirname, '..');
 const DEFAULT_MANIFEST = path.join(ROOT, 'data', 'codex-session-manifest.json');
@@ -14,11 +15,9 @@ function codexHome(env = process.env) {
   return path.resolve(env.CODEX_HOME || path.join(os.homedir(), '.codex'));
 }
 
-function atomicWriteJson(filePath, value) {
-  fs.mkdirSync(path.dirname(filePath), { recursive: true });
-  const tempPath = `${filePath}.${process.pid}.${Date.now()}.tmp`;
-  fs.writeFileSync(tempPath, `${JSON.stringify(value, null, 2)}\n`, 'utf8');
-  fs.renameSync(tempPath, filePath);
+function atomicWriteJson(filePath, value, options = {}) {
+  const serialized = `${JSON.stringify(value, null, 2)}\n`;
+  return atomicReplaceText(filePath, serialized, options, candidate => JSON.parse(candidate));
 }
 
 function validateManifest(manifest) {
@@ -27,6 +26,9 @@ function validateManifest(manifest) {
   }
   if (!manifest.sessions || typeof manifest.sessions !== 'object' || Array.isArray(manifest.sessions)) {
     throw new Error('Codex session manifest must contain a sessions object');
+  }
+  if (manifest.rotation?.autoStart === true) {
+    throw new Error('Codex session autoStart is forbidden; managed sessions are operator-started and parked');
   }
   for (const [logicalName, entry] of Object.entries(manifest.sessions)) {
     if (!/^[a-z0-9][a-z0-9-]*$/.test(logicalName)) {
@@ -43,6 +45,15 @@ function validateManifest(manifest) {
     }
     if (entry.codexGlobalArgs != null && !Array.isArray(entry.codexGlobalArgs)) {
       throw new Error(`codexGlobalArgs must be an array for ${logicalName}`);
+    }
+    if (entry.autoStart === true) {
+      throw new Error(`autoStart is forbidden for ${logicalName}`);
+    }
+    if (entry.resumeConfigOverride != null) {
+      const override = entry.resumeConfigOverride;
+      if (override?.explicit !== true || (!String(override.model || '').trim() && !String(override.effort || '').trim())) {
+        throw new Error(`resumeConfigOverride must be an explicit persisted choice for ${logicalName}`);
+      }
     }
   }
   return manifest;
@@ -151,15 +162,126 @@ function extractGoalPromptFromRollout(filePath) {
 }
 
 function rolloutMetadata(filePath) {
-  const records = parseJsonlPrefix(filePath, 2 * 1024 * 1024);
+  const records = parseJsonlPrefix(filePath, 8 * 1024 * 1024);
   const meta = records.find(record => record?.type === 'session_meta')?.payload || {};
+  const configs = records
+    .filter(record => record?.type === 'turn_context')
+    .map(record => normalizeCodexConfig({
+      model: record.payload?.model || record.payload?.model_id,
+      effort: record.payload?.effort || record.payload?.model_reasoning_effort,
+    }))
+    .filter(config => config.model || config.effort);
+  const metaConfig = normalizeCodexConfig({
+    model: meta.model || meta.model_id,
+    effort: meta.effort || meta.model_reasoning_effort,
+  });
+  if ((metaConfig.model || metaConfig.effort) && !configs.length) configs.push(metaConfig);
   return {
     sessionId: meta.id || meta.session_id || null,
     createdAt: meta.timestamp || null,
     cwd: meta.cwd || null,
     originator: meta.originator || null,
     cliVersion: meta.cli_version || null,
+    recordedConfig: configs[0] || { model: null, effort: null },
+    observedConfig: configs[configs.length - 1] || metaConfig,
   };
+}
+
+function persistResumeConfigOverride(sessionId, patch, options = {}) {
+  if (!UUID_RE.test(String(sessionId || ''))) throw new Error('A canonical Codex session UUID is required');
+  const manifestPath = path.resolve(options.manifestPath || DEFAULT_MANIFEST);
+  const manifest = loadManifest(manifestPath);
+  const match = Object.entries(manifest.sessions).find(([, entry]) => entry.sessionId === sessionId);
+  if (!match && options.allowUnmanaged === true) return null;
+  if (!match) throw new Error(`No managed Codex session owns ${sessionId}`);
+  const [logicalName, entry] = match;
+  const current = entry.resumeConfigOverride?.explicit === true ? entry.resumeConfigOverride : {};
+  const next = normalizeCodexConfig({
+    model: patch?.model === undefined ? current.model : patch.model,
+    effort: patch?.effort === undefined ? current.effort : patch.effort,
+  });
+  if (!next.model && !next.effort) throw new Error('An explicit model or effort choice is required');
+  manifest.sessions[logicalName] = {
+    ...entry,
+    resumeConfigOverride: {
+      ...next,
+      explicit: true,
+      chosen_at: new Date(Number(options.nowMs) || Date.now()).toISOString(),
+      chosen_by: String(options.chosenBy || 'rac_operator_control'),
+    },
+  };
+  manifest.updatedAt = new Date(Number(options.nowMs) || Date.now()).toISOString();
+  validateManifest(manifest);
+  atomicWriteJson(manifestPath, manifest);
+  return { logicalName, entry: manifest.sessions[logicalName], manifestPath };
+}
+
+function normalizeCodexConfig(value) {
+  const model = String(value?.model || '').trim() || null;
+  const effort = String(value?.effort || '').trim().toLowerCase() || null;
+  return { model, effort };
+}
+
+function parseCodexConfigArgs(args = []) {
+  const config = { model: null, effort: null };
+  for (let index = 0; index < args.length; index += 1) {
+    if ((args[index] === '-c' || args[index] === '--config') && args[index + 1]) {
+      const value = String(args[++index]);
+      const model = value.match(/^model\s*=\s*["']?([^"']+?)["']?$/i)?.[1]?.trim();
+      const effort = value.match(/^model_reasoning_effort\s*=\s*["']?([^"']+?)["']?$/i)?.[1]?.trim();
+      if (model) config.model = model;
+      if (effort) config.effort = effort.toLowerCase();
+    }
+  }
+  return config;
+}
+
+function stripCodexConfigArgs(args = []) {
+  const result = [];
+  for (let index = 0; index < args.length; index += 1) {
+    if ((args[index] === '-c' || args[index] === '--config') && args[index + 1]
+        && /^(?:model|model_reasoning_effort)\s*=/i.test(String(args[index + 1]))) {
+      index += 1;
+      continue;
+    }
+    result.push(args[index]);
+  }
+  return result;
+}
+
+function codexConfigArgs(config) {
+  const normalized = normalizeCodexConfig(config);
+  return [
+    ...(normalized.model ? ['-c', `model=${JSON.stringify(normalized.model)}`] : []),
+    ...(normalized.effort ? ['-c', `model_reasoning_effort=${JSON.stringify(normalized.effort)}`] : []),
+  ];
+}
+
+function resolveResumeConfig(entry, rolloutPath = entry?.rolloutPath) {
+  const metadata = rolloutPath && fs.existsSync(rolloutPath) ? rolloutMetadata(rolloutPath) : {};
+  const recorded = normalizeCodexConfig(metadata.recordedConfig || entry?.recordedConfig);
+  const observed = normalizeCodexConfig(metadata.observedConfig || entry?.observedConfig);
+  const requested = normalizeCodexConfig(entry?.requestedConfig || parseCodexConfigArgs(entry?.codexGlobalArgs));
+  const explicit = entry?.resumeConfigOverride?.explicit === true
+    ? normalizeCodexConfig(entry.resumeConfigOverride)
+    : { model: null, effort: null };
+  const selected = {
+    model: explicit.model || recorded.model || null,
+    effort: explicit.effort || recorded.effort || null,
+  };
+  return {
+    recorded,
+    requested,
+    observed,
+    selected,
+    source: explicit.model || explicit.effort ? 'explicit_operator_override' : 'recorded_rollout',
+    explicit: Boolean(explicit.model || explicit.effort),
+  };
+}
+
+function resumeGlobalArgs(entry, rolloutPath = entry?.rolloutPath) {
+  const config = resolveResumeConfig(entry, rolloutPath);
+  return [...stripCodexConfigArgs(entry?.codexGlobalArgs || []), ...codexConfigArgs(config.selected)];
 }
 
 function formatDigest(manifest, options = {}) {
@@ -252,6 +374,7 @@ module.exports = {
   MANIFEST_SCHEMA_VERSION,
   UUID_RE,
   atomicWriteJson,
+  codexConfigArgs,
   cleanGoalPrompt,
   codexHome,
   extractGoalPromptFromRollout,
@@ -261,9 +384,14 @@ module.exports = {
   loadManifest,
   main,
   parseJsonlPrefix,
+  parseCodexConfigArgs,
+  resolveResumeConfig,
+  resumeGlobalArgs,
   resolveSession,
+  persistResumeConfigOverride,
   responseItemUserText,
   rolloutMetadata,
+  stripCodexConfigArgs,
   validateManifest,
   walkJsonlFiles,
 };

@@ -211,7 +211,10 @@ if (!baselineLegacy) {
     'Model vendor',
     'Applicable limits',
     'Open Usage &amp; limits',
-    "navigation.navigate('SessionList', { openUsageNonce: Date.now() })",
+    "navigation.push('SessionList', {",
+    'openUsageNonce: Date.now(),',
+    'returnToChat: true,',
+    'returnSessionId: sessionId,',
   ]) assert(androidChat.includes(marker), `Android session usage UI missing ${marker}`);
   assert(androidList.includes('route?.params?.openUsageNonce'), 'Android Usage route handoff missing');
 }

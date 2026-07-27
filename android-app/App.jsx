@@ -15,6 +15,7 @@ import SkillsScreen       from './screens/SkillsScreen';
 import { getStoredJwt }  from './lib/auth';
 import { configureNotificationChannels } from './lib/notifications';
 import { useReducedMotion } from './lib/reduced-motion';
+import { useAppTheme, useThemedStyles } from './lib/theme';
 import {
   processSemanticNotification,
   refreshAuthoritativeSemanticNotificationPreferences,
@@ -38,10 +39,7 @@ const Stack  = createNativeStackNavigator();
 const prefix = Linking.createURL('/');
 
 const SCREEN_OPTIONS = {
-  headerStyle:      { backgroundColor: '#0b0f14' },
-  headerTintColor:  '#cdd9e5',
   headerTitleStyle: { fontSize: 16, fontWeight: '600' },
-  contentStyle:     { backgroundColor: '#0b0f14' },
   animation:        'slide_from_right',
 };
 
@@ -61,6 +59,7 @@ const LINKING = {
 // ── In-app notification banner ────────────────────────────────────────────────
 
 function NotificationBanner({ notification, onDismiss, onPress }) {
+  const bs = useThemedStyles(darkBannerStyles);
   const reducedMotion = useReducedMotion();
   const reducedMotionRef = useRef(reducedMotion);
   reducedMotionRef.current = reducedMotion;
@@ -154,7 +153,7 @@ function NotificationBanner({ notification, onDismiss, onPress }) {
   );
 }
 
-const bs = StyleSheet.create({
+const darkBannerStyles = StyleSheet.create({
   banner: {
     position:        'absolute',
     top:             48,
@@ -213,6 +212,7 @@ const bs = StyleSheet.create({
 // ── App ───────────────────────────────────────────────────────────────────────
 
 export default function App() {
+  const theme = useAppTheme();
   const reducedMotion = useReducedMotion();
   const [initialRoute, setInitialRoute] = useState(null);
   const [banner,       setBanner]       = useState(null);
@@ -273,12 +273,18 @@ export default function App() {
   if (!initialRoute) return null;
 
   return (
-    <View style={{ flex: 1 }}>
-      <NavigationContainer ref={navigationRef} linking={LINKING}>
-        <StatusBar style="light" />
+    <View style={{ flex: 1, backgroundColor: theme.screen }}>
+      <NavigationContainer ref={navigationRef} linking={LINKING} theme={theme.navigation}>
+        <StatusBar style={theme.statusBar} />
         <Stack.Navigator
           initialRouteName={initialRoute}
-          screenOptions={{ ...SCREEN_OPTIONS, animation: reducedMotion ? 'none' : SCREEN_OPTIONS.animation }}
+          screenOptions={{
+            ...SCREEN_OPTIONS,
+            headerStyle: { backgroundColor: theme.navigation.colors.card },
+            headerTintColor: theme.navigation.colors.text,
+            contentStyle: { backgroundColor: theme.navigation.colors.background },
+            animation: reducedMotion ? 'none' : SCREEN_OPTIONS.animation,
+          }}
         >
           <Stack.Screen
             name="Login"
@@ -297,7 +303,7 @@ export default function App() {
                     onPress={() => navigation.navigate('Settings')}
                     style={{ marginRight: 4, padding: 8 }}
                   >
-                    <Text style={{ color: '#cdd9e5', fontSize: 22 }}>⚙</Text>
+                    <Text style={{ color: theme.text, fontSize: 22 }}>⚙</Text>
                   </TouchableOpacity>
                 </View>
               ),

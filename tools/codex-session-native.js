@@ -66,9 +66,10 @@ function normalizeRateLimitState(response) {
 }
 
 class NativeCodexSessionManager {
-  constructor({ sessionId, cwd, connectionFactory } = {}) {
+  constructor({ sessionId, cwd, codexGlobalArgs = [], connectionFactory } = {}) {
     this.sessionId = sessionId;
     this.cwd = cwd;
+    this.codexGlobalArgs = [...codexGlobalArgs];
     this.connectionFactory = connectionFactory || (options => new CodexAppServerConnection(options));
     this.connection = null;
   }
@@ -78,6 +79,7 @@ class NativeCodexSessionManager {
     this.connection = this.connectionFactory({
       sessionId: this.sessionId,
       cwd: this.cwd,
+      codexGlobalArgs: this.codexGlobalArgs,
       clientName: 'remote-agent-chat-session-manager',
       clientVersion: '1.0.0',
     });
@@ -93,6 +95,48 @@ class NativeCodexSessionManager {
   async getGoal(threadId) {
     const connection = await this.start();
     return goalFromResponse(await connection.getGoal(threadId));
+  }
+
+  async createParkedThread(objective, options = {}) {
+    const normalizedObjective = String(objective || '').trim();
+    if (!normalizedObjective) throw new Error('A parked Codex successor requires an objective');
+    const connection = await this.start();
+    let threadId = null;
+    try {
+      const started = await connection.startThread({
+        ephemeral: false,
+        cwd: options.cwd || this.cwd,
+        ...(options.approvalPolicy ? { approvalPolicy: options.approvalPolicy } : {}),
+        ...(options.sandbox ? { sandbox: options.sandbox } : {}),
+      });
+      threadId = started.thread.id;
+      await connection.setGoal(threadId, 'paused', { objective: normalizedObjective });
+      const goal = goalFromResponse(await connection.getGoal(threadId));
+      if (!goal || goal.status !== 'paused' || goal.objective !== normalizedObjective) {
+        throw new Error('Codex did not durably acknowledge the parked successor goal');
+      }
+      return { sessionId: threadId, goal, createdAt: new Date().toISOString() };
+    } catch (error) {
+      if (threadId) {
+        try { await connection.clearGoal(threadId); } catch {}
+        try { await connection.request('thread/archive', { threadId }); } catch {}
+      }
+      throw error;
+    }
+  }
+
+  async parkGoal(threadId, objective) {
+    return this.ensureGoal(threadId, objective, 'paused', {
+      updateExisting: true,
+      preserveExistingStatuses: false,
+      acceptExistingObjective: true,
+    });
+  }
+
+  async interruptTurn(threadId, turnId) {
+    if (!threadId || !turnId) throw new Error('An exact Codex thread and turn are required for handoff');
+    const connection = await this.start();
+    return connection.request('turn/interrupt', { threadId, turnId });
   }
 
   async ensureGoal(threadId, objective, status, options = {}) {

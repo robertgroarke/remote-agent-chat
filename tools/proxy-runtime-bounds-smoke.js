@@ -51,6 +51,17 @@ process.env.SESSION_STORE_PATH = path.join(tempRoot, 'session-store.json');
       engine._relayBulkDeferralLogAt,
     ]) assert(map.size <= 512, `runtime metadata map exceeded bound: ${map.size}`);
 
+    const repeatedCursorSession = 'repeat-cursor-session';
+    const repeatedCursorRequest = {
+      mode: 'older',
+      user_initiated: true,
+      before_offset: 3220208,
+    };
+    assert.equal(engine._codexCliHistoryChunkThrottle(repeatedCursorSession, repeatedCursorRequest), null);
+    engine._codexCliHistoryChunkRequests.get(`${repeatedCursorSession}:older`).at -= 5001;
+    assert.equal(engine._codexCliHistoryChunkThrottle(repeatedCursorSession, repeatedCursorRequest), null,
+      'a completed native cursor remained tombstoned after the bounded rate interval');
+
     for (let index = 0; index < 1000; index += 1) {
       engine._rememberCodexConfigReceipt(`session-${index}\u0001request-${index}`, { result: 'ok' });
     }
